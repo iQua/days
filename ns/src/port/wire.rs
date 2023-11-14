@@ -41,38 +41,34 @@ impl Wire {
         self.packets_in_queue += 1;
 
         println!(
-            "Port {} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            {} packets received, {} packets in queue.",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now()
-        );
-
-        println!(
-            "\t{} packets received, {} packets in queue.",
+            sim.now(),
             self.packets_received,
             self.packets_in_queue
-        )
+        );
+
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.packets_sent += 1;
         self.packets_in_queue -= 1;
         println!(
-            "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
+            "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+            {} packets sent, {} packets in queue.",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now()
-        );
-
-        println!(
-            "\t{} packets sent, {} packets in queue.",
+            sim.now(),
             self.packets_sent,
             self.packets_in_queue
         );
+
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
@@ -93,6 +89,10 @@ impl Wire {
                 },
                 None => {
                     if let Some((packet, _)) = self.queue.pop_front() {
+                        self.sender
+                            .send(packet.clone())
+                            .await
+                            .expect("no receiving element in the simulation");
                         self.packet_sent(packet, sim);
                     }
                 }
