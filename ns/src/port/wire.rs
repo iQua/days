@@ -29,7 +29,7 @@ impl Wire {
             packets_sent: 0,
             packets_received: 0,
             packets_in_queue: 0,
-            queue: Vec::new(),
+            queue: VecDeque::new(),
             sender: channel().0,
             receiver: channel().1,
         }
