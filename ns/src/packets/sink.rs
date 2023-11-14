@@ -35,7 +35,7 @@ pub struct PacketSink {
 impl PacketSink {
     pub fn new(element_id: u32) -> PacketSink {
         PacketSink {
-            element_id: element_id,
+            element_id,
             packets_received: 0,
             bytes_received: 0,
             arrival_times: Vec::new(),

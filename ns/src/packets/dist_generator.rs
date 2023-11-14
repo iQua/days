@@ -12,10 +12,10 @@ where
     B: Distribution<u32>,
 {
     element_id: u32,
-    packets_sent: u32,
     initial_delay: Time,
     arr_interval_dist: Box<dyn Fn() -> A>,
     packet_size_dist: Box<dyn Fn() -> B>,
+    packets_sent: u32,
     pub sender: Sender<Packet>,
 }
 
@@ -32,10 +32,10 @@ where
     ) -> DistPacketGenerator<A, B> {
         DistPacketGenerator {
             element_id,
-            packets_sent: 0,
             initial_delay,
             arr_interval_dist,
             packet_size_dist,
+            packets_sent: 0,
             sender: channel().0,
         }
     }
