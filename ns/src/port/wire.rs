@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use crate::{packets::packet::Packet, Shared};
-use sim::{channel, Sender, Receiver, SimContext, select};
+use sim::{channel, Sender, Receiver, SimContext, select, Time};
 
 pub struct Wire {
     element_id: u32,
@@ -15,7 +15,7 @@ pub struct Wire {
     // the number of packets in the queue
     packets_in_queue: u32,
     // the packet queue of the port
-    queue: VecDeque<Packet>,
+    queue: VecDeque<(Packet, Time)>,
     // a sender for sending packets
     pub sender: Sender<Packet>,
     /// a receiver for receiving incoming packets
@@ -36,7 +36,7 @@ impl Wire {
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.queue.push_back(packet.clone());
+        self.queue.push_back((packet.clone(), sim.now()));
         self.packets_received += 1;
         self.packets_in_queue += 1;
 
@@ -79,7 +79,12 @@ impl Wire {
         loop {
             let receive_action = self.receiver.recv();
             let send_action = async {
-                sim.advance(1.0).await;
+                if let Some((_, arrival_time)) = self.queue.front() {
+                    let wait_time = arrival_time + 1.0 - sim.now();
+                    sim.advance(wait_time).await;
+                } else {
+                    sim.advance(1.0).await;
+                }
                 None
             };
             match select(sim, receive_action, send_action).await {
@@ -87,7 +92,7 @@ impl Wire {
                     self.packet_received(packet, sim);
                 },
                 None => {
-                    if let Some(packet) = self.queue.pop_front() {
+                    if let Some((packet, _)) = self.queue.pop_front() {
                         self.packet_sent(packet, sim);
                     }
                 }
