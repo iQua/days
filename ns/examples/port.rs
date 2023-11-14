@@ -6,8 +6,8 @@ use std::cell::RefCell;
 
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
+use ns::ports::port::Port;
 use ns::Shared;
-use ns::port::port::Port;
 use sim::{channel, Process, RandomVar, SimContext};
 
 const SEED: u64 = 1000;
@@ -28,7 +28,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     port.receiver = receiver1;
     port.sender = sender2;
     sink.receiver = receiver2;
-
 
     sim.activate(generator.run(sim));
     sim.activate(port.run(sim));
