@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use crate::{packets::packet::Packet, Shared};
-use sim::{channel, Sender, Receiver, SimContext, select, Time};
+use sim::{channel, select, Receiver, Sender, SimContext, Time};
 
 pub struct Port {
     element_id: u32,
@@ -86,7 +86,6 @@ impl Port {
             self.packets_received,
             self.packets_in_queue
         );
-
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
@@ -105,7 +104,6 @@ impl Port {
             self.packets_sent,
             self.packets_in_queue
         );
-
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
@@ -124,7 +122,7 @@ impl Port {
             match select(sim, receive_action, send_action).await {
                 Some(packet) => {
                     self.packet_received(packet, sim);
-                },
+                }
                 None => {
                     if let Some((packet, _)) = self.queue.pop_front() {
                         self.sender
@@ -137,5 +135,4 @@ impl Port {
             }
         }
     }
-
 }
