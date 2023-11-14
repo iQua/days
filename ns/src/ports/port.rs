@@ -52,11 +52,12 @@ impl Port {
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.packets_received += 1;
+
         let byte_count = self.bytes_in_queue + packet.size;
         let should_drop_packet = (self.limit_bytes && byte_count > self.qlimit)
             || (!self.limit_bytes && self.queue.len() >= self.qlimit as usize);
 
-        // the case that the packet will be dropped.
+        // the case that this packet will be dropped.
         if should_drop_packet {
             self.packets_dropped += 1;
             println! {
@@ -69,7 +70,7 @@ impl Port {
             return;
         }
 
-        // the case that packet will not be dropped.
+        // the case that this packet will not be dropped.
         self.queue.push_back((packet.clone(), sim.now()));
         self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
