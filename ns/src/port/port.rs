@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use crate::{packets::packet::Packet, Shared};
 use sim::{channel, Sender, Receiver, SimContext, select, Time};
 
-pub struct Wire {
+pub struct Port {
     element_id: u32,
     // the number of packets sent
     packets_sent: u32,
@@ -22,9 +22,9 @@ pub struct Wire {
     pub receiver: Receiver<Packet>,
 }
 
-impl Wire {
-    pub fn new(element_id: u32) -> Wire {
-        Wire {
+impl Port {
+    pub fn new(element_id: u32) -> Port {
+        Port {
             element_id: element_id,
             packets_sent: 0,
             packets_received: 0,

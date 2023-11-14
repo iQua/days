@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::Shared;
-use ns::port::wire::Wire;
+use ns::port::port::Port;
 use sim::{channel, Process, RandomVar, SimContext};
 
 const SEED: u64 = 1000;
@@ -19,19 +19,19 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         Box::new(|| Exp::new(1.).unwrap()),
         Box::new(|| Uniform::new(1000, 1500)),
     );
-    let mut wire = Wire::new(1);
+    let mut port = Port::new(1);
     let mut sink = PacketSink::new(2);
 
     let (sender1, receiver1) = channel();
     let (sender2, receiver2) = channel();
     generator.sender = sender1;
-    wire.receiver = receiver1;
-    wire.sender = sender2;
+    port.receiver = receiver1;
+    port.sender = sender2;
     sink.receiver = receiver2;
 
 
     sim.activate(generator.run(sim));
-    sim.activate(wire.run(sim));
+    sim.activate(port.run(sim));
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation
