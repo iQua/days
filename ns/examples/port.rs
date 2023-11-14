@@ -17,9 +17,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         0,
         1.0,
         Box::new(|| Exp::new(1.).unwrap()),
-        Box::new(|| Uniform::new(1000, 1500)),
+        Box::new(|| Uniform::new(1000, 1001)),
     );
-    let mut port = Port::new(1);
+    let mut port = Port::new(1, (1000*8) as f64);
     let mut sink = PacketSink::new(2);
 
     let (sender1, receiver1) = channel();

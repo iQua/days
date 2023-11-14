@@ -8,6 +8,8 @@ use sim::{channel, Sender, Receiver, SimContext, select, Time};
 
 pub struct Port {
     element_id: u32,
+    // the bit rate of the port
+    rate: f64,
     // the number of packets sent
     packets_sent: u32,
     // the number of packets received
@@ -23,9 +25,10 @@ pub struct Port {
 }
 
 impl Port {
-    pub fn new(element_id: u32) -> Port {
+    pub fn new(element_id: u32, rate: f64) -> Port {
         Port {
             element_id: element_id,
+            rate: rate,
             packets_sent: 0,
             packets_received: 0,
             packets_in_queue: 0,
@@ -75,8 +78,9 @@ impl Port {
         loop {
             let receive_action = self.receiver.recv();
             let send_action = async {
-                if let Some((_, arrival_time)) = self.queue.front() {
-                    let wait_time = arrival_time + 1.0 - sim.now();
+                if let Some((packet, arrival_time)) = self.queue.front() {
+                    let delay = (packet.size as f64) * 8.0 / self.rate;
+                    let wait_time = arrival_time + delay - sim.now();
                     sim.advance(wait_time).await;
                 } else {
                     sim.advance(1.0).await;
