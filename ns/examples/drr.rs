@@ -44,7 +44,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     drr_server.sender = senders[1].clone();
 
     // sim.activate(drr_server.fetch_packet(sim));
-    sim.activate(drr_server.schedule_packets(sim));
+    sim.activate(drr_server.run(sim));
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation
