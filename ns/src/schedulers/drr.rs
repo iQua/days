@@ -9,8 +9,6 @@ pub struct DRRServer {
     element_id: u32,
     /// the bit rate of the port
     rate: f64,
-    /// the following packets to be sent
-    packet_to_send: Vec<Packet>,
 
     /// a closure that maps a flow_id to a class_id, used to implement
     /// class-based Deficit Round Robin. The default uses a packet's flow_id as
@@ -48,12 +46,14 @@ impl DRRServer {
         let mut deficit = HashMap::new();
         let mut quantum = HashMap::new();
         let mut flow_queue_count = HashMap::new();
+        let mut byte_sizes = HashMap::new();
 
         let min_weight = weights.values().min().unwrap();
         for (class_id, weight) in &weights {
             deficit.insert(*class_id, 0);
             quantum.insert(*class_id, min_quantum * weight / min_weight);
             flow_queue_count.insert(*class_id, 0);
+            byte_sizes.insert(*class_id, 0);
         }
 
         println!("weights: {:?};\nquantum: {:?}", weights, quantum);
@@ -61,15 +61,14 @@ impl DRRServer {
         DRRServer {
             element_id,
             rate,
-            packet_to_send: Vec::new(),
             flow_classes: Box::new(|flow_id| flow_id),
-            deficit: deficit,
-            flow_queue_count: flow_queue_count,
-            quantum: quantum,
+            deficit,
+            flow_queue_count,
+            quantum,
             head_of_line: HashMap::new(),
             packets_received: 0,
             current_packet: None,
-            byte_sizes: HashMap::new(),
+            byte_sizes,
             queues: HashMap::new(),
             sender: channel().0,
             receiver: channel().1,
