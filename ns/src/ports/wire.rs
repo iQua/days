@@ -2,31 +2,29 @@
 
 use rand_distr::Distribution;
 
-
-pub struct Wire<A> where A: Distribution<Time>
+pub struct Wire<A>
+where
+    A: Distribution<Time>,
 {
     element_id: u32,
-    // the packet delay distribution
+    /// the packet delay distribution
     delay_dist: Box<dyn Fn() -> A>,
-    // the number of packets sent
-    packets_sent: u32,
-    // the number of packets received
-    packets_received: u32,
-    // the packet queue of the wire
+    /// the packet queue of the wire
     queue: VecDeque<(Packet, Time)>,
-    // a sender for sending packets
+    /// a sender for sending packets
     pub sender: Sender<Packet>,
     /// a receiver for receiving incoming packets
     pub receiver: Receiver<Packet>,
 }
 
-impl<A> Wire<A> where A: Distribution<Time> {
+impl<A> Wire<A>
+where
+    A: Distribution<Time>,
+{
     pub fn new(element_id: u32, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
         Wire {
             element_id,
             delay_dist,
-            packets_sent: 0,
-            packets_received: 0,
             queue: VecDeque::new(),
             sender: channel().0,
             receiver: channel().1,
@@ -34,38 +32,27 @@ impl<A> Wire<A> where A: Distribution<Time> {
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        
         self.queue.push_back((packet.clone(), sim.now()));
-        self.packets_received += 1;
-        self.packets_in_queue += 1;
 
         println!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets received, {} packets in queue.",
+            {} packets in queue.",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             sim.now(),
-            self.packets_received,
-            self.packets_in_queue
         );
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.packets_sent += 1;
-        self.packets_in_queue -= 1;
-
         println!(
-            "Wire {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets sent, {} packets in queue.",
+            "Wire {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             sim.now(),
-            self.packets_sent,
-            self.packets_in_queue
         );
     }
 

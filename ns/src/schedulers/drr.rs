@@ -7,53 +7,69 @@ use std::collections::{HashMap, VecDeque};
 
 pub struct DRRServer {
     element_id: u32,
-    // the bit rate of the port
+    /// the bit rate of the port
     rate: f64,
-    // the number of packets sent
-    packets_sent: u32,
-    // the number of packets received
-    packets_received: u32,
-    // the following packets to be sent
+    /// the following packets to be sent
     packet_to_send: Vec<Packet>,
-    // the number of packets of each flow
+
+    /// a closure that maps a flow_id to a class_id, used to implement
+    /// class-based Deficit Round Robin. The default uses a packet's flow_id as
+    /// its class_id, which is equivalent to flow-based DRR.
+    pub flow_classes: Box<dyn Fn(u32) -> u32>,
+
+    /// class_id -> deficit
+    deficit: HashMap<u32, u32>,
+    /// class_id -> the number of packets in its queue
     flow_queue_count: HashMap<u32, u32>,
-    // the bytes of each flow
-    bytes_sizes: HashMap<u32, u32>,
-    // the head of line packet for each flow
-    head_of_line: HashMap<u32, Packet>,
-    // the quantum counter for all flows
+    /// class_id -> quantum
     quantum: HashMap<u32, u32>,
-    // the deficit counter for all flows
-    deficits: HashMap<u32, u32>,
-    // one FIFO queue for each flow
+    /// class_id -> the head-of-line packet in its queue
+    head_of_line: HashMap<u32, Packet>,
+
+    /// the number of packets received
+    packets_received: u32,
+    /// the current packet being sent to the downstream element, if any
+    current_packet: Option<Packet>,
+    /// class_id -> the number of bytes in its queue
+    byte_sizes: HashMap<u32, u32>,
+
+    /// class_id -> its FIFO queue
     queues: HashMap<u32, VecDeque<(Packet, Time)>>,
-    // a sender for sending packets
+
+    /// a sender for sending packets to downstream elements
     pub sender: Sender<Packet>,
-    /// a receiver for receiving incoming packets
+    /// a receiver for receiving incoming packets from upstream elements
     pub receiver: Receiver<Packet>,
 }
 
 impl DRRServer {
     pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
         let min_quantum = 1500;
-        let min_weight = weights.values().min_by(|a, b| a.cmp(b)).unwrap_or(&1);
-        let quantum: HashMap<u32, u32> = weights
-            .iter()
-            .map(|(&key, &value)| (key, min_quantum * value / min_weight))
-            .collect();
+        let mut deficit = HashMap::new();
+        let mut quantum = HashMap::new();
+        let mut flow_queue_count = HashMap::new();
+
+        let min_weight = weights.values().min().unwrap();
+        for (class_id, weight) in &weights {
+            deficit.insert(*class_id, 0);
+            quantum.insert(*class_id, min_quantum * weight / min_weight);
+            flow_queue_count.insert(*class_id, 0);
+        }
 
         println!("weights: {:?};\nquantum: {:?}", weights, quantum);
+
         DRRServer {
             element_id,
             rate,
-            packets_sent: 0,
-            packets_received: 0,
-            packet_to_send: Vec::new(), 
-            flow_queue_count: HashMap::new(),
-            bytes_sizes: HashMap::new(),
-            head_of_line: HashMap::new(),
+            packet_to_send: Vec::new(),
+            flow_classes: Box::new(|flow_id| flow_id),
+            deficit: deficit,
+            flow_queue_count: flow_queue_count,
             quantum: quantum,
-            deficits: HashMap::new(),
+            head_of_line: HashMap::new(),
+            packets_received: 0,
+            current_packet: None,
+            byte_sizes: HashMap::new(),
             queues: HashMap::new(),
             sender: channel().0,
             receiver: channel().1,
@@ -67,7 +83,7 @@ impl DRRServer {
             .or_insert_with(VecDeque::new)
             .push_back((packet.clone(), sim.now()));
         self.packets_received += 1;
-        *self.bytes_sizes.entry(packet.flow_id).or_insert(0) += packet.size;
+        *self.byte_sizes.entry(packet.flow_id).or_insert(0) += packet.size;
         *self.flow_queue_count.entry(packet.flow_id).or_insert(0) += 1;
 
         println!(
@@ -86,7 +102,7 @@ impl DRRServer {
     async fn fetch_packet_to_send(&mut self, sim: SimContext<'_, Shared>) {
         for (flow_id, count) in self.flow_queue_count.iter() {
             if *count > 0 {
-                *self.deficits.entry(*flow_id).or_insert(0) += self.quantum.get(&flow_id).unwrap();
+                *self.deficit.entry(*flow_id).or_insert(0) += self.quantum.get(&flow_id).unwrap();
             }
             
             // TODO!
