@@ -4,7 +4,6 @@ use crate::packets::packet::Packet;
 use crate::Shared;
 use sim::{channel, select, until, Control, Receiver, Sender, SimContext, Time};
 use std::collections::{HashMap, VecDeque};
-use future::futures::join;
 
 pub struct DRRServer {
     element_id: u32,
@@ -214,7 +213,5 @@ impl DRRServer {
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         let fetch_action = self.fetch_packet(sim);
         let schedule_action = self.schedule_packets(sim);
-
-        
     }
 }
