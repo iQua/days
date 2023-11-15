@@ -212,12 +212,6 @@ impl<'s, G> SimContext<'s, G> {
         self.sched().now.get()
     }
 
-    /// Dials back the current simulation time.
-    #[inline]
-    pub fn set_time(&self, t: Time) {
-        self.sched().now.set(t);
-    }
-
     /// Returns a shared reference to the global data.
     #[inline]
     pub fn shared(&self) -> &G {
