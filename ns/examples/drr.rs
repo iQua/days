@@ -4,7 +4,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 use rand_distr::{Exp, Uniform};
 use std::{cell::RefCell, collections::HashMap};
 
-use ns::packets::dist_generator::DistPacketGenerator;
+use ns::{packets::dist_generator::DistPacketGenerator, schedulers::drr};
 use ns::packets::packet::Packet;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
@@ -34,7 +34,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     }
     let mut weights = HashMap::new();
     weights.insert(0, 1);
-    weights.insert(0, 2);
+    weights.insert(1, 2);
     let mut drr_server = DRRServer::new(0, (1000 * 8) as f64, weights);
     let mut sink = PacketSink::new(0);
 
@@ -43,7 +43,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     drr_server.sender = senders[1].clone();
 
-    // sim.activate(drr_server.fetch_packet(sim));
     sim.activate(drr_server.run(sim));
     sim.activate(sink.run(sim));
 
