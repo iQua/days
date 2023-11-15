@@ -91,9 +91,7 @@ impl DRRServer {
 
         self.byte_sizes
             .entry(packet.flow_id)
-            .and_modify(|byte_size| {
-                *byte_size += packet.size;
-            });
+            .and_modify(|byte_size| *byte_size += packet.size);
         self.flow_queue_count
             .entry(packet.flow_id)
             .and_modify(|flow_id| *flow_id += 1);
@@ -114,12 +112,24 @@ impl DRRServer {
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.total_packets.set(self.total_packets.get() - 1);
-        *self.byte_sizes.get_mut(&packet.flow_id).unwrap() -= packet.size;
-        *self.flow_queue_count.get_mut(&packet.flow_id).unwrap() -= 1;
-        *self.deficit.get_mut(&packet.flow_id).unwrap() -= packet.size;
+
+        self.byte_sizes
+            .entry(packet.flow_id)
+            .and_modify(|byte_size| {
+                *byte_size -= packet.size;
+            });
+        self.flow_queue_count
+            .entry(packet.flow_id)
+            .and_modify(|packet_count| *packet_count -= 1);
+
+        self.deficit
+            .entry(packet.flow_id)
+            .and_modify(|deficit| *deficit -= packet.size);
 
         if *self.flow_queue_count.get(&packet.flow_id).unwrap() == 0 {
-            *self.deficit.get_mut(&packet.flow_id).unwrap() = 0;
+            self.deficit
+                .entry(packet.flow_id)
+                .and_modify(|deficit| *deficit = 0);
         }
 
         println!(
