@@ -127,7 +127,7 @@ impl DRRServer {
         );
     }
 
-    async fn fetch_packet(&mut self, sim: SimContext<'_, Shared>) {
+    pub async fn fetch_packet(&mut self, sim: SimContext<'_, Shared>) {
         loop {
             // wait until there exist packets
             until(&self.total_packets, |counts| counts.get() > 0).await;
@@ -161,7 +161,7 @@ impl DRRServer {
         }
     }
 
-    pub async fn run(&mut self, sim: SimContext<'_, Shared>) {
+    pub async fn schedule_packets(mut self, sim: SimContext<'_, Shared>) {
         loop {
             let receive_action = self.receiver.recv();
             let send_action = async {
