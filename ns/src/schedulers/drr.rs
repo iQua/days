@@ -142,7 +142,9 @@ impl DRRServer {
 
             for (flow_id, &count) in self.flow_queue_count.iter() {
                 if count > 0 {
-                    *self.deficit.get_mut(flow_id).unwrap() += self.quantum.get(flow_id).unwrap();
+                    self.deficit.entry(*flow_id).and_modify(|deficit| {
+                        *deficit += self.quantum.get(flow_id).unwrap();
+                    });
                 }
 
                 while *self.deficit.get(flow_id).unwrap() > 0
