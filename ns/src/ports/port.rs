@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, Sender, Receiver, SimContext, select, Time};
+use sim::{channel, select, Sender, Receiver, SimContext, Time};
 
 pub struct Port {
     element_id: u32,
@@ -36,10 +36,10 @@ pub struct Port {
 impl Port {
     pub fn new(element_id: u32, rate: f64, qlimit: u32, limit_bytes: bool) -> Port {
         Port {
-            element_id: element_id,
-            rate: rate,
-            qlimit: qlimit,
-            limit_bytes: limit_bytes,
+            element_id,
+            rate,
+            qlimit,
+            limit_bytes,
             packets_sent: 0,
             packets_received: 0,
             packets_dropped: 0,
@@ -53,15 +53,15 @@ impl Port {
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.packets_received += 1;
+
         let byte_count = self.bytes_in_queue + packet.size;
-        let should_drop_packet = 
-            (self.limit_bytes && byte_count > self.qlimit) || 
-            (!self.limit_bytes && self.queue.len() >= self.qlimit as usize);
-        
-        // the case that the packet will be dropped.
+        let should_drop_packet = (self.limit_bytes && byte_count > self.qlimit)
+            || (!self.limit_bytes && self.queue.len() >= self.qlimit as usize);
+
+        // the case that this packet will be dropped.
         if should_drop_packet {
             self.packets_dropped += 1;
-            println!{
+            println! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.element_id,
                 packet.packet_id,
@@ -70,8 +70,8 @@ impl Port {
             }
             return;
         }
-        
-        // the case that packet will not be dropped.
+
+        // the case that this packet will not be dropped.
         self.queue.push_back((packet.clone(), sim.now()));
         self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
@@ -87,14 +87,13 @@ impl Port {
             self.packets_received,
             self.packets_in_queue
         );
-
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.packets_sent += 1;
         self.packets_in_queue -= 1;
         self.bytes_in_queue -= packet.size;
-        
+
         println!(
             "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets sent, {} packets in queue.",
@@ -106,7 +105,6 @@ impl Port {
             self.packets_sent,
             self.packets_in_queue
         );
-
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
@@ -125,7 +123,7 @@ impl Port {
             match select(sim, receive_action, send_action).await {
                 Some(packet) => {
                     self.packet_received(packet, sim);
-                },
+                }
                 None => {
                     if let Some((packet, _)) = self.queue.pop_front() {
                         self.sender
@@ -138,5 +136,4 @@ impl Port {
             }
         }
     }
-
 }
