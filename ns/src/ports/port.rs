@@ -3,7 +3,8 @@
 //! future versions?
 use std::collections::VecDeque;
 
-use crate::{packets::packet::Packet, Shared};
+use crate::packets::packet::Packet;
+use crate::Shared;
 use sim::{channel, Sender, Receiver, SimContext, select, Time};
 
 pub struct Port {
