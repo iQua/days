@@ -2,7 +2,6 @@
 
 use crate::packets::packet::Packet;
 use sim::{channel, Receiver, Sender, Time};
-use std::cmp::min_by;
 use std::collections::{HashMap, VecDeque};
 
 pub struct DRRServer {
