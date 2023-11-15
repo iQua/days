@@ -28,8 +28,9 @@ pub struct DRRServer {
     packets_received: u32,
     // the total number of packets in the server
     total_packets: Control<u32>,
-    /// the current packet being sent to the downstream element, if any
-    current_packet: Option<Packet>,
+    /// the current packet being sent to the downstream element with its sending
+    /// time, if any
+    current_packet: Option<(Packet, Time)>,
     /// class_id -> the number of bytes in its queue
     byte_sizes: HashMap<u32, u32>,
 
@@ -59,7 +60,7 @@ impl DRRServer {
         }
 
         println!("weights: {:?};\nquantum: {:?}", weights, quantum);
-
+        // TODO: add the usage of flow_classes!
         DRRServer {
             element_id,
             rate,
@@ -85,19 +86,44 @@ impl DRRServer {
             .or_insert_with(VecDeque::new)
             .push_back((packet.clone(), sim.now()));
         self.packets_received += 1;
-        *self.byte_sizes.entry(packet.flow_id).or_insert(0) += packet.size;
-        *self.flow_queue_count.entry(packet.flow_id).or_insert(0) += 1;
+        self.total_packets.set(self.total_packets.get() + 1);
+        *self.byte_sizes.get_mut(&packet.flow_id).unwrap() += packet.size;
+        *self.flow_queue_count.get_mut(&packet.flow_id).unwrap() += 1;
 
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets received, {} packets in the flow queue.",
+            {} packets received, {} packets in the flow queue, {} packets in all flow queues",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.flow_queue_count.get(&packet.flow_id).unwrap()
+            self.flow_queue_count.get(&packet.flow_id).unwrap(),
+            self.total_packets.get()
+        );
+    }
+
+    fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
+        self.total_packets.set(self.total_packets.get() - 1);
+        *self.byte_sizes.get_mut(&packet.flow_id).unwrap() -= packet.size;
+        *self.flow_queue_count.get_mut(&packet.flow_id).unwrap() -= 1;
+        *self.deficit.get_mut(&packet.flow_id).unwrap() -= packet.size;
+
+        if *self.flow_queue_count.get(&packet.flow_id).unwrap() == 0 {
+            *self.deficit.get_mut(&packet.flow_id).unwrap() = 0;
+        }
+
+        println!(
+            "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+            {} packets in the flow queue, {} packets in all flow queues.",
+            self.element_id,
+            packet.packet_id,
+            packet.size,
+            packet.flow_id,
+            sim.now(),
+            self.flow_queue_count.get(&packet.flow_id).unwrap(),
+            self.total_packets.get()
         );
     }
 
@@ -122,13 +148,42 @@ impl DRRServer {
                     }
 
                     if packet.size < *self.deficit.get(flow_id).unwrap() {
-                        let send_time = (packet.size as f64) * 8.0 / self.rate;
-                        sim.advance(send_time).await;
-                        self.current_packet = Some(packet);
+                        let wait_time = (packet.size as f64) * 8.0 / self.rate;
+                        self.current_packet = Some((packet, wait_time));
+                        sim.advance(wait_time).await;
 
                         // updates stats will be done in run funtion
                     } else {
                         self.head_of_line.insert(*flow_id, packet);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn run(&mut self, sim: SimContext<'_, Shared>) {
+        loop {
+            let receive_action = self.receiver.recv();
+            let send_action = async {
+                if let Some((_, wait_time)) = self.current_packet.clone() {
+                    sim.advance(wait_time).await;
+                } else {
+                    sim.advance(1.0).await;
+                }
+                None
+            };
+            match select(sim, receive_action, send_action).await {
+                Some(packet) => {
+                    self.packet_received(packet, sim);
+                }
+                None => {
+                    if let Some((packet, _)) = self.current_packet.take() {
+                        self.sender
+                            .send(packet.clone())
+                            .await
+                            .expect("no receiving element in the simulation");
+                        // update stats here
+                        self.packet_sent(packet, sim);
                     }
                 }
             }
