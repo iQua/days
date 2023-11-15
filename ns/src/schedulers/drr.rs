@@ -85,10 +85,18 @@ impl DRRServer {
             .entry(packet.flow_id)
             .or_insert_with(VecDeque::new)
             .push_back((packet.clone(), sim.now()));
+
         self.packets_received += 1;
         self.total_packets.set(self.total_packets.get() + 1);
-        *self.byte_sizes.get_mut(&packet.flow_id).unwrap() += packet.size;
-        *self.flow_queue_count.get_mut(&packet.flow_id).unwrap() += 1;
+
+        self.byte_sizes
+            .entry(packet.flow_id)
+            .and_modify(|byte_size| {
+                *byte_size += packet.size;
+            });
+        self.flow_queue_count
+            .entry(packet.flow_id)
+            .and_modify(|flow_id| *flow_id += 1);
 
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
