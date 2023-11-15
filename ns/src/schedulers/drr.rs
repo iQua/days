@@ -2,7 +2,7 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, select, Receiver, Sender, SimContext, Time};
+use sim::{channel, select, until, Control, Receiver, Sender, SimContext, Time};
 use std::collections::{HashMap, VecDeque};
 
 pub struct DRRServer {
@@ -26,6 +26,8 @@ pub struct DRRServer {
 
     /// the number of packets received
     packets_received: u32,
+    // the total number of packets in the server
+    total_packets: Control<u32>,
     /// the current packet being sent to the downstream element, if any
     current_packet: Option<Packet>,
     /// class_id -> the number of bytes in its queue
@@ -67,6 +69,7 @@ impl DRRServer {
             quantum,
             head_of_line: HashMap::new(),
             packets_received: 0,
+            total_packets: Control::default(),
             current_packet: None,
             byte_sizes,
             queues: HashMap::new(),
@@ -98,21 +101,37 @@ impl DRRServer {
         );
     }
 
-    async fn fetch_packet_to_send(&mut self, sim: SimContext<'_, Shared>) {
-        for (flow_id, count) in self.flow_queue_count.iter() {
-            if *count > 0 {
-                *self.deficit.entry(*flow_id).or_insert(0) += self.quantum.get(&flow_id).unwrap();
+    async fn fetch_packet(&mut self, sim: SimContext<'_, Shared>) {
+        loop {
+            // wait until there exist packets
+            until(&self.total_packets, |counts| counts.get() > 0).await;
+
+            for (flow_id, &count) in self.flow_queue_count.iter() {
+                if count > 0 {
+                    *self.deficit.get_mut(flow_id).unwrap() += self.quantum.get(flow_id).unwrap();
+                }
+
+                while *self.deficit.get(flow_id).unwrap() > 0
+                    && *self.flow_queue_count.get(flow_id).unwrap() > 0
+                {
+                    let packet; // Do we need to store the arrival time here?
+                    if let Some(head_packet) = self.head_of_line.remove(flow_id) {
+                        packet = head_packet;
+                    } else {
+                        packet = self.queues.get_mut(flow_id).unwrap().pop_front().unwrap().0;
+                    }
+
+                    if packet.size < *self.deficit.get(flow_id).unwrap() {
+                        let send_time = (packet.size as f64) * 8.0 / self.rate;
+                        sim.advance(send_time).await;
+                        self.current_packet = Some(packet);
+
+                        // updates stats will be done in run funtion
+                    } else {
+                        self.head_of_line.insert(*flow_id, packet);
+                    }
+                }
             }
-            
-            // TODO!
-            // The current design want to get only one packet to be sent.
-            // However, if we use 'match select' between this function and
-            // 'self.receiver.recv()', we can work fine here. That is, we can
-            // receive packet and find the next packet to be sent.
-            // However, the problem is, if we only fetch one packet to be sent
-            // at a time, then after sending this packet, we will bach to this
-            // function and iterate again, rather than iterate for this specific
-            // flow until the deficit is not enough.
-        } 
+        }
     }
 }
