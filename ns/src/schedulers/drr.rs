@@ -4,8 +4,8 @@ use crate::packets::packet::Packet;
 use crate::Shared;
 use sim::{channel, select, Receiver, Sender, SimContext};
 use std::collections::{HashMap, VecDeque};
-
-pub struct DRRServer {
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+pub struct DRRScheduler {
     element_id: u32,
     /// the bit rate of the port
     rate: f64,
@@ -25,7 +25,6 @@ pub struct DRRServer {
     /// the number of packets received and in the queues waiting to be sent
     packets_received: u32,
     packets_waiting: u32,
-    packets_in_transit: Vec<Packet>,
 
     /// class_id -> the number of bytes in its queue
     byte_sizes: HashMap<u32, u32>,
@@ -33,14 +32,14 @@ pub struct DRRServer {
     /// class_id -> its FIFO queue
     queues: HashMap<u32, VecDeque<Packet>>,
 
-    /// a sender for sending packets to downstream elements
-    pub sender: Sender<Packet>,
-    /// a receiver for receiving incoming packets from upstream elements
-    pub receiver: Receiver<Packet>,
+    /// a sender for sending packets to the DRR server
+    pub sender: UnboundedSender<Packet>,
+    /// a receiver for receiving incoming packets from the DRR server
+    pub receiver: UnboundedReceiver<Packet>,
 }
 
-impl DRRServer {
-    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
+impl DRRScheduler {
+    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRScheduler {
         let min_quantum = 1500;
         let mut deficit = HashMap::new();
         let mut quantum = HashMap::new();
@@ -53,9 +52,11 @@ impl DRRServer {
             byte_sizes.insert(*class_id, 0);
         }
 
+        let (tx, rx) = mpsc::unbounded_channel();
+
         println!("weights: {:?};\nquantum: {:?}", weights, quantum);
         // TODO: add the usage of flow_classes!
-        DRRServer {
+        DRRScheduler {
             element_id,
             rate,
             flow_classes: Box::new(|flow_id| flow_id),
@@ -64,11 +65,10 @@ impl DRRServer {
             head_of_line: HashMap::new(),
             packets_received: 0,
             packets_waiting: 0,
-            packets_in_transit: Vec::new(),
             byte_sizes,
             queues: HashMap::new(),
-            sender: channel().0,
-            receiver: channel().1,
+            sender: tx,
+            receiver: rx,
         }
         // Q: do we need packet_available?
     }
@@ -99,123 +99,77 @@ impl DRRServer {
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(
+        mut self,
+        scheduler_rx: UnboundedReceiver<Packet>,
+        scheduler_tx: UnboundedSender<Packet>,
+        sim: SimContext<'_, Shared>,
+    ) {
+        self.receiver = scheduler_rx;
+        self.sender = scheduler_tx;
+
         loop {
-            let drr_scheduler = async {
-                if self.packets_waiting == 0 {
-                    sim.advance(1.0).await;
+            if self.packets_waiting == 0 {
+                let packet = self.receiver.recv().await.unwrap();
+                self.packet_received(packet, sim);
+            }
+
+            let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
+
+            // Updating the deficit counters
+            for (queue_id, queue) in &self.queues {
+                if queue.len() > 0 {
+                    self.deficit.entry(*queue_id).and_modify(|deficit| {
+                        *deficit += self.quantum.get(&queue_id).unwrap();
+                    });
                     println!(
-                        "DRRServer {} has no packets to send at time {:.3}.",
+                        "DRRServer {} updated deficit of class {} to {} at time {:.3}.",
                         self.element_id,
+                        queue_id,
+                        self.deficit.get(&queue_id).unwrap(),
                         sim.now()
                     );
-                    return None;
+                } else {
+                    self.deficit
+                        .entry(*queue_id)
+                        .and_modify(|deficit| *deficit = 0);
                 }
 
-                let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
+                flow_queue_count.insert(*queue_id, queue.len() as u32);
+            }
 
-                // Updating the deficit counters
-                for (queue_id, queue) in &self.queues {
-                    if queue.len() > 0 {
-                        self.deficit.entry(*queue_id).and_modify(|deficit| {
-                            *deficit += self.quantum.get(&queue_id).unwrap();
-                        });
-                        println!(
-                            "DRRServer {} updated deficit of class {} to {} at time {:.3}.",
-                            self.element_id,
-                            queue_id,
-                            self.deficit.get(&queue_id).unwrap(),
-                            sim.now()
-                        );
+            // Scheduling packets
+            for (queue_id, &count) in &flow_queue_count {
+                let mut current_length = count;
+                let deficit = *self.deficit.get(&queue_id).unwrap();
+
+                while deficit > 0 && current_length > 0 {
+                    let packet;
+                    if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
+                        packet = head_packet;
                     } else {
+                        packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
+                        current_length -= 1;
+                    }
+
+                    if packet.size < deficit {
+                        // sending the packet out to the next element
+                        self.byte_sizes
+                            .entry(packet.flow_id)
+                            .and_modify(|byte_size| {
+                                *byte_size -= packet.size;
+                            });
+
                         self.deficit
-                            .entry(*queue_id)
-                            .and_modify(|deficit| *deficit = 0);
-                    }
+                            .entry(packet.flow_id)
+                            .and_modify(|deficit| *deficit -= packet.size);
 
-                    flow_queue_count.insert(*queue_id, queue.len() as u32);
-                }
-
-                // Scheduling packets
-                for (queue_id, &count) in &flow_queue_count {
-                    let mut current_length = count;
-                    let deficit = *self.deficit.get(&queue_id).unwrap();
-
-                    while deficit > 0 && current_length > 0 {
-                        let packet;
-                        if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
-                            packet = head_packet;
-                        } else {
-                            packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
-                            current_length -= 1;
-                        }
-
-                        if packet.size < deficit {
-                            // sending the packet out to the next element
-                            println!(
-                                "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
-                                {} packets in the flow queue.",
-                                self.element_id,
-                                packet.packet_id,
-                                packet.size,
-                                packet.flow_id,
-                                sim.now(),
-                                self.queues.get(&packet.flow_id).unwrap().len(),
-                            );
-
-                            self.byte_sizes
-                                .entry(packet.flow_id)
-                                .and_modify(|byte_size| {
-                                    *byte_size -= packet.size;
-                                });
-
-                            self.deficit
-                                .entry(packet.flow_id)
-                                .and_modify(|deficit| *deficit -= packet.size);
-
-                            self.packets_in_transit.push(packet);
-                        } else {
-                            self.head_of_line.insert(*queue_id, packet);
-                            break;
-                        }
-                    }
-                }
-
-                None
-            };
-
-            // A Design Problem:
-            // The new design makes sim.advance() inside the
-            // None block of 'match select'. However, this approach will block
-            // the packet receive process. In other words, the DRRServer can not
-            // receive packets until all packets in self.packets_in_transit are
-            // sent. In other words, the send and receive actions are not
-            // seperated properly.
-
-            // Buggy Example:
-            // DistPacketGenerator 1 will send packet 0 (1000 bytes) at time 1.000. 1 packets sent.
-            // DistPacketGenerator 0 will send packet 0 (1000 bytes) at time 1.000. 1 packets sent.
-            // DRRServer 0 received packet 0 (1000 bytes) from flow 1 at time 1.000. 1 packets received, 1 packet(s) in the flow queue.
-            // DistPacketGenerator 1 will send packet 1 (1000 bytes) at time 1.205. 2 packets sent.
-            // DRRServer 0 sent packet 0 (1000 bytes) from flow 1 at time 2.000. 0 packets in the flow queue.
-            // DRRServer 0 received packet 1 (1000 bytes) from flow 1 at time 2.000. 2 packets received, 1 packet(s) in the flow queue.
-
-            match select(sim, self.receiver.recv(), drr_scheduler).await {
-                Some(packet) => {
-                    self.packet_received(packet, sim);
-                }
-                None => {
-                    for packet in self.packets_in_transit.drain(..) {
                         self.packets_waiting -= 1;
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
-
                         sim.advance(timeout).await;
 
-                        self.sender
-                            .send(packet.clone())
-                            .await
-                            .expect("no receiving element in the simulation");
+                        self.sender.send(packet.clone()).unwrap();
 
                         println!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -227,7 +181,77 @@ impl DRRServer {
                             sim.now(),
                             self.queues.get(&packet.flow_id).unwrap().len(),
                         );
+                    } else {
+                        self.head_of_line.insert(*queue_id, packet);
+                        break;
                     }
+                }
+            }
+        }
+    }
+}
+
+pub struct DRRServer {
+    element_id: u32,
+    /// a packet scheduler using the Deficit Round Robin algorithm
+    drr_scheduler: DRRScheduler,
+
+    /// a sender for sending packets
+    pub sender: Sender<Packet>,
+    /// a receiver for receiving incoming packets
+    pub receiver: Receiver<Packet>,
+}
+
+impl DRRServer {
+    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
+        DRRServer {
+            element_id,
+            drr_scheduler: DRRScheduler::new(element_id, rate, weights),
+            sender: channel().0,
+            receiver: channel().1,
+        }
+    }
+
+    pub async fn run(self, sim: SimContext<'_, Shared>) {
+        let (server_tx, scheduler_rx) = mpsc::unbounded_channel();
+        let (scheduler_tx, mut server_rx) = mpsc::unbounded_channel();
+
+        let mut packet = Packet {
+            production_time: sim.now(),
+            time: sim.now(),
+            size: 0,
+            flow_id: 0,
+            packet_id: 0,
+            src: "source".to_string(),
+            dst: "destination".to_string(),
+        };
+
+        sim.activate(self.drr_scheduler.run(scheduler_rx, scheduler_tx, sim));
+
+        loop {
+            match select(sim, self.receiver.recv(), async {
+                packet = server_rx.recv().await.unwrap();
+                None
+            })
+            .await
+            {
+                Some(packet) => {
+                    server_tx.send(packet).unwrap();
+                }
+                None => {
+                    self.sender
+                        .send(packet.clone())
+                        .await
+                        .expect("no receiving element in the simulation");
+
+                    println!(
+                        "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
+                        self.element_id,
+                        packet.packet_id,
+                        packet.size,
+                        packet.flow_id,
+                        sim.now(),
+                    );
                 }
             }
         }

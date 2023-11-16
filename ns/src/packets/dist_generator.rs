@@ -47,7 +47,7 @@ where
         sim.shared().packet_size.tabulate(packet.size);
 
         println!(
-            "DistPacketGenerator {} will send packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            "DistPacketGenerator {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.element_id,
             packet.packet_id,
             packet.size,

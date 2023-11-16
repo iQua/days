@@ -7,25 +7,25 @@ use sim::{channel, select, Receiver, Sender, SimContext};
 
 pub struct Port {
     element_id: u32,
-    // the bit rate of the port
+    /// the bit rate of the port
     rate: f64,
-    // a queue limit in bytes or packets
+    /// a queue limit in bytes or packets
     qlimit: u32,
-    // if true, qlimit will be based on bytes
+    /// if true, qlimit will be based on bytes
     limit_bytes: bool,
-    // the number of packets sent
+    /// the number of packets sent
     packets_sent: u32,
-    // the number of packets received
+    /// the number of packets received
     packets_received: u32,
-    // the number of dropped packets
+    /// the number of dropped packets
     packets_dropped: u32,
-    // the number of packets in the queue
+    /// the number of packets in the queue
     packets_in_queue: u32,
-    // the total byte sizes in the queue
+    /// the total byte sizes in the queue
     bytes_in_queue: u32,
-    // the packet queue of the port
+    /// the packet queue of the port
     queue: VecDeque<Packet>,
-    // a sender for sending packets
+    /// a sender for sending packets
     pub sender: Sender<Packet>,
     /// a receiver for receiving incoming packets
     pub receiver: Receiver<Packet>,
