@@ -74,7 +74,6 @@ impl DRRScheduler {
             sender,
             receiver,
         }
-        // Q: do we need packet_available?
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
@@ -92,7 +91,7 @@ impl DRRScheduler {
 
         println!(
             "DRRScheduler {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets received, {} packet(s) in the flow queue.",
+            {} packets received, {} packet(s) in class queue {}.",
             self.element_id,
             packet.packet_id,
             packet.size,
@@ -100,16 +99,34 @@ impl DRRScheduler {
             sim.now(),
             self.packets_received,
             self.queues.get(&packet.flow_id).unwrap().len(),
+            packet.flow_id
         );
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            println!("{}", self.packets_waiting);
+            // Problem 1:
+            // In current solution, the scheduling part works with only one
+            // packet in self.queues. What if there is a packet comes but the
+            // run function is scheduling the packet send? It is not a proper
+            // way to keep packets in the channel? In the following example, two
+            // packets should be received by DRRScheduler at time 1.000, but the
+            // second packet was received at time 2.000 (after the first packet
+            // was sent to DRRServer).
+
+            // Buggy Example:
+            // DistPacketGenerator 1 sent packet 0 (1000 bytes) at time 1.000. 1 packets sent.
+            // DistPacketGenerator 0 sent packet 0 (1000 bytes) at time 1.000. 1 packets sent.
+            // DRRServer received packet at 1.000
+            // DRRScheduler 0 received packet 0 (1000 bytes) from flow 1 at time 1.000. 1 packets received, 1 packet(s) in class queue 1.
+            // DRRServer received packet at 1.000
+            // DistPacketGenerator 1 sent packet 1 (1000 bytes) at time 1.205. 2 packets sent.
+            // DRRServer received packet at 1.205
+            // DRRScheduler 0 sent packet 0 (1000 bytes) from flow 1 at time 2.000. 0 packets in the flow queue.
+            // DRRScheduler 0 received packet 0 (1000 bytes) from flow 0 at time 2.000. 2 packets received, 1 packet(s) in class queue 0.
 
             if self.packets_waiting == 0 {
                 let packet = self.receiver.recv().await.unwrap();
-                println!("DRRScheduler received packet at {:.3}", sim.now());
                 self.packet_received(packet, sim);
             }
 
