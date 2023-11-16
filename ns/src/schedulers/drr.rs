@@ -105,14 +105,11 @@ impl DRRScheduler {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // Problem 1:
-            // In current solution, the scheduling part works with only one
-            // packet in self.queues. What if there is a packet comes but the
-            // run function is scheduling the packet send? It is not a proper
-            // way to keep packets in the channel? In the following example, two
-            // packets should be received by DRRScheduler at time 1.000, but the
-            // second packet was received at time 2.000 (after the first packet
-            // was sent to DRRServer).
+            // Problem:
+            // The current problem is, DRRServer uses the channel from tokio
+            // rather than simcore-rs, then we can not guarantee that two
+            // packets sent to the DRRServer at the same time can be received by
+            // the DRRScheduler at the same simulation time as well.
 
             // Buggy Example:
             // DistPacketGenerator 1 sent packet 0 (1000 bytes) at time 1.000. 1 packets sent.
@@ -124,10 +121,22 @@ impl DRRScheduler {
             // DRRServer received packet at 1.205
             // DRRScheduler 0 sent packet 0 (1000 bytes) from flow 1 at time 2.000. 0 packets in the flow queue.
             // DRRScheduler 0 received packet 0 (1000 bytes) from flow 0 at time 2.000. 2 packets received, 1 packet(s) in class queue 0.
+            // DRRScheduler 0 received packet 1 (1000 bytes) from flow 1 at time 2.000. 3 packets received, 1 packet(s) in class queue 1.
 
             if self.packets_waiting == 0 {
                 let packet = self.receiver.recv().await.unwrap();
                 self.packet_received(packet, sim);
+                loop {
+                    match self.receiver.try_recv() {
+                        Ok(packet) => {
+                            self.packet_received(packet, sim);
+                        },
+                        Err(_) => {
+                            break;
+                        } 
+                        
+                    }
+                }
             }
 
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
