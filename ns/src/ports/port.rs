@@ -24,7 +24,7 @@ pub struct Port {
     // the total byte sizes in the queue
     bytes_in_queue: u32,
     // the packet queue of the port
-    queue: VecDeque<(Packet, Time)>,
+    queue: VecDeque<Packet>,
     // a sender for sending packets
     pub sender: Sender<Packet>,
     /// a receiver for receiving incoming packets
@@ -70,7 +70,7 @@ impl Port {
         }
 
         // the case that this packet will not be dropped.
-        self.queue.push_back((packet.clone(), sim.now()));
+        self.queue.push_back(packet.clone());
         self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
 
@@ -109,10 +109,9 @@ impl Port {
         loop {
             let receive_action = self.receiver.recv();
             let send_action = async {
-                if let Some((packet, arrival_time)) = self.queue.front() {
-                    let delay = (packet.size as f64) * 8.0 / self.rate;
-                    let wait_time = arrival_time + delay - sim.now();
-                    sim.advance(wait_time).await;
+                if let Some(packet) = self.queue.front() {
+                    let timeout = (packet.size as f64) * 8.0 / self.rate;
+                    sim.advance(timeout).await;
                 } else {
                     sim.advance(1.0).await;
                 }
@@ -123,7 +122,7 @@ impl Port {
                     self.packet_received(packet, sim);
                 }
                 None => {
-                    if let Some((packet, _)) = self.queue.pop_front() {
+                    if let Some(packet) = self.queue.pop_front() {
                         self.sender
                             .send(packet.clone())
                             .await
