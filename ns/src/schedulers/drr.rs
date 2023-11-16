@@ -105,24 +105,8 @@ impl DRRScheduler {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // Problem:
-            // The current problem is, DRRServer uses the channel from tokio
-            // rather than simcore-rs, then we can not guarantee that two
-            // packets sent to the DRRServer at the same time can be received by
-            // the DRRScheduler at the same simulation time as well.
-
-            // Buggy Example:
-            // DistPacketGenerator 1 sent packet 0 (1000 bytes) at time 1.000. 1 packets sent.
-            // DistPacketGenerator 0 sent packet 0 (1000 bytes) at time 1.000. 1 packets sent.
-            // DRRServer received packet at 1.000
-            // DRRScheduler 0 received packet 0 (1000 bytes) from flow 1 at time 1.000. 1 packets received, 1 packet(s) in class queue 1.
-            // DRRServer received packet at 1.000
-            // DistPacketGenerator 1 sent packet 1 (1000 bytes) at time 1.205. 2 packets sent.
-            // DRRServer received packet at 1.205
-            // DRRScheduler 0 sent packet 0 (1000 bytes) from flow 1 at time 2.000. 0 packets in the flow queue.
-            // DRRScheduler 0 received packet 0 (1000 bytes) from flow 0 at time 2.000. 2 packets received, 1 packet(s) in class queue 0.
-            // DRRScheduler 0 received packet 1 (1000 bytes) from flow 1 at time 2.000. 3 packets received, 1 packet(s) in class queue 1.
-
+            // If we do not care about the packet receive time for the
+            // DRRScheduler, it works properly with packet sending time.
             if self.packets_waiting == 0 {
                 let packet = self.receiver.recv().await.unwrap();
                 self.packet_received(packet, sim);
@@ -226,7 +210,6 @@ impl DRRServer {
     pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
         let (server_tx, scheduler_rx) = mpsc::unbounded_channel();
         let (scheduler_tx, server_rx) = mpsc::unbounded_channel();
-
         DRRServer {
             element_id,
             drr_scheduler: DRRScheduler::new(element_id, rate, weights, scheduler_tx, scheduler_rx),
