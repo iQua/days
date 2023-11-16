@@ -2,8 +2,7 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use futures::future::join;
-use sim::{channel, select, until, Control, Receiver, Sender, SimContext, Time};
+use sim::{Receiver, Sender, SimContext};
 use std::collections::{HashMap, VecDeque};
 
 pub struct DRRServer {
@@ -34,7 +33,7 @@ pub struct DRRServer {
     byte_sizes: HashMap<u32, u32>,
 
     /// class_id -> its FIFO queue
-    queues: HashMap<u32, VecDeque<(Packet, Time)>>,
+    queues: HashMap<u32, VecDeque<Packet>>,
 
     /// a sender for sending packets to downstream elements
     pub sender: Sender<Packet>,
@@ -84,7 +83,7 @@ impl DRRServer {
         self.queues
             .entry(packet.flow_id)
             .or_insert_with(VecDeque::new)
-            .push_back((packet.clone(), sim.now()));
+            .push_back(packet.clone());
 
         self.packets_received += 1;
 
@@ -167,13 +166,7 @@ impl DRRServer {
                         if let Some(head_packet) = self.head_of_line.remove(queue_id) {
                             packet = head_packet;
                         } else {
-                            packet = self
-                                .queues
-                                .get_mut(queue_id)
-                                .unwrap()
-                                .pop_front()
-                                .unwrap()
-                                .0;
+                            packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
                         }
 
                         if packet.size < *self.deficit.get(queue_id).unwrap() {
