@@ -184,6 +184,21 @@ impl DRRServer {
                 None
             };
 
+            // A Design Problem:
+            // The new design makes sim.advance() inside the None block of
+            // 'match select'. However, this approach will block the packet
+            // receive process. In other words, the DRRServer can not receive
+            // packets until all packets in self.packets_in_transit are sent. In other words, the send and
+            // receive actions are not seperated properly.
+            
+            // Buggy Example:
+            // DistPacketGenerator 1 will send packet 0 (1000 bytes) at time 1.000. 1 packets sent.
+            // DistPacketGenerator 0 will send packet 0 (1000 bytes) at time 1.000. 1 packets sent.
+            // DRRServer 0 received packet 0 (1000 bytes) from flow 1 at time 1.000. 1 packets received, 1 packet(s) in the flow queue.
+            // DistPacketGenerator 1 will send packet 1 (1000 bytes) at time 1.205. 2 packets sent.
+            // DRRServer 0 sent packet 0 (1000 bytes) from flow 1 at time 2.000. 0 packets in the flow queue.
+            // DRRServer 0 received packet 1 (1000 bytes) from flow 1 at time 2.000. 2 packets received, 1 packet(s) in the flow queue.
+
             match select(sim, self.receiver.recv(), drr_scheduler).await {
                 Some(packet) => {
                     self.packet_received(packet, sim);
