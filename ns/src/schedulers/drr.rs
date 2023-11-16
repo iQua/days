@@ -91,7 +91,7 @@ impl DRRScheduler {
             .and_modify(|byte_size| *byte_size += packet.size);
 
         println!(
-            "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "DRRScheduler {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in the flow queue.",
             self.element_id,
             packet.packet_id,
@@ -109,7 +109,7 @@ impl DRRScheduler {
 
             if self.packets_waiting == 0 {
                 let packet = self.receiver.recv().await.unwrap();
-                println!("DRRScheduler received packet at {}", sim.now());
+                println!("DRRScheduler received packet at {:.3}", sim.now());
                 self.packet_received(packet, sim);
             }
 
@@ -121,13 +121,6 @@ impl DRRScheduler {
                     self.deficit.entry(*queue_id).and_modify(|deficit| {
                         *deficit += self.quantum.get(&queue_id).unwrap();
                     });
-                    println!(
-                        "DRRServer {} updated deficit of class {} to {} at time {:.3}.",
-                        self.element_id,
-                        queue_id,
-                        self.deficit.get(&queue_id).unwrap(),
-                        sim.now()
-                    );
                 } else {
                     self.deficit
                         .entry(*queue_id)
@@ -166,11 +159,10 @@ impl DRRScheduler {
                         self.packets_waiting -= 1;
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
-                        println!("timeout: {}", timeout);
                         self.sender.send((packet.clone(), timeout)).unwrap();
 
                         println!(
-                            "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+                            "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                                     {} packets in the flow queue.",
                             self.element_id,
                             packet.packet_id,
@@ -234,15 +226,20 @@ impl DRRServer {
         loop {
             let drr_scheduler = async {
                 if let Some((inbound_packet, timeout)) = self.server_rx.recv().await {
+                    println!(
+                        "DRRServer received packet from scheduler at {:.3}",
+                        sim.now()
+                    );
                     packet = inbound_packet.clone();
                     sim.advance(timeout).await;
                 }
+
                 None
             };
 
             match select(sim, self.receiver.recv(), drr_scheduler).await {
                 Some(packet) => {
-                    println!("DRRServer received packet at {}", sim.now());
+                    println!("DRRServer received packet at {:.3}", sim.now());
                     self.server_tx.send(packet).unwrap();
                 }
                 None => {
