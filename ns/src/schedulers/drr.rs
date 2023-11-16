@@ -99,21 +99,6 @@ impl DRRServer {
         );
     }
 
-    fn packets_sent(&mut self, sim: SimContext<'_, Shared>) {
-        for packet in self.packets_in_transit.drain(..) {
-            println!(
-                "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets in the flow queue.",
-                self.element_id,
-                packet.packet_id,
-                packet.size,
-                packet.flow_id,
-                sim.now(),
-                self.queues.get(&packet.flow_id).unwrap().len(),
-            );
-        }
-    }
-
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             let drr_scheduler = async {
@@ -167,8 +152,23 @@ impl DRRServer {
                             self.packets_waiting -= 1;
 
                             let timeout = (packet.size as f64) * 8.0 / self.rate;
-                            self.packets_in_transit.push(packet);
+                            //self.packets_in_transit.push(packet);
                             sim.advance(timeout).await;
+                            self.sender
+                                .send(packet.clone())
+                                .await
+                                .expect("no receiving element in the simulation");
+
+                            println!(
+                                "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+                                {} packets in the flow queue.",
+                                self.element_id,
+                                packet.packet_id,
+                                packet.size,
+                                packet.flow_id,
+                                sim.now(),
+                                self.queues.get(&packet.flow_id).unwrap().len(),
+                            );
                         } else {
                             self.head_of_line.insert(*queue_id, packet);
                             break;
@@ -183,16 +183,7 @@ impl DRRServer {
                 Some(packet) => {
                     self.packet_received(packet, sim);
                 }
-                None => {
-                    for packet in &self.packets_in_transit {
-                        self.sender
-                            .send(packet.clone())
-                            .await
-                            .expect("no receiving element in the simulation");
-                    }
-
-                    self.packets_sent(sim);
-                }
+                None => {}
             }
         }
     }
