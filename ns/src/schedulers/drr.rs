@@ -109,28 +109,6 @@ impl DRRServer {
 
     fn packets_sent(&mut self, sim: SimContext<'_, Shared>) {
         for packet in self.packets_in_transit.drain(..) {
-            self.packets_waiting -= 1;
-
-            self.byte_sizes
-                .entry(packet.flow_id)
-                .and_modify(|byte_size| {
-                    *byte_size -= packet.size;
-                });
-
-            self.deficit
-                .entry(packet.flow_id)
-                .and_modify(|deficit| *deficit -= packet.size);
-
-            self.flow_queue_count
-                .entry(packet.flow_id)
-                .and_modify(|packet_count| *packet_count -= 1);
-
-            if *self.flow_queue_count.get(&packet.flow_id).unwrap() == 0 {
-                self.deficit
-                    .entry(packet.flow_id)
-                    .and_modify(|deficit| *deficit = 0);
-            }
-
             println!(
                 "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets in the flow queue.",
@@ -152,16 +130,17 @@ impl DRRServer {
                     return None;
                 }
 
+                let mut queue_count_updates = Vec::new();
+
                 for (queue_id, &count) in self.flow_queue_count.iter() {
                     if count > 0 {
                         self.deficit.entry(*queue_id).and_modify(|deficit| {
                             *deficit += self.quantum.get(queue_id).unwrap();
                         });
                     }
+                    let mut flow_queue_count = *self.flow_queue_count.get(queue_id).unwrap();
 
-                    while *self.deficit.get(queue_id).unwrap() > 0
-                        && *self.flow_queue_count.get(queue_id).unwrap() > 0
-                    {
+                    while *self.deficit.get(queue_id).unwrap() > 0 && flow_queue_count > 0 {
                         let packet;
                         if let Some(head_packet) = self.head_of_line.remove(queue_id) {
                             packet = head_packet;
@@ -170,6 +149,19 @@ impl DRRServer {
                         }
 
                         if packet.size < *self.deficit.get(queue_id).unwrap() {
+                            self.byte_sizes
+                                .entry(packet.flow_id)
+                                .and_modify(|byte_size| {
+                                    *byte_size -= packet.size;
+                                });
+
+                            self.deficit
+                                .entry(packet.flow_id)
+                                .and_modify(|deficit| *deficit -= packet.size);
+
+                            flow_queue_count -= 1;
+                            self.packets_waiting -= 1;
+
                             let timeout = (packet.size as f64) * 8.0 / self.rate;
                             self.packets_in_transit.push(packet);
                             sim.advance(timeout).await;
@@ -177,6 +169,17 @@ impl DRRServer {
                             self.head_of_line.insert(*queue_id, packet);
                             break;
                         }
+                    }
+
+                    queue_count_updates.push((*queue_id, flow_queue_count))
+                }
+
+                for (queue_id, flow_queue_count) in queue_count_updates {
+                    self.flow_queue_count.insert(queue_id, flow_queue_count);
+                    if flow_queue_count == 0 {
+                        self.deficit
+                            .entry(queue_id)
+                            .and_modify(|deficit| *deficit = 0);
                     }
                 }
 
