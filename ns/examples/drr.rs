@@ -95,7 +95,7 @@ fn main() {
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             packet_size: RandomVar::new(),
-            duration: 30.,
+            duration: 20.,
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

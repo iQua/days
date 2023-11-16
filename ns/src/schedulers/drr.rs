@@ -246,17 +246,7 @@ impl DRRServer {
                 None
             };
 
-            // Bug:
-            // In the following example, there is a packet to be sent at time
-            // 15.75, also there is a packet received at time 15.75. However,
-            // that packet has not been sent!
-
-            // Example:
-            // DRRScheduler 0 sent packet 1 (1000 bytes) from flow 1 at time 15.750. 0 packets in the flow queue.
-            // DRRServer received packet from scheduler at 15.750
-            // DRRServer received packet at 15.750
-
-            match select(sim, self.receiver.recv(), drr_scheduler).await {
+            match select(sim, drr_scheduler, self.receiver.recv()).await {
                 Some(packet) => {
                     println!("DRRServer received packet at {:.3}", sim.now());
                     self.server_tx.send(packet).unwrap();
