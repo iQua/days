@@ -17,8 +17,6 @@ pub struct DRRServer {
 
     /// class_id -> deficit
     deficit: HashMap<u32, u32>,
-    /// class_id -> the number of packets in its queue
-    flow_queue_count: HashMap<u32, u32>,
     /// class_id -> quantum
     quantum: HashMap<u32, u32>,
     /// class_id -> the head-of-line packet in its queue
@@ -46,14 +44,12 @@ impl DRRServer {
         let min_quantum = 1500;
         let mut deficit = HashMap::new();
         let mut quantum = HashMap::new();
-        let mut flow_queue_count = HashMap::new();
         let mut byte_sizes = HashMap::new();
 
         let min_weight = weights.values().min().unwrap();
         for (class_id, weight) in &weights {
             deficit.insert(*class_id, 0);
             quantum.insert(*class_id, min_quantum * weight / min_weight);
-            flow_queue_count.insert(*class_id, 0);
             byte_sizes.insert(*class_id, 0);
         }
 
@@ -64,7 +60,6 @@ impl DRRServer {
             rate,
             flow_classes: Box::new(|flow_id| flow_id),
             deficit,
-            flow_queue_count,
             quantum,
             head_of_line: HashMap::new(),
             packets_received: 0,
@@ -91,10 +86,6 @@ impl DRRServer {
             .entry(packet.flow_id)
             .and_modify(|byte_size| *byte_size += packet.size);
 
-        self.flow_queue_count
-            .entry(packet.flow_id)
-            .and_modify(|count| *count += 1);
-
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in the flow queue.",
@@ -104,7 +95,7 @@ impl DRRServer {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.flow_queue_count.get(&packet.flow_id).unwrap(),
+            self.queues.get(&packet.flow_id).unwrap().len(),
         );
     }
 
@@ -118,7 +109,7 @@ impl DRRServer {
                 packet.size,
                 packet.flow_id,
                 sim.now(),
-                self.flow_queue_count.get(&packet.flow_id).unwrap(),
+                self.queues.get(&packet.flow_id).unwrap().len(),
             );
         }
     }
@@ -131,37 +122,35 @@ impl DRRServer {
                     return None;
                 }
 
-                let mut queue_count_updates = Vec::new();
+                let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
 
-                for (queue_id, &count) in self.flow_queue_count.iter() {
-                    if count > 0 {
+                // Updating the deficit counters
+                for (queue_id, queue) in &self.queues {
+                    if queue.len() > 0 {
                         self.deficit.entry(*queue_id).and_modify(|deficit| {
-                            *deficit += self.quantum.get(queue_id).unwrap();
+                            *deficit += self.quantum.get(&queue_id).unwrap();
                         });
+                    } else {
+                        self.deficit
+                            .entry(*queue_id)
+                            .and_modify(|deficit| *deficit = 0);
                     }
 
-                    let mut flow_queue_count = *self.flow_queue_count.get(queue_id).unwrap();
-                    let deficit = *self.deficit.get(queue_id).unwrap();
+                    flow_queue_count.insert(*queue_id, queue.len() as u32);
+                }
 
-                    while deficit > 0 && flow_queue_count > 0 {
-                        println!("queue_id in while: {}", queue_id);
+                // Scheduling packets
+                for (queue_id, &count) in &flow_queue_count {
+                    let mut current_length = count;
+                    let deficit = *self.deficit.get(&queue_id).unwrap();
+
+                    while deficit > 0 && current_length > 0 {
                         let packet;
-                        if let Some(head_packet) = self.head_of_line.remove(queue_id) {
+                        if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
                             packet = head_packet;
                         } else {
-                            println!("queue_id: {}", queue_id);
-                            println!("flow_queue_count: {}", flow_queue_count);
-                            println!(
-                                "length of flow_queue_count: {}",
-                                self.queues.get_mut(queue_id).unwrap().len()
-                            );
                             packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
-                            flow_queue_count -= 1;
-                            println!("flow_queue_count2: {}", flow_queue_count);
-                            println!(
-                                "length of flow_queue_count2: {}",
-                                self.queues.get_mut(queue_id).unwrap().len()
-                            );
+                            current_length -= 1;
                         }
 
                         if packet.size < deficit {
@@ -184,18 +173,6 @@ impl DRRServer {
                             self.head_of_line.insert(*queue_id, packet);
                             break;
                         }
-                        println!("queue_id in while end: {}", queue_id);
-                    }
-
-                    queue_count_updates.push((*queue_id, flow_queue_count))
-                }
-
-                for (queue_id, flow_queue_count) in queue_count_updates {
-                    self.flow_queue_count.insert(queue_id, flow_queue_count);
-                    if flow_queue_count == 0 {
-                        self.deficit
-                            .entry(queue_id)
-                            .and_modify(|deficit| *deficit = 0);
                     }
                 }
 
