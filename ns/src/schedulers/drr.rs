@@ -104,6 +104,11 @@ impl DRRServer {
             let drr_scheduler = async {
                 if self.packets_waiting == 0 {
                     sim.advance(1.0).await;
+                    println!(
+                        "DRRServer {} has no packets to send at time {:.3}.",
+                        self.element_id,
+                        sim.now()
+                    );
                     return None;
                 }
 
@@ -115,6 +120,13 @@ impl DRRServer {
                         self.deficit.entry(*queue_id).and_modify(|deficit| {
                             *deficit += self.quantum.get(&queue_id).unwrap();
                         });
+                        println!(
+                            "DRRServer {} updated deficit of class {} to {} at time {:.3}.",
+                            self.element_id,
+                            queue_id,
+                            self.deficit.get(&queue_id).unwrap(),
+                            sim.now()
+                        );
                     } else {
                         self.deficit
                             .entry(*queue_id)
@@ -139,6 +151,18 @@ impl DRRServer {
                         }
 
                         if packet.size < deficit {
+                            // sending the packet out to the next element
+                            println!(
+                                "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                                {} packets in the flow queue.",
+                                self.element_id,
+                                packet.packet_id,
+                                packet.size,
+                                packet.flow_id,
+                                sim.now(),
+                                self.queues.get(&packet.flow_id).unwrap().len(),
+                            );
+
                             self.byte_sizes
                                 .entry(packet.flow_id)
                                 .and_modify(|byte_size| {
@@ -149,26 +173,7 @@ impl DRRServer {
                                 .entry(packet.flow_id)
                                 .and_modify(|deficit| *deficit -= packet.size);
 
-                            self.packets_waiting -= 1;
-
-                            let timeout = (packet.size as f64) * 8.0 / self.rate;
-                            //self.packets_in_transit.push(packet);
-                            sim.advance(timeout).await;
-                            self.sender
-                                .send(packet.clone())
-                                .await
-                                .expect("no receiving element in the simulation");
-
-                            println!(
-                                "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-                                {} packets in the flow queue.",
-                                self.element_id,
-                                packet.packet_id,
-                                packet.size,
-                                packet.flow_id,
-                                sim.now(),
-                                self.queues.get(&packet.flow_id).unwrap().len(),
-                            );
+                            self.packets_in_transit.push(packet);
                         } else {
                             self.head_of_line.insert(*queue_id, packet);
                             break;
@@ -183,7 +188,31 @@ impl DRRServer {
                 Some(packet) => {
                     self.packet_received(packet, sim);
                 }
-                None => {}
+                None => {
+                    for packet in self.packets_in_transit.drain(..) {
+                        self.packets_waiting -= 1;
+
+                        let timeout = (packet.size as f64) * 8.0 / self.rate;
+
+                        sim.advance(timeout).await;
+
+                        self.sender
+                            .send(packet.clone())
+                            .await
+                            .expect("no receiving element in the simulation");
+
+                        println!(
+                            "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+                                    {} packets in the flow queue.",
+                            self.element_id,
+                            packet.packet_id,
+                            packet.size,
+                            packet.flow_id,
+                            sim.now(),
+                            self.queues.get(&packet.flow_id).unwrap().len(),
+                        );
+                    }
+                }
             }
         }
     }

@@ -35,7 +35,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut weights = HashMap::new();
     weights.insert(0, 1);
     weights.insert(1, 2);
-    let mut drr_server = DRRServer::new(0, (4000 * 8) as f64, weights);
+    let mut drr_server = DRRServer::new(0, (1000 * 8) as f64, weights);
     let mut sink = PacketSink::new(0);
 
     drr_server.receiver = receivers[0].clone();
