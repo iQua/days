@@ -2,7 +2,7 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, select, Receiver, Sender, SimContext, Time};
+use sim::{channel, select, Receiver, Sender, SimContext};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 pub struct DRRScheduler {
@@ -33,7 +33,7 @@ pub struct DRRScheduler {
     queues: HashMap<u32, VecDeque<Packet>>,
 
     /// a sender for sending packets to the DRR server
-    pub sender: UnboundedSender<(Packet, Time)>,
+    pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving incoming packets from the DRR server
     pub receiver: UnboundedReceiver<Packet>,
 }
@@ -43,7 +43,7 @@ impl DRRScheduler {
         element_id: u32,
         rate: f64,
         weights: HashMap<u32, u32>,
-        sender: UnboundedSender<(Packet, Time)>,
+        sender: UnboundedSender<Packet>,
         receiver: UnboundedReceiver<Packet>,
     ) -> DRRScheduler {
         let min_quantum = 1500;
@@ -159,7 +159,8 @@ impl DRRScheduler {
                         self.packets_waiting -= 1;
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
-                        self.sender.send((packet.clone(), timeout)).unwrap();
+                        sim.advance(timeout).await;
+                        self.sender.send(packet.clone()).unwrap();
 
                         println!(
                             "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -187,7 +188,7 @@ pub struct DRRServer {
     drr_scheduler: DRRScheduler,
 
     server_tx: UnboundedSender<Packet>,
-    server_rx: UnboundedReceiver<(Packet, Time)>,
+    server_rx: UnboundedReceiver<Packet>,
 
     /// a sender for sending packets
     pub sender: Sender<Packet>,
@@ -225,13 +226,12 @@ impl DRRServer {
 
         loop {
             let drr_scheduler = async {
-                if let Some((inbound_packet, timeout)) = self.server_rx.recv().await {
+                if let Some(inbound_packet) = self.server_rx.recv().await {
                     println!(
                         "DRRServer received packet from scheduler at {:.3}",
                         sim.now()
                     );
                     packet = inbound_packet.clone();
-                    sim.advance(timeout).await;
                 }
 
                 None
