@@ -4,7 +4,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 use rand_distr::{Exp, Uniform};
 use std::{cell::RefCell, collections::HashMap};
 
-use ns::{packets::dist_generator::DistPacketGenerator, schedulers::drr};
+use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::packet::Packet;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;

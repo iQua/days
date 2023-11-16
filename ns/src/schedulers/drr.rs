@@ -2,7 +2,7 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{Receiver, Sender, SimContext};
+use sim::{channel, select, Receiver, Sender, SimContext};
 use std::collections::{HashMap, VecDeque};
 
 pub struct DRRServer {

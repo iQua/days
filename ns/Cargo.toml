@@ -16,4 +16,3 @@ edition = "2021"
 sim = { path = "../sim" }
 rand = {version = "0.8.5", features = ["small_rng"]}
 rand_distr = "0.4.3"
-futures = "0.3"
