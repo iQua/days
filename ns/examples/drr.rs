@@ -42,14 +42,14 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // initializes packet sinks
     let mut ps: PacketSink = PacketSink::new(0);
-    let mut sink_1: PacketSink = PacketSink::new(0);
-    let mut sink_2: PacketSink = PacketSink::new(0);
+    let mut sink_1: PacketSink = PacketSink::new(1);
+    let mut sink_2: PacketSink = PacketSink::new(2);
 
     // initializes the DRR server
     let mut weights = HashMap::new();
     weights.insert(0, 1);
     weights.insert(1, 2);
-    let mut drr_server = DRRServer::new(0, (1000 * 8) as f64, weights);
+    let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights);
     
     // initializes splitters
     let mut splitter_1 = Splitter::new();
@@ -95,7 +95,7 @@ fn main() {
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             packet_size: RandomVar::new(),
-            duration: 10.,
+            duration: 30.,
         },
         |sim| Process::new(sim, network_sim(sim)),
     );
