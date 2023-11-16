@@ -2,7 +2,7 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, select, Receiver, Sender, SimContext};
+use sim::{channel, select, Receiver, Sender, SimContext, Time};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 pub struct DRRScheduler {
@@ -33,13 +33,19 @@ pub struct DRRScheduler {
     queues: HashMap<u32, VecDeque<Packet>>,
 
     /// a sender for sending packets to the DRR server
-    pub sender: UnboundedSender<Packet>,
+    pub sender: UnboundedSender<(Packet, Time)>,
     /// a receiver for receiving incoming packets from the DRR server
     pub receiver: UnboundedReceiver<Packet>,
 }
 
 impl DRRScheduler {
-    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRScheduler {
+    pub fn new(
+        element_id: u32,
+        rate: f64,
+        weights: HashMap<u32, u32>,
+        sender: UnboundedSender<(Packet, Time)>,
+        receiver: UnboundedReceiver<Packet>,
+    ) -> DRRScheduler {
         let min_quantum = 1500;
         let mut deficit = HashMap::new();
         let mut quantum = HashMap::new();
@@ -51,8 +57,6 @@ impl DRRScheduler {
             quantum.insert(*class_id, min_quantum * weight / min_weight);
             byte_sizes.insert(*class_id, 0);
         }
-
-        let (tx, rx) = mpsc::unbounded_channel();
 
         println!("weights: {:?};\nquantum: {:?}", weights, quantum);
         // TODO: add the usage of flow_classes!
@@ -67,8 +71,8 @@ impl DRRScheduler {
             packets_waiting: 0,
             byte_sizes,
             queues: HashMap::new(),
-            sender: tx,
-            receiver: rx,
+            sender,
+            receiver,
         }
         // Q: do we need packet_available?
     }
@@ -99,18 +103,13 @@ impl DRRScheduler {
         );
     }
 
-    pub async fn run(
-        mut self,
-        scheduler_rx: UnboundedReceiver<Packet>,
-        scheduler_tx: UnboundedSender<Packet>,
-        sim: SimContext<'_, Shared>,
-    ) {
-        self.receiver = scheduler_rx;
-        self.sender = scheduler_tx;
-
+    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
+            println!("{}", self.packets_waiting);
+
             if self.packets_waiting == 0 {
                 let packet = self.receiver.recv().await.unwrap();
+                println!("DRRScheduler received packet at {}", sim.now());
                 self.packet_received(packet, sim);
             }
 
@@ -167,9 +166,8 @@ impl DRRScheduler {
                         self.packets_waiting -= 1;
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
-                        sim.advance(timeout).await;
-
-                        self.sender.send(packet.clone()).unwrap();
+                        println!("timeout: {}", timeout);
+                        self.sender.send((packet.clone(), timeout)).unwrap();
 
                         println!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -196,6 +194,9 @@ pub struct DRRServer {
     /// a packet scheduler using the Deficit Round Robin algorithm
     drr_scheduler: DRRScheduler,
 
+    server_tx: UnboundedSender<Packet>,
+    server_rx: UnboundedReceiver<(Packet, Time)>,
+
     /// a sender for sending packets
     pub sender: Sender<Packet>,
     /// a receiver for receiving incoming packets
@@ -204,17 +205,21 @@ pub struct DRRServer {
 
 impl DRRServer {
     pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
+        let (server_tx, scheduler_rx) = mpsc::unbounded_channel();
+        let (scheduler_tx, server_rx) = mpsc::unbounded_channel();
+
         DRRServer {
             element_id,
-            drr_scheduler: DRRScheduler::new(element_id, rate, weights),
+            drr_scheduler: DRRScheduler::new(element_id, rate, weights, scheduler_tx, scheduler_rx),
             sender: channel().0,
             receiver: channel().1,
+            server_tx,
+            server_rx,
         }
     }
 
-    pub async fn run(self, sim: SimContext<'_, Shared>) {
-        let (server_tx, scheduler_rx) = mpsc::unbounded_channel();
-        let (scheduler_tx, mut server_rx) = mpsc::unbounded_channel();
+    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+        sim.activate(self.drr_scheduler.run(sim));
 
         let mut packet = Packet {
             production_time: sim.now(),
@@ -226,17 +231,19 @@ impl DRRServer {
             dst: "destination".to_string(),
         };
 
-        sim.activate(self.drr_scheduler.run(scheduler_rx, scheduler_tx, sim));
-
         loop {
-            match select(sim, self.receiver.recv(), async {
-                packet = server_rx.recv().await.unwrap();
+            let drr_scheduler = async {
+                if let Some((inbound_packet, timeout)) = self.server_rx.recv().await {
+                    packet = inbound_packet.clone();
+                    sim.advance(timeout).await;
+                }
                 None
-            })
-            .await
-            {
+            };
+
+            match select(sim, self.receiver.recv(), drr_scheduler).await {
                 Some(packet) => {
-                    server_tx.send(packet).unwrap();
+                    println!("DRRServer received packet at {}", sim.now());
+                    self.server_tx.send(packet).unwrap();
                 }
                 None => {
                     self.sender
