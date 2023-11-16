@@ -185,12 +185,13 @@ impl DRRServer {
             };
 
             // A Design Problem:
-            // The new design makes sim.advance() inside the None block of
-            // 'match select'. However, this approach will block the packet
-            // receive process. In other words, the DRRServer can not receive
-            // packets until all packets in self.packets_in_transit are sent. In other words, the send and
-            // receive actions are not seperated properly.
-            
+            // The new design makes sim.advance() inside the
+            // None block of 'match select'. However, this approach will block
+            // the packet receive process. In other words, the DRRServer can not
+            // receive packets until all packets in self.packets_in_transit are
+            // sent. In other words, the send and receive actions are not
+            // seperated properly.
+
             // Buggy Example:
             // DistPacketGenerator 1 will send packet 0 (1000 bytes) at time 1.000. 1 packets sent.
             // DistPacketGenerator 0 will send packet 0 (1000 bytes) at time 1.000. 1 packets sent.
