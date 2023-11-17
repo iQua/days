@@ -34,7 +34,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     );
     let mut pg2 = DistPacketGenerator::new(
         1,
-        10.0,
+        1.0,
         Box::new(|| FixedDistribution(1.75)),
         Box::new(|| Uniform::new(1000, 1001)),
     );
@@ -47,7 +47,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes the DRR server
     let mut weights = HashMap::new();
     weights.insert(0, 1);
-    weights.insert(1, 2);
+    weights.insert(1, 1);
     let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights);
 
     // initializes splitters
@@ -86,7 +86,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     sim.activate(sink_2.run(sim));
 
     // waiting for the end of this simulation
-    sim.advance(sim.shared().duration + 100.0).await;
+    sim.advance(sim.shared().duration).await;
 }
 
 fn main() {

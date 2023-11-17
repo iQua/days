@@ -122,6 +122,8 @@ impl DRRScheduler {
                         }
                     }
                 }
+
+                println!("\nDRRScheduler queue at time {} before updating deficit: {:?}", sim.now(), self.queues);
             }
 
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
@@ -139,11 +141,7 @@ impl DRRScheduler {
                         self.deficit.get(&queue_id).unwrap(),
                         queue_id
                     );
-                } else {
-                    self.deficit
-                        .entry(queue_id)
-                        .and_modify(|deficit| *deficit = 0);
-                }
+                } 
 
                 flow_queue_count.insert(queue_id, queue.len() as u32);
             }
@@ -204,6 +202,12 @@ impl DRRScheduler {
                         self.head_of_line.insert(queue_id, packet);
                         break;
                     }
+                }
+
+                if current_length == 0 && self.head_of_line.len() == 0{
+                    self.deficit
+                        .entry(queue_id)
+                        .and_modify(|deficit| *deficit = 0);
                 }
             }
         }
