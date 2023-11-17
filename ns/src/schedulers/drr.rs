@@ -1,10 +1,12 @@
 //! Implements a Deficit Round Robin (DRR) server.
 
-use crate::packets::packet::Packet;
-use crate::Shared;
-use sim::{SimContext, Time};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use sim::SimContext;
+
+use crate::packets::packet::Packet;
+use crate::Shared;
 pub struct DRRScheduler {
     element_id: u32,
     /// the bit rate of the port
@@ -124,44 +126,55 @@ impl DRRScheduler {
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
 
             // Updating the deficit counters
-            for (queue_id, queue) in &self.queues {
+            for (&queue_id, queue) in &self.queues {
                 if queue.len() > 0 {
-                    self.deficit.entry(*queue_id).and_modify(|deficit| {
+                    self.deficit.entry(queue_id).and_modify(|deficit| {
                         *deficit += self.quantum.get(&queue_id).unwrap();
                     });
+
+                    println!(
+                        "\nDRRScheduler {} deficit increased to {}, queue_id: {}\n",
+                        self.element_id,
+                        self.deficit.get(&queue_id).unwrap(),
+                        queue_id
+                    );
                 } else {
                     self.deficit
-                        .entry(*queue_id)
+                        .entry(queue_id)
                         .and_modify(|deficit| *deficit = 0);
                 }
 
-                flow_queue_count.insert(*queue_id, queue.len() as u32);
+                flow_queue_count.insert(queue_id, queue.len() as u32);
             }
 
             // Scheduling packets
-            for (queue_id, &count) in &flow_queue_count {
+            for (&queue_id, &count) in &flow_queue_count {
                 let mut current_length = count;
-                let deficit = *self.deficit.get(&queue_id).unwrap();
+                let mut deficit = *self.deficit.get(&queue_id).unwrap();
+
+                println!(
+                    "\nDRRScheduler {} deficit: {}, queue_id: {}, count: {}\n",
+                    self.element_id, deficit, queue_id, count
+                );
 
                 while deficit > 0 && current_length > 0 {
                     let packet;
+
                     if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
                         packet = head_packet;
                     } else {
-                        packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
+                        packet = self.queues.get_mut(&queue_id).unwrap().pop_front().unwrap();
                         current_length -= 1;
                     }
 
                     if packet.size < deficit {
                         // sending the packet out to the next element
-                        self.byte_sizes
-                            .entry(packet.flow_id)
-                            .and_modify(|byte_size| {
-                                *byte_size -= packet.size;
-                            });
+                        self.byte_sizes.entry(queue_id).and_modify(|byte_size| {
+                            *byte_size -= packet.size;
+                        });
 
                         self.deficit
-                            .entry(packet.flow_id)
+                            .entry(queue_id)
                             .and_modify(|deficit| *deficit -= packet.size);
 
                         self.packets_waiting -= 1;
@@ -180,8 +193,10 @@ impl DRRScheduler {
                             sim.now(),
                             self.queues.get(&packet.flow_id).unwrap().len(),
                         );
+
+                        deficit -= packet.size;
                     } else {
-                        self.head_of_line.insert(*queue_id, packet);
+                        self.head_of_line.insert(queue_id, packet);
                         break;
                     }
                 }
