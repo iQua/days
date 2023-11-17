@@ -1,7 +1,7 @@
 //! A simple FIFO port with only one receiver.
 use std::collections::VecDeque;
 
-use crate::packets::packet::{Packet, self};
+use crate::packets::packet::{self, Packet};
 use crate::Shared;
 use sim::{select, SimContext};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -108,59 +108,40 @@ impl Port {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let receive_action = self.receiver.recv();
-            let send_action = async {
-                if let Some(packet) = self.queue.front() {
-                    let timeout = (packet.size as f64) * 8.0 / self.rate;
-                    sim.advance(timeout).await;
-                    Some(packet.clone())
-                } else {
-                    sim.advance(1.0).await;
-                    None
-                }
-            };
-
-
-            let (receive_result, send_result) = select(sim, receive_action, send_action).await;
-            println!("!!! {:?} {:?}", receive_result, send_result);
-            match (receive_result, send_result) {
-                (Some(receive), Some(send)) => {
-                    println!("Condition 1: both send and receive.");
-                    if let Some(packet) = receive {
+            // trying to receive all the packets accumulated in the channel
+            loop {
+                match self.receiver.try_recv() {
+                    Ok(packet) => {
                         self.packet_received(packet, sim);
                     }
-                    if let Some(_) = send {
-                        if let Some(packet) = self.queue.pop_front() {
-                            self.sender
-                                .send(packet.clone())
-                                .unwrap();
-                            self.packet_sent(packet, sim);
-                        }
+                    Err(_) => {
+                        break;
                     }
-                }
-                (Some(receive), _) => {
-                    println!("Condition 2: only receive.");
-                    if let Some(packet) = receive {
-                        self.packet_received(packet, sim);
-                    }
-                }
-                (_, Some(send)) => {
-                    println!("Condition 3: only send.");
-                    if let Some(_) = send {
-                        if let Some(packet) = self.queue.pop_front() {
-                            self.sender
-                                .send(packet.clone())
-                                .unwrap();
-                            self.packet_sent(packet, sim);
-                        }
-                    }
-                }
-                (None, None) => {
-                    println!("Condition 4: Nothing.");
                 }
             }
-            
-        }
 
+            // sending all packets in an FIFO order to the downstream element
+            loop {
+                if let Some(mut packet) = self.queue.pop_front() {
+                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+
+                    packet.time = sim.now();
+                    self.sender.send(packet.clone()).unwrap();
+                    self.packet_sent(packet, sim);
+                } else {
+                    break;
+                }
+            }
+
+            // waiting for the next packet to arrive from the upstream elements
+            if let Some(packet) = self.receiver.recv().await {
+                self.packet_received(packet, sim);
+            } else {
+                panic!(
+                    "Port {}: an upstream element may have closed its channel.",
+                    self.element_id
+                );
+            }
+        }
     }
 }

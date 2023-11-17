@@ -114,11 +114,10 @@ impl DRRScheduler {
                     match self.receiver.try_recv() {
                         Ok(packet) => {
                             self.packet_received(packet, sim);
-                        },
+                        }
                         Err(_) => {
                             break;
-                        } 
-                        
+                        }
                     }
                 }
             }
@@ -253,9 +252,7 @@ impl DRRServer {
                 }
                 None => {
                     println!("Before DRRServer send at time {}", sim.now());
-                    self.sender
-                        .send(packet.clone())
-                        .unwrap();
+                    self.sender.send(packet.clone()).unwrap();
 
                     println!(
                         "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
