@@ -118,12 +118,12 @@ impl Port {
             });
 
             tokio::spawn(async {
-                if let Some(packet) = self.queue.pop_front() {
-                    let _ = tx2.send(Some(packet));
+                if !self.queue.is_empty() {
+                    let _ = tx2.send(Some(true));
                 } else {
-                    println!("wait before: {}", sim.now());
+                    // println!("wait before: {}", sim.now());
                     sim.advance(1.0).await;
-                    println!("wait after: {}", sim.now());
+                    // println!("wait after: {}", sim.now());
                     let _ = tx2.send(None);
                 }
             });
@@ -135,7 +135,8 @@ impl Port {
                     }
                 },
                 val = rx2 => {
-                    if let Ok(Some(packet)) = val {
+                    if let Ok(_) = val {
+                        let packet = self.queue.pop_front().unwrap();
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         // Test the correctness of sim.advance
                         println!("time before advance: {}", sim.now());
