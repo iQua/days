@@ -66,6 +66,8 @@ where
         sim.advance(self.initial_delay).await;
 
         while sim.now() < sim.shared().duration {
+            let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+            sim.advance(interval).await;
             let packet_size = (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut());
 
             let packet = Packet {
@@ -82,8 +84,6 @@ where
 
             self.packet_sent(sim, packet);
 
-            let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
-            sim.advance(interval).await;
         }
     }
 }
