@@ -4,6 +4,8 @@ use std::cell::RefCell;
 
 pub mod packets;
 pub mod ports;
+pub mod schedulers;
+pub mod utils;
 
 /// Globally shared data.
 pub struct Shared {

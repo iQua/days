@@ -8,6 +8,8 @@ use std::{
     pin::Pin,
     rc::{Rc, Weak},
     task::{self, Context, Poll},
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
 // simple time type
@@ -586,7 +588,7 @@ impl<T> Promise<T> {
 /// function cannot outlive its returned future, enabling us to allow
 /// references to variables in the local scope. The passed futures may
 /// compute a value, as long as the return type is identical in both cases.
-pub async fn select<'s, 'u, G, E, O, R>(sim: SimContext<'s, G>, either: E, or: O) -> R
+pub async fn select<'s, 'u, G, E, O, R>(sim: SimContext<'s, G>, either: E, or: O) -> (Option<R>, Option<R>)
 where
     E: Future<Output = R> + 'u,
     O: Future<Output = R> + 'u,
@@ -594,8 +596,14 @@ where
 {
     use std::mem::transmute;
 
+    let either_completed = Arc::new(AtomicBool::new(false));
+    let or_completed = Arc::new(AtomicBool::new(false));
+    let either_completed_clone = either_completed.clone();
+    let or_completed_clone = or_completed.clone();
+
     // create a one-shot channel that reactivates the caller on write
-    let promise = &Promise::new(sim.active().waker());
+    let promise_either = &Promise::new(sim.active().waker());
+    let promise_or = &Promise::new(sim.active().waker());
 
     // this unsafe block shortens the guaranteed lifetimes of the processes
     // contained in the scheduler; it is safe because the constructed future
@@ -606,11 +614,15 @@ where
 
     // create the two competing processes
     // a future optimization would be to keep them on the stack
-    let p1 = Process::new(sim, async move {
-        promise.fulfill(either.await);
+    let p1 = Process::new(sim.clone(), async move {
+        let result = either.await;
+        either_completed_clone.store(true, AtomicOrdering::SeqCst);
+        promise_either.fulfill(result);
     });
     let p2 = Process::new(sim, async move {
-        promise.fulfill(or.await);
+        let result = or.await;
+        or_completed_clone.store(true, AtomicOrdering::SeqCst);
+        promise_or.fulfill(result);
     });
 
     // activate them
@@ -620,13 +632,35 @@ where
     // wait for reactivation; the promise will wake us on fulfillment
     sleep().await;
 
+    let result1 = if either_completed.load(AtomicOrdering::SeqCst) {
+        match promise_either.redeem() {
+            Some(result) => Some(result),
+            None => {
+                None
+            }
+        }
+    } else {
+        None
+    };
+    
+    let result2 = if or_completed.load(AtomicOrdering::SeqCst) {
+        match promise_or.redeem() {
+            Some(result) => Some(result),
+            None => {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // terminate both processes
     // (this is redundant for one of them but doesn't hurt either)
     p1.terminate();
     p2.terminate();
 
     // extract the promised value
-    promise.redeem().unwrap()
+    (result1, result2)
 }
 
 /// Complex channel with space for infinitely many elements of arbitrary type.

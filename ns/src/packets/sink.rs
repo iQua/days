@@ -8,7 +8,8 @@
 //! each packet.
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, Receiver, SimContext};
+use sim::SimContext;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 pub struct PacketSink {
     element_id: u32,
@@ -29,7 +30,7 @@ pub struct PacketSink {
     /// the size of the packets
     packet_sizes: Vec<u32>,
     /// a receiver for receiving incoming packets
-    pub receiver: Receiver<Packet>,
+    pub receiver: UnboundedReceiver<Packet>,
 }
 
 impl PacketSink {
@@ -44,7 +45,7 @@ impl PacketSink {
             one_way_delays: Vec::new(),
             queueing_delays: 0.0,
             packet_sizes: Vec::new(),
-            receiver: channel().1,
+            receiver: unbounded_channel().1,
         }
     }
 
@@ -64,8 +65,11 @@ impl PacketSink {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let packet = self.receiver.recv().await.unwrap();
-            self.packet_received(packet, sim);
+            if let Some(packet) = self.receiver.recv().await {
+                self.packet_received(packet, sim);
+            } else {
+                break;
+            }
         }
     }
 }

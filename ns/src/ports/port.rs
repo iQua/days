@@ -1,36 +1,36 @@
-//! A very simple FIFO Wire with only one sender and one receiver.
-//! It seems that port can have only one receiver with mutiple senders in the
-//! future versions?
+//! A simple FIFO port with only one receiver.
 use std::collections::VecDeque;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use sim::SimContext;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, select, Sender, Receiver, SimContext, Time};
 
 pub struct Port {
     element_id: u32,
-    // the bit rate of the port
+    /// the bit rate of the port
     rate: f64,
-    // a queue limit in bytes or packets
+    /// a queue limit in bytes or packets
     qlimit: u32,
-    // if true, qlimit will be based on bytes
+    /// if true, qlimit will be based on bytes
     limit_bytes: bool,
-    // the number of packets sent
+    /// the number of packets sent
     packets_sent: u32,
-    // the number of packets received
+    /// the number of packets received
     packets_received: u32,
-    // the number of dropped packets
+    /// the number of dropped packets
     packets_dropped: u32,
-    // the number of packets in the queue
+    /// the number of packets in the queue
     packets_in_queue: u32,
-    // the total byte sizes in the queue
+    /// the total byte sizes in the queue
     bytes_in_queue: u32,
-    // the packet queue of the port
-    queue: VecDeque<(Packet, Time)>,
-    // a sender for sending packets
-    pub sender: Sender<Packet>,
+    /// the packet queue of the port
+    queue: VecDeque<Packet>,
+    /// a sender for sending packets
+    pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving incoming packets
-    pub receiver: Receiver<Packet>,
+    pub receiver: UnboundedReceiver<Packet>,
 }
 
 impl Port {
@@ -46,8 +46,8 @@ impl Port {
             packets_in_queue: 0,
             bytes_in_queue: 0,
             queue: VecDeque::new(),
-            sender: channel().0,
-            receiver: channel().1,
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
         }
     }
 
@@ -72,7 +72,7 @@ impl Port {
         }
 
         // the case that this packet will not be dropped.
-        self.queue.push_back((packet.clone(), sim.now()));
+        self.queue.push_back(packet.clone());
         self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
 
@@ -109,30 +109,36 @@ impl Port {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let receive_action = self.receiver.recv();
-            let send_action = async {
-                if let Some((packet, arrival_time)) = self.queue.front() {
-                    let delay = (packet.size as f64) * 8.0 / self.rate;
-                    let wait_time = arrival_time + delay - sim.now();
-                    sim.advance(wait_time).await;
-                } else {
-                    sim.advance(1.0).await;
-                }
-                None
-            };
-            match select(sim, receive_action, send_action).await {
-                Some(packet) => {
-                    self.packet_received(packet, sim);
-                }
-                None => {
-                    if let Some((packet, _)) = self.queue.pop_front() {
-                        self.sender
-                            .send(packet.clone())
-                            .await
-                            .expect("no receiving element in the simulation");
-                        self.packet_sent(packet, sim);
+            // trying to receive all the packets accumulated in the channel
+            loop {
+                match self.receiver.try_recv() {
+                    Ok(packet) => {
+                        self.packet_received(packet, sim);
+                    }
+                    Err(_) => {
+                        break;
                     }
                 }
+            }
+
+            // sending all packets in an FIFO order to the downstream element
+            loop {
+                if let Some(mut packet) = self.queue.pop_front() {
+                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+
+                    packet.time = sim.now();
+                    self.sender.send(packet.clone()).unwrap();
+                    self.packet_sent(packet, sim);
+                } else {
+                    break;
+                }
+            }
+
+            // waiting for the next packet to arrive from the upstream elements
+            if let Some(packet) = self.receiver.recv().await {
+                self.packet_received(packet, sim);
+            } else {
+                break;
             }
         }
     }

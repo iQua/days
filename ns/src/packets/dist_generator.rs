@@ -4,7 +4,8 @@ use crate::packets::packet::Packet;
 use crate::Shared;
 
 use rand_distr::Distribution;
-use sim::{channel, Sender, SimContext, Time};
+use sim::{SimContext, Time};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 pub struct DistPacketGenerator<A, B>
 where
@@ -16,7 +17,7 @@ where
     arr_interval_dist: Box<dyn Fn() -> A>,
     packet_size_dist: Box<dyn Fn() -> B>,
     packets_sent: u32,
-    pub sender: Sender<Packet>,
+    pub sender: UnboundedSender<Packet>,
 }
 
 impl<A, B> DistPacketGenerator<A, B>
@@ -36,7 +37,7 @@ where
             arr_interval_dist,
             packet_size_dist,
             packets_sent: 0,
-            sender: channel().0,
+            sender: unbounded_channel().0,
         }
     }
 
@@ -47,7 +48,7 @@ where
         sim.shared().packet_size.tabulate(packet.size);
 
         println!(
-            "DistPacketGenerator {} will send packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            "DistPacketGenerator {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.element_id,
             packet.packet_id,
             packet.size,
@@ -65,6 +66,8 @@ where
         sim.advance(self.initial_delay).await;
 
         while sim.now() < sim.shared().duration {
+            let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+            sim.advance(interval).await;
             let packet_size = (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut());
 
             let packet = Packet {
@@ -77,15 +80,10 @@ where
                 dst: "destination".to_string(),
             };
 
-            self.sender
-                .send(packet.clone())
-                .await
-                .expect("no receiving element in the simulation");
+            self.sender.send(packet.clone()).unwrap();
 
             self.packet_sent(sim, packet);
 
-            let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
-            sim.advance(interval).await;
         }
     }
 }

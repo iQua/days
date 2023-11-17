@@ -3,51 +3,42 @@
 //! respectively.
 
 use rand::{rngs::SmallRng, SeedableRng};
-use rand_distr::{Exp, Uniform};
+use rand_distr::Uniform;
 use std::cell::RefCell;
 
 use ns::packets::dist_generator::DistPacketGenerator;
-use ns::packets::packet::Packet;
 use ns::packets::sink::PacketSink;
 use ns::ports::port::Port;
 use ns::Shared;
-use sim::{channel, Process, RandomVar, Receiver, Sender, SimContext};
+use ns::utils::utils::FixedDistribution;
+use sim::{Process, RandomVar, SimContext};
+use tokio::sync::mpsc::unbounded_channel;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let mut senders: Vec<Sender<Packet>> = Vec::new();
-    let mut receivers: Vec<Receiver<Packet>> = Vec::new();
-    for _ in 0..3 {
-        let (sender, receiver) = channel();
-        senders.push(sender);
-        receivers.push(receiver);
-    }
+    let (sender_0, receiver_0) = unbounded_channel();
+    let (sender_1, receiver_1) = unbounded_channel();
 
-    for i in 0..4 {
+    for i in 0..2 {
         let mut generator = DistPacketGenerator::new(
             i,
             1.0,
-            Box::new(|| Exp::new(1.).unwrap()),
+            Box::new(|| FixedDistribution(1.0)),
             Box::new(|| Uniform::new(1000, 1001)),
         );
-        generator.sender = senders[i as usize / 2].clone();
+        generator.sender = sender_0.clone();
         sim.activate(generator.run(sim));
     }
 
-    let mut port_on_packets = Port::new(0, (1000 * 8) as f64, 1, false);
-    let mut port_on_bytes = Port::new(1, (1000 * 8) as f64, 1000, true);
+    let mut port = Port::new(0, (1000 * 8) as f64, 100, false);
     let mut sink = PacketSink::new(0);
 
-    port_on_packets.receiver = receivers[0].clone();
-    port_on_bytes.receiver = receivers[1].clone();
-    sink.receiver = receivers[2].clone();
+    port.receiver = receiver_0;
+    sink.receiver = receiver_1;
+    port.sender = sender_1;
 
-    port_on_packets.sender = senders[2].clone();
-    port_on_bytes.sender = senders[2].clone();
-
-    sim.activate(port_on_packets.run(sim));
-    sim.activate(port_on_bytes.run(sim));
+    sim.activate(port.run(sim));
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation
