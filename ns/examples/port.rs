@@ -3,7 +3,7 @@
 //! respectively.
 
 use rand::{rngs::SmallRng, SeedableRng};
-use rand_distr::{Exp, Uniform};
+use rand_distr::Uniform;
 use std::cell::RefCell;
 
 use ns::packets::dist_generator::DistPacketGenerator;
@@ -11,6 +11,7 @@ use ns::packets::sink::PacketSink;
 use ns::packets::packet::Packet;
 use ns::ports::port::Port;
 use ns::Shared;
+use ns::utils::utils::FixedDistribution;
 use sim::{Process, RandomVar, SimContext};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
@@ -31,15 +32,15 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         let mut generator = DistPacketGenerator::new(
             i,
             1.0,
-            Box::new(|| Exp::new(1.).unwrap()),
+            Box::new(|| FixedDistribution(1.0)),
             Box::new(|| Uniform::new(1000, 1001)),
         );
         generator.sender = senders[i as usize / 2].clone();
         sim.activate(generator.run(sim));
     }
 
-    let mut port_on_packets = Port::new(0, (1000 * 8) as f64, 1, false);
-    let mut port_on_bytes = Port::new(1, (1000 * 8) as f64, 1000, true);
+    let mut port_on_packets = Port::new(0, (1000 * 8) as f64, 100, false);
+    let mut port_on_bytes = Port::new(1, (1000 * 8) as f64, 1000 * 100, true);
     let mut sink = PacketSink::new(0);
 
     port_on_packets.receiver = receiver_0;
