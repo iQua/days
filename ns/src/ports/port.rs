@@ -116,7 +116,12 @@ impl Port {
                 if let Some(packet) = self.queue.pop_front() {
                     let timeout = (packet.size as f64) * 8.0 / self.rate;
                     println!("TIMEOUT of Port {}: {} at time {}", self.element_id, timeout, sim.now());
-                    sim.advance(timeout).await;
+                    
+                    // Test the correctness of sim.advance
+                    println!("time before advance: {}", sim.now());
+                    sim.advance(1.0).await;
+                    println!("time after advence {}", sim.now());
+                    
                     Some(packet)
                 } else {
                     sim.advance(1.0).await;
@@ -130,7 +135,6 @@ impl Port {
                 },
                 packet_to_send = send_action => {
                     if let Some(packet) = packet_to_send {
-                        println!("Before Send, the time in Port {} is {}", self.element_id, sim.now());
                         self.sender
                             .send(packet.clone())
                             .unwrap();

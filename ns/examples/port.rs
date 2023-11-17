@@ -20,38 +20,26 @@ const SEED: u64 = 1000;
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let (sender_0, receiver_0) = unbounded_channel();
     let (sender_1, receiver_1) = unbounded_channel();
-    let (sender_2, receiver_2) = unbounded_channel();
 
-    let mut senders: Vec<UnboundedSender<Packet>> = Vec::new();
-    senders.push(sender_0);
-    senders.push(sender_1);
-
-
-
-    for i in 0..4 {
+    for i in 0..2 {
         let mut generator = DistPacketGenerator::new(
             i,
             1.0,
             Box::new(|| FixedDistribution(1.0)),
             Box::new(|| Uniform::new(1000, 1001)),
         );
-        generator.sender = senders[i as usize / 2].clone();
+        generator.sender = sender_0.clone();
         sim.activate(generator.run(sim));
     }
 
-    let mut port_on_packets = Port::new(0, (1000 * 8) as f64, 100, false);
-    let mut port_on_bytes = Port::new(1, (1000 * 8) as f64, 1000 * 100, true);
+    let mut port = Port::new(0, (1000 * 8) as f64, 100, false);
     let mut sink = PacketSink::new(0);
 
-    port_on_packets.receiver = receiver_0;
-    port_on_bytes.receiver = receiver_1;
-    sink.receiver = receiver_2;
+    port.receiver = receiver_0;
+    sink.receiver = receiver_1;
+    port.sender = sender_1;
 
-    port_on_packets.sender = sender_2.clone();
-    port_on_bytes.sender = sender_2.clone();
-
-    sim.activate(port_on_packets.run(sim));
-    sim.activate(port_on_bytes.run(sim));
+    sim.activate(port.run(sim));
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation
