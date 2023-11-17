@@ -128,7 +128,7 @@ impl DRRScheduler {
 
             // Updating the deficit counters
             for (&queue_id, queue) in &self.queues {
-                if queue.len() > 0 {
+                if queue.len() > 0 || self.head_of_line.contains_key(&queue_id) {
                     self.deficit.entry(queue_id).and_modify(|deficit| {
                         *deficit += self.quantum.get(&queue_id).unwrap();
                     });
@@ -159,7 +159,7 @@ impl DRRScheduler {
 
                 println!(
                     "\nDRRScheduler {} deficit: {}, queue_id: {}, count: {}, waiting: {}\n",
-                    self.element_id, deficit, queue_id, count, self.packets_waiting
+                    self.element_id, deficit, queue_id, current_length, self.packets_waiting
                 );
 
                 while deficit > 0 && current_length > 0 {
