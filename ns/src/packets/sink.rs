@@ -65,8 +65,14 @@ impl PacketSink {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let packet = self.receiver.recv().await.unwrap();
-            self.packet_received(packet, sim);
+            if let Some(packet) = self.receiver.recv().await {
+                self.packet_received(packet, sim);
+            } else {
+                panic!(
+                    "Port {}: an upstream element may have closed its channel.",
+                    self.element_id
+                );
+            }
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{select, SimContext};
+use sim::{SimContext, Time};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub struct DRRScheduler {
@@ -105,11 +105,10 @@ impl DRRScheduler {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // If we do not care about the packet receive time for the
-            // DRRScheduler, it works properly with packet sending time.
             if self.packets_waiting == 0 {
                 let packet = self.receiver.recv().await.unwrap();
                 self.packet_received(packet, sim);
+
                 loop {
                     match self.receiver.try_recv() {
                         Ok(packet) => {
@@ -169,7 +168,7 @@ impl DRRScheduler {
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
-                        self.sender.send(packet.clone()).unwrap();
+                        let _ = self.sender.send(packet.clone());
 
                         println!(
                             "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -222,45 +221,79 @@ impl DRRServer {
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         sim.activate(self.drr_scheduler.run(sim));
 
-        let mut packet = Packet {
-            production_time: sim.now(),
-            time: sim.now(),
-            size: 0,
-            flow_id: 0,
-            packet_id: 0,
-            src: "source".to_string(),
-            dst: "destination".to_string(),
-        };
-
         loop {
-            let drr_scheduler = async {
-                if let Some(inbound_packet) = self.server_rx.recv().await {
+            // trying to receive all the packets accumulated in the channel from
+            // upstream elements
+            // loop {
+            //     match self.receiver.try_recv() {
+            //         Ok(packet) => {
+            //             println!(
+            //                 "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            //                 self.element_id,
+            //                 packet.packet_id,
+            //                 packet.size,
+            //                 packet.flow_id,
+            //                 sim.now(),
+            //             );
+            //             let _ = self.server_tx.send(packet);
+            //         }
+            //         Err(_) => {
+            //             break;
+            //         }
+            //     }
+            // }
+
+            // // trying to send all the packets from the DRR scheduler
+            // loop {
+            //     match self.server_rx.try_recv() {
+            //         Ok(mut packet) => {
+            //             packet.time = sim.now();
+            //             let _ = self.sender.send(packet.clone());
+
+            //             println!(
+            //                 "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
+            //                 self.element_id,
+            //                 packet.packet_id,
+            //                 packet.size,
+            //                 packet.flow_id,
+            //                 sim.now(),
+            //             );
+            //         }
+            //         Err(_) => {
+            //             break;
+            //         }
+            //     }
+            // }
+
+            // waiting for the next packet to arrive from either upstream elements or DRRScheduler
+            tokio::select! {
+                Some(packet) = self.receiver.recv() => {
+                    let _ = self.server_tx.send(packet.clone());
                     println!(
-                        "DRRServer received packet from scheduler at {:.3}",
-                        sim.now()
-                    );
-                    packet = inbound_packet.clone();
-                }
-
-                None
-            };
-
-            match select(sim, drr_scheduler, self.receiver.recv()).await {
-                Some(packet) => {
-                    println!("DRRServer received packet at {:.3}", sim.now());
-                    self.server_tx.send(packet).unwrap();
-                }
-                None => {
-                    println!("Before DRRServer send at time {}", sim.now());
-                    self.sender.send(packet.clone()).unwrap();
-
-                    println!(
-                        "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
+                        "DRRServer {} received (in select) packet {} ({} bytes) from flow {} at time {:.3}.",
                         self.element_id,
                         packet.packet_id,
                         packet.size,
                         packet.flow_id,
                         sim.now(),
+                    );
+                }
+                Some(mut packet) = self.server_rx.recv() => {
+                    packet.time = sim.now();
+                    let _ = self.sender.send(packet.clone());
+                    println!(
+                        "DRRServer {} sent (in select) packet {} ({} bytes) from flow {} at time {:.3}.",
+                        self.element_id,
+                        packet.packet_id,
+                        packet.size,
+                        packet.flow_id,
+                        sim.now(),
+                    );
+                }
+                else => {
+                    panic!(
+                        "Port {}: an upstream element may have closed its channel.",
+                        self.element_id
                     );
                 }
             }
