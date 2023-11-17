@@ -1,7 +1,7 @@
 //! A simple FIFO port with only one receiver.
 use std::collections::VecDeque;
 
-use crate::packets::packet::Packet;
+use crate::packets::packet::{Packet, self};
 use crate::Shared;
 use sim::{select, SimContext};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -113,24 +113,53 @@ impl Port {
                 if let Some(packet) = self.queue.front() {
                     let timeout = (packet.size as f64) * 8.0 / self.rate;
                     sim.advance(timeout).await;
+                    Some(packet.clone())
                 } else {
                     sim.advance(1.0).await;
+                    None
                 }
-                None
             };
-            match select(sim, send_action, receive_action).await {
-                Some(packet) => {
-                    self.packet_received(packet, sim);
-                }
-                None => {
-                    if let Some(packet) = self.queue.pop_front() {
-                        self.sender
-                            .send(packet.clone())
-                            .unwrap();
-                        self.packet_sent(packet, sim);
+
+
+            let (receive_result, send_result) = select(sim, receive_action, send_action).await;
+            println!("!!! {:?} {:?}", receive_result, send_result);
+            match (receive_result, send_result) {
+                (Some(receive), Some(send)) => {
+                    println!("Condition 1: both send and receive.");
+                    if let Some(packet) = receive {
+                        self.packet_received(packet, sim);
+                    }
+                    if let Some(_) = send {
+                        if let Some(packet) = self.queue.pop_front() {
+                            self.sender
+                                .send(packet.clone())
+                                .unwrap();
+                            self.packet_sent(packet, sim);
+                        }
                     }
                 }
+                (Some(receive), _) => {
+                    println!("Condition 2: only receive.");
+                    if let Some(packet) = receive {
+                        self.packet_received(packet, sim);
+                    }
+                }
+                (_, Some(send)) => {
+                    println!("Condition 3: only send.");
+                    if let Some(_) = send {
+                        if let Some(packet) = self.queue.pop_front() {
+                            self.sender
+                                .send(packet.clone())
+                                .unwrap();
+                            self.packet_sent(packet, sim);
+                        }
+                    }
+                }
+                (None, None) => {
+                    println!("Condition 4: Nothing.");
+                }
             }
+            
         }
 
     }
