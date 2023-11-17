@@ -3,9 +3,8 @@ use std::collections::VecDeque;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::SimContext;
+use sim::{select, SimContext};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
 
 pub struct Port {
     element_id: u32,
@@ -109,40 +108,22 @@ impl Port {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let (tx1, rx1) = oneshot::channel();
-            let (tx2, rx2) = oneshot::channel();
-
-            tokio::spawn(async {
-                let packet = self.receiver.recv().await.unwrap();
-                let _ = tx1.send(packet);
-            });
-
-            tokio::spawn(async {
-                if !self.queue.is_empty() {
-                    let _ = tx2.send(Some(true));
+            let receive_action = self.receiver.recv();
+            let send_action = async {
+                if let Some(packet) = self.queue.front() {
+                    let timeout = (packet.size as f64) * 8.0 / self.rate;
+                    sim.advance(timeout).await;
                 } else {
-                    // println!("wait before: {}", sim.now());
                     sim.advance(1.0).await;
-                    // println!("wait after: {}", sim.now());
-                    let _ = tx2.send(None);
                 }
-            });
-
-            tokio::select! {
-                val = rx1 => {
-                    if let Ok(packet) = val {
-                        self.packet_received(packet, sim);
-                    }
-                },
-                val = rx2 => {
-                    if let Ok(_) = val {
-                        let packet = self.queue.pop_front().unwrap();
-                        let timeout = (packet.size as f64) * 8.0 / self.rate;
-                        // Test the correctness of sim.advance
-                        println!("time before advance: {}", sim.now());
-                        sim.advance(timeout).await;
-                        println!("time after advence {}", sim.now());
-
+                None
+            };
+            match select(sim, send_action, receive_action).await {
+                Some(packet) => {
+                    self.packet_received(packet, sim);
+                }
+                None => {
+                    if let Some(packet) = self.queue.pop_front() {
                         self.sender
                             .send(packet.clone())
                             .unwrap();
@@ -151,5 +132,6 @@ impl Port {
                 }
             }
         }
+
     }
 }

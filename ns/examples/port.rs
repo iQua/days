@@ -8,12 +8,11 @@ use std::cell::RefCell;
 
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
-use ns::packets::packet::Packet;
 use ns::ports::port::Port;
 use ns::Shared;
 use ns::utils::utils::FixedDistribution;
 use sim::{Process, RandomVar, SimContext};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::unbounded_channel;
 
 const SEED: u64 = 1000;
 
