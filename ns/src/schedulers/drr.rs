@@ -2,9 +2,9 @@
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, select, Receiver, Sender, SimContext};
+use sim::{select, SimContext};
 use std::collections::{HashMap, VecDeque};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub struct DRRScheduler {
     element_id: u32,
     /// the bit rate of the port
@@ -201,20 +201,20 @@ pub struct DRRServer {
     server_rx: UnboundedReceiver<Packet>,
 
     /// a sender for sending packets
-    pub sender: Sender<Packet>,
+    pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving incoming packets
-    pub receiver: Receiver<Packet>,
+    pub receiver: UnboundedReceiver<Packet>,
 }
 
 impl DRRServer {
     pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
-        let (server_tx, scheduler_rx) = mpsc::unbounded_channel();
-        let (scheduler_tx, server_rx) = mpsc::unbounded_channel();
+        let (server_tx, scheduler_rx) = unbounded_channel();
+        let (scheduler_tx, server_rx) = unbounded_channel();
         DRRServer {
             element_id,
             drr_scheduler: DRRScheduler::new(element_id, rate, weights, scheduler_tx, scheduler_rx),
-            sender: channel().0,
-            receiver: channel().1,
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
             server_tx,
             server_rx,
         }
@@ -255,8 +255,7 @@ impl DRRServer {
                     println!("Before DRRServer send at time {}", sim.now());
                     self.sender
                         .send(packet.clone())
-                        .await
-                        .expect("no receiving element in the simulation");
+                        .unwrap();
 
                     println!(
                         "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",

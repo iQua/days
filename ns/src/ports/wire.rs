@@ -1,6 +1,7 @@
 //! A simple wire component.
 
 use rand_distr::Distribution;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct Wire<A>
 where
@@ -12,9 +13,9 @@ where
     /// the packet queue of the wire
     queue: VecDeque<(Packet, Time)>,
     /// a sender for sending packets
-    pub sender: Sender<Packet>,
+    pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving incoming packets
-    pub receiver: Receiver<Packet>,
+    pub receiver: UnboundedReceiver <Packet>,
 }
 
 impl<A> Wire<A>
@@ -26,8 +27,8 @@ where
             element_id,
             delay_dist,
             queue: VecDeque::new(),
-            sender: channel().0,
-            receiver: channel().1,
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
         }
     }
 
@@ -77,8 +78,7 @@ where
                     if let Some((packet, _)) = self.queue.pop_front() {
                         self.sender
                             .send(packet.clone())
-                            .await
-                            .expect("no receiving element in the simulation");
+                            .unwrap();
                         self.packet_sent(packet, sim);
                     }
                 }

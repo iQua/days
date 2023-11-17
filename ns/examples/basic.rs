@@ -7,14 +7,15 @@ use std::cell::RefCell;
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::Shared;
-use sim::{channel, Process, RandomVar, SimContext};
+use sim::{Process, RandomVar, SimContext};
+use tokio::sync::mpsc::unbounded_channel;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink = PacketSink::new(2);
 
-    let (sender, receiver) = channel();
+    let (sender, receiver) = unbounded_channel();
     // Creating a collection of packet generators
     for i in 0..2 {
         let mut generator = DistPacketGenerator::new(

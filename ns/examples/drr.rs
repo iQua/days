@@ -5,26 +5,28 @@ use rand_distr::Uniform;
 use std::{cell::RefCell, collections::HashMap};
 
 use ns::packets::dist_generator::DistPacketGenerator;
-use ns::packets::packet::Packet;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
 use ns::Shared;
 use ns::utils::utils::FixedDistribution;
 use ns::utils::splitter::Splitter;
-use sim::{channel, Process, RandomVar, Receiver, Sender, SimContext};
+use sim::{Process, RandomVar, SimContext};
+use tokio::sync::mpsc::unbounded_channel;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // initializes channels
-    let mut senders: Vec<Sender<Packet>> = Vec::new();
-    let mut receivers: Vec<Receiver<Packet>> = Vec::new();
-    for _ in 0..6 {
-        let (sender, receiver) = channel();
-        senders.push(sender);
-        receivers.push(receiver);
-    }
+
+    let (sender_0, receiver_0) = unbounded_channel();
+    let (sender_1, receiver_1) = unbounded_channel();
+    let (sender_2, receiver_2) = unbounded_channel();
+    let (sender_3, receiver_3) = unbounded_channel();
+    let (sender_4, receiver_4) = unbounded_channel();
+    let (sender_5, receiver_5) = unbounded_channel();
+
+
 
     // initializes packet generators
     let mut pg1 = DistPacketGenerator::new(
@@ -56,25 +58,25 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut splitter_2 = Splitter::new();
 
     // connects packet generators and splitters
-    pg1.sender = senders[0].clone();
-    pg2.sender = senders[1].clone();
-    splitter_1.receiver = receivers[0].clone();
-    splitter_2.receiver = receivers[1].clone();
+    pg1.sender = sender_0;
+    pg2.sender = sender_1;
+    splitter_1.receiver = receiver_0;
+    splitter_2.receiver = receiver_1;
 
     // connects splitters and the DRR server
-    splitter_1.sender_1 = senders[2].clone();
-    splitter_2.sender_1 = senders[2].clone();
-    drr_server.receiver = receivers[2].clone();
+    splitter_1.sender_1 = sender_2.clone();
+    splitter_2.sender_1 = sender_2.clone();
+    drr_server.receiver = receiver_2;
 
     // connects the DRR server and the packet sink
-    drr_server.sender = senders[3].clone();
-    ps.receiver = receivers[3].clone();
+    drr_server.sender = sender_3;
+    ps.receiver = receiver_3;
 
     // connects splitters and packet sinks
-    splitter_1.sender_2 = senders[4].clone();
-    splitter_2.sender_2 = senders[5].clone();
-    sink_1.receiver = receivers[4].clone();
-    sink_2.receiver = receivers[5].clone();
+    splitter_1.sender_2 = sender_4;
+    splitter_2.sender_2 = sender_5;
+    sink_1.receiver = receiver_4;
+    sink_2.receiver = receiver_5;
 
     // activates all network components
     sim.activate(pg1.run(sim));

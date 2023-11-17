@@ -3,7 +3,8 @@ use std::collections::VecDeque;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{channel, select, Receiver, Sender, SimContext};
+use sim::{select, SimContext};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct Port {
     element_id: u32,
@@ -26,9 +27,9 @@ pub struct Port {
     /// the packet queue of the port
     queue: VecDeque<Packet>,
     /// a sender for sending packets
-    pub sender: Sender<Packet>,
+    pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving incoming packets
-    pub receiver: Receiver<Packet>,
+    pub receiver: UnboundedReceiver<Packet>,
 }
 
 impl Port {
@@ -44,8 +45,8 @@ impl Port {
             packets_in_queue: 0,
             bytes_in_queue: 0,
             queue: VecDeque::new(),
-            sender: channel().0,
-            receiver: channel().1,
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
         }
     }
 
@@ -125,8 +126,7 @@ impl Port {
                     if let Some(packet) = self.queue.pop_front() {
                         self.sender
                             .send(packet.clone())
-                            .await
-                            .expect("no receiving element in the simulation");
+                            .unwrap();
                         self.packet_sent(packet, sim);
                     }
                 }
