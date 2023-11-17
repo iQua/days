@@ -602,7 +602,8 @@ where
     let or_completed_clone = or_completed.clone();
 
     // create a one-shot channel that reactivates the caller on write
-    let promise = &Promise::new(sim.active().waker());
+    let promise_either = &Promise::new(sim.active().waker());
+    let promise_or = &Promise::new(sim.active().waker());
 
     // this unsafe block shortens the guaranteed lifetimes of the processes
     // contained in the scheduler; it is safe because the constructed future
@@ -616,12 +617,12 @@ where
     let p1 = Process::new(sim.clone(), async move {
         let result = either.await;
         either_completed_clone.store(true, AtomicOrdering::SeqCst);
-        promise.fulfill(result);
+        promise_either.fulfill(result);
     });
     let p2 = Process::new(sim, async move {
         let result = or.await;
         or_completed_clone.store(true, AtomicOrdering::SeqCst);
-        promise.fulfill(result);
+        promise_or.fulfill(result);
     });
     // let p1 = Process::new(sim, async move {
     //     promise.fulfill(either.await);
@@ -639,7 +640,7 @@ where
 
 
     let result1 = if either_completed.load(AtomicOrdering::SeqCst) {
-        match promise.redeem() {
+        match promise_either.redeem() {
             Some(result) => Some(result),
             None => {
                 None
@@ -650,7 +651,7 @@ where
     };
     
     let result2 = if or_completed.load(AtomicOrdering::SeqCst) {
-        match promise.redeem() {
+        match promise_or.redeem() {
             Some(result) => Some(result),
             None => {
                 None
