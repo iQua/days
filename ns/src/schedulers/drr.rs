@@ -1,7 +1,6 @@
 //! Implements a Deficit Round Robin (DRR) server.
 
 use std::collections::{HashMap, VecDeque};
-use std::thread::current;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use sim::SimContext;
@@ -108,10 +107,8 @@ impl DRRScheduler {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-
-            let packet = self.receiver.recv().await.unwrap();
-            self.packet_received(packet, sim);
-
+            // receiving all outstanding packets from DDRServer while sending
+            // the previous packets to the downstream element
             loop {
                 match self.receiver.try_recv() {
                     Ok(packet) => {
@@ -123,74 +120,53 @@ impl DRRScheduler {
                 }
             }
 
-            println!("\nDRRScheduler queue at time {} before updating deficit: {:?}", sim.now(), self.queues);
-
+            // counting the number of packets in each queue
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
-
-            println!("Before update deficit, queue: {:?}", self.queues);
-            println!("Before update deficit, head_of_line: {:?}", self.head_of_line);
-
-            // Updating the deficit counters
             for (&queue_id, queue) in &self.queues {
-                if queue.len() > 0 || self.head_of_line.contains_key(&queue_id) {
-                    self.deficit.entry(queue_id).and_modify(|deficit| {
-                        *deficit += self.quantum.get(&queue_id).unwrap();
-                    });
-
-                    println!(
-                        "\nDRRScheduler {} deficit increased to {}, queue_id: {}\n",
-                        self.element_id,
-                        self.deficit.get(&queue_id).unwrap(),
-                        queue_id
-                    );
-                } 
-
                 flow_queue_count.insert(queue_id, queue.len() as u32);
             }
 
-            // Scheduling packets
+            // scheduling packets by going through each queue
             for (&queue_id, &count) in &flow_queue_count {
                 let mut current_length = count;
-                if self.head_of_line.contains_key(&queue_id) {
-                    current_length += 1;
+
+                // increase the deficit of the current queue if it is non-empty
+                if current_length > 0 || self.head_of_line.contains_key(&queue_id) {
+                    self.deficit.entry(queue_id).and_modify(|deficit| {
+                        *deficit += self.quantum.get(&queue_id).unwrap();
+                    });
+                } else {
+                    self.deficit.entry(queue_id).and_modify(|deficit| {
+                        *deficit = 0;
+                    });
                 }
 
-                let mut deficit = *self.deficit.get(&queue_id).unwrap();
+                let mut current_deficit = *self.deficit.get(&queue_id).unwrap();
 
-                println!(
-                    "\nDRRScheduler {} deficit: {}, queue_id: {}, count: {}, waiting: {}\n",
-                    self.element_id, deficit, queue_id, current_length, self.packets_waiting
-                );
-
-                while deficit > 0 && current_length > 0 {
+                while (current_deficit > 0 && current_length > 0)
+                    || self.head_of_line.contains_key(&queue_id)
+                {
                     let packet;
 
                     if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
                         packet = head_packet;
                     } else {
                         packet = self.queues.get_mut(&queue_id).unwrap().pop_front().unwrap();
+                        current_length -= 1;
                     }
 
-                    println!("packet size: {} deficit: {}", packet.size, deficit);
-                    if packet.size < deficit {
+                    if packet.size <= current_deficit {
                         // sending the packet out to the next element
                         self.byte_sizes.entry(queue_id).and_modify(|byte_size| {
                             *byte_size -= packet.size;
                         });
-
-                        self.deficit
-                            .entry(queue_id)
-                            .and_modify(|deficit| *deficit -= packet.size);
-
-                        println!("New deficit now is {}", self.deficit.get(&queue_id).unwrap());
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
                         let _ = self.sender.send(packet.clone());
 
                         self.packets_waiting -= 1;
-                        current_length -= 1;
-                        deficit -= packet.size;
+                        current_deficit -= packet.size;
 
                         println!(
                             "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -208,10 +184,16 @@ impl DRRScheduler {
                     }
                 }
 
-                if current_length == 0 && self.head_of_line.len() == 0{
-                    self.deficit
-                        .entry(queue_id)
-                        .and_modify(|deficit| *deficit = 0);
+                self.deficit
+                    .entry(queue_id)
+                    .and_modify(|deficit| *deficit = current_deficit);
+            } // finished going through each queue in one round
+
+            if self.packets_waiting == 0 {
+                if let Some(packet) = self.receiver.recv().await {
+                    self.packet_received(packet, sim);
+                } else {
+                    break;
                 }
             }
         }

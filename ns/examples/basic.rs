@@ -41,7 +41,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation
-    sim.advance(sim.shared().duration).await;
+    sim.advance(sim.shared().duration + 100.).await;
 }
 
 fn main() {
