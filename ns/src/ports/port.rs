@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-use sim::{select, SimContext};
+use sim::SimContext;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct Port {
@@ -108,22 +108,29 @@ impl Port {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let receive_action = self.receiver.recv();
+            let receive_action = async {
+                self.receiver.recv().await
+            };
+
             let send_action = async {
-                if let Some(packet) = self.queue.front() {
+                if let Some(packet) = self.queue.pop_front() {
                     let timeout = (packet.size as f64) * 8.0 / self.rate;
+                    println!("TIMEOUT of Port {}: {} at time {}", self.element_id, timeout, sim.now());
                     sim.advance(timeout).await;
+                    Some(packet)
                 } else {
                     sim.advance(1.0).await;
+                    None
                 }
-                None
             };
-            match select(sim, receive_action, send_action).await {
-                Some(packet) => {
-                    self.packet_received(packet, sim);
-                }
-                None => {
-                    if let Some(packet) = self.queue.pop_front() {
+
+            tokio::select! {
+                received_packet = receive_action => {
+                    self.packet_received(received_packet.unwrap(), sim);
+                },
+                packet_to_send = send_action => {
+                    if let Some(packet) = packet_to_send {
+                        println!("Before Send, the time in Port {} is {}", self.element_id, sim.now());
                         self.sender
                             .send(packet.clone())
                             .unwrap();
