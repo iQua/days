@@ -1,6 +1,7 @@
 //! Implements a Deficit Round Robin (DRR) server.
 
 use std::collections::{HashMap, VecDeque};
+use std::thread::current;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use sim::SimContext;
@@ -150,11 +151,15 @@ impl DRRScheduler {
             // Scheduling packets
             for (&queue_id, &count) in &flow_queue_count {
                 let mut current_length = count;
+                if self.head_of_line.contains_key(&queue_id) {
+                    current_length += 1;
+                }
+
                 let mut deficit = *self.deficit.get(&queue_id).unwrap();
 
                 println!(
-                    "\nDRRScheduler {} deficit: {}, queue_id: {}, count: {}\n",
-                    self.element_id, deficit, queue_id, count
+                    "\nDRRScheduler {} deficit: {}, queue_id: {}, count: {}, waiting: {}\n",
+                    self.element_id, deficit, queue_id, count, self.packets_waiting
                 );
 
                 while deficit > 0 && current_length > 0 {
@@ -164,9 +169,9 @@ impl DRRScheduler {
                         packet = head_packet;
                     } else {
                         packet = self.queues.get_mut(&queue_id).unwrap().pop_front().unwrap();
-                        current_length -= 1;
                     }
 
+                    println!("packet size: {} deficit: {}", packet.size, deficit);
                     if packet.size < deficit {
                         // sending the packet out to the next element
                         self.byte_sizes.entry(queue_id).and_modify(|byte_size| {
@@ -177,11 +182,13 @@ impl DRRScheduler {
                             .entry(queue_id)
                             .and_modify(|deficit| *deficit -= packet.size);
 
-                        self.packets_waiting -= 1;
-
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
                         let _ = self.sender.send(packet.clone());
+
+                        self.packets_waiting -= 1;
+                        current_length -= 1;
+                        deficit -= packet.size;
 
                         println!(
                             "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -193,8 +200,6 @@ impl DRRScheduler {
                             sim.now(),
                             self.queues.get(&packet.flow_id).unwrap().len(),
                         );
-
-                        deficit -= packet.size;
                     } else {
                         self.head_of_line.insert(queue_id, packet);
                         break;
