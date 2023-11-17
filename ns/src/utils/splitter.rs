@@ -22,8 +22,13 @@ impl Splitter {
     pub async fn run(mut self) {
         loop {
             if let Some(packet) = self.receiver.recv().await {
-                let _ = self.sender_1.send(packet.clone()).unwrap();
-                let _ = self.sender_2.send(packet.clone()).unwrap();
+                println!(
+                    "Splitter {} forwarded packet {} ({} bytes).",
+                    self.element_id, packet.packet_id, packet.size,
+                );
+
+                let _ = self.sender_1.send(packet.clone());
+                let _ = self.sender_2.send(packet.clone());
             } else {
                 break;
             }
