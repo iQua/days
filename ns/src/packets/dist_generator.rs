@@ -78,15 +78,12 @@ where
                 dst: "destination".to_string(),
             };
 
-            self.sender
-                .send(packet.clone())
-                .unwrap();
+            self.sender.send(packet.clone()).unwrap();
 
             self.packet_sent(sim, packet);
 
             let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
             sim.advance(interval).await;
-
         }
     }
 }

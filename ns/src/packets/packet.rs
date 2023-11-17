@@ -21,6 +21,7 @@ pub struct Packet {
     ///     src: "source".to_string(),
     ///     dst: "destination".to_string(),
     ///     flow_id: 0,
+    ///     time: sim.now(),
     /// };
 
     /// println!("{:?}", packet);
@@ -46,8 +47,8 @@ impl std::fmt::Display for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "id: {}, src: {}, time: {}, size: {}",
-            self.packet_id, self.src, self.time, self.size
+            "id: {}, src: {}, production time: {}, size: {}",
+            self.packet_id, self.src, self.production_time, self.size
         )
     }
 }
