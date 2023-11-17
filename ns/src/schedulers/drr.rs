@@ -105,21 +105,21 @@ impl DRRScheduler {
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    fn poll_packets(&mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // receiving all outstanding packets from DDRServer while sending
-            // the previous packets to the downstream element
-            loop {
-                match self.receiver.try_recv() {
-                    Ok(packet) => {
-                        self.packet_received(packet, sim);
-                    }
-                    Err(_) => {
-                        break;
-                    }
+            match self.receiver.try_recv() {
+                Ok(packet) => {
+                    self.packet_received(packet, sim);
+                }
+                Err(_) => {
+                    break;
                 }
             }
+        }
+    }
 
+    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+        loop {
             // counting the number of packets in each queue
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
             for (&queue_id, queue) in &self.queues {
@@ -167,6 +167,11 @@ impl DRRScheduler {
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
+
+                        // polls for and receives all outstanding packets from
+                        // DDRServer while sending the previous packets to the
+                        // downstream element
+                        self.poll_packets(sim);
 
                         println!(
                             "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
