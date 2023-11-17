@@ -108,23 +108,22 @@ impl DRRScheduler {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            if self.packets_waiting == 0 || self.head_of_line.len() > 0 {
-                let packet = self.receiver.recv().await.unwrap();
-                self.packet_received(packet, sim);
 
-                loop {
-                    match self.receiver.try_recv() {
-                        Ok(packet) => {
-                            self.packet_received(packet, sim);
-                        }
-                        Err(_) => {
-                            break;
-                        }
+            let packet = self.receiver.recv().await.unwrap();
+            self.packet_received(packet, sim);
+
+            loop {
+                match self.receiver.try_recv() {
+                    Ok(packet) => {
+                        self.packet_received(packet, sim);
+                    }
+                    Err(_) => {
+                        break;
                     }
                 }
-
-                println!("\nDRRScheduler queue at time {} before updating deficit: {:?}", sim.now(), self.queues);
             }
+
+            println!("\nDRRScheduler queue at time {} before updating deficit: {:?}", sim.now(), self.queues);
 
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
 
