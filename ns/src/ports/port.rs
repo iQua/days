@@ -5,6 +5,7 @@ use crate::packets::packet::Packet;
 use crate::Shared;
 use sim::SimContext;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 pub struct Port {
     element_id: u32,
@@ -108,25 +109,33 @@ impl Port {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            let receive_action = async {
-                self.receiver.recv().await
-            };
+            let (tx1, rx1) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
 
-            let send_action = async {
+            tokio::spawn(async {
+                let packet = self.receiver.recv().await.unwrap();
+                let _ = tx1.send(packet);
+            });
+
+            tokio::spawn(async {
                 if let Some(packet) = self.queue.pop_front() {
-                    Some(packet)
+                    let _ = tx2.send(Some(packet));
                 } else {
+                    println!("wait before: {}", sim.now());
                     sim.advance(1.0).await;
-                    None
+                    println!("wait after: {}", sim.now());
+                    let _ = tx2.send(None);
                 }
-            };
+            });
 
             tokio::select! {
-                received_packet = receive_action => {
-                    self.packet_received(received_packet.unwrap(), sim);
+                val = rx1 => {
+                    if let Ok(packet) = val {
+                        self.packet_received(packet, sim);
+                    }
                 },
-                packet_to_send = send_action => {
-                    if let Some(packet) = packet_to_send {
+                val = rx2 => {
+                    if let Ok(Some(packet)) = val {
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         // Test the correctness of sim.advance
                         println!("time before advance: {}", sim.now());
