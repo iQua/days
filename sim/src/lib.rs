@@ -624,12 +624,6 @@ where
         or_completed_clone.store(true, AtomicOrdering::SeqCst);
         promise_or.fulfill(result);
     });
-    // let p1 = Process::new(sim, async move {
-    //     promise.fulfill(either.await);
-    // });
-    // let p2 = Process::new(sim, async move {
-    //     promise.fulfill(or.await);
-    // });
 
     // activate them
     sim.reactivate(p1.clone());
@@ -637,7 +631,6 @@ where
 
     // wait for reactivation; the promise will wake us on fulfillment
     sleep().await;
-
 
     let result1 = if either_completed.load(AtomicOrdering::SeqCst) {
         match promise_either.redeem() {
@@ -668,7 +661,6 @@ where
 
     // extract the promised value
     (result1, result2)
-    // promise.redeem().unwrap()
 }
 
 /// Complex channel with space for infinitely many elements of arbitrary type.
