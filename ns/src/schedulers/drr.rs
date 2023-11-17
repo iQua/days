@@ -222,67 +222,24 @@ impl DRRServer {
         sim.activate(self.drr_scheduler.run(sim));
 
         loop {
-            // trying to receive all the packets accumulated in the channel from
-            // upstream elements
-            // loop {
-            //     match self.receiver.try_recv() {
-            //         Ok(packet) => {
-            //             println!(
-            //                 "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            //                 self.element_id,
-            //                 packet.packet_id,
-            //                 packet.size,
-            //                 packet.flow_id,
-            //                 sim.now(),
-            //             );
-            //             let _ = self.server_tx.send(packet);
-            //         }
-            //         Err(_) => {
-            //             break;
-            //         }
-            //     }
-            // }
-
-            // // trying to send all the packets from the DRR scheduler
-            // loop {
-            //     match self.server_rx.try_recv() {
-            //         Ok(mut packet) => {
-            //             packet.time = sim.now();
-            //             let _ = self.sender.send(packet.clone());
-
-            //             println!(
-            //                 "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
-            //                 self.element_id,
-            //                 packet.packet_id,
-            //                 packet.size,
-            //                 packet.flow_id,
-            //                 sim.now(),
-            //             );
-            //         }
-            //         Err(_) => {
-            //             break;
-            //         }
-            //     }
-            // }
-
             // waiting for the next packet to arrive from either upstream elements or DRRScheduler
             tokio::select! {
                 Some(packet) = self.receiver.recv() => {
-                    let _ = self.server_tx.send(packet.clone());
                     println!(
-                        "DRRServer {} received (in select) packet {} ({} bytes) from flow {} at time {:.3}.",
+                        "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}.",
                         self.element_id,
                         packet.packet_id,
                         packet.size,
                         packet.flow_id,
                         sim.now(),
                     );
+                    let _ = self.server_tx.send(packet.clone());
                 }
                 Some(mut packet) = self.server_rx.recv() => {
                     packet.time = sim.now();
                     let _ = self.sender.send(packet.clone());
                     println!(
-                        "DRRServer {} sent (in select) packet {} ({} bytes) from flow {} at time {:.3}.",
+                        "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
                         self.element_id,
                         packet.packet_id,
                         packet.size,

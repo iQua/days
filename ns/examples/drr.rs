@@ -7,16 +7,15 @@ use std::{cell::RefCell, collections::HashMap};
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
-use ns::Shared;
-use ns::utils::utils::FixedDistribution;
 use ns::utils::splitter::Splitter;
+use ns::utils::utils::FixedDistribution;
+use ns::Shared;
 use sim::{Process, RandomVar, SimContext};
 use tokio::sync::mpsc::unbounded_channel;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-
     // initializes channels
 
     let (sender_0, receiver_0) = unbounded_channel();
@@ -25,8 +24,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let (sender_3, receiver_3) = unbounded_channel();
     let (sender_4, receiver_4) = unbounded_channel();
     let (sender_5, receiver_5) = unbounded_channel();
-
-
 
     // initializes packet generators
     let mut pg1 = DistPacketGenerator::new(
@@ -52,10 +49,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     weights.insert(0, 1);
     weights.insert(1, 2);
     let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights);
-    
+
     // initializes splitters
-    let mut splitter_1 = Splitter::new();
-    let mut splitter_2 = Splitter::new();
+    let mut splitter_1 = Splitter::new(3);
+    let mut splitter_2 = Splitter::new(4);
 
     // connects packet generators and splitters
     pg1.sender = sender_0;
@@ -89,7 +86,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     sim.activate(sink_2.run(sim));
 
     // waiting for the end of this simulation
-    sim.advance(sim.shared().duration).await;
+    sim.advance(sim.shared().duration + 100.0).await;
 }
 
 fn main() {
