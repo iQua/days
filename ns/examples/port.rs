@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::ports::port::Port;
-use ns::Shared;
 use ns::utils::utils::FixedDistribution;
+use ns::Shared;
 use sim::{Process, RandomVar, SimContext};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -42,7 +42,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation
-    sim.advance(sim.shared().duration).await;
+    sim.advance(sim.shared().duration + 100.).await;
 }
 
 fn main() {
