@@ -7,7 +7,7 @@ use sim::SimContext;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
-pub struct DRRScheduler {
+pub struct DRRServer {
     element_id: u32,
     /// the bit rate of the port
     rate: f64,
@@ -40,18 +40,13 @@ pub struct DRRScheduler {
     pub receiver: UnboundedReceiver<Packet>,
 }
 
-impl DRRScheduler {
-    pub fn new(
-        element_id: u32,
-        rate: f64,
-        weights: HashMap<u32, u32>,
-        sender: UnboundedSender<Packet>,
-        receiver: UnboundedReceiver<Packet>,
-    ) -> DRRScheduler {
+impl DRRServer {
+    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
         let min_quantum = 1500;
         let mut deficit = HashMap::new();
         let mut quantum = HashMap::new();
         let mut byte_sizes = HashMap::new();
+        let (sender, receiver) = unbounded_channel();
 
         let min_weight = weights.values().min().unwrap();
         for (class_id, weight) in &weights {
@@ -62,7 +57,7 @@ impl DRRScheduler {
 
         println!("weights: {:?};\nquantum: {:?}", weights, quantum);
         // TODO: add the usage of flow_classes!
-        DRRScheduler {
+        DRRServer {
             element_id,
             rate,
             flow_classes: Box::new(|flow_id| flow_id),
@@ -92,7 +87,7 @@ impl DRRScheduler {
             .and_modify(|byte_size| *byte_size += packet.size);
 
         println!(
-            "DRRScheduler {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in class queue {}.",
             self.element_id,
             packet.packet_id,
@@ -176,7 +171,7 @@ impl DRRScheduler {
                         current_length = self.poll_packets(queue_id, sim);
 
                         println!(
-                            "DRRScheduler {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+                            "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                                     {} packets in the flow queue.",
                             self.element_id,
                             packet.packet_id,
@@ -201,74 +196,6 @@ impl DRRScheduler {
                     self.packet_received(packet, sim);
                 } else {
                     break;
-                }
-            }
-        }
-    }
-}
-
-pub struct DRRServer {
-    element_id: u32,
-    /// a packet scheduler using the Deficit Round Robin algorithm
-    drr_scheduler: DRRScheduler,
-
-    server_tx: UnboundedSender<Packet>,
-    server_rx: UnboundedReceiver<Packet>,
-
-    /// a sender for sending packets
-    pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving incoming packets
-    pub receiver: UnboundedReceiver<Packet>,
-}
-
-impl DRRServer {
-    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
-        let (server_tx, scheduler_rx) = unbounded_channel();
-        let (scheduler_tx, server_rx) = unbounded_channel();
-        DRRServer {
-            element_id,
-            drr_scheduler: DRRScheduler::new(element_id, rate, weights, scheduler_tx, scheduler_rx),
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
-            server_tx,
-            server_rx,
-        }
-    }
-
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        sim.activate(self.drr_scheduler.run(sim));
-
-        loop {
-            // waiting for the next packet to arrive from either upstream elements or DRRScheduler
-            tokio::select! {
-                Some(packet) = self.receiver.recv() => {
-                    println!(
-                        "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-                        self.element_id,
-                        packet.packet_id,
-                        packet.size,
-                        packet.flow_id,
-                        sim.now(),
-                    );
-                    let _ = self.server_tx.send(packet.clone());
-                }
-                Some(mut packet) = self.server_rx.recv() => {
-                    packet.time = sim.now();
-                    let _ = self.sender.send(packet.clone());
-                    println!(
-                        "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
-                        self.element_id,
-                        packet.packet_id,
-                        packet.size,
-                        packet.flow_id,
-                        sim.now(),
-                    );
-                }
-                else => {
-                    panic!(
-                        "Port {}: an upstream element may have closed its channel.",
-                        self.element_id
-                    );
                 }
             }
         }
