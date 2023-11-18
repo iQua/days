@@ -127,7 +127,7 @@ impl Port {
                     sim.advance(packet.size as f64 * 8.0 / self.rate).await;
 
                     packet.time = sim.now();
-                    self.sender.send(packet.clone()).unwrap();
+                    let _ = self.sender.send(packet.clone());
                     self.packet_sent(packet, sim);
                 } else {
                     break;

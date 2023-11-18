@@ -7,6 +7,7 @@ use sim::SimContext;
 
 use crate::packets::packet::Packet;
 use crate::Shared;
+
 pub struct DRRServer {
     element_id: u32,
     /// the bit rate of the port
@@ -34,9 +35,9 @@ pub struct DRRServer {
     /// class_id -> its FIFO queue
     queues: HashMap<u32, VecDeque<Packet>>,
 
-    /// a sender for sending packets to the DRR server
+    /// a sender for sending outbound packets to the downstream element
     pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving incoming packets from the DRR server
+    /// a receiver for receiving inbound packets from upstream elements
     pub receiver: UnboundedReceiver<Packet>,
 }
 
@@ -55,8 +56,6 @@ impl DRRServer {
             byte_sizes.insert(*class_id, 0);
         }
 
-        println!("weights: {:?};\nquantum: {:?}", weights, quantum);
-        // TODO: add the usage of flow_classes!
         DRRServer {
             element_id,
             rate,
@@ -117,22 +116,23 @@ impl DRRServer {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // counting the number of packets in each queue
+            // counts the number of packets in each queue
             let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
             for (&queue_id, queue) in &self.queues {
                 flow_queue_count.insert(queue_id, queue.len() as u32);
             }
 
-            // scheduling packets by going through each queue
+            // schedules packets by going through each queue
             for (&queue_id, &count) in &flow_queue_count {
                 let mut current_length = count;
 
-                // increase the deficit of the current queue if it is non-empty
+                // increases the deficit of the current queue if it is non-empty
                 if current_length > 0 || self.head_of_line.contains_key(&queue_id) {
                     self.deficit.entry(queue_id).and_modify(|deficit| {
                         *deficit += self.quantum.get(&queue_id).unwrap();
                     });
                 } else {
+                    // resets to zero if the queue is empty
                     self.deficit.entry(queue_id).and_modify(|deficit| {
                         *deficit = 0;
                     });
@@ -143,7 +143,7 @@ impl DRRServer {
                 while (current_deficit > 0 && current_length > 0)
                     || self.head_of_line.contains_key(&queue_id)
                 {
-                    let packet;
+                    let mut packet;
 
                     if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
                         packet = head_packet;
@@ -152,22 +152,23 @@ impl DRRServer {
                     }
 
                     if packet.size <= current_deficit {
-                        // sending the packet out to the next element
+                        // sends the packet out to the next element
                         self.byte_sizes.entry(queue_id).and_modify(|byte_size| {
                             *byte_size -= packet.size;
                         });
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
+                        packet.time = sim.now();
                         let _ = self.sender.send(packet.clone());
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
 
-                        // Polls for and receives all outstanding packets from
+                        // polls for and receives all outstanding packets from
                         // DDRServer while sending the previous packets to the
-                        // downstream element. Updates the length of the current
-                        // queue.
+                        // downstream element
+                        // updates the length of the current queue
                         current_length = self.poll_packets(queue_id, sim);
 
                         println!(
@@ -189,8 +190,9 @@ impl DRRServer {
                 self.deficit
                     .entry(queue_id)
                     .and_modify(|deficit| *deficit = current_deficit);
-            } // finished going through each queue in one round
+            } // finishes going through each queue in one round
 
+            // waits for inbound packets from the upstream element
             if self.packets_waiting == 0 {
                 if let Some(packet) = self.receiver.recv().await {
                     self.packet_received(packet, sim);

@@ -80,10 +80,9 @@ where
                 dst: "destination".to_string(),
             };
 
-            self.sender.send(packet.clone()).unwrap();
+            let _ = self.sender.send(packet.clone());
 
             self.packet_sent(sim, packet);
-
         }
     }
 }
