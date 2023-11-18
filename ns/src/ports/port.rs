@@ -110,28 +110,17 @@ impl Port {
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             // trying to receive all the packets accumulated in the channel
-            loop {
-                match self.receiver.try_recv() {
-                    Ok(packet) => {
-                        self.packet_received(packet, sim);
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
+            while let Ok(packet) = self.receiver.try_recv() {
+                self.packet_received(packet, sim);
             }
 
             // sending all packets in an FIFO order to the downstream element
-            loop {
-                if let Some(mut packet) = self.queue.pop_front() {
-                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+            while let Some(mut packet) = self.queue.pop_front() {
+                sim.advance(packet.size as f64 * 8.0 / self.rate).await;
 
-                    packet.time = sim.now();
-                    let _ = self.sender.send(packet.clone());
-                    self.packet_sent(packet, sim);
-                } else {
-                    break;
-                }
+                packet.time = sim.now();
+                let _ = self.sender.send(packet.clone());
+                self.packet_sent(packet, sim);
             }
 
             // waiting for the next packet to arrive from the upstream elements

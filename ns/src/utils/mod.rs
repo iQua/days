@@ -1,2 +1,2 @@
-pub mod utils;
+pub mod distribution;
 pub mod splitter;

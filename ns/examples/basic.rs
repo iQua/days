@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::ports::wire::Wire;
-use ns::utils::utils::FixedDistribution;
+use ns::utils::distribution::FixedDistribution;
 use ns::Shared;
 use sim::{Process, RandomVar, SimContext};
 use tokio::sync::mpsc::unbounded_channel;

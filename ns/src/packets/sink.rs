@@ -64,12 +64,8 @@ impl PacketSink {
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        loop {
-            if let Some(packet) = self.receiver.recv().await {
-                self.packet_received(packet, sim);
-            } else {
-                break;
-            }
+        while let Some(packet) = self.receiver.recv().await {
+            self.packet_received(packet, sim);
         }
     }
 }
