@@ -80,17 +80,8 @@ where
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        loop {
-            loop {
-                if let Some(packet) = self.receiver.recv().await {
-                    self.forward_packet(packet, sim).await;
-                } else {
-                    panic!(
-                        "Wire {}: an upstream element may have closed its channel.",
-                        self.element_id
-                    );
-                }
-            }
+        while let Some(packet) = self.receiver.recv().await {
+            self.forward_packet(packet, sim).await;
         }
     }
 }

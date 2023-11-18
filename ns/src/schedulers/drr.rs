@@ -78,7 +78,7 @@ impl DRRServer {
 
         self.queues
             .entry(packet.flow_id)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_back(packet.clone());
 
         self.byte_sizes
@@ -100,15 +100,8 @@ impl DRRServer {
     }
 
     fn poll_packets(&mut self, queue_id: u32, sim: SimContext<'_, Shared>) -> u32 {
-        loop {
-            match self.receiver.try_recv() {
-                Ok(packet) => {
-                    self.packet_received(packet, sim);
-                }
-                Err(_) => {
-                    break;
-                }
-            }
+        while let Ok(packet) = self.receiver.try_recv() {
+            self.packet_received(packet, sim);
         }
 
         self.queues.get(&queue_id).unwrap().len() as u32
