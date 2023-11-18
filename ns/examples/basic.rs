@@ -1,13 +1,11 @@
 //! A basic example where two packet generators sends packets to a sink.
 
 use rand::{rngs::SmallRng, SeedableRng};
-use rand_distr::{Exp, Uniform};
 use std::cell::RefCell;
-
+use statrs::distribution::{Exp, Uniform, DiscreteUniform};
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::ports::wire::Wire;
-use ns::utils::utils::FixedDistribution;
 use ns::Shared;
 use sim::{Process, RandomVar, SimContext};
 use tokio::sync::mpsc::unbounded_channel;
@@ -16,7 +14,7 @@ const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink = PacketSink::new(2);
-    let mut wire = Wire::new(1, Box::new(|| FixedDistribution(2.00)));
+    let mut wire = Wire::new(1, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
     let (sender_1, receiver_1) = unbounded_channel();
     let (sender_2, receiver_2) = unbounded_channel();
@@ -27,7 +25,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
             i,
             1.0,
             Box::new(|| Exp::new(1.).unwrap()),
-            Box::new(|| Uniform::new(1000, 1500)),
+            Box::new(|| DiscreteUniform::new(1000, 1500).unwrap()),
         );
         generator.sender = sender_1.clone();
         sim.activate(generator.run(sim));

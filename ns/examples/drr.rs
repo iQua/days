@@ -1,14 +1,13 @@
 //! TODO
 
 use rand::{rngs::SmallRng, SeedableRng};
-use rand_distr::Uniform;
+use statrs::distribution::{Uniform, DiscreteUniform};
 use std::{cell::RefCell, collections::HashMap};
 
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
 use ns::utils::splitter::Splitter;
-use ns::utils::utils::FixedDistribution;
 use ns::Shared;
 use sim::{Process, RandomVar, SimContext};
 use tokio::sync::mpsc::unbounded_channel;
@@ -29,14 +28,14 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut pg1 = DistPacketGenerator::new(
         0,
         0.0,
-        Box::new(|| FixedDistribution(1.75)),
-        Box::new(|| Uniform::new(1000, 1001)),
+        Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
+        Box::new(|| DiscreteUniform::new(1000, 1000).unwrap()),
     );
     let mut pg2 = DistPacketGenerator::new(
         1,
         1.0,
-        Box::new(|| FixedDistribution(1.75)),
-        Box::new(|| Uniform::new(1000, 1001)),
+        Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
+        Box::new(|| DiscreteUniform::new(1000, 1000).unwrap()),
     );
 
     // initializes packet sinks
@@ -47,7 +46,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes the DRR server
     let mut weights = HashMap::new();
     weights.insert(0, 1);
-    weights.insert(1, 1);
+    weights.insert(1, 2);
     let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights);
 
     // initializes splitters
@@ -86,7 +85,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     sim.activate(sink_2.run(sim));
 
     // waiting for the end of this simulation
-    sim.advance(sim.shared().duration + 100.).await;
+    sim.advance(sim.shared().duration + 20.).await;
 }
 
 fn main() {

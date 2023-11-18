@@ -3,14 +3,14 @@
 use crate::packets::packet::Packet;
 use crate::Shared;
 
-use rand_distr::Distribution;
+use statrs::statistics::Distribution;
 use sim::{SimContext, Time};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 pub struct DistPacketGenerator<A, B>
 where
     A: Distribution<Time>,
-    B: Distribution<u32>,
+    B: Distribution<f64>,
 {
     element_id: u32,
     initial_delay: Time,
@@ -23,7 +23,7 @@ where
 impl<A, B> DistPacketGenerator<A, B>
 where
     A: Distribution<Time>,
-    B: Distribution<u32>,
+    B: Distribution<f64>,
 {
     pub fn new(
         element_id: u32,
@@ -68,7 +68,7 @@ where
         while sim.now() < sim.shared().duration {
             let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
             sim.advance(interval).await;
-            let packet_size = (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+            let packet_size = (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut()) as u32;
 
             let packet = Packet {
                 production_time: sim.now(),

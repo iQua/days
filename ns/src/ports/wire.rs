@@ -1,8 +1,7 @@
 //! A simple wire component.
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-use rand_distr::Distribution;
+use statrs::statistics::Distribution;
 use sim::{SimContext, Time};
 
 use crate::packets::packet::Packet;
