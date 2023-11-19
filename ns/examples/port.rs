@@ -6,10 +6,10 @@ use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::Uniform;
 use std::cell::RefCell;
 
-use ns::packets::dist_generator::DistPacketGenerator;
-use ns::packets::sink::PacketSink;
-use ns::ports::port::Port;
-use ns::{connect, connect_one, Shared};
+use due::packets::dist_generator::DistPacketGenerator;
+use due::packets::sink::PacketSink;
+use due::ports::port::Port;
+use due::{connect, connect_pair, Shared};
 use sim::{Process, RandomVar, SimContext};
 
 const SEED: u64 = 1000;
@@ -34,7 +34,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect(&mut generators, &mut port);
 
     // connects the port to the sink
-    connect_one(&mut port, &mut sink);
+    connect_pair(&mut port, &mut sink);
 
     for generator in generators {
         sim.activate(generator.run(sim));

@@ -34,7 +34,7 @@ pub fn connect(upstream: &mut [impl Element], downstream: &mut impl Element) {
     (*downstream).connect_receiver(receiver);
 }
 
-pub fn connect_one(upstream: &mut impl Element, downstream: &mut impl Element) {
+pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
     upstream.connect_sender(sender);

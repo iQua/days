@@ -7,9 +7,9 @@ use std::{
     future::Future,
     pin::Pin,
     rc::{Rc, Weak},
-    task::{self, Context, Poll},
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+    sync::Arc,
+    task::{self, Context, Poll},
 };
 
 // simple time type
@@ -588,7 +588,11 @@ impl<T> Promise<T> {
 /// function cannot outlive its returned future, enabling us to allow
 /// references to variables in the local scope. The passed futures may
 /// compute a value, as long as the return type is identical in both cases.
-pub async fn select<'s, 'u, G, E, O, R>(sim: SimContext<'s, G>, either: E, or: O) -> (Option<R>, Option<R>)
+pub async fn select<'s, 'u, G, E, O, R>(
+    sim: SimContext<'s, G>,
+    either: E,
+    or: O,
+) -> (Option<R>, Option<R>)
 where
     E: Future<Output = R> + 'u,
     O: Future<Output = R> + 'u,
@@ -635,20 +639,16 @@ where
     let result1 = if either_completed.load(AtomicOrdering::SeqCst) {
         match promise_either.redeem() {
             Some(result) => Some(result),
-            None => {
-                None
-            }
+            None => None,
         }
     } else {
         None
     };
-    
+
     let result2 = if or_completed.load(AtomicOrdering::SeqCst) {
         match promise_or.redeem() {
             Some(result) => Some(result),
-            None => {
-                None
-            }
+            None => None,
         }
     } else {
         None

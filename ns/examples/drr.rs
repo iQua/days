@@ -2,17 +2,17 @@
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collectiodue::HashMap};
 
 use tokio::sync::mpsc::unbounded_channel;
 
 use sim::{Process, RandomVar, SimContext};
 
-use ns::packets::dist_generator::DistPacketGenerator;
-use ns::packets::sink::PacketSink;
-use ns::schedulers::drr::DRRServer;
-use ns::utils::splitter::Splitter;
-use ns::{connect_one, Shared};
+use due::packets::dist_generator::DistPacketGenerator;
+use due::packets::sink::PacketSink;
+use due::schedulers::drr::DRRServer;
+use due::utils::splitter::Splitter;
+use due::{connect_pair, Shared};
 
 const SEED: u64 = 1000;
 
@@ -61,7 +61,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     drr_server.receiver = receiver_2;
 
     // connects the DRR server and the packet sink
-    connect_one(&mut drr_server, &mut ps);
+    connect_pair(&mut drr_server, &mut ps);
 
     // connects splitters and packet sinks
     let (sender_4, receiver_4) = unbounded_channel();

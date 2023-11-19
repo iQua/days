@@ -1,9 +1,9 @@
 //! A basic example where two packet generators sends packets to a sink.
 
-use ns::packets::dist_generator::DistPacketGenerator;
-use ns::packets::sink::PacketSink;
-use ns::ports::wire::Wire;
-use ns::{connect, connect_one, Shared};
+use due::packets::dist_generator::DistPacketGenerator;
+use due::packets::sink::PacketSink;
+use due::ports::wire::Wire;
+use due::{connect, connect_pair, Shared};
 
 use rand::{rngs::SmallRng, SeedableRng};
 use sim::{Process, RandomVar, SimContext};
@@ -31,7 +31,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // connects the generators to the wire
     connect(&mut generators, &mut wire);
     // connects the wire to the sink
-    connect_one(&mut wire, &mut sink);
+    connect_pair(&mut wire, &mut sink);
 
     for generator in generators {
         sim.activate(generator.run(sim));
