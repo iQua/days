@@ -12,7 +12,7 @@ use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
 use ns::utils::splitter::Splitter;
-use ns::{Element, Shared};
+use ns::Shared;
 
 const SEED: u64 = 1000;
 
