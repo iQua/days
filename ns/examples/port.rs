@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::ports::port::Port;
-use ns::{connect, Shared};
+use ns::{connect, connect_one, Shared};
 use sim::{Process, RandomVar, SimContext};
 
 const SEED: u64 = 1000;
@@ -34,16 +34,12 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect(&mut generators, &mut port);
 
     // connects the port to the sink
-    let mut ports = Vec::new();
-    ports.push(port);
-    connect(&mut ports, &mut sink);
+    connect_one(&mut port, &mut sink);
 
     for generator in generators {
         sim.activate(generator.run(sim));
     }
-    for port in ports {
-        sim.activate(port.run(sim));
-    }
+    sim.activate(port.run(sim));
     sim.activate(sink.run(sim));
 
     // waits for the end of this simulation

@@ -12,7 +12,7 @@ use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
 use ns::utils::splitter::Splitter;
-use ns::Shared;
+use ns::{connect_one, Shared};
 
 const SEED: u64 = 1000;
 
@@ -61,9 +61,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     drr_server.receiver = receiver_2;
 
     // connects the DRR server and the packet sink
-    let (sender_3, receiver_3) = unbounded_channel();
-    drr_server.sender = sender_3;
-    ps.receiver = receiver_3;
+    connect_one(&mut drr_server, &mut ps);
 
     // connects splitters and packet sinks
     let (sender_4, receiver_4) = unbounded_channel();

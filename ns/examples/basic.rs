@@ -3,7 +3,7 @@
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::ports::wire::Wire;
-use ns::{connect, Shared};
+use ns::{connect, connect_one, Shared};
 
 use rand::{rngs::SmallRng, SeedableRng};
 use sim::{Process, RandomVar, SimContext};
@@ -30,18 +30,13 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // connects the generators to the wire
     connect(&mut generators, &mut wire);
-
     // connects the wire to the sink
-    let mut wires = Vec::new();
-    wires.push(wire);
-    connect(&mut wires, &mut sink);
+    connect_one(&mut wire, &mut sink);
 
     for generator in generators {
         sim.activate(generator.run(sim));
     }
-    for wire in wires {
-        sim.activate(wire.run(sim));
-    }
+    sim.activate(wire.run(sim));
     sim.activate(sink.run(sim));
 
     // waits for the end of this simulation
