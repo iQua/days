@@ -31,5 +31,7 @@ impl Splitter {
             let _ = self.sender_1.send(packet.clone());
             let _ = self.sender_2.send(packet.clone());
         }
+
+        println!("Splitter {} finished running.", self.element_id);
     }
 }

@@ -14,7 +14,7 @@ use crate::sim::{RandomVar, Time};
 /// Globally shared data.
 pub struct Shared {
     pub rng: RefCell<SmallRng>,
-    pub packet_size: RandomVar,
+    pub queueing_delay: RandomVar,
     pub duration: Time,
 }
 

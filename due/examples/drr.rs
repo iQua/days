@@ -43,8 +43,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights);
 
     // initializes splitters
-    let mut splitter_1 = Splitter::new(3);
-    let mut splitter_2 = Splitter::new(4);
+    let mut splitter_1 = Splitter::new(1);
+    let mut splitter_2 = Splitter::new(2);
 
     // connects packet generators and splitters
     let (sender_0, receiver_0) = unbounded_channel();
@@ -59,6 +59,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     splitter_1.sender_1 = sender_2.clone();
     splitter_2.sender_1 = sender_2.clone();
     drr_server.receiver = receiver_2;
+    drop(sender_2);
 
     // connects the DRR server and the packet sink
     connect_pair(&mut drr_server, &mut ps);
@@ -82,21 +83,21 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     sim.activate(sink_2.run(sim));
 
     // waiting for the end of this simulation
-    sim.advance(sim.shared().duration + 20.).await;
+    sim.advance(sim.shared().duration + 100.).await;
 }
 
 fn main() {
     let outcome = simulation(
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
-            packet_size: RandomVar::new(),
+            queueing_delay: RandomVar::new(),
             duration: 20.,
         },
         |sim| Process::new(sim, network_sim(sim)),
     );
 
     println!(
-        "Statistics on packet sizes in this simulation: {:#.3}",
-        outcome.packet_size
+        "Statistics on queueing delay in this simulation: {:#.3}",
+        outcome.queueing_delay
     );
 }

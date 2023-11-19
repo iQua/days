@@ -1,4 +1,4 @@
-//! This example shows hw that four packet generators sends packets to a sink via two
+//! In this example, four packet generators send packets to a sink via two
 //! ports, where their queues are limited by bytes and packet numbers,
 //! respectively.
 
@@ -50,14 +50,14 @@ fn main() {
     let outcome = simulation(
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
-            packet_size: RandomVar::new(),
+            queueing_delay: RandomVar::new(),
             duration: 5.,
         },
         |sim| Process::new(sim, network_sim(sim)),
     );
 
     println!(
-        "Statistics on packet sizes in this simulation: {:#.3}",
-        outcome.packet_size
+        "Statistics on queueing delay in this simulation: {:#.3}",
+        outcome.queueing_delay
     );
 }
