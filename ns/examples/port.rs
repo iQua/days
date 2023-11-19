@@ -30,10 +30,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut port = Port::new(0, (1000 * 8) as f64, 100, false);
     let mut sink = PacketSink::new(0);
 
-    // Connecting the generators to the port
+    // connects the generators to the port
     connect(&mut generators, &mut port);
 
-    // Connecting the port to the sink
+    // connects the port to the sink
     let mut ports = Vec::new();
     ports.push(port);
     connect(&mut ports, &mut sink);
@@ -46,7 +46,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     }
     sim.activate(sink.run(sim));
 
-    // waiting for the end of this simulation
+    // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
 }
 

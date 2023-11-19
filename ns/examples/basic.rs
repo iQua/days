@@ -16,7 +16,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink = PacketSink::new(2);
     let mut wire = Wire::new(1, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
-    // Creating a collection of packet generators
+    // creates a collection of packet generators
     let mut generators = Vec::new();
     for i in 0..2 {
         let generator = DistPacketGenerator::new(
@@ -28,10 +28,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         generators.push(generator);
     }
 
-    // Connecting the generators to the wire
+    // connects the generators to the wire
     connect(&mut generators, &mut wire);
 
-    // Connecting the wire to the sink
+    // connects the wire to the sink
     let mut wires = Vec::new();
     wires.push(wire);
     connect(&mut wires, &mut sink);
@@ -44,7 +44,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     }
     sim.activate(sink.run(sim));
 
-    // waiting for the end of this simulation
+    // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
 }
 
