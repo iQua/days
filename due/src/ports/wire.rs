@@ -1,12 +1,11 @@
 //! A simple wire component.
 
+use crate::sim::{SimContext, Time};
+use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use rand_distr::Distribution;
-use sim::{SimContext, Time};
-
 use crate::packets::packet::Packet;
-use crate::Shared;
+use crate::{Element, Shared};
 
 pub struct Wire<A>
 where
@@ -18,10 +17,23 @@ where
     /// the time of the last sent packet, used to calculate the delay of the
     /// next packet
     last_sent: Time,
-    /// the packet queue of the wire
+    /// the sender for sending outbound packets
     pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving incoming packets
+    /// a receiver for receiving inbound packets
     pub receiver: UnboundedReceiver<Packet>,
+}
+
+impl<A> Element for Wire<A>
+where
+    A: Distribution<Time>,
+{
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl<A> Wire<A>
@@ -81,17 +93,8 @@ where
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        loop {
-            loop {
-                if let Some(packet) = self.receiver.recv().await {
-                    self.forward_packet(packet, sim).await;
-                } else {
-                    panic!(
-                        "Wire {}: an upstream element may have closed its channel.",
-                        self.element_id
-                    );
-                }
-            }
+        while let Some(packet) = self.receiver.recv().await {
+            self.forward_packet(packet, sim).await;
         }
     }
 }

@@ -1,16 +1,16 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
-use crate::packets::packet::Packet;
-use crate::Shared;
+use statrs::statistics::Distribution;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use rand_distr::Distribution;
-use sim::{SimContext, Time};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use crate::packets::packet::Packet;
+use crate::sim::{SimContext, Time};
+use crate::{Element, Shared};
 
 pub struct DistPacketGenerator<A, B>
 where
     A: Distribution<Time>,
-    B: Distribution<u32>,
+    B: Distribution<f64>,
 {
     element_id: u32,
     initial_delay: Time,
@@ -18,12 +18,27 @@ where
     packet_size_dist: Box<dyn Fn() -> B>,
     packets_sent: u32,
     pub sender: UnboundedSender<Packet>,
+    receiver: UnboundedReceiver<Packet>,
+}
+
+impl<A, B> Element for DistPacketGenerator<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl<A, B> DistPacketGenerator<A, B>
 where
     A: Distribution<Time>,
-    B: Distribution<u32>,
+    B: Distribution<f64>,
 {
     pub fn new(
         element_id: u32,
@@ -38,6 +53,7 @@ where
             packet_size_dist,
             packets_sent: 0,
             sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
         }
     }
 
@@ -68,7 +84,8 @@ where
         while sim.now() < sim.shared().duration {
             let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
             sim.advance(interval).await;
-            let packet_size = (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+            let packet_size =
+                (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut()) as u32;
 
             let packet = Packet {
                 production_time: sim.now(),
@@ -80,10 +97,9 @@ where
                 dst: "destination".to_string(),
             };
 
-            self.sender.send(packet.clone()).unwrap();
+            let _ = self.sender.send(packet.clone());
 
             self.packet_sent(sim, packet);
-
         }
     }
 }

@@ -1,3 +1,5 @@
+//! A splitter is a utility element that forwards packets to two downstream elements.
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
@@ -20,18 +22,14 @@ impl Splitter {
     }
 
     pub async fn run(mut self) {
-        loop {
-            if let Some(packet) = self.receiver.recv().await {
-                println!(
-                    "Splitter {} forwarded packet {} ({} bytes).",
-                    self.element_id, packet.packet_id, packet.size,
-                );
+        while let Some(packet) = self.receiver.recv().await {
+            println!(
+                "Splitter {} forwarded packet {} ({} bytes).",
+                self.element_id, packet.packet_id, packet.size,
+            );
 
-                let _ = self.sender_1.send(packet.clone());
-                let _ = self.sender_2.send(packet.clone());
-            } else {
-                break;
-            }
+            let _ = self.sender_1.send(packet.clone());
+            let _ = self.sender_2.send(packet.clone());
         }
     }
 }

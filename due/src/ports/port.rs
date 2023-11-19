@@ -2,10 +2,10 @@
 use std::collections::VecDeque;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use sim::SimContext;
+use crate::sim::SimContext;
 
 use crate::packets::packet::Packet;
-use crate::Shared;
+use crate::{Element, Shared};
 
 pub struct Port {
     element_id: u32,
@@ -27,10 +27,20 @@ pub struct Port {
     bytes_in_queue: u32,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
-    /// a sender for sending packets
+    /// a sender for sending outbound packets
     pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving incoming packets
+    /// a receiver for receiving inbound packets
     pub receiver: UnboundedReceiver<Packet>,
+}
+
+impl Element for Port {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl Port {
@@ -110,28 +120,17 @@ impl Port {
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             // trying to receive all the packets accumulated in the channel
-            loop {
-                match self.receiver.try_recv() {
-                    Ok(packet) => {
-                        self.packet_received(packet, sim);
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
+            while let Ok(packet) = self.receiver.try_recv() {
+                self.packet_received(packet, sim);
             }
 
             // sending all packets in an FIFO order to the downstream element
-            loop {
-                if let Some(mut packet) = self.queue.pop_front() {
-                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+            while let Some(mut packet) = self.queue.pop_front() {
+                sim.advance(packet.size as f64 * 8.0 / self.rate).await;
 
-                    packet.time = sim.now();
-                    self.sender.send(packet.clone()).unwrap();
-                    self.packet_sent(packet, sim);
-                } else {
-                    break;
-                }
+                packet.time = sim.now();
+                let _ = self.sender.send(packet.clone());
+                self.packet_sent(packet, sim);
             }
 
             // waiting for the next packet to arrive from the upstream elements
