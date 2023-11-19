@@ -60,9 +60,6 @@ where
     fn packet_sent(&mut self, sim: SimContext<'_, Shared>, packet: Packet) {
         self.packets_sent += 1;
 
-        // Update global statistics about packet sizes
-        sim.shared().packet_size.tabulate(packet.size);
-
         println!(
             "DistPacketGenerator {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.element_id,
@@ -87,19 +84,21 @@ where
             let packet_size =
                 (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut()) as u32;
 
-            let packet = Packet {
-                production_time: sim.now(),
-                time: sim.now(),
-                size: packet_size,
-                flow_id: self.element_id,
-                packet_id: self.packets_sent,
-                src: "source".to_string(),
-                dst: "destination".to_string(),
-            };
+            let mut packet = Packet::new(
+                packet_size,
+                self.packets_sent,
+                "source".to_string(),
+                "destination".to_string(),
+                self.element_id,
+                sim.now(),
+            );
 
+            packet.send(sim.now());
             let _ = self.sender.send(packet.clone());
 
             self.packet_sent(sim, packet);
         }
+
+        println!("DistPacketGenerator {} finished running.", self.element_id);
     }
 }

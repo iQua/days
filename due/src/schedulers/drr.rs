@@ -112,6 +112,7 @@ impl DRRServer {
     fn poll_packets(&mut self, queue_id: u32, sim: SimContext<'_, Shared>) -> u32 {
         while let Ok(packet) = self.receiver.try_recv() {
             self.packet_received(packet, sim);
+            println!("in poll packets.");
         }
 
         self.queues.get(&queue_id).unwrap().len() as u32
@@ -162,7 +163,7 @@ impl DRRServer {
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
-                        packet.time = sim.now();
+                        packet.send(sim.now());
                         let _ = self.sender.send(packet.clone());
 
                         self.packets_waiting -= 1;
@@ -204,5 +205,6 @@ impl DRRServer {
                 }
             }
         }
+        println!("DRRServer {} finished running.", self.element_id);
     }
 }

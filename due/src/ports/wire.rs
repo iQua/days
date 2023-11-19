@@ -66,6 +66,8 @@ where
             self.last_sent = packet.time;
         }
 
+        // updates the packet's time and advance the simulation to that time
+        // before sending the packet, whose queueing delay remains unchanged
         packet.time += delay;
         sim.advance(packet.time - self.last_sent).await;
 
@@ -96,5 +98,7 @@ where
         while let Some(packet) = self.receiver.recv().await {
             self.forward_packet(packet, sim).await;
         }
+
+        println!("Wire {} finished running.", self.element_id);
     }
 }

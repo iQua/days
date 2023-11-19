@@ -128,7 +128,7 @@ impl Port {
             while let Some(mut packet) = self.queue.pop_front() {
                 sim.advance(packet.size as f64 * 8.0 / self.rate).await;
 
-                packet.time = sim.now();
+                packet.send(sim.now());
                 let _ = self.sender.send(packet.clone());
                 self.packet_sent(packet, sim);
             }
@@ -140,5 +140,7 @@ impl Port {
                 break;
             }
         }
+
+        println!("Port {} finished running.", self.element_id);
     }
 }
