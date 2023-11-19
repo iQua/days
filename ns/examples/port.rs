@@ -9,35 +9,41 @@ use std::cell::RefCell;
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::ports::port::Port;
-use ns::Shared;
+use ns::{connect, Shared};
 use sim::{Process, RandomVar, SimContext};
-use tokio::sync::mpsc::unbounded_channel;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let (sender_0, receiver_0) = unbounded_channel();
-    let (sender_1, receiver_1) = unbounded_channel();
+    let mut generators = Vec::new();
 
     for i in 0..2 {
-        let mut generator = DistPacketGenerator::new(
+        let generator = DistPacketGenerator::new(
             i,
             1.0,
-            Box::new(|| Uniform::new(1.0,  1.0).unwrap()),
+            Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
             Box::new(|| Uniform::new(1000.0, 1000.0).unwrap()),
         );
-        generator.sender = sender_0.clone();
-        sim.activate(generator.run(sim));
+        generators.push(generator);
     }
 
     let mut port = Port::new(0, (1000 * 8) as f64, 100, false);
     let mut sink = PacketSink::new(0);
 
-    port.receiver = receiver_0;
-    sink.receiver = receiver_1;
-    port.sender = sender_1;
+    // Connecting the generators to the port
+    connect(&mut generators, &mut port);
 
-    sim.activate(port.run(sim));
+    // Connecting the port to the sink
+    let mut ports = Vec::new();
+    ports.push(port);
+    connect(&mut ports, &mut sink);
+
+    for generator in generators {
+        sim.activate(generator.run(sim));
+    }
+    for port in ports {
+        sim.activate(port.run(sim));
+    }
     sim.activate(sink.run(sim));
 
     // waiting for the end of this simulation

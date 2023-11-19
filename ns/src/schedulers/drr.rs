@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use sim::SimContext;
 
 use crate::packets::packet::Packet;
-use crate::Shared;
+use crate::{Element, Shared};
 
 pub struct DRRServer {
     element_id: u32,
@@ -39,6 +39,16 @@ pub struct DRRServer {
     pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets from upstream elements
     pub receiver: UnboundedReceiver<Packet>,
+}
+
+impl Element for DRRServer {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl DRRServer {

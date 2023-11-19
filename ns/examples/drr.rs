@@ -1,29 +1,22 @@
 //! TODO
 
 use rand::{rngs::SmallRng, SeedableRng};
-use statrs::distribution::{Uniform, DiscreteUniform};
+use statrs::distribution::{DiscreteUniform, Uniform};
 use std::{cell::RefCell, collections::HashMap};
+
+use tokio::sync::mpsc::unbounded_channel;
+
+use sim::{Process, RandomVar, SimContext};
 
 use ns::packets::dist_generator::DistPacketGenerator;
 use ns::packets::sink::PacketSink;
 use ns::schedulers::drr::DRRServer;
 use ns::utils::splitter::Splitter;
-use ns::Shared;
-use sim::{Process, RandomVar, SimContext};
-use tokio::sync::mpsc::unbounded_channel;
+use ns::{Element, Shared};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    // initializes channels
-
-    let (sender_0, receiver_0) = unbounded_channel();
-    let (sender_1, receiver_1) = unbounded_channel();
-    let (sender_2, receiver_2) = unbounded_channel();
-    let (sender_3, receiver_3) = unbounded_channel();
-    let (sender_4, receiver_4) = unbounded_channel();
-    let (sender_5, receiver_5) = unbounded_channel();
-
     // initializes packet generators
     let mut pg1 = DistPacketGenerator::new(
         0,
@@ -54,21 +47,27 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut splitter_2 = Splitter::new(4);
 
     // connects packet generators and splitters
+    let (sender_0, receiver_0) = unbounded_channel();
+    let (sender_1, receiver_1) = unbounded_channel();
     pg1.sender = sender_0;
     pg2.sender = sender_1;
     splitter_1.receiver = receiver_0;
     splitter_2.receiver = receiver_1;
 
     // connects splitters and the DRR server
+    let (sender_2, receiver_2) = unbounded_channel();
     splitter_1.sender_1 = sender_2.clone();
     splitter_2.sender_1 = sender_2.clone();
     drr_server.receiver = receiver_2;
 
     // connects the DRR server and the packet sink
+    let (sender_3, receiver_3) = unbounded_channel();
     drr_server.sender = sender_3;
     ps.receiver = receiver_3;
 
     // connects splitters and packet sinks
+    let (sender_4, receiver_4) = unbounded_channel();
+    let (sender_5, receiver_5) = unbounded_channel();
     splitter_1.sender_2 = sender_4;
     splitter_2.sender_2 = sender_5;
     sink_1.receiver = receiver_4;

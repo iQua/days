@@ -7,9 +7,9 @@
 //! These statistics are indexed by either the flow identifier or the source of
 //! each packet.
 use crate::packets::packet::Packet;
-use crate::Shared;
+use crate::{Element, Shared};
 use sim::SimContext;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct PacketSink {
     element_id: u32,
@@ -29,8 +29,20 @@ pub struct PacketSink {
     queueing_delays: f64,
     /// the size of the packets
     packet_sizes: Vec<u32>,
-    /// a receiver for receiving incoming packets
+    /// a sender for sending outbound packets
+    pub sender: UnboundedSender<Packet>,
+    /// a receiver for receiving inbound packets
     pub receiver: UnboundedReceiver<Packet>,
+}
+
+impl Element for PacketSink {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl PacketSink {
@@ -45,6 +57,7 @@ impl PacketSink {
             one_way_delays: Vec::new(),
             queueing_delays: 0.0,
             packet_sizes: Vec::new(),
+            sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
         }
     }

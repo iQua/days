@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use sim::SimContext;
 
 use crate::packets::packet::Packet;
-use crate::Shared;
+use crate::{Element, Shared};
 
 pub struct Port {
     element_id: u32,
@@ -27,10 +27,20 @@ pub struct Port {
     bytes_in_queue: u32,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
-    /// a sender for sending packets
+    /// a sender for sending outbound packets
     pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving incoming packets
+    /// a receiver for receiving inbound packets
     pub receiver: UnboundedReceiver<Packet>,
+}
+
+impl Element for Port {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl Port {
