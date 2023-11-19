@@ -2,7 +2,7 @@
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
-use std::{cell::RefCell, collectiodue::HashMap};
+use std::{cell::RefCell, collections::HashMap};
 
 use tokio::sync::mpsc::unbounded_channel;
 
