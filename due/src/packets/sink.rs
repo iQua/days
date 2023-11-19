@@ -6,10 +6,12 @@
 //! the one-way end-to-end delays, and the total time spent waiting in queues.
 //! These statistics are indexed by either the flow identifier or the source of
 //! each packet.
-use crate::packets::packet::Packet;
-use crate::{Element, Shared};
-use sim::SimContext;
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use crate::packets::packet::Packet;
+use crate::sim::SimContext;
+use crate::{Element, Shared};
 
 pub struct PacketSink {
     element_id: u32,

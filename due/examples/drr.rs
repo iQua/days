@@ -1,16 +1,16 @@
-//! TODO
+//! This example shows a simple example that uses a Deficit Round Robin (DRR)
+//! server.
+
+use std::{cell::RefCell, collections::HashMap};
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
-use std::{cell::RefCell, collections::HashMap};
-
 use tokio::sync::mpsc::unbounded_channel;
-
-use sim::{Process, RandomVar, SimContext};
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
 use due::schedulers::drr::DRRServer;
+use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::utils::splitter::Splitter;
 use due::{connect_pair, Shared};
 
@@ -86,7 +86,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 }
 
 fn main() {
-    let outcome = sim::simulation(
+    let outcome = simulation(
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             packet_size: RandomVar::new(),

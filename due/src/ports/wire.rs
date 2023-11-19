@@ -1,6 +1,6 @@
 //! A simple wire component.
 
-use sim::{SimContext, Time};
+use crate::sim::{SimContext, Time};
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 

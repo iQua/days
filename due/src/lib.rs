@@ -1,14 +1,15 @@
 use rand::rngs::SmallRng;
-use sim::{RandomVar, Time};
 use std::cell::RefCell;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub mod packets;
 pub mod ports;
 pub mod schedulers;
+pub mod sim;
 pub mod utils;
 
 use crate::packets::packet::Packet;
+use crate::sim::{RandomVar, Time};
 
 /// Globally shared data.
 pub struct Shared {

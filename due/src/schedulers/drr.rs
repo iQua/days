@@ -1,11 +1,11 @@
 //! Implements a Deficit Round Robin (DRR) server.
 
 use std::collections::{HashMap, VecDeque};
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use sim::SimContext;
-
 use crate::packets::packet::Packet;
+use crate::sim::SimContext;
 use crate::{Element, Shared};
 
 pub struct DRRServer {

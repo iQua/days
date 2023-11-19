@@ -1,3 +1,5 @@
+//! A splitter is a utility element that forwards packets to two downstream elements.
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;

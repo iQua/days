@@ -1,9 +1,9 @@
 [package]
 name = "due"
 version = "0.1.0"
-description = "A Performant Discrete-Event Simulator for Network Simulations with Rust"
+description = "A Performant Discrete-Event Simulator for Network Simulations"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]
-repository = "https://github.com/iqua/ns.rs"
+repository = "https://github.com/iqua/due.rs"
 readme = "README.md"
 keywords =  ["network", "simulation", "framework", "time", "discrete", "events"]
 categories = ["simulation", "science"]
@@ -13,7 +13,6 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-sim = { path = "../sim" }
 rand = {version = "0.8.5", features = ["small_rng"]}
 statrs = "0.15.0"
 tokio = { version = "1", features = ["full"] }

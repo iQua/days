@@ -24,7 +24,7 @@ pub type Time = f64;
 ///
 /// But just in case you're wondering how to do it:
 /// ```
-/// # use sim::{SimContext, Process};
+/// # use crate::sim::{SimContext, Process};
 /// # use std::future::Future;
 /// pub trait Active<'s,G> {
 ///   fn lifecycle(self, sim: SimContext<'s,G>) -> Process<'s,G>;

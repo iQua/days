@@ -1,12 +1,11 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
-use crate::packets::packet::Packet;
-use crate::Element;
-use crate::Shared;
-
-use sim::{SimContext, Time};
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use crate::packets::packet::Packet;
+use crate::sim::{SimContext, Time};
+use crate::{Element, Shared};
 
 pub struct DistPacketGenerator<A, B>
 where
