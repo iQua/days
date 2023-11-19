@@ -1,4 +1,5 @@
 //! A simple FIFO port with only one receiver.
+
 use std::collections::VecDeque;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 

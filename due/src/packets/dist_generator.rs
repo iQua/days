@@ -1,5 +1,6 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
+
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 

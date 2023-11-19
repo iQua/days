@@ -1,4 +1,4 @@
-//! This example shows hw that four packet generators sends packets to a sink via two
+//! In this example, four packet generators send packets to a sink via two
 //! ports, where their queues are limited by bytes and packet numbers,
 //! respectively.
 
