@@ -19,8 +19,6 @@ pub struct Port {
     packets_received: usize,
     /// the number of dropped packets
     packets_dropped: usize,
-    /// the number of packets in the queue
-    packets_in_queue: usize,
     /// the total byte sizes in the queue
     bytes_in_queue: usize,
     /// the packet queue of the port
@@ -60,7 +58,6 @@ impl Port {
             drop_strategy: Box::new(packet_drop),
             packets_received: 0,
             packets_dropped: 0,
-            packets_in_queue: 0,
             bytes_in_queue: 0,
             queue: VecDeque::new(),
             sender: unbounded_channel().0,
@@ -90,7 +87,6 @@ impl Port {
         // the case that this packet will not be dropped.
         self.packets_received += 1;
         self.queue.push_back(packet.clone());
-        self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
 
         println!(
@@ -102,12 +98,11 @@ impl Port {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.packets_in_queue
+            self.queue.len()
         );
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.packets_in_queue -= 1;
         self.bytes_in_queue -= packet.size;
 
         println!(
@@ -118,7 +113,7 @@ impl Port {
             packet.size,
             packet.flow_id,
             sim.now(),
-            self.packets_in_queue
+            self.queue.len()
         );
     }
 
