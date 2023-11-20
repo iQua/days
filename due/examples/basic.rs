@@ -1,5 +1,6 @@
 //! This example shows how to create a basic network where two packet generators
-//! sends packets to a sink.
+//! send packets to a wire that adds propagation delays according to a random
+//! distribution, and then to a packet sink.
 
 use std::cell::RefCell;
 
