@@ -91,11 +91,13 @@ impl DRRServer {
         self.packets_waiting += 1;
         self.packets_received += 1;
 
+        let queue_id = (self.flow_classes)(packet.flow_id) as usize;
+
         self.queues
-            .get_mut(packet.flow_id as usize)
+            .get_mut(queue_id)
             .unwrap()
             .push_back(packet.clone());
-        *self.byte_sizes.get_mut(packet.flow_id as usize).unwrap() += packet.size;
+        *self.byte_sizes.get_mut(queue_id).unwrap() += packet.size;
 
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
