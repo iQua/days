@@ -6,16 +6,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::sim::SimContext;
 
 use crate::packets::packet::Packet;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::{Element, Shared};
 
 pub struct Port {
     element_id: usize,
     /// the bit rate of the port
     rate: f64,
-    /// a queue limit in bytes or packets
-    qlimit: usize,
-    /// if true, qlimit will be based on bytes
-    limit_bytes: bool,
+    /// a closure that determines whether an inbound packet should be dropped or not
+    pub drop_strategy: Box<dyn PacketDrop>,
     /// the number of packets received
     packets_received: usize,
     /// the number of dropped packets
@@ -24,16 +23,8 @@ pub struct Port {
     packets_in_queue: usize,
     /// the total byte sizes in the queue
     bytes_in_queue: usize,
-    /// if True, assume that the downstream element does not have any buffers,
-    /// and backpressure is in effect so that all waiting packets queue up in
-    /// this element's buffer.
-    zero_downstream_buffer: bool,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
-    /// the packet queue of the downstream element
-    downstream_queue: VecDeque<Packet>,
-    /// a receiver for receving packet sending messages from the downstream element
-    pub receiver_from_downstream: UnboundedReceiver<Packet>,
     /// a sender for sending outbound packets
     pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
@@ -54,34 +45,34 @@ impl Port {
     pub fn new(
         element_id: usize,
         rate: f64,
-        qlimit: usize,
-        limit_bytes: bool,
-        zero_downstream_buffer: bool,
+        capacity: usize,
+        capacity_unit: CapacityUnit,
+        drop_strategy: DropStrategy,
     ) -> Port {
+        let packet_drop = match drop_strategy {
+            DropStrategy::TailDrop => TailDrop::new(capacity, capacity_unit),
+            _ => unimplemented!(),
+        };
+
         Port {
             element_id,
             rate,
-            qlimit,
-            limit_bytes,
+            drop_strategy: Box::new(packet_drop),
             packets_received: 0,
             packets_dropped: 0,
             packets_in_queue: 0,
             bytes_in_queue: 0,
-            zero_downstream_buffer,
             queue: VecDeque::new(),
-            downstream_queue: VecDeque::new(),
-            receiver_from_downstream: unbounded_channel().1,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
         }
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.packets_received += 1;
-
         let byte_count = self.bytes_in_queue + packet.size;
-        let should_drop_packet = (self.limit_bytes && byte_count > self.qlimit)
-            || (!self.limit_bytes && self.queue.len() >= self.qlimit);
+
+        // drops the packet if the buffer is full
+        let should_drop_packet = self.drop_strategy.should_drop(byte_count, self.queue.len());
 
         // the case that this packet will be dropped.
         if should_drop_packet {
@@ -97,10 +88,8 @@ impl Port {
         }
 
         // the case that this packet will not be dropped.
+        self.packets_received += 1;
         self.queue.push_back(packet.clone());
-        if self.zero_downstream_buffer {
-            self.downstream_queue.push_back(packet.clone());
-        }
         self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
 
@@ -121,14 +110,6 @@ impl Port {
         self.packets_in_queue -= 1;
         self.bytes_in_queue -= packet.size;
 
-        // deletes the packet in self.queue
-        // TODO: need to think about better data structure to avoid loop, and
-        // also effective for the !zero_downstream_buffer case.
-        if self.zero_downstream_buffer {
-            self.queue
-                .retain(|pkt| packet.flow_id != pkt.flow_id || packet.packet_id != pkt.packet_id)
-        }
-
         println!(
             "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets in queue.",
@@ -148,46 +129,18 @@ impl Port {
                 self.packet_received(packet, sim);
             }
 
-            // trying to receive packet sending messages from the downstream
-            // element
-            if self.zero_downstream_buffer {
-                while let Ok(packet) = self.receiver_from_downstream.try_recv() {
-                    self.packet_sent(packet, sim);
-                }
+            while let Some(mut packet) = self.queue.pop_front() {
+                sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+
+                packet.send(sim.now());
+                let _ = self.sender.send(packet.clone());
+                self.packet_sent(packet, sim);
             }
 
-            // sending all packets in an FIFO order to the downstream element
-            // TODO: Optimize this part!
-            if self.zero_downstream_buffer {
-                while let Some(mut packet) = self.downstream_queue.pop_front() {
-                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
-
-                    packet.send(sim.now());
-                    let _ = self.sender.send(packet.clone());
-                }
+            if let Some(packet) = self.receiver.recv().await {
+                self.packet_received(packet, sim);
             } else {
-                while let Some(mut packet) = self.queue.pop_front() {
-                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
-
-                    packet.send(sim.now());
-                    let _ = self.sender.send(packet.clone());
-                    self.packet_sent(packet, sim);
-                }
-            }
-
-            tokio::select! {
-                packet = self.receiver.recv() => {
-                    match packet {
-                        Some(packet) => self.packet_received(packet, sim),
-                        None => break,
-                    }
-                }
-                packet = self.receiver_from_downstream.recv(), if self.zero_downstream_buffer => {
-                    match packet {
-                        Some(packet) => self.packet_sent(packet, sim),
-                        None => break,
-                    }
-                }
+                break;
             }
         }
 

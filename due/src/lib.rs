@@ -3,11 +3,9 @@ use std::cell::RefCell;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub mod packets;
-pub mod ports;
 pub mod schedulers;
 pub mod sim;
-pub mod switches;
-pub mod utils;
+// pub mod switches;
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, Time};

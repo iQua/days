@@ -2,8 +2,8 @@
 //! buffers, on each of the outgoing ports.
 
 use crate::packets::packet::Packet;
-use crate::ports::port::Port;
 use crate::schedulers::drr::DRRServer;
+use crate::schedulers::port::Port;
 use crate::Shared;
 use crate::{sim::SimContext, Element};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};

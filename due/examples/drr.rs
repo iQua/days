@@ -9,9 +9,10 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
+use due::packets::splitter::Splitter;
+use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::utils::splitter::Splitter;
 use due::{connect_pair, Shared};
 
 const SEED: u64 = 1000;
@@ -40,7 +41,14 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut weights = Vec::new();
     weights.push(1);
     weights.push(2);
-    let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights, false);
+    let mut drr_server = DRRServer::new(
+        0,
+        100,
+        CapacityUnit::Packets,
+        (1000 * 8) as f64 / 1.75,
+        DropStrategy::TailDrop,
+        weights,
+    );
 
     // initializes splitters
     let mut splitter_1 = Splitter::new(1);

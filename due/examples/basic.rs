@@ -9,7 +9,7 @@ use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
-use due::ports::wire::Wire;
+use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::{connect, connect_pair, Shared};
 

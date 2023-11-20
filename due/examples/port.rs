@@ -8,7 +8,8 @@ use std::cell::RefCell;
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
-use due::ports::port::Port;
+use due::schedulers::drop::{CapacityUnit, DropStrategy};
+use due::schedulers::port::Port;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::{connect, connect_pair, Shared};
 
@@ -27,7 +28,13 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         generators.push(generator);
     }
 
-    let mut port = Port::new(0, (1000 * 8) as f64, 100, false, false);
+    let mut port = Port::new(
+        0,
+        (1000 * 8) as f64,
+        100,
+        CapacityUnit::Packets,
+        DropStrategy::TailDrop,
+    );
     let mut sink = PacketSink::new(0);
 
     // connects the generators to the port
