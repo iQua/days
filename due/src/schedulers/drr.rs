@@ -18,10 +18,10 @@ pub struct DRRServer {
     /// its class_id, which is equivalent to flow-based DRR.
     pub flow_classes: Box<dyn Fn(u32) -> u32>,
 
-    /// class_id -> deficit
-    deficit: HashMap<u32, u32>,
-    /// class_id -> quantum
-    quantum: HashMap<u32, u32>,
+    /// deficit of classes, which are consecutive and start from 0
+    deficit: Vec<u32>,
+    /// quantum of classes, which are consecutive and start from 0
+    quantum: Vec<u32>,
     /// class_id -> the head-of-line packet in its queue
     head_of_line: HashMap<u32, Packet>,
 
@@ -29,11 +29,11 @@ pub struct DRRServer {
     packets_received: u32,
     packets_waiting: u32,
 
-    /// class_id -> the number of bytes in its queue
-    byte_sizes: HashMap<u32, u32>,
+    /// the number of bytes of classes, which are consecutive and start from 0
+    byte_sizes: Vec<u32>,
 
-    /// class_id -> its FIFO queue
-    queues: HashMap<u32, VecDeque<Packet>>,
+    /// FIFO queues of classes, which are consecutive and start from 0
+    queues: Vec<VecDeque<Packet>>,
 
     /// a sender for sending outbound packets to the downstream element
     pub sender: UnboundedSender<Packet>,
@@ -54,16 +54,21 @@ impl Element for DRRServer {
 impl DRRServer {
     pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
         let min_quantum = 1500;
-        let mut deficit = HashMap::new();
-        let mut quantum = HashMap::new();
-        let mut byte_sizes = HashMap::new();
+        let mut deficit = Vec::new();
+        let mut quantum = Vec::new();
+        let mut byte_sizes = Vec::new();
+        let mut queues = Vec::new();
         let (sender, receiver) = unbounded_channel();
 
         let min_weight = weights.values().min().unwrap();
-        for (class_id, weight) in &weights {
-            deficit.insert(*class_id, 0);
-            quantum.insert(*class_id, min_quantum * weight / min_weight);
-            byte_sizes.insert(*class_id, 0);
+
+        let mut class_ids: Vec<_> = weights.keys().collect();
+        class_ids.sort();
+        for class_id in class_ids {
+            deficit.push(0);
+            quantum.push(min_quantum * weights[class_id] / min_weight);
+            byte_sizes.push(0);
+            queues.push(VecDeque::new());
         }
 
         DRRServer {
@@ -76,7 +81,7 @@ impl DRRServer {
             packets_received: 0,
             packets_waiting: 0,
             byte_sizes,
-            queues: HashMap::new(),
+            queues,
             sender,
             receiver,
         }
@@ -87,13 +92,10 @@ impl DRRServer {
         self.packets_received += 1;
 
         self.queues
-            .entry(packet.flow_id)
-            .or_default()
+            .get_mut(packet.flow_id as usize)
+            .unwrap()
             .push_back(packet.clone());
-
-        self.byte_sizes
-            .entry(packet.flow_id)
-            .and_modify(|byte_size| *byte_size += packet.size);
+        *self.byte_sizes.get_mut(packet.flow_id as usize).unwrap() += packet.size;
 
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -104,61 +106,55 @@ impl DRRServer {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.queues.get(&packet.flow_id).unwrap().len(),
+            self.queues[packet.flow_id as usize].len(),
             packet.flow_id
         );
     }
 
-    fn poll_packets(&mut self, queue_id: u32, sim: SimContext<'_, Shared>) -> u32 {
+    fn poll_packets(&mut self, queue_id: usize, sim: SimContext<'_, Shared>) -> u32 {
         while let Ok(packet) = self.receiver.try_recv() {
             self.packet_received(packet, sim);
         }
 
-        self.queues.get(&queue_id).unwrap().len() as u32
+        self.queues[queue_id].len() as u32
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             // counts the number of packets in each queue
-            let mut flow_queue_count: HashMap<u32, u32> = HashMap::new();
-            for (&queue_id, queue) in &self.queues {
-                flow_queue_count.insert(queue_id, queue.len() as u32);
+            let mut flow_queue_count: Vec<u32> = Vec::new();
+            for queue in &self.queues {
+                flow_queue_count.push(queue.len() as u32);
             }
 
             // schedules packets by going through each queue
-            for (&queue_id, &count) in &flow_queue_count {
+            for (queue_id, &count) in flow_queue_count.iter().enumerate() {
                 let mut current_length = count;
 
                 // increases the deficit of the current queue if it is non-empty
-                if current_length > 0 || self.head_of_line.contains_key(&queue_id) {
-                    self.deficit.entry(queue_id).and_modify(|deficit| {
-                        *deficit += self.quantum.get(&queue_id).unwrap();
-                    });
+                if current_length > 0 || self.head_of_line.contains_key(&(queue_id as u32)) {
+                    *self.deficit.get_mut(queue_id).unwrap() += self.quantum[queue_id];
                 } else {
                     // resets to zero if the queue is empty
-                    self.deficit.entry(queue_id).and_modify(|deficit| {
-                        *deficit = 0;
-                    });
+                    *self.deficit.get_mut(queue_id).unwrap() = 0;
                 }
 
-                let mut current_deficit = *self.deficit.get(&queue_id).unwrap();
+                let mut current_deficit = self.deficit[queue_id];
 
                 while (current_deficit > 0 && current_length > 0)
-                    || self.head_of_line.contains_key(&queue_id)
+                    || self.head_of_line.contains_key(&(queue_id as u32))
                 {
                     let mut packet;
 
-                    if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
+                    if let Some(head_packet) = self.head_of_line.remove(&(queue_id as u32)) {
                         packet = head_packet;
                     } else {
-                        packet = self.queues.get_mut(&queue_id).unwrap().pop_front().unwrap();
+                        packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
                     }
 
                     if packet.size <= current_deficit {
                         // sends the packet out to the next element
-                        self.byte_sizes.entry(queue_id).and_modify(|byte_size| {
-                            *byte_size -= packet.size;
-                        });
+                        *self.byte_sizes.get_mut(queue_id).unwrap() -= packet.size;
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
@@ -176,23 +172,21 @@ impl DRRServer {
 
                         println!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-                                    {} packets in the flow queue.",
+                                    {} packets in the class queue.",
                             self.element_id,
                             packet.packet_id,
                             packet.size,
                             packet.flow_id,
                             sim.now(),
-                            self.queues.get(&packet.flow_id).unwrap().len(),
+                            current_length,
                         );
                     } else {
-                        self.head_of_line.insert(queue_id, packet);
+                        self.head_of_line.insert(queue_id as u32, packet);
                         break;
                     }
                 }
 
-                self.deficit
-                    .entry(queue_id)
-                    .and_modify(|deficit| *deficit = current_deficit);
+                *self.deficit.get_mut(queue_id).unwrap() = current_deficit;
             } // finishes going through each queue in one round
 
             // waits for inbound packets from the upstream element
