@@ -31,7 +31,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut port = Port::new(
         0,
         (1000 * 8) as f64,
-        100,
+        3,
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
