@@ -99,6 +99,6 @@ where
             self.forward_packet(packet, sim).await;
         }
 
-        println!("Wire {} finished running.", self.element_id);
+        println!("Wire {} finished running at time {}.", self.element_id, sim.now());
     }
 }

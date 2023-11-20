@@ -198,6 +198,6 @@ impl DRRServer {
                 }
             }
         }
-        println!("DRRServer {} finished running.", self.element_id);
+        println!("DRRServer {} finished running at time {}.", self.element_id, sim.now());
     }
 }

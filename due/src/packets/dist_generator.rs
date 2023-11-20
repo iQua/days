@@ -100,6 +100,6 @@ where
             self.packet_sent(sim, packet);
         }
 
-        println!("DistPacketGenerator {} finished running.", self.element_id);
+        println!("DistPacketGenerator {} finished running at time {}.", self.element_id, sim.now());
     }
 }

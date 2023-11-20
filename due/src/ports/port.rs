@@ -142,6 +142,6 @@ impl Port {
             }
         }
 
-        println!("Port {} finished running.", self.element_id);
+        println!("Port {} finished running at time {}.", self.element_id, sim.now());
     }
 }
