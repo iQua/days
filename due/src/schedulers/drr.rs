@@ -107,6 +107,7 @@ impl DRRServer {
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
+            packet.size,
             self.byte_sizes.iter().sum(),
             self.queues.iter().map(|q| q.len()).sum(),
         );

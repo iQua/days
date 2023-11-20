@@ -69,10 +69,10 @@ impl Port {
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        let byte_count = self.bytes_in_queue + packet.size;
-
         // drops the packet if the buffer is full
-        let should_drop_packet = self.drop_strategy.should_drop(byte_count, self.queue.len());
+        let should_drop_packet =
+            self.drop_strategy
+                .should_drop(packet.size, self.bytes_in_queue, self.queue.len());
 
         // the case that this packet will be dropped.
         if should_drop_packet {
