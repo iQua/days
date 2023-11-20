@@ -137,15 +137,6 @@ impl Port {
             } else if self.queue.is_empty() {
                 break;
             }
-
-            tokio::select! {
-                packet = self.receiver.recv() => {
-                    match packet {
-                        Some(packet) => self.packet_received(packet, sim),
-                        None => if self.queue.is_empty() {break;}
-                    }
-                }
-            }
         }
 
         println!(
