@@ -60,7 +60,7 @@ impl Element for DRRServer {
 }
 
 impl DRRServer {
-    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>, zero_buffer: bool) -> DRRServer {
+    pub fn new(element_id: u32, rate: f64, weights: Vec<u32>, zero_buffer: bool) -> DRRServer {
         let min_quantum = 1500;
         let mut deficit = Vec::new();
         let mut quantum = Vec::new();
@@ -68,13 +68,12 @@ impl DRRServer {
         let mut queues = Vec::new();
         let (sender, receiver) = unbounded_channel();
 
-        let min_weight = weights.values().min().unwrap();
+        let min_weight = weights.iter().min().unwrap();
 
-        let mut class_ids: Vec<_> = weights.keys().collect();
-        class_ids.sort();
-        for class_id in class_ids {
+
+        for class_id in 0..weights.len() {
             deficit.push(0);
-            quantum.push(min_quantum * weights[class_id] / min_weight);
+            quantum.push(min_quantum * weights[class_id] as u32 / min_weight);
             byte_sizes.push(0);
             queues.push(VecDeque::new());
         }
