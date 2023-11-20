@@ -57,12 +57,14 @@ pub fn connect_to_many(
     senders: Vec<UnboundedSender<Packet>>,
     receivers: Vec<UnboundedReceiver<Packet>>,
 ) {
-    upstream.connect_senders(senders);
     assert_eq!(
         downstream.len(),
         receivers.len(),
         "The number of receivers is not equal to the number of downstream elements."
     );
+
+    // connects senders and receivers
+    upstream.connect_senders(senders);
     for (element, receiver) in downstream.iter_mut().zip(receivers.into_iter()) {
         element.connect_receiver(receiver);
     }
