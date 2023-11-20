@@ -164,7 +164,6 @@ impl Port {
 
                     packet.send(sim.now());
                     let _ = self.sender.send(packet.clone());
-                    self.packet_sent(packet, sim);
                 }
             } else {
                 while let Some(mut packet) = self.queue.pop_front() {
@@ -176,11 +175,19 @@ impl Port {
                 }
             }
 
-            // waiting for the next packet to arrive from the upstream elements
-            if let Some(packet) = self.receiver.recv().await {
-                self.packet_received(packet, sim);
-            } else {
-                break;
+            tokio::select! {
+                packet = self.receiver.recv() => {
+                    match packet {
+                        Some(packet) => self.packet_received(packet, sim),
+                        None => break,
+                    }
+                }
+                packet = self.receiver_from_downstream.recv(), if self.zero_downstream_buffer => {
+                    match packet {
+                        Some(packet) => self.packet_sent(packet, sim),
+                        None => break,
+                    }
+                }
             }
         }
 
