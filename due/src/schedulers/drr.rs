@@ -101,11 +101,8 @@ impl DRRServer {
 
         let queue_id = (self.flow_classes)(packet.flow_id);
 
-        self.queues
-            .get_mut(queue_id)
-            .unwrap()
-            .push_back(packet.clone());
-        *self.byte_sizes.get_mut(queue_id).unwrap() += packet.size;
+        self.queues[queue_id].push_back(packet.clone());
+        self.byte_sizes[queue_id] += packet.size;
 
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -143,10 +140,10 @@ impl DRRServer {
 
                 // increases the deficit of the current queue if it is non-empty
                 if current_length > 0 || self.head_of_line.contains_key(&queue_id) {
-                    *self.deficit.get_mut(queue_id).unwrap() += self.quantum[queue_id];
+                    self.deficit[queue_id] += self.quantum[queue_id];
                 } else {
                     // resets to zero if the queue is empty
-                    *self.deficit.get_mut(queue_id).unwrap() = 0;
+                    self.deficit[queue_id] = 0;
                 }
 
                 let mut current_deficit = self.deficit[queue_id];
@@ -159,12 +156,12 @@ impl DRRServer {
                     if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
                         packet = head_packet;
                     } else {
-                        packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
+                        packet = self.queues[queue_id].pop_front().unwrap();
                     }
 
                     if packet.size <= current_deficit {
                         // sends the packet out to the next element
-                        *self.byte_sizes.get_mut(queue_id).unwrap() -= packet.size;
+                        self.byte_sizes[queue_id] -= packet.size;
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
@@ -202,7 +199,7 @@ impl DRRServer {
                     }
                 }
 
-                *self.deficit.get_mut(queue_id).unwrap() = current_deficit;
+                self.deficit[queue_id] = current_deficit;
             } // finishes going through each queue in one round
 
             // waits for inbound packets from the upstream element
