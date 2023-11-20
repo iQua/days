@@ -9,21 +9,21 @@ use crate::packets::packet::Packet;
 use crate::{Element, Shared};
 
 pub struct Port {
-    element_id: u32,
+    element_id: usize,
     /// the bit rate of the port
     rate: f64,
     /// a queue limit in bytes or packets
-    qlimit: u32,
+    qlimit: usize,
     /// if true, qlimit will be based on bytes
     limit_bytes: bool,
     /// the number of packets received
-    packets_received: u32,
+    packets_received: usize,
     /// the number of dropped packets
-    packets_dropped: u32,
+    packets_dropped: usize,
     /// the number of packets in the queue
-    packets_in_queue: u32,
+    packets_in_queue: usize,
     /// the total byte sizes in the queue
-    bytes_in_queue: u32,
+    bytes_in_queue: usize,
     /// if True, assume that the downstream element does not have any buffers,
     /// and backpressure is in effect so that all waiting packets queue up in
     /// this element's buffer.
@@ -52,9 +52,9 @@ impl Element for Port {
 
 impl Port {
     pub fn new(
-        element_id: u32,
+        element_id: usize,
         rate: f64,
-        qlimit: u32,
+        qlimit: usize,
         limit_bytes: bool,
         zero_downstream_buffer: bool,
     ) -> Port {
@@ -81,7 +81,7 @@ impl Port {
 
         let byte_count = self.bytes_in_queue + packet.size;
         let should_drop_packet = (self.limit_bytes && byte_count > self.qlimit)
-            || (!self.limit_bytes && self.queue.len() >= self.qlimit as usize);
+            || (!self.limit_bytes && self.queue.len() >= self.qlimit);
 
         // the case that this packet will be dropped.
         if should_drop_packet {

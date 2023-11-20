@@ -14,7 +14,7 @@ use crate::sim::{RandomVar, SimContext};
 use crate::{Element, Shared};
 
 pub struct PacketSink {
-    element_id: u32,
+    element_id: usize,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -44,7 +44,7 @@ impl Element for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(element_id: u32) -> PacketSink {
+    pub fn new(element_id: usize) -> PacketSink {
         PacketSink {
             element_id,
             arrival_times: RandomVar::new(),
@@ -66,7 +66,7 @@ impl PacketSink {
         self.one_way_delays
             .tabulate(sim.now() - packet.creation_time);
         self.queueing_delays.tabulate(packet.queueing_delay);
-        self.packet_sizes.tabulate(packet.size);
+        self.packet_sizes.tabulate(packet.size as u32);
 
         // Update global statistics about packet sizes
         sim.shared().queueing_delay.tabulate(packet.queueing_delay);

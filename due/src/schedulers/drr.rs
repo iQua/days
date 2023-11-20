@@ -9,28 +9,28 @@ use crate::sim::SimContext;
 use crate::{Element, Shared};
 
 pub struct DRRServer {
-    element_id: u32,
+    element_id: usize,
     /// the bit rate of the port
     rate: f64,
 
     /// a closure that maps a flow_id to a class_id, used to implement
     /// class-based Deficit Round Robin. The default uses a packet's flow_id as
     /// its class_id, which is equivalent to flow-based DRR.
-    pub flow_classes: Box<dyn Fn(u32) -> u32>,
+    pub flow_classes: Box<dyn Fn(usize) -> usize>,
 
     /// deficit of classes, which are consecutive and start from 0
-    deficit: Vec<u32>,
+    deficit: Vec<usize>,
     /// quantum of classes, which are consecutive and start from 0
-    quantum: Vec<u32>,
+    quantum: Vec<usize>,
     /// class_id -> the head-of-line packet in its queue
-    head_of_line: HashMap<u32, Packet>,
+    head_of_line: HashMap<usize, Packet>,
 
     /// the number of packets received and in the queues waiting to be sent
-    packets_received: u32,
-    packets_waiting: u32,
+    packets_received: usize,
+    packets_waiting: usize,
 
     /// the number of bytes of classes, which are consecutive and start from 0
-    byte_sizes: Vec<u32>,
+    byte_sizes: Vec<usize>,
 
     /// FIFO queues of classes, which are consecutive and start from 0
     queues: Vec<VecDeque<Packet>>,
@@ -60,7 +60,7 @@ impl Element for DRRServer {
 }
 
 impl DRRServer {
-    pub fn new(element_id: u32, rate: f64, weights: Vec<u32>, zero_buffer: bool) -> DRRServer {
+    pub fn new(element_id: usize, rate: f64, weights: Vec<usize>, zero_buffer: bool) -> DRRServer {
         let min_quantum = 1500;
         let mut deficit = Vec::new();
         let mut quantum = Vec::new();
@@ -72,7 +72,7 @@ impl DRRServer {
 
         for class_id in 0..weights.len() {
             deficit.push(0);
-            quantum.push(min_quantum * weights[class_id] as u32 / min_weight);
+            quantum.push(min_quantum * weights[class_id] / min_weight);
             byte_sizes.push(0);
             queues.push(VecDeque::new());
         }
@@ -99,7 +99,7 @@ impl DRRServer {
         self.packets_waiting += 1;
         self.packets_received += 1;
 
-        let queue_id = (self.flow_classes)(packet.flow_id) as usize;
+        let queue_id = (self.flow_classes)(packet.flow_id);
 
         self.queues
             .get_mut(queue_id)
@@ -116,25 +116,25 @@ impl DRRServer {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.queues[packet.flow_id as usize].len(),
+            self.queues[packet.flow_id].len(),
             packet.flow_id
         );
     }
 
-    fn poll_packets(&mut self, queue_id: usize, sim: SimContext<'_, Shared>) -> u32 {
+    fn poll_packets(&mut self, queue_id: usize, sim: SimContext<'_, Shared>) -> usize {
         while let Ok(packet) = self.receiver.try_recv() {
             self.packet_received(packet, sim);
         }
 
-        self.queues[queue_id].len() as u32
+        self.queues[queue_id].len()
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             // counts the number of packets in each queue
-            let mut flow_queue_count: Vec<u32> = Vec::new();
+            let mut flow_queue_count: Vec<usize> = Vec::new();
             for queue in &self.queues {
-                flow_queue_count.push(queue.len() as u32);
+                flow_queue_count.push(queue.len());
             }
 
             // schedules packets by going through each queue
@@ -142,7 +142,7 @@ impl DRRServer {
                 let mut current_length = count;
 
                 // increases the deficit of the current queue if it is non-empty
-                if current_length > 0 || self.head_of_line.contains_key(&(queue_id as u32)) {
+                if current_length > 0 || self.head_of_line.contains_key(&queue_id) {
                     *self.deficit.get_mut(queue_id).unwrap() += self.quantum[queue_id];
                 } else {
                     // resets to zero if the queue is empty
@@ -152,11 +152,11 @@ impl DRRServer {
                 let mut current_deficit = self.deficit[queue_id];
 
                 while (current_deficit > 0 && current_length > 0)
-                    || self.head_of_line.contains_key(&(queue_id as u32))
+                    || self.head_of_line.contains_key(&queue_id)
                 {
                     let mut packet;
 
-                    if let Some(head_packet) = self.head_of_line.remove(&(queue_id as u32)) {
+                    if let Some(head_packet) = self.head_of_line.remove(&queue_id) {
                         packet = head_packet;
                     } else {
                         packet = self.queues.get_mut(queue_id).unwrap().pop_front().unwrap();
@@ -197,7 +197,7 @@ impl DRRServer {
                             current_length,
                         );
                     } else {
-                        self.head_of_line.insert(queue_id as u32, packet);
+                        self.head_of_line.insert(queue_id, packet);
                         break;
                     }
                 }

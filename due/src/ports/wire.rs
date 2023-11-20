@@ -11,7 +11,7 @@ pub struct Wire<A>
 where
     A: Distribution<Time>,
 {
-    element_id: u32,
+    element_id: usize,
     /// the packet delay distribution
     delay_dist: Box<dyn Fn() -> A>,
     /// the time of the last sent packet, used to calculate the delay of the
@@ -40,7 +40,7 @@ impl<A> Wire<A>
 where
     A: Distribution<Time>,
 {
-    pub fn new(element_id: u32, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
+    pub fn new(element_id: usize, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
         Wire {
             element_id,
             delay_dist,
