@@ -31,7 +31,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut port = Port::new(
         0,
         (1000 * 8) as f64,
-        3,
+        2,
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
@@ -58,7 +58,7 @@ fn main() {
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
-            duration: 5.,
+            duration: 10.,
         },
         |sim| Process::new(sim, network_sim(sim)),
     );
