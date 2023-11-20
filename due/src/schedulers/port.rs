@@ -70,13 +70,6 @@ impl Port {
         let should_drop_packet =
             self.drop_strategy
                 .should_drop(packet.size, self.bytes_in_queue, self.queue.len());
-        println!(
-            "should_drop: {}, bytes_in_queue: {}, queue_length: {} at time {}",
-            should_drop_packet,
-            self.bytes_in_queue,
-            self.queue.len(),
-            sim.now()
-        );
 
         // the case that this packet will be dropped.
         if should_drop_packet {
@@ -137,6 +130,12 @@ impl Port {
                 packet.send(sim.now());
                 let _ = self.sender.send(packet.clone());
                 self.packet_sent(packet, sim);
+            }
+
+            if let Some(packet) = self.receiver.recv().await {
+                self.packet_received(packet, sim);
+            } else if self.queue.is_empty() {
+                break;
             }
 
             tokio::select! {
