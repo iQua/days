@@ -70,7 +70,6 @@ impl DRRServer {
 
         let min_weight = weights.iter().min().unwrap();
 
-
         for class_id in 0..weights.len() {
             deficit.push(0);
             quantum.push(min_quantum * weights[class_id] as u32 / min_weight);
@@ -174,7 +173,9 @@ impl DRRServer {
 
                         // indicates the upstream device to delete the packet
                         // its buffer.
-                        let _ = self.sender_to_upstream.send(packet.clone());
+                        if self.zero_buffer {
+                            let _ = self.sender_to_upstream.send(packet.clone());
+                        }
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
@@ -213,6 +214,10 @@ impl DRRServer {
                 }
             }
         }
-        println!("DRRServer {} finished running at time {}.", self.element_id, sim.now());
+        println!(
+            "DRRServer {} finished running at time {}.",
+            self.element_id,
+            sim.now()
+        );
     }
 }

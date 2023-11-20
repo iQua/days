@@ -1,7 +1,7 @@
 //! This example shows a simple example that uses a Deficit Round Robin (DRR)
 //! server.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::cell::RefCell;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -37,10 +37,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink_2: PacketSink = PacketSink::new(2);
 
     // initializes the DRR server
-    let mut weights = HashMap::new();
-    weights.insert(0, 1);
-    weights.insert(1, 2);
-    let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights);
+    let mut weights = Vec::new();
+    weights.push(1);
+    weights.push(2);
+    let mut drr_server = DRRServer::new(0, (1000 * 8) as f64 / 1.75, weights, false);
 
     // initializes splitters
     let mut splitter_1 = Splitter::new(1);

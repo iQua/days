@@ -50,7 +50,7 @@ impl SimplePacketSwitch {
         let mut senders = Vec::new();
         for i in 0..nports {
             let (sender, receiver) = unbounded_channel();
-            let mut port = Port::new(i, port_rate, buffer_size, false);
+            let mut port = Port::new(i, port_rate, buffer_size, false, false);
             port.connect_receiver(receiver);
             senders.push(sender);
             ports.push(port);
@@ -87,6 +87,10 @@ impl SimplePacketSwitch {
             }
         }
 
-        println!("SimplePacketSwitch {} finished running.", self.element_id);
+        println!(
+            "SimplePacketSwitch {} finished running at time {}.",
+            self.element_id,
+            sim.now()
+        );
     }
 }

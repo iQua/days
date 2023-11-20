@@ -27,7 +27,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         generators.push(generator);
     }
 
-    let mut port = Port::new(0, (1000 * 8) as f64, 100, false);
+    let mut port = Port::new(0, (1000 * 8) as f64, 100, false, false);
     let mut sink = PacketSink::new(0);
 
     // connects the generators to the port

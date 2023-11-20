@@ -51,7 +51,13 @@ impl Element for Port {
 }
 
 impl Port {
-    pub fn new(element_id: u32, rate: f64, qlimit: u32, limit_bytes: bool, zero_downstream_buffer: bool) -> Port {
+    pub fn new(
+        element_id: u32,
+        rate: f64,
+        qlimit: u32,
+        limit_bytes: bool,
+        zero_downstream_buffer: bool,
+    ) -> Port {
         Port {
             element_id,
             rate,
@@ -63,7 +69,7 @@ impl Port {
             bytes_in_queue: 0,
             zero_downstream_buffer,
             queue: VecDeque::new(),
-            downstream_queue:VecDeque::new(),
+            downstream_queue: VecDeque::new(),
             receiver_from_downstream: unbounded_channel().1,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -119,7 +125,8 @@ impl Port {
         // TODO: need to think about better data structure to avoid loop, and
         // also effective for the !zero_downstream_buffer case.
         if self.zero_downstream_buffer {
-            self.queue.retain(|pkt| packet.flow_id != pkt.flow_id || packet.packet_id != pkt.packet_id)
+            self.queue
+                .retain(|pkt| packet.flow_id != pkt.flow_id || packet.packet_id != pkt.packet_id)
         }
 
         println!(
@@ -154,7 +161,7 @@ impl Port {
             if self.zero_downstream_buffer {
                 while let Some(mut packet) = self.downstream_queue.pop_front() {
                     sim.advance(packet.size as f64 * 8.0 / self.rate).await;
-    
+
                     packet.send(sim.now());
                     let _ = self.sender.send(packet.clone());
                     self.packet_sent(packet, sim);
@@ -162,13 +169,12 @@ impl Port {
             } else {
                 while let Some(mut packet) = self.queue.pop_front() {
                     sim.advance(packet.size as f64 * 8.0 / self.rate).await;
-    
+
                     packet.send(sim.now());
                     let _ = self.sender.send(packet.clone());
                     self.packet_sent(packet, sim);
                 }
             }
-            
 
             // waiting for the next packet to arrive from the upstream elements
             if let Some(packet) = self.receiver.recv().await {
@@ -178,6 +184,10 @@ impl Port {
             }
         }
 
-        println!("Port {} finished running at time {}.", self.element_id, sim.now());
+        println!(
+            "Port {} finished running at time {}.",
+            self.element_id,
+            sim.now()
+        );
     }
 }
