@@ -20,7 +20,7 @@ pub struct DRRServer {
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
-    pub drop_strategy: Box<dyn PacketDrop>,
+    drop_strategy: Box<dyn PacketDrop>,
 
     /// deficit of classes, which are consecutive and start from 0
     deficit: Vec<usize>,

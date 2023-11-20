@@ -14,7 +14,7 @@ pub struct Port {
     /// the bit rate of the port
     rate: f64,
     /// a closure that determines whether an inbound packet should be dropped or not
-    pub drop_strategy: Box<dyn PacketDrop>,
+    drop_strategy: Box<dyn PacketDrop>,
     /// the number of packets received
     packets_received: usize,
     /// the number of dropped packets
