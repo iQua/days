@@ -16,8 +16,6 @@ pub struct Port {
     qlimit: u32,
     /// if true, qlimit will be based on bytes
     limit_bytes: bool,
-    /// the number of packets sent
-    packets_sent: u32,
     /// the number of packets received
     packets_received: u32,
     /// the number of dropped packets
@@ -26,8 +24,16 @@ pub struct Port {
     packets_in_queue: u32,
     /// the total byte sizes in the queue
     bytes_in_queue: u32,
+    /// if True, assume that the downstream element does not have any buffers,
+    /// and backpressure is in effect so that all waiting packets queue up in
+    /// this element's buffer.
+    zero_downstream_buffer: bool,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
+    /// the packet queue of the downstream element
+    downstream_queue: VecDeque<Packet>,
+    /// a receiver for receving packet sending messages from the downstream element
+    pub receiver_from_downstream: UnboundedReceiver<Packet>,
     /// a sender for sending outbound packets
     pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
@@ -45,18 +51,20 @@ impl Element for Port {
 }
 
 impl Port {
-    pub fn new(element_id: u32, rate: f64, qlimit: u32, limit_bytes: bool) -> Port {
+    pub fn new(element_id: u32, rate: f64, qlimit: u32, limit_bytes: bool, zero_downstream_buffer: bool) -> Port {
         Port {
             element_id,
             rate,
             qlimit,
             limit_bytes,
-            packets_sent: 0,
             packets_received: 0,
             packets_dropped: 0,
             packets_in_queue: 0,
             bytes_in_queue: 0,
+            zero_downstream_buffer,
             queue: VecDeque::new(),
+            downstream_queue:VecDeque::new(),
+            receiver_from_downstream: unbounded_channel().1,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
         }
@@ -84,6 +92,9 @@ impl Port {
 
         // the case that this packet will not be dropped.
         self.queue.push_back(packet.clone());
+        if self.zero_downstream_buffer {
+            self.downstream_queue.push_back(packet.clone());
+        }
         self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
 
@@ -101,19 +112,24 @@ impl Port {
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.packets_sent += 1;
         self.packets_in_queue -= 1;
         self.bytes_in_queue -= packet.size;
 
+        // deletes the packet in self.queue
+        // TODO: need to think about better data structure to avoid loop, and
+        // also effective for the !zero_downstream_buffer case.
+        if self.zero_downstream_buffer {
+            self.queue.retain(|pkt| packet.flow_id != pkt.flow_id || packet.packet_id != pkt.packet_id)
+        }
+
         println!(
             "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets sent, {} packets in queue.",
+            {} packets in queue.",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             sim.now(),
-            self.packets_sent,
             self.packets_in_queue
         );
     }
@@ -125,14 +141,34 @@ impl Port {
                 self.packet_received(packet, sim);
             }
 
-            // sending all packets in an FIFO order to the downstream element
-            while let Some(mut packet) = self.queue.pop_front() {
-                sim.advance(packet.size as f64 * 8.0 / self.rate).await;
-
-                packet.send(sim.now());
-                let _ = self.sender.send(packet.clone());
-                self.packet_sent(packet, sim);
+            // trying to receive packet sending messages from the downstream
+            // element
+            if self.zero_downstream_buffer {
+                while let Ok(packet) = self.receiver_from_downstream.try_recv() {
+                    self.packet_sent(packet, sim);
+                }
             }
+
+            // sending all packets in an FIFO order to the downstream element
+            // TODO: Optimize this part!
+            if self.zero_downstream_buffer {
+                while let Some(mut packet) = self.downstream_queue.pop_front() {
+                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+    
+                    packet.send(sim.now());
+                    let _ = self.sender.send(packet.clone());
+                    self.packet_sent(packet, sim);
+                }
+            } else {
+                while let Some(mut packet) = self.queue.pop_front() {
+                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+    
+                    packet.send(sim.now());
+                    let _ = self.sender.send(packet.clone());
+                    self.packet_sent(packet, sim);
+                }
+            }
+            
 
             // waiting for the next packet to arrive from the upstream elements
             if let Some(packet) = self.receiver.recv().await {

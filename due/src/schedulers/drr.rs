@@ -35,6 +35,14 @@ pub struct DRRServer {
     /// FIFO queues of classes, which are consecutive and start from 0
     queues: Vec<VecDeque<Packet>>,
 
+    /// Does this server have a zero-length buffer? This is useful when multiple
+    /// basic elements need to be put together to construct a more complex
+    /// element with a unified buffer.
+    zero_buffer: bool,
+
+    // a sender for indicating the upstream element to send a packet
+    pub sender_to_upstream: UnboundedSender<Packet>,
+
     /// a sender for sending outbound packets to the downstream element
     pub sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets from upstream elements
@@ -52,7 +60,7 @@ impl Element for DRRServer {
 }
 
 impl DRRServer {
-    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>) -> DRRServer {
+    pub fn new(element_id: u32, rate: f64, weights: HashMap<u32, u32>, zero_buffer: bool) -> DRRServer {
         let min_quantum = 1500;
         let mut deficit = Vec::new();
         let mut quantum = Vec::new();
@@ -82,6 +90,8 @@ impl DRRServer {
             packets_waiting: 0,
             byte_sizes,
             queues,
+            zero_buffer,
+            sender_to_upstream: unbounded_channel().0,
             sender,
             receiver,
         }
@@ -162,6 +172,10 @@ impl DRRServer {
                         sim.advance(timeout).await;
                         packet.send(sim.now());
                         let _ = self.sender.send(packet.clone());
+
+                        // indicates the upstream device to delete the packet
+                        // its buffer.
+                        let _ = self.sender_to_upstream.send(packet.clone());
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
