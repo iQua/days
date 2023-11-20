@@ -100,7 +100,7 @@ impl FairPacketSwitch {
 
                 // forwards packets to their corresponding ports
                 if let Some(&port_id) = self.fib.get(flow_class) {
-                    let _ = self.senders.get_mut(port_id).unwrap().send(packet);
+                    let _ = self.senders[port_id].send(packet);
                 } else {
                     println!("Wrong fib demux in SimplePacketSwitch {}.", self.element_id);
                 }
