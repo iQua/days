@@ -19,9 +19,9 @@ pub struct FairPacketSwitch {
     /// the schedulers of the switch, with consecutive ids start from 0
     pub ports: Vec<DRRServer>,
     /// senders for sending outbound packets to ports or schedulers
-    pub senders: Vec<UnboundedSender<Packet>>,
+    senders: Vec<UnboundedSender<Packet>>,
     /// a receiver for receiving inbound packets
-    pub receiver: UnboundedReceiver<Packet>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Element for FairPacketSwitch {
