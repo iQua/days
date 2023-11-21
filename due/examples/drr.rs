@@ -40,9 +40,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let weights = vec![1, 2];
     let mut drr_server = DRRServer::new(
         0,
+        (1000 * 8) as f64,
         100,
         CapacityUnit::Packets,
-        (1000 * 8) as f64,
         DropStrategy::TailDrop,
         weights,
     );
