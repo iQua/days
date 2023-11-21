@@ -56,20 +56,17 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect_pair(&mut generator_2, &mut splitter_2);
 
     // connects splitters and the DRR server
-    connect_1_n(
-        &mut splitter_1,
-        &mut vec![
-            ElementType::DRRServer(drr_server),
-            ElementType::PacketSink(sink_1),
-        ],
-    );
-    connect_1_n(
-        &mut splitter_2,
-        &mut vec![
-            ElementType::DRRServer(drr_server),
-            ElementType::PacketSink(sink_2),
-        ],
-    );
+    let mut downstreams: Vec<ElementType<Uniform, DiscreteUniform>> = vec![
+        ElementType::DRRServer(&mut drr_server),
+        ElementType::PacketSink(&mut sink_1),
+    ];
+    connect_1_n(&mut splitter_1, &mut downstreams);
+
+    let mut downstreams: Vec<ElementType<Uniform, DiscreteUniform>> = vec![
+        ElementType::DRRServer(&mut drr_server),
+        ElementType::PacketSink(&mut sink_2),
+    ];
+    connect_1_n(&mut splitter_2, &mut downstreams);
 
     // connects the DRR server and the packet sink
     connect_pair(&mut drr_server, &mut sink);

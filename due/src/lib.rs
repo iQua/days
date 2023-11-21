@@ -36,22 +36,22 @@ pub trait Element {
     }
 }
 
-pub enum ElementType<A, B>
+pub enum ElementType<'a, A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
-    DistPacketGenerator(DistPacketGenerator<A, B>),
-    PacketSink(PacketSink),
-    Port(Port),
-    Wire(Wire<A>),
-    DRRServer(DRRServer),
-    Splitter(Splitter),
-    SimplePacketSwitch(SimplePacketSwitch),
-    FairPacketSwitch(FairPacketSwitch),
+    DistPacketGenerator(&'a mut DistPacketGenerator<A, B>),
+    PacketSink(&'a mut PacketSink),
+    Port(&'a mut Port),
+    Wire(&'a mut Wire<A>),
+    DRRServer(&'a mut DRRServer),
+    Splitter(&'a mut Splitter),
+    SimplePacketSwitch(&'a mut SimplePacketSwitch),
+    FairPacketSwitch(&'a mut FairPacketSwitch),
 }
 
-impl<A, B> Element for ElementType<A, B>
+impl<'a, A, B> Element for ElementType<'a, A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
