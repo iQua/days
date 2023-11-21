@@ -13,12 +13,12 @@ where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
-    element_id: u32,
+    element_id: usize,
     initial_delay: Time,
     arr_interval_dist: Box<dyn Fn() -> A>,
     packet_size_dist: Box<dyn Fn() -> B>,
-    packets_sent: u32,
-    pub sender: UnboundedSender<Packet>,
+    packets_sent: usize,
+    sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
 }
 
@@ -42,7 +42,7 @@ where
     B: Distribution<f64>,
 {
     pub fn new(
-        element_id: u32,
+        element_id: usize,
         initial_delay: Time,
         arr_interval_dist: Box<dyn Fn() -> A>,
         packet_size_dist: Box<dyn Fn() -> B>,
@@ -83,7 +83,7 @@ where
             let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
             sim.advance(interval).await;
             let packet_size =
-                (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut()) as u32;
+                (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut()) as usize;
 
             let mut packet = Packet::new(
                 packet_size,
@@ -100,6 +100,10 @@ where
             self.packet_sent(sim, packet);
         }
 
-        println!("DistPacketGenerator {} finished running.", self.element_id);
+        println!(
+            "DistPacketGenerator {} finished running at time {}.",
+            self.element_id,
+            sim.now()
+        );
     }
 }

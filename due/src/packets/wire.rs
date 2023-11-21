@@ -11,16 +11,16 @@ pub struct Wire<A>
 where
     A: Distribution<Time>,
 {
-    element_id: u32,
+    element_id: usize,
     /// the packet delay distribution
     delay_dist: Box<dyn Fn() -> A>,
     /// the time of the last sent packet, used to calculate the delay of the
     /// next packet
     last_sent: Time,
     /// the sender for sending outbound packets
-    pub sender: UnboundedSender<Packet>,
+    sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
-    pub receiver: UnboundedReceiver<Packet>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl<A> Element for Wire<A>
@@ -40,7 +40,7 @@ impl<A> Wire<A>
 where
     A: Distribution<Time>,
 {
-    pub fn new(element_id: u32, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
+    pub fn new(element_id: usize, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
         Wire {
             element_id,
             delay_dist,
@@ -99,6 +99,10 @@ where
             self.forward_packet(packet, sim).await;
         }
 
-        println!("Wire {} finished running.", self.element_id);
+        println!(
+            "Wire {} finished running at time {}.",
+            self.element_id,
+            sim.now()
+        );
     }
 }

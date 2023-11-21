@@ -1,37 +1,32 @@
-//! A simple FIFO port with only one receiver.
+//! Implements a simple FIFO scheduler with only one queue.
 
 use std::collections::VecDeque;
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::sim::SimContext;
-
 use crate::packets::packet::Packet;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::sim::SimContext;
 use crate::{Element, Shared};
 
 pub struct Port {
-    element_id: u32,
+    element_id: usize,
     /// the bit rate of the port
     rate: f64,
-    /// a queue limit in bytes or packets
-    qlimit: u32,
-    /// if true, qlimit will be based on bytes
-    limit_bytes: bool,
-    /// the number of packets sent
-    packets_sent: u32,
+    /// a closure that determines whether an inbound packet should be dropped or not
+    drop_strategy: Box<dyn PacketDrop>,
     /// the number of packets received
-    packets_received: u32,
+    packets_received: usize,
     /// the number of dropped packets
-    packets_dropped: u32,
-    /// the number of packets in the queue
-    packets_in_queue: u32,
+    packets_dropped: usize,
     /// the total byte sizes in the queue
-    bytes_in_queue: u32,
+    bytes_in_queue: usize,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
     /// a sender for sending outbound packets
-    pub sender: UnboundedSender<Packet>,
+    sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
-    pub receiver: UnboundedReceiver<Packet>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Element for Port {
@@ -45,16 +40,24 @@ impl Element for Port {
 }
 
 impl Port {
-    pub fn new(element_id: u32, rate: f64, qlimit: u32, limit_bytes: bool) -> Port {
+    pub fn new(
+        element_id: usize,
+        rate: f64,
+        capacity: usize,
+        capacity_unit: CapacityUnit,
+        drop_strategy: DropStrategy,
+    ) -> Port {
+        let packet_drop = match drop_strategy {
+            DropStrategy::TailDrop => TailDrop::new(capacity, capacity_unit),
+            _ => unimplemented!(),
+        };
+
         Port {
             element_id,
             rate,
-            qlimit,
-            limit_bytes,
-            packets_sent: 0,
+            drop_strategy: Box::new(packet_drop),
             packets_received: 0,
             packets_dropped: 0,
-            packets_in_queue: 0,
             bytes_in_queue: 0,
             queue: VecDeque::new(),
             sender: unbounded_channel().0,
@@ -63,11 +66,10 @@ impl Port {
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.packets_received += 1;
-
-        let byte_count = self.bytes_in_queue + packet.size;
-        let should_drop_packet = (self.limit_bytes && byte_count > self.qlimit)
-            || (!self.limit_bytes && self.queue.len() >= self.qlimit as usize);
+        // drops the packet if the buffer is full
+        let should_drop_packet =
+            self.drop_strategy
+                .should_drop(packet.size, self.bytes_in_queue, self.queue.len());
 
         // the case that this packet will be dropped.
         if should_drop_packet {
@@ -83,8 +85,8 @@ impl Port {
         }
 
         // the case that this packet will not be dropped.
+        self.packets_received += 1;
         self.queue.push_back(packet.clone());
-        self.packets_in_queue += 1;
         self.bytes_in_queue += packet.size;
 
         println!(
@@ -96,25 +98,22 @@ impl Port {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.packets_in_queue
+            self.queue.len()
         );
     }
 
     fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.packets_sent += 1;
-        self.packets_in_queue -= 1;
         self.bytes_in_queue -= packet.size;
 
         println!(
             "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets sent, {} packets in queue.",
+            {} packets in queue.",
             self.element_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             sim.now(),
-            self.packets_sent,
-            self.packets_in_queue
+            self.queue.len()
         );
     }
 
@@ -125,8 +124,7 @@ impl Port {
                 self.packet_received(packet, sim);
             }
 
-            // sending all packets in an FIFO order to the downstream element
-            while let Some(mut packet) = self.queue.pop_front() {
+            if let Some(mut packet) = self.queue.pop_front() {
                 sim.advance(packet.size as f64 * 8.0 / self.rate).await;
 
                 packet.send(sim.now());
@@ -134,14 +132,21 @@ impl Port {
                 self.packet_sent(packet, sim);
             }
 
-            // waiting for the next packet to arrive from the upstream elements
-            if let Some(packet) = self.receiver.recv().await {
+            if !self.queue.is_empty() {
+                // if there are packets in the queue, continue the loop
+                continue;
+            } else if let Some(packet) = self.receiver.recv().await {
+                // waits for the packet from the upstream element
                 self.packet_received(packet, sim);
             } else {
                 break;
             }
         }
 
-        println!("Port {} finished running.", self.element_id);
+        println!(
+            "Port {} finished running at time {}.",
+            self.element_id,
+            sim.now()
+        );
     }
 }

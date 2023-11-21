@@ -2,21 +2,28 @@
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::{packets::packet::Packet, Element};
 
+impl Element for Splitter {
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
+
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.senders.push(sender.clone());
+    }
+}
 pub struct Splitter {
-    element_id: u32,
-    pub sender_1: UnboundedSender<Packet>,
-    pub sender_2: UnboundedSender<Packet>,
-    pub receiver: UnboundedReceiver<Packet>,
+    element_id: usize,
+    senders: Vec<UnboundedSender<Packet>>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Splitter {
-    pub fn new(element_id: u32) -> Splitter {
+    pub fn new(element_id: usize) -> Splitter {
         Splitter {
             element_id,
-            sender_1: unbounded_channel().0,
-            sender_2: unbounded_channel().0,
+            senders: Vec::new(),
             receiver: unbounded_channel().1,
         }
     }
@@ -28,8 +35,9 @@ impl Splitter {
                 self.element_id, packet.packet_id, packet.size,
             );
 
-            let _ = self.sender_1.send(packet.clone());
-            let _ = self.sender_2.send(packet.clone());
+            for sender in self.senders.iter() {
+                let _ = sender.send(packet.clone());
+            }
         }
 
         println!("Splitter {} finished running.", self.element_id);

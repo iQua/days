@@ -32,15 +32,15 @@ pub struct Packet {
     /// the time when the packet is originally generated
     pub creation_time: Time,
     /// the size of the packet in bytes
-    pub size: u32,
+    pub size: usize,
     /// a unique identifier
-    pub packet_id: u32,
+    pub packet_id: usize,
     /// identifiers for the source
     pub src: String,
     /// identifiers for the destination
     pub dst: String,
     /// the flow identifier that the packet belongs to
-    pub flow_id: u32,
+    pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
     pub queueing_delay: Time,
 }
@@ -48,11 +48,11 @@ pub struct Packet {
 impl Packet {
     /// creates a new packet.
     pub fn new(
-        size: u32,
-        packet_id: u32,
+        size: usize,
+        packet_id: usize,
         src: String,
         dst: String,
-        flow_id: u32,
+        flow_id: usize,
         creation_time: Time,
     ) -> Packet {
         Packet {

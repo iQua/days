@@ -1,5 +1,6 @@
 //! This example shows how to create a basic network where two packet generators
-//! sends packets to a sink.
+//! send packets to a wire that adds propagation delays according to a random
+//! distribution, and then to a packet sink.
 
 use std::cell::RefCell;
 
@@ -8,9 +9,9 @@ use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
-use due::ports::wire::Wire;
+use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect, connect_pair, Shared};
+use due::{connect_n_1, connect_pair, Shared};
 
 const SEED: u64 = 1000;
 
@@ -31,7 +32,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     }
 
     // connects the generators to the wire
-    connect(&mut generators, &mut wire);
+    connect_n_1(&mut generators, &mut wire);
     // connects the wire to the sink
     connect_pair(&mut wire, &mut sink);
 
