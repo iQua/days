@@ -24,9 +24,9 @@ pub struct Port {
     /// the packet queue of the port
     queue: VecDeque<Packet>,
     /// a sender for sending outbound packets
-    pub sender: UnboundedSender<Packet>,
+    sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
-    pub receiver: UnboundedReceiver<Packet>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Element for Port {

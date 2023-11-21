@@ -18,9 +18,9 @@ pub struct SimplePacketSwitch {
     /// the output ports of the switch, with consecutive port ids start from 0
     pub ports: Vec<Port>,
     /// senders for sending outbound packets to ports or schedulers
-    pub senders: Vec<UnboundedSender<Packet>>,
+    senders: Vec<UnboundedSender<Packet>>,
     /// a receiver for receiving inbound packets
-    pub receiver: UnboundedReceiver<Packet>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Element for SimplePacketSwitch {

@@ -18,9 +18,9 @@ where
     /// next packet
     last_sent: Time,
     /// the sender for sending outbound packets
-    pub sender: UnboundedSender<Packet>,
+    sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
-    pub receiver: UnboundedReceiver<Packet>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl<A> Element for Wire<A>

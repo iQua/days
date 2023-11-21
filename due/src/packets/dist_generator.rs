@@ -18,7 +18,7 @@ where
     arr_interval_dist: Box<dyn Fn() -> A>,
     packet_size_dist: Box<dyn Fn() -> B>,
     packets_sent: usize,
-    pub sender: UnboundedSender<Packet>,
+    sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
 }
 
