@@ -31,7 +31,7 @@ pub trait Element {
 }
 
 /// connects a collection of upstream elements to a downstream element.
-pub fn connect(upstream: &mut [impl Element], downstream: &mut impl Element) {
+pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
     for element in upstream {
@@ -49,21 +49,10 @@ pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) 
 }
 
 /// connects an upstream element to a collection of downstream elemets.
-pub fn connect_to_many(
-    upstream: &mut impl Element,
-    downstream: &mut [impl Element],
-    senders: Vec<UnboundedSender<Packet>>,
-    receivers: Vec<UnboundedReceiver<Packet>>,
-) {
-    assert_eq!(
-        downstream.len(),
-        receivers.len(),
-        "The number of receivers is not equal to the number of downstream elements."
-    );
-
-    // connects senders and receivers
-    upstream.connect_senders(senders);
-    for (element, receiver) in downstream.iter_mut().zip(receivers.into_iter()) {
+pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element]) {
+    for element in downstream {
+        let (sender, receiver) = unbounded_channel();
+        upstream.connect_sender(sender);
         element.connect_receiver(receiver);
     }
 }
