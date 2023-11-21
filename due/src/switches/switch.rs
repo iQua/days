@@ -68,9 +68,9 @@ impl PacketSwitch {
                 SchedulingDiscipline::DRR => {
                     let mut port = DRRServer::new(
                         i,
+                        port_rate,
                         capacity,
                         CapacityUnit::Packets,
-                        port_rate,
                         DropStrategy::TailDrop,
                         weights.clone(),
                     );

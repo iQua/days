@@ -57,9 +57,9 @@ impl Element for DRRServer {
 impl DRRServer {
     pub fn new(
         element_id: usize,
+        rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
-        rate: f64,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> DRRServer {
