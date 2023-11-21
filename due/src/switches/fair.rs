@@ -18,6 +18,8 @@ pub struct FairPacketSwitch {
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
     /// the schedulers of the switch, with consecutive ids start from 0
     pub ports: Vec<DRRServer>,
+    /// senders for sending inbound packets to ports
+    port_senders: Vec<UnboundedSender<Packet>>,
     /// senders for sending outbound packets to ports or schedulers
     senders: Vec<UnboundedSender<Packet>>,
     /// a receiver for receiving inbound packets
@@ -71,14 +73,20 @@ impl FairPacketSwitch {
             fib,
             flow_classes: Box::new(|flow_id| flow_id),
             ports,
+            port_senders,
             senders: Vec::new(),
             receiver: unbounded_channel().1,
         }
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        for scheduler in self.ports {
-            sim.activate(scheduler.run(sim))
+        // connects ports to outbound senders
+        let mut i = 0;
+
+        for mut scheduler in self.ports {
+            scheduler.connect_sender(self.senders[i].clone());
+            sim.activate(scheduler.run(sim));
+            i += 1;
         }
 
         loop {
@@ -99,7 +107,7 @@ impl FairPacketSwitch {
 
                 // forwards packets to their corresponding ports
                 let port_id = self.fib[flow_class];
-                let _ = self.senders[port_id].send(packet);
+                let _ = self.port_senders[port_id].send(packet);
             } else {
                 break;
             }
