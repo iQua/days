@@ -92,7 +92,7 @@ fn main() {
     );
 
     println!(
-        "Statistics on queuing delay in this simulation: {:#.3}",
+        "Statistics on queueing delay in this simulation: {:#.3}",
         outcome.queueing_delay
     );
 }
