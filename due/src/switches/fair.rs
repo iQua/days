@@ -92,6 +92,17 @@ impl FairPacketSwitch {
                 self.packets_received += 1;
                 let flow_class = (self.flow_classes)(packet.flow_id);
 
+                println!(
+                    "FairPacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+                    {} packets received.",
+                    self.element_id,
+                    packet.packet_id,
+                    packet.size,
+                    packet.flow_id,
+                    sim.now(),
+                    self.packets_received
+                );
+
                 // forwards packets to their corresponding ports
                 if let Some(&port_id) = self.fib.get(flow_class) {
                     let _ = self.senders[port_id].send(packet);
