@@ -45,7 +45,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         0,
         100,
         CapacityUnit::Packets,
-        (1000 * 8) as f64 / 1.75,
+        (1000 * 8) as f64,
         DropStrategy::TailDrop,
         weights,
     );
@@ -55,12 +55,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut splitter_2 = Splitter::new(2);
 
     // connects packet generators and splitters
-    let (sender_0, receiver_0) = unbounded_channel();
-    let (sender_1, receiver_1) = unbounded_channel();
-    pg1.sender = sender_0;
-    pg2.sender = sender_1;
-    splitter_1.receiver = receiver_0;
-    splitter_2.receiver = receiver_1;
+    connect_pair(&mut pg1, &mut splitter_1);
+    connect_pair(&mut pg2, &mut splitter_2);
 
     // connects splitters and the DRR server
     let (sender_2, receiver_2) = unbounded_channel();

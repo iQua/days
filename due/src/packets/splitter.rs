@@ -2,8 +2,19 @@
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::{packets::packet::Packet, Element};
 
+impl Element for Splitter {
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
+
+    fn connect_senders(&mut self, senders: Vec<UnboundedSender<Packet>>) {
+        assert_eq!(senders.len(), 2, "The number of senders is not equal to 2.");
+        self.sender_1 = senders[0].clone();
+        self.sender_2 = senders[1].clone();
+    }
+}
 pub struct Splitter {
     element_id: usize,
     pub sender_1: UnboundedSender<Packet>,
