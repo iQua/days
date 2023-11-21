@@ -46,7 +46,7 @@ impl FairPacketSwitch {
         let mut ports = Vec::new();
 
         // the senders from the FairPacketSwitch to ports
-        let mut senders = Vec::new();
+        let mut port_senders = Vec::new();
 
         for i in 0..nports {
             let (sender, receiver) = unbounded_channel();
@@ -61,16 +61,17 @@ impl FairPacketSwitch {
             );
 
             scheduler.connect_receiver(receiver);
-            senders.push(sender);
+            port_senders.push(sender);
             ports.push(scheduler);
         }
+
         FairPacketSwitch {
             element_id,
             packets_received: 0,
             fib,
             flow_classes: Box::new(|flow_id| flow_id),
             ports,
-            senders,
+            senders: Vec::new(),
             receiver: unbounded_channel().1,
         }
     }
@@ -97,11 +98,8 @@ impl FairPacketSwitch {
                 );
 
                 // forwards packets to their corresponding ports
-                if let Some(&port_id) = self.fib.get(flow_class) {
-                    let _ = self.senders[port_id].send(packet);
-                } else {
-                    println!("Wrong fib demux in SimplePacketSwitch {}.", self.element_id);
-                }
+                let port_id = self.fib[flow_class];
+                let _ = self.senders[port_id].send(packet);
             } else {
                 break;
             }
