@@ -1,6 +1,6 @@
 //! Implements a Deficit Round Robin (DRR) server.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -26,8 +26,6 @@ pub struct DRRServer {
     deficit: Vec<usize>,
     /// quantum of classes, which are consecutive and start from 0
     quantum: Vec<usize>,
-    /// class_id -> the head-of-line packet in its queue
-    head_of_line: HashMap<usize, Packet>,
 
     /// the number of packets received, dropped, and in the queues waiting to be sent
     packets_received: usize,
@@ -93,7 +91,6 @@ impl DRRServer {
             drop_strategy: Box::new(packet_drop),
             deficit,
             quantum,
-            head_of_line: HashMap::new(),
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
@@ -147,14 +144,6 @@ impl DRRServer {
         );
     }
 
-    fn poll_packets(&mut self, class_id: usize, sim: SimContext<'_, Shared>) -> usize {
-        while let Ok(packet) = self.receiver.try_recv() {
-            self.packet_received(packet, sim);
-        }
-
-        self.queues[class_id].len()
-    }
-
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             // counts the number of packets in each queue
@@ -164,11 +153,9 @@ impl DRRServer {
             }
 
             // schedules packets by going through each queue
-            for (class_id, &count) in flow_queue_count.iter().enumerate() {
-                let mut current_length = count;
-
+            for class_id in 0..self.queues.len() {
                 // increases the deficit of the current queue if it is non-empty
-                if current_length > 0 || self.head_of_line.contains_key(&class_id) {
+                if self.queues[class_id].len() > 0 {
                     self.deficit[class_id] += self.quantum[class_id];
                 } else {
                     // resets to zero if the queue is empty
@@ -177,16 +164,8 @@ impl DRRServer {
 
                 let mut current_deficit = self.deficit[class_id];
 
-                while (current_deficit > 0)
-                    && (current_length > 0 || self.head_of_line.contains_key(&class_id))
-                {
-                    let mut packet;
-
-                    if let Some(head_packet) = self.head_of_line.remove(&class_id) {
-                        packet = head_packet;
-                    } else {
-                        packet = self.queues[class_id].pop_front().unwrap();
-                    }
+                while current_deficit > 0 && self.queues[class_id].len() > 0 {
+                    let packet = self.queues[class_id].front().unwrap().clone();
 
                     if packet.size <= current_deficit {
                         // sends the packet out to the next element
@@ -194,17 +173,19 @@ impl DRRServer {
 
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
-                        packet.send(sim.now());
+                        let mut outbound = self.queues[class_id].pop_front().unwrap();
+                        outbound.send(sim.now());
                         let _ = self.sender.send(packet.clone());
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
 
-                        // polls for and receives all outstanding packets from
-                        // DDRServer while sending the previous packets to the
-                        // downstream element
-                        // updates the length of the current queue
-                        current_length = self.poll_packets(class_id, sim);
+                        // polls for and receives all outstanding packets
+                        // recently sent to DDRServer while sending the previous
+                        // packet
+                        while let Ok(packet) = self.receiver.try_recv() {
+                            self.packet_received(packet, sim);
+                        }
 
                         println!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -214,10 +195,9 @@ impl DRRServer {
                             packet.size,
                             packet.flow_id,
                             sim.now(),
-                            current_length,
+                            self.queues[class_id].len(),
                         );
                     } else {
-                        self.head_of_line.insert(class_id, packet);
                         break;
                     }
                 }
