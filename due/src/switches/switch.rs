@@ -1,15 +1,22 @@
 //! Implements a fair packet switch with various schedulers, as well as bounded
 //! buffers, on each of the outgoing ports.
 
+use std::any::Any;
+
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
+use crate::schedulers::port::Port;
+use crate::switches::SchedulingDiscipline;
 use crate::Shared;
 use crate::{sim::SimContext, Element};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-pub struct FairPacketSwitch {
+pub struct PacketSwitch {
     element_id: usize,
+    /// Scheduling discipline
+    discipline: SchedulingDiscipline,
     /// the number of packets received by the switch
     packets_received: usize,
     /// the fib demux of the switch,
@@ -17,16 +24,16 @@ pub struct FairPacketSwitch {
     /// a closure that maps a flow_id to a class_id
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
     /// the schedulers of the switch, with consecutive ids start from 0
-    pub ports: Vec<DRRServer>,
+    pub ports: Vec<Box<dyn Any>>,
     /// senders for sending inbound packets to ports
     port_senders: Vec<UnboundedSender<Packet>>,
-    /// senders for sending outbound packets to ports or schedulers
+    /// senders for sending outbound packets to downstream elements
     senders: Vec<UnboundedSender<Packet>>,
     /// a receiver for receiving inbound packets
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for FairPacketSwitch {
+impl Element for PacketSwitch {
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         self.receiver = receiver;
     }
@@ -36,7 +43,7 @@ impl Element for FairPacketSwitch {
     }
 }
 
-impl FairPacketSwitch {
+impl PacketSwitch {
     pub fn new(
         element_id: usize,
         nports: usize,
@@ -44,32 +51,50 @@ impl FairPacketSwitch {
         capacity: usize,
         weights: Vec<usize>,
         fib: Vec<usize>,
-    ) -> FairPacketSwitch {
-        let mut ports = Vec::new();
-
-        // the senders from the FairPacketSwitch to ports
+        discipline: SchedulingDiscipline,
+    ) -> PacketSwitch {
+        // the senders from the PacketSwitch to ports
         let mut port_senders = Vec::new();
+        let mut ports: Vec<Box<dyn Any>> = Vec::new();
 
         for i in 0..nports {
             let (sender, receiver) = unbounded_channel();
 
-            let mut scheduler = DRRServer::new(
-                i,
-                capacity,
-                CapacityUnit::Packets,
-                port_rate,
-                DropStrategy::TailDrop,
-                weights.clone(),
-            );
+            match discipline {
+                SchedulingDiscipline::DRR => {
+                    let mut port = DRRServer::new(
+                        i,
+                        capacity,
+                        CapacityUnit::Packets,
+                        port_rate,
+                        DropStrategy::TailDrop,
+                        weights.clone(),
+                    );
 
-            scheduler.connect_receiver(receiver);
-            port_senders.push(sender);
-            ports.push(scheduler);
+                    port.connect_receiver(receiver);
+                    port_senders.push(sender);
+                    ports.push(Box::new(port));
+                }
+                SchedulingDiscipline::FIFO => {
+                    let mut port = Port::new(
+                        i,
+                        port_rate,
+                        capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    );
+
+                    port.connect_receiver(receiver);
+                    port_senders.push(sender);
+                    ports.push(Box::new(port));
+                }
+            }
         }
 
-        FairPacketSwitch {
+        PacketSwitch {
             element_id,
             packets_received: 0,
+            discipline,
             fib,
             flow_classes: Box::new(|flow_id| flow_id),
             ports,
@@ -83,10 +108,25 @@ impl FairPacketSwitch {
         // connects ports to outbound senders
         let mut i = 0;
 
-        for mut scheduler in self.ports {
-            scheduler.connect_sender(self.senders[i].clone());
-            sim.activate(scheduler.run(sim));
-            i += 1;
+        match self.discipline {
+            SchedulingDiscipline::DRR => {
+                for port in self.ports {
+                    let mut p = port.downcast::<DRRServer>().unwrap();
+                    p.connect_sender(self.senders[i].clone());
+                    sim.activate(p.run(sim));
+
+                    i += 1;
+                }
+            }
+            SchedulingDiscipline::FIFO => {
+                for port in self.ports {
+                    let mut p = port.downcast::<Port>().unwrap();
+                    p.connect_sender(self.senders[i].clone());
+                    sim.activate(p.run(sim));
+
+                    i += 1;
+                }
+            }
         }
 
         loop {
@@ -95,7 +135,7 @@ impl FairPacketSwitch {
                 let flow_class = (self.flow_classes)(packet.flow_id);
 
                 println!(
-                    "FairPacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+                    "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
                     {} packets received.",
                     self.element_id,
                     packet.packet_id,
@@ -114,7 +154,7 @@ impl FairPacketSwitch {
         }
 
         println!(
-            "FairPacketSwitch {} finished running at time {}.",
+            "PacketSwitch {} finished running at time {}.",
             self.element_id,
             sim.now()
         );

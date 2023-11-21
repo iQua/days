@@ -1,2 +1,6 @@
-pub mod fair;
-pub mod simple;
+pub mod switch;
+
+pub enum SchedulingDiscipline {
+    DRR,
+    FIFO,
+}

@@ -8,7 +8,8 @@ use statrs::distribution::{DiscreteUniform, Uniform};
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::switches::fair::FairPacketSwitch;
+use due::switches::switch::PacketSwitch;
+use due::switches::SchedulingDiscipline;
 use due::{connect_1_n, connect_n_1, Shared};
 
 const SEED: u64 = 1000;
@@ -33,12 +34,20 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes the fair packet switch
     let weights = vec![1, 2];
     let fib = vec![0, 1];
-    let mut fair_packet_switch = FairPacketSwitch::new(0, 2, (1000 * 8) as f64, 100, weights, fib);
+    let mut switch = PacketSwitch::new(
+        0,
+        2,
+        (1000 * 8) as f64,
+        100,
+        weights,
+        fib,
+        SchedulingDiscipline::DRR,
+    );
 
     // connects packet generators and the switch
-    connect_n_1(&mut generators, &mut fair_packet_switch);
+    connect_n_1(&mut generators, &mut switch);
     // connects the switch to packet sinks
-    connect_1_n(&mut fair_packet_switch, &mut sinks);
+    connect_1_n(&mut switch, &mut sinks);
 
     // activates all elements
     for generator in generators {
@@ -47,7 +56,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     for sink in sinks {
         sim.activate(sink.run(sim));
     }
-    sim.activate(fair_packet_switch.run(sim));
+    sim.activate(switch.run(sim));
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await

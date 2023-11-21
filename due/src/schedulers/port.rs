@@ -1,12 +1,12 @@
 //! A simple FIFO port with only one receiver.
 
 use std::collections::VecDeque;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::sim::SimContext;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::sim::SimContext;
 use crate::{Element, Shared};
 
 pub struct Port {
