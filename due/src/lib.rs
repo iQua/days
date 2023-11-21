@@ -22,12 +22,13 @@ pub trait Element {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         println!("The sender: {:?}", sender);
     }
+
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         println!("The receiver: {:?}", receiver)
     }
 }
 
-/// connects a collection of heterogeneous upstream elements to a downstream element.
+/// connects a collection of homogeneous upstream elements to a downstream element.
 pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
@@ -46,8 +47,17 @@ pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) 
     downstream.connect_receiver(receiver);
 }
 
+/// connects an upstream element to a collection of homogeneous downstream elements.
+pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element]) {
+    for element in downstream {
+        let (sender, receiver) = unbounded_channel();
+        upstream.connect_sender(sender);
+        element.connect_receiver(receiver);
+    }
+}
+
 /// connects an upstream element to a collection of heterogeneous downstream elements.
-pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [Box<&mut dyn Element>]) {
+pub fn connect_1_m(upstream: &mut impl Element, downstream: &mut [Box<&mut dyn Element>]) {
     for element in downstream {
         let (sender, receiver) = unbounded_channel();
         upstream.connect_sender(sender);
