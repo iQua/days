@@ -13,7 +13,7 @@ use due::packets::splitter::Splitter;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_pair, Shared, Element};
+use due::{connect_pair, Element, Shared};
 
 const SEED: u64 = 1000;
 
@@ -56,7 +56,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect_pair(&mut pg1, &mut splitter_1);
     connect_pair(&mut pg2, &mut splitter_2);
 
-        // connects the DRR server and the packet sink
+    // connects the DRR server and the packet sink
     connect_pair(&mut drr_server, &mut ps);
 
     // connects the DRR server and the packet sink
@@ -74,7 +74,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     drr_server.connect_receiver(receiver_0);
     sink_1.connect_receiver(receiver_1);
     sink_2.connect_receiver(receiver_2);
-    
 
     // activates all network components
     sim.activate(pg1.run(sim));
