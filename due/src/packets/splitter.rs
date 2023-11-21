@@ -15,8 +15,8 @@ impl Element for Splitter {
 }
 pub struct Splitter {
     element_id: usize,
-    pub senders: Vec<UnboundedSender<Packet>>,
-    pub receiver: UnboundedReceiver<Packet>,
+    senders: Vec<UnboundedSender<Packet>>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Splitter {

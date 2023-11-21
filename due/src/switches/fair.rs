@@ -29,15 +29,8 @@ impl Element for FairPacketSwitch {
         self.receiver = receiver;
     }
 
-    fn connect_senders(&mut self, senders: Vec<UnboundedSender<Packet>>) {
-        assert_eq!(
-            self.ports.len(),
-            senders.len(),
-            "The number of senders is not equal to the number of ports."
-        );
-        for (port, sender) in self.ports.iter_mut().zip(senders.iter()) {
-            port.connect_sender(sender.clone());
-        }
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.senders.push(sender.clone());
     }
 }
 

@@ -1,4 +1,5 @@
 use rand::rngs::SmallRng;
+use statrs::statistics::Distribution;
 use std::cell::RefCell;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -7,8 +8,16 @@ pub mod schedulers;
 pub mod sim;
 pub mod switches;
 
+use crate::packets::dist_generator::DistPacketGenerator;
 use crate::packets::packet::Packet;
+use crate::packets::sink::PacketSink;
+use crate::packets::splitter::Splitter;
+use crate::packets::wire::Wire;
+use crate::schedulers::drr::DRRServer;
+use crate::schedulers::port::Port;
 use crate::sim::{RandomVar, Time};
+use crate::switches::fair::FairPacketSwitch;
+use crate::switches::simple::SimplePacketSwitch;
 
 /// Globally shared data.
 pub struct Shared {
@@ -25,9 +34,28 @@ pub trait Element {
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         println!("The receiver: {:?}", receiver)
     }
-    fn connect_senders(&mut self, senders: Vec<UnboundedSender<Packet>>) {
-        println!("Length of the senders: {}", senders.len());
-    }
+}
+
+pub enum ElementType<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
+    DistPacketGenerator(DistPacketGenerator<A, B>),
+    PacketSink(PacketSink),
+    Port(Port),
+    Wire(Wire<A>),
+    DRRServer(DRRServer),
+    Splitter(Splitter),
+    SimplePacketSwitch(SimplePacketSwitch),
+    FairPacketSwitch(FairPacketSwitch),
+}
+
+impl<A, B> Element for ElementType<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
 }
 
 /// connects a collection of upstream elements to a downstream element.
@@ -41,6 +69,7 @@ pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element)
     (*downstream).connect_receiver(receiver);
 }
 
+/// connects an upstream element to a downstream element.
 pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
@@ -48,8 +77,12 @@ pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) 
     downstream.connect_receiver(receiver);
 }
 
-/// connects an upstream element to a collection of downstream elemets.
-pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element]) {
+/// connects an upstream element to a collection of downstream elements.
+pub fn connect_1_n<A, B>(upstream: &mut impl Element, downstream: &mut [ElementType<A, B>])
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
     for element in downstream {
         let (sender, receiver) = unbounded_channel();
         upstream.connect_sender(sender);
