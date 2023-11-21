@@ -177,8 +177,8 @@ impl DRRServer {
 
                 let mut current_deficit = self.deficit[class_id];
 
-                while (current_deficit > 0 && current_length > 0)
-                    || self.head_of_line.contains_key(&class_id)
+                while (current_deficit > 0)
+                    && (current_length > 0 || self.head_of_line.contains_key(&class_id))
                 {
                     let mut packet;
 
