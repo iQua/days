@@ -1,10 +1,10 @@
 //! A simple wire component.
 
-use crate::sim::{SimContext, Time};
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
+use crate::sim::{SimContext, Time};
 use crate::{Element, Shared};
 
 pub struct Wire<A>

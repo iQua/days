@@ -13,6 +13,7 @@ impl Element for Splitter {
         self.senders.push(sender.clone());
     }
 }
+
 pub struct Splitter {
     element_id: usize,
     senders: Vec<UnboundedSender<Packet>>,
