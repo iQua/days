@@ -31,12 +31,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     }
 
     // initializes the fair packet switch
-    let mut weights = Vec::new();
-    let mut fib = Vec::new();
-    for i in 0..2 {
-        fib.push(i);
-        weights.push(i + 1);
-    }
+    let weights = vec![1, 2];
+    let fib = vec![0, 1];
     let mut fair_packet_switch = FairPacketSwitch::new(0, 2, (1000 * 8) as f64, 100, weights, fib);
 
     // connects packet generators and the switch
