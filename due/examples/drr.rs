@@ -13,7 +13,7 @@ use due::packets::splitter::Splitter;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_pair, Shared};
+use due::{connect_pair, Shared, Element};
 
 const SEED: u64 = 1000;
 
@@ -38,9 +38,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink_2: PacketSink = PacketSink::new(2);
 
     // initializes the DRR server
-    let mut weights = Vec::new();
-    weights.push(1);
-    weights.push(2);
+    let weights = vec![1, 2];
     let mut drr_server = DRRServer::new(
         0,
         100,
@@ -58,23 +56,25 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect_pair(&mut pg1, &mut splitter_1);
     connect_pair(&mut pg2, &mut splitter_2);
 
-    // connects splitters and the DRR server
-    let (sender_2, receiver_2) = unbounded_channel();
-    splitter_1.sender_1 = sender_2.clone();
-    splitter_2.sender_1 = sender_2.clone();
-    drr_server.receiver = receiver_2;
-    drop(sender_2);
+        // connects the DRR server and the packet sink
+    connect_pair(&mut drr_server, &mut ps);
 
     // connects the DRR server and the packet sink
     connect_pair(&mut drr_server, &mut ps);
 
-    // connects splitters and packet sinks
-    let (sender_4, receiver_4) = unbounded_channel();
-    let (sender_5, receiver_5) = unbounded_channel();
-    splitter_1.sender_2 = sender_4;
-    splitter_2.sender_2 = sender_5;
-    sink_1.receiver = receiver_4;
-    sink_2.receiver = receiver_5;
+    let (sender_0, receiver_0) = unbounded_channel();
+    let (sender_1, receiver_1) = unbounded_channel();
+    let (sender_2, receiver_2) = unbounded_channel();
+    let senders_splitter_1 = vec![sender_0.clone(), sender_1];
+    let senders_splitter_2 = vec![sender_0, sender_2];
+
+    // connects splitters to packet sinks and the DRR server
+    splitter_1.connect_senders(senders_splitter_1);
+    splitter_2.connect_senders(senders_splitter_2);
+    drr_server.connect_receiver(receiver_0);
+    sink_1.connect_receiver(receiver_1);
+    sink_2.connect_receiver(receiver_2);
+    
 
     // activates all network components
     sim.activate(pg1.run(sim));
