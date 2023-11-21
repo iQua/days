@@ -1,7 +1,8 @@
 //! Implements a packet switch with a FIFO bounded buffer on each of the outgoing ports.
 
 use crate::packets::packet::Packet;
-use crate::ports::port::Port;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy};
+use crate::schedulers::port::Port;
 use crate::Shared;
 use crate::{sim::SimContext, Element};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -11,7 +12,7 @@ pub struct SimplePacketSwitch {
     /// the number of packets received by the switch
     packets_received: usize,
     /// the fib demux of the switch,
-    pub fib: Vec<usize>,
+    fib: Vec<usize>,
     /// a closure that maps a flow_id to a class_id
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
     /// the output ports of the switch, with consecutive port ids start from 0
@@ -50,7 +51,13 @@ impl SimplePacketSwitch {
         let mut senders = Vec::new();
         for i in 0..nports {
             let (sender, receiver) = unbounded_channel();
-            let mut port = Port::new(i, port_rate, buffer_size, false, false);
+            let mut port = Port::new(
+                i,
+                port_rate,
+                buffer_size,
+                CapacityUnit::Packets,
+                DropStrategy::TailDrop,
+            );
             port.connect_receiver(receiver);
             senders.push(sender);
             ports.push(port);

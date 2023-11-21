@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub mod packets;
 pub mod schedulers;
 pub mod sim;
-// pub mod switches;
+pub mod switches;
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, Time};

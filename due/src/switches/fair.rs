@@ -2,8 +2,8 @@
 //! buffers, on each of the outgoing ports.
 
 use crate::packets::packet::Packet;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
-use crate::schedulers::port::Port;
 use crate::Shared;
 use crate::{sim::SimContext, Element};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -13,12 +13,10 @@ pub struct FairPacketSwitch {
     /// the number of packets received by the switch
     packets_received: usize,
     /// the fib demux of the switch,
-    pub fib: Vec<usize>,
+    fib: Vec<usize>,
     /// a closure that maps a flow_id to a class_id
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
     /// the schedulers of the switch, with consecutive ids start from 0
-    pub egress_ports: Vec<Port>,
-    /// the output ports of the switch, with consecutive ids start from 0
     pub ports: Vec<DRRServer>,
     /// senders for sending outbound packets to ports or schedulers
     pub senders: Vec<UnboundedSender<Packet>>,
@@ -51,25 +49,25 @@ impl FairPacketSwitch {
         buffer_size: usize,
         weights: Vec<usize>,
     ) -> FairPacketSwitch {
-        let mut egress_ports = Vec::new();
         let mut ports = Vec::new();
 
         // the senders from the FairPacketSwitch to ports
         let mut senders = Vec::new();
 
         for i in 0..nports {
-            let (sender_1, receiver_1) = unbounded_channel();
-            let (sender_2, receiver_2) = unbounded_channel();
+            let (sender, receiver) = unbounded_channel();
 
-            let mut scheduler = DRRServer::new(i, port_rate, weights.clone(), true);
-            let mut port = Port::new(i, port_rate, buffer_size, false, true);
+            let mut scheduler = DRRServer::new(
+                i,
+                buffer_size,
+                CapacityUnit::Packets,
+                port_rate,
+                DropStrategy::TailDrop,
+                weights.clone(),
+            );
 
-            senders.push(sender_1);
-            port.connect_receiver(receiver_1);
-            scheduler.sender_to_upstream = sender_2;
-            port.receiver_from_downstream = receiver_2;
-
-            egress_ports.push(port);
+            scheduler.connect_receiver(receiver);
+            senders.push(sender);
             ports.push(scheduler);
         }
         let fib = Vec::new();
@@ -78,7 +76,6 @@ impl FairPacketSwitch {
             packets_received: 0,
             fib,
             flow_classes: Box::new(|flow_id| flow_id),
-            egress_ports,
             ports,
             senders,
             receiver: unbounded_channel().1,
@@ -86,9 +83,6 @@ impl FairPacketSwitch {
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        for port in self.egress_ports {
-            sim.activate(port.run(sim));
-        }
         for scheduler in self.ports {
             sim.activate(scheduler.run(sim))
         }
@@ -110,7 +104,7 @@ impl FairPacketSwitch {
         }
 
         println!(
-            "SimplePacketSwitch {} finished running at time {}.",
+            "FairPacketSwitch {} finished running at time {}.",
             self.element_id,
             sim.now()
         );
