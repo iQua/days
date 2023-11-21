@@ -146,12 +146,6 @@ impl DRRServer {
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // counts the number of packets in each queue
-            let mut flow_queue_count: Vec<usize> = Vec::new();
-            for queue in &self.queues {
-                flow_queue_count.push(queue.len());
-            }
-
             // schedules packets by going through each queue
             for class_id in 0..self.queues.len() {
                 // increases the deficit of the current queue if it is non-empty
