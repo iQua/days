@@ -19,12 +19,12 @@ pub struct PacketSwitch {
     discipline: SchedulingDiscipline,
     /// the number of packets received by the switch
     packets_received: usize,
-    /// the fib demux of the switch,
+    /// the flow information base (FIB) of the switch
     fib: Vec<usize>,
     /// a closure that maps a flow_id to a class_id
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
     /// the schedulers of the switch, with consecutive ids start from 0
-    pub ports: Vec<Box<dyn Any>>,
+    ports: Vec<Box<dyn Any>>,
     /// senders for sending inbound packets to ports
     port_senders: Vec<UnboundedSender<Packet>>,
     /// senders for sending outbound packets to downstream elements
@@ -53,9 +53,10 @@ impl PacketSwitch {
         fib: Vec<usize>,
         discipline: SchedulingDiscipline,
     ) -> PacketSwitch {
-        // the senders from the PacketSwitch to ports
-        let mut port_senders = Vec::new();
         let mut ports: Vec<Box<dyn Any>> = Vec::new();
+
+        // the senders from the demultiplexer to ports inside the switch
+        let mut port_senders = Vec::new();
 
         for i in 0..nports {
             let (sender, receiver) = unbounded_channel();
