@@ -1,4 +1,4 @@
-//! Implements a Deficit Round Robin (DRR) server.
+//! Implements a Deficit Round Robin (DRR) scheduler.
 
 use std::collections::VecDeque;
 

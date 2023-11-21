@@ -1,4 +1,4 @@
-//! A simple FIFO port with only one receiver.
+//! Implements a simple FIFO scheduler with only one queue.
 
 use std::collections::VecDeque;
 
