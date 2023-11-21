@@ -20,13 +20,16 @@ pub struct PacketSwitch {
     /// the number of packets received by the switch
     packets_received: usize,
     /// the flow information base (FIB) of the switch
+    /// class_id -> the outbound port_id
     fib: Vec<usize>,
-    /// a closure that maps a flow_id to a class_id
+    /// a closure that maps flow_id -> class_id
     pub flow_classes: Box<dyn Fn(usize) -> usize>,
-    /// the schedulers of the switch, with consecutive ids start from 0
+    /// the outbound ports, with consecutive ids starting from 0
+    /// each of these ports is governed by a DRR or FIFO scheduler
     ports: Vec<Box<dyn Any>>,
-    /// senders for sending inbound packets to ports
+    /// senders for sending inbound packets to outbound ports
     port_senders: Vec<UnboundedSender<Packet>>,
+
     /// senders for sending outbound packets to downstream elements
     senders: Vec<UnboundedSender<Packet>>,
     /// a receiver for receiving inbound packets
@@ -146,7 +149,7 @@ impl PacketSwitch {
                     self.packets_received
                 );
 
-                // forwards packets to their corresponding ports
+                // forwards packets to their corresponding outbound ports
                 let port_id = self.fib[flow_class];
                 let _ = self.port_senders[port_id].send(packet);
             } else {
