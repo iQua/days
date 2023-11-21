@@ -46,8 +46,9 @@ impl FairPacketSwitch {
         element_id: usize,
         nports: usize,
         port_rate: f64,
-        buffer_size: usize,
+        capacity: usize,
         weights: Vec<usize>,
+        fib: Vec<usize>,
     ) -> FairPacketSwitch {
         let mut ports = Vec::new();
 
@@ -59,7 +60,7 @@ impl FairPacketSwitch {
 
             let mut scheduler = DRRServer::new(
                 i,
-                buffer_size,
+                capacity,
                 CapacityUnit::Packets,
                 port_rate,
                 DropStrategy::TailDrop,
@@ -70,7 +71,6 @@ impl FairPacketSwitch {
             senders.push(sender);
             ports.push(scheduler);
         }
-        let fib = Vec::new();
         FairPacketSwitch {
             element_id,
             packets_received: 0,
