@@ -109,7 +109,7 @@ impl PacketSwitch {
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        // connects ports to outbound senders
+        // connects ports to outbound senders and activates them in the simulator
         let mut i = 0;
 
         match self.discipline {
