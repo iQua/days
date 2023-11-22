@@ -27,6 +27,10 @@ impl<A> Element for Wire<A>
 where
     A: Distribution<Time>,
 {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
