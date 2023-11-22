@@ -42,10 +42,7 @@ pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element)
 }
 
 /// Connects a collection of upstream elements to a downstream element.
-pub fn connect_n_1_new(
-    upstream: &mut [Box<&mut dyn Element>],
-    downstream: &mut impl Element,
-) {
+pub fn connect_n_1_new(upstream: &mut [Box<&mut dyn Element>], downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
     for upstream_element in upstream.iter_mut() {
