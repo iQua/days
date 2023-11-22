@@ -30,6 +30,10 @@ pub struct Port {
 }
 
 impl Element for Port {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }

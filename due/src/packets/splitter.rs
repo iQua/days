@@ -5,6 +5,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::{packets::packet::Packet, Element};
 
 impl Element for Splitter {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         self.receiver = receiver;
     }
@@ -13,6 +17,7 @@ impl Element for Splitter {
         self.senders.push(sender.clone());
     }
 }
+
 pub struct Splitter {
     element_id: usize,
     senders: Vec<UnboundedSender<Packet>>,

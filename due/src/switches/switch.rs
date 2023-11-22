@@ -37,6 +37,10 @@ pub struct PacketSwitch {
 }
 
 impl Element for PacketSwitch {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         self.receiver = receiver;
     }
@@ -109,7 +113,7 @@ impl PacketSwitch {
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        // connects ports to outbound senders
+        // connects ports to outbound senders and activates them for execution
         let mut i = 0;
 
         match self.discipline {

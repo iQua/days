@@ -1,10 +1,10 @@
 //! A simple wire component.
 
-use crate::sim::{SimContext, Time};
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
+use crate::sim::{SimContext, Time};
 use crate::{Element, Shared};
 
 pub struct Wire<A>
@@ -27,6 +27,10 @@ impl<A> Element for Wire<A>
 where
     A: Distribution<Time>,
 {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }

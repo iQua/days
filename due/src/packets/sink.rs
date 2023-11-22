@@ -34,6 +34,10 @@ pub struct PacketSink {
 }
 
 impl Element for PacketSink {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }

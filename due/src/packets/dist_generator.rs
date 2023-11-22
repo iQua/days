@@ -27,6 +27,10 @@ where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
+    fn id(&mut self) -> usize {
+        self.element_id
+    }
+
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
