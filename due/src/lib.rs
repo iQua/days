@@ -146,8 +146,7 @@ pub fn elements_to_core(k: usize, core_id: usize) -> Vec<usize> {
 
     let agg_start = switches_per_layer;
     let core_type = (core_id - 2 * switches_per_layer) / pod_switches_per_layer;
-    let agg_ids = (agg_start + core_type..agg_start + switches_per_layer)
+    (agg_start + core_type..agg_start + switches_per_layer)
         .step_by(pod_switches_per_layer)
-        .collect::<Vec<_>>();
-    agg_ids
+        .collect::<Vec<_>>()
 }
