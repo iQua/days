@@ -15,6 +15,24 @@ use due::{connect_n_1_hetero, connect_pair, Element, Shared};
 
 const SEED: u64 = 1000;
 
+/// This function returns the ids of packet generators and aggregation layer
+/// switches that send packets to a given edge layer switch.
+fn elements_to_edge(k: usize, edge_id: usize) -> (Vec<usize>, Vec<usize>) {
+    let pod_switches_per_layer = k / 2;
+    let switches_per_layer = pod_switches_per_layer * k;
+    let hosts_per_switch = k/2;
+    assert!(edge_id < switches_per_layer, "Invalid edge id.");
+    
+    let pod_id = edge_id / pod_switches_per_layer;
+    let agg_start = switches_per_layer + pod_id * pod_switches_per_layer;
+    let host_start = edge_id * hosts_per_switch;
+
+    let agg_ids = (agg_start..agg_start+pod_switches_per_layer).collect::<Vec<_>>();
+    let generator_ids = (host_start..host_start+hosts_per_switch).collect::<Vec<_>>();
+
+    (agg_ids, generator_ids)
+}
+
 fn is_agg_edge_connected(k: usize, aggregation_id: usize, edge_id: usize) -> bool {
     let switches_per_pod = k / 2;
     let switches_per_layer = switches_per_pod * k;
@@ -26,11 +44,13 @@ fn is_agg_edge_connected(k: usize, aggregation_id: usize, edge_id: usize) -> boo
     );
 
     let pod_id = edge_id / (k / 2);
-    let in_same_pod = (aggregation_id >= switches_per_layer + pod_id * switches_per_pod)
+    let is_connected = (aggregation_id >= switches_per_layer + pod_id * switches_per_pod)
         && (aggregation_id < switches_per_layer + (pod_id + 1) * switches_per_pod);
 
-    in_same_pod
+    is_connected
 }
+
+
 
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     assert!(k > 0 && k % 2 == 0, "Invalid k!");
@@ -120,14 +140,16 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // connects elements that send packets to edge layer switches
     for (edge_id, edge_switch) in edge_switches.iter_mut().enumerate() {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
+        let (agg_ids, generator_ids) = elements_to_edge(k, edge_id);
+        
         for generator in &mut generators {
-            if generator.id() == k / 2 * edge_id || generator.id() == k / 2 * edge_id + 1 {
+            if generator_ids.contains(&generator.id()) {
                 upstreams.push(Box::new(generator as &mut dyn Element));
             }
         }
 
         for switch in &mut aggregation_switches {
-            if is_agg_edge_connected(k, switch.id(), edge_id) {
+            if agg_ids.contains(&switch.id()) {
                 upstreams.push(Box::new(switch as &mut dyn Element));
             }
         }
