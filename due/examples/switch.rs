@@ -18,14 +18,12 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes packet generators and packet sinks
     let mut generators = Vec::new();
     let mut sinks = Vec::new();
+    let arr_interval_dist = Box::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     for i in 0..2 {
-        let generator = DistPacketGenerator::new(
-            i,
-            0.,
-            Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
-            Box::new(|| DiscreteUniform::new(1000, 1000).unwrap()),
-        );
+        let generator =
+            DistPacketGenerator::new(i, 0., arr_interval_dist.clone(), packet_size_dist.clone());
         let sink = PacketSink::new(i);
         generators.push(generator);
         sinks.push(sink);

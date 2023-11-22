@@ -17,14 +17,12 @@ const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut generators = Vec::new();
+    let arr_interval_dist = Box::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Box::new(|| Uniform::new(1000.0, 1000.0).unwrap());
 
     for i in 0..2 {
-        let generator = DistPacketGenerator::new(
-            i,
-            1.0,
-            Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
-            Box::new(|| Uniform::new(1000.0, 1000.0).unwrap()),
-        );
+        let generator =
+            DistPacketGenerator::new(i, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
         generators.push(generator);
     }
 
