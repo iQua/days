@@ -11,12 +11,11 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::{connect_n_m, connect_pair, Element, Shared};
+use due::{Element, Shared, connect_n_1_new};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
-
     let num_core_switches = (k / 2).pow(2);
     let num_aggregation_switches = (k.pow(2)) / 2;
     let num_edge_switches = (k.pow(2)) / 2;
@@ -91,16 +90,24 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
 
     // connects elements that send packets to edge layer switches
     for (edge_id, edge_switch) in edge_switches.iter_mut().enumerate() {
-        let packet_generator_1 = generators.get_mut(edge_id).unwrap();
-        let packet_generator_2 = generators.get_mut(edge_id + 1).unwrap();
-        let aggregation_switch_1 = aggregation_switches.get_mut(edge_id).unwrap();
-        let aggregation_switch_2 = aggregation_switches.get_mut(edge_id + 1).unwrap();
-        let mut upstreams: Vec<Box<&mut dyn Element>> = vec![
-            Box::new(packet_generator_1),
-            Box::new(packet_generator_2),
-            Box::new(aggregation_switch_1),
-            Box::new(aggregation_switch_2),
-        ];
+        
+        let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
+        for generator in &mut generators {
+            if generator.id() == edge_id || generator.id() == edge_id + 1 {
+                upstreams.push(Box::new(generator as &mut dyn Element));
+            }
+        }
+
+        for switch in &mut aggregation_switches {
+            if switch.id() == edge_id || switch.id() == edge_id+1 {
+                upstreams.push(Box::new(switch as &mut dyn Element));
+            }
+        }
+        
+        connect_n_1_new(
+            &mut upstreams,
+            edge_switch,
+        );
     }
 
     // connects edge layer switches and aggregation layer switches
