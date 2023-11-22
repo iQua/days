@@ -59,7 +59,9 @@ pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element])
 }
 
 /// connects multiple heterogeneous upstream elements to multiple heterogeneous
-/// downstream elements.
+/// downstream elements. The connections are established based on the bipartite
+/// graph `edges`, where each Vec corresponds to a specific upstream element and
+/// contains the indices of downstream elements it should connect to.
 pub fn connect_n_m(
     upstream: &mut [Box<&mut dyn Element>],
     downstream: &mut [Box<&mut dyn Element>],

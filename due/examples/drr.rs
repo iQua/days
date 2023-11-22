@@ -68,7 +68,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect_n_m(
         &mut upstreams,
         &mut downstreams,
-        vec![vec![0, 1], vec![1, 2]],
+        vec![vec![0, 1], vec![0, 2]],
     );
 
     // connects the DRR server and the packet sink
