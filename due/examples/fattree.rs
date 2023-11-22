@@ -11,11 +11,19 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::Shared;
+use due::{connect_n_m, connect_pair, Element, Shared};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
+
+    let num_core_switches = (k / 2).pow(2);
+    let num_aggregation_switches = (k.pow(2)) / 2;
+    let num_edge_switches = (k.pow(2)) / 2;
+
+    let port_rate = (4000 * 8) as f64;
+    let capacity = 100;
+
     // initializes packet generators and packet sinks
     let mut generators = Vec::new();
     let mut sinks = Vec::new();
@@ -23,7 +31,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // initializes all (k^3)/4 hosts
-    for i in 0..k.pow(3) / 4 {
+    for i in 0..num_edge_switches {
         let generator =
             DistPacketGenerator::new(i, 0., arr_interval_dist.clone(), packet_size_dist.clone());
         let sink = PacketSink::new(i);
@@ -31,47 +39,10 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         sinks.push(sink);
     }
 
-    let port_rate = (4000 * 8) as f64;
-    let capacity = 100;
-
-    let num_core_switches = (k / 2).pow(2);
-    let num_aggregation_switches = (k.pow(2)) / 2;
-    let num_edge_switches = (k.pow(2)) / 2;
-
     // TODO:
     // modify weights, fib, flow_to_classes, and add dst for flows!
     let weights: Vec<_> = (1..=4).cycle().take(num_core_switches).collect();
     let fib: Vec<_> = vec![0, 1, 2, 3];
-
-    // initializes switches in the core layer
-    let mut core_switches = Vec::new();
-    for i in 0..num_core_switches {
-        let switch = PacketSwitch::new(
-            i,
-            k,
-            port_rate,
-            capacity,
-            weights.clone(),
-            fib.clone(),
-            SchedulingDiscipline::DRR,
-        );
-        core_switches.push(switch);
-    }
-
-    // initializes switches in the aggregation layer
-    let mut aggregation_switches = Vec::new();
-    for i in 0..num_aggregation_switches {
-        let switch = PacketSwitch::new(
-            i,
-            k,
-            port_rate,
-            capacity,
-            weights.clone(),
-            fib.clone(),
-            SchedulingDiscipline::DRR,
-        );
-        aggregation_switches.push(switch);
-    }
 
     // initializes switches in the edge layer
     let mut edge_switches = Vec::new();
@@ -88,7 +59,49 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         edge_switches.push(switch);
     }
 
-    // connects hosts and edge layer switches
+    // initializes switches in the aggregation layer
+    let mut aggregation_switches = Vec::new();
+    for i in 0..num_aggregation_switches {
+        let switch = PacketSwitch::new(
+            i + num_edge_switches,
+            k,
+            port_rate,
+            capacity,
+            weights.clone(),
+            fib.clone(),
+            SchedulingDiscipline::DRR,
+        );
+        aggregation_switches.push(switch);
+    }
+
+    // initializes switches in the core layer
+    let mut core_switches = Vec::new();
+    for i in 0..num_core_switches {
+        let switch = PacketSwitch::new(
+            i + num_edge_switches + num_aggregation_switches,
+            k,
+            port_rate,
+            capacity,
+            weights.clone(),
+            fib.clone(),
+            SchedulingDiscipline::DRR,
+        );
+        core_switches.push(switch);
+    }
+
+    // connects elements that send packets to edge layer switches
+    for (edge_id, edge_switch) in edge_switches.iter_mut().enumerate() {
+        let packet_generator_1 = generators.get_mut(edge_id).unwrap();
+        let packet_generator_2 = generators.get_mut(edge_id + 1).unwrap();
+        let aggregation_switch_1 = aggregation_switches.get_mut(edge_id).unwrap();
+        let aggregation_switch_2 = aggregation_switches.get_mut(edge_id + 1).unwrap();
+        let mut upstreams: Vec<Box<&mut dyn Element>> = vec![
+            Box::new(packet_generator_1),
+            Box::new(packet_generator_2),
+            Box::new(aggregation_switch_1),
+            Box::new(aggregation_switch_2),
+        ];
+    }
 
     // connects edge layer switches and aggregation layer switches
 
