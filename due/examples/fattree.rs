@@ -11,26 +11,29 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::{connect_n_1_new, connect_pair, Element, Shared};
+use due::{connect_n_1_hetero, connect_pair, Element, Shared};
 
 const SEED: u64 = 1000;
 
-fn in_same_pod(k: usize, edge_id: usize, aggregation_id: usize) -> bool {
+fn is_agg_edge_connected(k: usize, aggregation_id: usize, edge_id: usize) -> bool {
     let switches_per_pod = k / 2;
     let switches_per_layer = switches_per_pod * k;
 
     assert!(edge_id < switches_per_layer, "Invalid edge id.");
-    assert!(aggregation_id >= switches_per_layer && aggregation_id < 2 * switches_per_layer, "Invalid aggregation id.");
+    assert!(
+        aggregation_id >= switches_per_layer && aggregation_id < 2 * switches_per_layer,
+        "Invalid aggregation id."
+    );
 
-    let pod_id = edge_id / (k/2);
-    let in_same_pod = (aggregation_id >= switches_per_layer + pod_id * switches_per_pod) && (aggregation_id < switches_per_layer + (pod_id + 1) * switches_per_pod);
-    
+    let pod_id = edge_id / (k / 2);
+    let in_same_pod = (aggregation_id >= switches_per_layer + pod_id * switches_per_pod)
+        && (aggregation_id < switches_per_layer + (pod_id + 1) * switches_per_pod);
+
     in_same_pod
 }
 
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
-
-    assert!(k > 0 && k%2 == 0, "Invalid k!");
+    assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
     let num_core_switches = (k / 2).pow(2);
     let num_aggregation_switches = (k.pow(2)) / 2;
@@ -124,13 +127,12 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         }
 
         for switch in &mut aggregation_switches {
-            if in_same_pod(k, edge_id, switch.id())
-            {
+            if is_agg_edge_connected(k, switch.id(), edge_id) {
                 upstreams.push(Box::new(switch as &mut dyn Element));
             }
         }
 
-        connect_n_1_new(&mut upstreams, edge_switch);
+        connect_n_1_hetero(&mut upstreams, edge_switch);
     }
 
     // connects elements that send packets to aggregation layer switches
@@ -138,8 +140,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
 
         for switch in &mut edge_switches {
-            if in_same_pod(k, switch.id(), aggregation_id)
-            {
+            if is_agg_edge_connected(k, aggregation_id, switch.id()) {
                 upstreams.push(Box::new(switch as &mut dyn Element));
             }
         }
@@ -150,7 +151,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
             }
         }
 
-        connect_n_1_new(&mut upstreams, aggregation_switch);
+        connect_n_1_hetero(&mut upstreams, aggregation_switch);
     }
 
     // connects aggregation layer switches and core layer switches

@@ -11,7 +11,7 @@ use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
 use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_1, connect_pair, Shared};
+use due::{connect_n_1_homo, connect_pair, Shared};
 
 const SEED: u64 = 1000;
 
@@ -30,7 +30,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     }
 
     // connects the generators to the wire
-    connect_n_1(&mut generators, &mut wire);
+    connect_n_1_homo(&mut generators, &mut wire);
     // connects the wire to the sink
     connect_pair(&mut wire, &mut sink);
 

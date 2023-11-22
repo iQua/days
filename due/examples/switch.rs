@@ -10,7 +10,7 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::{connect_1_n, connect_n_1, Shared};
+use due::{connect_1_n, connect_n_1_homo, Shared};
 
 const SEED: u64 = 1000;
 
@@ -43,7 +43,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     );
 
     // connects packet generators and the switch
-    connect_n_1(&mut generators, &mut switch);
+    connect_n_1_homo(&mut generators, &mut switch);
     // connects the switch to packet sinks
     connect_1_n(&mut switch, &mut sinks);
 

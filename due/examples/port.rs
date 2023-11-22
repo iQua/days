@@ -11,7 +11,7 @@ use due::packets::sink::PacketSink;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::port::Port;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_1, connect_pair, Shared};
+use due::{connect_n_1_homo, connect_pair, Shared};
 
 const SEED: u64 = 1000;
 
@@ -36,7 +36,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink = PacketSink::new(0);
 
     // connects the generators to the port
-    connect_n_1(&mut generators, &mut port);
+    connect_n_1_homo(&mut generators, &mut port);
 
     // connects the port to the sink
     connect_pair(&mut port, &mut sink);
