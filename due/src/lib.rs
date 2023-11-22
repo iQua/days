@@ -30,7 +30,7 @@ pub trait Element {
     }
 }
 
-/// connects a collection of homogeneous upstream elements to a downstream element.
+/// Connects a collection of homogeneous upstream elements to a downstream element.
 pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
@@ -41,7 +41,7 @@ pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element)
     (*downstream).connect_receiver(receiver);
 }
 
-/// connects an upstream element to a downstream element.
+/// Connects an upstream element to a downstream element.
 pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) {
     let (sender, receiver) = unbounded_channel();
 
@@ -49,7 +49,7 @@ pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) 
     downstream.connect_receiver(receiver);
 }
 
-/// connects an upstream element to a collection of homogeneous downstream elements.
+/// Connects an upstream element to a collection of homogeneous downstream elements.
 pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element]) {
     for element in downstream {
         let (sender, receiver) = unbounded_channel();
