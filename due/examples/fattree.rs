@@ -11,75 +11,18 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::{connect_n_1_hetero, connect_pair, Element, Shared};
+use due::{
+    connect_n_1_hetero, connect_pair, elements_to_agg, elements_to_core, elements_to_edge, Element,
+    Shared,
+};
 
 const SEED: u64 = 1000;
-
-/// This function returns the ids of aggregation layer switches and packet
-/// generators that send packets to a given edge layer switch.
-fn elements_to_edge(k: usize, edge_id: usize) -> (Vec<usize>, Vec<usize>) {
-    let pod_switches_per_layer = k / 2;
-    let switches_per_layer = pod_switches_per_layer * k;
-    let hosts_per_switch = k / 2;
-    assert!(
-        edge_id < switches_per_layer,
-        "Invalid edge layer switch id."
-    );
-
-    let pod_id = edge_id / pod_switches_per_layer;
-    let agg_start = switches_per_layer + pod_id * pod_switches_per_layer;
-    let host_start = edge_id * hosts_per_switch;
-
-    let agg_ids = (agg_start..agg_start + pod_switches_per_layer).collect::<Vec<_>>();
-    let generator_ids = (host_start..host_start + hosts_per_switch).collect::<Vec<_>>();
-
-    (agg_ids, generator_ids)
-}
-
-/// This function returns the ids of core layer switches and edge layer switches
-/// that send packets to a given aggregation layer switch.
-fn elements_to_agg(k: usize, agg_id: usize) -> (Vec<usize>, Vec<usize>) {
-    let core_switches = (k / 2).pow(2);
-    let pod_switches_per_layer = k / 2;
-    let switches_per_layer = pod_switches_per_layer * k;
-    let core_switches_per_agg = core_switches / pod_switches_per_layer;
-    assert!(
-        agg_id >= switches_per_layer && agg_id < 2 * switches_per_layer,
-        "Invalid aggregation layer switch id."
-    );
-
-    let pod_id = (agg_id - switches_per_layer) / pod_switches_per_layer;
-    let core_start =
-        2 * switches_per_layer + core_switches_per_agg * (agg_id % pod_switches_per_layer);
-    let edge_start = pod_id * pod_switches_per_layer;
-
-    let core_ids = (core_start..core_start + core_switches_per_agg).collect::<Vec<_>>();
-    let edge_ids = (edge_start..edge_start + pod_switches_per_layer).collect::<Vec<_>>();
-
-    (core_ids, edge_ids)
-}
-
-/// This function returns the ids of aggregation layer switches that send
-/// packets to teh given core layer switch.
-fn elements_to_core(k: usize, core_id: usize) -> Vec<usize> {
-    let core_switches = (k / 2).pow(2);
-    let pod_switches_per_layer = k / 2;
-    let switches_per_layer = pod_switches_per_layer * k;
-    assert!(core_id >= 2 * switches_per_layer && core_id < 2 * switches_per_layer + core_switches);
-
-    let agg_start = switches_per_layer;
-    let core_type = (core_id - 2 * switches_per_layer) / pod_switches_per_layer;
-    let agg_ids = (agg_start + core_type..agg_start + switches_per_layer)
-        .step_by(pod_switches_per_layer)
-        .collect::<Vec<_>>();
-    agg_ids
-}
 
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
     let num_core_switches = (k / 2).pow(2);
-    let num_aggregation_switches = (k.pow(2)) / 2;
+    let num_agg_switches = (k.pow(2)) / 2;
     let num_edge_switches = (k.pow(2)) / 2;
     let num_hosts = num_edge_switches * k / 2;
 
@@ -122,8 +65,8 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // initializes switches in the aggregation layer
-    let mut aggregation_switches = Vec::new();
-    for i in 0..num_aggregation_switches {
+    let mut agg_switches = Vec::new();
+    for i in 0..num_agg_switches {
         let switch = PacketSwitch::new(
             i + num_edge_switches,
             k,
@@ -133,14 +76,14 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
             fib.clone(),
             SchedulingDiscipline::DRR,
         );
-        aggregation_switches.push(switch);
+        agg_switches.push(switch);
     }
 
     // initializes switches in the core layer
     let mut core_switches = Vec::new();
     for i in 0..num_core_switches {
         let switch = PacketSwitch::new(
-            i + num_edge_switches + num_aggregation_switches,
+            i + num_edge_switches + num_agg_switches,
             k,
             port_rate,
             capacity,
@@ -165,7 +108,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
         let (agg_ids, generator_ids) = elements_to_edge(k, edge_switch.id());
 
-        for switch in &mut aggregation_switches {
+        for switch in &mut agg_switches {
             if agg_ids.contains(&switch.id()) {
                 upstreams.push(Box::new(switch as &mut dyn Element));
             }
@@ -181,9 +124,9 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // connects elements that send packets to aggregation layer switches
-    for aggregation_switch in aggregation_switches.iter_mut() {
+    for agg_switch in agg_switches.iter_mut() {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-        let (core_ids, edge_ids) = elements_to_agg(k, aggregation_switch.id());
+        let (core_ids, edge_ids) = elements_to_agg(k, agg_switch.id());
 
         for switch in &mut core_switches {
             if core_ids.contains(&switch.id()) {
@@ -197,7 +140,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
             }
         }
 
-        connect_n_1_hetero(&mut upstreams, aggregation_switch);
+        connect_n_1_hetero(&mut upstreams, agg_switch);
     }
 
     // connects aggregation layer switches and core layer switches
@@ -205,7 +148,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
         let agg_ids = elements_to_core(k, core_switch.id());
 
-        for switch in &mut aggregation_switches {
+        for switch in &mut agg_switches {
             if agg_ids.contains(&switch.id()) {
                 upstreams.push(Box::new(switch as &mut dyn Element));
             }
@@ -224,7 +167,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     for switch in core_switches {
         sim.activate(switch.run(sim));
     }
-    for switch in aggregation_switches {
+    for switch in agg_switches {
         sim.activate(switch.run(sim));
     }
     for switch in edge_switches {
