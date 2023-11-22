@@ -137,28 +137,24 @@ impl PacketSwitch {
             }
         }
 
-        loop {
-            if let Some(packet) = self.receiver.recv().await {
-                self.packets_received += 1;
-                let flow_class = (self.flow_classes)(packet.flow_id);
+        while let Some(packet) = self.receiver.recv().await {
+            self.packets_received += 1;
+            let flow_class = (self.flow_classes)(packet.flow_id);
 
-                println!(
-                    "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            println!(
+                "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
                     {} packets received.",
-                    self.element_id,
-                    packet.packet_id,
-                    packet.size,
-                    packet.flow_id,
-                    sim.now(),
-                    self.packets_received
-                );
+                self.element_id,
+                packet.packet_id,
+                packet.size,
+                packet.flow_id,
+                sim.now(),
+                self.packets_received
+            );
 
-                // forwards packets to their corresponding outbound ports
-                let port_id = self.fib[flow_class];
-                let _ = self.port_senders[port_id].send(packet);
-            } else {
-                break;
-            }
+            // forwards packets to their corresponding outbound ports
+            let port_id = self.fib[flow_class];
+            let _ = self.port_senders[port_id].send(packet);
         }
 
         println!(

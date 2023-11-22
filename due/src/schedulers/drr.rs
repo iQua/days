@@ -76,7 +76,7 @@ impl DRRServer {
 
         let min_weight = weights.iter().min().unwrap();
 
-        for class_id in 0..weights.len() {
+        for (class_id, _) in weights.iter().enumerate() {
             deficit.push(0);
             quantum.push(min_quantum * weights[class_id] / min_weight);
             byte_sizes.push(0);
@@ -153,7 +153,7 @@ impl DRRServer {
             // schedules packets by going through each queue
             for class_id in 0..self.queues.len() {
                 // increases the deficit of the current queue if it is non-empty
-                if self.queues[class_id].len() > 0 {
+                if !self.queues[class_id].is_empty() {
                     self.deficit[class_id] += self.quantum[class_id];
                 } else {
                     // resets to zero if the queue is empty
@@ -162,7 +162,7 @@ impl DRRServer {
 
                 let mut current_deficit = self.deficit[class_id];
 
-                while current_deficit > 0 && self.queues[class_id].len() > 0 {
+                while current_deficit > 0 && !self.queues[class_id].is_empty() {
                     let packet = self.queues[class_id].front().unwrap().clone();
 
                     if packet.size <= current_deficit {
