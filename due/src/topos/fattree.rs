@@ -49,7 +49,7 @@ where
         }
     }
 
-    pub fn connect(mut self) {
+    pub fn connect(&mut self) {
         // connects edge-layer switches to sinks
         for (sink_id, sink) in self.sinks.iter_mut().enumerate() {
             let switch_id = sink_id / 2;

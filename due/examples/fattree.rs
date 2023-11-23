@@ -11,8 +11,8 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::topos::{connect_n_1_hetero, connect_pair};
-use due::{elements_to_agg, elements_to_core, elements_to_edge, Element, Shared};
+use due::topos::fattree::FatTree;
+use due::Shared;
 
 const SEED: u64 = 1000;
 
@@ -92,88 +92,15 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         core_switches.push(switch);
     }
 
-    // TODO:
-    // Includes some hard-coded parts, which should be REMOVED later!
 
-    // connects edge-layer switches to sinks
-    for (sink_id, sink) in sinks.iter_mut().enumerate() {
-        let switch_id = sink_id / 2;
-        connect_pair(edge_switches.get_mut(switch_id).unwrap(), sink);
-    }
+    let mut fattree = FatTree::new(k, generators, sinks, core_switches, agg_switches, edge_switches);
 
-    // connects elements that send packets to edge-layer switches
-    for edge_switch in edge_switches.iter_mut() {
-        let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-        let (agg_ids, generator_ids) = elements_to_edge(k, edge_switch.id());
+    // connect all elements in the fattree topology
+    fattree.connect();
 
-        for switch in &mut agg_switches {
-            if agg_ids.contains(&switch.id()) {
-                upstreams.push(Box::new(switch as &mut dyn Element));
-            }
-        }
+    // activates all elements and waits for the end of this simulation
+    sim.activate(fattree.run(sim));
 
-        for generator in &mut generators {
-            if generator_ids.contains(&generator.id()) {
-                upstreams.push(Box::new(generator as &mut dyn Element));
-            }
-        }
-
-        connect_n_1_hetero(&mut upstreams, edge_switch);
-    }
-
-    // connects elements that send packets to aggregation-layer switches
-    for agg_switch in agg_switches.iter_mut() {
-        let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-        let (core_ids, edge_ids) = elements_to_agg(k, agg_switch.id());
-
-        for switch in &mut core_switches {
-            if core_ids.contains(&switch.id()) {
-                upstreams.push(Box::new(switch as &mut dyn Element));
-            }
-        }
-
-        for switch in &mut edge_switches {
-            if edge_ids.contains(&switch.id()) {
-                upstreams.push(Box::new(switch as &mut dyn Element));
-            }
-        }
-
-        connect_n_1_hetero(&mut upstreams, agg_switch);
-    }
-
-    // connects aggregation-layer switches and core-layer switches
-    for core_switch in core_switches.iter_mut() {
-        let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-        let agg_ids = elements_to_core(k, core_switch.id());
-
-        for switch in &mut agg_switches {
-            if agg_ids.contains(&switch.id()) {
-                upstreams.push(Box::new(switch as &mut dyn Element));
-            }
-        }
-
-        connect_n_1_hetero(&mut upstreams, core_switch);
-    }
-
-    // activates all elements
-    for generator in generators {
-        sim.activate(generator.run(sim));
-    }
-    for sink in sinks {
-        sim.activate(sink.run(sim));
-    }
-    for switch in core_switches {
-        sim.activate(switch.run(sim));
-    }
-    for switch in agg_switches {
-        sim.activate(switch.run(sim));
-    }
-    for switch in edge_switches {
-        sim.activate(switch.run(sim));
-    }
-
-    // waits for the end of this simulation
-    sim.advance(sim.shared().duration + 100.).await;
 }
 
 fn main() {
