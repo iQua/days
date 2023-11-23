@@ -2,7 +2,7 @@
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::{packets::packet::Packet, Element};
+use crate::{get_id, packets::packet::Packet, Element};
 
 impl Element for Splitter {
     fn id(&mut self) -> usize {
@@ -25,9 +25,9 @@ pub struct Splitter {
 }
 
 impl Splitter {
-    pub fn new(element_id: usize) -> Splitter {
+    pub fn new() -> Splitter {
         Splitter {
-            element_id,
+            element_id: get_id(),
             senders: Vec::new(),
             receiver: unbounded_channel().1,
         }

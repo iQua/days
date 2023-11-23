@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::sim::SimContext;
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
 pub struct DRRServer {
     element_id: usize,
@@ -61,7 +61,6 @@ impl Element for DRRServer {
 
 impl DRRServer {
     pub fn new(
-        element_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
@@ -91,7 +90,7 @@ impl DRRServer {
         };
 
         DRRServer {
-            element_id,
+            element_id: get_id(),
             rate,
             flow_classes,
             drop_strategy: Box::new(packet_drop),

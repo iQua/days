@@ -13,7 +13,7 @@ use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::{connect_1_n, connect_n_1_homo};
-use due::{get_flow_id, get_id, Shared};
+use due::Shared;
 
 const SEED: u64 = 1000;
 
@@ -25,14 +25,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // initializes packet generators and packet sinks
     for _ in 0..2 {
-        let generator = DistPacketGenerator::new(
-            get_id(),
-            get_flow_id(),
-            0.,
-            arr_interval_dist.clone(),
-            packet_size_dist.clone(),
-        );
-        let sink = PacketSink::new(get_id());
+        let generator =
+            DistPacketGenerator::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
+        let sink = PacketSink::new();
         generators.push(generator);
         sinks.push(sink);
     }
@@ -41,7 +36,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let weights = vec![1, 2];
     let fib = vec![0, 1];
     let mut switch = PacketSwitch::new(
-        get_id(),
         2,
         (1000 * 8) as f64,
         100,

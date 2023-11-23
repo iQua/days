@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
 pub struct Wire<A>
 where
@@ -44,9 +44,9 @@ impl<A> Wire<A>
 where
     A: Distribution<Time>,
 {
-    pub fn new(element_id: usize, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
+    pub fn new(delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
         Wire {
-            element_id,
+            element_id: get_id(),
             delay_dist,
             last_sent: 0.,
             sender: unbounded_channel().0,

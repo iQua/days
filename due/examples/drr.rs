@@ -15,7 +15,7 @@ use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::{connect_n_m, connect_pair};
-use due::{get_flow_id, get_id, Element, Shared};
+use due::{Element, Shared};
 
 const SEED: u64 = 1000;
 
@@ -24,29 +24,17 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // initializes packet generators
-    let mut generator_1 = DistPacketGenerator::new(
-        get_id(),
-        get_flow_id(),
-        0.0,
-        arr_interval_dist.clone(),
-        packet_size_dist.clone(),
-    );
-    let mut generator_2 = DistPacketGenerator::new(
-        get_id(),
-        get_flow_id(),
-        1.0,
-        arr_interval_dist,
-        packet_size_dist,
-    );
+    let mut generator_1 =
+        DistPacketGenerator::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    let mut generator_2 = DistPacketGenerator::new(1.0, arr_interval_dist, packet_size_dist);
 
     // initializes splitters
-    let mut splitter_1 = Splitter::new(get_id());
-    let mut splitter_2 = Splitter::new(get_id());
+    let mut splitter_1 = Splitter::new();
+    let mut splitter_2 = Splitter::new();
 
     // initializes the DRR server
     let weights = vec![1, 2];
     let mut drr_server = DRRServer::new(
-        get_id(),
         (1000 * 8) as f64,
         100,
         CapacityUnit::Packets,
@@ -57,10 +45,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let drr_server_id = drr_server.id();
 
     // initializes packet sinks
-    let mut sink: PacketSink = PacketSink::new(get_id());
-    let mut sink_1: PacketSink = PacketSink::new(get_id());
+    let mut sink: PacketSink = PacketSink::new();
+    let mut sink_1: PacketSink = PacketSink::new();
     let sink_1_id = sink_1.id();
-    let mut sink_2: PacketSink = PacketSink::new(get_id());
+    let mut sink_2: PacketSink = PacketSink::new();
     let sink_2_id = sink_2.id();
 
     // connects packet generators and splitters

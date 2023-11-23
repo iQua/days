@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
 pub struct PacketSink {
     element_id: usize,
@@ -48,9 +48,9 @@ impl Element for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(element_id: usize) -> PacketSink {
+    pub fn new() -> PacketSink {
         PacketSink {
-            element_id,
+            element_id: get_id(),
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),

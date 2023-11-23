@@ -51,7 +51,6 @@ impl Element for PacketSwitch {
 
 impl PacketSwitch {
     pub fn new(
-        element_id: usize,
         nports: usize,
         port_rate: f64,
         capacity: usize,
@@ -71,7 +70,6 @@ impl PacketSwitch {
             match discipline {
                 SchedulingDiscipline::DRR => {
                     let mut port = DRRServer::new(
-                        get_id(),
                         port_rate,
                         capacity,
                         CapacityUnit::Packets,
@@ -86,7 +84,6 @@ impl PacketSwitch {
                 }
                 SchedulingDiscipline::FIFO => {
                     let mut port = Port::new(
-                        get_id(),
                         port_rate,
                         capacity,
                         CapacityUnit::Packets,
@@ -101,7 +98,7 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            element_id,
+            element_id: get_id(),
             packets_received: 0,
             discipline,
             fib,

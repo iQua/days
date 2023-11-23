@@ -67,15 +67,13 @@ where
     B: Distribution<f64>,
 {
     pub fn new(
-        element_id: usize,
-        flow_id: usize,
         initial_delay: Time,
         arr_interval_dist: Arc<dyn Fn() -> A>,
         packet_size_dist: Arc<dyn Fn() -> B>,
     ) -> DistPacketGenerator<A, B> {
         DistPacketGenerator {
-            element_id,
-            flow_id,
+            element_id: get_id(),
+            flow_id: get_flow_id(),
             initial_delay,
             arr_interval_dist,
             packet_size_dist,

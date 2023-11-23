@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::sim::SimContext;
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
 pub struct Port {
     element_id: usize,
@@ -45,7 +45,6 @@ impl Element for Port {
 
 impl Port {
     pub fn new(
-        element_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
@@ -57,7 +56,7 @@ impl Port {
         };
 
         Port {
-            element_id,
+            element_id: get_id(),
             rate,
             drop_strategy: Box::new(packet_drop),
             packets_received: 0,

@@ -3,6 +3,8 @@
 //! Besides, three helper functions are also provided to get the identifiers of
 //! elements that will send packets to a given device.
 
+use std::sync::Arc;
+
 use statrs::statistics::Distribution;
 
 use crate::packets::dist_generator::DistPacketGenerator;
@@ -10,7 +12,7 @@ use crate::packets::sink::PacketSink;
 use crate::sim::{SimContext, Time};
 use crate::switches::switch::PacketSwitch;
 use crate::topos::{connect_n_1_hetero, connect_pair};
-use crate::{get_id, Element, Shared};
+use crate::{Element, Shared};
 
 pub struct FatTree<A, B>
 where
@@ -35,7 +37,12 @@ where
     A: Distribution<Time> + 'static,
     B: Distribution<f64> + 'static,
 {
-    pub fn new(k: usize, generator: DistPacketGenerator<A, B>) -> FatTree<A, B> {
+    pub fn new(
+        k: usize,
+        initial_delay: f64,
+        arr_interval_dist: Arc<dyn Fn() -> A>,
+        packet_size_dist: Arc<dyn Fn() -> B>,
+    ) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
         // initializes all hosts
@@ -44,12 +51,15 @@ where
         let mut sinks = Vec::new();
 
         for _ in 0..num_hosts {
-            let pg = generator.clone();
-            let sink = PacketSink::new(get_id());
+            let pg = DistPacketGenerator::new(
+                initial_delay,
+                arr_interval_dist.clone(),
+                packet_size_dist.clone(),
+            );
+            let sink = PacketSink::new();
             generators.push(pg);
             sinks.push(sink);
         }
-        drop(generator);
 
         FatTree {
             k,

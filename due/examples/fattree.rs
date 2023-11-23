@@ -9,12 +9,11 @@ use rand::Rng;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::dist_generator::DistPacketGenerator;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::topos::fattree::{FatTree, get_path};
-use due::{get_id, Shared};
+use due::topos::fattree::{get_path, FatTree};
+use due::Shared;
 
 const SEED: u64 = 1000;
 
@@ -40,17 +39,8 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
-    // initializes one generator
-    let generator = DistPacketGenerator::new(
-        usize::MAX,
-        usize::MAX,
-        0.,
-        arr_interval_dist.clone(),
-        packet_size_dist.clone(),
-    );
-
     // constructs the fattree topology
-    let mut fattree = FatTree::new(k, generator);
+    let mut fattree = FatTree::new(k, 0., arr_interval_dist, packet_size_dist);
 
     // initializes flow_classes and weights for all DRRServer inside switches
     let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
@@ -66,11 +56,9 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
 
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
-
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {
         let switch = PacketSwitch::new(
-            get_id(),
             k,
             port_rate,
             capacity,
@@ -85,7 +73,6 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // initializes switches in the aggregation layer
     for _ in 0..num_agg_switches {
         let switch = PacketSwitch::new(
-            get_id(),
             k,
             port_rate,
             capacity,
@@ -100,7 +87,6 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // initializes switches in the core layer
     for _ in 0..num_core_switches {
         let switch = PacketSwitch::new(
-            get_id(),
             k,
             port_rate,
             capacity,
