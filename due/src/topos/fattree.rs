@@ -20,12 +20,12 @@ where
     generators: Vec<DistPacketGenerator<A, B>>,
     /// packet sinks of in hosts
     sinks: Vec<PacketSink>,
-    /// core-layer switches
-    core_switches: Vec<PacketSwitch>,
-    /// aggregation-layer switches
-    agg_switches: Vec<PacketSwitch>,
     /// edge-layer switches
     edge_switches: Vec<PacketSwitch>,
+    /// aggregation-layer switches
+    agg_switches: Vec<PacketSwitch>,
+    /// core-layer switches
+    core_switches: Vec<PacketSwitch>,
 }
 
 impl<A, B> FatTree<A, B>
@@ -37,18 +37,18 @@ where
         k: usize,
         generators: Vec<DistPacketGenerator<A, B>>,
         sinks: Vec<PacketSink>,
-        core_switches: Vec<PacketSwitch>,
-        agg_switches: Vec<PacketSwitch>,
         edge_switches: Vec<PacketSwitch>,
+        agg_switches: Vec<PacketSwitch>,
+        core_switches: Vec<PacketSwitch>,
     ) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "Invalid k!");
         FatTree {
             k,
             generators,
             sinks,
-            core_switches,
-            agg_switches,
             edge_switches,
+            agg_switches,
+            core_switches,
         }
     }
 

@@ -1,4 +1,4 @@
-//! This example shows an examples to simulate networks of fat tree datacenter
+//! This example shows an example to simulate networks of fat tree datacenter
 //! topology.
 
 use std::cell::RefCell;
@@ -19,21 +19,29 @@ const SEED: u64 = 1000;
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
+    // initializes number of elements for all layers
     let num_core_switches = (k / 2).pow(2);
     let num_agg_switches = (k.pow(2)) / 2;
     let num_edge_switches = (k.pow(2)) / 2;
     let num_hosts = num_edge_switches * k / 2;
 
-    let port_rate = (4000 * 8) as f64;
-    let capacity = 100;
-
-    // initializes packet generators and packet sinks
+    // initializes all elements
     let mut generators = Vec::new();
     let mut sinks = Vec::new();
+    let mut edge_switches = Vec::new();
+    let mut agg_switches = Vec::new();
+    let mut core_switches = Vec::new();
+
+    // sets up parameters for packet generators and switches
+    let port_rate = (4000 * 8) as f64;
+    let capacity = 100;
     let arr_interval_dist = Box::new(|| Uniform::new(1.0, 1.0).unwrap());
     let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1000).unwrap());
+    // TODO: modify weights, fib, flow_to_classes, and add dst for flows!
+    let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
+    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
-    // initializes all (k^3)/4 hosts
+    // initializes all hosts
     for i in 0..num_hosts {
         let generator =
             DistPacketGenerator::new(i, 0., arr_interval_dist.clone(), packet_size_dist.clone());
@@ -42,13 +50,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         sinks.push(sink);
     }
 
-    // TODO:
-    // modify weights, fib, flow_to_classes, and add dst for flows!
-    let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
-    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
-
     // initializes switches in the edge layer
-    let mut edge_switches = Vec::new();
     for i in 0..num_edge_switches {
         let switch = PacketSwitch::new(
             i,
@@ -63,7 +65,6 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // initializes switches in the aggregation layer
-    let mut agg_switches = Vec::new();
     for i in 0..num_agg_switches {
         let switch = PacketSwitch::new(
             i + num_edge_switches,
@@ -78,7 +79,6 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // initializes switches in the core layer
-    let mut core_switches = Vec::new();
     for i in 0..num_core_switches {
         let switch = PacketSwitch::new(
             i + num_edge_switches + num_agg_switches,
@@ -92,13 +92,14 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         core_switches.push(switch);
     }
 
+    // constructs the fattree topology
     let mut fattree = FatTree::new(
         k,
         generators,
         sinks,
-        core_switches,
-        agg_switches,
         edge_switches,
+        agg_switches,
+        core_switches,
     );
 
     // connect all elements in the fattree topology
