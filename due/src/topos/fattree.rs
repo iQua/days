@@ -19,9 +19,9 @@ where
 {
     k: usize,
     /// packet generators in hosts
-    generators: Vec<DistPacketGenerator<A, B>>,
+    pub generators: Vec<DistPacketGenerator<A, B>>,
     /// packet sinks of in hosts
-    sinks: Vec<PacketSink>,
+    pub sinks: Vec<PacketSink>,
     /// edge-layer switches
     edge_switches: Vec<PacketSwitch>,
     /// aggregation-layer switches
@@ -35,13 +35,7 @@ where
     A: Distribution<Time> + 'static,
     B: Distribution<f64> + 'static,
 {
-    pub fn new(
-        k: usize,
-        generator: DistPacketGenerator<A, B>,
-        edge_switches: Vec<PacketSwitch>,
-        agg_switches: Vec<PacketSwitch>,
-        core_switches: Vec<PacketSwitch>,
-    ) -> FatTree<A, B> {
+    pub fn new(k: usize, generator: DistPacketGenerator<A, B>) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
         // initializes all hosts
@@ -61,13 +55,24 @@ where
             k,
             generators,
             sinks,
-            edge_switches,
-            agg_switches,
-            core_switches,
+            edge_switches: Vec::new(),
+            agg_switches: Vec::new(),
+            core_switches: Vec::new(),
         }
     }
 
-    pub fn connect(&mut self) {
+    pub fn set_switches(
+        &mut self,
+        edge_switches: Vec<PacketSwitch>,
+        agg_switches: Vec<PacketSwitch>,
+        core_switches: Vec<PacketSwitch>,
+    ) {
+        self.edge_switches = edge_switches;
+        self.agg_switches = agg_switches;
+        self.core_switches = core_switches;
+    }
+
+    fn connect(&mut self) {
         // connects edge-layer switches to sinks
         for (sink_idx, sink) in self.sinks.iter_mut().enumerate() {
             let switch_idx = sink_idx / 2;
@@ -129,7 +134,11 @@ where
         }
     }
 
-    pub fn activate(self, sim: SimContext<'_, Shared>) {
+    pub fn run(mut self, sim: SimContext<'_, Shared>) {
+        // connects all elements in the fattree topology
+        self.connect();
+
+        // activates all elements in the fattree topology
         for generator in self.generators {
             sim.activate(generator.run(sim));
         }

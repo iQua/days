@@ -47,14 +47,12 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         packet_size_dist.clone(),
     );
 
+    // constructs the fattree topology
+    let mut fattree = FatTree::new(k, generator);
+
     // TODO: modify weights, fib, flow_to_classes, and add dst for flows!
     let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
-    // let fib = Vec::new();
-    // for i in 0..num_edge_switches {
-    //     // TODO
-    //     println!("{i}");
-    // }
 
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {
@@ -98,14 +96,11 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         core_switches.push(switch);
     }
 
-    // constructs the fattree topology
-    let mut fattree = FatTree::new(k, generator, edge_switches, agg_switches, core_switches);
+    // sets switches for the fattree topology
+    fattree.set_switches(edge_switches, agg_switches, core_switches);
 
-    // connect all elements in the fattree topology
-    fattree.connect();
-
-    // activates all elements
-    fattree.activate(sim);
+    // connects and activates all elements
+    fattree.run(sim);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
