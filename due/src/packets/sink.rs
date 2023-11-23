@@ -47,8 +47,8 @@ impl Element for PacketSink {
     }
 }
 
-impl PacketSink {
-    pub fn new() -> PacketSink {
+impl Default for PacketSink {
+    fn default() -> Self {
         PacketSink {
             element_id: get_id(),
             arrival_times: RandomVar::new(),
@@ -60,6 +60,12 @@ impl PacketSink {
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
         }
+    }
+}
+
+impl PacketSink {
+    pub fn new() -> PacketSink {
+        Default::default()
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {

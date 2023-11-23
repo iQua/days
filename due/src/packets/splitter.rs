@@ -18,6 +18,16 @@ impl Element for Splitter {
     }
 }
 
+impl Default for Splitter {
+    fn default() -> Self {
+        Splitter {
+            element_id: get_id(),
+            senders: Vec::new(),
+            receiver: unbounded_channel().1,
+        }
+    }
+}
+
 pub struct Splitter {
     element_id: usize,
     senders: Vec<UnboundedSender<Packet>>,
@@ -26,11 +36,7 @@ pub struct Splitter {
 
 impl Splitter {
     pub fn new() -> Splitter {
-        Splitter {
-            element_id: get_id(),
-            senders: Vec::new(),
-            receiver: unbounded_channel().1,
-        }
+        Default::default()
     }
 
     pub async fn run(mut self) {
