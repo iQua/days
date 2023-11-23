@@ -2,9 +2,9 @@
 //!  specified inter-arrival time distribution and a packet size distribution.
 
 use statrs::statistics::Distribution;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};

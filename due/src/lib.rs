@@ -1,6 +1,6 @@
 use rand::rngs::SmallRng;
 use std::cell::RefCell;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -18,7 +18,7 @@ pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
-    pub next_id: Vec<AtomicUsize>
+    pub next_id: Vec<AtomicUsize>,
 }
 
 /// Element is a trait that defines the interface for all elements in the network.
@@ -32,4 +32,9 @@ pub trait Element {
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         println!("The receiver: {:?}", receiver)
     }
+}
+
+fn get_id() -> usize {
+    static COUNTER: AtomicUsize = AtomicUsize::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }

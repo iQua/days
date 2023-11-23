@@ -1,8 +1,8 @@
 //! This example shows a simple example that uses a fair packet switch.
 
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};

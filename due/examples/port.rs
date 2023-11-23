@@ -5,8 +5,8 @@
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::Uniform;
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
