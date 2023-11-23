@@ -84,8 +84,8 @@ impl PacketSink {
         Default::default()
     }
 
-    /// Samples a PacketSink, which will not occupy ids.
-    pub fn sample() -> PacketSink {
+    /// Creates a PacketSink without occupying ids.
+    pub fn new_without_id() -> PacketSink {
         PacketSink {
             element_id: usize::MAX,
             arrival_times: RandomVar::new(),

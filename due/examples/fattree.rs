@@ -42,8 +42,8 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // sets a generator and a sink
-    let generator = DistPacketGenerator::sample(0., arr_interval_dist, packet_size_dist);
-    let sink = PacketSink::sample();
+    let generator = DistPacketGenerator::new_without_id(0., arr_interval_dist, packet_size_dist);
+    let sink = PacketSink::new_without_id();
 
     // constructs the fattree topology
     let mut fattree = FatTree::new(k, generator, sink);

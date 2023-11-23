@@ -83,8 +83,8 @@ where
         }
     }
 
-    /// Samples a DistPacketGenerator, which will not occupy ids.
-    pub fn sample(
+    /// Creates a DistPacketGenerator without occupying ids.
+    pub fn new_without_id(
         initial_delay: Time,
         arr_interval_dist: Arc<dyn Fn() -> A>,
         packet_size_dist: Arc<dyn Fn() -> B>,
