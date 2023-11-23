@@ -77,7 +77,7 @@ pub fn elements_to_agg(k: usize, agg_id: usize) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// This function returns the ids of aggregation layer switches that send
-/// packets to teh given core layer switch.
+/// packets to the given core layer switch.
 pub fn elements_to_core(k: usize, core_id: usize) -> Vec<usize> {
     let core_switches = (k / 2).pow(2);
     let pod_switches_per_layer = k / 2;
