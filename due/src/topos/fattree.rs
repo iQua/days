@@ -1,5 +1,7 @@
-//! This file provides standard methods to connect and activate elements in a
-//! fattree topology.
+//! This file provides standard methods to construct a fattree topology, as well
+//! as connecting and activating elements inside of the fattree topology.
+//! Besides, three helper functions are also provided to get the identifiers of
+//! elements that will send packets to a given device.
 
 use statrs::statistics::Distribution;
 
@@ -8,7 +10,7 @@ use crate::packets::sink::PacketSink;
 use crate::sim::{SimContext, Time};
 use crate::switches::switch::PacketSwitch;
 use crate::topos::{connect_n_1_hetero, connect_pair};
-use crate::{elements_to_agg, elements_to_core, elements_to_edge, Element, Shared};
+use crate::{Element, Shared};
 
 pub struct FatTree<A, B>
 where
@@ -114,7 +116,7 @@ where
         }
     }
 
-    pub async fn run(self, sim: SimContext<'_, Shared>) {
+    pub fn activate(self, sim: SimContext<'_, Shared>) {
         for generator in self.generators {
             sim.activate(generator.run(sim));
         }
@@ -130,8 +132,64 @@ where
         for switch in self.edge_switches {
             sim.activate(switch.run(sim));
         }
-
-        // waits for the end of this simulation
-        sim.advance(sim.shared().duration + 100.).await;
     }
+}
+
+/// This function returns the ids of aggregation layer switches and packet
+/// generators that send packets to a given edge layer switch.
+fn elements_to_edge(k: usize, edge_id: usize) -> (Vec<usize>, Vec<usize>) {
+    let pod_switches_per_layer = k / 2;
+    let switches_per_layer = pod_switches_per_layer * k;
+    let hosts_per_switch = k / 2;
+    assert!(
+        edge_id < switches_per_layer,
+        "Invalid edge layer switch id."
+    );
+
+    let pod_id = edge_id / pod_switches_per_layer;
+    let agg_start = switches_per_layer + pod_id * pod_switches_per_layer;
+    let host_start = edge_id * hosts_per_switch;
+
+    let agg_ids = (agg_start..agg_start + pod_switches_per_layer).collect::<Vec<_>>();
+    let generator_ids = (host_start..host_start + hosts_per_switch).collect::<Vec<_>>();
+
+    (agg_ids, generator_ids)
+}
+
+/// This function returns the ids of core layer switches and edge layer switches
+/// that send packets to a given aggregation layer switch.
+fn elements_to_agg(k: usize, agg_id: usize) -> (Vec<usize>, Vec<usize>) {
+    let core_switches = (k / 2).pow(2);
+    let pod_switches_per_layer = k / 2;
+    let switches_per_layer = pod_switches_per_layer * k;
+    let core_switches_per_agg = core_switches / pod_switches_per_layer;
+    assert!(
+        agg_id >= switches_per_layer && agg_id < 2 * switches_per_layer,
+        "Invalid aggregation layer switch id."
+    );
+
+    let pod_id = (agg_id - switches_per_layer) / pod_switches_per_layer;
+    let core_start =
+        2 * switches_per_layer + core_switches_per_agg * (agg_id % pod_switches_per_layer);
+    let edge_start = pod_id * pod_switches_per_layer;
+
+    let core_ids = (core_start..core_start + core_switches_per_agg).collect::<Vec<_>>();
+    let edge_ids = (edge_start..edge_start + pod_switches_per_layer).collect::<Vec<_>>();
+
+    (core_ids, edge_ids)
+}
+
+/// This function returns the ids of aggregation layer switches that send
+/// packets to the given core layer switch.
+fn elements_to_core(k: usize, core_id: usize) -> Vec<usize> {
+    let core_switches = (k / 2).pow(2);
+    let pod_switches_per_layer = k / 2;
+    let switches_per_layer = pod_switches_per_layer * k;
+    assert!(core_id >= 2 * switches_per_layer && core_id < 2 * switches_per_layer + core_switches);
+
+    let agg_start = switches_per_layer;
+    let core_type = (core_id - 2 * switches_per_layer) / pod_switches_per_layer;
+    (agg_start + core_type..agg_start + switches_per_layer)
+        .step_by(pod_switches_per_layer)
+        .collect::<Vec<_>>()
 }

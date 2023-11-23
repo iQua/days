@@ -105,8 +105,11 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // connect all elements in the fattree topology
     fattree.connect();
 
-    // activates all elements and waits for the end of this simulation
-    sim.activate(fattree.run(sim));
+    // activates all elements
+    fattree.activate(sim);
+
+    // waits for the end of this simulation
+    sim.advance(sim.shared().duration + 100.).await;
 }
 
 fn main() {
