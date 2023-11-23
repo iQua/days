@@ -92,15 +92,20 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         core_switches.push(switch);
     }
 
-
-    let mut fattree = FatTree::new(k, generators, sinks, core_switches, agg_switches, edge_switches);
+    let mut fattree = FatTree::new(
+        k,
+        generators,
+        sinks,
+        core_switches,
+        agg_switches,
+        edge_switches,
+    );
 
     // connect all elements in the fattree topology
     fattree.connect();
 
     // activates all elements and waits for the end of this simulation
     sim.activate(fattree.run(sim));
-
 }
 
 fn main() {

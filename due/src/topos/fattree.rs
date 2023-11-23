@@ -1,3 +1,6 @@
+//! This file provides standard methods to connect and activate elements in a
+//! fattree topology.
+
 use statrs::statistics::Distribution;
 
 use crate::packets::dist_generator::DistPacketGenerator;
