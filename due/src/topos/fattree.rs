@@ -56,7 +56,7 @@ where
                 arr_interval_dist.clone(),
                 packet_size_dist.clone(),
             );
-            let sink = PacketSink::new();
+            let sink = PacketSink::default();
             generators.push(pg);
             sinks.push(sink);
         }

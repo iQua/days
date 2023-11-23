@@ -32,7 +32,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     let mut wire = Wire::new(Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
-    let mut sink = PacketSink::new();
+    let mut sink = PacketSink::default();
 
     // connects the generators to the wire
     connect_n_1_homo(&mut generators, &mut wire);

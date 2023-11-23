@@ -35,7 +35,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
-    let mut sink = PacketSink::new();
+    let mut sink = PacketSink::default();
 
     // connects the generators to the port
     connect_n_1_homo(&mut generators, &mut port);

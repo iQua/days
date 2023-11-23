@@ -27,7 +27,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     for _ in 0..2 {
         let generator =
             DistPacketGenerator::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
-        let sink = PacketSink::new();
+        let sink = PacketSink::default();
         generators.push(generator);
         sinks.push(sink);
     }
