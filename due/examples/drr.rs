@@ -2,6 +2,8 @@
 //! server.
 
 use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -18,8 +20,8 @@ use due::{Element, Shared};
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let arr_interval_dist = Box::new(|| Uniform::new(1.0, 1.0).unwrap());
-    let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1000).unwrap());
+    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // initializes packet generators
     let mut generator_1 =
@@ -89,6 +91,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 20.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

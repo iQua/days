@@ -3,6 +3,8 @@
 //! distribution, and then to a packet sink.
 
 use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
@@ -19,8 +21,8 @@ const SEED: u64 = 1000;
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut sink = PacketSink::new(2);
     let mut wire = Wire::new(1, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
-    let arr_interval_dist = Box::new(|| Exp::new(1.0).unwrap());
-    let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1500).unwrap());
+    let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
+    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
 
     // creates a collection of packet generators
     let mut generators = Vec::new();
@@ -51,6 +53,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

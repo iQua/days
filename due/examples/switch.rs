@@ -1,6 +1,8 @@
 //! This example shows a simple example that uses a fair packet switch.
 
 use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -19,8 +21,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes packet generators and packet sinks
     let mut generators = Vec::new();
     let mut sinks = Vec::new();
-    let arr_interval_dist = Box::new(|| Uniform::new(1.0, 1.0).unwrap());
-    let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1000).unwrap());
+    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     for i in 0..2 {
         let generator =
@@ -67,6 +69,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

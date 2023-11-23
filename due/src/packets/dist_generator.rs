@@ -3,6 +3,8 @@
 
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
@@ -15,8 +17,8 @@ where
 {
     element_id: usize,
     initial_delay: Time,
-    arr_interval_dist: Box<dyn Fn() -> A>,
-    packet_size_dist: Box<dyn Fn() -> B>,
+    arr_interval_dist: Arc<dyn Fn() -> A>,
+    packet_size_dist: Arc<dyn Fn() -> B>,
     packets_sent: usize,
     sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
@@ -48,14 +50,27 @@ where
     pub fn new(
         element_id: usize,
         initial_delay: Time,
-        arr_interval_dist: Box<dyn Fn() -> A>,
-        packet_size_dist: Box<dyn Fn() -> B>,
+        arr_interval_dist: Arc<dyn Fn() -> A>,
+        packet_size_dist: Arc<dyn Fn() -> B>,
     ) -> DistPacketGenerator<A, B> {
         DistPacketGenerator {
             element_id,
             initial_delay,
             arr_interval_dist,
             packet_size_dist,
+            packets_sent: 0,
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
+        }
+    }
+
+    pub fn clone(&self, shared: &Shared) -> Self {
+        let element_id = shared.next_id[0].fetch_add(1, Ordering::SeqCst);
+        DistPacketGenerator {
+            element_id,
+            initial_delay: self.initial_delay,
+            arr_interval_dist: self.arr_interval_dist.clone(),
+            packet_size_dist: self.packet_size_dist.clone(),
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,

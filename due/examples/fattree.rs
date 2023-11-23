@@ -2,6 +2,8 @@
 //! topology.
 
 use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -35,11 +37,17 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // sets up parameters for packet generators and switches
     let port_rate = (4000 * 8) as f64;
     let capacity = 100;
-    let arr_interval_dist = Box::new(|| Uniform::new(1.0, 1.0).unwrap());
-    let packet_size_dist = Box::new(|| DiscreteUniform::new(1000, 1000).unwrap());
+    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
+
     // TODO: modify weights, fib, flow_to_classes, and add dst for flows!
     let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
-    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
+    // let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
+    let fib = Vec::new();
+    for i in 0..num_edge_switches {
+        // TODO
+        println!("{i}");
+    }
 
     // initializes all hosts
     for i in 0..num_hosts {
@@ -118,6 +126,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(4, sim)),
     );

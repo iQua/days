@@ -1,5 +1,6 @@
 use rand::rngs::SmallRng;
 use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -17,6 +18,7 @@ pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
+    pub next_id: Vec<AtomicUsize>
 }
 
 /// Element is a trait that defines the interface for all elements in the network.
