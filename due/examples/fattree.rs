@@ -14,7 +14,7 @@ use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::fattree::FatTree;
-use due::Shared;
+use due::{get_id, Shared};
 
 const SEED: u64 = 1000;
 
@@ -50,18 +50,22 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // initializes all hosts
-    for i in 0..num_hosts {
-        let generator =
-            DistPacketGenerator::new(i, 0., arr_interval_dist.clone(), packet_size_dist.clone());
-        let sink = PacketSink::new(i);
+    for _ in 0..num_hosts {
+        let generator = DistPacketGenerator::new(
+            get_id(),
+            0.,
+            arr_interval_dist.clone(),
+            packet_size_dist.clone(),
+        );
+        let sink = PacketSink::new(get_id());
         generators.push(generator);
         sinks.push(sink);
     }
 
     // initializes switches in the edge layer
-    for i in 0..num_edge_switches {
+    for _ in 0..num_edge_switches {
         let switch = PacketSwitch::new(
-            i,
+            get_id(),
             k,
             port_rate,
             capacity,
@@ -73,9 +77,9 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // initializes switches in the aggregation layer
-    for i in 0..num_agg_switches {
+    for _ in 0..num_agg_switches {
         let switch = PacketSwitch::new(
-            i + num_edge_switches,
+            get_id(),
             k,
             port_rate,
             capacity,
@@ -87,9 +91,9 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // initializes switches in the core layer
-    for i in 0..num_core_switches {
+    for _ in 0..num_core_switches {
         let switch = PacketSwitch::new(
-            i + num_edge_switches + num_agg_switches,
+            get_id(),
             k,
             port_rate,
             capacity,

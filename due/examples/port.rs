@@ -14,7 +14,7 @@ use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::port::Port;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::{connect_n_1_homo, connect_pair};
-use due::Shared;
+use due::{get_id, Shared};
 
 const SEED: u64 = 1000;
 
@@ -23,20 +23,24 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
     let packet_size_dist = Arc::new(|| Uniform::new(1000.0, 1000.0).unwrap());
 
-    for i in 0..2 {
-        let generator =
-            DistPacketGenerator::new(i, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    for _ in 0..2 {
+        let generator = DistPacketGenerator::new(
+            get_id(),
+            1.0,
+            arr_interval_dist.clone(),
+            packet_size_dist.clone(),
+        );
         generators.push(generator);
     }
 
     let mut port = Port::new(
-        0,
+        get_id(),
         (1000 * 8) as f64,
         2,
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
-    let mut sink = PacketSink::new(0);
+    let mut sink = PacketSink::new(get_id());
 
     // connects the generators to the port
     connect_n_1_homo(&mut generators, &mut port);

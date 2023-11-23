@@ -34,7 +34,7 @@ pub trait Element {
     }
 }
 
-fn get_id() -> usize {
-    static COUNTER: AtomicUsize = AtomicUsize::new(1);
+pub fn get_id() -> usize {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
