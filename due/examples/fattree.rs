@@ -56,7 +56,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
     let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
-    let weights = vec![1,2,3,4];
+    let weights = (1..=n_classes_per_port).collect::<Vec<_>>();
 
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {
