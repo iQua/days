@@ -52,10 +52,11 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let mut fattree = FatTree::new(k, generator);
 
     // TODO: modify weights, fib, flow_to_classes, and add dst for flows!
-    let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
+    // let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
     let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
+    let weights = vec![1,2,3,4];
 
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {

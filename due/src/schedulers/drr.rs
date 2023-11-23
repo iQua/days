@@ -145,8 +145,8 @@ impl DRRServer {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.queues[packet.flow_id].len(),
-            packet.flow_id
+            self.queues[class_id].len(),
+            class_id
         );
     }
 
