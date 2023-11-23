@@ -51,7 +51,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     for (pg_idx, generator) in fattree.generators.iter().enumerate() {
         // first randomly set the destination of the flow
         let sink_idx = sim.shared().rng.borrow_mut().gen_range(0..num_hosts);
-        paths.push(get_path(k, pg_idx, sink_idx))
+        paths.push(get_path(k, pg_idx, sink_idx, &sim.shared()))
     }
 
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();

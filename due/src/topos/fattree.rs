@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use rand::Rng;
 use statrs::statistics::Distribution;
 
 use crate::packets::dist_generator::DistPacketGenerator;
@@ -224,7 +225,67 @@ fn elements_to_core(k: usize, core_idx: usize) -> Vec<usize> {
         .collect::<Vec<_>>()
 }
 
-pub fn get_path(k: usize, generator_idx: usize, sink_idx: usize) -> Vec<usize> {
-    // Get the path
-    Vec::new()
+/// This function is used to generate path of indexes for a given pair of
+/// generator and sink index.
+pub fn get_path(k: usize, generator_idx: usize, sink_idx: usize, shared: &Shared) -> Vec<usize> {
+    let mut path = Vec::new();
+    let pod_switches_per_layer = k / 2;
+    let hosts_per_switch = k / 2;
+    let hosts_per_pod = pod_switches_per_layer * hosts_per_switch;
+    let core_switches = (k / 2).pow(2);
+    let core_switches_per_agg = core_switches / pod_switches_per_layer;
+
+    // adds the generator idx to the path
+    path.push(generator_idx);
+
+    // gets the indexes of edge-layer switch and the pod of both the generator
+    // and the sink
+    let edge_idx = generator_idx / hosts_per_switch;
+    let pod_idx = generator_idx / hosts_per_pod;
+    let dst_edge_idx = sink_idx / hosts_per_switch;
+    let dst_pod_idx = sink_idx / hosts_per_pod;
+
+    // adds the first edge-layer switch idx to the path
+    path.push(edge_idx);
+
+    if dst_edge_idx == edge_idx {
+        // the generator and the sink connect to the same edge-layer switch
+        path.push(sink_idx);
+    } else if dst_pod_idx == pod_idx {
+        // the generator and the sink belong to the same pod, but not same
+        // edge-layer switch
+        let agg_idx = shared
+            .rng
+            .borrow_mut()
+            .gen_range(pod_idx * pod_switches_per_layer..(pod_idx + 1) * pod_switches_per_layer);
+        path.push(agg_idx);
+        path.push(dst_edge_idx);
+        path.push(sink_idx);
+    } else {
+        // the generator and the sinks belong to different pod
+
+        // 1. randomly select an aggregation-layer switch
+        let agg_idx = shared
+            .rng
+            .borrow_mut()
+            .gen_range(pod_idx * pod_switches_per_layer..(pod_idx + 1) * pod_switches_per_layer);
+        path.push(agg_idx);
+        // 2. based on the aggregation-layer switch, randomly select a
+        //    core-layer switch
+        let core_start = core_switches_per_agg * (agg_idx % pod_switches_per_layer);
+        let core_idx = shared
+            .rng
+            .borrow_mut()
+            .gen_range(core_start..core_start + core_switches_per_agg);
+        path.push(core_idx);
+        // 3. connects the aggregation-layer switch in the destination pod
+        let dst_agg_idx = dst_pod_idx + agg_idx % pod_switches_per_layer;
+        path.push(dst_agg_idx);
+        // 4. connects the edge-layer switch in the destination pod, as well as
+        //    the sink
+        path.push(dst_edge_idx);
+        path.push(sink_idx);
+    };
+
+    path
 }
