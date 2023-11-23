@@ -12,7 +12,8 @@ use due::packets::splitter::Splitter;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_m, connect_pair, Element, Shared};
+use due::topos::{connect_n_m, connect_pair};
+use due::{Element, Shared};
 
 const SEED: u64 = 1000;
 

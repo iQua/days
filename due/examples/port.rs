@@ -11,7 +11,8 @@ use due::packets::sink::PacketSink;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::port::Port;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_1_homo, connect_pair, Shared};
+use due::topos::{connect_n_1_homo, connect_pair};
+use due::Shared;
 
 const SEED: u64 = 1000;
 

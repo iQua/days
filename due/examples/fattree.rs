@@ -11,10 +11,8 @@ use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::{
-    connect_n_1_hetero, connect_pair, elements_to_agg, elements_to_core, elements_to_edge, Element,
-    Shared,
-};
+use due::topos::{connect_n_1_hetero, connect_pair};
+use due::{elements_to_agg, elements_to_core, elements_to_edge, Element, Shared};
 
 const SEED: u64 = 1000;
 

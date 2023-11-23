@@ -11,7 +11,8 @@ use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
 use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_1_homo, connect_pair, Shared};
+use due::topos::{connect_n_1_homo, connect_pair};
+use due::Shared;
 
 const SEED: u64 = 1000;
 
