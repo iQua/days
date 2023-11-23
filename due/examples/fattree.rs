@@ -95,13 +95,13 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // TODO:
     // Includes some hard-coded parts, which should be REMOVED later!
 
-    // connects edge layer switches to sinks
+    // connects edge-layer switches to sinks
     for (sink_id, sink) in sinks.iter_mut().enumerate() {
         let switch_id = sink_id / 2;
         connect_pair(edge_switches.get_mut(switch_id).unwrap(), sink);
     }
 
-    // connects elements that send packets to edge layer switches
+    // connects elements that send packets to edge-layer switches
     for edge_switch in edge_switches.iter_mut() {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
         let (agg_ids, generator_ids) = elements_to_edge(k, edge_switch.id());
@@ -121,7 +121,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         connect_n_1_hetero(&mut upstreams, edge_switch);
     }
 
-    // connects elements that send packets to aggregation layer switches
+    // connects elements that send packets to aggregation-layer switches
     for agg_switch in agg_switches.iter_mut() {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
         let (core_ids, edge_ids) = elements_to_agg(k, agg_switch.id());
@@ -141,7 +141,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         connect_n_1_hetero(&mut upstreams, agg_switch);
     }
 
-    // connects aggregation layer switches and core layer switches
+    // connects aggregation-layer switches and core-layer switches
     for core_switch in core_switches.iter_mut() {
         let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
         let agg_ids = elements_to_core(k, core_switch.id());

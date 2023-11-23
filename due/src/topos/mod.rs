@@ -1,6 +1,7 @@
-use tokio::sync::mpsc::unbounded_channel;
+pub mod fattree;
 
 use crate::Element;
+use tokio::sync::mpsc::unbounded_channel;
 
 /// Connects a collection of homogeneous upstream elements to a downstream element.
 pub fn connect_n_1_homo(upstream: &mut [impl Element], downstream: &mut impl Element) {
