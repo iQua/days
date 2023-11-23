@@ -59,6 +59,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         let sink_idx = sim.shared().rng.borrow_mut().gen_range(0..num_hosts);
         paths.push(get_path(k, pg_idx, sink_idx, &sim.shared()))
     }
+    println!("\n\nlength of flows:{}\n{:?}\n\n", paths.len(), paths);
 
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
@@ -111,7 +112,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     fattree.run(sim);
 
     // waits for the end of this simulation
-    sim.advance(sim.shared().duration + 100.).await;
+    sim.advance(sim.shared().duration + 1.).await;
 }
 
 fn main() {
@@ -119,7 +120,7 @@ fn main() {
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
-            duration: 10.,
+            duration: 1.,
             next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(4, sim)),
