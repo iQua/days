@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use rand::Rng;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
@@ -12,7 +13,7 @@ use due::packets::dist_generator::DistPacketGenerator;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::topos::fattree::FatTree;
+use due::topos::fattree::{FatTree, get_path};
 use due::{get_id, Shared};
 
 const SEED: u64 = 1000;
@@ -51,12 +52,20 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     // constructs the fattree topology
     let mut fattree = FatTree::new(k, generator);
 
-    // TODO: modify weights, fib, flow_to_classes, and add dst for flows!
-    // let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
-    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
-
+    // initializes flow_classes and weights for all DRRServer inside switches
     let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
     let weights = (1..=n_classes_per_port).collect::<Vec<_>>();
+
+    // TODO: initializes paths and fibs for all flows!!!
+    let mut paths = Vec::new();
+    for (pg_idx, generator) in fattree.generators.iter().enumerate() {
+        // first randomly set the destination of the flow
+        let sink_idx = sim.shared().rng.borrow_mut().gen_range(0..num_hosts);
+        paths.push(get_path(k, pg_idx, sink_idx))
+    }
+
+    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
+
 
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {

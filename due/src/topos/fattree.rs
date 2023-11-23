@@ -213,3 +213,8 @@ fn elements_to_core(k: usize, core_idx: usize) -> Vec<usize> {
         .step_by(pod_switches_per_layer)
         .collect::<Vec<_>>()
 }
+
+pub fn get_path(k: usize, generator_idx: usize, sink_idx: usize) -> Vec<usize> {
+    // Get the path
+    Vec::new()
+}
