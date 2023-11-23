@@ -48,6 +48,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         weights,
         fib,
         SchedulingDiscipline::DRR,
+        Arc::new(|flow_id| flow_id),
     );
 
     // connects packet generators and the switch

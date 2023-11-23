@@ -50,6 +50,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         (1000 * 8) as f64,
         100,
         CapacityUnit::Packets,
+        Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
         weights,
     );

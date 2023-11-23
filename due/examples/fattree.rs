@@ -20,6 +20,8 @@ const SEED: u64 = 1000;
 async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
+    let n_classes_per_port: usize = 4;
+
     // initializes number of elements for all layers
     let num_core_switches = (k / 2).pow(2);
     let num_agg_switches = (k.pow(2)) / 2;
@@ -53,6 +55,8 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
+    let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
+
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {
         let switch = PacketSwitch::new(
@@ -63,6 +67,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
             weights.clone(),
             fib.clone(),
             SchedulingDiscipline::DRR,
+            flow_classes.clone(),
         );
         edge_switches.push(switch);
     }
@@ -77,6 +82,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
             weights.clone(),
             fib.clone(),
             SchedulingDiscipline::DRR,
+            flow_classes.clone(),
         );
         agg_switches.push(switch);
     }
@@ -91,6 +97,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
             weights.clone(),
             fib.clone(),
             SchedulingDiscipline::DRR,
+            flow_classes.clone(),
         );
         core_switches.push(switch);
     }

@@ -1,6 +1,7 @@
 //! Implements a Deficit Round Robin (DRR) scheduler.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -17,7 +18,7 @@ pub struct DRRServer {
     /// a closure that maps a flow_id to a class_id, used to implement
     /// class-based Deficit Round Robin. The default uses a packet's flow_id as
     /// its class_id, which is equivalent to flow-based DRR.
-    pub flow_classes: Box<dyn Fn(usize) -> usize>,
+    pub flow_classes: Arc<dyn Fn(usize) -> usize>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop>,
@@ -64,6 +65,7 @@ impl DRRServer {
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
+        flow_classes: Arc<dyn Fn(usize) -> usize>,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> DRRServer {
@@ -91,7 +93,7 @@ impl DRRServer {
         DRRServer {
             element_id,
             rate,
-            flow_classes: Box::new(|flow_id| flow_id),
+            flow_classes,
             drop_strategy: Box::new(packet_drop),
             deficit,
             quantum,
