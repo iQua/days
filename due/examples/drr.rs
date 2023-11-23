@@ -15,7 +15,7 @@ use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::{connect_n_m, connect_pair};
-use due::{get_id, Element, Shared};
+use due::{get_flow_id, get_id, Element, Shared};
 
 const SEED: u64 = 1000;
 
@@ -26,12 +26,18 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes packet generators
     let mut generator_1 = DistPacketGenerator::new(
         get_id(),
+        get_flow_id(),
         0.0,
         arr_interval_dist.clone(),
         packet_size_dist.clone(),
     );
-    let mut generator_2 =
-        DistPacketGenerator::new(get_id(), 1.0, arr_interval_dist, packet_size_dist);
+    let mut generator_2 = DistPacketGenerator::new(
+        get_id(),
+        get_flow_id(),
+        1.0,
+        arr_interval_dist,
+        packet_size_dist,
+    );
 
     // initializes splitters
     let mut splitter_1 = Splitter::new(get_id());

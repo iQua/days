@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{get_id, Element, Shared};
+use crate::{get_flow_id, get_id, Element, Shared};
 
 pub struct DistPacketGenerator<A, B>
 where
@@ -15,6 +15,7 @@ where
     B: Distribution<f64>,
 {
     element_id: usize,
+    flow_id: usize,
     initial_delay: Time,
     arr_interval_dist: Arc<dyn Fn() -> A>,
     packet_size_dist: Arc<dyn Fn() -> B>,
@@ -49,6 +50,7 @@ where
     fn clone(&self) -> Self {
         DistPacketGenerator {
             element_id: get_id(),
+            flow_id: get_flow_id(),
             initial_delay: self.initial_delay,
             arr_interval_dist: self.arr_interval_dist.clone(),
             packet_size_dist: self.packet_size_dist.clone(),
@@ -66,12 +68,14 @@ where
 {
     pub fn new(
         element_id: usize,
+        flow_id: usize,
         initial_delay: Time,
         arr_interval_dist: Arc<dyn Fn() -> A>,
         packet_size_dist: Arc<dyn Fn() -> B>,
     ) -> DistPacketGenerator<A, B> {
         DistPacketGenerator {
             element_id,
+            flow_id,
             initial_delay,
             arr_interval_dist,
             packet_size_dist,
@@ -79,6 +83,10 @@ where
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
         }
+    }
+
+    pub fn flow_id(&self) -> usize {
+        self.flow_id
     }
 
     fn packet_sent(&mut self, sim: SimContext<'_, Shared>, packet: Packet) {
@@ -113,7 +121,7 @@ where
                 self.packets_sent,
                 "source".to_string(),
                 "destination".to_string(),
-                self.element_id,
+                self.flow_id,
                 sim.now(),
             );
 

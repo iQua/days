@@ -14,7 +14,7 @@ use due::packets::sink::PacketSink;
 use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::{connect_n_1_homo, connect_pair};
-use due::{get_id, Shared};
+use due::{get_flow_id, get_id, Shared};
 
 const SEED: u64 = 1000;
 
@@ -27,6 +27,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     for _ in 0..2 {
         let generator = DistPacketGenerator::new(
             get_id(),
+            get_flow_id(),
             1.0,
             arr_interval_dist.clone(),
             packet_size_dist.clone(),

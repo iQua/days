@@ -153,6 +153,8 @@ impl PacketSwitch {
             );
 
             // forwards packets to their corresponding outbound ports
+            println!("{:?}", self.fib);
+            println!("{}, {}", packet.flow_id, flow_class);
             let port_id = self.fib[flow_class];
             let _ = self.port_senders[port_id].send(packet);
         }

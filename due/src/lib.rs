@@ -38,3 +38,8 @@ pub fn get_id() -> usize {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
+
+pub fn get_flow_id() -> usize {
+    static FLOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    FLOW_COUNTER.fetch_add(1, Ordering::Relaxed)
+}

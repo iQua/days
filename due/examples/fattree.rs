@@ -38,10 +38,9 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // initializes one generator
-    // TODO: this sample generator will be dropped later, then it seems like we
-    // wasted an id here.
     let generator = DistPacketGenerator::new(
-        get_id(),
+        usize::MAX,
+        usize::MAX,
         0.,
         arr_interval_dist.clone(),
         packet_size_dist.clone(),
