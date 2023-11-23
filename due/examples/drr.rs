@@ -47,11 +47,14 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         DropStrategy::TailDrop,
         weights,
     );
+    let drr_server_id = drr_server.id();
 
     // initializes packet sinks
     let mut sink: PacketSink = PacketSink::new(get_id());
     let mut sink_1: PacketSink = PacketSink::new(get_id());
+    let sink_1_id = sink_1.id();
     let mut sink_2: PacketSink = PacketSink::new(get_id());
+    let sink_2_id = sink_2.id();
 
     // connects packet generators and splitters
     connect_pair(&mut generator_1, &mut splitter_1);
@@ -70,7 +73,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect_n_m(
         &mut upstreams,
         &mut downstreams,
-        vec![vec![0, 1], vec![0, 2]],
+        vec![
+            vec![sink_1_id, drr_server_id],
+            vec![drr_server_id, sink_2_id],
+        ],
     );
 
     // connects the DRR server and the packet sink
