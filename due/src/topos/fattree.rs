@@ -10,7 +10,7 @@ use crate::packets::sink::PacketSink;
 use crate::sim::{SimContext, Time};
 use crate::switches::switch::PacketSwitch;
 use crate::topos::{connect_n_1_hetero, connect_pair};
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
 pub struct FatTree<A, B>
 where
@@ -37,13 +37,26 @@ where
 {
     pub fn new(
         k: usize,
-        generators: Vec<DistPacketGenerator<A, B>>,
-        sinks: Vec<PacketSink>,
+        generator: DistPacketGenerator<A, B>,
         edge_switches: Vec<PacketSwitch>,
         agg_switches: Vec<PacketSwitch>,
         core_switches: Vec<PacketSwitch>,
     ) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "Invalid k!");
+
+        // initializes all hosts
+        let num_hosts = k.pow(3) / 4;
+        let mut generators = Vec::new();
+        let mut sinks = Vec::new();
+
+        for _ in 0..num_hosts {
+            let pg = generator.clone();
+            let sink = PacketSink::new(get_id());
+            generators.push(pg);
+            sinks.push(sink);
+        }
+        drop(generator);
+
         FatTree {
             k,
             generators,

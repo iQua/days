@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{Element, Shared, get_id};
+use crate::{get_id, Element, Shared};
 
 pub struct DistPacketGenerator<A, B>
 where

@@ -9,7 +9,6 @@ use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
 use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
@@ -27,9 +26,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let num_edge_switches = (k.pow(2)) / 2;
     let num_hosts = num_edge_switches * k / 2;
 
-    // initializes all elements
-    let mut generators = Vec::new();
-    let mut sinks = Vec::new();
+    // initializes Vecs for all switches
     let mut edge_switches = Vec::new();
     let mut agg_switches = Vec::new();
     let mut core_switches = Vec::new();
@@ -40,27 +37,24 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
+    // initializes one generator
+    // TODO: this sample generator will be dropped later, then it seems like we
+    // wasted an id here.
+    let generator = DistPacketGenerator::new(
+        get_id(),
+        0.,
+        arr_interval_dist.clone(),
+        packet_size_dist.clone(),
+    );
+
     // TODO: modify weights, fib, flow_to_classes, and add dst for flows!
     let weights: Vec<_> = (1..=4).cycle().take(num_hosts).collect();
-    // let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
-    let fib = Vec::new();
-    for i in 0..num_edge_switches {
-        // TODO
-        println!("{i}");
-    }
-
-    // initializes all hosts
-    for _ in 0..num_hosts {
-        let generator = DistPacketGenerator::new(
-            get_id(),
-            0.,
-            arr_interval_dist.clone(),
-            packet_size_dist.clone(),
-        );
-        let sink = PacketSink::new(get_id());
-        generators.push(generator);
-        sinks.push(sink);
-    }
+    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
+    // let fib = Vec::new();
+    // for i in 0..num_edge_switches {
+    //     // TODO
+    //     println!("{i}");
+    // }
 
     // initializes switches in the edge layer
     for _ in 0..num_edge_switches {
@@ -105,14 +99,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
 
     // constructs the fattree topology
-    let mut fattree = FatTree::new(
-        k,
-        generators,
-        sinks,
-        edge_switches,
-        agg_switches,
-        core_switches,
-    );
+    let mut fattree = FatTree::new(k, generator, edge_switches, agg_switches, core_switches);
 
     // connect all elements in the fattree topology
     fattree.connect();
