@@ -2,13 +2,12 @@
 //!  specified inter-arrival time distribution and a packet size distribution.
 
 use statrs::statistics::Distribution;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{Element, Shared};
+use crate::{Element, Shared, get_id};
 
 pub struct DistPacketGenerator<A, B>
 where
@@ -42,6 +41,24 @@ where
     }
 }
 
+impl<A, B> Clone for DistPacketGenerator<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
+    fn clone(&self) -> Self {
+        DistPacketGenerator {
+            element_id: get_id(),
+            initial_delay: self.initial_delay,
+            arr_interval_dist: self.arr_interval_dist.clone(),
+            packet_size_dist: self.packet_size_dist.clone(),
+            packets_sent: 0,
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
+        }
+    }
+}
+
 impl<A, B> DistPacketGenerator<A, B>
 where
     A: Distribution<Time>,
@@ -58,19 +75,6 @@ where
             initial_delay,
             arr_interval_dist,
             packet_size_dist,
-            packets_sent: 0,
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
-        }
-    }
-
-    pub fn clone(&self, shared: &Shared) -> Self {
-        let element_id = shared.next_id[0].fetch_add(1, Ordering::SeqCst);
-        DistPacketGenerator {
-            element_id,
-            initial_delay: self.initial_delay,
-            arr_interval_dist: self.arr_interval_dist.clone(),
-            packet_size_dist: self.packet_size_dist.clone(),
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
