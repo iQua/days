@@ -63,6 +63,22 @@ impl Default for PacketSink {
     }
 }
 
+impl Clone for PacketSink {
+    fn clone(&self) -> Self {
+        PacketSink {
+            element_id: get_id(),
+            arrival_times: RandomVar::new(),
+            last_arrival_time: 0.0,
+            inter_arrival_times: RandomVar::new(),
+            one_way_delays: RandomVar::new(),
+            queueing_delays: RandomVar::new(),
+            packet_sizes: RandomVar::new(),
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
+        }
+    }
+}
+
 impl PacketSink {
     pub fn new() -> PacketSink {
         Default::default()

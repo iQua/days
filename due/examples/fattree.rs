@@ -5,6 +5,8 @@ use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use due::packets::dist_generator::DistPacketGenerator;
+use due::packets::sink::PacketSink;
 use rand::Rng;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -39,8 +41,12 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
+    // sets a generator and a sink
+    let generator = DistPacketGenerator::new(0., arr_interval_dist, packet_size_dist);
+    let sink = PacketSink::default();
+
     // constructs the fattree topology
-    let mut fattree = FatTree::new(k, 0., arr_interval_dist, packet_size_dist);
+    let mut fattree = FatTree::new(k, generator, sink);
 
     // initializes flow_classes and weights for all DRRServer inside switches
     let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);

@@ -3,8 +3,6 @@
 //! Besides, three helper functions are also provided to get the identifiers of
 //! elements that will send packets to a given device.
 
-use std::sync::Arc;
-
 use rand::Rng;
 use statrs::statistics::Distribution;
 
@@ -38,12 +36,7 @@ where
     A: Distribution<Time> + 'static,
     B: Distribution<f64> + 'static,
 {
-    pub fn new(
-        k: usize,
-        initial_delay: f64,
-        arr_interval_dist: Arc<dyn Fn() -> A>,
-        packet_size_dist: Arc<dyn Fn() -> B>,
-    ) -> FatTree<A, B> {
+    pub fn new(k: usize, generator: DistPacketGenerator<A, B>, sink: PacketSink) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "Invalid k!");
 
         // initializes all hosts
@@ -52,14 +45,8 @@ where
         let mut sinks = Vec::new();
 
         for _ in 0..num_hosts {
-            let pg = DistPacketGenerator::new(
-                initial_delay,
-                arr_interval_dist.clone(),
-                packet_size_dist.clone(),
-            );
-            let sink = PacketSink::default();
-            generators.push(pg);
-            sinks.push(sink);
+            generators.push(generator.clone());
+            sinks.push(sink.clone());
         }
 
         FatTree {
