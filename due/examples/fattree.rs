@@ -55,12 +55,12 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
 
     // TODO: initializes paths and fibs for all flows!!!
     let mut paths = Vec::new();
-    for (pg_idx, generator) in fattree.generators.iter().enumerate() {
+    for (gen_idx, generator) in fattree.generators.iter().enumerate() {
         // first randomly set the destination of the flow
         let sink_idx = sim.shared().rng.borrow_mut().gen_range(0..num_hosts);
-        paths.push(get_path(k, pg_idx, sink_idx, &sim.shared()))
+        paths.push(get_path(k, gen_idx, sink_idx, &sim.shared()))
     }
-    println!("\n\nlength of flows:{}\n{:?}\n\n", paths.len(), paths);
+    println!("\n\nlength of flows: {}\n{:?}\n\n", paths.len(), paths);
 
     // connects and activates all elements
     fattree.run(sim);

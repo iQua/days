@@ -228,7 +228,7 @@ fn elements_to_edge(k: usize, edge_idx: usize) -> (Vec<usize>, Vec<usize>) {
     let hosts_per_switch = k / 2;
     assert!(
         edge_idx < switches_per_layer,
-        "Invalid edge layer switch idx."
+        "Invalid edge layer switch index."
     );
 
     let pod_idx = edge_idx / pod_switches_per_layer;
@@ -250,7 +250,7 @@ fn elements_to_agg(k: usize, agg_idx: usize) -> (Vec<usize>, Vec<usize>) {
     let core_switches_per_agg = core_switches / pod_switches_per_layer;
     assert!(
         agg_idx < switches_per_layer,
-        "Invalid aggregation layer switch idx."
+        "Invalid aggregation layer switch index."
     );
 
     let pod_idx = agg_idx / pod_switches_per_layer;
@@ -263,13 +263,13 @@ fn elements_to_agg(k: usize, agg_idx: usize) -> (Vec<usize>, Vec<usize>) {
     (core_idxs, edge_idxs)
 }
 
-/// This function returns the indexes of switches in aggregation layer that send
-/// packets to the given core layer switch.
+/// This function returns the indexes of switches in the aggregation layer that
+/// send packets to the given core layer switch.
 fn elements_to_core(k: usize, core_idx: usize) -> Vec<usize> {
     let core_switches = (k / 2).pow(2);
     let pod_switches_per_layer = k / 2;
     let switches_per_layer = pod_switches_per_layer * k;
-    assert!(core_idx < core_switches, "Invalid core layer switch idx.");
+    assert!(core_idx < core_switches, "Invalid core layer switch index.");
 
     let core_type = core_idx / pod_switches_per_layer;
     (core_type..switches_per_layer)
