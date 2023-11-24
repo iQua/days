@@ -2,11 +2,12 @@
 //! ports, where their queues are limited by bytes and packet numbers,
 //! respectively.
 
-use rand::{rngs::SmallRng, SeedableRng};
-use statrs::distribution::Uniform;
 use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+
+use rand::{rngs::SmallRng, SeedableRng};
+use statrs::distribution::Uniform;
 
 use due::packets::dist_generator::DistPacketGenerator;
 use due::packets::sink::PacketSink;
