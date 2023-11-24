@@ -15,7 +15,7 @@ pub fn connect_n_1_homo(upstream: &mut [impl Element], downstream: &mut impl Ele
 }
 
 /// Connects a collection of heterogeneous upstream elements to a downstream element.
-pub fn connect_n_1_hetero(upstream: &mut [Box<&mut dyn Element>], downstream: &mut impl Element) {
+pub fn connect_n_1_hetero(upstream: &mut [Box<&mut dyn Element>], downstream: &mut dyn Element) {
     let (sender, receiver) = unbounded_channel();
 
     for upstream_element in upstream.iter_mut() {
