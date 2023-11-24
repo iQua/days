@@ -1,5 +1,6 @@
 //! Constructs a FatTree topology with the given parameters.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rand::Rng;
@@ -344,4 +345,20 @@ pub fn get_path(k: usize, generator_idx: usize, sink_idx: usize, shared: &Shared
     };
 
     path
+}
+
+/// This function is used to generate demux fib for all switches in the fattree
+/// topology, based on the given fattree size k and routing information.
+pub fn get_fibs(k: usize, paths: Vec<Vec<usize>>) -> Vec<HashMap<usize, usize>> {
+    // TODO: Do we have better ideas to replace HashMap? Like just use Vec.
+
+    let num_switches = 5 * k.pow(2) / 4;
+
+    let mut fibs: Vec<HashMap<usize, usize>> = (0..num_switches).map(|_| HashMap::new()).collect();
+    for path in paths.iter() {
+        println!("{:?} with length {}", &path, &path.len());
+        let flow_id = 1; // TODO: should place this function inside of FatTree!
+    }
+
+    fibs
 }

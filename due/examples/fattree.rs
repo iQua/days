@@ -13,7 +13,7 @@ use statrs::distribution::{DiscreteUniform, Uniform};
 
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::SchedulingDiscipline;
-use due::topos::fattree::{get_path, FatTree};
+use due::topos::fattree::{get_fibs, get_path, FatTree};
 use due::Shared;
 
 const SEED: u64 = 1000;
@@ -55,12 +55,23 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
 
     // TODO: initializes paths and fibs for all flows!!!
     let mut paths = Vec::new();
-    for (gen_idx, generator) in fattree.generators.iter().enumerate() {
+    for gen_idx in 0..fattree.generators.len() {
         // first randomly set the destination of the flow
         let sink_idx = sim.shared().rng.borrow_mut().gen_range(0..num_hosts);
         paths.push(get_path(k, gen_idx, sink_idx, &sim.shared()))
     }
     println!("\n\nlength of flows: {}\n{:?}\n\n", paths.len(), paths);
+
+    // The order of senders in switches.
+    // 1. for edge-layer switches: sink1, sink2, agg1, agg2
+    // 2. for agg-layer switches: edge1, edge2, core1, core2
+    // 3. for core-layer switches: agg1, agg2, agg3, agg4
+    // Next step is to generate a fib (Vec<HashMap<>>).
+    // Given paths, for each path (starts from a pg, ends with a sink), iterate
+    // all hops, and generate fib for each switch.
+    // Lastly, assign fibs to all switches.
+    let fibs = get_fibs(k, paths);
+    println!("\n\nlength of fibs: {}\n{:?}\n\n", fibs.len(), fibs);
 
     // constructs, connects and activates all elements
     fattree.activate(sim);
