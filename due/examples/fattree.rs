@@ -62,8 +62,8 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     }
     println!("\n\nlength of flows: {}\n{:?}\n\n", paths.len(), paths);
 
-    // connects and activates all elements
-    fattree.run(sim);
+    // constructs, connects and activates all elements
+    fattree.activate(sim);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 1.).await;

@@ -1,6 +1,4 @@
-//! Constructs a FatTree topology with the given parameters. In addition, three
-//! helper functions are also provided to get the identifiers of elements that
-//! will send packets to a given device.
+//! Constructs a FatTree topology with the given parameters.
 
 use std::sync::Arc;
 
@@ -21,16 +19,22 @@ where
     B: Distribution<f64> + 'static,
 {
     k: usize,
+    /// the port rate of each port in the switches
     port_rate: f64,
+    /// the buffer capacity of each port in the switches
     capacity: usize,
+    /// flow_id -> class_id
     flow_classes: Arc<dyn Fn(usize) -> usize>,
+    /// class_id -> weight
     weights: Vec<usize>,
+    /// Flow Information Base: flow_id -> destination port
     fib: Vec<usize>,
+    /// scheduling discipline at each switch
     scheduling_discipline: SchedulingDiscipline,
-    /// packet generators in hosts
-    pub generators: Vec<DistPacketGenerator<A, B>>,
-    /// packet sinks of in hosts
-    pub sinks: Vec<PacketSink>,
+    /// packet generators in the hosts
+    generators: Vec<DistPacketGenerator<A, B>>,
+    /// packet sinks in the hosts
+    sinks: Vec<PacketSink>,
     /// edge-layer switches
     edge_switches: Vec<PacketSwitch>,
     /// aggregation-layer switches
@@ -85,7 +89,30 @@ where
         }
     }
 
-    pub fn construct(&mut self) {
+    pub fn activate(mut self, sim: SimContext<'_, Shared>) {
+        // constructs and connects all elements in the FatTree topology
+        self.construct();
+        self.connect();
+
+        // activates all elements in the FatTree topology
+        for generator in self.generators {
+            sim.activate(generator.run(sim));
+        }
+        for sink in self.sinks {
+            sim.activate(sink.run(sim));
+        }
+        for switch in self.core_switches {
+            sim.activate(switch.run(sim));
+        }
+        for switch in self.agg_switches {
+            sim.activate(switch.run(sim));
+        }
+        for switch in self.edge_switches {
+            sim.activate(switch.run(sim));
+        }
+    }
+
+    fn construct(&mut self) {
         // initializes number of elements for all layers
         let num_core_switches = (self.k / 2).pow(2);
         let num_agg_switches = self.k.pow(2) / 2;
@@ -144,7 +171,7 @@ where
         // connects elements that send packets to edge-layer switches
         for (edge_idx, edge_switch) in self.edge_switches.iter_mut().enumerate() {
             let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-            let (agg_idxs, generator_idxs) = elements_to_edge(self.k, edge_idx);
+            let (agg_idxs, generator_idxs) = self.elements_to_edge(edge_idx);
 
             for (agg_idx, switch) in self.agg_switches.iter_mut().enumerate() {
                 if agg_idxs.contains(&agg_idx) {
@@ -164,7 +191,7 @@ where
         // connects elements that send packets to aggregation-layer switches
         for (agg_idx, agg_switch) in self.agg_switches.iter_mut().enumerate() {
             let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-            let (core_idxs, edge_idxs) = elements_to_agg(self.k, agg_idx);
+            let (core_idxs, edge_idxs) = self.elements_to_agg(agg_idx);
 
             for (core_idx, switch) in self.core_switches.iter_mut().enumerate() {
                 if core_idxs.contains(&core_idx) {
@@ -184,7 +211,7 @@ where
         // connects aggregation-layer switches and core-layer switches
         for (core_idx, core_switch) in self.core_switches.iter_mut().enumerate() {
             let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-            let agg_idxs = elements_to_core(self.k, core_idx);
+            let agg_idxs = self.elements_to_core(core_idx);
 
             for (agg_idx, switch) in self.agg_switches.iter_mut().enumerate() {
                 if agg_idxs.contains(&agg_idx) {
@@ -196,85 +223,62 @@ where
         }
     }
 
-    pub fn run(mut self, sim: SimContext<'_, Shared>) {
-        // connects all elements in the FatTree topology
-        self.construct();
-        self.connect();
+    /// This function returns the indexes of switches in the aggregation layer and
+    /// generators that send packets to a given edge layer switch.
+    fn elements_to_edge(&self, edge_idx: usize) -> (Vec<usize>, Vec<usize>) {
+        let pod_switches_per_layer = self.k / 2;
+        let switches_per_layer = pod_switches_per_layer * self.k;
+        let hosts_per_switch = self.k / 2;
+        assert!(
+            edge_idx < switches_per_layer,
+            "Invalid edge layer switch index."
+        );
 
-        // activates all elements in the FatTree topology
-        for generator in self.generators {
-            sim.activate(generator.run(sim));
-        }
-        for sink in self.sinks {
-            sim.activate(sink.run(sim));
-        }
-        for switch in self.core_switches {
-            sim.activate(switch.run(sim));
-        }
-        for switch in self.agg_switches {
-            sim.activate(switch.run(sim));
-        }
-        for switch in self.edge_switches {
-            sim.activate(switch.run(sim));
-        }
+        let pod_idx = edge_idx / pod_switches_per_layer;
+        let agg_start = pod_idx * pod_switches_per_layer;
+        let host_start = edge_idx * hosts_per_switch;
+
+        let agg_idxs = (agg_start..agg_start + pod_switches_per_layer).collect::<Vec<_>>();
+        let generator_idxs = (host_start..host_start + hosts_per_switch).collect::<Vec<_>>();
+
+        (agg_idxs, generator_idxs)
     }
-}
 
-/// This function returns the indexes of switches in the aggregation layer and
-/// generators that send packets to a given edge layer switch.
-fn elements_to_edge(k: usize, edge_idx: usize) -> (Vec<usize>, Vec<usize>) {
-    let pod_switches_per_layer = k / 2;
-    let switches_per_layer = pod_switches_per_layer * k;
-    let hosts_per_switch = k / 2;
-    assert!(
-        edge_idx < switches_per_layer,
-        "Invalid edge layer switch index."
-    );
+    /// This function returns the indexes of switches in the core layer and the edge
+    /// layer that send packets to a given aggregation layer switch.
+    fn elements_to_agg(&self, agg_idx: usize) -> (Vec<usize>, Vec<usize>) {
+        let core_switches = (self.k / 2).pow(2);
+        let pod_switches_per_layer = self.k / 2;
+        let switches_per_layer = pod_switches_per_layer * self.k;
+        let core_switches_per_agg = core_switches / pod_switches_per_layer;
+        assert!(
+            agg_idx < switches_per_layer,
+            "Invalid aggregation layer switch index."
+        );
 
-    let pod_idx = edge_idx / pod_switches_per_layer;
-    let agg_start = pod_idx * pod_switches_per_layer;
-    let host_start = edge_idx * hosts_per_switch;
+        let pod_idx = agg_idx / pod_switches_per_layer;
+        let core_start = core_switches_per_agg * (agg_idx % pod_switches_per_layer);
+        let edge_start = pod_idx * pod_switches_per_layer;
 
-    let agg_idxs = (agg_start..agg_start + pod_switches_per_layer).collect::<Vec<_>>();
-    let generator_idxs = (host_start..host_start + hosts_per_switch).collect::<Vec<_>>();
+        let core_idxs = (core_start..core_start + core_switches_per_agg).collect::<Vec<_>>();
+        let edge_idxs = (edge_start..edge_start + pod_switches_per_layer).collect::<Vec<_>>();
 
-    (agg_idxs, generator_idxs)
-}
+        (core_idxs, edge_idxs)
+    }
 
-/// This function returns the indexes of switches in the core layer and the edge
-/// layer that send packets to a given aggregation layer switch.
-fn elements_to_agg(k: usize, agg_idx: usize) -> (Vec<usize>, Vec<usize>) {
-    let core_switches = (k / 2).pow(2);
-    let pod_switches_per_layer = k / 2;
-    let switches_per_layer = pod_switches_per_layer * k;
-    let core_switches_per_agg = core_switches / pod_switches_per_layer;
-    assert!(
-        agg_idx < switches_per_layer,
-        "Invalid aggregation layer switch index."
-    );
+    /// This function returns the indexes of switches in the aggregation layer that
+    /// send packets to the given core layer switch.
+    fn elements_to_core(&self, core_idx: usize) -> Vec<usize> {
+        let core_switches = (self.k / 2).pow(2);
+        let pod_switches_per_layer = self.k / 2;
+        let switches_per_layer = pod_switches_per_layer * self.k;
+        assert!(core_idx < core_switches, "Invalid core layer switch index.");
 
-    let pod_idx = agg_idx / pod_switches_per_layer;
-    let core_start = core_switches_per_agg * (agg_idx % pod_switches_per_layer);
-    let edge_start = pod_idx * pod_switches_per_layer;
-
-    let core_idxs = (core_start..core_start + core_switches_per_agg).collect::<Vec<_>>();
-    let edge_idxs = (edge_start..edge_start + pod_switches_per_layer).collect::<Vec<_>>();
-
-    (core_idxs, edge_idxs)
-}
-
-/// This function returns the indexes of switches in the aggregation layer that
-/// send packets to the given core layer switch.
-fn elements_to_core(k: usize, core_idx: usize) -> Vec<usize> {
-    let core_switches = (k / 2).pow(2);
-    let pod_switches_per_layer = k / 2;
-    let switches_per_layer = pod_switches_per_layer * k;
-    assert!(core_idx < core_switches, "Invalid core layer switch index.");
-
-    let core_type = core_idx / pod_switches_per_layer;
-    (core_type..switches_per_layer)
-        .step_by(pod_switches_per_layer)
-        .collect::<Vec<_>>()
+        let core_type = core_idx / pod_switches_per_layer;
+        (core_type..switches_per_layer)
+            .step_by(pod_switches_per_layer)
+            .collect::<Vec<_>>()
+    }
 }
 
 /// This function is used to generate path of indexes for a given pair of
