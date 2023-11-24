@@ -1,13 +1,14 @@
 //! Implements a Deficit Round Robin (DRR) scheduler.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::sim::SimContext;
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
 pub struct DRRServer {
     element_id: usize,
@@ -17,7 +18,7 @@ pub struct DRRServer {
     /// a closure that maps a flow_id to a class_id, used to implement
     /// class-based Deficit Round Robin. The default uses a packet's flow_id as
     /// its class_id, which is equivalent to flow-based DRR.
-    pub flow_classes: Box<dyn Fn(usize) -> usize>,
+    pub flow_classes: Arc<dyn Fn(usize) -> usize>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop>,
@@ -60,10 +61,10 @@ impl Element for DRRServer {
 
 impl DRRServer {
     pub fn new(
-        element_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
+        flow_classes: Arc<dyn Fn(usize) -> usize>,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> DRRServer {
@@ -76,7 +77,7 @@ impl DRRServer {
 
         let min_weight = weights.iter().min().unwrap();
 
-        for class_id in 0..weights.len() {
+        for (class_id, _) in weights.iter().enumerate() {
             deficit.push(0);
             quantum.push(min_quantum * weights[class_id] / min_weight);
             byte_sizes.push(0);
@@ -89,9 +90,9 @@ impl DRRServer {
         };
 
         DRRServer {
-            element_id,
+            element_id: get_id(),
             rate,
-            flow_classes: Box::new(|flow_id| flow_id),
+            flow_classes,
             drop_strategy: Box::new(packet_drop),
             deficit,
             quantum,
@@ -143,8 +144,8 @@ impl DRRServer {
             packet.flow_id,
             sim.now(),
             self.packets_received,
-            self.queues[packet.flow_id].len(),
-            packet.flow_id
+            self.queues[class_id].len(),
+            class_id
         );
     }
 
@@ -153,7 +154,7 @@ impl DRRServer {
             // schedules packets by going through each queue
             for class_id in 0..self.queues.len() {
                 // increases the deficit of the current queue if it is non-empty
-                if self.queues[class_id].len() > 0 {
+                if !self.queues[class_id].is_empty() {
                     self.deficit[class_id] += self.quantum[class_id];
                 } else {
                     // resets to zero if the queue is empty
@@ -162,7 +163,7 @@ impl DRRServer {
 
                 let mut current_deficit = self.deficit[class_id];
 
-                while current_deficit > 0 && self.queues[class_id].len() > 0 {
+                while current_deficit > 0 && !self.queues[class_id].is_empty() {
                     let packet = self.queues[class_id].front().unwrap().clone();
 
                     if packet.size <= current_deficit {

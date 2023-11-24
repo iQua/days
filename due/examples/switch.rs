@@ -1,32 +1,32 @@
 //! This example shows a simple example that uses a fair packet switch.
 
 use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::{connect_1_n, connect_n_1, Shared};
+use due::topos::{connect_1_n, connect_n_1_homo};
+use due::Shared;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    // initializes packet generators and packet sinks
     let mut generators = Vec::new();
     let mut sinks = Vec::new();
+    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
-    for i in 0..2 {
-        let generator = DistPacketGenerator::new(
-            i,
-            0.,
-            Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
-            Box::new(|| DiscreteUniform::new(1000, 1000).unwrap()),
-        );
-        let sink = PacketSink::new(i);
+    // initializes packet generators and packet sinks
+    for _ in 0..2 {
+        let generator = Source::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
+        let sink = Sink::default();
         generators.push(generator);
         sinks.push(sink);
     }
@@ -35,17 +35,17 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let weights = vec![1, 2];
     let fib = vec![0, 1];
     let mut switch = PacketSwitch::new(
-        0,
         2,
         (1000 * 8) as f64,
         100,
         weights,
         fib,
         SchedulingDiscipline::DRR,
+        Arc::new(|flow_id| flow_id),
     );
 
     // connects packet generators and the switch
-    connect_n_1(&mut generators, &mut switch);
+    connect_n_1_homo(&mut generators, &mut switch);
     // connects the switch to packet sinks
     connect_1_n(&mut switch, &mut sinks);
 
@@ -68,6 +68,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

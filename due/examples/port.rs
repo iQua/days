@@ -2,43 +2,43 @@
 //! ports, where their queues are limited by bytes and packet numbers,
 //! respectively.
 
+use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::Uniform;
-use std::cell::RefCell;
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::port::Port;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_1, connect_pair, Shared};
+use due::topos::{connect_n_1_homo, connect_pair};
+use due::Shared;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut generators = Vec::new();
+    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Arc::new(|| Uniform::new(1000.0, 1000.0).unwrap());
 
-    for i in 0..2 {
-        let generator = DistPacketGenerator::new(
-            i,
-            1.0,
-            Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
-            Box::new(|| Uniform::new(1000.0, 1000.0).unwrap()),
-        );
+    for _ in 0..2 {
+        let generator = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
         generators.push(generator);
     }
 
     let mut port = Port::new(
-        0,
         (1000 * 8) as f64,
         2,
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
-    let mut sink = PacketSink::new(0);
+    let mut sink = Sink::default();
 
     // connects the generators to the port
-    connect_n_1(&mut generators, &mut port);
+    connect_n_1_homo(&mut generators, &mut port);
 
     // connects the port to the sink
     connect_pair(&mut port, &mut sink);
@@ -59,6 +59,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

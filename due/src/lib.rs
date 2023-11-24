@@ -1,11 +1,14 @@
 use rand::rngs::SmallRng;
 use std::cell::RefCell;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub mod packets;
 pub mod schedulers;
 pub mod sim;
 pub mod switches;
+pub mod topos;
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, Time};
@@ -15,6 +18,7 @@ pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
+    pub next_id: Vec<AtomicUsize>,
 }
 
 /// Element is a trait that defines the interface for all elements in the network.
@@ -30,53 +34,12 @@ pub trait Element {
     }
 }
 
-/// connects a collection of homogeneous upstream elements to a downstream element.
-pub fn connect_n_1(upstream: &mut [impl Element], downstream: &mut impl Element) {
-    let (sender, receiver) = unbounded_channel();
-
-    for element in upstream {
-        element.connect_sender(sender.clone());
-    }
-
-    (*downstream).connect_receiver(receiver);
+pub fn get_id() -> usize {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// connects an upstream element to a downstream element.
-pub fn connect_pair(upstream: &mut impl Element, downstream: &mut impl Element) {
-    let (sender, receiver) = unbounded_channel();
-
-    upstream.connect_sender(sender);
-    downstream.connect_receiver(receiver);
-}
-
-/// connects an upstream element to a collection of homogeneous downstream elements.
-pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element]) {
-    for element in downstream {
-        let (sender, receiver) = unbounded_channel();
-        upstream.connect_sender(sender);
-        element.connect_receiver(receiver);
-    }
-}
-
-/// Connects multiple heterogeneous upstream elements to multiple heterogeneous
-/// downstream elements. The connections are established based on the bipartite
-/// graph `edges`, where each Vec corresponds to a specific upstream element and
-/// contains the indices of downstream elements it should connect to.
-pub fn connect_n_m(
-    upstream: &mut [Box<&mut dyn Element>],
-    downstream: &mut [Box<&mut dyn Element>],
-    edges: Vec<Vec<usize>>,
-) {
-    for downstream_element in downstream {
-        let (sender, receiver) = unbounded_channel();
-
-        downstream_element.connect_receiver(receiver);
-        let id = downstream_element.id();
-
-        for (i, upstream_element) in upstream.iter_mut().enumerate() {
-            if edges[i].contains(&id) {
-                upstream_element.connect_sender(sender.clone());
-            }
-        }
-    }
+pub fn get_flow_id() -> usize {
+    static FLOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    FLOW_COUNTER.fetch_add(1, Ordering::Relaxed)
 }

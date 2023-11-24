@@ -2,54 +2,53 @@
 //! server.
 
 use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::packets::splitter::Splitter;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{connect_n_m, connect_pair, Element, Shared};
+use due::topos::{connect_n_m, connect_pair};
+use due::{Element, Shared};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    // initializes packet generators
-    let mut generator_1 = DistPacketGenerator::new(
-        0,
-        0.0,
-        Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
-        Box::new(|| DiscreteUniform::new(1000, 1000).unwrap()),
-    );
-    let mut generator_2 = DistPacketGenerator::new(
-        1,
-        1.0,
-        Box::new(|| Uniform::new(1.0, 1.0).unwrap()),
-        Box::new(|| DiscreteUniform::new(1000, 1000).unwrap()),
-    );
+    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
+    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
-    // initializes packet sinks
-    let mut sink: PacketSink = PacketSink::new(0);
-    let mut sink_1: PacketSink = PacketSink::new(1);
-    let mut sink_2: PacketSink = PacketSink::new(2);
+    // initializes packet generators
+    let mut generator_1 = Source::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    let mut generator_2 = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+
+    // initializes splitters
+    let mut splitter_1 = Splitter::default();
+    let mut splitter_2 = Splitter::default();
 
     // initializes the DRR server
     let weights = vec![1, 2];
     let mut drr_server = DRRServer::new(
-        0,
         (1000 * 8) as f64,
         100,
         CapacityUnit::Packets,
+        Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
         weights,
     );
+    let drr_server_id = drr_server.id();
 
-    // initializes splitters
-    let mut splitter_1 = Splitter::new(1);
-    let mut splitter_2 = Splitter::new(2);
+    // initializes packet sinks
+    let mut sink: Sink = Sink::default();
+    let mut sink_1: Sink = Sink::default();
+    let sink_1_id = sink_1.id();
+    let mut sink_2: Sink = Sink::default();
+    let sink_2_id = sink_2.id();
 
     // connects packet generators and splitters
     connect_pair(&mut generator_1, &mut splitter_1);
@@ -68,7 +67,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     connect_n_m(
         &mut upstreams,
         &mut downstreams,
-        vec![vec![0, 1], vec![0, 2]],
+        vec![
+            vec![sink_1_id, drr_server_id],
+            vec![drr_server_id, sink_2_id],
+        ],
     );
 
     // connects the DRR server and the packet sink
@@ -94,6 +96,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 20.,
+            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

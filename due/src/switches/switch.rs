@@ -2,6 +2,7 @@
 //! buffers, on each of the outgoing ports.
 
 use std::any::Any;
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -10,7 +11,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::switches::SchedulingDiscipline;
-use crate::Shared;
+use crate::{get_id, Shared};
 use crate::{sim::SimContext, Element};
 
 pub struct PacketSwitch {
@@ -22,8 +23,6 @@ pub struct PacketSwitch {
     /// the flow information base (FIB) of the switch
     /// class_id -> the outbound port_id
     fib: Vec<usize>,
-    /// a closure that maps flow_id -> class_id
-    pub flow_classes: Box<dyn Fn(usize) -> usize>,
     /// the outbound ports, with consecutive ids starting from 0
     /// each of these ports is governed by a DRR or FIFO scheduler
     ports: Vec<Box<dyn Any>>,
@@ -52,29 +51,29 @@ impl Element for PacketSwitch {
 
 impl PacketSwitch {
     pub fn new(
-        element_id: usize,
         nports: usize,
         port_rate: f64,
         capacity: usize,
         weights: Vec<usize>,
         fib: Vec<usize>,
         discipline: SchedulingDiscipline,
+        flow_classes: Arc<dyn Fn(usize) -> usize>,
     ) -> PacketSwitch {
         let mut ports: Vec<Box<dyn Any>> = Vec::new();
 
         // the senders from the demultiplexer to ports inside the switch
         let mut port_senders = Vec::new();
 
-        for i in 0..nports {
+        for _ in 0..nports {
             let (sender, receiver) = unbounded_channel();
 
             match discipline {
                 SchedulingDiscipline::DRR => {
                     let mut port = DRRServer::new(
-                        i,
                         port_rate,
                         capacity,
                         CapacityUnit::Packets,
+                        flow_classes.clone(),
                         DropStrategy::TailDrop,
                         weights.clone(),
                     );
@@ -85,7 +84,6 @@ impl PacketSwitch {
                 }
                 SchedulingDiscipline::FIFO => {
                     let mut port = Port::new(
-                        i,
                         port_rate,
                         capacity,
                         CapacityUnit::Packets,
@@ -100,11 +98,10 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            element_id,
+            element_id: get_id(),
             packets_received: 0,
             discipline,
             fib,
-            flow_classes: Box::new(|flow_id| flow_id),
             ports,
             port_senders,
             senders: Vec::new(),
@@ -137,28 +134,23 @@ impl PacketSwitch {
             }
         }
 
-        loop {
-            if let Some(packet) = self.receiver.recv().await {
-                self.packets_received += 1;
-                let flow_class = (self.flow_classes)(packet.flow_id);
+        while let Some(packet) = self.receiver.recv().await {
+            self.packets_received += 1;
 
-                println!(
-                    "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            println!(
+                "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
                     {} packets received.",
-                    self.element_id,
-                    packet.packet_id,
-                    packet.size,
-                    packet.flow_id,
-                    sim.now(),
-                    self.packets_received
-                );
+                self.element_id,
+                packet.packet_id,
+                packet.size,
+                packet.flow_id,
+                sim.now(),
+                self.packets_received
+            );
 
-                // forwards packets to their corresponding outbound ports
-                let port_id = self.fib[flow_class];
-                let _ = self.port_senders[port_id].send(packet);
-            } else {
-                break;
-            }
+            // forwards packets to their corresponding outbound ports
+            let port_id = self.fib[packet.flow_id];
+            let _ = self.port_senders[port_id].send(packet);
         }
 
         println!(

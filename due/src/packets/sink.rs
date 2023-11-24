@@ -1,7 +1,7 @@
-//! Implements a PacketSink, designed to record both arrival times and waiting
+//! Implements a Sink, designed to record both arrival times and waiting
 //! times from the incoming packets.
 
-//! The PacketSink records a variety of statistics, including absolute arrival
+//! The Sink records a variety of statistics, including absolute arrival
 //! times, inter-arrival times, the total number of packets and bytes received,
 //! the one-way end-to-end delays, and the total time spent waiting in queues.
 //! These statistics are indexed by either the flow identifier or the source of
@@ -11,9 +11,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
-use crate::{Element, Shared};
+use crate::{get_id, Element, Shared};
 
-pub struct PacketSink {
+pub struct Sink {
     element_id: usize,
     /// the arrival times of the packets
     arrival_times: RandomVar,
@@ -33,7 +33,7 @@ pub struct PacketSink {
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for PacketSink {
+impl Element for Sink {
     fn id(&mut self) -> usize {
         self.element_id
     }
@@ -47,10 +47,10 @@ impl Element for PacketSink {
     }
 }
 
-impl PacketSink {
-    pub fn new(element_id: usize) -> PacketSink {
-        PacketSink {
-            element_id,
+impl Default for Sink {
+    fn default() -> Self {
+        Sink {
+            element_id: get_id(),
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -60,6 +60,28 @@ impl PacketSink {
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
         }
+    }
+}
+
+impl Clone for Sink {
+    fn clone(&self) -> Self {
+        Sink {
+            element_id: get_id(),
+            arrival_times: RandomVar::new(),
+            last_arrival_time: 0.0,
+            inter_arrival_times: RandomVar::new(),
+            one_way_delays: RandomVar::new(),
+            queueing_delays: RandomVar::new(),
+            packet_sizes: RandomVar::new(),
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
+        }
+    }
+}
+
+impl Sink {
+    pub fn new() -> Sink {
+        Default::default()
     }
 
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
