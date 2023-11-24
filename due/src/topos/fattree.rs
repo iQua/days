@@ -32,7 +32,7 @@ where
     /// scheduling discipline at each switch
     scheduling_discipline: SchedulingDiscipline,
     /// packet generators in the hosts
-    generators: Vec<DistPacketGenerator<A, B>>,
+    pub generators: Vec<DistPacketGenerator<A, B>>,
     /// packet sinks in the hosts
     sinks: Vec<PacketSink>,
     /// edge-layer switches
@@ -45,8 +45,8 @@ where
 
 impl<A, B> FatTree<A, B>
 where
-    A: Distribution<Time> + 'static,
-    B: Distribution<f64> + 'static,
+    A: Distribution<Time>,
+    B: Distribution<f64>,
 {
     pub fn new(
         k: usize,
@@ -171,7 +171,7 @@ where
         // connects elements that send packets to edge-layer switches
         for (edge_idx, edge_switch) in self.edge_switches.iter_mut().enumerate() {
             let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-            let (agg_idxs, generator_idxs) = self.elements_to_edge(edge_idx);
+            let (agg_idxs, generator_idxs) = FatTree::<A, B>::elements_to_edge(self.k, edge_idx);
 
             for (agg_idx, switch) in self.agg_switches.iter_mut().enumerate() {
                 if agg_idxs.contains(&agg_idx) {
@@ -191,7 +191,7 @@ where
         // connects elements that send packets to aggregation-layer switches
         for (agg_idx, agg_switch) in self.agg_switches.iter_mut().enumerate() {
             let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-            let (core_idxs, edge_idxs) = self.elements_to_agg(agg_idx);
+            let (core_idxs, edge_idxs) = FatTree::<A, B>::elements_to_agg(self.k, agg_idx);
 
             for (core_idx, switch) in self.core_switches.iter_mut().enumerate() {
                 if core_idxs.contains(&core_idx) {
@@ -211,7 +211,7 @@ where
         // connects aggregation-layer switches and core-layer switches
         for (core_idx, core_switch) in self.core_switches.iter_mut().enumerate() {
             let mut upstreams: Vec<Box<&mut dyn Element>> = Vec::new();
-            let agg_idxs = self.elements_to_core(core_idx);
+            let agg_idxs = FatTree::<A, B>::elements_to_core(self.k, core_idx);
 
             for (agg_idx, switch) in self.agg_switches.iter_mut().enumerate() {
                 if agg_idxs.contains(&agg_idx) {
@@ -225,10 +225,10 @@ where
 
     /// This function returns the indexes of switches in the aggregation layer and
     /// generators that send packets to a given edge layer switch.
-    fn elements_to_edge(&self, edge_idx: usize) -> (Vec<usize>, Vec<usize>) {
-        let pod_switches_per_layer = self.k / 2;
-        let switches_per_layer = pod_switches_per_layer * self.k;
-        let hosts_per_switch = self.k / 2;
+    fn elements_to_edge(k: usize, edge_idx: usize) -> (Vec<usize>, Vec<usize>) {
+        let pod_switches_per_layer = k / 2;
+        let switches_per_layer = pod_switches_per_layer * k;
+        let hosts_per_switch = k / 2;
         assert!(
             edge_idx < switches_per_layer,
             "Invalid edge layer switch index."
@@ -246,10 +246,10 @@ where
 
     /// This function returns the indexes of switches in the core layer and the edge
     /// layer that send packets to a given aggregation layer switch.
-    fn elements_to_agg(&self, agg_idx: usize) -> (Vec<usize>, Vec<usize>) {
-        let core_switches = (self.k / 2).pow(2);
-        let pod_switches_per_layer = self.k / 2;
-        let switches_per_layer = pod_switches_per_layer * self.k;
+    fn elements_to_agg(k: usize, agg_idx: usize) -> (Vec<usize>, Vec<usize>) {
+        let core_switches = (k / 2).pow(2);
+        let pod_switches_per_layer = k / 2;
+        let switches_per_layer = pod_switches_per_layer * k;
         let core_switches_per_agg = core_switches / pod_switches_per_layer;
         assert!(
             agg_idx < switches_per_layer,
@@ -268,10 +268,10 @@ where
 
     /// This function returns the indexes of switches in the aggregation layer that
     /// send packets to the given core layer switch.
-    fn elements_to_core(&self, core_idx: usize) -> Vec<usize> {
-        let core_switches = (self.k / 2).pow(2);
-        let pod_switches_per_layer = self.k / 2;
-        let switches_per_layer = pod_switches_per_layer * self.k;
+    fn elements_to_core(k: usize, core_idx: usize) -> Vec<usize> {
+        let core_switches = (k / 2).pow(2);
+        let pod_switches_per_layer = k / 2;
+        let switches_per_layer = pod_switches_per_layer * k;
         assert!(core_idx < core_switches, "Invalid core layer switch index.");
 
         let core_type = core_idx / pod_switches_per_layer;
