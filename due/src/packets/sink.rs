@@ -84,21 +84,6 @@ impl PacketSink {
         Default::default()
     }
 
-    /// Creates a PacketSink without occupying ids.
-    pub fn new_without_id() -> PacketSink {
-        PacketSink {
-            element_id: usize::MAX,
-            arrival_times: RandomVar::new(),
-            last_arrival_time: 0.0,
-            inter_arrival_times: RandomVar::new(),
-            one_way_delays: RandomVar::new(),
-            queueing_delays: RandomVar::new(),
-            packet_sizes: RandomVar::new(),
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
-        }
-    }
-
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.arrival_times.tabulate(sim.now());
         self.inter_arrival_times

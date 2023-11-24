@@ -83,24 +83,6 @@ where
         }
     }
 
-    /// Creates a DistPacketGenerator without occupying ids.
-    pub fn new_without_id(
-        initial_delay: Time,
-        arr_interval_dist: Arc<dyn Fn() -> A>,
-        packet_size_dist: Arc<dyn Fn() -> B>,
-    ) -> DistPacketGenerator<A, B> {
-        DistPacketGenerator {
-            element_id: usize::MAX,
-            flow_id: usize::MAX,
-            initial_delay,
-            arr_interval_dist,
-            packet_size_dist,
-            packets_sent: 0,
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
-        }
-    }
-
     pub fn flow_id(&self) -> usize {
         self.flow_id
     }

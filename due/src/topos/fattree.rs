@@ -37,17 +37,19 @@ where
     B: Distribution<f64> + 'static,
 {
     pub fn new(k: usize, generator: DistPacketGenerator<A, B>, sink: PacketSink) -> FatTree<A, B> {
-        assert!(k > 0 && k % 2 == 0, "Invalid k!");
+        assert!(k > 0 && k % 2 == 0, "The value of parameter k is invalid.");
 
         // initializes all hosts
         let num_hosts = k.pow(3) / 4;
         let mut generators = Vec::new();
         let mut sinks = Vec::new();
 
-        for _ in 0..num_hosts {
+        for _ in 1..num_hosts {
             generators.push(generator.clone());
             sinks.push(sink.clone());
         }
+        generators.push(generator);
+        sinks.push(sink);
 
         FatTree {
             k,
