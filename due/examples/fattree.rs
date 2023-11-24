@@ -12,7 +12,6 @@ use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::fattree::{get_path, FatTree};
 use due::Shared;
@@ -24,33 +23,35 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
 
     let n_classes_per_port: usize = 4;
 
-    // initializes number of elements for all layers
-    let num_core_switches = (k / 2).pow(2);
-    let num_agg_switches = (k.pow(2)) / 2;
-    let num_edge_switches = (k.pow(2)) / 2;
-    let num_hosts = num_edge_switches * k / 2;
-
-    // initializes Vecs for all switches
-    let mut edge_switches = Vec::new();
-    let mut agg_switches = Vec::new();
-    let mut core_switches = Vec::new();
-
     // sets up parameters for packet generators and switches
     let port_rate = (4000 * 8) as f64;
     let capacity = 100;
     let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
+    // initializes flow_classes and weights for all DRRServer inside switches
+    let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
+    let weights = (1..=n_classes_per_port).collect::<Vec<_>>();
+    let num_edge_switches = k.pow(2) / 2;
+    let num_hosts = num_edge_switches * k / 2;
+    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
+
     // sets a generator and a sink
     let generator = DistPacketGenerator::new(0., arr_interval_dist, packet_size_dist);
     let sink = PacketSink::default();
 
-    // constructs the fattree topology
-    let mut fattree = FatTree::new(k, generator, sink);
-
-    // initializes flow_classes and weights for all DRRServer inside switches
-    let flow_classes = Arc::new(move |flow_id| flow_id % n_classes_per_port);
-    let weights = (1..=n_classes_per_port).collect::<Vec<_>>();
+    // constructs the FatTree topology
+    let fattree = FatTree::new(
+        k,
+        port_rate,
+        capacity,
+        flow_classes,
+        weights,
+        fib,
+        SchedulingDiscipline::DRR,
+        generator,
+        sink,
+    );
 
     // TODO: initializes paths and fibs for all flows!!!
     let mut paths = Vec::new();
@@ -60,53 +61,6 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
         paths.push(get_path(k, pg_idx, sink_idx, &sim.shared()))
     }
     println!("\n\nlength of flows:{}\n{:?}\n\n", paths.len(), paths);
-
-    let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
-
-    // initializes switches in the edge layer
-    for _ in 0..num_edge_switches {
-        let switch = PacketSwitch::new(
-            k,
-            port_rate,
-            capacity,
-            weights.clone(),
-            fib.clone(),
-            SchedulingDiscipline::DRR,
-            flow_classes.clone(),
-        );
-        edge_switches.push(switch);
-    }
-
-    // initializes switches in the aggregation layer
-    for _ in 0..num_agg_switches {
-        let switch = PacketSwitch::new(
-            k,
-            port_rate,
-            capacity,
-            weights.clone(),
-            fib.clone(),
-            SchedulingDiscipline::DRR,
-            flow_classes.clone(),
-        );
-        agg_switches.push(switch);
-    }
-
-    // initializes switches in the core layer
-    for _ in 0..num_core_switches {
-        let switch = PacketSwitch::new(
-            k,
-            port_rate,
-            capacity,
-            weights.clone(),
-            fib.clone(),
-            SchedulingDiscipline::DRR,
-            flow_classes.clone(),
-        );
-        core_switches.push(switch);
-    }
-
-    // sets switches for the fattree topology
-    fattree.set_switches(edge_switches, agg_switches, core_switches);
 
     // connects and activates all elements
     fattree.run(sim);

@@ -1,7 +1,8 @@
-//! This file provides standard methods to construct a fattree topology, as well
-//! as connecting and activating elements inside of the fattree topology.
-//! Besides, three helper functions are also provided to get the identifiers of
-//! elements that will send packets to a given device.
+//! Constructs a FatTree topology with the given parameters. In addition, three
+//! helper functions are also provided to get the identifiers of elements that
+//! will send packets to a given device.
+
+use std::sync::Arc;
 
 use rand::Rng;
 use statrs::statistics::Distribution;
@@ -10,6 +11,7 @@ use crate::packets::dist_generator::DistPacketGenerator;
 use crate::packets::sink::PacketSink;
 use crate::sim::{SimContext, Time};
 use crate::switches::switch::PacketSwitch;
+use crate::switches::SchedulingDiscipline;
 use crate::topos::{connect_n_1_hetero, connect_pair};
 use crate::{Element, Shared};
 
@@ -19,6 +21,12 @@ where
     B: Distribution<f64> + 'static,
 {
     k: usize,
+    port_rate: f64,
+    capacity: usize,
+    flow_classes: Arc<dyn Fn(usize) -> usize>,
+    weights: Vec<usize>,
+    fib: Vec<usize>,
+    scheduling_discipline: SchedulingDiscipline,
     /// packet generators in hosts
     pub generators: Vec<DistPacketGenerator<A, B>>,
     /// packet sinks of in hosts
@@ -36,7 +44,17 @@ where
     A: Distribution<Time> + 'static,
     B: Distribution<f64> + 'static,
 {
-    pub fn new(k: usize, generator: DistPacketGenerator<A, B>, sink: PacketSink) -> FatTree<A, B> {
+    pub fn new(
+        k: usize,
+        port_rate: f64,
+        capacity: usize,
+        flow_classes: Arc<dyn Fn(usize) -> usize>,
+        weights: Vec<usize>,
+        fib: Vec<usize>,
+        scheduling_discipline: SchedulingDiscipline,
+        generator: DistPacketGenerator<A, B>,
+        sink: PacketSink,
+    ) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "The value of parameter k is invalid.");
 
         // initializes all hosts
@@ -53,6 +71,12 @@ where
 
         FatTree {
             k,
+            port_rate,
+            capacity,
+            flow_classes,
+            weights,
+            fib,
+            scheduling_discipline,
             generators,
             sinks,
             edge_switches: Vec::new(),
@@ -61,15 +85,53 @@ where
         }
     }
 
-    pub fn set_switches(
-        &mut self,
-        edge_switches: Vec<PacketSwitch>,
-        agg_switches: Vec<PacketSwitch>,
-        core_switches: Vec<PacketSwitch>,
-    ) {
-        self.edge_switches = edge_switches;
-        self.agg_switches = agg_switches;
-        self.core_switches = core_switches;
+    pub fn construct(&mut self) {
+        // initializes number of elements for all layers
+        let num_core_switches = (self.k / 2).pow(2);
+        let num_agg_switches = self.k.pow(2) / 2;
+        let num_edge_switches = self.k.pow(2) / 2;
+
+        // initializes switches in the edge layer
+        for _ in 0..num_edge_switches {
+            let switch = PacketSwitch::new(
+                self.k,
+                self.port_rate,
+                self.capacity,
+                self.weights.clone(),
+                self.fib.clone(),
+                self.scheduling_discipline.clone(),
+                self.flow_classes.clone(),
+            );
+            self.edge_switches.push(switch);
+        }
+
+        // initializes switches in the aggregation layer
+        for _ in 0..num_agg_switches {
+            let switch = PacketSwitch::new(
+                self.k,
+                self.port_rate,
+                self.capacity,
+                self.weights.clone(),
+                self.fib.clone(),
+                self.scheduling_discipline.clone(),
+                self.flow_classes.clone(),
+            );
+            self.agg_switches.push(switch);
+        }
+
+        // initializes switches in the core layer
+        for _ in 0..num_core_switches {
+            let switch = PacketSwitch::new(
+                self.k,
+                self.port_rate,
+                self.capacity,
+                self.weights.clone(),
+                self.fib.clone(),
+                self.scheduling_discipline.clone(),
+                self.flow_classes.clone(),
+            );
+            self.core_switches.push(switch);
+        }
     }
 
     fn connect(&mut self) {
@@ -135,10 +197,11 @@ where
     }
 
     pub fn run(mut self, sim: SimContext<'_, Shared>) {
-        // connects all elements in the fattree topology
+        // connects all elements in the FatTree topology
+        self.construct();
         self.connect();
 
-        // activates all elements in the fattree topology
+        // activates all elements in the FatTree topology
         for generator in self.generators {
             sim.activate(generator.run(sim));
         }
