@@ -6,8 +6,8 @@ use std::sync::Arc;
 use rand::Rng;
 use statrs::statistics::Distribution;
 
-use crate::packets::dist_generator::DistPacketGenerator;
-use crate::packets::sink::PacketSink;
+use crate::packets::sink::Sink;
+use crate::packets::source::Source;
 use crate::sim::{SimContext, Time};
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
@@ -33,9 +33,9 @@ where
     /// scheduling discipline at each switch
     scheduling_discipline: SchedulingDiscipline,
     /// packet generators in the hosts
-    pub generators: Vec<DistPacketGenerator<A, B>>,
+    pub generators: Vec<Source<A, B>>,
     /// packet sinks in the hosts
-    sinks: Vec<PacketSink>,
+    sinks: Vec<Sink>,
     /// edge-layer switches
     edge_switches: Vec<PacketSwitch>,
     /// aggregation-layer switches
@@ -57,8 +57,8 @@ where
         weights: Vec<usize>,
         fib: Vec<usize>,
         scheduling_discipline: SchedulingDiscipline,
-        generator: DistPacketGenerator<A, B>,
-        sink: PacketSink,
+        generator: Source<A, B>,
+        sink: Sink,
     ) -> FatTree<A, B> {
         assert!(k > 0 && k % 2 == 0, "The value of parameter k is invalid.");
 

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::Uniform;
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::port::Port;
 use due::sim::{simulation, Process, RandomVar, SimContext};
@@ -25,8 +25,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let packet_size_dist = Arc::new(|| Uniform::new(1000.0, 1000.0).unwrap());
 
     for _ in 0..2 {
-        let generator =
-            DistPacketGenerator::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+        let generator = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
         generators.push(generator);
     }
 
@@ -36,7 +35,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
-    let mut sink = PacketSink::default();
+    let mut sink = Sink::default();
 
     // connects the generators to the port
     connect_n_1_homo(&mut generators, &mut port);

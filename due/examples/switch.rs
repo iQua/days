@@ -7,8 +7,8 @@ use std::sync::Arc;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
@@ -25,9 +25,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // initializes packet generators and packet sinks
     for _ in 0..2 {
-        let generator =
-            DistPacketGenerator::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
-        let sink = PacketSink::default();
+        let generator = Source::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
+        let sink = Sink::default();
         generators.push(generator);
         sinks.push(sink);
     }

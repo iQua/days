@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use rand::Rng;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -37,8 +37,8 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
     // sets a generator and a sink
-    let generator = DistPacketGenerator::new(0., arr_interval_dist, packet_size_dist);
-    let sink = PacketSink::default();
+    let generator = Source::new(0., arr_interval_dist, packet_size_dist);
+    let sink = Sink::default();
 
     // constructs the FatTree topology
     let fattree = FatTree::new(

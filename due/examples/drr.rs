@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::packets::splitter::Splitter;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
@@ -24,10 +24,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // initializes packet generators
-    let mut generator_1 =
-        DistPacketGenerator::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
-    let mut generator_2 =
-        DistPacketGenerator::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    let mut generator_1 = Source::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    let mut generator_2 = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
 
     // initializes splitters
     let mut splitter_1 = Splitter::default();
@@ -46,10 +44,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let drr_server_id = drr_server.id();
 
     // initializes packet sinks
-    let mut sink: PacketSink = PacketSink::default();
-    let mut sink_1: PacketSink = PacketSink::default();
+    let mut sink: Sink = Sink::default();
+    let mut sink_1: Sink = Sink::default();
     let sink_1_id = sink_1.id();
-    let mut sink_2: PacketSink = PacketSink::default();
+    let mut sink_2: Sink = Sink::default();
     let sink_2_id = sink_2.id();
 
     // connects packet generators and splitters

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
-use due::packets::dist_generator::DistPacketGenerator;
-use due::packets::sink::PacketSink;
+use due::packets::sink::Sink;
+use due::packets::source::Source;
 use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::{connect_n_1_homo, connect_pair};
@@ -25,14 +25,13 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a collection of packet generators
     let mut generators = Vec::new();
     for _ in 0..2 {
-        let generator =
-            DistPacketGenerator::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+        let generator = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
         generators.push(generator);
     }
 
     let mut wire = Wire::new(Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
-    let mut sink = PacketSink::default();
+    let mut sink = Sink::default();
 
     // connects the generators to the wire
     connect_n_1_homo(&mut generators, &mut wire);

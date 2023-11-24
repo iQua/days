@@ -9,7 +9,7 @@ use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::{get_flow_id, get_id, Element, Shared};
 
-pub struct DistPacketGenerator<A, B>
+pub struct Source<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
@@ -24,7 +24,7 @@ where
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl<A, B> Element for DistPacketGenerator<A, B>
+impl<A, B> Element for Source<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
@@ -42,13 +42,13 @@ where
     }
 }
 
-impl<A, B> Clone for DistPacketGenerator<A, B>
+impl<A, B> Clone for Source<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
     fn clone(&self) -> Self {
-        DistPacketGenerator {
+        Source {
             element_id: get_id(),
             flow_id: get_flow_id(),
             initial_delay: self.initial_delay,
@@ -61,7 +61,7 @@ where
     }
 }
 
-impl<A, B> DistPacketGenerator<A, B>
+impl<A, B> Source<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
@@ -70,8 +70,8 @@ where
         initial_delay: Time,
         arr_interval_dist: Arc<dyn Fn() -> A>,
         packet_size_dist: Arc<dyn Fn() -> B>,
-    ) -> DistPacketGenerator<A, B> {
-        DistPacketGenerator {
+    ) -> Source<A, B> {
+        Source {
             element_id: get_id(),
             flow_id: get_flow_id(),
             initial_delay,
