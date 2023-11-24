@@ -26,7 +26,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes packet generators
     let mut generator_1 =
         DistPacketGenerator::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
-    let mut generator_2 = DistPacketGenerator::new(1.0, arr_interval_dist, packet_size_dist);
+    let mut generator_2 =
+        DistPacketGenerator::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
 
     // initializes splitters
     let mut splitter_1 = Splitter::default();
