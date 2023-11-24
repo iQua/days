@@ -1,4 +1,4 @@
-//! A simple wire component.
+//! The wire element adds a propagation delay to packets.
 
 use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
