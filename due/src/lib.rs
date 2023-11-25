@@ -44,16 +44,3 @@ pub fn get_flow_id() -> usize {
     FLOW_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Types of elements in the topology
-#[derive(Hash, Eq, PartialEq, Debug)]
-pub enum NodeType {
-    Edge,
-    Regular,
-    Source,
-    Sink,
-}
-
-pub struct NodeData {
-    pub id: usize,
-    pub node_type: NodeType,
-}
