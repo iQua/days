@@ -1,19 +1,15 @@
 //! The wire element adds a propagation delay to packets.
 
-use statrs::statistics::Distribution;
+use rand::distributions::Distribution;
+use statrs::distribution::Uniform;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::Shared;
 
-pub struct Wire<A>
-where
-    A: Distribution<Time>,
-{
+pub struct Wire {
     wire_id: usize,
-    /// the packet delay distribution
-    delay_dist: Box<dyn Fn() -> A>,
     /// the time of the last sent packet, used to calculate the delay of the
     /// next packet
     last_sent: Time,
@@ -23,14 +19,10 @@ where
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl<A> Wire<A>
-where
-    A: Distribution<Time>,
-{
-    pub fn new(wire_id: usize, delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
+impl Wire {
+    pub fn new(wire_id: usize) -> Wire {
         Wire {
             wire_id,
-            delay_dist,
             last_sent: 0.,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -47,7 +39,8 @@ where
             sim.now(),
         );
 
-        let delay = (self.delay_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+        let delay_dist = Uniform::new(2.0, 2.0).unwrap();
+        let delay = delay_dist.sample(&mut *sim.shared().rng.borrow_mut());
 
         if self.last_sent == 0. {
             self.last_sent = packet.time;

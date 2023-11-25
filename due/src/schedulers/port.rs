@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::sim::SimContext;
+use crate::sim::{SimContext, Time};
 use crate::{Scheduler, Shared};
 
 pub struct Port {
@@ -65,7 +65,7 @@ impl Port {
         }
     }
 
-    fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
+    fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet =
             self.drop_strategy
@@ -79,7 +79,7 @@ impl Port {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                sim.now()
+                now
             }
             return;
         }
@@ -96,13 +96,13 @@ impl Port {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now(),
+            now,
             self.packets_received,
             self.queue.len()
         );
     }
 
-    fn packet_sent(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
+    fn packet_sent(&mut self, packet: Packet, now: Time) {
         self.bytes_in_queue -= packet.size;
 
         println!(
@@ -112,7 +112,7 @@ impl Port {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now(),
+            now,
             self.queue.len()
         );
     }
@@ -121,7 +121,7 @@ impl Port {
         loop {
             // trying to receive all the packets accumulated in the channel
             while let Ok(packet) = self.receiver.try_recv() {
-                self.packet_received(packet, sim);
+                self.packet_received(packet, sim.now());
             }
 
             if let Some(mut packet) = self.queue.pop_front() {
@@ -129,7 +129,7 @@ impl Port {
 
                 packet.send(sim.now());
                 let _ = self.sender.send(packet.clone());
-                self.packet_sent(packet, sim);
+                self.packet_sent(packet, sim.now());
             }
 
             if !self.queue.is_empty() {
@@ -137,7 +137,7 @@ impl Port {
                 continue;
             } else if let Some(packet) = self.receiver.recv().await {
                 // waits for the packet from the upstream element
-                self.packet_received(packet, sim);
+                self.packet_received(packet, sim.now());
             } else {
                 break;
             }

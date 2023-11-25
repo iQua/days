@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::sim::SimContext;
+use crate::sim::{SimContext, Time};
 use crate::{Scheduler, Shared};
 
 pub struct DRRServer {
@@ -104,7 +104,7 @@ impl DRRServer {
         }
     }
 
-    fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
+    fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -120,7 +120,7 @@ impl DRRServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                sim.now()
+                now
             }
             return;
         }
@@ -140,7 +140,7 @@ impl DRRServer {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now(),
+            now,
             self.packets_received,
             self.queues[class_id].len(),
             class_id
@@ -181,7 +181,7 @@ impl DRRServer {
                         // recently sent to DDRServer while sending the previous
                         // packet
                         while let Ok(packet) = self.receiver.try_recv() {
-                            self.packet_received(packet, sim);
+                            self.packet_received(packet, sim.now());
                         }
 
                         println!(
@@ -205,7 +205,7 @@ impl DRRServer {
             // waits for inbound packets from the upstream element
             if self.packets_waiting == 0 {
                 if let Some(packet) = self.receiver.recv().await {
-                    self.packet_received(packet, sim);
+                    self.packet_received(packet, sim.now());
                 } else {
                     break;
                 }

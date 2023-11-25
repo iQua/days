@@ -1,40 +1,27 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
 
-use std::sync::Arc;
-
-use statrs::statistics::Distribution;
+use rand::distributions::Distribution;
+use statrs::distribution::{DiscreteUniform, Exp};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::Shared;
 
-pub struct PacketSource<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
+pub struct PacketSource {
     flow_id: usize,
     initial_delay: Time,
-    arr_interval_dist: Arc<dyn Fn() -> A>,
-    packet_size_dist: Arc<dyn Fn() -> B>,
     packets_sent: usize,
     sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl<A, B> Clone for PacketSource<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
+impl Clone for PacketSource {
     fn clone(&self) -> Self {
         PacketSource {
             flow_id: self.flow_id + 1,
             initial_delay: self.initial_delay,
-            arr_interval_dist: self.arr_interval_dist.clone(),
-            packet_size_dist: self.packet_size_dist.clone(),
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -42,22 +29,11 @@ where
     }
 }
 
-impl<A, B> PacketSource<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
-    pub fn new(
-        flow_id: usize,
-        initial_delay: Time,
-        arr_interval_dist: Arc<dyn Fn() -> A>,
-        packet_size_dist: Arc<dyn Fn() -> B>,
-    ) -> PacketSource<A, B> {
+impl PacketSource {
+    pub fn new(flow_id: usize, initial_delay: Time) -> PacketSource {
         PacketSource {
             flow_id,
             initial_delay,
-            arr_interval_dist,
-            packet_size_dist,
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -76,16 +52,12 @@ where
         self.receiver = receiver;
     }
 
-    fn packet_sent(&mut self, sim: SimContext<'_, Shared>, packet: Packet) {
+    fn packet_sent(&mut self, now: Time, packet: Packet) {
         self.packets_sent += 1;
 
         println!(
             "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.flow_id,
-            packet.packet_id,
-            packet.size,
-            sim.now(),
-            self.packets_sent,
+            self.flow_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
     }
 
@@ -98,10 +70,13 @@ where
         sim.advance(self.initial_delay).await;
 
         while sim.now() < sim.shared().duration {
-            let interval = (self.arr_interval_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+            let interval = Exp::new(1.0)
+                .unwrap()
+                .sample(&mut *sim.shared().rng.borrow_mut());
             sim.advance(interval).await;
-            let packet_size =
-                (self.packet_size_dist)().sample(&mut *sim.shared().rng.borrow_mut()) as usize;
+            let packet_size = DiscreteUniform::new(1000, 1500)
+                .unwrap()
+                .sample(&mut *sim.shared().rng.borrow_mut()) as usize;
 
             let mut packet = Packet::new(
                 packet_size,
@@ -115,7 +90,7 @@ where
             packet.send(sim.now());
             let _ = self.sender.send(packet.clone());
 
-            self.packet_sent(sim, packet);
+            self.packet_sent(sim.now(), packet);
         }
 
         println!(

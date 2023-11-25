@@ -1,8 +1,7 @@
-use rand::rngs::SmallRng;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use statrs::statistics::Distribution;
+use rand::rngs::SmallRng;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
@@ -23,12 +22,8 @@ pub enum Element {
     Splitter(Splitter),
 }
 
-pub enum EndPoint<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
-    PacketSource(PacketSource<A, B>),
+pub enum EndPoint {
+    PacketSource(PacketSource),
     PacketSink(PacketSink),
 }
 

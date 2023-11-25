@@ -1,34 +1,24 @@
 pub mod builders;
 
 use petgraph::graph::{NodeIndex, UnGraph};
-use statrs::statistics::Distribution;
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::sim::Time;
 use crate::{Element, EndPoint};
 
-pub struct Topology<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
+pub struct Topology {
     graph: UnGraph<i32, ()>,
     hosts: Vec<usize>,
     elements: Vec<Element>,
-    endpoints: Vec<EndPoint<A, B>>,
+    endpoints: Vec<EndPoint>,
 }
 
-impl<A, B> Topology<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
+impl Topology {
     pub fn new(
         graph: UnGraph<i32, ()>,
         elements: Vec<Element>,
-        endpoints: Vec<EndPoint<A, B>>,
+        endpoints: Vec<EndPoint>,
         hosts: Vec<usize>,
-    ) -> Topology<A, B> {
+    ) -> Topology {
         Topology {
             graph,
             elements,

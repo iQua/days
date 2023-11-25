@@ -20,22 +20,18 @@ use due::{Element, EndPoint, Shared};
 
 const SEED: u64 = 1000;
 
-async fn network_sim<A, B>(sim: SimContext<'_, Shared>)
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
+async fn network_sim(sim: SimContext<'_, Shared>) {
     // element ids in a network graph start from 0
     let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
     // packet sources and sinks are endpoints
-    let mut endpoints: Vec<EndPoint<A, B>> = Vec::new();
+    let mut endpoints: Vec<EndPoint> = Vec::new();
 
     let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
 
     // creates a collection of packet sources
     for _ in 0..2 {
-        let source = PacketSource::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+        let source = PacketSource::new(0, 1.0);
         endpoints.push(EndPoint::PacketSource(source));
     }
 
