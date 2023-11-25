@@ -13,7 +13,7 @@ use due::packets::source::PacketSource;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
-use due::topos::Topology;
+use due::topos::topology::Topology;
 use due::{Element, EndPoint, Shared};
 
 const SEED: u64 = 1000;
@@ -33,9 +33,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a sink
     let sink = PacketSink::default();
     endpoints.push(EndPoint::PacketSink(sink));
-
-    // creates a wire that can be used to connect elements in the network
-    // let wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
     // initializes a packet switch only one outbound port (#0)
     let weights = vec![1];
@@ -72,8 +69,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     topology.connect();
     // attaches sources and sinks to hosts in the network graph
     topology.attach(vec![0, 0, 1]);
-    // activate the topology
-    topology.activate(sim);
+    // runs the topology
+    topology.run(sim);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
