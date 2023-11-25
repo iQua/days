@@ -27,19 +27,8 @@ impl Topology {
         }
     }
 
-    pub fn construct(&mut self) {
-        let mut next_id = 0;
-
-        for node_id in self.graph.node_indices() {
-            // node indices should be assigned in order starting from 0
-            assert!(node_id.index() == next_id);
-            self.connect();
-            next_id += 1;
-        }
-    }
-
     /// connects a vector of elements according to edges in the network topology.
-    fn connect(&mut self) {
+    pub fn connect(&mut self) {
         for node_id in self.graph.node_indices() {
             let (sender, receiver) = unbounded_channel();
 
@@ -80,7 +69,7 @@ impl Topology {
                 // attaches each endpoint's receiver to its corresponding host's sender
                 let (sender, receiver) = unbounded_channel();
                 endpoint.connect_receiver(receiver);
-                self.elements[host_id].connect_sender(0, sender);
+                self.elements[host_id].connect_sender(usize::MAX, sender);
             } else {
                 panic!("No neighbors found for host element {}", host_id);
             }

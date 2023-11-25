@@ -18,7 +18,6 @@ pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
-    pub next_id: AtomicUsize,
 }
 
 /// EndPoint is a trait that defines the interface for all packet sources and sinks.
@@ -45,6 +44,6 @@ pub trait Element {
 pub fn get_id() -> usize {
     // the sequence of unique element_ids starts from 1
     // 0 is reserved for the endpoints
-    static COUNTER: AtomicUsize = AtomicUsize::new(1);
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }

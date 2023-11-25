@@ -3,7 +3,6 @@
 //! distribution, and then to a packet sink.
 
 use std::cell::RefCell;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use petgraph::graph::UnGraph;
@@ -21,8 +20,8 @@ use due::{Element, EndPoint, Shared};
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    // element ids in a network graph should be assigned starting from 1
-    let graph = UnGraph::<i32, ()>::from_edges(&[(1, 2)]);
+    // element ids in a network graph start from 0
+    let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
     // packet sources and sinks are endpoints
     let mut endpoints: Vec<Box<dyn EndPoint>> = Vec::new();
 
@@ -67,13 +66,13 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     );
 
     let elements: Vec<Box<dyn Element>> = vec![Box::new(switch_1), Box::new(switch_2)];
-    let hosts = vec![1, 2];
+    let hosts = vec![0, 1];
     let mut topology = Topology::new(graph, elements, endpoints, hosts);
 
     // constructs the network graph with network elements
-    topology.construct();
+    topology.connect();
     // attaches sources and sinks to hosts in the network graph
-    topology.attach(vec![1, 1, 2]);
+    topology.attach(vec![0, 0, 1]);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
@@ -85,7 +84,6 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
-            next_id: AtomicUsize::new(0),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );
