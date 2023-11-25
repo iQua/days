@@ -14,8 +14,10 @@ use due::packets::sink::PacketSink;
 use due::packets::source::PacketSource;
 use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos;
-use due::{Shared, Sink, Source};
+use due::switches::switch::PacketSwitch;
+use due::switches::SchedulingDiscipline;
+use due::topos::Topology;
+use due::{Element, Shared, Sink, Source};
 
 const SEED: u64 = 1000;
 
@@ -42,8 +44,24 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a wire that can be used to connect elements in the network
     let mut wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
+    // initializes a packet switch
+    let weights = vec![1, 2];
+    let fib = vec![0, 1];
+    let mut switch = PacketSwitch::new(
+        0,
+        1,
+        (1000 * 8) as f64,
+        100,
+        weights,
+        fib,
+        SchedulingDiscipline::FIFO,
+        Arc::new(|flow_id| flow_id),
+    );
+
     // constructs the network graph with the (optionally provided) wire
-    topology = topos::construct(graph, &mut wire);
+    let topology = Topology::new(graph);
+    let mut elements: Vec<Box<&mut dyn Element>> = vec![Box::new(&mut switch)];
+    topology.construct(&mut elements);
 
     // attaches sources and sinks to hosts in the network graph
     topology.attach(sources, sinks);
