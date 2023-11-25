@@ -136,5 +136,16 @@ impl Topology {
                 }
             }
         }
+
+        for endpoint in self.endpoints {
+            match endpoint {
+                EndPoint::PacketSource(source) => {
+                    sim.activate(source.run(sim));
+                }
+                EndPoint::PacketSink(sink) => {
+                    sim.activate(sink.run(sim));
+                }
+            }
+        }
     }
 }
