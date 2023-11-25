@@ -1,13 +1,14 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
 
-use statrs::statistics::Distribution;
 use std::sync::Arc;
+
+use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{EndPoint, Shared};
+use crate::Shared;
 
 pub struct PacketSource<A, B>
 where
@@ -21,20 +22,6 @@ where
     packets_sent: usize,
     sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
-}
-
-impl<A, B> EndPoint for PacketSource<A, B>
-where
-    A: Distribution<Time>,
-    B: Distribution<f64>,
-{
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
 }
 
 impl<A, B> Clone for PacketSource<A, B>
@@ -79,6 +66,14 @@ where
 
     pub fn flow_id(&self) -> usize {
         self.flow_id
+    }
+
+    pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
     }
 
     fn packet_sent(&mut self, sim: SimContext<'_, Shared>, packet: Packet) {

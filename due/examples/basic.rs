@@ -8,10 +8,11 @@ use std::sync::Arc;
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Exp};
+use statrs::statistics::Distribution;
 
 use due::packets::sink::PacketSink;
 use due::packets::source::PacketSource;
-use due::sim::{simulation, Process, RandomVar, SimContext};
+use due::sim::{simulation, Process, RandomVar, SimContext, Time};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::Topology;
@@ -19,11 +20,15 @@ use due::{Element, EndPoint, Shared};
 
 const SEED: u64 = 1000;
 
-async fn network_sim(sim: SimContext<'_, Shared>) {
+async fn network_sim<A, B>(sim: SimContext<'_, Shared>)
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
     // element ids in a network graph start from 0
     let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
     // packet sources and sinks are endpoints
-    let mut endpoints: Vec<Box<dyn EndPoint>> = Vec::new();
+    let mut endpoints: Vec<EndPoint<A, B>> = Vec::new();
 
     let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
@@ -31,12 +36,12 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a collection of packet sources
     for _ in 0..2 {
         let source = PacketSource::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
-        endpoints.push(Box::new(source));
+        endpoints.push(EndPoint::PacketSource(source));
     }
 
     // creates a sink
     let sink = PacketSink::default();
-    endpoints.push(Box::new(sink));
+    endpoints.push(EndPoint::PacketSink(sink));
 
     // creates a wire that can be used to connect elements in the network
     // let wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));

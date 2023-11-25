@@ -2,9 +2,12 @@ use rand::rngs::SmallRng;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use statrs::statistics::Distribution;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
+use crate::packets::sink::PacketSink;
+use crate::packets::source::PacketSource;
 use crate::packets::splitter::Splitter;
 use crate::sim::{RandomVar, Time};
 use crate::switches::switch::PacketSwitch;
@@ -20,17 +23,20 @@ pub enum Element {
     Splitter(Splitter),
 }
 
+pub enum EndPoint<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
+    PacketSource(PacketSource<A, B>),
+    PacketSink(PacketSink),
+}
+
 /// Globally shared data.
 pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
-}
-
-/// EndPoint is a trait that defines the interface for all packet sources and sinks.
-pub trait EndPoint {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>);
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
 }
 
 /// Scheduler is a trait that defines the interface for all schedulers in packet

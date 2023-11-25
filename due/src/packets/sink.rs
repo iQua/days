@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
-use crate::{EndPoint, Shared};
+use crate::Shared;
 
 pub struct PacketSink {
     flow_id: usize,
@@ -31,16 +31,6 @@ pub struct PacketSink {
     sender: UnboundedSender<Packet>,
     /// a receiver for receiving inbound packets
     receiver: UnboundedReceiver<Packet>,
-}
-
-impl EndPoint for PacketSink {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
 }
 
 impl Default for PacketSink {
@@ -101,6 +91,14 @@ impl PacketSink {
             packet.flow_id,
             sim.now(),
         );
+    }
+
+    pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {

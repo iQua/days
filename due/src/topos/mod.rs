@@ -1,24 +1,34 @@
 pub mod builders;
 
 use petgraph::graph::{NodeIndex, UnGraph};
+use statrs::statistics::Distribution;
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::sim::Time;
 use crate::{Element, EndPoint};
 
-pub struct Topology {
+pub struct Topology<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
     graph: UnGraph<i32, ()>,
     hosts: Vec<usize>,
     elements: Vec<Element>,
-    endpoints: Vec<Box<dyn EndPoint>>,
+    endpoints: Vec<EndPoint<A, B>>,
 }
 
-impl Topology {
+impl<A, B> Topology<A, B>
+where
+    A: Distribution<Time>,
+    B: Distribution<f64>,
+{
     pub fn new(
         graph: UnGraph<i32, ()>,
         elements: Vec<Element>,
-        endpoints: Vec<Box<dyn EndPoint>>,
+        endpoints: Vec<EndPoint<A, B>>,
         hosts: Vec<usize>,
-    ) -> Topology {
+    ) -> Topology<A, B> {
         Topology {
             graph,
             elements,
@@ -73,22 +83,40 @@ impl Topology {
             let mut neighbors = self.graph.neighbors(NodeIndex::new(host_id));
 
             let (downlink_sender, downlink_receiver) = unbounded_channel();
-            let endpoint = endpoint_iter.next().unwrap();
+            let mut endpoint = endpoint_iter.next().unwrap();
 
             if let Some(first_neighbor) = neighbors.next() {
                 match &mut self.elements[first_neighbor.index()] {
                     Element::PacketSwitch(switch) => {
                         let uplink_sender = switch.get_sender(host_id).unwrap();
-                        // attaches each endpoint's sender to its corresponding host's receiver
-                        endpoint.connect_sender(uplink_sender);
-                        // attaches each endpoint's receiver to its corresponding host's sender
-                        endpoint.connect_receiver(downlink_receiver);
+
+                        match &mut endpoint {
+                            EndPoint::PacketSource(source) => {
+                                // attaches each endpoint's sender to its corresponding host's receiver
+                                source.connect_sender(uplink_sender);
+                                // attaches each endpoint's receiver to its corresponding host's sender
+                                source.connect_receiver(downlink_receiver);
+                            }
+                            EndPoint::PacketSink(sink) => {
+                                sink.connect_sender(uplink_sender);
+                                sink.connect_receiver(downlink_receiver);
+                            }
+                        }
                     }
                     Element::Splitter(splitter) => {
                         let uplink_sender = splitter.get_sender(host_id).unwrap();
-                        endpoint.connect_sender(uplink_sender);
-                        // attaches each endpoint's receiver to its corresponding host's sender
-                        endpoint.connect_receiver(downlink_receiver);
+
+                        match &mut endpoint {
+                            EndPoint::PacketSource(source) => {
+                                source.connect_sender(uplink_sender);
+                                // attaches each endpoint's receiver to its corresponding host's sender
+                                source.connect_receiver(downlink_receiver);
+                            }
+                            EndPoint::PacketSink(sink) => {
+                                sink.connect_sender(uplink_sender);
+                                sink.connect_receiver(downlink_receiver);
+                            }
+                        }
                     }
                 }
 
