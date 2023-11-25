@@ -8,11 +8,10 @@ use std::sync::Arc;
 
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
-use statrs::distribution::{DiscreteUniform, Exp, Uniform};
+use statrs::distribution::{DiscreteUniform, Exp};
 
 use due::packets::sink::PacketSink;
 use due::packets::source::PacketSource;
-use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
@@ -39,7 +38,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     endpoints.push(Box::new(sink));
 
     // creates a wire that can be used to connect elements in the network
-    let wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
+    // let wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
     // initializes a packet switch
     let weights = vec![1, 1];
