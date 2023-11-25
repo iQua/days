@@ -1,5 +1,7 @@
 //! A splitter is a utility element that forwards packets to two downstream elements.
 
+use std::collections::HashMap;
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{get_id, packets::packet::Packet, Element};
@@ -9,12 +11,20 @@ impl Element for Splitter {
         self.element_id
     }
 
+    fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
+        if let Some(sender) = self.senders.get(&element_id) {
+            return Some(sender.clone());
+        }
+
+        None
+    }
+
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         self.receiver = receiver;
     }
 
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.senders.push(sender.clone());
+    fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
+        self.senders.insert(element_id, sender.clone());
     }
 }
 
@@ -22,7 +32,7 @@ impl Default for Splitter {
     fn default() -> Self {
         Splitter {
             element_id: get_id(),
-            senders: Vec::new(),
+            senders: HashMap::new(),
             receiver: unbounded_channel().1,
         }
     }
@@ -30,7 +40,7 @@ impl Default for Splitter {
 
 pub struct Splitter {
     element_id: usize,
-    senders: Vec<UnboundedSender<Packet>>,
+    senders: HashMap<usize, UnboundedSender<Packet>>,
     receiver: UnboundedReceiver<Packet>,
 }
 
@@ -46,7 +56,7 @@ impl Splitter {
                 self.element_id, packet.packet_id, packet.size,
             );
 
-            for sender in self.senders.iter() {
+            for (_, sender) in &self.senders {
                 let _ = sender.send(packet.clone());
             }
         }

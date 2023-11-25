@@ -2,6 +2,7 @@
 //! buffers, on each of the outgoing ports.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -12,7 +13,7 @@ use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
-use crate::{Element, Scheduler, Shared};
+use crate::{get_id, Element, Scheduler, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
@@ -30,7 +31,9 @@ pub struct PacketSwitch {
     port_senders: Vec<UnboundedSender<Packet>>,
 
     /// senders for sending outbound packets to downstream elements
-    senders: Vec<UnboundedSender<Packet>>,
+    /// element_id -> UnboundedSender<Packet>
+    senders: HashMap<usize, UnboundedSender<Packet>>,
+
     /// a receiver for receiving inbound packets
     receiver: UnboundedReceiver<Packet>,
 }
@@ -40,18 +43,25 @@ impl Element for PacketSwitch {
         self.element_id
     }
 
+    fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
+        if let Some(sender) = self.senders.get(&element_id) {
+            return Some(sender.clone());
+        }
+
+        None
+    }
+
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         self.receiver = receiver;
     }
 
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.senders.push(sender.clone());
+    fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
+        self.senders.insert(element_id, sender.clone());
     }
 }
 
 impl PacketSwitch {
     pub fn new(
-        element_id: usize,
         nports: usize,
         port_rate: f64,
         capacity: usize,
@@ -101,38 +111,47 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            element_id,
+            element_id: get_id(),
             packets_received: 0,
             discipline,
             fib,
             ports,
             port_senders,
-            senders: Vec::new(),
+            senders: HashMap::new(),
             receiver: unbounded_channel().1,
         }
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         // connects ports to outbound senders and activates them for execution
-        let mut i = 0;
-
         match self.discipline {
             SchedulingDiscipline::DRR => {
+                let mut senders_iter = self.senders.iter();
+
                 for port in self.ports {
                     let mut p = port.downcast::<DRRServer>().unwrap();
-                    p.connect_sender(self.senders[i].clone());
-                    sim.activate(p.run(sim));
 
-                    i += 1;
+                    if let Some((_, sender)) = senders_iter.next() {
+                        p.connect_sender(sender.clone());
+                    } else {
+                        panic!("Not enough senders for ports.");
+                    }
+
+                    sim.activate(p.run(sim));
                 }
             }
             SchedulingDiscipline::FIFO => {
+                let mut senders_iter = self.senders.iter();
+
                 for port in self.ports {
                     let mut p = port.downcast::<Port>().unwrap();
-                    p.connect_sender(self.senders[i].clone());
-                    sim.activate(p.run(sim));
 
-                    i += 1;
+                    if let Some((_, sender)) = senders_iter.next() {
+                        p.connect_sender(sender.clone());
+                    } else {
+                        panic!("Not enough senders for ports.");
+                    }
+                    sim.activate(p.run(sim));
                 }
             }
         }

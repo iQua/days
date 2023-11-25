@@ -22,18 +22,7 @@ pub struct Shared {
 }
 
 /// Source is a trait that defines the interface for all packet sources.
-pub trait Source {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        println!("The sender: {:?}", sender);
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        println!("The receiver: {:?}", receiver)
-    }
-}
-
-/// Sink is a trait that defines the interface for all packet sinks.
-pub trait Sink {
+pub trait EndPoint {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         println!("The sender: {:?}", sender);
     }
@@ -59,16 +48,16 @@ pub trait Scheduler {
 pub trait Element {
     fn id(&self) -> usize;
 
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        println!("The sender: {:?}", sender);
-    }
+    fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>>;
 
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        println!("The receiver: {:?}", receiver)
-    }
+    fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>);
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
 }
 
 pub fn get_id() -> usize {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    // the sequence of unique element_ids starts from 1
+    // 0 is reserved for the endpoints
+    static COUNTER: AtomicUsize = AtomicUsize::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }

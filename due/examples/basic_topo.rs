@@ -17,54 +17,63 @@ use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::Topology;
-use due::{Element, Shared, Sink, Source};
+use due::{Element, EndPoint, Shared};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
 
-    let mut sources: Vec<Box<dyn Source>> = Vec::new();
-    let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
-
     let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
 
+    let mut endpoints: Vec<Box<dyn EndPoint>> = Vec::new();
     // creates a collection of packet sources
     for _ in 0..2 {
-        let mut source =
-            PacketSource::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
-        sources.push(Box::new(source));
+        let source = PacketSource::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+        endpoints.push(Box::new(source));
     }
 
     // creates a sink
-    let mut sink = PacketSink::default();
-    sinks.push(Box::new(sink));
+    let sink = PacketSink::default();
+    endpoints.push(Box::new(sink));
 
     // creates a wire that can be used to connect elements in the network
-    let mut wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
+    let wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
     // initializes a packet switch
-    let weights = vec![1, 2];
-    let fib = vec![0, 1];
-    let mut switch = PacketSwitch::new(
-        0,
+    let weights = vec![1, 1];
+    let fib = vec![0];
+
+    let mut switch_1 = PacketSwitch::new(
         1,
         (1000 * 8) as f64,
         100,
-        weights,
-        fib,
+        weights.clone(),
+        fib.clone(),
         SchedulingDiscipline::FIFO,
         Arc::new(|flow_id| flow_id),
     );
 
-    // constructs the network graph with the (optionally provided) wire
-    let topology = Topology::new(graph);
-    let mut elements: Vec<Box<&mut dyn Element>> = vec![Box::new(&mut switch)];
+    let mut switch_2 = PacketSwitch::new(
+        1,
+        (1000 * 8) as f64,
+        100,
+        weights.clone(),
+        fib.clone(),
+        SchedulingDiscipline::FIFO,
+        Arc::new(|flow_id| flow_id),
+    );
+
+    let mut topology = Topology::new(graph);
+
+    // constructs the network graph with network elements
+    let mut elements: Vec<Box<&mut dyn Element>> =
+        vec![Box::new(&mut switch_1), Box::new(&mut switch_2)];
     topology.construct(&mut elements);
 
     // attaches sources and sinks to hosts in the network graph
-    topology.attach(sources, sinks);
+    topology.attach(elements, endpoints, vec![0, 0, 1]);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;

@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{Shared, Source};
+use crate::{EndPoint, Shared};
 
 pub struct PacketSource<A, B>
 where
@@ -23,7 +23,7 @@ where
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl<A, B> Source for PacketSource<A, B>
+impl<A, B> EndPoint for PacketSource<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
