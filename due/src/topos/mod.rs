@@ -3,7 +3,8 @@ pub mod builders;
 use petgraph::graph::{NodeIndex, UnGraph};
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::{Element, EndPoint};
+use crate::sim::SimContext;
+use crate::{Element, EndPoint, Shared};
 
 pub struct Topology {
     graph: UnGraph<i32, ()>,
@@ -120,6 +121,19 @@ impl Topology {
                 }
             } else {
                 panic!("No neighbors found for host element {}", host_id);
+            }
+        }
+    }
+
+    pub fn activate(self, sim: SimContext<'_, Shared>) {
+        for element in self.elements {
+            match element {
+                Element::PacketSwitch(switch) => {
+                    sim.activate(switch.run(sim));
+                }
+                Element::Splitter(splitter) => {
+                    sim.activate(splitter.run());
+                }
             }
         }
     }

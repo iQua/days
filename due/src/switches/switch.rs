@@ -100,10 +100,6 @@ impl PacketSwitch {
         }
     }
 
-    fn id(&self) -> usize {
-        self.element_id
-    }
-
     pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
         if let Some(sender) = self.senders.get(&element_id) {
             return Some(sender.clone());
@@ -120,7 +116,7 @@ impl PacketSwitch {
         self.senders.insert(element_id, sender.clone());
     }
 
-    async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         // connects ports to outbound senders and activates them for execution
         match self.discipline {
             SchedulingDiscipline::DRR => {

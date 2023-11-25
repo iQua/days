@@ -7,12 +7,10 @@ use std::sync::Arc;
 
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
-use statrs::distribution::{DiscreteUniform, Exp};
-use statrs::statistics::Distribution;
 
 use due::packets::sink::PacketSink;
 use due::packets::source::PacketSource;
-use due::sim::{simulation, Process, RandomVar, SimContext, Time};
+use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::Topology;
@@ -25,9 +23,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
     // packet sources and sinks are endpoints
     let mut endpoints: Vec<EndPoint> = Vec::new();
-
-    let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
-    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
 
     // creates a collection of packet sources
     for _ in 0..2 {
@@ -77,6 +72,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     topology.connect();
     // attaches sources and sinks to hosts in the network graph
     topology.attach(vec![0, 0, 1]);
+    // activate the topology
+    topology.activate(sim);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
