@@ -1,5 +1,5 @@
-pub mod fattree;
 pub mod builder;
+pub mod fattree;
 
 use crate::Element;
 use tokio::sync::mpsc::unbounded_channel;

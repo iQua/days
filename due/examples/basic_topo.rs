@@ -16,7 +16,7 @@ use due::packets::source::Source;
 use due::packets::wire::Wire;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::connect_n_1_hetero;
-use due::{NodeData, NodeType, Shared, Element};
+use due::{Element, NodeData, NodeType, Shared};
 
 const SEED: u64 = 1000;
 
@@ -62,7 +62,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
             _ => false,
         })
         .collect();
-    
+
     println!("{:?}", edge_node_idxs);
 
     // connects sources and the sink to the wire in the graph
@@ -91,9 +91,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
                         upstreams.push(Box::new(element.as_mut()));
                     }
                 }
-                let downstream= elements.get_mut(&g[node_idx].id).unwrap();
+                let downstream = elements.get_mut(&g[node_idx].id).unwrap();
                 connect_n_1_hetero(&mut upstreams, downstream.as_mut());
-            },
+            }
             _ => {
                 continue;
             }

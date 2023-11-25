@@ -1,14 +1,12 @@
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
-use std::fs;
+use std::{collections::HashMap, fs};
 
 /// Types of elements in the topology
-#[derive(Debug, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize)]
 pub enum NodeType {
     Edge,
     Regular,
-    Source,
-    Sink,
 }
 
 #[derive(Debug)]
@@ -36,32 +34,31 @@ struct Edges {
 
 /// This function is used to build a topology from a toml file
 pub fn build(file_path: &str) -> UnGraph<Node, ()> {
-    // read the toml file
+    // reads the toml file
     let content = fs::read_to_string(file_path).expect("No valid TOML file.");
 
-    // deserialize the content of the toml file
+    // deserializes the content of the toml file
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the toml file.");
 
     let mut graph = UnGraph::<Node, ()>::new_undirected();
-    let mut indices = Vec::new();
+    let mut indices = HashMap::new();
 
+    // addes nodes for the graph
     for toml_node in config.nodes {
         let node = Node {
             id: toml_node.id,
-            node_type: toml_node.node_type
+            node_type: toml_node.node_type,
         };
 
-        // as indices is a Vec, need to make sure consecutive indices and start
-        // from 0
         let index = graph.add_node(node);
-        indices.push(index);
+        indices.insert(toml_node.id, index);
     }
 
+    // adds edges for the graph
     for edge in config.edges.pairs {
-        println!("{:?}", edge);
-        graph.add_edge(indices[edge.0], indices[edge.1], ());
+        graph.add_edge(indices[&edge.0], indices[&edge.1], ());
     }
 
-    println!("{:?}", graph);
+    println!("The graph is:\n{:?}", graph);
     graph
 }
