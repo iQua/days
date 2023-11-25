@@ -21,37 +21,24 @@ pub struct Shared {
     pub next_id: AtomicUsize,
 }
 
-/// Source is a trait that defines the interface for all packet sources.
+/// EndPoint is a trait that defines the interface for all packet sources and sinks.
 pub trait EndPoint {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        println!("The sender: {:?}", sender);
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        println!("The receiver: {:?}", receiver)
-    }
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>);
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
 }
 
 /// Scheduler is a trait that defines the interface for all schedulers in packet
 /// switches.
 pub trait Scheduler {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        println!("The sender: {:?}", sender);
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        println!("The receiver: {:?}", receiver)
-    }
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>);
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
 }
 
 /// Element is a trait that defines the interface for all elements in the network.
 pub trait Element {
     fn id(&self) -> usize;
-
     fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>>;
-
     fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>);
-
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
 }
 

@@ -21,12 +21,14 @@ use due::{Element, EndPoint, Shared};
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
+    // element ids in a network graph should be assigned starting from 1
+    let graph = UnGraph::<i32, ()>::from_edges(&[(1, 2)]);
+    // packet sources and sinks are endpoints
+    let mut endpoints: Vec<Box<dyn EndPoint>> = Vec::new();
 
     let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
 
-    let mut endpoints: Vec<Box<dyn EndPoint>> = Vec::new();
     // creates a collection of packet sources
     for _ in 0..2 {
         let source = PacketSource::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
@@ -40,8 +42,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a wire that can be used to connect elements in the network
     // let wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
-    // initializes a packet switch
-    let weights = vec![1, 1];
+    // initializes a packet switch only one outbound port (#0)
+    let weights = vec![1];
     let fib = vec![0];
 
     let switch_1 = PacketSwitch::new(
@@ -71,7 +73,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // constructs the network graph with network elements
     topology.construct();
     // attaches sources and sinks to hosts in the network graph
-    topology.attach(vec![0, 0, 1]);
+    topology.attach(vec![1, 1, 2]);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;

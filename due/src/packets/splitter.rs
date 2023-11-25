@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::{get_id, packets::packet::Packet, Element};
+use crate::packets::packet::Packet;
+use crate::sim::SimContext;
+use crate::{get_id, Element, Shared};
 
 impl Element for Splitter {
     fn id(&self) -> usize {
@@ -49,7 +51,7 @@ impl Splitter {
         Default::default()
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self, _: SimContext<'_, Shared>) {
         while let Some(packet) = self.receiver.recv().await {
             println!(
                 "Splitter {} forwarded packet {} ({} bytes).",
