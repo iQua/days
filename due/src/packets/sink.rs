@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
-use crate::{get_flow_id, Shared, Sink};
+use crate::{Shared, Sink};
 
 pub struct PacketSink {
     flow_id: usize,
@@ -46,7 +46,7 @@ impl Sink for PacketSink {
 impl Default for PacketSink {
     fn default() -> Self {
         PacketSink {
-            flow_id: get_flow_id(),
+            flow_id: 0,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -62,7 +62,7 @@ impl Default for PacketSink {
 impl Clone for PacketSink {
     fn clone(&self) -> Self {
         PacketSink {
-            flow_id: get_flow_id(),
+            flow_id: self.flow_id + 1,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),

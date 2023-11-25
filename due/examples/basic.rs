@@ -25,7 +25,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a collection of packet generators
     let mut generators = Vec::new();
     for _ in 0..2 {
-        let generator = PacketSource::new(0, arr_interval_dist.clone(), packet_size_dist.clone());
+        let generator = PacketSource::new(arr_interval_dist.clone(), packet_size_dist.clone());
         generators.push(generator);
     }
 

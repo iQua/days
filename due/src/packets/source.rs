@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{get_flow_id, Shared, Source};
+use crate::{Shared, Source};
 
 pub struct PacketSource<A, B>
 where
@@ -44,7 +44,7 @@ where
 {
     fn clone(&self) -> Self {
         PacketSource {
-            flow_id: get_flow_id(),
+            flow_id: self.flow_id + 1,
             initial_delay: self.initial_delay,
             arr_interval_dist: self.arr_interval_dist.clone(),
             packet_size_dist: self.packet_size_dist.clone(),
@@ -61,12 +61,13 @@ where
     B: Distribution<f64>,
 {
     pub fn new(
+        flow_id: usize,
         initial_delay: Time,
         arr_interval_dist: Arc<dyn Fn() -> A>,
         packet_size_dist: Arc<dyn Fn() -> B>,
     ) -> PacketSource<A, B> {
         PacketSource {
-            flow_id: get_flow_id(),
+            flow_id,
             initial_delay,
             arr_interval_dist,
             packet_size_dist,
