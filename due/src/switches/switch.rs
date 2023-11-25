@@ -10,9 +10,9 @@ use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
+use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
-use crate::Shared;
-use crate::{sim::SimContext, Element};
+use crate::{Element, Scheduler, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
@@ -64,9 +64,8 @@ impl PacketSwitch {
 
         // the senders from the demultiplexer to ports inside the switch
         let mut port_senders = Vec::new();
-        let scheduler_id = 0;
 
-        for _ in 0..nports {
+        for scheduler_id in 0..nports {
             let (sender, receiver) = unbounded_channel();
 
             match discipline {
@@ -87,6 +86,7 @@ impl PacketSwitch {
                 }
                 SchedulingDiscipline::FIFO => {
                     let mut port = Port::new(
+                        scheduler_id,
                         port_rate,
                         capacity,
                         CapacityUnit::Packets,

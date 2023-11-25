@@ -37,7 +37,7 @@ async fn network_sim(k: usize, sim: SimContext<'_, Shared>) {
     let fib: Vec<_> = (0..=3).cycle().take(num_hosts).collect();
 
     // sets a generator and a sink
-    let generator = Source::new(0., arr_interval_dist, packet_size_dist);
+    let generator = PacketSource::new(0., arr_interval_dist, packet_size_dist);
     let sink = Sink::default();
 
     // constructs the FatTree topology
@@ -86,7 +86,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 1.,
-            next_id: AutomicUSize::new(0),
+            next_id: AtomicUSize::new(0),
         },
         |sim| Process::new(sim, network_sim(4, sim)),
     );

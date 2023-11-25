@@ -1,6 +1,6 @@
 pub mod builders;
 
-use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::graph::UnGraph;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::Element;
@@ -49,13 +49,12 @@ pub fn connect_1_n(upstream: &mut impl Element, downstream: &mut [impl Element])
 /// graph `edges`, where each Vec corresponds to a specific upstream element and
 /// contains the indices of downstream elements it should connect to.
 pub fn connect(elements: &mut [Box<&mut dyn Element>], graph: UnGraph<i32, ()>) {
-    for downstream_element in elements {
+    for node_id in graph.node_indices() {
         let (sender, receiver) = unbounded_channel();
 
-        downstream_element.connect_receiver(receiver);
-        let downstream_id = downstream_element.id();
+        elements[node_id.index()].connect_receiver(receiver);
 
-        for neighbor_index in graph.neighbors(NodeIndex::new(downstream_id)) {
+        for neighbor_index in graph.neighbors(node_id) {
             // if an edge exists between an upstream element and this downstream
             // element in the provided network graph, then connect them
             elements[neighbor_index.index()].connect_sender(sender.clone());

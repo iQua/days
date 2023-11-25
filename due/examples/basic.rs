@@ -25,13 +25,13 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // creates a collection of packet generators
     let mut generators = Vec::new();
     for _ in 0..2 {
-        let generator = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+        let generator = PacketSource::new(0, arr_interval_dist.clone(), packet_size_dist.clone());
         generators.push(generator);
     }
 
     let mut wire = Wire::new(0, Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
 
-    let mut sink = Sink::default();
+    let mut sink = PacketSink::default();
 
     // connects the generators to the wire
     connect_n_1_homo(&mut generators, &mut wire);
@@ -54,7 +54,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
-            next_id: AutomicUSize::new(0),
+            next_id: AtomicUsize::new(0),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

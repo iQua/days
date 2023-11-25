@@ -25,7 +25,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // initializes packet generators and packet sinks
     for _ in 0..2 {
-        let generator = Source::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
+        let generator = PacketSource::new(0., arr_interval_dist.clone(), packet_size_dist.clone());
         let sink = Sink::default();
         generators.push(generator);
         sinks.push(sink);
@@ -68,7 +68,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
-            next_id: AutomicUSize::new(0),
+            next_id: AtomicUSize::new(0),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

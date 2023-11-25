@@ -24,8 +24,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
 
     // initializes packet generators
-    let mut generator_1 = Source::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
-    let mut generator_2 = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    let mut generator_1 =
+        PacketSource::new(0.0, arr_interval_dist.clone(), packet_size_dist.clone());
+    let mut generator_2 = PacketSource::new(0, arr_interval_dist.clone(), packet_size_dist.clone());
 
     // initializes splitters
     let mut splitter_1 = Splitter::default();

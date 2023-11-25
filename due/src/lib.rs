@@ -18,7 +18,7 @@ pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
-    pub next_id: Vec<AtomicUsize>,
+    pub next_id: AtomicUsize,
 }
 
 /// Source is a trait that defines the interface for all packet sources.

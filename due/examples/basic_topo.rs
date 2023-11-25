@@ -30,7 +30,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // creates a collection of packet sources
     for _ in 0..2 {
-        let mut source = Source::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
+        let mut source =
+            PacketSource::new(0, 1.0, arr_interval_dist.clone(), packet_size_dist.clone());
         sources.push(Box::new(source));
     }
 
