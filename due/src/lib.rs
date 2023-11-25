@@ -5,13 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
+use crate::packets::splitter::Splitter;
 use crate::sim::{RandomVar, Time};
+use crate::switches::switch::PacketSwitch;
 
 pub mod packets;
 pub mod schedulers;
 pub mod sim;
 pub mod switches;
 pub mod topos;
+
+pub enum Element {
+    PacketSwitch(PacketSwitch),
+    Splitter(Splitter),
+}
 
 /// Globally shared data.
 pub struct Shared {
@@ -30,14 +37,6 @@ pub trait EndPoint {
 /// switches.
 pub trait Scheduler {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>);
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
-}
-
-/// Element is a trait that defines the interface for all elements in the network.
-pub trait Element {
-    fn id(&self) -> usize;
-    fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>>;
-    fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>);
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
 }
 

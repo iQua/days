@@ -4,30 +4,13 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::get_id;
 use crate::packets::packet::Packet;
-use crate::sim::SimContext;
-use crate::{get_id, Element, Shared};
 
-impl Element for Splitter {
-    fn id(&self) -> usize {
-        self.element_id
-    }
-
-    fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
-        if let Some(sender) = self.senders.get(&element_id) {
-            return Some(sender.clone());
-        }
-
-        None
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
-
-    fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
-        self.senders.insert(element_id, sender.clone());
-    }
+pub struct Splitter {
+    element_id: usize,
+    senders: HashMap<usize, UnboundedSender<Packet>>,
+    receiver: UnboundedReceiver<Packet>,
 }
 
 impl Default for Splitter {
@@ -40,18 +23,32 @@ impl Default for Splitter {
     }
 }
 
-pub struct Splitter {
-    element_id: usize,
-    senders: HashMap<usize, UnboundedSender<Packet>>,
-    receiver: UnboundedReceiver<Packet>,
-}
-
 impl Splitter {
+    fn id(&self) -> usize {
+        self.element_id
+    }
+
+    pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
+        if let Some(sender) = self.senders.get(&element_id) {
+            return Some(sender.clone());
+        }
+
+        None
+    }
+
+    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
+
+    pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
+        self.senders.insert(element_id, sender.clone());
+    }
+
     pub fn new() -> Splitter {
         Default::default()
     }
 
-    pub async fn run(mut self, _: SimContext<'_, Shared>) {
+    pub async fn run(mut self) {
         while let Some(packet) = self.receiver.recv().await {
             println!(
                 "Splitter {} forwarded packet {} ({} bytes).",

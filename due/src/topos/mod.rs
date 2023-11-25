@@ -8,14 +8,14 @@ use crate::{Element, EndPoint};
 pub struct Topology {
     graph: UnGraph<i32, ()>,
     hosts: Vec<usize>,
-    elements: Vec<Box<dyn Element>>,
+    elements: Vec<Element>,
     endpoints: Vec<Box<dyn EndPoint>>,
 }
 
 impl Topology {
     pub fn new(
         graph: UnGraph<i32, ()>,
-        elements: Vec<Box<dyn Element>>,
+        elements: Vec<Element>,
         endpoints: Vec<Box<dyn EndPoint>>,
         hosts: Vec<usize>,
     ) -> Topology {
@@ -32,14 +32,27 @@ impl Topology {
         for node_id in self.graph.node_indices() {
             let (sender, receiver) = unbounded_channel();
 
-            self.elements[node_id.index()].connect_receiver(receiver);
+            match &mut self.elements[node_id.index()] {
+                Element::PacketSwitch(switch) => {
+                    switch.connect_receiver(receiver);
+                }
+                Element::Splitter(splitter) => {
+                    splitter.connect_receiver(receiver);
+                }
+            }
 
             for neighbor_index in self.graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them
-                self.elements[neighbor_index.index()]
-                    .connect_sender(node_id.index(), sender.clone());
+                match &mut self.elements[neighbor_index.index()] {
+                    Element::PacketSwitch(switch) => {
+                        switch.connect_sender(node_id.index(), sender.clone());
+                    }
+                    Element::Splitter(splitter) => {
+                        splitter.connect_sender(node_id.index(), sender.clone());
+                    }
+                }
             }
         }
     }
@@ -59,17 +72,34 @@ impl Topology {
             // locate a neighboring element in the network graph to this host
             let mut neighbors = self.graph.neighbors(NodeIndex::new(host_id));
 
-            if let Some(first_neighbor) = neighbors.next() {
-                let sender = self.elements[first_neighbor.index()]
-                    .get_sender(host_id)
-                    .unwrap();
-                let endpoint = endpoint_iter.next().unwrap();
-                endpoint.connect_sender(sender);
+            let (downlink_sender, downlink_receiver) = unbounded_channel();
+            let endpoint = endpoint_iter.next().unwrap();
 
-                // attaches each endpoint's receiver to its corresponding host's sender
-                let (sender, receiver) = unbounded_channel();
-                endpoint.connect_receiver(receiver);
-                self.elements[host_id].connect_sender(usize::MAX, sender);
+            if let Some(first_neighbor) = neighbors.next() {
+                match &mut self.elements[first_neighbor.index()] {
+                    Element::PacketSwitch(switch) => {
+                        let uplink_sender = switch.get_sender(host_id).unwrap();
+                        // attaches each endpoint's sender to its corresponding host's receiver
+                        endpoint.connect_sender(uplink_sender);
+                        // attaches each endpoint's receiver to its corresponding host's sender
+                        endpoint.connect_receiver(downlink_receiver);
+                    }
+                    Element::Splitter(splitter) => {
+                        let uplink_sender = splitter.get_sender(host_id).unwrap();
+                        endpoint.connect_sender(uplink_sender);
+                        // attaches each endpoint's receiver to its corresponding host's sender
+                        endpoint.connect_receiver(downlink_receiver);
+                    }
+                }
+
+                match &mut self.elements[host_id] {
+                    Element::PacketSwitch(switch) => {
+                        switch.connect_sender(usize::MAX, downlink_sender);
+                    }
+                    Element::Splitter(splitter) => {
+                        splitter.connect_sender(usize::MAX, downlink_sender);
+                    }
+                }
             } else {
                 panic!("No neighbors found for host element {}", host_id);
             }

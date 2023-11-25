@@ -13,7 +13,7 @@ use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
-use crate::{get_id, Element, Scheduler, Shared};
+use crate::{get_id, Scheduler, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
@@ -36,28 +36,6 @@ pub struct PacketSwitch {
 
     /// a receiver for receiving inbound packets
     receiver: UnboundedReceiver<Packet>,
-}
-
-impl Element for PacketSwitch {
-    fn id(&self) -> usize {
-        self.element_id
-    }
-
-    fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
-        if let Some(sender) = self.senders.get(&element_id) {
-            return Some(sender.clone());
-        }
-
-        None
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
-
-    fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
-        self.senders.insert(element_id, sender.clone());
-    }
 }
 
 impl PacketSwitch {
@@ -122,7 +100,27 @@ impl PacketSwitch {
         }
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    fn id(&self) -> usize {
+        self.element_id
+    }
+
+    pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
+        if let Some(sender) = self.senders.get(&element_id) {
+            return Some(sender.clone());
+        }
+
+        None
+    }
+
+    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
+
+    pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
+        self.senders.insert(element_id, sender.clone());
+    }
+
+    async fn run(mut self, sim: SimContext<'_, Shared>) {
         // connects ports to outbound senders and activates them for execution
         match self.discipline {
             SchedulingDiscipline::DRR => {

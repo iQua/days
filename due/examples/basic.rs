@@ -65,7 +65,10 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         Arc::new(|flow_id| flow_id),
     );
 
-    let elements: Vec<Box<dyn Element>> = vec![Box::new(switch_1), Box::new(switch_2)];
+    let elements: Vec<Element> = vec![
+        Element::PacketSwitch(switch_1),
+        Element::PacketSwitch(switch_2),
+    ];
     let hosts = vec![0, 1];
     let mut topology = Topology::new(graph, elements, endpoints, hosts);
 
