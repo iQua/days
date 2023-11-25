@@ -1,7 +1,5 @@
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
-use statrs::distribution::{DiscreteUniform, Uniform};
-use std::sync::Arc;
 use std::{collections::HashMap, fs};
 
 /// Types of elements in the topology
@@ -86,12 +84,33 @@ pub fn build_fattree(file_path: &str) -> UnGraph<Node, ()> {
         config.k, config.port_rate, config.capacity, config.n_classes_per_port
     );
 
+    let num_edge_switches = config.k.pow(2) / 2;
+    let num_regular_switches = config.k.pow(2) * 3 / 4;
     let mut graph = UnGraph::<Node, ()>::new_undirected();
 
-    // TODO: Put these in toml
-    let arr_interval_dist = Arc::new(|| Uniform::new(1.0, 1.0).unwrap());
-    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1000).unwrap());
+    // initializes nodes for edge switches
+    for _ in 0..num_edge_switches {
+        let index = graph.add_node(Node {
+            id: 0,
+            node_type: NodeType::Edge,
+        });
+        if let Some(node) = graph.node_weight_mut(index) {
+            node.id = index.index();
+        }
+    }
 
-    // TODO: construct the fattree
+    // initializes nodes for aggregation and core switches
+    for _ in 0..num_regular_switches {
+        let index = graph.add_node(Node {
+            id: 0,
+            node_type: NodeType::Regular,
+        });
+        if let Some(node) = graph.node_weight_mut(index) {
+            node.id = index.index();
+        }
+    }
+
+    // TODO: connects nodes
+
     graph
 }
