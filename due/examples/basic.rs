@@ -44,7 +44,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let weights = vec![1, 1];
     let fib = vec![0];
 
-    let mut switch_1 = PacketSwitch::new(
+    let switch_1 = PacketSwitch::new(
         1,
         (1000 * 8) as f64,
         100,
@@ -54,7 +54,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         Arc::new(|flow_id| flow_id),
     );
 
-    let mut switch_2 = PacketSwitch::new(
+    let switch_2 = PacketSwitch::new(
         1,
         (1000 * 8) as f64,
         100,
@@ -64,15 +64,14 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         Arc::new(|flow_id| flow_id),
     );
 
-    let mut topology = Topology::new(graph);
+    let elements: Vec<Box<dyn Element>> = vec![Box::new(switch_1), Box::new(switch_2)];
+    let hosts = vec![1, 2];
+    let mut topology = Topology::new(graph, elements, endpoints, hosts);
 
     // constructs the network graph with network elements
-    let mut elements: Vec<Box<&mut dyn Element>> =
-        vec![Box::new(&mut switch_1), Box::new(&mut switch_2)];
-    topology.construct(&mut elements);
-
+    topology.construct();
     // attaches sources and sinks to hosts in the network graph
-    topology.attach(elements, endpoints, vec![0, 0, 1]);
+    topology.attach(vec![0, 0, 1]);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
