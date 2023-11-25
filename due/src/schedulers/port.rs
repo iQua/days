@@ -7,10 +7,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::sim::SimContext;
-use crate::{get_id, Element, Shared};
+use crate::{Scheduler, Shared};
 
 pub struct Port {
-    element_id: usize,
+    scheduler_id: usize,
     /// the bit rate of the port
     rate: f64,
     /// a closure that determines whether an inbound packet should be dropped or not
@@ -29,11 +29,7 @@ pub struct Port {
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for Port {
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
+impl Scheduler for Port {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
@@ -45,6 +41,7 @@ impl Element for Port {
 
 impl Port {
     pub fn new(
+        scheduler_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
@@ -56,7 +53,7 @@ impl Port {
         };
 
         Port {
-            element_id: get_id(),
+            scheduler_id,
             rate,
             drop_strategy: Box::new(packet_drop),
             packets_received: 0,
@@ -79,7 +76,7 @@ impl Port {
             self.packets_dropped += 1;
             println! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
-                self.element_id,
+                self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
                 sim.now()
@@ -95,7 +92,7 @@ impl Port {
         println!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packets in queue.",
-            self.element_id,
+            self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
@@ -111,7 +108,7 @@ impl Port {
         println!(
             "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets in queue.",
-            self.element_id,
+            self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
@@ -148,7 +145,7 @@ impl Port {
 
         println!(
             "Port {} finished running at time {}.",
-            self.element_id,
+            self.scheduler_id,
             sim.now()
         );
     }

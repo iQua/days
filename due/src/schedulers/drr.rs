@@ -8,10 +8,11 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::sim::SimContext;
-use crate::{get_id, Element, Shared};
+use crate::{Scheduler, Shared};
 
 pub struct DRRServer {
-    element_id: usize,
+    scheduler_id: usize,
+
     /// the bit rate of the server
     rate: f64,
 
@@ -45,11 +46,7 @@ pub struct DRRServer {
     pub receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for DRRServer {
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
+impl Scheduler for DRRServer {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
@@ -61,6 +58,7 @@ impl Element for DRRServer {
 
 impl DRRServer {
     pub fn new(
+        scheduler_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
@@ -90,7 +88,7 @@ impl DRRServer {
         };
 
         DRRServer {
-            element_id: get_id(),
+            scheduler_id,
             rate,
             flow_classes,
             drop_strategy: Box::new(packet_drop),
@@ -119,7 +117,7 @@ impl DRRServer {
             self.packets_dropped += 1;
             println! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
-                self.element_id,
+                self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
                 sim.now()
@@ -138,7 +136,7 @@ impl DRRServer {
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in class queue {}.",
-            self.element_id,
+            self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
@@ -189,7 +187,7 @@ impl DRRServer {
                         println!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                                     {} packets in the class queue.",
-                            self.element_id,
+                            self.scheduler_id,
                             packet.packet_id,
                             packet.size,
                             packet.flow_id,
@@ -215,7 +213,7 @@ impl DRRServer {
         }
         println!(
             "DRRServer {} finished running at time {}.",
-            self.element_id,
+            self.scheduler_id,
             sim.now()
         );
     }

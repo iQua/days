@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::packets::packet::Packet;
+use crate::sim::{RandomVar, Time};
+
 pub mod packets;
 pub mod schedulers;
 pub mod sim;
 pub mod switches;
 pub mod topos;
-
-use crate::packets::packet::Packet;
-use crate::sim::{RandomVar, Time};
 
 /// Globally shared data.
 pub struct Shared {
@@ -21,9 +21,43 @@ pub struct Shared {
     pub next_id: Vec<AtomicUsize>,
 }
 
+/// Source is a trait that defines the interface for all packet sources.
+pub trait Source {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        println!("The sender: {:?}", sender);
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        println!("The receiver: {:?}", receiver)
+    }
+}
+
+/// Sink is a trait that defines the interface for all packet sinks.
+pub trait Sink {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        println!("The sender: {:?}", sender);
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        println!("The receiver: {:?}", receiver)
+    }
+}
+
+/// Scheduler is a trait that defines the interface for all schedulers in packet
+/// switches.
+pub trait Scheduler {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        println!("The sender: {:?}", sender);
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        println!("The receiver: {:?}", receiver)
+    }
+}
+
 /// Element is a trait that defines the interface for all elements in the network.
 pub trait Element {
-    fn id(&mut self) -> usize;
+    fn id(&self) -> usize;
 
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         println!("The sender: {:?}", sender);

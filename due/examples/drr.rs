@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::sink::Sink;
-use due::packets::source::Source;
+use due::packets::sink::PacketSink;
+use due::packets::source::PacketSource;
 use due::packets::splitter::Splitter;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
@@ -34,6 +34,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // initializes the DRR server
     let weights = vec![1, 2];
     let mut drr_server = DRRServer::new(
+        0,
         (1000 * 8) as f64,
         100,
         CapacityUnit::Packets,
@@ -44,7 +45,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let drr_server_id = drr_server.id();
 
     // initializes packet sinks
-    let mut sink: Sink = Sink::default();
+    let mut sink: PacketSink = Sink::default();
     let mut sink_1: Sink = Sink::default();
     let sink_1_id = sink_1.id();
     let mut sink_2: Sink = Sink::default();
@@ -96,7 +97,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 20.,
-            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
+            next_id: AtomicUsize::new(0),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

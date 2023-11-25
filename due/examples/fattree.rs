@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use due::packets::sink::Sink;
-use due::packets::source::Source;
+use due::packets::sink::PacketSink;
+use due::packets::source::PacketSource;
 use rand::Rng;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
@@ -86,7 +86,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 1.,
-            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
+            next_id: AutomicUSize::new(0),
         },
         |sim| Process::new(sim, network_sim(4, sim)),
     );

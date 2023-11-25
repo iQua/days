@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::{get_id, packets::packet::Packet, Element};
 
 impl Element for Splitter {
-    fn id(&mut self) -> usize {
+    fn id(&self) -> usize {
         self.element_id
     }
 

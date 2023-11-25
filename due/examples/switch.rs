@@ -7,8 +7,8 @@ use std::sync::Arc;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Uniform};
 
-use due::packets::sink::Sink;
-use due::packets::source::Source;
+use due::packets::sink::PacketSink;
+use due::packets::source::PacketSource;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
@@ -68,7 +68,7 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
-            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
+            next_id: AutomicUSize::new(0),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

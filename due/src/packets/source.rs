@@ -7,14 +7,13 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{get_flow_id, get_id, Element, Shared};
+use crate::{get_flow_id, Shared, Source};
 
-pub struct Source<A, B>
+pub struct PacketSource<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
-    element_id: usize,
     flow_id: usize,
     initial_delay: Time,
     arr_interval_dist: Arc<dyn Fn() -> A>,
@@ -24,15 +23,11 @@ where
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl<A, B> Element for Source<A, B>
+impl<A, B> Source for PacketSource<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
@@ -42,14 +37,13 @@ where
     }
 }
 
-impl<A, B> Clone for Source<A, B>
+impl<A, B> Clone for PacketSource<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
 {
     fn clone(&self) -> Self {
-        Source {
-            element_id: get_id(),
+        PacketSource {
             flow_id: get_flow_id(),
             initial_delay: self.initial_delay,
             arr_interval_dist: self.arr_interval_dist.clone(),
@@ -61,7 +55,7 @@ where
     }
 }
 
-impl<A, B> Source<A, B>
+impl<A, B> PacketSource<A, B>
 where
     A: Distribution<Time>,
     B: Distribution<f64>,
@@ -70,9 +64,8 @@ where
         initial_delay: Time,
         arr_interval_dist: Arc<dyn Fn() -> A>,
         packet_size_dist: Arc<dyn Fn() -> B>,
-    ) -> Source<A, B> {
-        Source {
-            element_id: get_id(),
+    ) -> PacketSource<A, B> {
+        PacketSource {
             flow_id: get_flow_id(),
             initial_delay,
             arr_interval_dist,
@@ -91,8 +84,8 @@ where
         self.packets_sent += 1;
 
         println!(
-            "DistPacketGenerator {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.element_id,
+            "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            self.flow_id,
             packet.packet_id,
             packet.size,
             sim.now(),
@@ -102,8 +95,8 @@ where
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         println!(
-            "DistPacketGenerator {} will be waiting for {:.3} sec(s) at the beginning.",
-            self.element_id, self.initial_delay
+            "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
+            self.flow_id, self.initial_delay
         );
 
         sim.advance(self.initial_delay).await;
@@ -117,7 +110,7 @@ where
             let mut packet = Packet::new(
                 packet_size,
                 self.packets_sent,
-                "source".to_string(),
+                "PacketSource".to_string(),
                 "destination".to_string(),
                 self.flow_id,
                 sim.now(),
@@ -130,8 +123,8 @@ where
         }
 
         println!(
-            "DistPacketGenerator {} finished running at time {}.",
-            self.element_id,
+            "PacketSource {} finished running at time {}.",
+            self.flow_id,
             sim.now()
         );
     }

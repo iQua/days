@@ -1,7 +1,7 @@
-//! Implements a Sink, designed to record both arrival times and waiting
+//! Implements a PacketSink, designed to record both arrival times and waiting
 //! times from the incoming packets.
 
-//! The Sink records a variety of statistics, including absolute arrival
+//! The PacketSink records a variety of statistics, including absolute arrival
 //! times, inter-arrival times, the total number of packets and bytes received,
 //! the one-way end-to-end delays, and the total time spent waiting in queues.
 //! These statistics are indexed by either the flow identifier or the source of
@@ -11,10 +11,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
-use crate::{get_id, Element, Shared};
+use crate::{get_flow_id, Shared, Sink};
 
-pub struct Sink {
-    element_id: usize,
+pub struct PacketSink {
+    flow_id: usize,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -33,11 +33,7 @@ pub struct Sink {
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for Sink {
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
+impl Sink for PacketSink {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
@@ -47,10 +43,10 @@ impl Element for Sink {
     }
 }
 
-impl Default for Sink {
+impl Default for PacketSink {
     fn default() -> Self {
-        Sink {
-            element_id: get_id(),
+        PacketSink {
+            flow_id: get_flow_id(),
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -63,10 +59,10 @@ impl Default for Sink {
     }
 }
 
-impl Clone for Sink {
+impl Clone for PacketSink {
     fn clone(&self) -> Self {
-        Sink {
-            element_id: get_id(),
+        PacketSink {
+            flow_id: get_flow_id(),
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -79,8 +75,8 @@ impl Clone for Sink {
     }
 }
 
-impl Sink {
-    pub fn new() -> Sink {
+impl PacketSink {
+    pub fn new() -> PacketSink {
         Default::default()
     }
 
@@ -98,8 +94,8 @@ impl Sink {
         sim.shared().queueing_delay.tabulate(packet.queueing_delay);
 
         println!(
-            "Sink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.element_id,
+            "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            self.flow_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
@@ -113,13 +109,13 @@ impl Sink {
         }
 
         println!(
-            "Sink {} finished running at time {:.3}. Statistics: \n\
+            "PacketSink {} finished running at time {:.3}. Statistics: \n\
             Arrival times: {:#.3} \n\
             Inter-arrival times: {:#.3} \n\
             One-way delays: {:#.3} \n\
             Queueing delays: {:#.3} \n\
             Packet sizes: {:#.3} \n",
-            self.element_id,
+            self.flow_id,
             sim.now(),
             self.arrival_times,
             self.inter_arrival_times,

@@ -11,7 +11,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::switches::SchedulingDiscipline;
-use crate::{get_id, Shared};
+use crate::Shared;
 use crate::{sim::SimContext, Element};
 
 pub struct PacketSwitch {
@@ -36,7 +36,7 @@ pub struct PacketSwitch {
 }
 
 impl Element for PacketSwitch {
-    fn id(&mut self) -> usize {
+    fn id(&self) -> usize {
         self.element_id
     }
 
@@ -51,6 +51,7 @@ impl Element for PacketSwitch {
 
 impl PacketSwitch {
     pub fn new(
+        element_id: usize,
         nports: usize,
         port_rate: f64,
         capacity: usize,
@@ -63,6 +64,7 @@ impl PacketSwitch {
 
         // the senders from the demultiplexer to ports inside the switch
         let mut port_senders = Vec::new();
+        let scheduler_id = 0;
 
         for _ in 0..nports {
             let (sender, receiver) = unbounded_channel();
@@ -70,6 +72,7 @@ impl PacketSwitch {
             match discipline {
                 SchedulingDiscipline::DRR => {
                     let mut port = DRRServer::new(
+                        scheduler_id,
                         port_rate,
                         capacity,
                         CapacityUnit::Packets,
@@ -98,7 +101,7 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            element_id: get_id(),
+            element_id,
             packets_received: 0,
             discipline,
             fib,
