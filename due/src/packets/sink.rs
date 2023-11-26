@@ -11,10 +11,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
-use crate::Shared;
+use crate::{next_endpoint_id, Shared};
 
 pub struct PacketSink {
-    flow_id: usize,
+    endpoint_id: usize,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -36,7 +36,7 @@ pub struct PacketSink {
 impl Default for PacketSink {
     fn default() -> Self {
         PacketSink {
-            flow_id: 0,
+            endpoint_id: next_endpoint_id(),
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -52,7 +52,7 @@ impl Default for PacketSink {
 impl Clone for PacketSink {
     fn clone(&self) -> Self {
         PacketSink {
-            flow_id: self.flow_id + 1,
+            endpoint_id: next_endpoint_id(),
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -85,7 +85,7 @@ impl PacketSink {
 
         println!(
             "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.flow_id,
+            self.endpoint_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
@@ -113,7 +113,7 @@ impl PacketSink {
             One-way delays: {:#.3} \n\
             Queueing delays: {:#.3} \n\
             Packet sizes: {:#.3} \n",
-            self.flow_id,
+            self.endpoint_id,
             sim.now(),
             self.arrival_times,
             self.inter_arrival_times,

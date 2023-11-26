@@ -7,10 +7,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::Shared;
+use crate::{next_endpoint_id, Shared};
 
 pub struct PacketSource {
-    flow_id: usize,
+    endpoint_id: usize,
     initial_delay: Time,
     packets_sent: usize,
     sender: UnboundedSender<Packet>,
@@ -20,7 +20,7 @@ pub struct PacketSource {
 impl Clone for PacketSource {
     fn clone(&self) -> Self {
         PacketSource {
-            flow_id: self.flow_id + 1,
+            endpoint_id: next_endpoint_id(),
             initial_delay: self.initial_delay,
             packets_sent: 0,
             sender: unbounded_channel().0,
@@ -30,9 +30,9 @@ impl Clone for PacketSource {
 }
 
 impl PacketSource {
-    pub fn new(flow_id: usize, initial_delay: Time) -> PacketSource {
+    pub fn new(initial_delay: Time) -> PacketSource {
         PacketSource {
-            flow_id,
+            endpoint_id: next_endpoint_id(),
             initial_delay,
             packets_sent: 0,
             sender: unbounded_channel().0,
@@ -40,8 +40,8 @@ impl PacketSource {
         }
     }
 
-    pub fn flow_id(&self) -> usize {
-        self.flow_id
+    pub fn endpoint_id(&self) -> usize {
+        self.endpoint_id
     }
 
     pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
@@ -57,14 +57,14 @@ impl PacketSource {
 
         println!(
             "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.flow_id, packet.packet_id, packet.size, now, self.packets_sent,
+            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         println!(
             "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
-            self.flow_id, self.initial_delay
+            self.endpoint_id, self.initial_delay
         );
 
         sim.advance(self.initial_delay).await;
@@ -83,7 +83,7 @@ impl PacketSource {
                 self.packets_sent,
                 "PacketSource".to_string(),
                 "destination".to_string(),
-                self.flow_id,
+                self.endpoint_id,
                 sim.now(),
             );
 
@@ -95,7 +95,7 @@ impl PacketSource {
 
         println!(
             "PacketSource {} finished running at time {}.",
-            self.flow_id,
+            self.endpoint_id,
             sim.now()
         );
     }

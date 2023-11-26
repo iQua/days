@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::get_id;
+use crate::next_element_id;
 use crate::packets::packet::Packet;
 
 pub struct Splitter {
@@ -16,7 +16,7 @@ pub struct Splitter {
 impl Default for Splitter {
     fn default() -> Self {
         Splitter {
-            element_id: get_id(),
+            element_id: next_element_id(),
             senders: HashMap::new(),
             receiver: unbounded_channel().1,
         }

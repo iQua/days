@@ -6,8 +6,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::schedulers::Scheduler;
 use crate::sim::{SimContext, Time};
-use crate::{Scheduler, Shared};
+use crate::Shared;
 
 pub struct Port {
     scheduler_id: usize,

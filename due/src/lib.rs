@@ -2,9 +2,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::rngs::SmallRng;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
 use crate::packets::sink::PacketSink;
 use crate::packets::source::PacketSource;
 use crate::packets::splitter::Splitter;
@@ -34,16 +32,12 @@ pub struct Shared {
     pub duration: Time,
 }
 
-/// Scheduler is a trait that defines the interface for all schedulers in packet
-/// switches.
-pub trait Scheduler {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>);
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>);
+pub fn next_element_id() -> usize {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-pub fn get_id() -> usize {
-    // the sequence of unique element_ids starts from 1
-    // 0 is reserved for the endpoints
+pub fn next_endpoint_id() -> usize {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }

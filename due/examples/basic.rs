@@ -26,7 +26,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // creates a collection of packet sources
     for _ in 0..2 {
-        let source = PacketSource::new(0, 1.0);
+        let source = PacketSource::new(1.0);
         endpoints.push(EndPoint::PacketSource(source));
     }
 
@@ -36,7 +36,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // initializes a packet switch only one outbound port (#0)
     let weights = vec![1];
-    let fib = vec![0];
+    let fib = vec![0, 0];
 
     let switch_1 = PacketSwitch::new(
         1,

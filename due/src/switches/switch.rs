@@ -11,9 +11,10 @@ use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
+use crate::schedulers::Scheduler;
 use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
-use crate::{get_id, Scheduler, Shared};
+use crate::{next_element_id, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
@@ -89,7 +90,7 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            element_id: get_id(),
+            element_id: next_element_id(),
             packets_received: 0,
             discipline,
             fib,
