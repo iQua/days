@@ -1,16 +1,21 @@
-num_nodes = 3
-edges = [[1, 0], [1, 2]]
+num_nodes = 32
+edges = [[1, 0]]
+num_splitters = 0
+num_sinks = 1
 
-[[element]]
-element_type = 'PacketSwitch'
+[[switch]]
 port_rate = 32000
 capacity = 100
 weights = [1]
 discipline = "DRR"
+fib = [0]
 
-[[element]]
-element_type = 'PacketSwitch'
+[[switch]]
 port_rate = 32000
 capacity = 100
 weights = [2]
 discipline = "DRR"
+fib = [1]
+
+[[source]]
+initial_delay = 1.0

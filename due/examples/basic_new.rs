@@ -3,7 +3,8 @@
 use std::cell::RefCell;
 
 use due::topos::builders::build_fattree;
-use due::topos::initializers::init_elements;
+use due::topos::initializers::{init_elements, init_endpoints};
+use due::topos::topology::Topology;
 use rand::{rngs::SmallRng, SeedableRng};
 
 use due::sim::{simulation, Process, RandomVar, SimContext};
@@ -19,7 +20,20 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 
     // tests of initializer
     let elements = init_elements("configs/simple.toml");
-    println!("{}", elements.len());
+    println!("number of elements: {}", elements.len());
+
+    let endpoints = init_endpoints("configs/simple.toml");
+    println!("number of endpoints: {}", endpoints.len());
+
+    let hosts = vec![0, 1];
+    let mut topology = Topology::new(graph, hosts, elements, endpoints);
+
+    // constructs the network graph with network elements
+    topology.connect();
+    // attaches sources and sinks to hosts in the network graph
+    topology.attach(vec![0, 1]);
+    // runs the topology
+    topology.run(sim);
 }
 
 fn main() {
