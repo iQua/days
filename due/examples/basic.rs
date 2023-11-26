@@ -1,48 +1,74 @@
-//! This example shows how to create a basic network where two packet generators
+//! This example shows how to create a basic network where two packet sources
 //! send packets to a wire that adds propagation delays according to a random
 //! distribution, and then to a packet sink.
 
 use std::cell::RefCell;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
-use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
-use due::packets::sink::Sink;
-use due::packets::source::Source;
-use due::packets::wire::Wire;
+use due::packets::sink::PacketSink;
+use due::packets::source::PacketSource;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos::{connect_n_1_homo, connect_pair};
-use due::Shared;
+use due::switches::switch::PacketSwitch;
+use due::switches::SchedulingDiscipline;
+use due::topos::topology::Topology;
+use due::{set_num_elements, Element, EndPoint, Shared};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let arr_interval_dist = Arc::new(|| Exp::new(1.0).unwrap());
-    let packet_size_dist = Arc::new(|| DiscreteUniform::new(1000, 1500).unwrap());
+    // element ids in a network graph start from 0
+    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    // endpoint ids start from the total number of elements
+    let num_elements = graph.node_count();
+    set_num_elements(num_elements);
+    // packet sources and sinks are endpoints
+    let mut endpoints: Vec<EndPoint> = Vec::new();
 
-    // creates a collection of packet generators
-    let mut generators = Vec::new();
-    for _ in 0..2 {
-        let generator = Source::new(1.0, arr_interval_dist.clone(), packet_size_dist.clone());
-        generators.push(generator);
-    }
+    // creates a collection of packet sources
+    let source = PacketSource::new(1.0);
+    endpoints.push(EndPoint::PacketSource(source));
 
-    let mut wire = Wire::new(Box::new(|| Uniform::new(2.0, 2.0).unwrap()));
+    // creates a sink
+    let sink = PacketSink::default();
+    endpoints.push(EndPoint::PacketSink(sink));
 
-    let mut sink = Sink::default();
+    // initializes a packet switch only one outbound port (#0)
+    let weights = vec![1];
 
-    // connects the generators to the wire
-    connect_n_1_homo(&mut generators, &mut wire);
-    // connects the wire to the sink
-    connect_pair(&mut wire, &mut sink);
+    let switch_1 = PacketSwitch::new(
+        (1000 * 8) as f64,
+        100,
+        weights.clone(),
+        vec![1],
+        SchedulingDiscipline::FIFO,
+        Arc::new(|flow_id| flow_id),
+    );
 
-    for generator in generators {
-        sim.activate(generator.run(sim));
-    }
-    sim.activate(wire.run(sim));
-    sim.activate(sink.run(sim));
+    let switch_2 = PacketSwitch::new(
+        (1000 * 8) as f64,
+        100,
+        weights.clone(),
+        vec![3],
+        SchedulingDiscipline::FIFO,
+        Arc::new(|flow_id| flow_id),
+    );
+
+    let elements: Vec<Element> = vec![
+        Element::PacketSwitch(switch_1),
+        Element::PacketSwitch(switch_2),
+    ];
+    let hosts = vec![0, 1];
+    let mut topology = Topology::new(graph, hosts, elements, endpoints);
+
+    // constructs the network graph with network elements
+    topology.connect();
+    // attaches sources and sinks to hosts in the network graph
+    topology.attach(vec![0, 1]);
+    // runs the topology
+    topology.run(sim);
 
     // waits for the end of this simulation
     sim.advance(sim.shared().duration + 100.).await;
@@ -54,7 +80,6 @@ fn main() {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
-            next_id: (0..3).map(|_| AtomicUsize::new(0)).collect(),
         },
         |sim| Process::new(sim, network_sim(sim)),
     );

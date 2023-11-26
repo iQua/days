@@ -1,19 +1,16 @@
-//! A simple wire component.
+//! The wire element adds a propagation delay to packets.
 
-use statrs::statistics::Distribution;
+use rand::distributions::Distribution;
+use statrs::distribution::Uniform;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{get_id, Element, Shared};
+use crate::Shared;
 
-pub struct Wire<A>
-where
-    A: Distribution<Time>,
-{
-    element_id: usize,
-    /// the packet delay distribution
-    delay_dist: Box<dyn Fn() -> A>,
+#[derive(Debug)]
+pub struct Wire {
+    wire_id: usize,
     /// the time of the last sent packet, used to calculate the delay of the
     /// next packet
     last_sent: Time,
@@ -23,31 +20,10 @@ where
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl<A> Element for Wire<A>
-where
-    A: Distribution<Time>,
-{
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
-}
-
-impl<A> Wire<A>
-where
-    A: Distribution<Time>,
-{
-    pub fn new(delay_dist: Box<dyn Fn() -> A>) -> Wire<A> {
+impl Wire {
+    pub fn new(wire_id: usize) -> Wire {
         Wire {
-            element_id: get_id(),
-            delay_dist,
+            wire_id,
             last_sent: 0.,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -57,14 +33,15 @@ where
     async fn forward_packet(&mut self, mut packet: Packet, sim: SimContext<'_, Shared>) {
         println!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.element_id,
+            self.wire_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             sim.now(),
         );
 
-        let delay = (self.delay_dist)().sample(&mut *sim.shared().rng.borrow_mut());
+        let delay_dist = Uniform::new(2.0, 2.0).unwrap();
+        let delay = delay_dist.sample(&mut *sim.shared().rng.borrow_mut());
 
         if self.last_sent == 0. {
             self.last_sent = packet.time;
@@ -81,7 +58,7 @@ where
 
                 println!(
                     "Wire {} sent packet {} ({} bytes) from flow {} with a packet time of {:.3} at time {:.3}.",
-                    self.element_id,
+                    self.wire_id,
                     packet.packet_id,
                     packet.size,
                     packet.flow_id,
@@ -92,7 +69,7 @@ where
             Err(_) => {
                 panic!(
                     "Wire {}: a downstream element may have closed its channel.",
-                    self.element_id
+                    self.wire_id
                 );
             }
         }
@@ -105,7 +82,7 @@ where
 
         println!(
             "Wire {} finished running at time {}.",
-            self.element_id,
+            self.wire_id,
             sim.now()
         );
     }

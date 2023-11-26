@@ -16,15 +16,17 @@ pub struct Packet {
 
     /// # Example
     /// ```
+    /// use due::packets::packet::Packet;
+    ///
     /// let mut packet = Packet::new(
-    ///     packet_size,
-    ///     self.packets_sent,
+    ///     1024, // packet size
+    ///     0, // packet id
     ///     "source".to_string(),
     ///     "destination".to_string(),
-    ///     self.element_id,
-    ///     sim.now(),
+    ///     0, // flow_id
+    ///     0.0, // creation time
     /// );
-    /// packet.send(sim.now());
+    ///
     /// println!("{:?}", packet);
     /// ```
     /// the time when the packet is sent through a channel to the next element

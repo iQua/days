@@ -7,11 +7,13 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::sim::SimContext;
-use crate::{get_id, Element, Shared};
+use crate::schedulers::Scheduler;
+use crate::sim::{SimContext, Time};
+use crate::{next_scheduler_id, Shared};
 
 pub struct DRRServer {
-    element_id: usize,
+    scheduler_id: usize,
+
     /// the bit rate of the server
     rate: f64,
 
@@ -45,11 +47,7 @@ pub struct DRRServer {
     pub receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for DRRServer {
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
+impl Scheduler for DRRServer {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
@@ -90,7 +88,7 @@ impl DRRServer {
         };
 
         DRRServer {
-            element_id: get_id(),
+            scheduler_id: next_scheduler_id(),
             rate,
             flow_classes,
             drop_strategy: Box::new(packet_drop),
@@ -106,7 +104,11 @@ impl DRRServer {
         }
     }
 
-    fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
+    pub fn id(&self) -> usize {
+        self.scheduler_id
+    }
+
+    fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -119,10 +121,10 @@ impl DRRServer {
             self.packets_dropped += 1;
             println! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
-                self.element_id,
+                self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                sim.now()
+                now
             }
             return;
         }
@@ -138,11 +140,11 @@ impl DRRServer {
         println!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in class queue {}.",
-            self.element_id,
+            self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now(),
+            now,
             self.packets_received,
             self.queues[class_id].len(),
             class_id
@@ -183,13 +185,13 @@ impl DRRServer {
                         // recently sent to DDRServer while sending the previous
                         // packet
                         while let Ok(packet) = self.receiver.try_recv() {
-                            self.packet_received(packet, sim);
+                            self.packet_received(packet, sim.now());
                         }
 
                         println!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                                     {} packets in the class queue.",
-                            self.element_id,
+                            self.scheduler_id,
                             packet.packet_id,
                             packet.size,
                             packet.flow_id,
@@ -207,7 +209,7 @@ impl DRRServer {
             // waits for inbound packets from the upstream element
             if self.packets_waiting == 0 {
                 if let Some(packet) = self.receiver.recv().await {
-                    self.packet_received(packet, sim);
+                    self.packet_received(packet, sim.now());
                 } else {
                     break;
                 }
@@ -215,7 +217,7 @@ impl DRRServer {
         }
         println!(
             "DRRServer {} finished running at time {}.",
-            self.element_id,
+            self.scheduler_id,
             sim.now()
         );
     }

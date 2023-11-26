@@ -16,31 +16,6 @@ pub type Time = f64;
 
 /// Performs a single simulation run.
 ///
-/// Input is a function that takes a simulation context and returns the first
-/// process. It would be better if the function only needed to return the future
-/// needed to initialize the first process, but then the function signature gets
-/// more complicated and is harder to explain in a paper.
-///
-/// But just in case you're wondering how to do it:
-/// ```
-/// # use crate::sim::{SimContext, Process};
-/// # use std::future::Future;
-/// pub trait Active<'s,G> {
-///   fn lifecycle(self, sim: SimContext<'s,G>) -> Process<'s,G>;
-/// }
-///
-/// impl<'s,G,F,R> Active<'s,G> for F
-/// where F: FnOnce(SimContext<'s,G>) -> R,
-///       R: Future<Output = ()> + 's {
-///   fn lifecycle(self, sim: SimContext<'s,G>) -> Process<'s,G> {
-///     sim.process(self(sim))
-///   }
-/// }
-/// ```
-/// You may then change the signature to
-/// ```
-/// fn simulation<G>(shared: G, main: impl for<'s> Active<'s,G>) {}
-/// ```
 pub fn simulation<G, F>(shared: G, main: F) -> G
 where
     F: FnOnce(SimContext<G>) -> Process<G>,
@@ -512,7 +487,7 @@ impl Future for Waker {
 // Statistical facilities
 
 /// A simple collector for statistical data, inspired by SLX's random_variable.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RandomVar {
     total: Cell<u32>,
     sum: Cell<f64>,
