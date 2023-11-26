@@ -13,20 +13,14 @@ use due::Shared;
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let (fattree_graph, fattree_hosts) = build_fattree("configs/fattree.toml");
-
-    println!("The fattree graph is:\n{:?}", fattree_graph);
-    println!("The fattree hosts is:\n{:?}", fattree_hosts);
-
-    // reproduces examples/basic.rs
-    let graph = build("configs/simple.toml");
-    let elements = init_elements("configs/simple.toml");
-    println!("number of elements: {}", elements.len());
-
-    let endpoints = init_endpoints("configs/simple.toml");
-    println!("number of endpoints: {}", endpoints.len());
-
+    // reproduces examples/basic.rs through builders and initializers
+    let toml_path = "configs/simple.toml";
+    
+    let graph = build(toml_path);
+    let elements = init_elements(toml_path);
+    let endpoints = init_endpoints(toml_path);
     let hosts = vec![0, 1];
+
     let mut topology = Topology::new(graph, hosts, elements, endpoints);
 
     // constructs the network graph with network elements
