@@ -3,6 +3,7 @@
 
 use std::{fs, sync::Arc};
 
+use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
 use crate::packets::sink::PacketSink;
@@ -26,6 +27,11 @@ struct TomlSource {
     initial_delay: f64,
 }
 
+#[derive(Deserialize, Debug)]
+struct TomlFlow {
+    flow: Vec<Vec<usize>>,
+}
+
 #[derive(Deserialize)]
 struct ElementConfig {
     num_splitters: usize,
@@ -36,6 +42,11 @@ struct ElementConfig {
 struct EndPointConfig {
     num_sinks: usize,
     source: Vec<TomlSource>,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlowConfig {
+    flows: Vec<TomlFlow>,
 }
 
 pub fn init_elements(file_path: &str) -> Vec<Element> {
@@ -92,4 +103,31 @@ pub fn init_endpoints(file_path: &str) -> Vec<EndPoint> {
     }
 
     endpoints
+}
+
+// This function is used to initialize flows by a Vec of directed graphs.
+pub fn init_flows(file_path: &str) -> Vec<DiGraph<usize, ()>> {
+    // reads the configuration
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+    // deserializes the content of the configuration
+    let config: FlowConfig =
+        toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+    let mut flows = Vec::new();
+    for e in config.flows {
+        let mut graph = DiGraph::<usize, ()>::new();
+        for pair in e.flow {
+            // for the case that pair.len() > 1, there are more than one
+            // generator for this flow, then the flow_id of that packet can
+            // not be 'self.endpoint_id - num_elements()'
+            let start = graph.add_node(pair[0]);
+            let end = graph.add_node(pair[1]);
+            graph.add_edge(start, end, ());
+        }
+        println!("Graph: {:?}", graph);
+        flows.push(graph);
+    }
+    println!("Flows: {:?}", flows);
+    flows
 }

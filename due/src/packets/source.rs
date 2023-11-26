@@ -45,6 +45,10 @@ impl PacketSource {
         self.endpoint_id
     }
 
+    pub fn flow_id(&self) -> usize {
+        self.endpoint_id - num_elements()
+    }
+
     pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
