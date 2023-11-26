@@ -9,9 +9,11 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::sim::SimContext;
-use crate::{get_id, Element, Shared};
+use crate::schedulers::Scheduler;
+use crate::sim::{SimContext, Time};
+use crate::{next_scheduler_id, Shared};
 
+#[derive(Debug, Clone)]
 pub struct TaggedPacket {
     pub packet: Packet,
     /// tag is the finish time of the packet
@@ -44,7 +46,8 @@ impl PartialEq for TaggedPacket {
 impl Eq for TaggedPacket {}
 
 pub struct WFQServer {
-    element_id: usize,
+    scheduler_id: usize,
+
     /// the bit rate of the server
     rate: f64,
 
@@ -79,16 +82,101 @@ pub struct WFQServer {
     pub receiver: UnboundedReceiver<Packet>,
 }
 
-impl Element for WFQServer {
-    fn id(&mut self) -> usize {
-        self.element_id
-    }
-
+impl Scheduler for WFQServer {
     fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
         self.sender = sender;
     }
 
     fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
         self.receiver = receiver;
+    }
+}
+
+impl WFQServer {
+    pub fn new(
+        rate: f64,
+        capacity: usize,
+        capacity_unit: CapacityUnit,
+        flow_classes: Arc<dyn Fn(usize) -> usize>,
+        drop_strategy: DropStrategy,
+        weights: Vec<usize>,
+    ) -> WFQServer {
+        let mut finish_times = Vec::new();
+        let mut vtime = 0.0;
+        let mut last_update = 0.0;
+        let mut byte_sizes = Vec::new();
+        let mut queues = Vec::new();
+        let (sender, receiver) = unbounded_channel();
+
+        for (class_id, _) in weights.iter().enumerate() {
+            finish_times.push(0.0);
+            byte_sizes.push(0);
+            queues.push(BinaryHeap::new());
+        }
+
+        let packet_drop = match drop_strategy {
+            DropStrategy::TailDrop => TailDrop::new(capacity, capacity_unit),
+            _ => unimplemented!(),
+        };
+
+        WFQServer {
+            scheduler_id: next_scheduler_id(),
+            rate,
+            flow_classes,
+            drop_strategy: Box::new(packet_drop),
+            finish_times,
+            vtime,
+            last_update,
+            packets_received: 0,
+            packets_dropped: 0,
+            packets_waiting: 0,
+            byte_sizes,
+            queues,
+            sender,
+            receiver,
+        }
+    }
+
+    fn packet_received(&mut self, packet: TaggedPacket, now: Time) {
+        // drops the packet if the buffer is full
+        let should_drop_packet = self.drop_strategy.should_drop(
+            packet.packet.size,
+            self.byte_sizes.iter().sum(),
+            self.queues.iter().map(|q| q.len()).sum(),
+        );
+
+        // the case that this packet will be dropped.
+        if should_drop_packet {
+            self.packets_dropped += 1;
+            println! {
+                "Port {} dropped packet {} from flow {} at time {:.3}",
+                self.scheduler_id,
+                packet.packet.packet_id,
+                packet.packet.flow_id,
+                now
+            }
+            return;
+        }
+
+        self.packets_waiting += 1;
+        self.packets_received += 1;
+
+        let class_id = (self.flow_classes)(packet.packet.flow_id);
+
+        self.queues[class_id].push(packet.clone());
+        self.byte_sizes[class_id] += packet.packet.size;
+
+        println!(
+            "WFQServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            {} packets received, {} packet(s) in class queue {}.",
+            self.scheduler_id,
+            packet.packet.packet_id,
+            packet.packet.size,
+            packet.packet.flow_id,
+            now,
+            self.packets_received,
+            self.queues[class_id].len(),
+            class_id
+        );
     }
 }
