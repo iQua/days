@@ -174,12 +174,10 @@ impl PacketSwitch {
                 }
             }
             SchedulingDiscipline::FIFO => {
-                let mut senders_iter = self.senders.iter();
-
-                for (_, port) in self.ports {
+                for (element_id, port) in self.ports {
                     let mut p = port.downcast::<Port>().unwrap();
 
-                    if let Some((_, sender)) = senders_iter.next() {
+                    if let Some(sender) = self.senders.get(&element_id) {
                         p.connect_sender(sender.clone());
                     } else {
                         panic!("Not enough senders for ports.");

@@ -48,7 +48,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         (1000 * 8) as f64,
         100,
         weights.clone(),
-        vec![0],
+        vec![usize::MAX],
         SchedulingDiscipline::FIFO,
         Arc::new(|flow_id| flow_id),
     );
