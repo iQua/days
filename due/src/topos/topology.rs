@@ -1,8 +1,10 @@
 use petgraph::graph::{NodeIndex, UnGraph};
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::packets::EndPoint;
 use crate::sim::SimContext;
-use crate::{Element, EndPoint, Shared};
+use crate::switches::Element;
+use crate::Shared;
 
 pub struct Topology {
     /// Undirected graph of the topology
@@ -34,29 +36,14 @@ impl Topology {
     pub fn connect(&mut self) {
         for node_id in self.graph.node_indices() {
             let (sender, receiver) = unbounded_channel();
-
-            match &mut self.elements[node_id.index()] {
-                Element::PacketSwitch(switch) => {
-                    switch.connect_receiver(receiver);
-                }
-                Element::Splitter(splitter) => {
-                    splitter.connect_receiver(receiver);
-                }
-            }
+            self.elements[node_id.index()].connect_receiver(receiver);
 
             for neighbor in self.graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them
                 if neighbor.index() != node_id.index() {
-                    match &mut self.elements[neighbor.index()] {
-                        Element::PacketSwitch(switch) => {
-                            switch.connect_sender(node_id.index(), sender.clone());
-                        }
-                        Element::Splitter(splitter) => {
-                            splitter.connect_sender(node_id.index(), sender.clone());
-                        }
-                    }
+                    self.elements[neighbor.index()].connect_sender(node_id.index(), sender.clone());
                 }
             }
         }
@@ -78,53 +65,17 @@ impl Topology {
             let mut neighbors = self.graph.neighbors(NodeIndex::new(host_id));
 
             let (downlink_sender, downlink_receiver) = unbounded_channel();
-            let mut endpoint = endpoint_iter.next().unwrap();
+            let endpoint = endpoint_iter.next().unwrap();
 
             if let Some(next_neighbor) = neighbors.next() {
                 if next_neighbor.index() != host_id {
-                    match &mut self.elements[next_neighbor.index()] {
-                        Element::PacketSwitch(switch) => {
-                            let uplink_sender = switch.get_sender(host_id).unwrap();
-
-                            match &mut endpoint {
-                                EndPoint::PacketSource(source) => {
-                                    // attaches each endpoint's sender to its corresponding host's receiver
-                                    source.connect_sender(uplink_sender);
-                                    // attaches each endpoint's receiver to its corresponding host's sender
-                                    source.connect_receiver(downlink_receiver);
-                                }
-                                EndPoint::PacketSink(sink) => {
-                                    sink.connect_sender(uplink_sender);
-                                    sink.connect_receiver(downlink_receiver);
-                                }
-                            }
-                        }
-                        Element::Splitter(splitter) => {
-                            let uplink_sender = splitter.get_sender(host_id).unwrap();
-
-                            match &mut endpoint {
-                                EndPoint::PacketSource(source) => {
-                                    source.connect_sender(uplink_sender);
-                                    // attaches each endpoint's receiver to its corresponding host's sender
-                                    source.connect_receiver(downlink_receiver);
-                                }
-                                EndPoint::PacketSink(sink) => {
-                                    sink.connect_sender(uplink_sender);
-                                    sink.connect_receiver(downlink_receiver);
-                                }
-                            }
-                        }
-                    }
+                    self.elements[next_neighbor.index()].connect_neighbour_to_endpoint(
+                        endpoint,
+                        downlink_receiver,
+                        host_id,
+                    );
                 }
-
-                match &mut self.elements[host_id] {
-                    Element::PacketSwitch(switch) => {
-                        switch.connect_sender(endpoint.id(), downlink_sender);
-                    }
-                    Element::Splitter(splitter) => {
-                        splitter.connect_sender(endpoint.id(), downlink_sender);
-                    }
-                }
+                self.elements[host_id].connect_sender(endpoint.id(), downlink_sender);
             } else {
                 panic!("No neighbors found for host element {}", host_id);
             }
@@ -144,14 +95,7 @@ impl Topology {
         }
 
         for element in self.elements {
-            match element {
-                Element::PacketSwitch(switch) => {
-                    sim.activate(switch.run(sim));
-                }
-                Element::Splitter(splitter) => {
-                    sim.activate(splitter.run());
-                }
-            }
+            element.activate(sim);
         }
     }
 }
