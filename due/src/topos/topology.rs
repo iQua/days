@@ -138,17 +138,6 @@ impl Topology {
     }
 
     pub fn run(self, sim: SimContext<'_, Shared>) {
-        for element in self.elements {
-            match element {
-                Element::PacketSwitch(switch) => {
-                    sim.activate(switch.run(sim));
-                }
-                Element::Splitter(splitter) => {
-                    sim.activate(splitter.run());
-                }
-            }
-        }
-
         for endpoint in self.endpoints {
             match endpoint {
                 EndPoint::PacketSource(source) => {
@@ -156,6 +145,17 @@ impl Topology {
                 }
                 EndPoint::PacketSink(sink) => {
                     sim.activate(sink.run(sim));
+                }
+            }
+        }
+
+        for element in self.elements {
+            match element {
+                Element::PacketSwitch(switch) => {
+                    sim.activate(switch.run(sim));
+                }
+                Element::Splitter(splitter) => {
+                    sim.activate(splitter.run());
                 }
             }
         }

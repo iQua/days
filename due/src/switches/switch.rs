@@ -18,6 +18,14 @@ use crate::{next_element_id, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
+    /// the bit rate of each outbound port
+    port_rate: f64,
+    /// the capacity of each outbound port
+    capacity: usize,
+    /// flow_id -> class_id
+    flow_classes: Arc<dyn Fn(usize) -> usize>,
+    /// the weights of the classes
+    weights: Vec<usize>,
     /// Scheduling discipline
     discipline: SchedulingDiscipline,
     /// the number of packets received by the switch
@@ -28,8 +36,10 @@ pub struct PacketSwitch {
     /// the outbound ports, with consecutive ids starting from 0
     /// each of these ports is governed by a DRR or FIFO scheduler
     ports: Vec<Box<dyn Any>>,
+
     /// senders for sending inbound packets to outbound ports
-    port_senders: Vec<UnboundedSender<Packet>>,
+    /// element_id -> Scheduler
+    port_senders: HashMap<usize, UnboundedSender<Packet>>,
 
     /// senders for sending outbound packets to downstream elements
     /// element_id -> UnboundedSender<Packet>
@@ -41,7 +51,6 @@ pub struct PacketSwitch {
 
 impl PacketSwitch {
     pub fn new(
-        nports: usize,
         port_rate: f64,
         capacity: usize,
         weights: Vec<usize>,
@@ -49,52 +58,21 @@ impl PacketSwitch {
         discipline: SchedulingDiscipline,
         flow_classes: Arc<dyn Fn(usize) -> usize>,
     ) -> PacketSwitch {
-        let mut ports: Vec<Box<dyn Any>> = Vec::new();
-
+        // outbound ports
+        let ports: Vec<Box<dyn Any>> = Vec::new();
         // the senders from the demultiplexer to ports inside the switch
-        let mut port_senders = Vec::new();
-
-        for scheduler_id in 0..nports {
-            let (sender, receiver) = unbounded_channel();
-
-            match discipline {
-                SchedulingDiscipline::DRR => {
-                    let mut port = DRRServer::new(
-                        scheduler_id,
-                        port_rate,
-                        capacity,
-                        CapacityUnit::Packets,
-                        flow_classes.clone(),
-                        DropStrategy::TailDrop,
-                        weights.clone(),
-                    );
-
-                    port.connect_receiver(receiver);
-                    port_senders.push(sender);
-                    ports.push(Box::new(port));
-                }
-                SchedulingDiscipline::FIFO => {
-                    let mut port = Port::new(
-                        scheduler_id,
-                        port_rate,
-                        capacity,
-                        CapacityUnit::Packets,
-                        DropStrategy::TailDrop,
-                    );
-
-                    port.connect_receiver(receiver);
-                    port_senders.push(sender);
-                    ports.push(Box::new(port));
-                }
-            }
-        }
+        let port_senders = HashMap::new();
 
         PacketSwitch {
             element_id: next_element_id(),
-            packets_received: 0,
+            port_rate,
+            capacity,
+            flow_classes,
+            weights,
             discipline,
             fib,
             ports,
+            packets_received: 0,
             port_senders,
             senders: HashMap::new(),
             receiver: unbounded_channel().1,
@@ -118,13 +96,56 @@ impl PacketSwitch {
     }
 
     pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
+        // if element_id is u32::MAX, then the sender is an endpoint (i.e., a source or sink)
+        let (port_sender, port_receiver) = unbounded_channel();
+        let port_id = self.ports.len() + 1;
+
+        // creates a port with the specified scheduling discipline
+        match self.discipline {
+            SchedulingDiscipline::DRR => {
+                let mut port = DRRServer::new(
+                    port_id,
+                    self.port_rate,
+                    self.capacity,
+                    CapacityUnit::Packets,
+                    self.flow_classes.clone(),
+                    DropStrategy::TailDrop,
+                    self.weights.clone(),
+                );
+
+                port.connect_receiver(port_receiver);
+                self.port_senders.insert(port_id, port_sender);
+                self.ports.push(Box::new(port));
+            }
+            SchedulingDiscipline::FIFO => {
+                let mut port = Port::new(
+                    port_id,
+                    self.port_rate,
+                    self.capacity,
+                    CapacityUnit::Packets,
+                    DropStrategy::TailDrop,
+                );
+
+                port.connect_receiver(port_receiver);
+                self.port_senders.insert(port_id, port_sender);
+                self.ports.push(Box::new(port));
+            }
+        }
+
         self.senders.insert(element_id, sender.clone());
+
+        println!(
+            "PacketSwitch {} connected its sender to element {}.",
+            self.element_id, element_id
+        );
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         // connects ports to outbound senders and activates them for execution
         match self.discipline {
             SchedulingDiscipline::DRR => {
+                println!("drr length of senders: {}", self.senders.len());
+                println!("drr length of ports: {}", self.ports.len());
                 let mut senders_iter = self.senders.iter();
 
                 for port in self.ports {
@@ -171,7 +192,9 @@ impl PacketSwitch {
 
             // forwards packets to their corresponding outbound ports
             let port_id = self.fib[packet.flow_id];
-            let _ = self.port_senders[port_id].send(packet);
+            if let Some(port_sender) = self.port_senders.get(&port_id) {
+                let _ = port_sender.send(packet);
+            }
         }
 
         println!(

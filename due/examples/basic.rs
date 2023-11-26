@@ -25,10 +25,8 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let mut endpoints: Vec<EndPoint> = Vec::new();
 
     // creates a collection of packet sources
-    for _ in 0..2 {
-        let source = PacketSource::new(1.0);
-        endpoints.push(EndPoint::PacketSource(source));
-    }
+    let source = PacketSource::new(1.0);
+    endpoints.push(EndPoint::PacketSource(source));
 
     // creates a sink
     let sink = PacketSink::default();
@@ -38,7 +36,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let weights = vec![1, 1];
 
     let switch_1 = PacketSwitch::new(
-        1,
         (1000 * 8) as f64,
         100,
         weights.clone(),
@@ -48,7 +45,6 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     );
 
     let switch_2 = PacketSwitch::new(
-        1,
         (1000 * 8) as f64,
         100,
         weights.clone(),
@@ -67,7 +63,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     // constructs the network graph with network elements
     topology.connect();
     // attaches sources and sinks to hosts in the network graph
-    topology.attach(vec![0, 0, 1]);
+    topology.attach(vec![0, 1]);
     // runs the topology
     topology.run(sim);
 
