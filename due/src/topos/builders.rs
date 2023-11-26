@@ -14,9 +14,6 @@ struct Config {
 #[derive(Deserialize)]
 struct FatTreeConfig {
     k: usize,
-    port_rate: f64,
-    capacity: usize,
-    n_classes_per_port: usize,
 }
 
 /// This function is used to build a topology from a toml file
@@ -36,7 +33,7 @@ pub fn build(file_path: &str) -> UnGraph<usize, ()> {
         indices.insert(id, node_index);
     }
 
-    // adds edges for the graph
+    // connects edges for the graph
     for edge in config.edges {
         graph.add_edge(indices[&edge.0], indices[&edge.1], ());
     }
@@ -44,8 +41,8 @@ pub fn build(file_path: &str) -> UnGraph<usize, ()> {
     graph
 }
 
-/// This function is used to build a fattree topology
-pub fn build_fattree(file_path: &str) -> UnGraph<usize, ()> {
+/// This function is used to build a fattree topology and its hosts.
+pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("No valid TOML file.");
 
@@ -53,16 +50,18 @@ pub fn build_fattree(file_path: &str) -> UnGraph<usize, ()> {
     let config: FatTreeConfig =
         toml::from_str(&content).expect("Failed to deserialize the toml file.");
 
-    println!(
-        "k: {}, port_rate: {:.1}, capacity: {}, n_classes_per_port: {}",
-        config.k, config.port_rate, config.capacity, config.n_classes_per_port
-    );
+    println!("In build_fattree, k: {}", config.k);
 
-    let num_edge_switches = config.k.pow(2) / 2;
-    let num_regular_switches = config.k.pow(2) * 3 / 4;
-    let num_switches = num_edge_switches + num_regular_switches;
+    let num_layer_switches = config.k.pow(2) / 2;
+    let num_core_switches = config.k.pow(2) / 4;
+    let num_switches = 2 * num_layer_switches + num_core_switches;
+
+    let layer_switches_per_pod = config.k / 2;
+    let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
+
     let mut graph = UnGraph::<usize, ()>::new_undirected();
     let mut indices = HashMap::new();
+    let mut edges = Vec::new();
 
     // initializes nodes for all elements
     for id in 0..num_switches {
@@ -70,7 +69,31 @@ pub fn build_fattree(file_path: &str) -> UnGraph<usize, ()> {
         indices.insert(id, node_index);
     }
 
-    // TODO: connects nodes
+    // sets edges between edge-layer switches and aggregation-layer switches
+    for edge_id in 0..num_layer_switches {
+        let pod_id = edge_id / layer_switches_per_pod;
+        let agg_start = num_layer_switches + pod_id * layer_switches_per_pod;
+        for agg_id in agg_start..agg_start + layer_switches_per_pod {
+            edges.push((edge_id, agg_id))
+        }
+    }
 
-    graph
+    // sets edges between aggregation-layer switches and core-layer switches
+    for agg_id in num_layer_switches..2 * num_layer_switches {
+        let core_group = agg_id % layer_switches_per_pod;
+        let core_start = 2 * num_layer_switches + core_group * core_switches_per_agg;
+        for core_id in core_start..core_start + core_switches_per_agg {
+            edges.push((agg_id, core_id));
+        }
+    }
+
+    // connects all nodes based on edges
+    for edge in edges {
+        graph.add_edge(indices[&edge.0], indices[&edge.1], ());
+    }
+
+    // distinguishes all hosts (edge switches)
+    let hosts: Vec<usize> = (0..num_layer_switches).collect();
+
+    (graph, hosts)
 }
