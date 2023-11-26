@@ -26,6 +26,15 @@ pub enum EndPoint {
     PacketSink(PacketSink),
 }
 
+impl EndPoint {
+    pub fn id(&self) -> usize {
+        match self {
+            EndPoint::PacketSource(source) => source.id(),
+            EndPoint::PacketSink(sink) => sink.id(),
+        }
+    }
+}
+
 /// Globally shared data.
 pub struct Shared {
     pub rng: RefCell<SmallRng>,
@@ -33,17 +42,28 @@ pub struct Shared {
     pub duration: Time,
 }
 
+static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);
+static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
+static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
+
+pub fn num_elements() -> usize {
+    NUM_ELEMENTS.load(Ordering::Relaxed)
+}
+
+pub fn set_num_elements(num_elements: usize) {
+    NUM_ELEMENTS.store(num_elements, Ordering::Relaxed);
+    ENDPOINT_ID.store(num_elements, Ordering::Relaxed);
+}
+
 pub fn next_element_id() -> usize {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    ELEMENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn next_endpoint_id() -> usize {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    ENDPOINT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn next_scheduler_id() -> usize {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    SCHEDULER_ID.fetch_add(1, Ordering::Relaxed)
 }

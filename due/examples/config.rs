@@ -2,13 +2,14 @@
 
 use std::cell::RefCell;
 
-use due::topos::build::{build_fattree, build_graph};
-use due::topos::init::{init_elements, init_endpoints};
-use due::topos::topology::Topology;
 use rand::{rngs::SmallRng, SeedableRng};
 
+use due::topos::build::build_graph;
+use due::topos::init::{init_elements, init_endpoints};
+use due::topos::topology::Topology;
+
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::Shared;
+use due::{set_num_elements, Shared};
 
 const SEED: u64 = 1000;
 
@@ -17,6 +18,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     let toml_path = "configs/simple.toml";
 
     let graph = build_graph(toml_path);
+    set_num_elements(graph.node_count());
     let elements = init_elements(toml_path);
     let endpoints = init_endpoints(toml_path);
     let hosts = vec![0, 1];

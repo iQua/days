@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{next_endpoint_id, Shared};
+use crate::{next_endpoint_id, num_elements, Shared};
 
 #[derive(Debug)]
 pub struct PacketSource {
@@ -84,7 +84,7 @@ impl PacketSource {
                 self.packets_sent,
                 "PacketSource".to_string(),
                 "destination".to_string(),
-                self.endpoint_id,
+                self.endpoint_id - num_elements(),
                 sim.now(),
             );
 

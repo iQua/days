@@ -14,13 +14,16 @@ use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::SchedulingDiscipline;
 use due::topos::topology::Topology;
-use due::{Element, EndPoint, Shared};
+use due::{set_num_elements, Element, EndPoint, Shared};
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     // element ids in a network graph start from 0
     let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    // endpoint ids start from the total number of elements
+    let num_elements = graph.node_count();
+    set_num_elements(num_elements);
     // packet sources and sinks are endpoints
     let mut endpoints: Vec<EndPoint> = Vec::new();
 
@@ -48,7 +51,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         (1000 * 8) as f64,
         100,
         weights.clone(),
-        vec![usize::MAX],
+        vec![3],
         SchedulingDiscipline::FIFO,
         Arc::new(|flow_id| flow_id),
     );

@@ -72,23 +72,18 @@ impl Topology {
 
         // attaches each endpoint's sender to its corresponding host's receiver
         for host_id in attach_to {
-            println!("Attaching endpoint to host {}.", host_id);
             assert!(self.hosts.contains(&host_id));
 
             // locate a neighboring element in the network graph to this host
             let mut neighbors = self.graph.neighbors(NodeIndex::new(host_id));
-            println!("Host {} has neighbors.", host_id);
-            println!("The neighbors are: {:?}", neighbors);
 
             let (downlink_sender, downlink_receiver) = unbounded_channel();
             let mut endpoint = endpoint_iter.next().unwrap();
 
             if let Some(next_neighbor) = neighbors.next() {
                 if next_neighbor.index() != host_id {
-                    println!("Processing neighbor {}.", next_neighbor.index());
                     match &mut self.elements[next_neighbor.index()] {
                         Element::PacketSwitch(switch) => {
-                            println!("Processing switch {}.", switch.id());
                             let uplink_sender = switch.get_sender(host_id).unwrap();
 
                             match &mut endpoint {
@@ -99,7 +94,6 @@ impl Topology {
                                     source.connect_receiver(downlink_receiver);
                                 }
                                 EndPoint::PacketSink(sink) => {
-                                    println!("Processing sink {}.", sink.id());
                                     sink.connect_sender(uplink_sender);
                                     sink.connect_receiver(downlink_receiver);
                                 }
@@ -125,10 +119,10 @@ impl Topology {
 
                 match &mut self.elements[host_id] {
                     Element::PacketSwitch(switch) => {
-                        switch.connect_sender(usize::MAX, downlink_sender);
+                        switch.connect_sender(endpoint.id(), downlink_sender);
                     }
                     Element::Splitter(splitter) => {
-                        splitter.connect_sender(usize::MAX, downlink_sender);
+                        splitter.connect_sender(endpoint.id(), downlink_sender);
                     }
                 }
             } else {

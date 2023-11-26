@@ -14,7 +14,7 @@ use crate::schedulers::port::Port;
 use crate::schedulers::Scheduler;
 use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
-use crate::{next_element_id, Shared};
+use crate::{next_element_id, num_elements, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
@@ -97,14 +97,12 @@ impl PacketSwitch {
     }
 
     pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
-        // if element_id is u32::MAX, then the sender is an endpoint (i.e., a source or sink)
-        // port 0 is reserved for sending to endpoints
         let (port_sender, port_receiver) = unbounded_channel();
         // creates a port with the specified scheduling discipline
         match self.discipline {
             SchedulingDiscipline::DRR => {
                 let mut port;
-                if element_id < usize::MAX {
+                if element_id < num_elements() {
                     // sends to another network element
                     port = DRRServer::new(
                         self.port_rate,
@@ -131,7 +129,7 @@ impl PacketSwitch {
             }
             SchedulingDiscipline::FIFO => {
                 let mut port;
-                if element_id < usize::MAX {
+                if element_id < num_elements() {
                     // sends to another network element
                     port = Port::new(
                         self.port_rate,
@@ -150,11 +148,6 @@ impl PacketSwitch {
         }
 
         self.senders.insert(element_id, sender.clone());
-
-        println!(
-            "PacketSwitch {} connected its sender to element {}.",
-            self.element_id, element_id
-        );
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
@@ -203,16 +196,7 @@ impl PacketSwitch {
 
             // forwards packets to their corresponding downstream elements
             let element_id = self.fib[packet.flow_id];
-
-            println!(
-                "Switch {}: sending packet {} to element {}.",
-                self.element_id, packet.packet_id, element_id
-            );
             if let Some(port_sender) = self.port_senders.get(&element_id) {
-                println!(
-                    "Sending packet {} to element {}.",
-                    packet.packet_id, element_id
-                );
                 let _ = port_sender.send(packet);
             }
         }
