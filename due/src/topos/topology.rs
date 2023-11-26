@@ -44,16 +44,18 @@ impl Topology {
                 }
             }
 
-            for neighbor_index in self.graph.neighbors(node_id) {
+            for neighbor in self.graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them
-                match &mut self.elements[neighbor_index.index()] {
-                    Element::PacketSwitch(switch) => {
-                        switch.connect_sender(node_id.index(), sender.clone());
-                    }
-                    Element::Splitter(splitter) => {
-                        splitter.connect_sender(node_id.index(), sender.clone());
+                if neighbor.index() != node_id.index() {
+                    match &mut self.elements[neighbor.index()] {
+                        Element::PacketSwitch(switch) => {
+                            switch.connect_sender(node_id.index(), sender.clone());
+                        }
+                        Element::Splitter(splitter) => {
+                            splitter.connect_sender(node_id.index(), sender.clone());
+                        }
                     }
                 }
             }
@@ -70,44 +72,52 @@ impl Topology {
 
         // attaches each endpoint's sender to its corresponding host's receiver
         for host_id in attach_to {
+            println!("Attaching endpoint to host {}.", host_id);
             assert!(self.hosts.contains(&host_id));
 
             // locate a neighboring element in the network graph to this host
             let mut neighbors = self.graph.neighbors(NodeIndex::new(host_id));
+            println!("Host {} has neighbors.", host_id);
+            println!("The neighbors are: {:?}", neighbors);
 
             let (downlink_sender, downlink_receiver) = unbounded_channel();
             let mut endpoint = endpoint_iter.next().unwrap();
 
-            if let Some(first_neighbor) = neighbors.next() {
-                match &mut self.elements[first_neighbor.index()] {
-                    Element::PacketSwitch(switch) => {
-                        let uplink_sender = switch.get_sender(host_id).unwrap();
+            if let Some(next_neighbor) = neighbors.next() {
+                if next_neighbor.index() != host_id {
+                    println!("Processing neighbor {}.", next_neighbor.index());
+                    match &mut self.elements[next_neighbor.index()] {
+                        Element::PacketSwitch(switch) => {
+                            println!("Processing switch {}.", switch.id());
+                            let uplink_sender = switch.get_sender(host_id).unwrap();
 
-                        match &mut endpoint {
-                            EndPoint::PacketSource(source) => {
-                                // attaches each endpoint's sender to its corresponding host's receiver
-                                source.connect_sender(uplink_sender);
-                                // attaches each endpoint's receiver to its corresponding host's sender
-                                source.connect_receiver(downlink_receiver);
-                            }
-                            EndPoint::PacketSink(sink) => {
-                                sink.connect_sender(uplink_sender);
-                                sink.connect_receiver(downlink_receiver);
+                            match &mut endpoint {
+                                EndPoint::PacketSource(source) => {
+                                    // attaches each endpoint's sender to its corresponding host's receiver
+                                    source.connect_sender(uplink_sender);
+                                    // attaches each endpoint's receiver to its corresponding host's sender
+                                    source.connect_receiver(downlink_receiver);
+                                }
+                                EndPoint::PacketSink(sink) => {
+                                    println!("Processing sink {}.", sink.id());
+                                    sink.connect_sender(uplink_sender);
+                                    sink.connect_receiver(downlink_receiver);
+                                }
                             }
                         }
-                    }
-                    Element::Splitter(splitter) => {
-                        let uplink_sender = splitter.get_sender(host_id).unwrap();
+                        Element::Splitter(splitter) => {
+                            let uplink_sender = splitter.get_sender(host_id).unwrap();
 
-                        match &mut endpoint {
-                            EndPoint::PacketSource(source) => {
-                                source.connect_sender(uplink_sender);
-                                // attaches each endpoint's receiver to its corresponding host's sender
-                                source.connect_receiver(downlink_receiver);
-                            }
-                            EndPoint::PacketSink(sink) => {
-                                sink.connect_sender(uplink_sender);
-                                sink.connect_receiver(downlink_receiver);
+                            match &mut endpoint {
+                                EndPoint::PacketSource(source) => {
+                                    source.connect_sender(uplink_sender);
+                                    // attaches each endpoint's receiver to its corresponding host's sender
+                                    source.connect_receiver(downlink_receiver);
+                                }
+                                EndPoint::PacketSink(sink) => {
+                                    sink.connect_sender(uplink_sender);
+                                    sink.connect_receiver(downlink_receiver);
+                                }
                             }
                         }
                     }
