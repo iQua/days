@@ -35,15 +35,14 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     endpoints.push(EndPoint::PacketSink(sink));
 
     // initializes a packet switch only one outbound port (#0)
-    let weights = vec![1];
-    let fib = vec![0, 0];
+    let weights = vec![1, 1];
 
     let switch_1 = PacketSwitch::new(
         1,
         (1000 * 8) as f64,
         100,
         weights.clone(),
-        fib.clone(),
+        vec![0, 0],
         SchedulingDiscipline::FIFO,
         Arc::new(|flow_id| flow_id),
     );
@@ -53,7 +52,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         (1000 * 8) as f64,
         100,
         weights.clone(),
-        fib.clone(),
+        vec![0, 0],
         SchedulingDiscipline::FIFO,
         Arc::new(|flow_id| flow_id),
     );
