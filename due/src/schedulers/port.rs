@@ -8,7 +8,7 @@ use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::schedulers::Scheduler;
 use crate::sim::{SimContext, Time};
-use crate::Shared;
+use crate::{next_scheduler_id, Shared};
 
 pub struct Port {
     scheduler_id: usize,
@@ -42,7 +42,6 @@ impl Scheduler for Port {
 
 impl Port {
     pub fn new(
-        scheduler_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
@@ -54,7 +53,7 @@ impl Port {
         };
 
         Port {
-            scheduler_id,
+            scheduler_id: next_scheduler_id(),
             rate,
             drop_strategy: Box::new(packet_drop),
             packets_received: 0,

@@ -9,7 +9,7 @@ use crate::packets::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::schedulers::Scheduler;
 use crate::sim::{SimContext, Time};
-use crate::Shared;
+use crate::{next_scheduler_id, Shared};
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -59,7 +59,6 @@ impl Scheduler for DRRServer {
 
 impl DRRServer {
     pub fn new(
-        scheduler_id: usize,
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
@@ -89,7 +88,7 @@ impl DRRServer {
         };
 
         DRRServer {
-            scheduler_id,
+            scheduler_id: next_scheduler_id(),
             rate,
             flow_classes,
             drop_strategy: Box::new(packet_drop),
