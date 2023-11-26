@@ -1,4 +1,4 @@
-num_nodes = 32
+num_nodes = 2
 edges = [[1, 0]]
 num_splitters = 0
 num_sinks = 1
@@ -7,14 +7,14 @@ num_sinks = 1
 port_rate = 32000
 capacity = 100
 weights = [1]
-discipline = "DRR"
+discipline = "FIFO"
 fib = [0]
 
 [[switch]]
 port_rate = 32000
 capacity = 100
-weights = [2]
-discipline = "DRR"
+weights = [1]
+discipline = "FIFO"
 fib = [1]
 
 [[source]]

@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use due::topos::builders::build_fattree;
+use due::topos::builders::{build, build_fattree};
 use due::topos::initializers::{init_elements, init_endpoints};
 use due::topos::topology::Topology;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -13,12 +13,13 @@ use due::Shared;
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    let (graph, hosts) = build_fattree("configs/fattree.toml");
+    let (fattree_graph, fattree_hosts) = build_fattree("configs/fattree.toml");
 
-    println!("The fattree graph is:\n{:?}", graph);
-    println!("The fattree hosts is:\n{:?}", hosts);
+    println!("The fattree graph is:\n{:?}", fattree_graph);
+    println!("The fattree hosts is:\n{:?}", fattree_hosts);
 
-    // tests of initializer
+    // reproduces examples/basic.rs
+    let graph = build("configs/simple.toml");
     let elements = init_elements("configs/simple.toml");
     println!("number of elements: {}", elements.len());
 
@@ -34,6 +35,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     topology.attach(vec![0, 1]);
     // runs the topology
     topology.run(sim);
+
+    // waits for the end of this simulation
+    sim.advance(sim.shared().duration + 100.).await;
 }
 
 fn main() {
