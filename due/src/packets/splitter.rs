@@ -24,6 +24,10 @@ impl Default for Splitter {
 }
 
 impl Splitter {
+    pub fn new() -> Splitter {
+        Default::default()
+    }
+
     pub fn id(&self) -> usize {
         self.element_id
     }
@@ -42,10 +46,6 @@ impl Splitter {
 
     pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
         self.senders.insert(element_id, sender.clone());
-    }
-
-    pub fn new() -> Splitter {
-        Default::default()
     }
 
     pub async fn run(mut self) {

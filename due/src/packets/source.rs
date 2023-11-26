@@ -40,7 +40,7 @@ impl PacketSource {
         }
     }
 
-    pub fn endpoint_id(&self) -> usize {
+    pub fn id(&self) -> usize {
         self.endpoint_id
     }
 

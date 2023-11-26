@@ -105,6 +105,10 @@ impl DRRServer {
         }
     }
 
+    pub fn id(&self) -> usize {
+        self.scheduler_id
+    }
+
     fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
