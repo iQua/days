@@ -1,3 +1,6 @@
+//! This file provides builders for building the topology based on the
+//! information given in a toml file.
+
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};

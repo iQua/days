@@ -5,18 +5,22 @@ use crate::sim::SimContext;
 use crate::{Element, EndPoint, Shared};
 
 pub struct Topology {
+    /// Undirected graph of the topology
     graph: UnGraph<i32, ()>,
+    /// A Vec of element ids that connects to endpoints
     hosts: Vec<usize>,
+    /// A Vec of PacketSwitchs and Splitters
     elements: Vec<Element>,
+    /// A Vec of PacketSources and PacketSinks
     endpoints: Vec<EndPoint>,
 }
 
 impl Topology {
     pub fn new(
         graph: UnGraph<i32, ()>,
+        hosts: Vec<usize>,
         elements: Vec<Element>,
         endpoints: Vec<EndPoint>,
-        hosts: Vec<usize>,
     ) -> Topology {
         Topology {
             graph,

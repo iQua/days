@@ -63,7 +63,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
         Element::PacketSwitch(switch_2),
     ];
     let hosts = vec![0, 1];
-    let mut topology = Topology::new(graph, elements, endpoints, hosts);
+    let mut topology = Topology::new(graph, hosts, elements, endpoints);
 
     // constructs the network graph with network elements
     topology.connect();
