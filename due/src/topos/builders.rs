@@ -5,11 +5,6 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
-#[derive(Debug)]
-pub struct Node {
-    pub id: usize,
-}
-
 #[derive(Deserialize)]
 struct Config {
     num_nodes: usize,
@@ -25,22 +20,20 @@ struct FatTreeConfig {
 }
 
 /// This function is used to build a topology from a toml file
-pub fn build(file_path: &str) -> UnGraph<Node, ()> {
+pub fn build(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("No valid TOML file.");
 
     // deserializes the content of the toml file
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the toml file.");
 
-    let mut graph = UnGraph::<Node, ()>::new_undirected();
+    let mut graph = UnGraph::<usize, ()>::new_undirected();
     let mut indices = HashMap::new();
 
     // addes nodes for the graph
-    for node_id in 0..config.num_nodes {
-        let node = Node { id: node_id };
-
-        let index = graph.add_node(node);
-        indices.insert(node_id, index);
+    for id in 0..config.num_nodes {
+        let node_index = graph.add_node(id);
+        indices.insert(id, node_index);
     }
 
     // adds edges for the graph
@@ -52,7 +45,7 @@ pub fn build(file_path: &str) -> UnGraph<Node, ()> {
 }
 
 /// This function is used to build a fattree topology
-pub fn build_fattree(file_path: &str) -> UnGraph<Node, ()> {
+pub fn build_fattree(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("No valid TOML file.");
 
@@ -67,22 +60,14 @@ pub fn build_fattree(file_path: &str) -> UnGraph<Node, ()> {
 
     let num_edge_switches = config.k.pow(2) / 2;
     let num_regular_switches = config.k.pow(2) * 3 / 4;
-    let mut graph = UnGraph::<Node, ()>::new_undirected();
+    let num_switches = num_edge_switches + num_regular_switches;
+    let mut graph = UnGraph::<usize, ()>::new_undirected();
+    let mut indices = HashMap::new();
 
-    // initializes nodes for edge switches
-    for _ in 0..num_edge_switches {
-        let index = graph.add_node(Node { id: 0 });
-        if let Some(node) = graph.node_weight_mut(index) {
-            node.id = index.index();
-        }
-    }
-
-    // initializes nodes for aggregation and core switches
-    for _ in 0..num_regular_switches {
-        let index = graph.add_node(Node { id: 0 });
-        if let Some(node) = graph.node_weight_mut(index) {
-            node.id = index.index();
-        }
+    // initializes nodes for all elements
+    for id in 0..num_switches {
+        let node_index = graph.add_node(id);
+        indices.insert(id, node_index);
     }
 
     // TODO: connects nodes

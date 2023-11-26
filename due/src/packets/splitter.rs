@@ -55,7 +55,7 @@ impl Splitter {
                 self.element_id, packet.packet_id, packet.size,
             );
 
-            for (_, sender) in &self.senders {
+            for sender in self.senders.values() {
                 let _ = sender.send(packet.clone());
             }
         }
