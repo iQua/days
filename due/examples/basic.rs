@@ -20,7 +20,7 @@ const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
     // element ids in a network graph start from 0
-    let graph = UnGraph::<i32, ()>::from_edges(&[(0, 1)]);
+    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
     // packet sources and sinks are endpoints
     let mut endpoints: Vec<EndPoint> = Vec::new();
 

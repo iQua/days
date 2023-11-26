@@ -6,7 +6,7 @@ use crate::{Element, EndPoint, Shared};
 
 pub struct Topology {
     /// Undirected graph of the topology
-    graph: UnGraph<i32, ()>,
+    graph: UnGraph<usize, ()>,
     /// A Vec of element ids that connects to endpoints
     hosts: Vec<usize>,
     /// A Vec of PacketSwitchs and Splitters
@@ -17,7 +17,7 @@ pub struct Topology {
 
 impl Topology {
     pub fn new(
-        graph: UnGraph<i32, ()>,
+        graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         elements: Vec<Element>,
         endpoints: Vec<EndPoint>,

@@ -5,34 +5,15 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
-/// Types of elements in the topology
-#[derive(Debug, Deserialize)]
-pub enum NodeType {
-    Edge,
-    Regular,
-}
-
 #[derive(Debug)]
 pub struct Node {
     pub id: usize,
-    pub node_type: NodeType,
-}
-
-#[derive(Deserialize)]
-struct TomlNode {
-    id: usize,
-    node_type: NodeType,
-}
-
-#[derive(Deserialize)]
-struct Edges {
-    pairs: Vec<(usize, usize)>,
 }
 
 #[derive(Deserialize)]
 struct Config {
-    nodes: Vec<TomlNode>,
-    edges: Edges,
+    num_nodes: usize,
+    edges: Vec<(usize, usize)>,
 }
 
 #[derive(Deserialize)]
@@ -55,18 +36,15 @@ pub fn build(file_path: &str) -> UnGraph<Node, ()> {
     let mut indices = HashMap::new();
 
     // addes nodes for the graph
-    for toml_node in config.nodes {
-        let node = Node {
-            id: toml_node.id,
-            node_type: toml_node.node_type,
-        };
+    for node_id in 0..config.num_nodes {
+        let node = Node { id: node_id };
 
         let index = graph.add_node(node);
-        indices.insert(toml_node.id, index);
+        indices.insert(node_id, index);
     }
 
     // adds edges for the graph
-    for edge in config.edges.pairs {
+    for edge in config.edges {
         graph.add_edge(indices[&edge.0], indices[&edge.1], ());
     }
 
@@ -93,10 +71,7 @@ pub fn build_fattree(file_path: &str) -> UnGraph<Node, ()> {
 
     // initializes nodes for edge switches
     for _ in 0..num_edge_switches {
-        let index = graph.add_node(Node {
-            id: 0,
-            node_type: NodeType::Edge,
-        });
+        let index = graph.add_node(Node { id: 0 });
         if let Some(node) = graph.node_weight_mut(index) {
             node.id = index.index();
         }
@@ -104,10 +79,7 @@ pub fn build_fattree(file_path: &str) -> UnGraph<Node, ()> {
 
     // initializes nodes for aggregation and core switches
     for _ in 0..num_regular_switches {
-        let index = graph.add_node(Node {
-            id: 0,
-            node_type: NodeType::Regular,
-        });
+        let index = graph.add_node(Node { id: 0 });
         if let Some(node) = graph.node_weight_mut(index) {
             node.id = index.index();
         }
