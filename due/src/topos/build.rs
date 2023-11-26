@@ -7,7 +7,7 @@ use std::{collections::HashMap, fs};
 
 #[derive(Deserialize)]
 struct Config {
-    num_nodes: usize,
+    num_elements: usize,
     edges: Vec<(usize, usize)>,
 }
 
@@ -16,19 +16,20 @@ struct FatTreeConfig {
     k: usize,
 }
 
-/// This function is used to build a topology from a toml file
-pub fn build(file_path: &str) -> UnGraph<usize, ()> {
+/// This function is used to build a topology from a toml configuration file
+pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
-    let content = fs::read_to_string(file_path).expect("No valid TOML file.");
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid.");
 
-    // deserializes the content of the toml file
-    let config: Config = toml::from_str(&content).expect("Failed to deserialize the toml file.");
+    // deserializes the content of the toml configuration file
+    let config: Config =
+        toml::from_str(&content).expect("Failed to deserialize the configuration.");
 
     let mut graph = UnGraph::<usize, ()>::new_undirected();
     let mut indices = HashMap::new();
 
-    // addes nodes for the graph
-    for id in 0..config.num_nodes {
+    // addes nodes to the graph
+    for id in 0..config.num_elements {
         let node_index = graph.add_node(id);
         indices.insert(id, node_index);
     }
@@ -44,11 +45,11 @@ pub fn build(file_path: &str) -> UnGraph<usize, ()> {
 /// This function is used to build a fattree topology and its hosts.
 pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the toml file
-    let content = fs::read_to_string(file_path).expect("No valid TOML file.");
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid.");
 
     // deserializes the content of the toml file
     let config: FatTreeConfig =
-        toml::from_str(&content).expect("Failed to deserialize the toml file.");
+        toml::from_str(&content).expect("Failed to deserialize the configuration.");
 
     println!("In build_fattree, k: {}", config.k);
 
