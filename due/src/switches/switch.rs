@@ -101,6 +101,10 @@ impl PacketSwitch {
         }
     }
 
+    pub fn id(&self) -> usize {
+        self.element_id
+    }
+
     pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
         if let Some(sender) = self.senders.get(&element_id) {
             return Some(sender.clone());

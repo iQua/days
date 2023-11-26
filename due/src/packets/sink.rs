@@ -70,6 +70,18 @@ impl PacketSink {
         Default::default()
     }
 
+    pub fn id(&self) -> usize {
+        self.endpoint_id
+    }
+
+    pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
+
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.arrival_times.tabulate(sim.now());
         self.inter_arrival_times
@@ -91,14 +103,6 @@ impl PacketSink {
             packet.flow_id,
             sim.now(),
         );
-    }
-
-    pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
-
-    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
