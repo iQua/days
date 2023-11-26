@@ -36,6 +36,8 @@ pub struct PacketSwitch {
     /// the outbound ports, with consecutive ids starting from 0
     /// each of these ports is governed by a DRR or FIFO scheduler
     ports: Vec<Box<dyn Any>>,
+    next_port_id: usize,
+    endpoint_port: Box<dyn Scheduler>,
 
     /// senders for sending inbound packets to outbound ports
     /// element_id -> Scheduler
@@ -62,6 +64,25 @@ impl PacketSwitch {
         let ports: Vec<Box<dyn Any>> = Vec::new();
         // the senders from the demultiplexer to ports inside the switch
         let port_senders = HashMap::new();
+        // the port for sending to endpoints
+        let endpoint_port: Box<dyn Scheduler> = match discipline {
+            SchedulingDiscipline::DRR => Box::new(DRRServer::new(
+                0,
+                0.0,
+                0,
+                CapacityUnit::Packets,
+                flow_classes.clone(),
+                DropStrategy::TailDrop,
+                weights.clone(),
+            )),
+            SchedulingDiscipline::FIFO => Box::new(Port::new(
+                0,
+                0.0,
+                0,
+                CapacityUnit::Packets,
+                DropStrategy::TailDrop,
+            )),
+        };
 
         PacketSwitch {
             element_id: next_element_id(),
@@ -72,6 +93,8 @@ impl PacketSwitch {
             discipline,
             fib,
             ports,
+            endpoint_port,
+            next_port_id: 0,
             packets_received: 0,
             port_senders,
             senders: HashMap::new(),
@@ -97,38 +120,62 @@ impl PacketSwitch {
 
     pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
         // if element_id is u32::MAX, then the sender is an endpoint (i.e., a source or sink)
+        // port 0 is reserved for sending to endpoints
         let (port_sender, port_receiver) = unbounded_channel();
-        let port_id = self.ports.len() + 1;
+        // ports are numbered from 1 for sending to other network elements
+        self.next_port_id += 1;
 
         // creates a port with the specified scheduling discipline
         match self.discipline {
             SchedulingDiscipline::DRR => {
-                let mut port = DRRServer::new(
-                    port_id,
-                    self.port_rate,
-                    self.capacity,
-                    CapacityUnit::Packets,
-                    self.flow_classes.clone(),
-                    DropStrategy::TailDrop,
-                    self.weights.clone(),
-                );
+                if element_id < usize::MAX {
+                    // sends to another network element
+                    let mut port = DRRServer::new(
+                        self.next_port_id,
+                        self.port_rate,
+                        self.capacity,
+                        CapacityUnit::Packets,
+                        self.flow_classes.clone(),
+                        DropStrategy::TailDrop,
+                        self.weights.clone(),
+                    );
 
-                port.connect_receiver(port_receiver);
-                self.port_senders.insert(port_id, port_sender);
-                self.ports.push(Box::new(port));
+                    port.connect_receiver(port_receiver);
+                    self.port_senders.insert(self.next_port_id, port_sender);
+                    self.ports.push(Box::new(port));
+                } else {
+                    // sends to an endpoint
+                    self.endpoint_port.connect_receiver(port_receiver);
+                    self.port_senders.insert(0, port_sender);
+                }
             }
             SchedulingDiscipline::FIFO => {
-                let mut port = Port::new(
-                    port_id,
-                    self.port_rate,
-                    self.capacity,
-                    CapacityUnit::Packets,
-                    DropStrategy::TailDrop,
-                );
+                if element_id < usize::MAX {
+                    // sends to another network element
+                    let mut port = Port::new(
+                        self.next_port_id,
+                        self.port_rate,
+                        self.capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    );
 
-                port.connect_receiver(port_receiver);
-                self.port_senders.insert(port_id, port_sender);
-                self.ports.push(Box::new(port));
+                    port.connect_receiver(port_receiver);
+                    println!(
+                        "Switch {}: inserting port {} into port_senders",
+                        self.element_id, self.next_port_id
+                    );
+                    self.port_senders.insert(self.next_port_id, port_sender);
+                    self.ports.push(Box::new(port));
+                } else {
+                    // sends to an endpoint
+                    println!(
+                        "Switch {}: inserting port 0 into port_senders",
+                        self.element_id
+                    );
+                    self.endpoint_port.connect_receiver(port_receiver);
+                    self.port_senders.insert(0, port_sender);
+                }
             }
         }
 
@@ -192,7 +239,13 @@ impl PacketSwitch {
 
             // forwards packets to their corresponding outbound ports
             let port_id = self.fib[packet.flow_id];
+
+            println!(
+                "Switch {}: sending packet {} to port {}.",
+                self.element_id, packet.packet_id, port_id
+            );
             if let Some(port_sender) = self.port_senders.get(&port_id) {
+                println!("Sending packet {} to port {}.", packet.packet_id, port_id);
                 let _ = port_sender.send(packet);
             }
         }

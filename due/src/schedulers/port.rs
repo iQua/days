@@ -12,7 +12,7 @@ use crate::Shared;
 
 pub struct Port {
     scheduler_id: usize,
-    /// the bit rate of the port
+    /// the bit rate of the port (0 for unlimited)
     rate: f64,
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop>,
@@ -130,7 +130,9 @@ impl Port {
             }
 
             if let Some(mut packet) = self.queue.pop_front() {
-                sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+                if self.rate > 0.0 {
+                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+                }
 
                 packet.send(sim.now());
                 let _ = self.sender.send(packet.clone());
