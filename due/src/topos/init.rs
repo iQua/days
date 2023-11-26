@@ -1,13 +1,16 @@
 //! Initializers for creating elements and endpoints based on the information
 //! given in a configuration.
 
-use crate::{
-    packets::{sink::PacketSink, source::PacketSource, splitter::Splitter},
-    switches::{switch::PacketSwitch, SchedulingDiscipline},
-    Element, EndPoint,
-};
-use serde::Deserialize;
 use std::{fs, sync::Arc};
+
+use serde::Deserialize;
+
+use crate::packets::sink::PacketSink;
+use crate::packets::source::PacketSource;
+use crate::packets::EndPoint;
+use crate::switches::splitter::Splitter;
+use crate::switches::switch::PacketSwitch;
+use crate::switches::{Element, SchedulingDiscipline};
 
 #[derive(Deserialize)]
 struct TomlSwitch {

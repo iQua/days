@@ -53,6 +53,15 @@ impl PacketSource {
         self.receiver = receiver;
     }
 
+    pub fn connect_switch(
+        &mut self,
+        sender: UnboundedSender<Packet>,
+        receiver: UnboundedReceiver<Packet>,
+    ) {
+        self.sender = sender;
+        self.receiver = receiver;
+    }
+
     fn packet_sent(&mut self, now: Time, packet: Packet) {
         self.packets_sent += 1;
 

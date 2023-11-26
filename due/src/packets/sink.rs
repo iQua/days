@@ -83,6 +83,15 @@ impl PacketSink {
         self.receiver = receiver;
     }
 
+    pub fn connect_switch(
+        &mut self,
+        sender: UnboundedSender<Packet>,
+        receiver: UnboundedReceiver<Packet>,
+    ) {
+        self.sender = sender;
+        self.receiver = receiver;
+    }
+
     fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
         self.arrival_times.tabulate(sim.now());
         self.inter_arrival_times
