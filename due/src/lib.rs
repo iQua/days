@@ -20,6 +20,7 @@ pub enum Element {
     Splitter(Splitter),
 }
 
+#[derive(Debug)]
 pub enum EndPoint {
     PacketSource(PacketSource),
     PacketSink(PacketSink),

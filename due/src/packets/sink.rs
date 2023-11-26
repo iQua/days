@@ -13,6 +13,7 @@ use crate::packets::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
 use crate::{next_endpoint_id, Shared};
 
+#[derive(Debug)]
 pub struct PacketSink {
     endpoint_id: usize,
     /// the arrival times of the packets

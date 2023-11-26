@@ -9,6 +9,7 @@ use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::{next_endpoint_id, Shared};
 
+#[derive(Debug)]
 pub struct PacketSource {
     endpoint_id: usize,
     initial_delay: Time,

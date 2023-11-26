@@ -512,7 +512,7 @@ impl Future for Waker {
 // Statistical facilities
 
 /// A simple collector for statistical data, inspired by SLX's random_variable.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RandomVar {
     total: Cell<u32>,
     sum: Cell<f64>,

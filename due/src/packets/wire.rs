@@ -8,6 +8,7 @@ use crate::packets::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::Shared;
 
+#[derive(Debug)]
 pub struct Wire {
     wire_id: usize,
     /// the time of the last sent packet, used to calculate the delay of the

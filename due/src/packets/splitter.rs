@@ -7,6 +7,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::next_element_id;
 use crate::packets::packet::Packet;
 
+#[derive(Debug)]
 pub struct Splitter {
     element_id: usize,
     senders: HashMap<usize, UnboundedSender<Packet>>,

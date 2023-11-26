@@ -1,2 +1,16 @@
 num_nodes = 3
 edges = [[1, 0], [1, 2]]
+
+[[element]]
+element_type = 'PacketSwitch'
+port_rate = 32000
+capacity = 100
+weights = [1]
+discipline = "DRR"
+
+[[element]]
+element_type = 'PacketSwitch'
+port_rate = 32000
+capacity = 100
+weights = [2]
+discipline = "DRR"
