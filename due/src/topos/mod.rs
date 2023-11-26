@@ -1,3 +1,3 @@
 pub mod build;
-pub mod initializers;
+pub mod init;
 pub mod topology;

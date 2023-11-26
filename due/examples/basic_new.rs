@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use due::topos::build::{build_fattree, build_graph};
-use due::topos::initializers::{init_elements, init_endpoints};
+use due::topos::init::{init_elements, init_endpoints};
 use due::topos::topology::Topology;
 use rand::{rngs::SmallRng, SeedableRng};
 

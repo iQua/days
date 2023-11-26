@@ -1,5 +1,5 @@
-//! This file provides initializers for creating elements and endpoints based on
-//! the information given in a toml file.
+//! Initializers for creating elements and endpoints based on the information
+//! given in a configuration.
 
 use crate::{
     packets::{sink::PacketSink, source::PacketSource, splitter::Splitter},
@@ -14,7 +14,7 @@ struct TomlSwitch {
     port_rate: f64,
     capacity: usize,
     weights: Vec<usize>,
-    discipline: String,
+    discipline: SchedulingDiscipline,
     fib: Vec<usize>,
 }
 
@@ -36,18 +36,18 @@ struct EndPointConfig {
 }
 
 pub fn init_elements(file_path: &str) -> Vec<Element> {
-    // reads the toml file
-    let content = fs::read_to_string(file_path).expect("No valid TOML file.");
+    // reads the configuration
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-    // deserializes the content of the toml file
+    // deserializes the content of the configuration
     let config: ElementConfig =
-        toml::from_str(&content).expect("Failed to deserialize the toml file.");
+        toml::from_str(&content).expect("Failed to deserialize the configuration");
 
     let mut elements: Vec<Element> = Vec::new();
 
     for e in config.switch {
         println!(
-            "{}, {}, {:?}, {}, {:?}",
+            "{}, {}, {:?}, {:?}, {:?}",
             e.port_rate, e.capacity, e.weights, e.discipline, e.fib
         );
 
@@ -56,7 +56,7 @@ pub fn init_elements(file_path: &str) -> Vec<Element> {
             e.capacity,
             e.weights,
             e.fib,
-            get_discipline(&e.discipline),
+            e.discipline,
             Arc::new(|flow_id| flow_id),
         );
         elements.push(Element::PacketSwitch(switch));
@@ -70,12 +70,12 @@ pub fn init_elements(file_path: &str) -> Vec<Element> {
 }
 
 pub fn init_endpoints(file_path: &str) -> Vec<EndPoint> {
-    // reads the toml file
-    let content = fs::read_to_string(file_path).expect("No valid TOML file.");
+    // reads the configuration
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-    // deserializes the content of the toml file
+    // deserializes the content of the configuration
     let config: EndPointConfig =
-        toml::from_str(&content).expect("Failed to deserialize the toml file.");
+        toml::from_str(&content).expect("Failed to deserialize the configuration");
 
     let mut endpoints: Vec<EndPoint> = Vec::new();
 
@@ -89,17 +89,4 @@ pub fn init_endpoints(file_path: &str) -> Vec<EndPoint> {
     }
 
     endpoints
-}
-
-/// This function uses scheduling discipline information in the toml file to get
-/// the discipline. May be removed later by implementing Deserialize for SchedulingDiscipline.
-fn get_discipline(discipline: &str) -> SchedulingDiscipline {
-    match discipline {
-        "FIFO" => SchedulingDiscipline::FIFO,
-        "DRR" => SchedulingDiscipline::DRR,
-        _ => {
-            println!("Invalid discipline.");
-            SchedulingDiscipline::FIFO
-        }
-    }
 }
