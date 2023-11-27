@@ -2,7 +2,6 @@ seed = 1000
 num_elements = 2
 edges = [[0, 1]]
 num_splitters = 0
-num_sinks = 1
 
 [[switch]]
 port_rate = 8000
@@ -17,9 +16,6 @@ capacity = 100
 weights = [1]
 discipline = "FIFO"
 fib = [3]
-
-[[source]]
-initial_delay = 1.0
 
 [[flows]]
 id = 0

@@ -26,7 +26,7 @@ pub struct SeedConfig {
     seed: u64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
 pub enum DistributionInfo {
     Exp { lambda: f64 },

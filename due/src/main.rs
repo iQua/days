@@ -14,14 +14,14 @@ use due::{get_seed, set_num_elements, Shared};
 async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path.as_str();
 
-    // tests for init_flows
-    let _ = init_flows(file_path);
+    let flows = init_flows(file_path);
+    println!("Flows: {:?}", flows);
 
     let graph = build_graph(file_path);
     set_num_elements(graph.node_count());
 
     let elements = init_elements(file_path);
-    let endpoints = init_endpoints(file_path);
+    let endpoints = init_endpoints(flows);
     let hosts = vec![0, 1];
 
     let mut topology = Topology::new(graph, hosts, elements, endpoints);

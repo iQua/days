@@ -25,11 +25,6 @@ struct TomlSwitch {
     fib: Vec<usize>,
 }
 
-#[derive(Deserialize)]
-struct TomlSource {
-    initial_delay: f64,
-}
-
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
     id: usize,
@@ -43,12 +38,6 @@ struct TomlFlow {
 struct ElementConfig {
     num_splitters: usize,
     switch: Vec<TomlSwitch>,
-}
-
-#[derive(Deserialize)]
-struct EndPointConfig {
-    num_sinks: usize,
-    source: Vec<TomlSource>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -90,22 +79,13 @@ pub fn init_elements(file_path: &str) -> Vec<Element> {
     elements
 }
 
-pub fn init_endpoints(file_path: &str) -> Vec<EndPoint> {
-    // reads the configuration
-    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
-
-    // deserializes the content of the configuration
-    let config: EndPointConfig =
-        toml::from_str(&content).expect("Failed to deserialize the configuration");
-
+pub fn init_endpoints(flows: Vec<Flow>) -> Vec<EndPoint> {
     let mut endpoints: Vec<EndPoint> = Vec::new();
 
-    for e in config.source {
-        let source = PacketSource::new(e.initial_delay);
+    for flow in flows {
+        // Need to set params for the pkt source!
+        let source = PacketSource::new(flow);
         endpoints.push(EndPoint::PacketSource(source));
-    }
-
-    for _ in 0..config.num_sinks {
         endpoints.push(EndPoint::PacketSink(PacketSink::new()));
     }
 
@@ -142,6 +122,5 @@ pub fn init_flows(file_path: &str) -> Vec<Flow> {
             e.pkt_size_dist,
         ));
     }
-    println!("Flows: {:?}", flows);
     flows
 }
