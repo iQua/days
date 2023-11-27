@@ -118,25 +118,34 @@ impl Topology {
                 // gets fibs for elements along the path
                 for (idx, &node_idx) in path.iter().enumerate() {
                     let element_id = self.graph.node_weight(node_idx).unwrap();
-                    let (flow_id, &next_id) = match idx < path.len() - 1 {
+                    let mut next_id = usize::MAX;
+                    let (flow_id, next_id) = match idx < path.len() - 1 {
                         true => {
-                            let next_element_id = self.graph.node_weight(path[idx + 1]).unwrap();
-                            (flow.id, next_element_id)
+                            next_id = *self.graph.node_weight(path[idx + 1]).unwrap();
+                            (flow.id, next_id)
                         }
                         false => {
-                            // TODO: change the endpoints
-                            // let next_endpoint_id = 100;
-                            (flow.id, &100)
+                            for endpoint in &self.endpoints {
+                                match endpoint {
+                                    EndPoint::PacketSource(source) => {
+                                        if source.flow_id() == flow.id {
+                                            next_id = source.id() + 1;
+                                        }
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            (flow.id, next_id)
                         }
                     };
                     results
                         .entry(*element_id)
                         .or_default()
                         .push((flow_id, next_id));
-                    println!("NodeIndex: {:?}, element_id: {}", node_idx, element_id)
                 }
             }
         }
+        println!("Results: {:?}", results);
 
         // sets fibs for all switch elemetns
         for element in &mut self.elements {
@@ -147,12 +156,11 @@ impl Topology {
                     for (flow_id, next_id) in flow_to_next {
                         switch.set_fib(*flow_id, *next_id);
                     }
+                    println!("Fib for Switch {} is: {:?}", switch.id(), switch.get_fib());
                 }
                 Element::Splitter(_) => continue,
             }
         }
-
-        println!("Results: {:?}", results);
     }
 
     pub fn run(self, sim: SimContext<'_, Shared>) {
