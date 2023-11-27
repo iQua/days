@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use petgraph::algo::all_simple_paths;
 use petgraph::graph::{NodeIndex, UnGraph};
-use petgraph::visit::{EdgeRef, Topo};
-use rand::seq::SliceRandom;
+use petgraph::visit::EdgeRef;
 use rand::Rng;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -108,31 +107,62 @@ impl Topology {
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
     pub fn set(&mut self, flows: Vec<Flow>, sim: SimContext<'_, Shared>) {
+        // element_id -> Vec<(flow_id, next_id)>
+        let mut results: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for flow in flows {
-            // computes the shortest paths for the flow
-            let mut path = Vec::new();
             for edge in flow.graph.edge_references() {
-                // start and end are element id of the host elements for the
-                // flow, while start_node_idx is the NodeIndex of the start
-                // host element of the flow
+                // finds the NodeIndex of start and end nodes of the path
                 let start = flow.graph.node_weight(edge.source()).unwrap();
                 let end = flow.graph.node_weight(edge.target()).unwrap();
                 let &start_node_idx = self.indices.get(start).unwrap();
                 let &end_node_idx = self.indices.get(end).unwrap();
 
-                // fetch all shortest paths and randomly select one
+                // fetches all shortest paths and randomly select one
                 let shortest_paths: Vec<Vec<NodeIndex>> =
                     self.get_shortest_paths(start_node_idx, end_node_idx);
                 let random_idx =
                     (&mut *sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
-                let shortest_path = &shortest_paths[random_idx];
-                path.push(shortest_path.clone());
-            }
-            println!("path {:?} of flow {}", path, flow.id);
+                let path = &shortest_paths[random_idx];
+                println!("The path of flow {}: {:?}", flow.id, path);
 
-            // set fibs for all elements along the path
-            
+                // gets fibs for elements along the path
+                for (idx, &node_idx) in path.iter().enumerate() {
+                    let element_id = self.graph.node_weight(node_idx).unwrap();
+                    let (flow_id, &next_id) = match idx < path.len() - 1 {
+                        true => {
+                            let next_element_id = self.graph.node_weight(path[idx + 1]).unwrap();
+                            (flow.id, next_element_id)
+                        }
+                        false => {
+                            // TODO: change the endpoints
+                            // let next_endpoint_id = 100;
+                            (flow.id, &100)
+                        }
+                    };
+                    results
+                        .entry(*element_id)
+                        .or_insert(Vec::new())
+                        .push((flow_id, next_id));
+                    println!("NodeIndex: {:?}, element_id: {}", node_idx, element_id)
+                }
+            }
         }
+
+        // sets fibs for all switch elemetns
+        for element in &mut self.elements {
+            match element {
+                Element::PacketSwitch(switch) => {
+                    let id = switch.id();
+                    let flow_to_next = results.get(&id).unwrap();
+                    for (flow_id, next_id) in flow_to_next {
+                        switch.set_fib(*flow_id, *next_id);
+                    }
+                }
+                Element::Splitter(_) => continue,
+            }
+        }
+
+        println!("Results: {:?}", results);
     }
 
     pub fn run(self, sim: SimContext<'_, Shared>) {

@@ -1,6 +1,7 @@
 //! Initializers for creating elements and endpoints based on the information
 //! given in a configuration.
 
+use std::collections::HashMap;
 use std::{fs, sync::Arc};
 
 use petgraph::graph::DiGraph;
@@ -22,7 +23,6 @@ struct TomlSwitch {
     capacity: usize,
     weights: Vec<usize>,
     discipline: SchedulingDiscipline,
-    fib: Vec<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -57,15 +57,15 @@ pub fn init_elements(file_path: &str) -> Vec<Element> {
 
     for e in config.switch {
         println!(
-            "{}, {}, {:?}, {:?}, {:?}",
-            e.port_rate, e.capacity, e.weights, e.discipline, e.fib
+            "{}, {}, {:?}, {:?}",
+            e.port_rate, e.capacity, e.weights, e.discipline
         );
 
         let switch = PacketSwitch::new(
             e.port_rate,
             e.capacity,
             e.weights,
-            e.fib,
+            HashMap::new(),
             e.discipline,
             Arc::new(|flow_id| flow_id),
         );
