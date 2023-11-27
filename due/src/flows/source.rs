@@ -5,8 +5,8 @@ use rand::distributions::Distribution;
 use statrs::distribution::{DiscreteUniform, Exp};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::flow::flow::Flow;
-use crate::packets::packet::Packet;
+use crate::flows::flow::Flow;
+use crate::flows::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::{next_endpoint_id, DistributionInfo, Shared};
 

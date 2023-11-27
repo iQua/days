@@ -5,8 +5,8 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::flow::flow::Flow;
-use crate::packets::EndPoint;
+use crate::flows::flow::Flow;
+use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::Element;
 use crate::Shared;

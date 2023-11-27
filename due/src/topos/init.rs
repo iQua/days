@@ -6,10 +6,10 @@ use std::{fs, sync::Arc};
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
-use crate::flow::flow::Flow;
-use crate::packets::sink::PacketSink;
-use crate::packets::source::PacketSource;
-use crate::packets::EndPoint;
+use crate::flows::flow::Flow;
+use crate::flows::sink::PacketSink;
+use crate::flows::source::PacketSource;
+use crate::flows::EndPoint;
 use crate::sim::Time;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;

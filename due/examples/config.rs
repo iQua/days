@@ -6,7 +6,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 
 use due::topos::build::build_graph;
 use due::topos::init::{init_elements, init_endpoints, init_flows};
-use due::topos::topology::Topology;
+use due::topos::topo::Topology;
 
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::{set_num_elements, Shared};

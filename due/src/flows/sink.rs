@@ -9,7 +9,7 @@
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
 use crate::{next_endpoint_id, Shared};
 

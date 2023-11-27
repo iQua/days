@@ -8,13 +8,13 @@ use std::sync::Arc;
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
-use due::packets::sink::PacketSink;
-use due::packets::source::PacketSource;
-use due::packets::EndPoint;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
+use due::flows::EndPoint;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::switches::switch::PacketSwitch;
 use due::switches::{Element, SchedulingDiscipline};
-use due::topos::topology::Topology;
+use due::topos::topo::Topology;
 use due::{set_num_elements, Shared};
 
 const SEED: u64 = 1000;

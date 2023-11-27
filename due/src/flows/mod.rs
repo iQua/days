@@ -1,3 +1,4 @@
+pub mod flow;
 pub mod packet;
 pub mod sink;
 pub mod source;
@@ -5,9 +6,9 @@ pub mod wire;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
-use crate::packets::sink::PacketSink;
-use crate::packets::source::PacketSource;
+use crate::flows::packet::Packet;
+use crate::flows::sink::PacketSink;
+use crate::flows::source::PacketSource;
 use crate::sim::SimContext;
 use crate::Shared;
 
