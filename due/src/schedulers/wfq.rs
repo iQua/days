@@ -4,7 +4,6 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use rand::distributions::weighted;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::packets::packet::Packet;
@@ -144,10 +143,10 @@ impl WFQServer {
         }
     }
 
-    fn packet_received(&mut self, packet: TaggedPacket, now: Time) {
+    fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
-            packet.packet.size,
+            packet.size,
             self.byte_sizes.iter().sum(),
             self.scheduler_queue.len(),
         );
@@ -158,8 +157,8 @@ impl WFQServer {
             println! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
-                packet.packet.packet_id,
-                packet.packet.flow_id,
+                packet.packet_id,
+                packet.flow_id,
                 now
             }
             return;
@@ -168,24 +167,54 @@ impl WFQServer {
         self.packets_waiting += 1;
         self.packets_received += 1;
 
-        let class_id = (self.flow_classes)(packet.packet.flow_id);
+        let class_id = (self.flow_classes)(packet.flow_id);
 
-        self.scheduler_queue.push(packet.clone());
+        // adds tag (finish time) to the packet before push to the priority queue
+        let tagged_packet = self.add_tag(packet, now);
 
-        self.byte_sizes[class_id] += packet.packet.size;
+        self.scheduler_queue.push(tagged_packet.clone());
+
+        self.byte_sizes[class_id] += packet.size;
 
         println!(
             "WFQServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in queue {}.",
             self.scheduler_id,
-            packet.packet.packet_id,
-            packet.packet.size,
-            packet.packet.flow_id,
+            packet.packet_id,
+            packet.size,
+            packet.flow_id,
             now,
             self.packets_received,
             self.scheduler_queue.len(),
             class_id
         );
+    }
+
+    fn add_tag(&mut self, packet: Packet, now: Time) -> TaggedPacket {
+        let mut finish_time = 0.0;
+        // updates the virtual time and the finish time for each flow class
+        if self.active_set.is_empty() {
+            self.vtime = 0.0;
+            for (class_id, _) in self.finish_times.iter().enumerate() {
+                self.finish_times[class_id] = 0.0;
+            }
+        } else {
+            let mut weight_sum = 0.0;
+
+            for i in self.active_set {
+                weight_sum += self.weights[i];
+            }
+
+            self.vtime += (now - self.last_update) / weight_sum;
+            let class_id = (self.flow_classes)(packet.flow_id);
+            finish_time = self.vtime.max(self.finish_times[class_id])
+                + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id]);
+            self.finish_times[class_id] = finish_time;
+        }
+        return TaggedPacket {
+            packet: packet,
+            tag: finish_time,
+        };
     }
 
     fn update_stats(&mut self, packet: TaggedPacket, now: Time) {
@@ -215,5 +244,59 @@ impl WFQServer {
         self.last_update = now;
 
         self.byte_sizes[class_id] -= packet.packet.size;
+    }
+
+    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+        loop {
+            // schedules packets by going through the priority queue
+            while !self.scheduler_queue.is_empty() {
+                let packet = self.scheduler_queue.pop().unwrap().clone();
+                let class_id = (self.flow_classes)(packet.packet.flow_id);
+
+                self.byte_sizes[class_id] -= packet.packet.size;
+
+                let timeout = (packet.packet.size as f64) * 8.0 / self.rate;
+                sim.advance(timeout).await;
+                let mut outbound = self.scheduler_queue.pop().unwrap();
+                outbound.packet.send(sim.now());
+                let _ = self.sender.send(packet.packet.clone());
+
+                self.packets_waiting -= 1;
+
+                self.update_stats(packet, sim.now());
+
+                // polls for and receives all outstanding packets
+                // recently sent to WFQServer while sending the previous
+                // packet
+                while let Ok(packet) = self.receiver.try_recv() {
+                    self.packet_received(packet, sim.now());
+                }
+
+                println!(
+                    "WFQServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+                            {} packets in the queue.",
+                    self.scheduler_id,
+                    packet.packet.packet_id,
+                    packet.packet.size,
+                    packet.packet.flow_id,
+                    sim.now(),
+                    self.active_set.len(),
+                );
+            } // finishes going through the queue in one round
+
+            // waits for inbound packets from the upstream element
+            if self.packets_waiting == 0 {
+                if let Some(packet) = self.receiver.recv().await {
+                    self.packet_received(packet, sim.now());
+                } else {
+                    break;
+                }
+            }
+        }
+        println!(
+            "WFQServer {} finished running at time {}.",
+            self.scheduler_id,
+            sim.now()
+        );
     }
 }
