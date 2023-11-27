@@ -22,7 +22,9 @@ fib = [3]
 initial_delay = 1.0
 
 [[flows]]
+id = 0
 flow = [[0, 1]]
 
 [[flows]]
+id = 1
 flow = [[1, 0]]

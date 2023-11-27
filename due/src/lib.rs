@@ -12,6 +12,7 @@ pub mod schedulers;
 pub mod sim;
 pub mod switches;
 pub mod topos;
+pub mod flow;
 
 /// Globally shared data.
 pub struct Shared {

@@ -6,6 +6,7 @@ use std::{fs, sync::Arc};
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
+use crate::flow::flow::Flow;
 use crate::packets::sink::PacketSink;
 use crate::packets::source::PacketSource;
 use crate::packets::EndPoint;
@@ -29,6 +30,7 @@ struct TomlSource {
 
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
+    id: usize,
     flow: Vec<Vec<usize>>,
 }
 
@@ -106,7 +108,7 @@ pub fn init_endpoints(file_path: &str) -> Vec<EndPoint> {
 }
 
 // This function is used to initialize flows by a Vec of directed graphs.
-pub fn init_flows(file_path: &str) -> Vec<DiGraph<usize, ()>> {
+pub fn init_flows(file_path: &str) -> Vec<Flow> {
     // reads the configuration
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -126,7 +128,7 @@ pub fn init_flows(file_path: &str) -> Vec<DiGraph<usize, ()>> {
             graph.add_edge(start, end, ());
         }
         println!("Graph: {:?}", graph);
-        flows.push(graph);
+        flows.push(Flow::new(e.id, 0.0, graph));
     }
     println!("Flows: {:?}", flows);
     flows
