@@ -1,16 +1,16 @@
-/// capacity unit for the packet drop strategy.
+/// Capacity unit for the packet drop strategy.
 pub enum CapacityUnit {
     Bytes,
     Packets,
 }
 
-/// the packet drop strategy.
+/// The packet drop strategy.
 pub enum DropStrategy {
     TailDrop,
     RED,
 }
 
-/// defines the interface for all packet drop strategies.
+/// Defines the interface for all packet drop strategies.
 pub trait PacketDrop {
     fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool;
 }

@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use petgraph::algo::dijkstra;
+use petgraph::algo::all_simple_paths;
 use petgraph::graph::{NodeIndex, UnGraph};
-use petgraph::visit::EdgeRef;
+use petgraph::visit::{EdgeRef, Topo};
+use rand::seq::SliceRandom;
+use rand::Rng;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
+use crate::flows::route::Routing;
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::Element;
@@ -22,6 +25,18 @@ pub struct Topology {
     elements: Vec<Element>,
     /// A Vec of PacketSources and PacketSinks
     endpoints: Vec<EndPoint>,
+}
+
+impl Routing for Topology {
+    fn get_shortest_paths(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<Vec<NodeIndex>> {
+        let mut all_shortest_paths = Vec::new();
+        let result = all_simple_paths(&self.graph, start, end, 0, None);
+        for path in result {
+            all_shortest_paths.push(path);
+        }
+        // all_shortest_paths
+        all_shortest_paths
+    }
 }
 
 impl Topology {
@@ -92,7 +107,7 @@ impl Topology {
     }
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
-    pub fn set(&mut self, flows: Vec<Flow>) {
+    pub fn set(&mut self, flows: Vec<Flow>, sim: SimContext<'_, Shared>) {
         for flow in flows {
             // computes the shortest paths for the flow
             let mut path = Vec::new();
@@ -102,11 +117,18 @@ impl Topology {
                 // host element of the flow
                 let start = flow.graph.node_weight(edge.source()).unwrap();
                 let end = flow.graph.node_weight(edge.target()).unwrap();
-                let start_node_idx = self.indices.get(start).unwrap();
-                let end_node_idx = self.indices.get(end).unwrap();
+                let &start_node_idx = self.indices.get(start).unwrap();
+                let &end_node_idx = self.indices.get(end).unwrap();
 
-                // todo: compute the shortest path, then push it to paths
+                // fetch all shortest paths and randomly select one
+                let shortest_paths: Vec<Vec<NodeIndex>> =
+                    self.get_shortest_paths(start_node_idx, end_node_idx);
+                let random_idx =
+                    (&mut *sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
+                let shortest_path = &shortest_paths[random_idx];
+                path.push(shortest_path.clone());
             }
+            println!("path {:?} of flow {}", path, flow.id);
 
             // set fibs for all elements along the path
         }
