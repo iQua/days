@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 
-use petgraph::algo::all_simple_paths;
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use rand::Rng;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
-use crate::flows::route::Routing;
+use crate::flows::route::{Route, Routing};
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::Element;
@@ -24,18 +23,8 @@ pub struct Topology {
     elements: Vec<Element>,
     /// A Vec of PacketSources and PacketSinks
     endpoints: Vec<EndPoint>,
-}
-
-impl Routing for Topology {
-    fn get_shortest_paths(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<Vec<NodeIndex>> {
-        let mut all_shortest_paths = Vec::new();
-        let result = all_simple_paths(&self.graph, start, end, 0, None);
-        for path in result {
-            all_shortest_paths.push(path);
-        }
-        // all_shortest_paths
-        all_shortest_paths
-    }
+    /// Routing module
+    routing: Route,
 }
 
 impl Topology {
@@ -47,11 +36,12 @@ impl Topology {
         endpoints: Vec<EndPoint>,
     ) -> Topology {
         Topology {
-            graph,
+            graph: graph.clone(),
             indices,
             elements,
             endpoints,
             hosts,
+            routing: Route::new(graph),
         }
     }
 
@@ -119,9 +109,9 @@ impl Topology {
 
                 // fetches all shortest paths and randomly select one
                 let shortest_paths: Vec<Vec<NodeIndex>> =
-                    self.get_shortest_paths(start_node_idx, end_node_idx);
+                    self.routing.compute_route(start_node_idx, end_node_idx);
                 let random_idx =
-                    (&mut *sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
+                    (*sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
                 let path = &shortest_paths[random_idx];
                 println!("The path of flow {}: {:?}", flow.id, path);
 
@@ -141,7 +131,7 @@ impl Topology {
                     };
                     results
                         .entry(*element_id)
-                        .or_insert(Vec::new())
+                        .or_default()
                         .push((flow_id, next_id));
                     println!("NodeIndex: {:?}, element_id: {}", node_idx, element_id)
                 }
