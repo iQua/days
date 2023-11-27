@@ -88,8 +88,8 @@ impl PacketSwitch {
         self.fib.insert(flow_id, next_id);
     }
 
-    pub fn get_fib(&self) -> HashMap<usize, usize> {
-        self.fib
+    pub fn get_fib(&self) -> &HashMap<usize, usize> {
+        &self.fib
     }
 
     pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
