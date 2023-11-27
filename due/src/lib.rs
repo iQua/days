@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::rngs::SmallRng;
+use serde::Deserialize;
 
 use crate::sim::{RandomVar, Time};
 
@@ -16,6 +18,22 @@ pub struct Shared {
     pub rng: RefCell<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
+}
+
+#[derive(Deserialize)]
+pub struct SeedConfig {
+    seed: u64,
+}
+
+pub fn get_seed(file_path: &str) -> u64 {
+    // reads the configuration
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+    // deserializes the content of the configuration
+    let config: SeedConfig =
+        toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+    config.seed
 }
 
 static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);

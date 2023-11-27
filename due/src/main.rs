@@ -9,9 +9,7 @@ use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::build::build_graph;
 use due::topos::init::{init_elements, init_endpoints};
 use due::topos::topology::Topology;
-use due::{set_num_elements, Shared};
-
-const SEED: u64 = 1000;
+use due::{get_seed, set_num_elements, Shared};
 
 async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path.as_str();
@@ -43,10 +41,11 @@ fn main() {
     }
 
     let path = args[1].clone();
+    let seed = get_seed(&path);
 
     let outcome = simulation(
         Shared {
-            rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
+            rng: RefCell::new(SmallRng::seed_from_u64(seed)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
         },
