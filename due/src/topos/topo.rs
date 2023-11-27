@@ -131,6 +131,7 @@ impl Topology {
             println!("path {:?} of flow {}", path, flow.id);
 
             // set fibs for all elements along the path
+            
         }
     }
 
