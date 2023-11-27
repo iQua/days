@@ -127,9 +127,15 @@ impl Topology {
                         false => {
                             for endpoint in &self.endpoints {
                                 match endpoint {
-                                    EndPoint::PacketSource(source) => {
-                                        if source.flow_id() == flow.id {
-                                            next_id = source.id() + 1;
+                                    EndPoint::PacketSink(sink) => {
+                                        if sink.flow_id() == flow.id {
+                                            next_id = sink.id();
+                                            println!(
+                                                "Sink {}'s flow id: {}",
+                                                sink.id(),
+                                                sink.flow_id()
+                                            );
+                                            break;
                                         }
                                     }
                                     _ => continue,
@@ -156,7 +162,12 @@ impl Topology {
                     for (flow_id, next_id) in flow_to_next {
                         switch.set_fib(*flow_id, *next_id);
                     }
-                    println!("Fib for Switch {} is: {:?}", switch.id(), switch.get_fib());
+                    println!("fib for Switch {} is: {:?}", switch.id(), switch.get_fib());
+                    println!(
+                        "keys of port_senders for Switch {} is: {:?}",
+                        switch.id(),
+                        switch.port_senders.keys()
+                    );
                 }
                 Element::Splitter(_) => continue,
             }

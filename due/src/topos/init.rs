@@ -84,9 +84,8 @@ pub fn init_endpoints(flows: Vec<Flow>) -> Vec<EndPoint> {
 
     for flow in flows {
         // Need to set params for the pkt source!
-        let source = PacketSource::new(flow);
-        endpoints.push(EndPoint::PacketSource(source));
-        endpoints.push(EndPoint::PacketSink(PacketSink::new()));
+        endpoints.push(EndPoint::PacketSource(PacketSource::new(flow.clone())));
+        endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
     }
 
     endpoints

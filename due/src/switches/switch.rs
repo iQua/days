@@ -40,7 +40,7 @@ pub struct PacketSwitch {
 
     /// senders for sending inbound packets to outbound ports
     /// element_id -> Scheduler
-    port_senders: HashMap<usize, UnboundedSender<Packet>>,
+    pub port_senders: HashMap<usize, UnboundedSender<Packet>>,
 
     /// senders for sending outbound packets to downstream elements
     /// element_id -> UnboundedSender<Packet>
