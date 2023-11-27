@@ -20,7 +20,7 @@ impl Clone for Flow {
             initial_delay: self.initial_delay,
             path: self.path.clone(),
             arr_dist: self.arr_dist,
-            pkt_size_dist: self.pkt_size_dist
+            pkt_size_dist: self.pkt_size_dist,
         }
     }
 }

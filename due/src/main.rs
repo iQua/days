@@ -29,7 +29,7 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     // constructs the network graph with network elements
     topology.connect();
     // attaches sources and sinks to hosts in the network graph
-    topology.attach(vec![0, 1]);
+    topology.attach(vec![0, 0, 1, 1]);
     // runs the topology
     topology.run(sim);
 
