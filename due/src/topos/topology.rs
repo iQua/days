@@ -1,6 +1,11 @@
+use std::collections::HashMap;
+
+use petgraph::algo::dijkstra;
 use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::visit::EdgeRef;
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::flow::flow::Flow;
 use crate::packets::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::Element;
@@ -9,6 +14,8 @@ use crate::Shared;
 pub struct Topology {
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
+    /// A HashMap to get the NodeIndex based on the element id
+    indices: HashMap<usize, NodeIndex>,
     /// A Vec of element ids that connects to endpoints
     hosts: Vec<usize>,
     /// A Vec of PacketSwitchs and Splitters
@@ -20,12 +27,14 @@ pub struct Topology {
 impl Topology {
     pub fn new(
         graph: UnGraph<usize, ()>,
+        indices: HashMap<usize, NodeIndex>,
         hosts: Vec<usize>,
         elements: Vec<Element>,
         endpoints: Vec<EndPoint>,
     ) -> Topology {
         Topology {
             graph,
+            indices,
             elements,
             endpoints,
             hosts,
@@ -79,6 +88,27 @@ impl Topology {
             } else {
                 panic!("No neighbors found for host element {}", host_id);
             }
+        }
+    }
+
+    /// computes shortest paths for all flows, and sets fibs for all switches.
+    pub fn set(&mut self, flows: Vec<Flow>) {
+        for flow in flows {
+            // computes the shortest paths for the flow
+            let mut path = Vec::new();
+            for edge in flow.graph.edge_references() {
+                // start and end are element id of the host elements for the
+                // flow, while start_node_idx is the NodeIndex of the start
+                // host element of the flow
+                let start = flow.graph.node_weight(edge.source()).unwrap();
+                let end = flow.graph.node_weight(edge.target()).unwrap();
+                let start_node_idx = self.indices.get(start).unwrap();
+                let end_node_idx = self.indices.get(end).unwrap();
+
+                // todo: compute the shortest path, then push it to paths
+            }
+
+            // set fibs for all elements along the path
         }
     }
 

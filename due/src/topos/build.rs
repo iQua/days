@@ -1,7 +1,7 @@
 //! This file provides builders for building the topology based on the
 //! information given in a toml file.
 
-use petgraph::graph::UnGraph;
+use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
@@ -17,7 +17,7 @@ struct FatTreeConfig {
 }
 
 /// This function is used to build a topology from a toml configuration file
-pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
+pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, HashMap<usize, NodeIndex>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -38,7 +38,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
         graph.add_edge(indices[&edge.0], indices[&edge.1], ());
     }
 
-    graph
+    (graph, indices)
 }
 
 /// This function is used to build a fattree topology and its hosts.

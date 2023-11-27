@@ -7,7 +7,6 @@ pub struct Flow {
     pub id: usize,
     pub graph: DiGraph<usize, ()>,
     pub initial_delay: Time,
-    pub path: Vec<usize>,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
 }
@@ -18,7 +17,6 @@ impl Clone for Flow {
             id: self.id,
             graph: self.graph.clone(),
             initial_delay: self.initial_delay,
-            path: self.path.clone(),
             arr_dist: self.arr_dist,
             pkt_size_dist: self.pkt_size_dist,
         }
@@ -37,7 +35,6 @@ impl Flow {
             id,
             graph,
             initial_delay,
-            path: Vec::new(),
             arr_dist,
             pkt_size_dist,
         }
