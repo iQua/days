@@ -10,9 +10,11 @@ use crate::flow::flow::Flow;
 use crate::packets::sink::PacketSink;
 use crate::packets::source::PacketSource;
 use crate::packets::EndPoint;
+use crate::sim::Time;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};
+use crate::DistributionInfo;
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -32,6 +34,9 @@ struct TomlSource {
 struct TomlFlow {
     id: usize,
     flow: Vec<Vec<usize>>,
+    initial_delay: Time,
+    arr_dist: DistributionInfo,
+    pkt_size_dist: DistributionInfo,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +133,14 @@ pub fn init_flows(file_path: &str) -> Vec<Flow> {
             graph.add_edge(start, end, ());
         }
         println!("Graph: {:?}", graph);
-        flows.push(Flow::new(e.id, 0.0, graph));
+
+        flows.push(Flow::new(
+            e.id,
+            graph,
+            e.initial_delay,
+            e.arr_dist,
+            e.pkt_size_dist,
+        ));
     }
     println!("Flows: {:?}", flows);
     flows

@@ -7,12 +7,12 @@ use serde::Deserialize;
 
 use crate::sim::{RandomVar, Time};
 
+pub mod flow;
 pub mod packets;
 pub mod schedulers;
 pub mod sim;
 pub mod switches;
 pub mod topos;
-pub mod flow;
 
 /// Globally shared data.
 pub struct Shared {
@@ -24,6 +24,13 @@ pub struct Shared {
 #[derive(Deserialize)]
 pub struct SeedConfig {
     seed: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum DistributionInfo {
+    Exp { lambda: f64 },
+    Uniform { low: i64, high: i64 },
 }
 
 pub fn get_seed(file_path: &str) -> u64 {
