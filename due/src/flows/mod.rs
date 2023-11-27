@@ -13,7 +13,7 @@ use crate::flows::source::PacketSource;
 use crate::sim::SimContext;
 use crate::Shared;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EndPoint {
     PacketSource(PacketSource),
     PacketSink(PacketSink),

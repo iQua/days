@@ -2,6 +2,8 @@ use petgraph::graph::DiGraph;
 
 use crate::{sim::Time, DistributionInfo};
 
+use super::{sink::PacketSink, source::PacketSource, EndPoint};
+
 #[derive(Debug)]
 pub struct Flow {
     pub id: usize,
@@ -9,6 +11,8 @@ pub struct Flow {
     pub initial_delay: Time,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
+    pub start_id: Vec<usize>,
+    pub end_id: Vec<usize>,
 }
 
 impl Clone for Flow {
@@ -19,6 +23,8 @@ impl Clone for Flow {
             initial_delay: self.initial_delay,
             arr_dist: self.arr_dist,
             pkt_size_dist: self.pkt_size_dist,
+            start_id: self.start_id.clone(),
+            end_id: self.end_id.clone(),
         }
     }
 }
@@ -37,6 +43,18 @@ impl Flow {
             initial_delay,
             arr_dist,
             pkt_size_dist,
+            start_id: Vec::new(),
+            end_id: Vec::new(),
         }
+    }
+
+    pub fn init_endpoints(&mut self, endpoints: &mut Vec<EndPoint>) {
+        endpoints.push(EndPoint::PacketSource(PacketSource::new(
+            self.id,
+            self.initial_delay,
+            self.arr_dist,
+            self.pkt_size_dist,
+        )));
+        endpoints.push(EndPoint::PacketSink(PacketSink::new(self.id)));
     }
 }
