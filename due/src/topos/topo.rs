@@ -60,8 +60,8 @@ impl Topology {
             endpoints.push(EndPoint::PacketSource(PacketSource::new(
                 flow.id,
                 flow.initial_delay,
-                flow.pkt_size_dist,
                 flow.arr_dist,
+                flow.pkt_size_dist,
             )));
             endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
         }

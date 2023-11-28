@@ -6,6 +6,10 @@ use serde::Deserialize;
 use crate::next_flow_id;
 use crate::sim::Time;
 
+use super::sink::PacketSink;
+use super::source::PacketSource;
+use super::EndPoint;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename = "UPPERCASE")]
 pub enum FlowType {
@@ -43,20 +47,7 @@ pub struct Flow {
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
     pub topo_graph: UnGraph<usize, ()>,
-}
-
-impl Clone for Flow {
-    fn clone(&self) -> Self {
-        Flow {
-            id: self.id,
-            flow_type: self.flow_type.clone(),
-            graph: self.graph.clone(),
-            initial_delay: self.initial_delay,
-            arr_dist: self.arr_dist,
-            pkt_size_dist: self.pkt_size_dist,
-            topo_graph: self.topo_graph.clone(),
-        }
-    }
+    pub endpoints: Vec<EndPoint>,
 }
 
 impl Flow {
@@ -76,6 +67,7 @@ impl Flow {
             arr_dist,
             pkt_size_dist,
             topo_graph: UnGraph::<usize, ()>::new_undirected(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -125,5 +117,25 @@ impl Flow {
         }
 
         flows
+    }
+
+    // Sets the connected graph of the topology
+    pub fn set_topo_graph(&mut self, graph: UnGraph<usize, ()>) {
+        self.topo_graph = graph.clone();
+    }
+
+    // Initializes endpoints for the flow
+    pub fn init_endpoints(&mut self) {
+        for _ in 0..self.graph.edge_count() {
+            self.endpoints
+                .push(EndPoint::PacketSource(PacketSource::new(
+                    self.id,
+                    self.initial_delay,
+                    self.arr_dist,
+                    self.pkt_size_dist,
+                )));
+            self.endpoints
+                .push(EndPoint::PacketSink(PacketSink::new(self.id)));
+        }
     }
 }
