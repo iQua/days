@@ -5,8 +5,8 @@ use serde;
 use serde::Deserialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
-use crate::packets::EndPoint;
+use crate::flows::packet::Packet;
+use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;

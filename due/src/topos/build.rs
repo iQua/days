@@ -1,14 +1,13 @@
-//! This file provides builders for building the topology based on the
-//! information given in a toml file.
+//! Provides builders for building specific types of topologies, or building
+//! topologies based on the information given in a TOML configuration file.
 
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
 #[derive(Deserialize)]
-struct Config {
-    num_elements: usize,
-    edges: Vec<(usize, usize)>,
+struct NetworkGraph {
+    edges: Vec<(u32, u32)>,
 }
 
 #[derive(Deserialize)]
@@ -22,27 +21,14 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
     // deserializes the content of the toml configuration file
-    let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
+    let graph: NetworkGraph =
+        toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    let mut graph = UnGraph::<usize, ()>::new_undirected();
-    let mut indices = HashMap::new();
-
-    // addes nodes to the graph
-    for id in 0..config.num_elements {
-        let node_index = graph.add_node(id);
-        indices.insert(id, node_index);
-    }
-
-    // connects edges for the graph
-    for edge in config.edges {
-        graph.add_edge(indices[&edge.0], indices[&edge.1], ());
-    }
-
-    graph
+    UnGraph::<usize, ()>::from_edges(graph.edges)
 }
 
 /// This function is used to build a fattree topology and its hosts.
-pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
+pub fn build_fattree(file_path: &str) -> (UnGraph<(), ()>, Vec<usize>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -50,7 +36,7 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     let config: FatTreeConfig =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    println!("In build_fattree, k: {}", config.k);
+    println!("Building a FatTree with k = {}.", config.k);
 
     let num_layer_switches = config.k.pow(2) / 2;
     let num_core_switches = config.k.pow(2) / 4;
@@ -59,13 +45,13 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     let layer_switches_per_pod = config.k / 2;
     let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
 
-    let mut graph = UnGraph::<usize, ()>::new_undirected();
+    let mut graph = UnGraph::<(), ()>::new_undirected();
     let mut indices = HashMap::new();
     let mut edges = Vec::new();
 
     // initializes nodes for all elements
     for id in 0..num_switches {
-        let node_index = graph.add_node(id);
+        let node_index = graph.add_node(());
         indices.insert(id, node_index);
     }
 

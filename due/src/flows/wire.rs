@@ -4,7 +4,7 @@ use rand::distributions::Distribution;
 use statrs::distribution::Uniform;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::Shared;
 

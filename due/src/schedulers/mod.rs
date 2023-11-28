@@ -4,7 +4,7 @@ pub mod port;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::packet::Packet;
 
 /// Scheduler is a trait that defines the interface for all schedulers in packet
 /// switches.

@@ -9,13 +9,14 @@
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::packet::Packet;
 use crate::sim::{RandomVar, SimContext};
 use crate::{next_endpoint_id, Shared};
 
 #[derive(Debug)]
 pub struct PacketSink {
     endpoint_id: usize,
+    flow_id: usize,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -34,26 +35,11 @@ pub struct PacketSink {
     receiver: UnboundedReceiver<Packet>,
 }
 
-impl Default for PacketSink {
-    fn default() -> Self {
-        PacketSink {
-            endpoint_id: next_endpoint_id(),
-            arrival_times: RandomVar::new(),
-            last_arrival_time: 0.0,
-            inter_arrival_times: RandomVar::new(),
-            one_way_delays: RandomVar::new(),
-            queueing_delays: RandomVar::new(),
-            packet_sizes: RandomVar::new(),
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
-        }
-    }
-}
-
 impl Clone for PacketSink {
     fn clone(&self) -> Self {
         PacketSink {
             endpoint_id: next_endpoint_id(),
+            flow_id: self.flow_id,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -67,12 +53,27 @@ impl Clone for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new() -> PacketSink {
-        Default::default()
+    pub fn new(flow_id: usize) -> PacketSink {
+        PacketSink {
+            endpoint_id: next_endpoint_id(),
+            flow_id,
+            arrival_times: RandomVar::new(),
+            last_arrival_time: 0.0,
+            inter_arrival_times: RandomVar::new(),
+            one_way_delays: RandomVar::new(),
+            queueing_delays: RandomVar::new(),
+            packet_sizes: RandomVar::new(),
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
+        }
     }
 
     pub fn id(&self) -> usize {
         self.endpoint_id
+    }
+
+    pub fn flow_id(&self) -> usize {
+        self.flow_id
     }
 
     pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {

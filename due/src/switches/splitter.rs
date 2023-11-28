@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::flows::packet::Packet;
 use crate::next_element_id;
-use crate::packets::packet::Packet;
 
 #[derive(Debug)]
 pub struct Splitter {

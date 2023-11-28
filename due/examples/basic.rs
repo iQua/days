@@ -3,71 +3,26 @@
 //! distribution, and then to a packet sink.
 
 use std::cell::RefCell;
-use std::sync::Arc;
 
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
-use due::packets::sink::PacketSink;
-use due::packets::source::PacketSource;
-use due::packets::EndPoint;
+use due::flows::flow::Flow;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::switches::switch::PacketSwitch;
-use due::switches::{Element, SchedulingDiscipline};
-use due::topos::topology::Topology;
-use due::{set_num_elements, Shared};
+use due::topos::topo::Topology;
+use due::Shared;
 
 const SEED: u64 = 1000;
 
 async fn network_sim(sim: SimContext<'_, Shared>) {
-    // element ids in a network graph start from 0
     let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
-    // endpoint ids start from the total number of elements
-    let num_elements = graph.node_count();
-    set_num_elements(num_elements);
-    // packet sources and sinks are endpoints
-    let mut endpoints: Vec<EndPoint> = Vec::new();
-
-    // creates a collection of packet sources
-    let source = PacketSource::new(1.0);
-    endpoints.push(EndPoint::PacketSource(source));
-
-    // creates a sink
-    let sink = PacketSink::default();
-    endpoints.push(EndPoint::PacketSink(sink));
-
-    // initializes a packet switch only one outbound port (#0)
-    let weights = vec![1];
-
-    let switch_1 = PacketSwitch::new(
-        (1000 * 8) as f64,
-        100,
-        weights.clone(),
-        vec![1],
-        SchedulingDiscipline::FIFO,
-        Arc::new(|flow_id| flow_id),
-    );
-
-    let switch_2 = PacketSwitch::new(
-        (1000 * 8) as f64,
-        100,
-        weights.clone(),
-        vec![3],
-        SchedulingDiscipline::FIFO,
-        Arc::new(|flow_id| flow_id),
-    );
-
-    let elements: Vec<Element> = vec![
-        Element::PacketSwitch(switch_1),
-        Element::PacketSwitch(switch_2),
-    ];
     let hosts = vec![0, 1];
-    let mut topology = Topology::new(graph, hosts, elements, endpoints);
 
-    // constructs the network graph with network elements
-    topology.connect();
-    // attaches sources and sinks to hosts in the network graph
-    topology.attach(vec![0, 1]);
+    let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+
+    // network elements are initialized from a configuration file
+    let topology = Topology::new("configs/simple.toml", graph, hosts, flows);
+
     // runs the topology
     topology.run(sim);
 
