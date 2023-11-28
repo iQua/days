@@ -7,7 +7,7 @@ use std::{fs, sync::Arc};
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
-use crate::flows::flow::Flow;
+use crate::flows::flow::{Flow, FlowType};
 use crate::next_flow_id;
 use crate::sim::Time;
 use crate::switches::splitter::Splitter;
@@ -21,13 +21,6 @@ struct TomlSwitch {
     capacity: usize,
     weights: Vec<usize>,
     discipline: SchedulingDiscipline,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename = "UPPERCASE")]
-pub enum FlowType {
-    PacketDistribution,
-    TCP,
 }
 
 #[derive(Deserialize, Debug)]
@@ -99,6 +92,7 @@ pub fn init_flows(file_path: &str) -> Vec<Flow> {
 
         flows.push(Flow::new(
             next_flow_id(),
+            flow.flow_type,
             graph,
             flow.initial_delay,
             flow.arr_dist,

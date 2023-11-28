@@ -40,7 +40,7 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<(), ()>, Vec<usize>) {
     let config: FatTreeConfig =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    println!("In build_fattree, k: {}", config.k);
+    println!("Building a FatTree with k = {}.", config.k);
 
     let num_layer_switches = config.k.pow(2) / 2;
     let num_core_switches = config.k.pow(2) / 4;
