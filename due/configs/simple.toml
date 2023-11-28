@@ -1,5 +1,4 @@
 seed = 1000
-num_elements = 2
 edges = [[0, 1]]
 num_splitters = 0
 

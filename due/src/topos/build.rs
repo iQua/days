@@ -1,7 +1,7 @@
 //! This file provides builders for building the topology based on the
 //! information given in a toml file.
 
-use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
@@ -9,8 +9,7 @@ use crate::set_num_elements;
 
 #[derive(Deserialize)]
 struct Config {
-    num_elements: usize,
-    edges: Vec<(usize, usize)>,
+    edges: Vec<(u32, u32)>,
 }
 
 #[derive(Deserialize)]
@@ -19,26 +18,16 @@ struct FatTreeConfig {
 }
 
 /// This function is used to build a topology from a toml configuration file
-pub fn build_graph(file_path: &str) -> UnGraph<(), ()> {
+pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
     // deserializes the content of the toml configuration file
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    let mut graph = UnGraph::<(), ()>::new_undirected();
-
-    // addes nodes to the graph
-    for _ in 0..config.num_elements {
-        graph.add_node(());
-    }
-
-    // connects edges for the graph
-    for (start, end) in config.edges {
-        graph.add_edge(NodeIndex::new(start), NodeIndex::new(end), ());
-    }
-
+    let graph = UnGraph::<usize, ()>::from_edges(&config.edges);
     set_num_elements(graph.node_count());
+
     graph
 }
 
