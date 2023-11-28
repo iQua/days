@@ -12,6 +12,8 @@ use crate::sim::SimContext;
 use crate::switches::Element;
 use crate::Shared;
 
+use super::init::init_endpoints;
+
 pub struct Topology {
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
@@ -32,13 +34,12 @@ impl Topology {
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         elements: Vec<Element>,
-        endpoints: Vec<EndPoint>,
         flows: Vec<Flow>,
     ) -> Topology {
         Topology {
             graph: graph.clone(),
             elements,
-            endpoints,
+            endpoints: init_endpoints(flows.clone()),
             hosts,
             flows,
             routing: Route::new(graph),
