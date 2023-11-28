@@ -23,8 +23,6 @@ pub struct Topology {
     elements: Vec<Element>,
     /// A Vec of PacketSources and PacketSinks
     endpoints: Vec<EndPoint>,
-    /// A Vec of all flows
-    flows: Vec<Flow>,
     /// Routing module
     routing: Route,
 }
@@ -35,19 +33,14 @@ impl Topology {
         indices: HashMap<usize, NodeIndex>,
         hosts: Vec<usize>,
         elements: Vec<Element>,
-        flows: &mut Vec<Flow>,
+        endpoints: Vec<EndPoint>,
     ) -> Topology {
-        let mut endpoints = Vec::new();
-        for flow in flows.iter_mut() {
-            flow.init_endpoints(&mut endpoints);
-        }
         Topology {
             graph: graph.clone(),
             indices,
             elements,
             endpoints,
             hosts,
-            flows: flows.to_vec(),
             routing: Route::new(graph),
         }
     }
@@ -103,10 +96,10 @@ impl Topology {
     }
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
-    pub fn set(&mut self, sim: SimContext<'_, Shared>) {
+    pub fn set(&mut self, flows: Vec<Flow>, sim: SimContext<'_, Shared>) {
         // element_id -> Vec<(flow_id, next_id)>
         let mut results: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for flow in &self.flows {
+        for flow in flows {
             for edge in flow.graph.edge_references() {
                 // finds the NodeIndex of start and end nodes of the path
                 let start = flow.graph.node_weight(edge.source()).unwrap();
