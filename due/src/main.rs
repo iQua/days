@@ -9,7 +9,7 @@ use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::build::build_graph;
 use due::topos::init::{init_elements, init_flows};
 use due::topos::topo::Topology;
-use due::{get_seed, set_num_elements, Shared};
+use due::{get_seed, Shared};
 
 async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path.as_str();
@@ -17,7 +17,6 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     // initializes flows, elements, hosts, and the graph
     let flows = init_flows(file_path);
     let graph = build_graph(file_path);
-    set_num_elements(graph.node_count());
     let elements = init_elements(file_path);
     let hosts = vec![0, 1];
 

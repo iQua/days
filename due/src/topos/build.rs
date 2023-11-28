@@ -5,6 +5,8 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
+use crate::set_num_elements;
+
 #[derive(Deserialize)]
 struct Config {
     num_elements: usize,
@@ -36,6 +38,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
         graph.add_edge(NodeIndex::new(edge.0), NodeIndex::new(edge.1), ());
     }
 
+    set_num_elements(graph.node_count());
     graph
 }
 
