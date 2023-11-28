@@ -34,8 +34,8 @@ pub fn build_graph(file_path: &str) -> UnGraph<(), ()> {
     }
 
     // connects edges for the graph
-    for edge in config.edges {
-        graph.add_edge(NodeIndex::new(edge.0), NodeIndex::new(edge.1), ());
+    for (start, end) in config.edges {
+        graph.add_edge(NodeIndex::new(start), NodeIndex::new(end), ());
     }
 
     set_num_elements(graph.node_count());

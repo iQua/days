@@ -33,7 +33,7 @@ pub enum FlowType {
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
     flow_type: FlowType,
-    graph: Vec<(usize, usize)>,
+    graph: Vec<(u32, u32)>,
     initial_delay: Time,
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
@@ -95,16 +95,7 @@ pub fn init_flows(file_path: &str) -> Vec<Flow> {
 
     let mut flows = Vec::new();
     for flow in config.flows {
-        let mut graph = DiGraph::<usize, ()>::new();
-        for edge in flow.graph {
-            // for the case that pair.len() > 1, there are more than one
-            // generator for this flow, then the flow_id of that packet can
-            // not be 'self.endpoint_id - num_elements()'
-            let start = graph.add_node(edge.0);
-            let end = graph.add_node(edge.1);
-            graph.add_edge(start, end, ());
-        }
-        println!("Graph: {:?}", graph);
+        let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
 
         flows.push(Flow::new(
             next_flow_id(),
