@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::env;
 
+use env_logger;
+use log::{debug, info};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
@@ -32,6 +34,7 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
 
     let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
     let hosts = vec![0, 1];
+    info!("The network graph has been initialized: {:?}", graph);
 
     // There are two ways of initializing the flows:
 
@@ -44,8 +47,10 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     //    let flows = Flow::flows_from_config(file_path);
 
     let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
-
-    // let elements = init_elements(file_path);
+    debug!(
+        "A total of {} network flows has been initialized.",
+        flows.len()
+    );
 
     // initializes the topology
     let topology = Topology::new(file_path, graph, hosts, flows);
@@ -58,6 +63,9 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
 }
 
 fn main() {
+    let env = env_logger::Env::default();
+    env_logger::init_from_env(env);
+
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         panic!("Please provide the path to the toml configuration file: cargo run -- <path>");
