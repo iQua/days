@@ -159,6 +159,7 @@ impl Topology {
                 for window in path.windows(2) {
                     let node_id = window.get(0).unwrap();
                     let next_id = window.get(1).unwrap();
+
                     if let Element::PacketSwitch(switch) = &mut self.elements[node_id.index()] {
                         let next_id = next_id.index();
                         switch.set_fib(flow.id, next_id);

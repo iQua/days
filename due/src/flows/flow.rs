@@ -132,6 +132,7 @@ impl Flow {
         self.routing = RandomSimplePath::new(graph);
 
         let mut paths = Vec::new();
+
         for (idx, edge) in self.graph.edge_references().enumerate() {
             let mut path = self
                 .routing
@@ -152,13 +153,14 @@ impl Flow {
         paths
     }
 
-    // Gets the hosts ids that endpoints attach to
+    // Gets the hosts ids that endpoints should attach to
     pub fn get_hosts(&self) -> Vec<NodeIndex> {
         let mut attach_to = Vec::new();
         for edge in self.graph.edge_references() {
             attach_to.push(edge.source());
             attach_to.push(edge.target());
         }
+
         attach_to
     }
 
