@@ -7,11 +7,11 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::flows::flow::Flow;
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
 use crate::flows::EndPoint;
+use crate::flows::sink::PacketSink;
+use crate::flows::source::PacketSource;
 use crate::sim::SimContext;
 use crate::switches::Element;
 use crate::Shared;
-
-use super::init::init_endpoints;
 
 pub struct Topology {
     /// Undirected graph of the topology
@@ -35,10 +35,19 @@ impl Topology {
         elements: Vec<Element>,
         flows: Vec<Flow>,
     ) -> Topology {
+
+        // initializes endpoints based on flows
+        let mut endpoints: Vec<EndPoint> = Vec::new();
+        for flow in &flows {
+            // TODO: this only works for flows with one pair of source and sink
+            endpoints.push(EndPoint::PacketSource(PacketSource::new(flow.clone())));
+            endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
+        }
+
         Topology {
             graph: graph.clone(),
             elements,
-            endpoints: init_endpoints(flows.clone()),
+            endpoints,
             hosts,
             flows,
             routing: RandomSimplePath::new(graph),
@@ -105,6 +114,8 @@ impl Topology {
                 // finds the index of start and end nodes of the path
                 let &start = flow.graph.node_weight(edge.source()).unwrap();
                 let &end = flow.graph.node_weight(edge.target()).unwrap();
+
+                // stores the host id that these endpoints connect to
                 attach_to.push(start);
                 attach_to.push(end);
 
