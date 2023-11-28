@@ -166,7 +166,8 @@ impl Topology {
                         }
                         _ => {
                             panic!(
-                                "element {} will be skipped when setting fib in flow {}",
+                                "Element {} is not a packet switch when setting up the
+                                Flow Information Base table along the path in flow {}.",
                                 node_id, flow.id
                             );
                         }
