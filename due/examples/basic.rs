@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 
+use log::{debug, info};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
@@ -17,8 +18,13 @@ const SEED: u64 = 1000;
 async fn network_sim(sim: SimContext<'_, Shared>) {
     let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
     let hosts = vec![0, 1];
+    info!("The network graph has been initialized: {:?}", graph);
 
     let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+    debug!(
+        "A total of {} network flows has been initialized.",
+        flows.len()
+    );
 
     // network elements are initialized from a configuration file
     let topology = Topology::new("configs/simple.toml", graph, hosts, flows);
@@ -31,6 +37,9 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
 }
 
 fn main() {
+    let env = env_logger::Env::default();
+    env_logger::init_from_env(env);
+
     let outcome = simulation(
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
