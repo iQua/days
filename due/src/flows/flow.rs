@@ -1,6 +1,9 @@
+use std::fs;
+
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
+use crate::next_flow_id;
 use crate::sim::Time;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -8,6 +11,20 @@ use crate::sim::Time;
 pub enum FlowType {
     PacketDistribution,
     TCP,
+}
+
+#[derive(Deserialize, Debug)]
+struct TomlFlow {
+    flow_type: FlowType,
+    graph: Vec<(u32, u32)>,
+    initial_delay: Time,
+    arr_dist: DistributionInfo,
+    pkt_size_dist: DistributionInfo,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlowConfig {
+    flows: Vec<TomlFlow>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
@@ -57,5 +74,53 @@ impl Flow {
             arr_dist,
             pkt_size_dist,
         }
+    }
+
+    // Initializes flows from a vector of directed graphs.
+    pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
+        let mut flows = Vec::new();
+
+        for graph in graphs {
+            let flow_graph = DiGraph::<usize, ()>::from_edges(&graph);
+
+            flows.push(Flow::new(
+                next_flow_id(),
+                FlowType::PacketDistribution,
+                flow_graph,
+                0.,
+                DistributionInfo::Exp { lambda: 1. },
+                DistributionInfo::Uniform {
+                    low: 1000,
+                    high: 1000,
+                },
+            ));
+        }
+
+        flows
+    }
+
+    // Initializes flows from a configuration file.
+    pub fn flows_from_config(file_path: &str) -> Vec<Flow> {
+        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+        let config: FlowConfig =
+            toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+        let mut flows = Vec::new();
+
+        for flow in config.flows {
+            let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
+
+            flows.push(Flow::new(
+                next_flow_id(),
+                flow.flow_type,
+                graph,
+                flow.initial_delay,
+                flow.arr_dist,
+                flow.pkt_size_dist,
+            ));
+        }
+
+        flows
     }
 }
