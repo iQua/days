@@ -24,9 +24,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     let graph: NetworkGraph =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    let graph = UnGraph::<usize, ()>::from_edges(graph.edges);
-
-    graph
+    UnGraph::<usize, ()>::from_edges(graph.edges)
 }
 
 /// This function is used to build a fattree topology and its hosts.

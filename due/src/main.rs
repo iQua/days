@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::env;
 
-use env_logger;
 use log::{debug, info};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
