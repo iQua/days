@@ -1,11 +1,13 @@
 use std::fs;
 
-use petgraph::graph::{DiGraph, UnGraph};
+use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
+use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
 use crate::sim::{SimContext, Time};
 use crate::{next_flow_id, Shared};
 
+use super::route::{RandomSimplePath, RoutingProtocol};
 use super::sink::PacketSink;
 use super::source::PacketSource;
 use super::EndPoint;
@@ -48,6 +50,7 @@ pub struct Flow {
     pub pkt_size_dist: DistributionInfo,
     pub topo_graph: UnGraph<usize, ()>,
     pub endpoints: Vec<EndPoint>,
+    pub routing: RandomSimplePath,
 }
 
 impl Flow {
@@ -59,6 +62,8 @@ impl Flow {
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> Flow {
+        let topo_graph = UnGraph::<usize, ()>::new_undirected();
+        let routing = RandomSimplePath::new(topo_graph.clone());
         Flow {
             id,
             flow_type,
@@ -66,8 +71,9 @@ impl Flow {
             initial_delay,
             arr_dist,
             pkt_size_dist,
-            topo_graph: UnGraph::<usize, ()>::new_undirected(),
+            topo_graph,
             endpoints: Vec::new(),
+            routing,
         }
     }
 
@@ -122,6 +128,19 @@ impl Flow {
     // Sets the connected graph of the topology
     pub fn set_topo_graph(&mut self, graph: UnGraph<usize, ()>) {
         self.topo_graph = graph.clone();
+        self.routing = RandomSimplePath::new(self.topo_graph.clone());
+    }
+
+    // Gets the simple paths for all edges of the flow
+    pub fn get_path(&mut self, sim: SimContext<'_, Shared>) -> Vec<Vec<NodeIndex>> {
+        let mut paths = Vec::new();
+        for edge in self.graph.edge_references() {
+            let path = self
+                .routing
+                .compute_route(edge.source(), edge.target(), sim);
+            paths.push(path);
+        }
+        paths
     }
 
     // Initializes endpoints for the flow

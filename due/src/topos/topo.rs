@@ -8,7 +8,6 @@ use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
-use crate::flows::route::{RandomSimplePath, RoutingProtocol};
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::splitter::Splitter;
@@ -38,8 +37,6 @@ pub struct Topology {
     elements: Vec<Element>,
     /// A Vec of all flows
     flows: Vec<Flow>,
-    /// Routing module
-    routing: RandomSimplePath,
 }
 
 impl Topology {
@@ -54,7 +51,6 @@ impl Topology {
             hosts,
             flows,
             elements: Topology::init_elements(file_path),
-            routing: RandomSimplePath::new(graph),
         }
     }
 
@@ -163,22 +159,21 @@ impl Topology {
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
     pub fn set(&mut self, sim: SimContext<'_, Shared>) {
-        for flow in &self.flows {
-            for edge in flow.graph.edge_references() {
-                // get the simple path
-                let path = self
-                    .routing
-                    .compute_route(edge.source(), edge.target(), sim);
-                println!("The path of flow {}: {:?}", flow.id, path);
+        for flow in self.flows.iter_mut() {
+            // sets the topology graph for the flow
+            flow.set_topo_graph(self.graph.clone());
+            // gets the all simple paths of the flow
+            let paths = flow.get_path(sim);
+            println!("paths of flow {}: {:?}", flow.id, paths);
 
+            for path in paths {
                 for (idx, &node_idx) in path.iter().enumerate() {
                     // gets fibs for elements along the path
                     let next_id = if idx < path.len() - 1 {
                         path[idx + 1].index()
                     } else {
-                        self.flows
+                        flow.endpoints
                             .iter()
-                            .flat_map(|flow| &flow.endpoints)
                             .find_map(|endpoint| match endpoint {
                                 EndPoint::PacketSink(sink) if sink.flow_id() == flow.id => {
                                     Some(sink.id())

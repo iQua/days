@@ -18,6 +18,7 @@ pub trait RoutingProtocol {
     ) -> Vec<NodeIndex>;
 }
 
+#[derive(Debug)]
 pub struct RandomSimplePath {
     graph: UnGraph<usize, ()>,
 }
