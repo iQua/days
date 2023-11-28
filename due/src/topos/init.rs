@@ -8,6 +8,7 @@ use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
 use crate::flows::flow::Flow;
+use crate::next_flow_id;
 use crate::sim::Time;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
@@ -22,10 +23,17 @@ struct TomlSwitch {
     discipline: SchedulingDiscipline,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename = "UPPERCASE")]
+pub enum FlowType {
+    PacketDistribution,
+    TCP,
+}
+
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
-    id: usize,
-    flow: Vec<Vec<usize>>,
+    flow_type: FlowType,
+    graph: Vec<(usize, usize)>,
     initial_delay: Time,
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
@@ -86,25 +94,26 @@ pub fn init_flows(file_path: &str) -> Vec<Flow> {
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
     let mut flows = Vec::new();
-    for e in config.flows {
+    for flow in config.flows {
         let mut graph = DiGraph::<usize, ()>::new();
-        for pair in e.flow {
+        for edge in flow.graph {
             // for the case that pair.len() > 1, there are more than one
             // generator for this flow, then the flow_id of that packet can
             // not be 'self.endpoint_id - num_elements()'
-            let start = graph.add_node(pair[0]);
-            let end = graph.add_node(pair[1]);
+            let start = graph.add_node(edge.0);
+            let end = graph.add_node(edge.1);
             graph.add_edge(start, end, ());
         }
         println!("Graph: {:?}", graph);
 
         flows.push(Flow::new(
-            e.id,
+            next_flow_id(),
             graph,
-            e.initial_delay,
-            e.arr_dist,
-            e.pkt_size_dist,
+            flow.initial_delay,
+            flow.arr_dist,
+            flow.pkt_size_dist,
         ));
     }
+
     flows
 }

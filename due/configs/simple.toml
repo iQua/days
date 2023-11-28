@@ -16,16 +16,16 @@ weights = [1]
 discipline = "FIFO"
 
 [[flows]]
-id = 0
-flow = [[0, 1]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
 initial_delay = 1.0
 arr_dist = {type = "Exp", lambda = 1.0}
 pkt_size_dist = {type = "Exp", lambda = 1.0}
 
 
 [[flows]]
-id = 1
-flow = [[1, 0]]
+flow_type = "PacketDistribution"
+graph = [[1, 0]]
 initial_delay = 2.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}

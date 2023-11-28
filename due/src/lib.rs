@@ -47,6 +47,7 @@ static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);
 static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
 static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
+static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn num_elements() -> usize {
     NUM_ELEMENTS.load(Ordering::Relaxed)
@@ -67,4 +68,8 @@ pub fn next_endpoint_id() -> usize {
 
 pub fn next_scheduler_id() -> usize {
     SCHEDULER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn next_flow_id() -> usize {
+    FLOW_ID.fetch_add(1, Ordering::Relaxed)
 }
