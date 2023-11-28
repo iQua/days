@@ -26,10 +26,10 @@ impl Clone for PacketSource {
     fn clone(&self) -> Self {
         PacketSource {
             endpoint_id: next_endpoint_id(),
-            flow_id: self.flow_id.clone(),
-            initial_delay: self.initial_delay.clone(),
-            arr_dist: self.arr_dist.clone(),
-            pkt_size_dist: self.pkt_size_dist.clone(),
+            flow_id: self.flow_id,
+            initial_delay: self.initial_delay,
+            arr_dist: self.arr_dist,
+            pkt_size_dist: self.pkt_size_dist,
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,

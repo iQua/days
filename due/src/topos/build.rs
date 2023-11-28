@@ -26,7 +26,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     let graph: NetworkGraph =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    let graph = UnGraph::<usize, ()>::from_edges(&graph.edges);
+    let graph = UnGraph::<usize, ()>::from_edges(graph.edges);
 
     set_num_elements(graph.node_count());
     graph

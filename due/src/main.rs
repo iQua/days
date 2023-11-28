@@ -30,7 +30,7 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     // 3. building a graph using a graph builder.
     //    let (graph, hosts) = build_fattree();
 
-    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
     let hosts = vec![0, 1];
 
     // There are two ways of initializing the flows:
