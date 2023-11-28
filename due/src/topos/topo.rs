@@ -166,8 +166,6 @@ impl Topology {
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
     pub fn set(&mut self, sim: SimContext<'_, Shared>) {
-        // element_id -> Vec<(flow_id, next_id)>
-        let mut results: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for flow in &self.flows {
             for edge in flow.graph.edge_references() {
                 // finds the index of start and end nodes of the path
@@ -180,9 +178,8 @@ impl Topology {
                         .compute_route(NodeIndex::new(start), NodeIndex::new(end), sim);
                 println!("The path of flow {}: {:?}", flow.id, path);
 
-                // gets fibs for elements along the path
                 for (idx, &node_idx) in path.iter().enumerate() {
-                    let element_id = node_idx;
+                    // gets fibs for elements along the path
                     let mut next_id = usize::MAX;
                     let next_id = match idx < path.len() - 1 {
                         true => path[idx + 1].index(),
@@ -197,29 +194,12 @@ impl Topology {
                             next_id
                         }
                     };
-                    results
-                        .entry(element_id.index())
-                        .or_default()
-                        .push((flow.id, next_id));
-                }
-            }
-        }
-        println!("Results: {:?}", results);
 
-        // sets fibs for all switch elements
-        for element in &mut self.elements {
-            if let Element::PacketSwitch(switch) = element {
-                let id = switch.id();
-                let flow_to_next = results.get(&id).unwrap();
-                for (flow_id, next_id) in flow_to_next {
-                    switch.set_fib(*flow_id, *next_id);
+                    // sets fibs
+                    if let Element::PacketSwitch(switch) = &mut self.elements[node_idx.index()] {
+                        switch.set_fib(flow.id, next_id)
+                    }
                 }
-                println!("fib for Switch {} is: {:?}", switch.id(), switch.get_fib());
-                println!(
-                    "keys of port_senders for Switch {} is: {:?}",
-                    switch.id(),
-                    switch.port_senders.keys()
-                );
             }
         }
     }
