@@ -9,7 +9,6 @@ use rand::{rngs::SmallRng, SeedableRng};
 use due::sim::{simulation, Process, RandomVar, SimContext};
 // use due::topos::build::build_graph;
 use due::flows::flow::Flow;
-use due::topos::init::init_elements;
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
@@ -46,10 +45,10 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
 
     let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
 
-    let elements = init_elements(file_path);
+    // let elements = init_elements(file_path);
 
     // initializes the topology
-    let topology = Topology::new(graph, hosts, elements, flows);
+    let topology = Topology::new(file_path, graph, hosts, flows);
 
     // runs the topology
     topology.run(sim);

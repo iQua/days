@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::fs;
+use std::sync::Arc;
 
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
+use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
@@ -10,9 +13,24 @@ use crate::flows::sink::PacketSink;
 use crate::flows::source::PacketSource;
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
-use crate::switches::Element;
+use crate::switches::splitter::Splitter;
+use crate::switches::switch::PacketSwitch;
+use crate::switches::{Element, SchedulingDiscipline};
 use crate::Shared;
 
+#[derive(Deserialize)]
+struct TomlSwitch {
+    port_rate: f64,
+    capacity: usize,
+    weights: Vec<usize>,
+    discipline: SchedulingDiscipline,
+}
+
+#[derive(Deserialize)]
+struct ElementConfig {
+    num_splitters: usize,
+    switch: Vec<TomlSwitch>,
+}
 pub struct Topology {
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
@@ -30,9 +48,9 @@ pub struct Topology {
 
 impl Topology {
     pub fn new(
+        file_path: &str,
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
-        elements: Vec<Element>,
         flows: Vec<Flow>,
     ) -> Topology {
         // initializes endpoints based on flows
@@ -45,12 +63,46 @@ impl Topology {
 
         Topology {
             graph: graph.clone(),
-            elements,
             endpoints,
             hosts,
             flows,
+            elements: Topology::init_elements(file_path),
             routing: RandomSimplePath::new(graph),
         }
+    }
+
+    fn init_elements(file_path: &str) -> Vec<Element> {
+        // reads the configuration
+        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+        // deserializes the content of the configuration
+        let config: ElementConfig =
+            toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+        let mut elements: Vec<Element> = Vec::new();
+
+        for e in config.switch {
+            println!(
+                "{}, {}, {:?}, {:?}",
+                e.port_rate, e.capacity, e.weights, e.discipline
+            );
+
+            let switch = PacketSwitch::new(
+                e.port_rate,
+                e.capacity,
+                e.weights,
+                HashMap::new(),
+                e.discipline,
+                Arc::new(|flow_id| flow_id),
+            );
+            elements.push(Element::PacketSwitch(switch));
+        }
+
+        for _ in 0..config.num_splitters {
+            elements.push(Element::Splitter(Splitter::new()));
+        }
+
+        elements
     }
 
     /// connects a vector of elements according to edges in the network topology.
