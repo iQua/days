@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
+use log::debug;
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
@@ -65,8 +66,8 @@ impl Topology {
         let mut elements: Vec<Element> = Vec::new();
 
         for e in config.switch {
-            println!(
-                "{}, {}, {:?}, {:?}",
+            debug!(
+                "Initialized a switch with port_rate: {}, capacity: {},\n weights: {:?}, discipline: {:?}",
                 e.port_rate, e.capacity, e.weights, e.discipline
             );
 
