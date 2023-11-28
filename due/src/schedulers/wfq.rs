@@ -21,9 +21,10 @@ pub struct TaggedPacket {
 
 impl Ord for TaggedPacket {
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.tag > other.tag {
+        // note: the queue should be a min-heap
+        if self.tag < other.tag {
             Ordering::Greater;
-        } else if self.tag < other.tag {
+        } else if self.tag > other.tag {
             Ordering::Less;
         }
         Ordering::Equal
@@ -74,7 +75,7 @@ pub struct WFQServer {
     /// the number of bytes of classes, which are consecutive and start from 0
     byte_sizes: Vec<usize>,
 
-    /// priority queue of packets from all the classes, where packets are sorted according to their finish times
+    /// min-heap of packets from all the classes, where packets are sorted according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
     /// a sender for sending outbound packets to the downstream element
@@ -169,7 +170,7 @@ impl WFQServer {
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
-        // adds tag (finish time) to the packet before push to the priority queue
+        // adds tag (finish time) to the packet before push to the queue (a min-heap)
         let tagged_packet = self.add_tag(packet, now);
 
         self.scheduler_queue.push(tagged_packet.clone());
@@ -217,7 +218,7 @@ impl WFQServer {
         };
     }
 
-    fn update_stats(&mut self, packet: TaggedPacket, now: Time) {
+    fn update_stats(&mut self, packet: Packet, now: Time) {
         let mut weight_sum = 0.0;
 
         // updates the virtual time based on the current set of active flow classes
@@ -228,7 +229,7 @@ impl WFQServer {
         self.vtime += (now - self.last_update) / weight_sum;
 
         // computes the new set of active flow classes
-        let class_id = (self.flow_classes)(packet.packet.flow_id);
+        let class_id = (self.flow_classes)(packet.flow_id);
 
         self.flow_queue_count[class_id] -= 1;
         if self.flow_queue_count[class_id] == 0 {
@@ -243,23 +244,23 @@ impl WFQServer {
 
         self.last_update = now;
 
-        self.byte_sizes[class_id] -= packet.packet.size;
+        self.byte_sizes[class_id] -= packet.size;
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
-            // schedules packets by going through the priority queue
+            // schedules packets by going through the queue
             while !self.scheduler_queue.is_empty() {
-                let packet = self.scheduler_queue.pop().unwrap().clone();
-                let class_id = (self.flow_classes)(packet.packet.flow_id);
+                let packet = self.scheduler_queue.peek().unwrap().clone().packet;
+                let class_id = (self.flow_classes)(packet.flow_id);
 
-                self.byte_sizes[class_id] -= packet.packet.size;
+                self.byte_sizes[class_id] -= packet.size;
 
-                let timeout = (packet.packet.size as f64) * 8.0 / self.rate;
+                let timeout = (packet.size as f64) * 8.0 / self.rate;
                 sim.advance(timeout).await;
                 let mut outbound = self.scheduler_queue.pop().unwrap();
                 outbound.packet.send(sim.now());
-                let _ = self.sender.send(packet.packet.clone());
+                let _ = self.sender.send(packet.clone());
 
                 self.packets_waiting -= 1;
 
@@ -276,9 +277,9 @@ impl WFQServer {
                     "WFQServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                             {} packets in the queue.",
                     self.scheduler_id,
-                    packet.packet.packet_id,
-                    packet.packet.size,
-                    packet.packet.flow_id,
+                    packet.packet_id,
+                    packet.size,
+                    packet.flow_id,
                     sim.now(),
                     self.active_set.len(),
                 );
