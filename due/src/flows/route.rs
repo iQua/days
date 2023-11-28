@@ -19,11 +19,11 @@ pub trait RoutingProtocol {
 }
 
 pub struct RandomSimplePath {
-    graph: UnGraph<usize, ()>,
+    graph: UnGraph<(), ()>,
 }
 
 impl RandomSimplePath {
-    pub fn new(graph: UnGraph<usize, ()>) -> RandomSimplePath {
+    pub fn new(graph: UnGraph<(), ()>) -> RandomSimplePath {
         RandomSimplePath { graph }
     }
 

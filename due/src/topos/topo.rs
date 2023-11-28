@@ -15,7 +15,7 @@ use crate::Shared;
 
 pub struct Topology {
     /// Undirected graph of the topology
-    graph: UnGraph<usize, ()>,
+    graph: UnGraph<(), ()>,
     /// A Vec of element ids that connects to endpoints
     hosts: Vec<usize>,
     /// A Vec of PacketSwitchs and Splitters
@@ -30,7 +30,7 @@ pub struct Topology {
 
 impl Topology {
     pub fn new(
-        graph: UnGraph<usize, ()>,
+        graph: UnGraph<(), ()>,
         hosts: Vec<usize>,
         elements: Vec<Element>,
         flows: Vec<Flow>,
@@ -112,8 +112,8 @@ impl Topology {
         for flow in &self.flows {
             for edge in flow.graph.edge_references() {
                 // finds the index of start and end nodes of the path
-                let &start = flow.graph.node_weight(edge.source()).unwrap();
-                let &end = flow.graph.node_weight(edge.target()).unwrap();
+                let start = edge.source().index();
+                let end = edge.target().index();
 
                 // stores the host id that these endpoints connect to
                 attach_to.push(start);
@@ -127,11 +127,11 @@ impl Topology {
 
                 // gets fibs for elements along the path
                 for (idx, &node_idx) in path.iter().enumerate() {
-                    let element_id = self.graph.node_weight(node_idx).unwrap();
+                    let element_id = node_idx;
                     let mut next_id = usize::MAX;
                     let (flow_id, next_id) = match idx < path.len() - 1 {
                         true => {
-                            next_id = *self.graph.node_weight(path[idx + 1]).unwrap();
+                            next_id = path[idx + 1].index();
                             (flow.id, next_id)
                         }
                         false => {
@@ -155,7 +155,7 @@ impl Topology {
                         }
                     };
                     results
-                        .entry(*element_id)
+                        .entry(element_id.index())
                         .or_default()
                         .push((flow_id, next_id));
                 }
