@@ -107,7 +107,8 @@ impl Topology {
 
     /// attaches packet endpoints (sources or sinks) to hosts in the network graph.
     pub fn attach(&mut self) {
-        // fetches NodeIndex of hosts and initializes endpoints for all flows
+        // obtains the element_id of all end hosts (where endpoints can be
+        // attached to), and initializes endpoints for all flows
         let mut attach_to = Vec::new();
         for flow in self.flows.iter_mut() {
             attach_to.extend(flow.get_hosts());
@@ -121,6 +122,8 @@ impl Topology {
 
         // attaches each endpoint's sender to its corresponding host's receiver
         for host_id in attach_to {
+            // an element in the network must be a host, as specified by the
+            // network graph
             assert!(self.hosts.contains(&host_id.index()));
 
             // locate a neighboring element in the network graph to this host
@@ -137,6 +140,7 @@ impl Topology {
                         host_id.index(),
                     );
                 }
+
                 self.elements[host_id.index()].connect_sender(endpoint.id(), downlink_sender);
             } else {
                 panic!("No neighbors found for host element {}", host_id.index());
@@ -144,13 +148,12 @@ impl Topology {
         }
     }
 
-    /// computes shortest paths for all flows, and sets fibs for all switches.
+    /// computes routing decisions for all the flows, and installs Flow
+    /// Information Base tables (FIBs) of these routing decisions into all the
+    /// switches.
     pub fn set(&mut self, sim: SimContext<'_, Shared>) {
         for flow in self.flows.iter_mut() {
-            // gets the flow's all simple paths, where the last item is the
-            // endpoint_id of the sink
             let paths = flow.compute_paths(self.graph.clone(), sim);
-            println!("paths of flow {}: {:?}", flow.id, paths);
 
             for path in paths {
                 for window in path.windows(2) {
