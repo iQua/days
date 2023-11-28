@@ -21,6 +21,8 @@ pub struct Topology {
     elements: Vec<Element>,
     /// A Vec of PacketSources and PacketSinks
     endpoints: Vec<EndPoint>,
+    /// A Vec of all flows
+    flows: Vec<Flow>,
     /// Routing module
     routing: Route,
 }
@@ -31,12 +33,14 @@ impl Topology {
         hosts: Vec<usize>,
         elements: Vec<Element>,
         endpoints: Vec<EndPoint>,
+        flows: Vec<Flow>,
     ) -> Topology {
         Topology {
             graph: graph.clone(),
             elements,
             endpoints,
             hosts,
+            flows,
             routing: Route::new(graph),
         }
     }
@@ -92,17 +96,22 @@ impl Topology {
     }
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
-    pub fn set(&mut self, flows: Vec<Flow>, sim: SimContext<'_, Shared>) {
+    pub fn set(&mut self, sim: SimContext<'_, Shared>) -> Vec<usize> {
         // element_id -> Vec<(flow_id, next_id)>
         let mut results: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for flow in flows {
+        let mut attach_to = Vec::new();
+        for flow in &self.flows {
             for edge in flow.graph.edge_references() {
-                // finds the NodeIndex of start and end nodes of the path
-                let start = NodeIndex::new(*flow.graph.node_weight(edge.source()).unwrap());
-                let end = NodeIndex::new(*flow.graph.node_weight(edge.target()).unwrap());
+                // finds the index of start and end nodes of the path
+                let &start = flow.graph.node_weight(edge.source()).unwrap();
+                let &end = flow.graph.node_weight(edge.target()).unwrap();
+                attach_to.push(start);
+                attach_to.push(end);
 
                 // fetches all shortest paths and randomly select one
-                let shortest_paths: Vec<Vec<NodeIndex>> = self.routing.compute_route(start, end);
+                let shortest_paths: Vec<Vec<NodeIndex>> = self
+                    .routing
+                    .compute_route(NodeIndex::new(start), NodeIndex::new(end));
                 let random_idx =
                     (*sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
                 let path = &shortest_paths[random_idx];
@@ -165,9 +174,17 @@ impl Topology {
                 Element::Splitter(_) => continue,
             }
         }
+        attach_to
     }
 
-    pub fn run(self, sim: SimContext<'_, Shared>) {
+    pub fn run(mut self, sim: SimContext<'_, Shared>) {
+        // constructs the network graph with network elements
+        self.connect();
+        // computes shortest paths for all flows, and sets fibs for all switches
+        let attach_to = self.set(sim);
+        // attaches sources and sinks to hosts in the network graph
+        self.attach(attach_to);
+
         for endpoint in self.endpoints {
             match endpoint {
                 EndPoint::PacketSource(source) => {

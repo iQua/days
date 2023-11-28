@@ -24,14 +24,8 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let endpoints = init_endpoints(flows.clone());
     let hosts = vec![0, 1];
 
-    let mut topology = Topology::new(graph, hosts, elements, endpoints);
+    let topology = Topology::new(graph, hosts, elements, endpoints, flows);
 
-    // constructs the network graph with network elements
-    topology.connect();
-    // attaches sources and sinks to hosts in the network graph
-    topology.attach(vec![0, 1, 1, 0]);
-    // computes shortest paths for all flows, and sets fibs for all switches
-    topology.set(flows, sim);
     // runs the topology
     topology.run(sim);
 
