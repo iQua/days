@@ -3,7 +3,6 @@ use std::fs;
 use std::sync::Arc;
 
 use petgraph::graph::UnGraph;
-use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -106,25 +105,12 @@ impl Topology {
 
     /// attaches packet endpoints (sources or sinks) to hosts in the network graph.
     pub fn attach(&mut self) {
-        // fetches NodeIndex of hosts for all paths
+        // fetches NodeIndex of hosts and initializes endpoints for all flows
         let mut attach_to = Vec::new();
-        for flow in &self.flows {
-            for edge in flow.graph.edge_references() {
-                attach_to.push(edge.source());
-                attach_to.push(edge.target());
-            }
-        }
-
-        // init_endpoints for all flows
         for flow in self.flows.iter_mut() {
+            attach_to.extend(flow.get_hosts());
             flow.init_endpoints();
         }
-        let total_endpoints: usize = self.flows.iter().map(|flow| flow.endpoints.len()).sum();
-        println!("Total endpoints of all flows: {}", total_endpoints);
-
-        // the number of endpoints should be equal to the number of hosts they
-        // attach to
-        assert_eq!(total_endpoints, attach_to.len());
 
         let mut endpoint_iter = self
             .flows

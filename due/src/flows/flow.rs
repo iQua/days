@@ -152,6 +152,16 @@ impl Flow {
         paths
     }
 
+    // Gets the hosts ids that endpoints attach to
+    pub fn get_hosts(&self) -> Vec<NodeIndex> {
+        let mut attach_to = Vec::new();
+        for edge in self.graph.edge_references() {
+            attach_to.push(edge.source());
+            attach_to.push(edge.target());
+        }
+        attach_to
+    }
+
     // Initializes endpoints for the flow
     pub fn init_endpoints(&mut self) {
         for _ in 0..self.graph.edge_count() {
