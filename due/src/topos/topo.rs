@@ -6,9 +6,9 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
-use crate::flows::EndPoint;
 use crate::flows::sink::PacketSink;
 use crate::flows::source::PacketSource;
+use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::Element;
 use crate::Shared;
@@ -35,7 +35,6 @@ impl Topology {
         elements: Vec<Element>,
         flows: Vec<Flow>,
     ) -> Topology {
-
         // initializes endpoints based on flows
         let mut endpoints: Vec<EndPoint> = Vec::new();
         for flow in &flows {
