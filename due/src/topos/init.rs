@@ -84,12 +84,7 @@ pub fn init_endpoints(flows: Vec<Flow>) -> Vec<EndPoint> {
 
     for flow in flows {
         // Need to set params for the pkt source!
-        endpoints.push(EndPoint::PacketSource(PacketSource::new(
-            flow.id,
-            flow.initial_delay,
-            flow.arr_dist,
-            flow.pkt_size_dist,
-        )));
+        endpoints.push(EndPoint::PacketSource(PacketSource::new(flow.clone())));
         endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
     }
 

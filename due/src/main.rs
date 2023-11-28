@@ -28,10 +28,10 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
 
     // constructs the network graph with network elements
     topology.connect();
-    // computes shortest paths for all flows, and sets fibs for all switches
-    topology.set(flows, sim);
     // attaches sources and sinks to hosts in the network graph
     topology.attach(vec![0, 1, 1, 0]);
+    // computes shortest paths for all flows, and sets fibs for all switches
+    topology.set(flows, sim);
     // runs the topology
     topology.run(sim);
 

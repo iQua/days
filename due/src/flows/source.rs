@@ -5,6 +5,7 @@ use rand::distributions::Distribution;
 use statrs::distribution::{DiscreteUniform, Exp};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::flows::flow::Flow;
 use crate::flows::packet::Packet;
 use crate::sim::{SimContext, Time};
 use crate::{next_endpoint_id, DistributionInfo, Shared};
@@ -12,10 +13,7 @@ use crate::{next_endpoint_id, DistributionInfo, Shared};
 #[derive(Debug)]
 pub struct PacketSource {
     endpoint_id: usize,
-    flow_id: usize,
-    initial_delay: Time,
-    arr_dist: DistributionInfo,
-    pkt_size_dist: DistributionInfo,
+    flow: Flow,
     packets_sent: usize,
     sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
@@ -25,10 +23,7 @@ impl Clone for PacketSource {
     fn clone(&self) -> Self {
         PacketSource {
             endpoint_id: next_endpoint_id(),
-            flow_id: self.flow_id.clone(),
-            initial_delay: self.initial_delay.clone(),
-            arr_dist: self.arr_dist.clone(),
-            pkt_size_dist: self.pkt_size_dist.clone(),
+            flow: self.flow.clone(),
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -37,18 +32,10 @@ impl Clone for PacketSource {
 }
 
 impl PacketSource {
-    pub fn new(
-        flow_id: usize,
-        initial_delay: Time,
-        arr_dist: DistributionInfo,
-        pkt_size_dist: DistributionInfo,
-    ) -> PacketSource {
+    pub fn new(flow: Flow) -> PacketSource {
         PacketSource {
             endpoint_id: next_endpoint_id(),
-            flow_id,
-            initial_delay,
-            arr_dist,
-            pkt_size_dist,
+            flow,
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -60,7 +47,7 @@ impl PacketSource {
     }
 
     pub fn flow_id(&self) -> usize {
-        self.flow_id
+        self.flow.id
     }
 
     pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
@@ -92,13 +79,13 @@ impl PacketSource {
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         println!(
             "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
-            self.endpoint_id, self.initial_delay
+            self.endpoint_id, self.flow.initial_delay
         );
 
-        sim.advance(self.initial_delay).await;
+        sim.advance(self.flow.initial_delay).await;
 
         while sim.now() < sim.shared().duration {
-            let interval = match self.arr_dist {
+            let interval = match self.flow.arr_dist {
                 DistributionInfo::Exp { lambda } => Exp::new(lambda)
                     .unwrap()
                     .sample(&mut *sim.shared().rng.borrow_mut()),
@@ -108,7 +95,7 @@ impl PacketSource {
             };
             sim.advance(interval).await;
 
-            let packet_size = match self.pkt_size_dist {
+            let packet_size = match self.flow.pkt_size_dist {
                 DistributionInfo::Exp { lambda } => Exp::new(lambda)
                     .unwrap()
                     .sample(&mut *sim.shared().rng.borrow_mut())
