@@ -10,7 +10,7 @@ use crate::flows::sink::PacketSink;
 use crate::flows::source::PacketSource;
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
-use crate::switches::Element;
+use crate::switches::{Element, switch};
 use crate::Shared;
 
 pub struct Topology {
@@ -133,10 +133,9 @@ impl Topology {
                 for (idx, &node_idx) in path.iter().enumerate() {
                     let element_id = node_idx;
                     let mut next_id = usize::MAX;
-                    let (flow_id, next_id) = match idx < path.len() - 1 {
+                    let next_id = match idx < path.len() - 1 {
                         true => {
-                            next_id = path[idx + 1].index();
-                            (flow.id, next_id)
+                            path[idx + 1].index()
                         }
                         false => {
                             for endpoint in &self.endpoints {
@@ -155,13 +154,13 @@ impl Topology {
                                     _ => continue,
                                 }
                             }
-                            (flow.id, next_id)
+                            next_id
                         }
                     };
                     results
                         .entry(element_id.index())
                         .or_default()
-                        .push((flow_id, next_id));
+                        .push((flow.id, next_id));
                 }
             }
         }
@@ -169,9 +168,8 @@ impl Topology {
 
         // sets fibs for all switch elements
         for element in &mut self.elements {
-            match element {
-                Element::PacketSwitch(switch) => {
-                    let id = switch.id();
+            if let Element::PacketSwitch(switch) = element {
+                let id = switch.id();
                     let flow_to_next = results.get(&id).unwrap();
                     for (flow_id, next_id) in flow_to_next {
                         switch.set_fib(*flow_id, *next_id);
@@ -182,8 +180,6 @@ impl Topology {
                         switch.id(),
                         switch.port_senders.keys()
                     );
-                }
-                Element::Splitter(_) => continue,
             }
         }
     }
