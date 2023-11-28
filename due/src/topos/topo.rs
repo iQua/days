@@ -11,7 +11,7 @@ use crate::sim::SimContext;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};
-use crate::Shared;
+use crate::{set_num_elements, Shared};
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -44,6 +44,8 @@ impl Topology {
         hosts: Vec<usize>,
         flows: Vec<Flow>,
     ) -> Topology {
+        set_num_elements(graph.node_count());
+
         Topology {
             graph: graph.clone(),
             hosts,

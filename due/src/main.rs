@@ -8,9 +8,9 @@ use log::{debug, info};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
+use due::flows::flow::Flow;
 use due::sim::{simulation, Process, RandomVar, SimContext};
 // use due::topos::build::build_graph;
-use due::flows::flow::Flow;
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
@@ -44,9 +44,9 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
 
     // 2. initializes flows using a configuration file.
     //    Example:
-    //    let flows = Flow::flows_from_config(file_path);
+    let flows = Flow::flows_from_config(file_path);
 
-    let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+    // let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
     debug!(
         "A total of {} network flows has been initialized.",
         flows.len()

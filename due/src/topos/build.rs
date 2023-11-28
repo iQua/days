@@ -5,8 +5,6 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
-use crate::set_num_elements;
-
 #[derive(Deserialize)]
 struct NetworkGraph {
     edges: Vec<(u32, u32)>,
@@ -28,7 +26,6 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
 
     let graph = UnGraph::<usize, ()>::from_edges(graph.edges);
 
-    set_num_elements(graph.node_count());
     graph
 }
 
@@ -86,6 +83,5 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<(), ()>, Vec<usize>) {
     // distinguishes all hosts (edge switches)
     let hosts: Vec<usize> = (0..num_layer_switches).collect();
 
-    set_num_elements(graph.node_count());
     (graph, hosts)
 }
