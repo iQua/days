@@ -212,10 +212,11 @@ impl WFQServer {
                 + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id]);
             self.finish_times[class_id] = finish_time;
         }
-        return TaggedPacket {
+
+        TaggedPacket {
             packet: packet,
             tag: finish_time,
-        };
+        }
     }
 
     fn update_stats(&mut self, packet: Packet, now: Time) {
