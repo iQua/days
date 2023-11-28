@@ -15,8 +15,6 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path.as_str();
 
     let flows = init_flows(file_path);
-    println!("Flows: {:?}", flows);
-
     let graph = build_graph(file_path);
     set_num_elements(graph.node_count());
 
