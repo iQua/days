@@ -37,7 +37,7 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
 
     // 1. initializes flows directly using flows_from_graph().
     //    Example:
-    //    let flows = Flow::flows_from_graph([vec![(0, 1)], vec![(1, 0)]]);
+    //    let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
 
     // 2. initializes flows using a configuration file.
     //    Example:
