@@ -88,8 +88,8 @@ impl Topology {
         elements
     }
 
-    /// connects a vector of elements according to edges in the network topology.
-    pub fn connect(&mut self) {
+    /// Connects a vector of elements according to edges in the network topology.
+    fn connect(&mut self) {
         for node_id in self.graph.node_indices() {
             let (sender, receiver) = unbounded_channel();
             self.elements[node_id.index()].connect_receiver(receiver);
@@ -105,8 +105,8 @@ impl Topology {
         }
     }
 
-    /// attaches packet endpoints (sources or sinks) to hosts in the network graph.
-    pub fn attach(&mut self) {
+    /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
+    fn attach(&mut self) {
         // obtains the element_id of all end hosts (where endpoints can be
         // attached to), and initializes endpoints for all flows
         let mut attach_to = Vec::new();
@@ -148,10 +148,10 @@ impl Topology {
         }
     }
 
-    /// computes routing decisions for all the flows, and installs Flow
+    /// Computes routing decisions for all the flows, and installs Flow
     /// Information Base tables (FIBs) of these routing decisions into all the
     /// switches.
-    pub fn set(&mut self, sim: SimContext<'_, Shared>) {
+    fn route(&mut self, sim: SimContext<'_, Shared>) {
         for flow in self.flows.iter_mut() {
             let paths = flow.compute_paths(self.graph.clone(), sim);
 
@@ -182,7 +182,7 @@ impl Topology {
         // attaches sources and sinks to hosts in the network graph
         self.attach();
         // computes shortest paths for all flows, and sets fibs for all switches
-        self.set(sim);
+        self.route(sim);
 
         for flow in self.flows {
             sim.activate(flow.run(sim));
