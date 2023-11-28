@@ -48,7 +48,6 @@ pub struct Flow {
     pub initial_delay: Time,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
-    pub topo_graph: UnGraph<usize, ()>,
     pub endpoints: Vec<EndPoint>,
     pub routing: RandomSimplePath,
 }
@@ -62,8 +61,7 @@ impl Flow {
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> Flow {
-        let topo_graph = UnGraph::<usize, ()>::new_undirected();
-        let routing = RandomSimplePath::new(topo_graph.clone());
+        let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
         Flow {
             id,
             flow_type,
@@ -71,7 +69,6 @@ impl Flow {
             initial_delay,
             arr_dist,
             pkt_size_dist,
-            topo_graph,
             endpoints: Vec::new(),
             routing,
         }
@@ -125,19 +122,31 @@ impl Flow {
         flows
     }
 
-    // Sets the connected graph of the topology
-    pub fn set_topo_graph(&mut self, graph: UnGraph<usize, ()>) {
-        self.topo_graph = graph.clone();
-        self.routing = RandomSimplePath::new(self.topo_graph.clone());
-    }
-
     // Gets the simple paths for all edges of the flow
-    pub fn get_path(&mut self, sim: SimContext<'_, Shared>) -> Vec<Vec<NodeIndex>> {
+    pub fn compute_paths(
+        &mut self,
+        graph: UnGraph<usize, ()>,
+        sim: SimContext<'_, Shared>,
+    ) -> Vec<Vec<NodeIndex>> {
+        // sets the routing protocol
+        self.routing = RandomSimplePath::new(graph);
+
         let mut paths = Vec::new();
-        for edge in self.graph.edge_references() {
-            let path = self
+        for (idx, edge) in self.graph.edge_references().enumerate() {
+            let mut path = self
                 .routing
                 .compute_route(edge.source(), edge.target(), sim);
+            let sink_id = self
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| match endpoint {
+                    EndPoint::PacketSink(sink) => Some(sink),
+                    _ => None,
+                })
+                .nth(idx)
+                .unwrap()
+                .id();
+            path.push(NodeIndex::new(sink_id));
             paths.push(path);
         }
         paths

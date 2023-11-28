@@ -8,7 +8,6 @@ use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
-use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
@@ -160,32 +159,18 @@ impl Topology {
     /// computes shortest paths for all flows, and sets fibs for all switches.
     pub fn set(&mut self, sim: SimContext<'_, Shared>) {
         for flow in self.flows.iter_mut() {
-            // sets the topology graph for the flow
-            flow.set_topo_graph(self.graph.clone());
-            // gets the all simple paths of the flow
-            let paths = flow.get_path(sim);
+            // gets the flow's all simple paths, where the last item is the
+            // endpoint_id of the sink
+            let paths = flow.compute_paths(self.graph.clone(), sim);
             println!("paths of flow {}: {:?}", flow.id, paths);
 
             for path in paths {
-                for (idx, &node_idx) in path.iter().enumerate() {
-                    // gets fibs for elements along the path
-                    let next_id = if idx < path.len() - 1 {
-                        path[idx + 1].index()
-                    } else {
-                        flow.endpoints
-                            .iter()
-                            .find_map(|endpoint| match endpoint {
-                                EndPoint::PacketSink(sink) if sink.flow_id() == flow.id => {
-                                    Some(sink.id())
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or(usize::MAX)
-                    };
-
-                    // sets fibs
-                    if let Element::PacketSwitch(switch) = &mut self.elements[node_idx.index()] {
-                        switch.set_fib(flow.id, next_id)
+                for window in path.windows(2) {
+                    let node_id = window.get(0).unwrap();
+                    let next_id = window.get(1).unwrap();
+                    if let Element::PacketSwitch(switch) = &mut self.elements[node_id.index()] {
+                        let next_id = next_id.index();
+                        switch.set_fib(flow.id, next_id);
                     }
                 }
             }
