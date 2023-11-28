@@ -71,7 +71,17 @@ impl Topology {
     }
 
     /// attaches packet endpoints (sources or sinks) to hosts in the network graph.
-    pub fn attach(&mut self, attach_to: Vec<usize>) {
+    pub fn attach(&mut self) {
+
+        // fetches NodeIndex of hosts for all paths
+        let mut attach_to = Vec::new();
+        for flow in &self.flows {
+            for edge in flow.graph.edge_references() {
+                attach_to.push(edge.source());
+                attach_to.push(edge.target());
+            }
+        }
+
         // the number of endpoints should be equal to the number of hosts they
         // attach to
         assert_eq!(self.endpoints.len(), attach_to.len());
@@ -80,43 +90,38 @@ impl Topology {
 
         // attaches each endpoint's sender to its corresponding host's receiver
         for host_id in attach_to {
-            assert!(self.hosts.contains(&host_id));
+            assert!(self.hosts.contains(&host_id.index()));
 
             // locate a neighboring element in the network graph to this host
-            let mut neighbors = self.graph.neighbors(NodeIndex::new(host_id));
+            let mut neighbors = self.graph.neighbors(host_id);
 
             let (downlink_sender, downlink_receiver) = unbounded_channel();
             let endpoint = endpoint_iter.next().unwrap();
 
             if let Some(next_neighbor) = neighbors.next() {
-                if next_neighbor.index() != host_id {
+                if next_neighbor != host_id {
                     self.elements[next_neighbor.index()].connect_neighbour_to_endpoint(
                         endpoint,
                         downlink_receiver,
-                        host_id,
+                        host_id.index(),
                     );
                 }
-                self.elements[host_id].connect_sender(endpoint.id(), downlink_sender);
+                self.elements[host_id.index()].connect_sender(endpoint.id(), downlink_sender);
             } else {
-                panic!("No neighbors found for host element {}", host_id);
+                panic!("No neighbors found for host element {}", host_id.index());
             }
         }
     }
 
     /// computes shortest paths for all flows, and sets fibs for all switches.
-    pub fn set(&mut self, sim: SimContext<'_, Shared>) -> Vec<usize> {
+    pub fn set(&mut self, sim: SimContext<'_, Shared>) {
         // element_id -> Vec<(flow_id, next_id)>
         let mut results: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        let mut attach_to = Vec::new();
         for flow in &self.flows {
             for edge in flow.graph.edge_references() {
                 // finds the index of start and end nodes of the path
                 let start = edge.source().index();
                 let end = edge.target().index();
-
-                // stores the host id that these endpoints connect to
-                attach_to.push(start);
-                attach_to.push(end);
 
                 // get the simple path
                 let path =
@@ -181,16 +186,15 @@ impl Topology {
                 Element::Splitter(_) => continue,
             }
         }
-        attach_to
     }
 
     pub fn run(mut self, sim: SimContext<'_, Shared>) {
         // constructs the network graph with network elements
         self.connect();
         // computes shortest paths for all flows, and sets fibs for all switches
-        let attach_to = self.set(sim);
+        self.set(sim);
         // attaches sources and sinks to hosts in the network graph
-        self.attach(attach_to);
+        self.attach();
 
         for endpoint in self.endpoints {
             match endpoint {
