@@ -2,11 +2,10 @@ use std::collections::HashMap;
 
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
-use rand::Rng;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
-use crate::flows::route::{Route, Routing};
+use crate::flows::route::{RandomSimplePath, RoutingProtocol};
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::Element;
@@ -26,7 +25,7 @@ pub struct Topology {
     /// A Vec of all flows
     flows: Vec<Flow>,
     /// Routing module
-    routing: Route,
+    routing: RandomSimplePath,
 }
 
 impl Topology {
@@ -42,7 +41,7 @@ impl Topology {
             endpoints: init_endpoints(flows.clone()),
             hosts,
             flows,
-            routing: Route::new(graph),
+            routing: RandomSimplePath::new(graph),
         }
     }
 
@@ -109,13 +108,10 @@ impl Topology {
                 attach_to.push(start);
                 attach_to.push(end);
 
-                // fetches all shortest paths and randomly select one
-                let shortest_paths: Vec<Vec<NodeIndex>> = self
-                    .routing
-                    .compute_route(NodeIndex::new(start), NodeIndex::new(end));
-                let random_idx =
-                    (*sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
-                let path = &shortest_paths[random_idx];
+                // get the simple path
+                let path =
+                    self.routing
+                        .compute_route(NodeIndex::new(start), NodeIndex::new(end), sim);
                 println!("The path of flow {}: {:?}", flow.id, path);
 
                 // gets fibs for elements along the path
@@ -156,7 +152,7 @@ impl Topology {
         }
         println!("Results: {:?}", results);
 
-        // sets fibs for all switch elemetns
+        // sets fibs for all switch elements
         for element in &mut self.elements {
             match element {
                 Element::PacketSwitch(switch) => {
