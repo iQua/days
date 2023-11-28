@@ -16,16 +16,22 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path.as_str();
 
     // There are three ways of building a graph:
-    // 1. build_graph(file_path) -> builds a graph from a toml file. Example:
+
+    // 1. build_graph(file_path) -> builds a graph from a configuration file.
+    //    Example:
     //    let graph = build_graph(file_path);
+    //    let hosts = vec![0, 1];
+
     // 2. building a graph directly using UnGraph::<usize, ()>::from_edges().
     //    Example:
     //    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    //    let hosts = vec![0, 1];
+
     // 3. building a graph using a graph builder.
-    //
-    //    let graph = build_fattree();
+    //    let (graph, hosts) = build_fattree();
 
     let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    let hosts = vec![0, 1];
 
     // There are two ways of initializing the flows:
     // 1. initializes flows directly using flows_from_graph().
@@ -38,7 +44,6 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let flows = flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
 
     let elements = init_elements(file_path);
-    let hosts = vec![0, 1];
 
     // initializes the topology
     let topology = Topology::new(graph, hosts, elements, flows);
