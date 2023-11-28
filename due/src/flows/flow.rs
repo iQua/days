@@ -3,8 +3,8 @@ use std::fs;
 use petgraph::graph::{DiGraph, UnGraph};
 use serde::Deserialize;
 
-use crate::next_flow_id;
-use crate::sim::Time;
+use crate::sim::{SimContext, Time};
+use crate::{next_flow_id, Shared};
 
 use super::sink::PacketSink;
 use super::source::PacketSource;
@@ -136,6 +136,19 @@ impl Flow {
                 )));
             self.endpoints
                 .push(EndPoint::PacketSink(PacketSink::new(self.id)));
+        }
+    }
+
+    pub async fn run(self, sim: SimContext<'_, Shared>) {
+        for endpoint in self.endpoints {
+            match endpoint {
+                EndPoint::PacketSource(source) => {
+                    sim.activate(source.run(sim));
+                }
+                EndPoint::PacketSink(sink) => {
+                    sim.activate(sink.run(sim));
+                }
+            }
         }
     }
 }

@@ -9,8 +9,6 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
-use crate::flows::sink::PacketSink;
-use crate::flows::source::PacketSource;
 use crate::flows::EndPoint;
 use crate::sim::SimContext;
 use crate::switches::splitter::Splitter;
@@ -38,8 +36,6 @@ pub struct Topology {
     hosts: Vec<usize>,
     /// A Vec of PacketSwitchs and Splitters
     elements: Vec<Element>,
-    /// A Vec of PacketSources and PacketSinks
-    endpoints: Vec<EndPoint>,
     /// A Vec of all flows
     flows: Vec<Flow>,
     /// Routing module
@@ -53,22 +49,8 @@ impl Topology {
         hosts: Vec<usize>,
         flows: Vec<Flow>,
     ) -> Topology {
-        // initializes endpoints based on flows
-        let mut endpoints: Vec<EndPoint> = Vec::new();
-        for flow in &flows {
-            // TODO: this only works for flows with one pair of source and sink
-            endpoints.push(EndPoint::PacketSource(PacketSource::new(
-                flow.id,
-                flow.initial_delay,
-                flow.arr_dist,
-                flow.pkt_size_dist,
-            )));
-            endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
-        }
-
         Topology {
             graph: graph.clone(),
-            endpoints,
             hosts,
             flows,
             elements: Topology::init_elements(file_path),
@@ -138,11 +120,21 @@ impl Topology {
             }
         }
 
+        // init_endpoints for all flows
+        for flow in self.flows.iter_mut() {
+            flow.init_endpoints();
+        }
+        let total_endpoints: usize = self.flows.iter().map(|flow| flow.endpoints.len()).sum();
+        println!("Total endpoints of all flows: {}", total_endpoints);
+
         // the number of endpoints should be equal to the number of hosts they
         // attach to
-        assert_eq!(self.endpoints.len(), attach_to.len());
+        assert_eq!(total_endpoints, attach_to.len());
 
-        let mut endpoint_iter = self.endpoints.iter_mut();
+        let mut endpoint_iter = self
+            .flows
+            .iter_mut()
+            .flat_map(|flow| flow.endpoints.iter_mut());
 
         // attaches each endpoint's sender to its corresponding host's receiver
         for host_id in attach_to {
@@ -184,8 +176,9 @@ impl Topology {
                     let next_id = if idx < path.len() - 1 {
                         path[idx + 1].index()
                     } else {
-                        self.endpoints
+                        self.flows
                             .iter()
+                            .flat_map(|flow| &flow.endpoints)
                             .find_map(|endpoint| match endpoint {
                                 EndPoint::PacketSink(sink) if sink.flow_id() == flow.id => {
                                     Some(sink.id())
@@ -207,20 +200,13 @@ impl Topology {
     pub fn run(mut self, sim: SimContext<'_, Shared>) {
         // constructs the network graph with network elements
         self.connect();
-        // computes shortest paths for all flows, and sets fibs for all switches
-        self.set(sim);
         // attaches sources and sinks to hosts in the network graph
         self.attach();
+        // computes shortest paths for all flows, and sets fibs for all switches
+        self.set(sim);
 
-        for endpoint in self.endpoints {
-            match endpoint {
-                EndPoint::PacketSource(source) => {
-                    sim.activate(source.run(sim));
-                }
-                EndPoint::PacketSink(sink) => {
-                    sim.activate(sink.run(sim));
-                }
-            }
+        for flow in self.flows {
+            sim.activate(flow.run(sim));
         }
 
         for element in self.elements {
