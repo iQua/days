@@ -157,12 +157,19 @@ impl Topology {
 
             for path in paths {
                 for window in path.windows(2) {
-                    let node_id = window.get(0).unwrap();
-                    let next_id = window.get(1).unwrap();
+                    let node_id = window.get(0).unwrap().index();
+                    let next_id = window.get(1).unwrap().index();
 
-                    if let Element::PacketSwitch(switch) = &mut self.elements[node_id.index()] {
-                        let next_id = next_id.index();
-                        switch.set_fib(flow.id, next_id);
+                    match &mut self.elements[node_id] {
+                        Element::PacketSwitch(switch) => {
+                            switch.set_fib(flow.id, next_id);
+                        }
+                        _ => {
+                            panic!(
+                                "element {} will be skipped when setting fib in flow {}",
+                                node_id, flow.id
+                            );
+                        }
                     }
                 }
             }
