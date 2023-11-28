@@ -124,7 +124,6 @@ impl Topology {
 
     /// attaches packet endpoints (sources or sinks) to hosts in the network graph.
     pub fn attach(&mut self) {
-
         // fetches NodeIndex of hosts for all paths
         let mut attach_to = Vec::new();
         for flow in &self.flows {
@@ -186,24 +185,13 @@ impl Topology {
                     let element_id = node_idx;
                     let mut next_id = usize::MAX;
                     let next_id = match idx < path.len() - 1 {
-                        true => {
-                            path[idx + 1].index()
-                        }
+                        true => path[idx + 1].index(),
                         false => {
                             for endpoint in &self.endpoints {
-                                match endpoint {
-                                    EndPoint::PacketSink(sink) => {
-                                        if sink.flow_id() == flow.id {
-                                            next_id = sink.id();
-                                            println!(
-                                                "Sink {}'s flow id: {}",
-                                                sink.id(),
-                                                sink.flow_id()
-                                            );
-                                            break;
-                                        }
+                                if let EndPoint::PacketSink(sink) = endpoint {
+                                    if sink.flow_id() == flow.id {
+                                        next_id = sink.id()
                                     }
-                                    _ => continue,
                                 }
                             }
                             next_id
@@ -222,16 +210,16 @@ impl Topology {
         for element in &mut self.elements {
             if let Element::PacketSwitch(switch) = element {
                 let id = switch.id();
-                    let flow_to_next = results.get(&id).unwrap();
-                    for (flow_id, next_id) in flow_to_next {
-                        switch.set_fib(*flow_id, *next_id);
-                    }
-                    println!("fib for Switch {} is: {:?}", switch.id(), switch.get_fib());
-                    println!(
-                        "keys of port_senders for Switch {} is: {:?}",
-                        switch.id(),
-                        switch.port_senders.keys()
-                    );
+                let flow_to_next = results.get(&id).unwrap();
+                for (flow_id, next_id) in flow_to_next {
+                    switch.set_fib(*flow_id, *next_id);
+                }
+                println!("fib for Switch {} is: {:?}", switch.id(), switch.get_fib());
+                println!(
+                    "keys of port_senders for Switch {} is: {:?}",
+                    switch.id(),
+                    switch.port_senders.keys()
+                );
             }
         }
     }
