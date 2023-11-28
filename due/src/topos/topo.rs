@@ -15,8 +15,6 @@ use crate::Shared;
 pub struct Topology {
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
-    /// A HashMap to get the NodeIndex based on the element id
-    indices: HashMap<usize, NodeIndex>,
     /// A Vec of element ids that connects to endpoints
     hosts: Vec<usize>,
     /// A Vec of PacketSwitchs and Splitters
@@ -30,14 +28,12 @@ pub struct Topology {
 impl Topology {
     pub fn new(
         graph: UnGraph<usize, ()>,
-        indices: HashMap<usize, NodeIndex>,
         hosts: Vec<usize>,
         elements: Vec<Element>,
         endpoints: Vec<EndPoint>,
     ) -> Topology {
         Topology {
             graph: graph.clone(),
-            indices,
             elements,
             endpoints,
             hosts,
@@ -102,14 +98,11 @@ impl Topology {
         for flow in flows {
             for edge in flow.graph.edge_references() {
                 // finds the NodeIndex of start and end nodes of the path
-                let start = flow.graph.node_weight(edge.source()).unwrap();
-                let end = flow.graph.node_weight(edge.target()).unwrap();
-                let &start_node_idx = self.indices.get(start).unwrap();
-                let &end_node_idx = self.indices.get(end).unwrap();
+                let start = NodeIndex::new(*flow.graph.node_weight(edge.source()).unwrap());
+                let end = NodeIndex::new(*flow.graph.node_weight(edge.target()).unwrap());
 
                 // fetches all shortest paths and randomly select one
-                let shortest_paths: Vec<Vec<NodeIndex>> =
-                    self.routing.compute_route(start_node_idx, end_node_idx);
+                let shortest_paths: Vec<Vec<NodeIndex>> = self.routing.compute_route(start, end);
                 let random_idx =
                     (*sim.shared().rng.borrow_mut()).gen_range(0..shortest_paths.len());
                 let path = &shortest_paths[random_idx];

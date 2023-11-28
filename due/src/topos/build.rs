@@ -17,7 +17,7 @@ struct FatTreeConfig {
 }
 
 /// This function is used to build a topology from a toml configuration file
-pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, HashMap<usize, NodeIndex>) {
+pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -25,20 +25,18 @@ pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, HashMap<usize, NodeI
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
 
     let mut graph = UnGraph::<usize, ()>::new_undirected();
-    let mut indices = HashMap::new();
 
     // addes nodes to the graph
     for id in 0..config.num_elements {
-        let node_index = graph.add_node(id);
-        indices.insert(id, node_index);
+        graph.add_node(id);
     }
 
     // connects edges for the graph
     for edge in config.edges {
-        graph.add_edge(indices[&edge.0], indices[&edge.1], ());
+        graph.add_edge(NodeIndex::new(edge.0), NodeIndex::new(edge.1), ());
     }
 
-    (graph, indices)
+    graph
 }
 
 /// This function is used to build a fattree topology and its hosts.

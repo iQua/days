@@ -17,14 +17,14 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let flows = init_flows(file_path);
     println!("Flows: {:?}", flows);
 
-    let (graph, indices) = build_graph(file_path);
+    let graph = build_graph(file_path);
     set_num_elements(graph.node_count());
 
     let elements = init_elements(file_path);
     let endpoints = init_endpoints(flows.clone());
     let hosts = vec![0, 1];
 
-    let mut topology = Topology::new(graph, indices, hosts, elements, endpoints);
+    let mut topology = Topology::new(graph, hosts, elements, endpoints);
 
     // constructs the network graph with network elements
     topology.connect();
