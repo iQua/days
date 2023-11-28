@@ -1,13 +1,20 @@
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
-use crate::{sim::Time, DistributionInfo};
+use crate::sim::Time;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename = "UPPERCASE")]
 pub enum FlowType {
     PacketDistribution,
     TCP,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+#[serde(tag = "type")]
+pub enum DistributionInfo {
+    Exp { lambda: f64 },
+    Uniform { low: i64, high: i64 },
 }
 
 #[derive(Debug)]

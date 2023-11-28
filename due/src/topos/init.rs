@@ -7,13 +7,12 @@ use std::{fs, sync::Arc};
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
-use crate::flows::flow::{Flow, FlowType};
+use crate::flows::flow::{DistributionInfo, Flow, FlowType};
 use crate::next_flow_id;
 use crate::sim::Time;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};
-use crate::DistributionInfo;
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -77,16 +76,38 @@ pub fn init_elements(file_path: &str) -> Vec<Element> {
     elements
 }
 
-// This function is used to initialize flows by a Vec of directed graphs.
-pub fn init_flows(file_path: &str) -> Vec<Flow> {
-    // reads the configuration
+// Initializes flows from a vector of directed graphs.
+pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
+    let mut flows = Vec::new();
+
+    for graph in graphs {
+        let flow_graph = DiGraph::<usize, ()>::from_edges(&graph);
+
+        flows.push(Flow::new(
+            next_flow_id(),
+            FlowType::PacketDistribution,
+            flow_graph,
+            0.,
+            DistributionInfo::Exp { lambda: 1. },
+            DistributionInfo::Uniform {
+                low: 1000,
+                high: 1000,
+            },
+        ));
+    }
+
+    flows
+}
+
+// Initializes flows from a configuration file.
+pub fn flows_from_config(file_path: &str) -> Vec<Flow> {
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-    // deserializes the content of the configuration
     let config: FlowConfig =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
     let mut flows = Vec::new();
+
     for flow in config.flows {
         let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
 

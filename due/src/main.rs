@@ -7,16 +7,30 @@ use rand::{rngs::SmallRng, SeedableRng};
 
 use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::build::build_graph;
-use due::topos::init::{init_elements, init_flows};
+use due::topos::init::{flows_from_graph, init_elements};
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
 async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path.as_str();
 
-    // initializes flows, elements, hosts, and the graph
-    let flows = init_flows(file_path);
+    // there are three ways of building a graph:
+    // 1. build_graph(file_path) -> builds a graph from a toml file
+    // 2. building a graph directly using UnGraph::<usize, ()>::from_edges(),
+    //    for example: let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    // 3. building a graph using a graph builder, for example:
+    //    let graph = build_fattree();
     let graph = build_graph(file_path);
+
+    // there are two ways of initializing the flows:
+    // 1. initializes flows directly using DiGraph::<usize, ()>::from_edges(),
+    //    for example: let graph = DiGraph::<usize, ()>::from_edges(flow_graph);
+    //                 let flows = flows_from_graph([vec![(0, 1)], vec![(1, 0)]]);
+    // 2. initializes flows using a configuration file, for example:
+    //    let flows = flows_from_config(file_path);
+    // let flows = flows_from_config(file_path);
+    let flows = flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+
     let elements = init_elements(file_path);
     let hosts = vec![0, 1];
 

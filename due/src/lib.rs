@@ -25,13 +25,6 @@ pub struct SeedConfig {
     seed: u64,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
-#[serde(tag = "type")]
-pub enum DistributionInfo {
-    Exp { lambda: f64 },
-    Uniform { low: i64, high: i64 },
-}
-
 pub fn get_seed(file_path: &str) -> u64 {
     // reads the configuration
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
