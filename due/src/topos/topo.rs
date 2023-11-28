@@ -37,11 +37,15 @@ impl Topology {
         elements: Vec<Element>,
         flows: &mut Vec<Flow>,
     ) -> Topology {
+        let mut endpoints = Vec::new();
+        for flow in flows.iter_mut() {
+            flow.init_endpoints(&mut endpoints);
+        }
         Topology {
             graph: graph.clone(),
             indices,
             elements,
-            endpoints: Vec::new(),
+            endpoints,
             hosts,
             flows: flows.to_vec(),
             routing: Route::new(graph),
@@ -178,10 +182,6 @@ impl Topology {
     }
 
     pub fn run(self, sim: SimContext<'_, Shared>) {
-        // for flow in self.flows {
-        //     sim.activate(flow.run(&mut self.endpoints, &mut self.graph, &self.indices, &mut self.elements, &mut self.routing, sim));
-        // }
-
         for endpoint in self.endpoints {
             match endpoint {
                 EndPoint::PacketSource(source) => {

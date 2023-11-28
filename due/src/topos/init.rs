@@ -8,6 +8,9 @@ use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
 use crate::flows::flow::Flow;
+use crate::flows::sink::PacketSink;
+use crate::flows::source::PacketSource;
+use crate::flows::EndPoint;
 use crate::sim::Time;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
@@ -74,6 +77,23 @@ pub fn init_elements(file_path: &str) -> Vec<Element> {
     }
 
     elements
+}
+
+pub fn init_endpoints(flows: Vec<Flow>) -> Vec<EndPoint> {
+    let mut endpoints: Vec<EndPoint> = Vec::new();
+
+    for flow in flows {
+        // Need to set params for the pkt source!
+        endpoints.push(EndPoint::PacketSource(PacketSource::new(
+            flow.id,
+            flow.initial_delay,
+            flow.arr_dist,
+            flow.pkt_size_dist,
+        )));
+        endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
+    }
+
+    endpoints
 }
 
 // This function is used to initialize flows by a Vec of directed graphs.
