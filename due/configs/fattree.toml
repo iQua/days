@@ -1,3 +1,4 @@
+seed = 1000
 k = 4
 port_rate = 32000 # which is equal to 4000 * 8
 capacity = 100

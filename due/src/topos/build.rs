@@ -28,7 +28,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
 }
 
 /// This function is used to build a fattree topology and its hosts.
-pub fn build_fattree(file_path: &str) -> (UnGraph<(), ()>, Vec<usize>) {
+pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -43,13 +43,13 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<(), ()>, Vec<usize>) {
     let layer_switches_per_pod = config.k / 2;
     let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
 
-    let mut graph = UnGraph::<(), ()>::new_undirected();
+    let mut graph = UnGraph::<usize, ()>::new_undirected();
     let mut indices = HashMap::new();
     let mut edges = Vec::new();
 
-    // initializes nodes for all elements
+    // // initializes nodes for all elements
     for id in 0..num_switches {
-        let node_index = graph.add_node(());
+        let node_index = graph.add_node(Default::default());
         indices.insert(id, node_index);
     }
 
