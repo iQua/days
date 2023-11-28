@@ -1,6 +1,6 @@
 use std::fs;
 
-use petgraph::graph::DiGraph;
+use petgraph::graph::{DiGraph, UnGraph};
 use serde::Deserialize;
 
 use crate::next_flow_id;
@@ -42,6 +42,7 @@ pub struct Flow {
     pub initial_delay: Time,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
+    pub topo_graph: UnGraph<usize, ()>,
 }
 
 impl Clone for Flow {
@@ -53,6 +54,7 @@ impl Clone for Flow {
             initial_delay: self.initial_delay,
             arr_dist: self.arr_dist,
             pkt_size_dist: self.pkt_size_dist,
+            topo_graph: self.topo_graph.clone(),
         }
     }
 }
@@ -73,6 +75,7 @@ impl Flow {
             initial_delay,
             arr_dist,
             pkt_size_dist,
+            topo_graph: UnGraph::<usize, ()>::new_undirected(),
         }
     }
 

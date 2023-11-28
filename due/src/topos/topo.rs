@@ -57,7 +57,12 @@ impl Topology {
         let mut endpoints: Vec<EndPoint> = Vec::new();
         for flow in &flows {
             // TODO: this only works for flows with one pair of source and sink
-            endpoints.push(EndPoint::PacketSource(PacketSource::new(flow.clone())));
+            endpoints.push(EndPoint::PacketSource(PacketSource::new(
+                flow.id,
+                flow.initial_delay,
+                flow.pkt_size_dist,
+                flow.arr_dist,
+            )));
             endpoints.push(EndPoint::PacketSink(PacketSink::new(flow.id)));
         }
 
@@ -189,7 +194,7 @@ impl Topology {
                             })
                             .unwrap_or(usize::MAX)
                     };
-                    
+
                     // sets fibs
                     if let Element::PacketSwitch(switch) = &mut self.elements[node_idx.index()] {
                         switch.set_fib(flow.id, next_id)
