@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
-use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::graph::UnGraph;
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
@@ -168,33 +168,28 @@ impl Topology {
     pub fn set(&mut self, sim: SimContext<'_, Shared>) {
         for flow in &self.flows {
             for edge in flow.graph.edge_references() {
-                // finds the index of start and end nodes of the path
-                let start = edge.source().index();
-                let end = edge.target().index();
-
                 // get the simple path
-                let path =
-                    self.routing
-                        .compute_route(NodeIndex::new(start), NodeIndex::new(end), sim);
+                let path = self
+                    .routing
+                    .compute_route(edge.source(), edge.target(), sim);
                 println!("The path of flow {}: {:?}", flow.id, path);
 
                 for (idx, &node_idx) in path.iter().enumerate() {
                     // gets fibs for elements along the path
-                    let mut next_id = usize::MAX;
-                    let next_id = match idx < path.len() - 1 {
-                        true => path[idx + 1].index(),
-                        false => {
-                            for endpoint in &self.endpoints {
-                                if let EndPoint::PacketSink(sink) = endpoint {
-                                    if sink.flow_id() == flow.id {
-                                        next_id = sink.id()
-                                    }
+                    let next_id = if idx < path.len() - 1 {
+                        path[idx + 1].index()
+                    } else {
+                        self.endpoints
+                            .iter()
+                            .find_map(|endpoint| match endpoint {
+                                EndPoint::PacketSink(sink) if sink.flow_id() == flow.id => {
+                                    Some(sink.id())
                                 }
-                            }
-                            next_id
-                        }
+                                _ => None,
+                            })
+                            .unwrap_or(usize::MAX)
                     };
-
+                    
                     // sets fibs
                     if let Element::PacketSwitch(switch) = &mut self.elements[node_idx.index()] {
                         switch.set_fib(flow.id, next_id)
