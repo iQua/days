@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
-use log::debug;
+use log::{debug, warn};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
@@ -166,7 +166,7 @@ impl Topology {
                             switch.set_fib(flow.id, next_id);
                         }
                         _ => {
-                            panic!(
+                            warn!(
                                 "Element {} is not a packet switch when setting up the
                                 Flow Information Base table along the path in flow {}.",
                                 node_id, flow.id
