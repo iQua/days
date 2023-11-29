@@ -11,6 +11,8 @@ use std::{
     task::{self, Context, Poll},
 };
 
+use log::warn;
+
 // simple time type
 pub type Time = f64;
 
@@ -35,9 +37,11 @@ where
 
     // pop processes until empty or the main process terminates
     while let Some(process) = sched.next_event() {
+        warn!("while loop start - {:.3}", sched.now.get());
         if process.poll(&mut cx).is_ready() && process == root {
             break;
         }
+        warn!("while loop end - {:.3}", sched.now.get());
     }
 
     // clear the scheduler before it is dropped to break the dependency
@@ -114,6 +118,7 @@ impl<'s, G> Scheduler<'s, G> {
     /// Schedules a process at the current simulation time.
     #[inline]
     fn schedule(&self, process: Process<'s, G>) {
+        warn!("schedule - {:.3}", self.now.get());
         self.schedule_in(Time::default(), process);
     }
 
@@ -123,6 +128,14 @@ impl<'s, G> Scheduler<'s, G> {
         self.calendar
             .borrow_mut()
             .push(NextEvent(self.now.get() + dt, process));
+        warn!(
+            "schedule_in: pushed back to EventQ with wake-up time = {:.3}; queue length = {:.3}",
+            self.now.get() + dt,
+            self.calendar.borrow().len()
+        );
+        for event in self.calendar.borrow().iter() {
+            warn!("schedule_in: EventQ = {:.3}", event);
+        }
     }
 
     /// Removes the process with the next event time from the calendar and
@@ -131,6 +144,11 @@ impl<'s, G> Scheduler<'s, G> {
     fn next_event(&self) -> Option<Process<'s, G>> {
         let NextEvent(now, process) = self.calendar.borrow_mut().pop()?;
         self.now.set(now);
+        warn!(
+            "next_event - popped out from EventQ with sim time = {:.3}; queue length = {:?}",
+            now,
+            self.calendar.borrow().len()
+        );
         self.active.replace(process.clone());
         Some(process)
     }
@@ -165,12 +183,17 @@ impl<'s, G> SimContext<'s, G> {
     where
         F: Future<Output = ()> + 's,
     {
+        warn!(
+            "New coroutine called sim::activate() - current time = {:.3}",
+            self.now()
+        );
         self.reactivate(Process::new(*self, f));
     }
 
     /// Reactivates a process that has been suspended with wait().
     #[inline]
     pub fn reactivate(&self, process: Process<'s, G>) {
+        warn!("reactivate - {:.3}", self.now());
         assert!(process.0.borrow().state.is_some());
         self.sched().schedule(process);
     }
@@ -178,6 +201,7 @@ impl<'s, G> SimContext<'s, G> {
     /// Reactivates the currently active process after some time has passed.
     #[inline]
     pub async fn advance(&self, dt: Time) {
+        warn!("advance - {:.3}", dt);
         self.sched().schedule_in(dt, self.active());
         sleep().await
     }
@@ -298,6 +322,12 @@ impl<G> PartialEq for NextEvent<'_, G> {
     }
 }
 
+impl<'s, G> Display for NextEvent<'s, G> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NextEvent").field("time", &self.0).finish()
+    }
+}
+
 impl<G> Eq for NextEvent<'_, G> {}
 
 impl<G> PartialOrd for NextEvent<'_, G> {
@@ -354,6 +384,7 @@ impl<'s, G> Process<'s, G> {
             "Attempted to wake a terminated process."
         );
 
+        warn!("wake - {:.3}", waker.borrow().context.now());
         // this is technically unsafe because Wakers are Send + Sync and so this
         // call might be executed from a different thread, creating a data race
         // hazard; we are using Arc<T> rather than Rc<T> to guard against this
