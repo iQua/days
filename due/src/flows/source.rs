@@ -5,14 +5,18 @@ use rand::distributions::Distribution;
 use statrs::distribution::{DiscreteUniform, Exp};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::flow::DistributionInfo;
+use crate::flows::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{next_endpoint_id, num_elements, Shared};
+use crate::{next_endpoint_id, Shared};
 
 #[derive(Debug)]
 pub struct PacketSource {
     endpoint_id: usize,
+    flow_id: usize,
     initial_delay: Time,
+    arr_dist: DistributionInfo,
+    pkt_size_dist: DistributionInfo,
     packets_sent: usize,
     sender: UnboundedSender<Packet>,
     receiver: UnboundedReceiver<Packet>,
@@ -22,7 +26,10 @@ impl Clone for PacketSource {
     fn clone(&self) -> Self {
         PacketSource {
             endpoint_id: next_endpoint_id(),
+            flow_id: self.flow_id,
             initial_delay: self.initial_delay,
+            arr_dist: self.arr_dist,
+            pkt_size_dist: self.pkt_size_dist,
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -31,10 +38,18 @@ impl Clone for PacketSource {
 }
 
 impl PacketSource {
-    pub fn new(initial_delay: Time) -> PacketSource {
+    pub fn new(
+        flow_id: usize,
+        initial_delay: Time,
+        arr_dist: DistributionInfo,
+        pkt_size_dist: DistributionInfo,
+    ) -> PacketSource {
         PacketSource {
             endpoint_id: next_endpoint_id(),
+            flow_id,
             initial_delay,
+            arr_dist,
+            pkt_size_dist,
             packets_sent: 0,
             sender: unbounded_channel().0,
             receiver: unbounded_channel().1,
@@ -43,6 +58,10 @@ impl PacketSource {
 
     pub fn id(&self) -> usize {
         self.endpoint_id
+    }
+
+    pub fn flow_id(&self) -> usize {
+        self.flow_id
     }
 
     pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
@@ -80,20 +99,33 @@ impl PacketSource {
         sim.advance(self.initial_delay).await;
 
         while sim.now() < sim.shared().duration {
-            let interval = Exp::new(1.0)
-                .unwrap()
-                .sample(&mut *sim.shared().rng.borrow_mut());
+            let interval = match self.arr_dist {
+                DistributionInfo::Exp { lambda } => Exp::new(lambda)
+                    .unwrap()
+                    .sample(&mut *sim.shared().rng.borrow_mut()),
+                DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
+                    .unwrap()
+                    .sample(&mut *sim.shared().rng.borrow_mut()),
+            };
             sim.advance(interval).await;
-            let packet_size = DiscreteUniform::new(1000, 1500)
-                .unwrap()
-                .sample(&mut *sim.shared().rng.borrow_mut()) as usize;
+
+            let packet_size = match self.pkt_size_dist {
+                DistributionInfo::Exp { lambda } => Exp::new(lambda)
+                    .unwrap()
+                    .sample(&mut *sim.shared().rng.borrow_mut())
+                    as usize,
+                DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
+                    .unwrap()
+                    .sample(&mut *sim.shared().rng.borrow_mut())
+                    as usize,
+            };
 
             let mut packet = Packet::new(
                 packet_size,
                 self.packets_sent,
                 "PacketSource".to_string(),
                 "destination".to_string(),
-                self.endpoint_id - num_elements(),
+                self.flow_id(),
                 sim.now(),
             );
 

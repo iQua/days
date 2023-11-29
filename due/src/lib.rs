@@ -1,11 +1,13 @@
 use std::cell::RefCell;
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::rngs::SmallRng;
+use serde::Deserialize;
 
 use crate::sim::{RandomVar, Time};
 
-pub mod packets;
+pub mod flows;
 pub mod schedulers;
 pub mod sim;
 pub mod switches;
@@ -18,10 +20,27 @@ pub struct Shared {
     pub duration: Time,
 }
 
+#[derive(Deserialize)]
+pub struct SeedConfig {
+    seed: u64,
+}
+
+pub fn get_seed(file_path: &str) -> u64 {
+    // reads the configuration
+    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+    // deserializes the content of the configuration
+    let config: SeedConfig =
+        toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+    config.seed
+}
+
 static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);
 static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
 static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
+static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn num_elements() -> usize {
     NUM_ELEMENTS.load(Ordering::Relaxed)
@@ -42,4 +61,8 @@ pub fn next_endpoint_id() -> usize {
 
 pub fn next_scheduler_id() -> usize {
     SCHEDULER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn next_flow_id() -> usize {
+    FLOW_ID.fetch_add(1, Ordering::Relaxed)
 }

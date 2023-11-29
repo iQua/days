@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
@@ -31,8 +31,8 @@ pub struct PacketSwitch {
     /// the number of packets received by the switch
     packets_received: usize,
     /// the flow information base (FIB) of the switch
-    /// class_id -> element_id
-    fib: Vec<usize>,
+    /// flow_id -> element_id
+    fib: HashMap<usize, usize>,
 
     /// the outbound ports, each of which is governed by a DRR or FIFO scheduler
     /// element_id -> Scheduler
@@ -40,7 +40,7 @@ pub struct PacketSwitch {
 
     /// senders for sending inbound packets to outbound ports
     /// element_id -> Scheduler
-    port_senders: HashMap<usize, UnboundedSender<Packet>>,
+    pub port_senders: HashMap<usize, UnboundedSender<Packet>>,
 
     /// senders for sending outbound packets to downstream elements
     /// element_id -> UnboundedSender<Packet>
@@ -55,7 +55,7 @@ impl PacketSwitch {
         port_rate: f64,
         capacity: usize,
         weights: Vec<usize>,
-        fib: Vec<usize>,
+        fib: HashMap<usize, usize>,
         discipline: SchedulingDiscipline,
         flow_classes: Arc<dyn Fn(usize) -> usize>,
     ) -> PacketSwitch {
@@ -82,6 +82,14 @@ impl PacketSwitch {
 
     pub fn id(&self) -> usize {
         self.element_id
+    }
+
+    pub fn set_fib(&mut self, flow_id: usize, next_id: usize) {
+        self.fib.insert(flow_id, next_id);
+    }
+
+    pub fn get_fib(&self) -> &HashMap<usize, usize> {
+        &self.fib
     }
 
     pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
@@ -195,7 +203,7 @@ impl PacketSwitch {
             );
 
             // forwards packets to their corresponding downstream elements
-            let element_id = self.fib[packet.flow_id];
+            let element_id = self.fib[&packet.flow_id];
             if let Some(port_sender) = self.port_senders.get(&element_id) {
                 let _ = port_sender.send(packet);
             }

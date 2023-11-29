@@ -7,7 +7,7 @@ use std::{
     fmt::{Display, Formatter},
     future::Future,
     pin::Pin,
-    rc::Rc,
+    sync::Arc,
     task::{self, Context, Poll},
 };
 
@@ -205,7 +205,7 @@ impl<'s, G> SimContext<'s, G> {
 }
 
 /// A bare-bone process type that can also be used as a waker.
-pub struct Process<'s, G>(Rc<RefCell<Inner<'s, G>>>);
+pub struct Process<'s, G>(Arc<RefCell<Inner<'s, G>>>);
 
 /// The private details of the [`Process`](struct.Process.html) type.
 struct Inner<'s, G> {
@@ -222,7 +222,7 @@ impl<'s, G> Process<'s, G> {
     /// Combines a future and a simulation context to a process.
     #[inline]
     pub fn new(sim: SimContext<'s, G>, fut: impl Future<Output = ()> + 's) -> Self {
-        Process(Rc::new(RefCell::new(Inner {
+        Process(Arc::new(RefCell::new(Inner {
             context: sim,
             state: Some(Box::pin(fut)),
         })))
@@ -260,7 +260,7 @@ impl<'s, G> Process<'s, G> {
 impl<'s, G> Default for Process<'s, G> {
     #[inline]
     fn default() -> Self {
-        Process(Rc::new(RefCell::new(Inner {
+        Process(Arc::new(RefCell::new(Inner {
             context: SimContext {
                 handle: std::ptr::null(),
             },
@@ -281,7 +281,7 @@ impl<'s, G> Clone for Process<'s, G> {
 impl<G> PartialEq for Process<'_, G> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -327,23 +327,24 @@ impl<'s, G> Process<'s, G> {
     /// Constructs a raw waker from a simulation context and a process.
     #[inline]
     fn raw_waker(self) -> task::RawWaker {
-        task::RawWaker::new(Rc::into_raw(self.0) as *const (), &Self::VTABLE)
+        task::RawWaker::new(Arc::into_raw(self.0) as *const (), &Self::VTABLE)
     }
 
     unsafe fn clone(this: *const ()) -> task::RawWaker {
-        let waker = Rc::from_raw(this as *const RefCell<Inner<G>>);
+        let waker = Arc::from_raw(this as *const RefCell<Inner<G>>);
 
         // increase the reference counter once
-        Rc::into_raw(waker.clone());
+        let _ = Arc::into_raw(waker.clone());
 
         // this is technically unsafe because Wakers are Send + Sync and so this
         // call might be executed from a different thread, creating a data race
-        // hazard; we leave preventing this as an exercise to the reader!
-        task::RawWaker::new(Rc::into_raw(waker) as *const (), &Self::VTABLE)
+        // hazard; we are using Arc<T> rather than Rc<T> to guard against this
+        // hazard.
+        task::RawWaker::new(Arc::into_raw(waker) as *const (), &Self::VTABLE)
     }
 
     unsafe fn wake(this: *const ()) {
-        let waker = Rc::from_raw(this as *const RefCell<Inner<G>>);
+        let waker = Arc::from_raw(this as *const RefCell<Inner<G>>);
 
         // this can happen if a synchronization structure forgets to clean
         // up registered Waker objects on destruct; this would lead to
@@ -355,16 +356,17 @@ impl<'s, G> Process<'s, G> {
 
         // this is technically unsafe because Wakers are Send + Sync and so this
         // call might be executed from a different thread, creating a data race
-        // hazard; we leave preventing this as an exercise to the reader!
+        // hazard; we are using Arc<T> rather than Rc<T> to guard against this
+        // hazard.
         let sim = waker.borrow().context;
         sim.reactivate(Process(waker));
     }
 
     unsafe fn wake_by_ref(this: *const ()) {
-        let waker = Rc::from_raw(this as *const RefCell<Inner<G>>);
+        let waker = Arc::from_raw(this as *const RefCell<Inner<G>>);
 
         // keep the waker alive
-        Rc::into_raw(waker.clone());
+        let _ = Arc::into_raw(waker.clone());
 
         // this can happen if a synchronization structure forgets to clean
         // up registered Waker objects on destruct; this would lead to
@@ -385,7 +387,7 @@ impl<'s, G> Process<'s, G> {
         // this is technically unsafe because Wakers are Send + Sync and so this
         // call might be executed from a different thread, creating a data race
         // hazard; we leave preventing this as an exercise to the reader!
-        Rc::from_raw(this as *const RefCell<Inner<G>>);
+        Arc::from_raw(this as *const RefCell<Inner<G>>);
     }
 }
 

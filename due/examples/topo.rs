@@ -4,6 +4,6 @@ fn main() {
     let simple_graph = build_graph("configs/simple.toml");
     let (fattree_graph, fattree_hosts) = build_fattree("configs/fattree.toml");
     println!("The simple graph is:\n{:?}", simple_graph);
-    println!("The fattree graph is:\n{:?}", fattree_graph);
-    println!("The fattree hosts is:\n{:?}", fattree_hosts);
+    println!("The fat tree graph is:\n{:?}", fattree_graph);
+    println!("The fat tree hosts are:\n{:?}", fattree_hosts);
 }
