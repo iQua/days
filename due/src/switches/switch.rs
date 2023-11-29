@@ -11,6 +11,7 @@ use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
+use crate::schedulers::wfq::WFQServer;
 use crate::schedulers::Scheduler;
 use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
@@ -153,6 +154,33 @@ impl PacketSwitch {
                 self.port_senders.insert(element_id, port_sender);
                 self.ports.insert(element_id, Box::new(port));
             }
+            SchedulingDiscipline::WFQ => {
+                let mut port;
+                if element_id < num_elements() {
+                    // sends to another network element
+                    port = WFQServer::new(
+                        self.port_rate,
+                        self.capacity,
+                        CapacityUnit::Packets,
+                        self.flow_classes.clone(),
+                        DropStrategy::TailDrop,
+                        self.weights.clone(),
+                    );
+                } else {
+                    port = WFQServer::new(
+                        0.0,
+                        0,
+                        CapacityUnit::Packets,
+                        self.flow_classes.clone(),
+                        DropStrategy::TailDrop,
+                        self.weights.clone(),
+                    );
+                }
+
+                port.connect_receiver(port_receiver);
+                self.port_senders.insert(element_id, port_sender);
+                self.ports.insert(element_id, Box::new(port));
+            }
         }
 
         self.senders.insert(element_id, sender.clone());
@@ -183,6 +211,19 @@ impl PacketSwitch {
                     } else {
                         panic!("Not enough senders for ports.");
                     }
+                    sim.activate(p.run(sim));
+                }
+            }
+            SchedulingDiscipline::WFQ => {
+                for (element_id, port) in self.ports {
+                    let mut p = port.downcast::<WFQServer>().unwrap();
+
+                    if let Some(sender) = self.senders.get(&element_id) {
+                        p.connect_sender(sender.clone());
+                    } else {
+                        panic!("Not enough senders for ports.");
+                    }
+
                     sim.activate(p.run(sim));
                 }
             }
