@@ -107,7 +107,7 @@ impl Topology {
 
         elements
     }
-    
+
     /// Connects a vector of elements according to edges in the network topology.
     fn connect(&mut self) {
         for node_id in self.graph.node_indices() {
