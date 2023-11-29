@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::packets::packet::Packet;
+use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::schedulers::Scheduler;
 use crate::sim::{SimContext, Time};
@@ -112,7 +112,7 @@ impl WFQServer {
         let mut scheduler_queue = BinaryHeap::new();
         let (sender, receiver) = unbounded_channel();
 
-        for (class_id, _) in weights.iter().enumerate() {
+        for _ in weights.iter().enumerate() {
             finish_times.push(0.0);
             flow_queue_count.push(0);
             byte_sizes.push(0);
@@ -171,11 +171,13 @@ impl WFQServer {
         let class_id = (self.flow_classes)(packet.flow_id);
 
         // adds tag (finish time) to the packet before push to the queue (a min-heap)
-        let tagged_packet = self.add_tag(packet, now);
+        let tagged_packet = self.add_tag(packet.clone(), now);
 
         self.scheduler_queue.push(tagged_packet.clone());
 
         self.byte_sizes[class_id] += packet.size;
+        self.flow_queue_count[class_id] += 1;
+        self.active_set.push(class_id);
 
         println!(
             "WFQServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -196,14 +198,13 @@ impl WFQServer {
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
             self.vtime = 0.0;
-            for (class_id, _) in self.finish_times.iter().enumerate() {
-                self.finish_times[class_id] = 0.0;
+            for i in 1..self.finish_times.len() {
+                self.finish_times[i] = 0.0;
             }
         } else {
             let mut weight_sum = 0.0;
-
-            for i in self.active_set {
-                weight_sum += self.weights[i];
+            for class_id in self.active_set.clone() {
+                weight_sum += self.weights[class_id];
             }
 
             self.vtime += (now - self.last_update) / weight_sum;
@@ -223,8 +224,8 @@ impl WFQServer {
         let mut weight_sum = 0.0;
 
         // updates the virtual time based on the current set of active flow classes
-        for i in self.active_set {
-            weight_sum += self.weights[i];
+        for class_id in self.active_set.clone() {
+            weight_sum += self.weights[class_id];
         }
 
         self.vtime += (now - self.last_update) / weight_sum;
@@ -252,7 +253,7 @@ impl WFQServer {
         loop {
             // schedules packets by going through the queue
             while !self.scheduler_queue.is_empty() {
-                let packet = self.scheduler_queue.peek().unwrap().clone().packet;
+                let packet = self.scheduler_queue.peek().unwrap().packet.clone();
                 let class_id = (self.flow_classes)(packet.flow_id);
 
                 self.byte_sizes[class_id] -= packet.size;
@@ -265,7 +266,7 @@ impl WFQServer {
 
                 self.packets_waiting -= 1;
 
-                self.update_stats(packet, sim.now());
+                self.update_stats(packet.clone(), sim.now());
 
                 // polls for and receives all outstanding packets
                 // recently sent to WFQServer while sending the previous
