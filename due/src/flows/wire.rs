@@ -1,5 +1,6 @@
 //! The wire element adds a propagation delay to packets.
 
+use log::{debug, info};
 use rand::distributions::Distribution;
 use statrs::distribution::Uniform;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -31,7 +32,7 @@ impl Wire {
     }
 
     async fn forward_packet(&mut self, mut packet: Packet, sim: SimContext<'_, Shared>) {
-        println!(
+        debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.wire_id,
             packet.packet_id,
@@ -56,7 +57,7 @@ impl Wire {
             Ok(_) => {
                 self.last_sent = sim.now();
 
-                println!(
+                debug!(
                     "Wire {} sent packet {} ({} bytes) from flow {} with a packet time of {:.3} at time {:.3}.",
                     self.wire_id,
                     packet.packet_id,
@@ -80,7 +81,7 @@ impl Wire {
             self.forward_packet(packet, sim).await;
         }
 
-        println!(
+        info!(
             "Wire {} finished running at time {}.",
             self.wire_id,
             sim.now()

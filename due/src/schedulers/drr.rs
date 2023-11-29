@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
@@ -119,7 +120,7 @@ impl DRRServer {
         // the case that this packet will be dropped.
         if should_drop_packet {
             self.packets_dropped += 1;
-            println! {
+            debug! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
                 packet.packet_id,
@@ -137,7 +138,7 @@ impl DRRServer {
         self.queues[class_id].push_back(packet.clone());
         self.byte_sizes[class_id] += packet.size;
 
-        println!(
+        debug!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in class queue {}.",
             self.scheduler_id,
@@ -188,7 +189,7 @@ impl DRRServer {
                             self.packet_received(packet, sim.now());
                         }
 
-                        println!(
+                        debug!(
                             "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                                     {} packets in the class queue.",
                             self.scheduler_id,
@@ -215,7 +216,7 @@ impl DRRServer {
                 }
             }
         }
-        println!(
+        info!(
             "DRRServer {} finished running at time {}.",
             self.scheduler_id,
             sim.now()

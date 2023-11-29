@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
@@ -78,7 +79,7 @@ impl Port {
         // the case that this packet will be dropped.
         if should_drop_packet {
             self.packets_dropped += 1;
-            println! {
+            debug! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
                 packet.packet_id,
@@ -93,7 +94,7 @@ impl Port {
         self.queue.push_back(packet.clone());
         self.bytes_in_queue += packet.size;
 
-        println!(
+        debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packets in queue.",
             self.scheduler_id,
@@ -109,7 +110,7 @@ impl Port {
     fn packet_sent(&mut self, packet: Packet, now: Time) {
         self.bytes_in_queue -= packet.size;
 
-        println!(
+        debug!(
             "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets in queue.",
             self.scheduler_id,
@@ -149,7 +150,7 @@ impl Port {
             }
         }
 
-        println!(
+        info!(
             "Port {} finished running at time {}.",
             self.scheduler_id,
             sim.now()

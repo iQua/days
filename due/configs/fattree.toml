@@ -1,4 +1,20 @@
+seed = 1000
 k = 4
 port_rate = 32000 # which is equal to 4000 * 8
 capacity = 100
-n_classes_per_port = 4
+weights = [1]
+discipline = "FIFO"
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[0, 3]]
+initial_delay = 1.0
+arr_dist = {type = "Exp", lambda = 1.0}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[1, 7]]
+initial_delay = 2.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
