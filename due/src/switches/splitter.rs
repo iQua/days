@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
@@ -51,7 +52,7 @@ impl Splitter {
 
     pub async fn run(mut self) {
         while let Some(packet) = self.receiver.recv().await {
-            println!(
+            debug!(
                 "Splitter {} forwarded packet {} ({} bytes).",
                 self.element_id, packet.packet_id, packet.size,
             );
@@ -61,6 +62,6 @@ impl Splitter {
             }
         }
 
-        println!("Splitter {} finished running.", self.element_id);
+        info!("Splitter {} finished running.", self.element_id);
     }
 }

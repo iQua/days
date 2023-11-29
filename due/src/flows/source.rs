@@ -1,6 +1,7 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
 
+use log::debug;
 use rand::distributions::Distribution;
 use statrs::distribution::{DiscreteUniform, Exp};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -84,14 +85,14 @@ impl PacketSource {
     fn packet_sent(&mut self, now: Time, packet: Packet) {
         self.packets_sent += 1;
 
-        println!(
+        debug!(
             "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        println!(
+        debug!(
             "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
             self.endpoint_id, self.initial_delay
         );
@@ -135,7 +136,7 @@ impl PacketSource {
             self.packet_sent(sim.now(), packet);
         }
 
-        println!(
+        debug!(
             "PacketSource {} finished running at time {}.",
             self.endpoint_id,
             sim.now()

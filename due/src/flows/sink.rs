@@ -7,6 +7,7 @@
 //! These statistics are indexed by either the flow identifier or the source of
 //! each packet.
 
+use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
@@ -106,7 +107,7 @@ impl PacketSink {
         // Update global statistics about packet sizes
         sim.shared().queueing_delay.tabulate(packet.queueing_delay);
 
-        println!(
+        debug!(
             "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.endpoint_id,
             packet.packet_id,
@@ -121,7 +122,7 @@ impl PacketSink {
             self.packet_received(packet, sim);
         }
 
-        println!(
+        info!(
             "PacketSink {} finished running at time {:.3}. Statistics: \n\
             Arrival times: {:#.3} \n\
             Inter-arrival times: {:#.3} \n\

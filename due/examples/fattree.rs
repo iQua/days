@@ -7,16 +7,18 @@ use rand::{rngs::SmallRng, SeedableRng};
 
 use due::flows::flow::Flow;
 use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos::build::build_graph;
+use due::topos::build::build_fattree;
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
 async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
     let file_path = config_path;
 
-    let graph = build_graph(file_path);
-    let hosts = vec![0, 1];
-    info!("The network graph has been initialized: {:?}", graph);
+    let (fattree_graph, fattree_hosts) = build_fattree(file_path);
+    info!(
+        "The fattree graph has been initialized: {:?}",
+        fattree_graph
+    );
 
     let flows = Flow::flows_from_config(file_path);
     debug!(
@@ -24,7 +26,7 @@ async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
         flows.len()
     );
 
-    let topology = Topology::new(file_path, graph, hosts, flows);
+    let topology = Topology::new(file_path, fattree_graph, fattree_hosts, flows);
 
     // runs the topology
     topology.run(sim);
@@ -37,7 +39,7 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    let path = "configs/simple.toml";
+    let path = "configs/fattree.toml";
     let seed = get_seed(&path);
 
     let outcome = simulation(

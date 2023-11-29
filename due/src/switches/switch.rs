@@ -5,6 +5,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
@@ -232,7 +233,7 @@ impl PacketSwitch {
         while let Some(packet) = self.receiver.recv().await {
             self.packets_received += 1;
 
-            println!(
+            debug!(
                 "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
                     {} packets received.",
                 self.element_id,
@@ -250,7 +251,7 @@ impl PacketSwitch {
             }
         }
 
-        println!(
+        info!(
             "PacketSwitch {} finished running at time {}.",
             self.element_id,
             sim.now()
