@@ -107,9 +107,9 @@ impl Topology {
 
         elements
     }
-
-    /// connects a vector of elements according to edges in the network topology.
-    pub fn connect(&mut self) {
+    
+    /// Connects a vector of elements according to edges in the network topology.
+    fn connect(&mut self) {
         for node_id in self.graph.node_indices() {
             let (sender, receiver) = unbounded_channel();
             self.elements[node_id.index()].connect_receiver(receiver);
