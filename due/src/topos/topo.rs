@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
-use log::{debug, warn};
+use log::warn;
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
@@ -12,6 +12,7 @@ use crate::sim::SimContext;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};
+use crate::topos::build::FatTreeConfig;
 use crate::{set_num_elements, Shared};
 
 #[derive(Deserialize)]
@@ -47,30 +48,29 @@ impl Topology {
     ) -> Topology {
         set_num_elements(graph.node_count());
 
+        // reads the configuration
+        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+        let elements: Vec<Element> = if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
+            Topology::init_fattree_elements(config)
+        } else {
+            let config: ElementConfig =
+                toml::from_str(&content).expect("Failed to deserialize the configuration");
+            Topology::init_elements(config)
+        };
+
         Topology {
             graph: graph.clone(),
             hosts,
             flows,
-            elements: Topology::init_elements(file_path),
+            elements,
         }
     }
 
-    fn init_elements(file_path: &str) -> Vec<Element> {
-        // reads the configuration
-        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
-
-        // deserializes the content of the configuration
-        let config: ElementConfig =
-            toml::from_str(&content).expect("Failed to deserialize the configuration");
-
+    fn init_elements(config: ElementConfig) -> Vec<Element> {
         let mut elements: Vec<Element> = Vec::new();
 
         for e in config.switch {
-            debug!(
-                "Initialized a switch with port_rate: {}, capacity: {},\n weights: {:?}, discipline: {:?}",
-                e.port_rate, e.capacity, e.weights, e.discipline
-            );
-
             let switch = PacketSwitch::new(
                 e.port_rate,
                 e.capacity,
@@ -84,6 +84,25 @@ impl Topology {
 
         for _ in 0..config.num_splitters {
             elements.push(Element::Splitter(Splitter::new()));
+        }
+
+        elements
+    }
+
+    fn init_fattree_elements(config: FatTreeConfig) -> Vec<Element> {
+        let mut elements: Vec<Element> = Vec::new();
+        let num_switches = config.k.pow(2) * 5 / 4;
+
+        for _ in 0..num_switches {
+            let switch = PacketSwitch::new(
+                config.port_rate,
+                config.capacity,
+                config.weights.clone(),
+                HashMap::new(),
+                config.discipline.clone(),
+                Arc::new(|flow_id| flow_id),
+            );
+            elements.push(Element::PacketSwitch(switch));
         }
 
         elements

@@ -6,17 +6,19 @@ use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
 
 use due::flows::flow::Flow;
+use due::sim::{simulation, Process, RandomVar, SimContext};
 use due::topos::build::build_fattree;
 use due::topos::topo::Topology;
-use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::{Shared, get_seed};
+use due::{get_seed, Shared};
 
 async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
     let file_path = config_path;
 
     let (fattree_graph, fattree_hosts) = build_fattree(file_path);
-    info!("The fattree graph has been initialized: {:?}", fattree_graph);
-
+    info!(
+        "The fattree graph has been initialized: {:?}",
+        fattree_graph
+    );
 
     let flows = Flow::flows_from_config(file_path);
     debug!(

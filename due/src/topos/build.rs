@@ -1,9 +1,12 @@
 //! Provides builders for building specific types of topologies, or building
 //! topologies based on the information given in a TOML configuration file.
 
+use log::info;
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
+
+use crate::switches::SchedulingDiscipline;
 
 #[derive(Deserialize)]
 struct NetworkGraph {
@@ -11,8 +14,12 @@ struct NetworkGraph {
 }
 
 #[derive(Deserialize)]
-struct FatTreeConfig {
-    k: usize,
+pub struct FatTreeConfig {
+    pub k: usize,
+    pub port_rate: f64,
+    pub capacity: usize,
+    pub weights: Vec<usize>,
+    pub discipline: SchedulingDiscipline,
 }
 
 /// This function is used to build a topology from a toml configuration file
@@ -32,9 +39,11 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-    // deserializes the content of the toml file
+    // deserializes the content of the configuration
     let config: FatTreeConfig =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+    info!("The k of fattree is {}.", config.k);
 
     let num_layer_switches = config.k.pow(2) / 2;
     let num_core_switches = config.k.pow(2) / 4;
