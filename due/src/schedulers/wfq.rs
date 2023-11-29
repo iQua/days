@@ -19,27 +19,21 @@ pub struct TaggedPacket {
     pub tag: f64,
 }
 
-impl Ord for TaggedPacket {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // note: the queue should be a min-heap
-        if self.tag < other.tag {
-            Ordering::Greater;
-        } else if self.tag > other.tag {
-            Ordering::Less;
-        }
-        Ordering::Equal
-    }
-}
-
 impl PartialOrd for TaggedPacket {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+        other.tag.partial_cmp(&self.tag)
     }
 }
 
 impl PartialEq for TaggedPacket {
     fn eq(&self, other: &Self) -> bool {
         self.tag == other.tag
+    }
+}
+
+impl Ord for TaggedPacket {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 
