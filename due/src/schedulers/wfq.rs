@@ -59,7 +59,7 @@ pub struct WFQServer {
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop>,
 
-    weights: Vec<f64>,
+    weights: Vec<usize>,
     /// finish time of the last packet served in each class
     finish_times: Vec<f64>,
     flow_queue_count: Vec<usize>,
@@ -101,7 +101,7 @@ impl WFQServer {
         capacity_unit: CapacityUnit,
         flow_classes: Arc<dyn Fn(usize) -> usize>,
         drop_strategy: DropStrategy,
-        weights: Vec<f64>,
+        weights: Vec<usize>,
     ) -> WFQServer {
         let mut finish_times = Vec::new();
         let mut flow_queue_count = Vec::new();
@@ -204,13 +204,13 @@ impl WFQServer {
         } else {
             let mut weight_sum = 0.0;
             for class_id in self.active_set.clone() {
-                weight_sum += self.weights[class_id];
+                weight_sum += self.weights[class_id] as f64;
             }
 
             self.vtime += (now - self.last_update) / weight_sum;
             let class_id = (self.flow_classes)(packet.flow_id);
             finish_time = self.vtime.max(self.finish_times[class_id])
-                + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id]);
+                + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
             self.finish_times[class_id] = finish_time;
         }
 
@@ -225,7 +225,7 @@ impl WFQServer {
 
         // updates the virtual time based on the current set of active flow classes
         for class_id in self.active_set.clone() {
-            weight_sum += self.weights[class_id];
+            weight_sum += self.weights[class_id] as f64;
         }
 
         self.vtime += (now - self.last_update) / weight_sum;
