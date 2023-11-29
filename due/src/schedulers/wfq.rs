@@ -53,11 +53,16 @@ pub struct WFQServer {
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop>,
 
+    /// weights of classes
     weights: Vec<usize>,
     /// finish time of the last packet served in each class
     finish_times: Vec<f64>,
+    /// number of to-be-sent packets of each class
     flow_queue_count: Vec<usize>,
+
+    /// set of active flow classes
     active_set: Vec<usize>,
+
     vtime: f64,
     last_update: f64,
 
@@ -166,7 +171,6 @@ impl WFQServer {
 
         // adds tag (finish time) to the packet before push to the queue (a min-heap)
         let tagged_packet = self.add_tag(packet.clone(), now);
-
         self.scheduler_queue.push(tagged_packet.clone());
 
         self.byte_sizes[class_id] += packet.size;
@@ -175,15 +179,14 @@ impl WFQServer {
 
         println!(
             "WFQServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets received, {} packet(s) in queue {}.",
+            {} packets received, {} packet(s) in queue.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             now,
             self.packets_received,
-            self.scheduler_queue.len(),
-            class_id
+            self.scheduler_queue.len()
         );
     }
 
@@ -239,8 +242,6 @@ impl WFQServer {
         }
 
         self.last_update = now;
-
-        self.byte_sizes[class_id] -= packet.size;
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
