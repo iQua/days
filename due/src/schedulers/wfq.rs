@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
@@ -154,7 +155,7 @@ impl WFQServer {
         // the case that this packet will be dropped.
         if should_drop_packet {
             self.packets_dropped += 1;
-            println! {
+            debug! {
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
                 packet.packet_id,
@@ -177,7 +178,7 @@ impl WFQServer {
         self.flow_queue_count[class_id] += 1;
         self.active_set.push(class_id);
 
-        println!(
+        debug!(
             "WFQServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in queue.",
             self.scheduler_id,
@@ -270,7 +271,7 @@ impl WFQServer {
                     self.packet_received(packet, sim.now());
                 }
 
-                println!(
+                debug!(
                     "WFQServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                             {} packets in the queue.",
                     self.scheduler_id,
@@ -291,7 +292,7 @@ impl WFQServer {
                 }
             }
         }
-        println!(
+        info!(
             "WFQServer {} finished running at time {}.",
             self.scheduler_id,
             sim.now()
