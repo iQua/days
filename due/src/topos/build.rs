@@ -71,7 +71,7 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     }
 
     // initializes the graph from edges
-    let graph = UnGraph::<usize, ()>::from_edges(edges);
+    let graph: UnGraph<usize, ()> = UnGraph::<usize, ()>::from_edges(edges);
 
     // distinguishes all hosts (edge switches)
     let hosts: Vec<usize> = (0..num_layer_switches).collect();
