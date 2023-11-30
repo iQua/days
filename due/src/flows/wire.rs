@@ -2,12 +2,13 @@
 
 use log::{debug, info};
 use rand::distributions::Distribution;
+use rand::rngs::SmallRng;
 use statrs::distribution::Uniform;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::Shared;
+use crate::{get_local_rng, Shared};
 
 #[derive(Debug)]
 pub struct Wire {
@@ -31,7 +32,12 @@ impl Wire {
         }
     }
 
-    async fn forward_packet(&mut self, mut packet: Packet, sim: SimContext<'_, Shared>) {
+    async fn forward_packet(
+        &mut self,
+        mut packet: Packet,
+        sim: SimContext<'_, Shared>,
+        mut rng: SmallRng,
+    ) {
         debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.wire_id,
@@ -42,7 +48,7 @@ impl Wire {
         );
 
         let delay_dist = Uniform::new(2.0, 2.0).unwrap();
-        let delay = delay_dist.sample(&mut *sim.shared().rng.borrow_mut());
+        let delay = delay_dist.sample(&mut rng);
 
         if self.last_sent == 0. {
             self.last_sent = packet.time;
@@ -77,8 +83,9 @@ impl Wire {
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+        let rng = get_local_rng(sim);
         while let Some(packet) = self.receiver.recv().await {
-            self.forward_packet(packet, sim).await;
+            self.forward_packet(packet, sim, rng.clone()).await;
         }
 
         info!(

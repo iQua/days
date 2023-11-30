@@ -57,7 +57,7 @@ where
 type EventQ<'s, G> = BinaryHeap<NextEvent<'s, G>>;
 
 /// The (private) scheduler for processes.
-struct Scheduler<'s, G> {
+pub struct Scheduler<'s, G> {
     /// The current simulation time.
     now: Cell<Time>,
 
@@ -74,7 +74,7 @@ struct Scheduler<'s, G> {
 impl<'s, G> Scheduler<'s, G> {
     /// Creates a new scheduler.
     #[inline]
-    fn new(shared: G) -> Self {
+    pub fn new(shared: G) -> Self {
         Self {
             now: Cell::default(),
             calendar: RefCell::default(),
@@ -156,7 +156,7 @@ impl<'s, G> Scheduler<'s, G> {
 
 /// A light-weight handle to the scheduler.
 pub struct SimContext<'s, G = ()> {
-    handle: *const Scheduler<'s, G>,
+    pub handle: *const Scheduler<'s, G>,
 }
 
 // this allows the creation of copies

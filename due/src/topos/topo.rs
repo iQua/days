@@ -211,7 +211,11 @@ impl Topology {
         }
 
         for element in self.elements {
-            warn!("Element {} will be activated at time {}", element.id(), sim.now());
+            warn!(
+                "Element {} will be activated at time {}",
+                element.id(),
+                sim.now()
+            );
             element.activate(sim);
         }
     }

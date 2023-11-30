@@ -1,9 +1,11 @@
-use std::cell::RefCell;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
+use sim::SimContext;
 
 use crate::sim::{RandomVar, Time};
 
@@ -15,7 +17,7 @@ pub mod topos;
 
 /// Globally shared data.
 pub struct Shared {
-    pub rng: RefCell<SmallRng>,
+    pub rng: Mutex<SmallRng>,
     pub queueing_delay: RandomVar,
     pub duration: Time,
 }
@@ -34,6 +36,14 @@ pub fn get_seed(file_path: &str) -> u64 {
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
     config.seed
+}
+
+pub fn get_local_rng(sim: SimContext<'_, Shared>) -> SmallRng {
+    let seed: u64 = {
+        let mut root_rng = sim.shared().rng.lock().unwrap();
+        root_rng.gen()
+    };
+    SmallRng::seed_from_u64(seed)
 }
 
 static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);

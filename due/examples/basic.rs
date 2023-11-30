@@ -2,7 +2,7 @@
 //! send packets to a wire that adds propagation delays according to a random
 //! distribution, and then to a packet sink.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use log::{debug, info};
 use petgraph::graph::UnGraph;
@@ -42,7 +42,7 @@ fn main() {
 
     let outcome = simulation(
         Shared {
-            rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
+            rng: Mutex::new(SmallRng::seed_from_u64(SEED)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
         },

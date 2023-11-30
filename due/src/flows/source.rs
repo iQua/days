@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::flows::flow::DistributionInfo;
 use crate::flows::packet::Packet;
 use crate::sim::{SimContext, Time};
-use crate::{next_endpoint_id, Shared};
+use crate::{get_local_rng, next_endpoint_id, Shared};
 
 #[derive(Debug)]
 pub struct PacketSource {
@@ -96,29 +96,26 @@ impl PacketSource {
             "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
             self.endpoint_id, self.initial_delay
         );
+        let mut rng = get_local_rng(sim);
 
         sim.advance(self.initial_delay).await;
 
         while sim.now() < sim.shared().duration {
             let interval = match self.arr_dist {
-                DistributionInfo::Exp { lambda } => Exp::new(lambda)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut()),
-                DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut()),
+                DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut rng),
+                DistributionInfo::Uniform { low, high } => {
+                    DiscreteUniform::new(low, high).unwrap().sample(&mut rng)
+                }
             };
             sim.advance(interval).await;
 
             let packet_size = match self.pkt_size_dist {
-                DistributionInfo::Exp { lambda } => Exp::new(lambda)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut())
-                    as usize,
-                DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut())
-                    as usize,
+                DistributionInfo::Exp { lambda } => {
+                    Exp::new(lambda).unwrap().sample(&mut rng) as usize
+                }
+                DistributionInfo::Uniform { low, high } => {
+                    DiscreteUniform::new(low, high).unwrap().sample(&mut rng) as usize
+                }
             };
 
             let mut packet = Packet::new(

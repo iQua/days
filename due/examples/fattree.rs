@@ -1,6 +1,6 @@
 //! This file is used for fattree simulation.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
@@ -44,7 +44,7 @@ fn main() {
 
     let outcome = simulation(
         Shared {
-            rng: RefCell::new(SmallRng::seed_from_u64(seed)),
+            rng: Mutex::new(SmallRng::seed_from_u64(seed)),
             queueing_delay: RandomVar::new(),
             duration: 10.,
         },

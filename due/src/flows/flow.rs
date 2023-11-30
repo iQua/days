@@ -5,7 +5,7 @@ use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
 use crate::sim::{SimContext, Time};
-use crate::{next_flow_id, Shared};
+use crate::{get_local_rng, next_flow_id, Shared};
 
 use super::route::{RandomSimplePath, RoutingProtocol};
 use super::sink::PacketSink;
@@ -133,10 +133,12 @@ impl Flow {
 
         let mut paths = Vec::new();
 
+        let rng = get_local_rng(sim);
+
         for (idx, edge) in self.graph.edge_references().enumerate() {
             let mut path = self
                 .routing
-                .compute_route(edge.source(), edge.target(), sim);
+                .compute_route(edge.source(), edge.target(), rng.clone());
             let sink_id = self
                 .endpoints
                 .iter()

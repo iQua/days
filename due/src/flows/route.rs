@@ -2,20 +2,12 @@ use petgraph::{
     algo::all_simple_paths,
     graph::{NodeIndex, UnGraph},
 };
-use rand::Rng;
-
-use crate::sim::SimContext;
-use crate::Shared;
+use rand::{rngs::SmallRng, Rng};
 
 /// Defines the interface for all routing protocols
 pub trait RoutingProtocol {
     /// This function returns a shortest path between two nodes in the graph
-    fn compute_route(
-        &mut self,
-        start: NodeIndex,
-        end: NodeIndex,
-        sim: SimContext<'_, Shared>,
-    ) -> Vec<NodeIndex>;
+    fn compute_route(&mut self, start: NodeIndex, end: NodeIndex, rng: SmallRng) -> Vec<NodeIndex>;
 }
 
 #[derive(Debug)]
@@ -43,10 +35,10 @@ impl RoutingProtocol for RandomSimplePath {
         &mut self,
         start: NodeIndex,
         end: NodeIndex,
-        sim: SimContext<'_, Shared>,
+        mut rng: SmallRng,
     ) -> Vec<NodeIndex> {
         let paths = self.get_all_simple_paths(start, end);
-        let rdm_idx = (*sim.shared().rng.borrow_mut()).gen_range(0..paths.len());
+        let rdm_idx = rng.gen_range(0..paths.len());
         paths[rdm_idx].clone()
     }
 }

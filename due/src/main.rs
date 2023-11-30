@@ -1,7 +1,7 @@
 //! The main program for running a simulation using a specific configuration.
 
-use std::cell::RefCell;
 use std::env;
+use std::sync::Mutex;
 
 use log::{debug, info};
 use petgraph::graph::UnGraph;
@@ -75,7 +75,7 @@ fn main() {
 
     let outcome = simulation(
         Shared {
-            rng: RefCell::new(SmallRng::seed_from_u64(seed)),
+            rng: Mutex::new(SmallRng::seed_from_u64(seed)),
             queueing_delay: RandomVar::new(),
             duration: 1.5,
         },
