@@ -105,11 +105,7 @@ impl WFQServer {
     ) -> WFQServer {
         let mut finish_times = Vec::new();
         let mut flow_queue_count = Vec::new();
-        let mut active_set = Vec::new();
-        let mut vtime = 0.0;
-        let mut last_update = 0.0;
         let mut byte_sizes = Vec::new();
-        let mut scheduler_queue = BinaryHeap::new();
         let (sender, receiver) = unbounded_channel();
 
         for _ in weights.iter().enumerate() {
@@ -131,14 +127,14 @@ impl WFQServer {
             weights,
             finish_times,
             flow_queue_count,
-            active_set,
-            vtime,
-            last_update,
+            active_set: Vec::new(),
+            vtime: 0.0,
+            last_update: 0.0,
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
             byte_sizes,
-            scheduler_queue,
+            scheduler_queue: BinaryHeap::new(),
             sender,
             receiver,
         }
