@@ -34,7 +34,10 @@ impl PartialEq for TaggedPacket {
 
 impl Ord for TaggedPacket {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        self.tag
+            .partial_cmp(&other.tag)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
     }
 }
 
