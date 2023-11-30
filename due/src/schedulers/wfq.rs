@@ -22,7 +22,7 @@ pub struct TaggedPacket {
 
 impl PartialOrd for TaggedPacket {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.tag.partial_cmp(&self.tag)
+        Some(self.cmp(other))
     }
 }
 
@@ -209,7 +209,7 @@ impl WFQServer {
         }
 
         TaggedPacket {
-            packet: packet,
+            packet,
             tag: finish_time,
         }
     }
