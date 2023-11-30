@@ -637,13 +637,12 @@ impl<'s, G> NewProcess<'s, G> {
             state: Some(Box::pin(fut)),
         })))
     }
-
 }
 
 impl<'s, G> Future for NewProcess<'s, G> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut inner = self.0.lock().expect("unable to lock the inner.");
         if let Some(ref mut fut) = inner.state {
             let fut = Pin::new(fut);
