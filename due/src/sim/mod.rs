@@ -7,7 +7,7 @@ use std::{
     fmt::{Display, Formatter},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, RwLock},
     task::{self, Context, Poll},
 };
 
@@ -271,7 +271,7 @@ impl<'s, G> Process<'s, G> {
 
     /// Private function for polling the process.
     #[inline]
-    fn poll(&self, cx: &mut Context) -> Poll<()> {
+    fn  poll(&self, cx: &mut Context) -> Poll<()> {
         warn!("poll - start at {}", self.0.borrow().context.now());
         if let Some(fut) = self.0.borrow_mut().state.as_mut() {
             fut.as_mut().poll(cx)
@@ -603,5 +603,96 @@ impl Display for RandomVar {
             .field("min", &self.min.get())
             .field("max", &self.max.get())
             .finish()
+    }
+}
+
+
+
+
+
+
+
+
+
+// ======================
+
+
+pub struct NewSimContext<G> {
+    pub now: Arc<RwLock<Time>>,
+    pub shared: G
+}
+
+pub struct NewProcess<'s, G>(Arc<Mutex<NewInner<'s, G>>>);
+
+struct NewInner<'s, G> {
+    context: NewSimContext<G>,
+    state: Option<Pin<Box<dyn Future<Output = ()> + Send + 's>>>,
+}
+
+impl<'s, G> NewProcess<'s, G> {
+    #[inline]
+    pub fn new(sim: NewSimContext<G>, fut: impl Future<Output = ()> + Send + 's) -> Self {
+        NewProcess(Arc::new(Mutex::new(NewInner {
+            context: sim,
+            state: Some(Box::pin(fut)),
+        })))
+    }
+
+}
+
+impl<'s, G> Future for NewProcess<'s, G> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.0.lock().expect("unable to lock the inner.");
+        if let Some(ref mut fut) = inner.state {
+            let fut = Pin::new(fut);
+            fut.poll(cx)
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+impl<'s, G> Clone for NewProcess<'s, G> {
+    #[inline]
+    fn clone(&self) -> Self {
+        NewProcess(self.0.clone())
+    }
+}
+
+
+/// Time-process-pair that has a total order defined based on the time.
+pub struct NewNextEvent<'p, G>(pub Time, pub NewProcess<'p, G>);
+
+impl<G> PartialEq for NewNextEvent<'_, G> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<'s, G> Display for NewNextEvent<'s, G> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NextEvent").field("time", &self.0).finish()
+    }
+}
+
+impl<G> Eq for NewNextEvent<'_, G> {}
+
+impl<G> PartialOrd for NewNextEvent<'_, G> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<G> Ord for NewNextEvent<'_, G> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .expect("illegal event time NaN")
+            .reverse()
     }
 }
