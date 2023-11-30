@@ -272,6 +272,7 @@ impl<'s, G> Process<'s, G> {
     /// Private function for polling the process.
     #[inline]
     fn poll(&self, cx: &mut Context) -> Poll<()> {
+        warn!("poll - start at {}", self.0.borrow().context.now());
         if let Some(fut) = self.0.borrow_mut().state.as_mut() {
             fut.as_mut().poll(cx)
         } else {

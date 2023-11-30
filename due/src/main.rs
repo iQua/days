@@ -77,7 +77,7 @@ fn main() {
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(seed)),
             queueing_delay: RandomVar::new(),
-            duration: 10.,
+            duration: 1.5,
         },
         |sim| Process::new(sim, network_sim(path, sim)),
     );

@@ -206,10 +206,12 @@ impl Topology {
         self.route(sim);
 
         for flow in self.flows {
+            warn!("Flow {} will be activated at time {}", flow.id, sim.now());
             sim.activate(flow.run(sim));
         }
 
         for element in self.elements {
+            warn!("Element {} will be activated at time {}", element.id(), sim.now());
             element.activate(sim);
         }
     }
