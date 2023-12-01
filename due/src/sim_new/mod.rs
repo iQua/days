@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use std::{collections::BinaryHeap, pin::Pin};
 
 use log::warn;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Semaphore;
 use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
 
@@ -60,12 +61,19 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     }
 
     #[inline]
-    pub async fn advance(&self, wait_time: Time, sender: UnboundedSender<usize>) {
-        // todo
-    }
+    pub async fn advance(&self, wait_time: Time) {
+        warn!("advance: {}", wait_time);
+        let (tx, mut rx) = unbounded_channel::<usize>();
+        let wake_time = self.get_time().await + wait_time;
+        let event = NextEvent(wake_time, tx);
 
-    fn clear(&self) {
-        // TODO
+        // adds the event to the calendar
+        {
+            let mut calendar = self.calendar.lock().await;
+            calendar.push(event);
+        }
+
+        rx.recv().await;
     }
 
     async fn get_time(&self) -> Time {
@@ -73,7 +81,7 @@ impl<G: Send + Sync + 'static> SimContext<G> {
         *now
     }
 
-    async fn set_time(&self, new_time: Time) {
+    pub async fn set_time(&self, new_time: Time) {
         let mut now = self.now.write().await;
         *now = new_time;
         warn!("set_time: set sim time to {:?}", new_time);
@@ -81,7 +89,7 @@ impl<G: Send + Sync + 'static> SimContext<G> {
 
     /// Removes the next event from the SortQ, sets the new time and return the
     /// sender to the coroutine
-    async fn next_event(&self) -> Option<UnboundedSender<usize>> {
+    pub async fn next_event(&self) -> Option<UnboundedSender<usize>> {
         let mut calendar = self.calendar.lock().await;
         let NextEvent(now, sender) = calendar.pop()?;
         self.set_time(now).await;
