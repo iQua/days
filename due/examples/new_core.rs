@@ -15,7 +15,7 @@ use due::{get_seed, Shared};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Semaphore;
 
-async fn network_sim(config_path: &str, sim: NewSimContext<Shared>, tx: UnboundedSender<usize>) {
+async fn network_sim(config_path: &str, sim: NewSimContext<Shared>, tx: UnboundedSender<Option<usize>>) {
     let file_path = config_path;
 
     let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
@@ -31,11 +31,11 @@ async fn network_sim(config_path: &str, sim: NewSimContext<Shared>, tx: Unbounde
     // initializes the topology
     let topology = Topology::new(file_path, graph, hosts, flows);
 
-    // runs the topology
-    topology.run(sim);
+    // // runs the topology
+    // topology.run(sim);
 
-    // waits for the end of this simulation
-    sim.advance(sim.shared().duration + 100.).await;
+    // // waits for the end of this simulation
+    // sim.advance(sim.shared().duration + 100.).await;
 }
 
 #[tokio::main]
@@ -54,10 +54,10 @@ async fn main() {
         queueing_delay: RandomVar::new(),
         duration: 1.5,
     };
-    let num_threads = 0;
+    let mut num_threads = 0;
 
     // initializes the UnboundedChannel
-    let (tx, rx) = unbounded_channel::<usize>();
+    let (tx, rx) = unbounded_channel::<Option<usize>>();
     
     let sim = NewSimContext{now, shared};
     let root = NewProcess::new(sim, network_sim(path, sim, tx.clone()));
@@ -68,6 +68,8 @@ async fn main() {
 
     tokio::spawn(root);
 
+    // how to keep track of total thread number?
+    
 
 
     // let semaphore = Arc::new(Semaphore::new(10));

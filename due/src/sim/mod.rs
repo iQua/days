@@ -271,7 +271,7 @@ impl<'s, G> Process<'s, G> {
 
     /// Private function for polling the process.
     #[inline]
-    fn  poll(&self, cx: &mut Context) -> Poll<()> {
+    fn poll(&self, cx: &mut Context) -> Poll<()> {
         warn!("poll - start at {}", self.0.borrow().context.now());
         if let Some(fut) = self.0.borrow_mut().state.as_mut() {
             fut.as_mut().poll(cx)
@@ -606,20 +606,11 @@ impl Display for RandomVar {
     }
 }
 
-
-
-
-
-
-
-
-
 // ======================
-
 
 pub struct NewSimContext<G> {
     pub now: Arc<RwLock<Time>>,
-    pub shared: G
+    pub shared: G,
 }
 
 pub struct NewProcess<'s, G>(Arc<Mutex<NewInner<'s, G>>>);
@@ -659,7 +650,6 @@ impl<'s, G> Clone for NewProcess<'s, G> {
         NewProcess(self.0.clone())
     }
 }
-
 
 /// Time-process-pair that has a total order defined based on the time.
 pub struct NewNextEvent<'p, G>(pub Time, pub NewProcess<'p, G>);

@@ -12,6 +12,7 @@ use crate::sim::{RandomVar, Time};
 pub mod flows;
 pub mod schedulers;
 pub mod sim;
+pub mod sim_new;
 pub mod switches;
 pub mod topos;
 
