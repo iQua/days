@@ -60,7 +60,7 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     }
 
     #[inline]
-    pub async fn advance(&self, sender: UnboundedSender<usize>) {
+    pub async fn advance(&self, wait_time: Time, sender: UnboundedSender<usize>) {
         // todo
     }
 
