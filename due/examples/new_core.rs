@@ -9,13 +9,17 @@ use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
 use due::flows::flow::Flow;
-use due::sim::{RandomVar, Time, NewProcess, NewSimContext, NewNextEvent};
+use due::sim::{NewNextEvent, NewProcess, NewSimContext, RandomVar, Time};
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Semaphore;
 
-async fn network_sim(config_path: &str, sim: NewSimContext<Shared>, tx: UnboundedSender<Option<usize>>) {
+async fn network_sim(
+    config_path: &str,
+    sim: NewSimContext<Shared>,
+    tx: UnboundedSender<Option<usize>>,
+) {
     let file_path = config_path;
 
     let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
@@ -58,10 +62,10 @@ async fn main() {
 
     // initializes the UnboundedChannel
     let (tx, rx) = unbounded_channel::<Option<usize>>();
-    
-    let sim = NewSimContext{now, shared};
+
+    let sim = NewSimContext { now, shared };
     let root = NewProcess::new(sim, network_sim(path, sim, tx.clone()));
-    
+
     // Now we do not add root to the calendar, but spawn it directly
     let active: RefCell<NewProcess<Shared>> = RefCell::new(root.clone());
     num_threads += 1;
@@ -69,11 +73,8 @@ async fn main() {
     tokio::spawn(root);
 
     // how to keep track of total thread number?
-    
-
 
     // let semaphore = Arc::new(Semaphore::new(10));
     // let permit = semaphore.clone().acquire_owned().await.unwrap();
     // warn!("After owned a permit in main function.");
-
 }

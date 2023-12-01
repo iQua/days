@@ -1,70 +1,63 @@
 use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
-use std::task::{Poll, Context};
+use std::task::{Context, Poll};
 use std::{collections::BinaryHeap, pin::Pin};
 
 use log::warn;
 use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
 
 pub type Time = f64;
-
-pub struct SimContext<G> {
-    pub handle: *const Scheduler<G>,
-}
-
-impl<G> Clone for SimContext<G> {
-    #[inline]
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<G> Copy for SimContext<G> {}
-
-impl<G> SimContext<G> {
-    pub async fn activate(&self, f: F)
-    where
-        F: Future<Output = ()> + Send,
-    {
-        warn!("New coroutine called sim.activate(): current time: {:?}", self.now().await);
-        tokio::spawn(Process::new(*self, f));
-    }
-
-    #[inline]
-    pub async fn now(&self) -> Time {
-        let now = self.sched().now.read().await;
-        *now
-    }
-
-    /// Private function to get a safe reference to the scheduler.
-    #[inline]
-    fn sched(&self) -> &Scheduler<G> {
-        unsafe { &*self.handle}
-    }
-
-}
-
 type SortQ = BinaryHeap<NextEvent>;
 
-pub struct Scheduler<G> {
+pub struct SimContext<G: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
     calendar: Arc<Mutex<SortQ>>,
-    shared: G,
+    shared: Arc<RwLock<G>>,
 }
 
-impl<G> Scheduler<G> {
+impl<G: Clone + Send + Sync + 'static> Clone for SimContext<G> {
     #[inline]
-    fn new(shared: G) -> Self {
-        Self {
+    fn clone(&self) -> Self {
+        SimContext {
+            now: Arc::clone(&self.now),
+            calendar: Arc::clone(&self.calendar),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<G: Send + Sync + 'static> SimContext<G> {
+    pub fn new(shared: G) -> Arc<Self> {
+        Arc::new(Self {
             now: Arc::new(RwLock::new(Time::default())),
             calendar: Arc::new(Mutex::new(SortQ::default())),
-            shared,
-        }
+            shared: Arc::new(RwLock::new(shared)),
+        })
+    }
+
+    pub async fn activate<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        warn!(
+            "New coroutine called sim.activate(): current time: {:?}",
+            self.get_time().await
+        );
+        tokio::spawn(Process::new(
+            Arc::clone(&self.now),
+            Arc::clone(&self.shared),
+            f,
+        ));
     }
 
     fn clear(&self) {
         // TODO
+    }
+
+    async fn get_time(&self) -> Time {
+        let now = self.now.read().await;
+        *now
     }
 
     async fn set_time(&self, new_time: Time) {
@@ -78,7 +71,7 @@ impl<G> Scheduler<G> {
     async fn next_event(&self) -> Option<UnboundedSender<usize>> {
         let mut calendar = self.calendar.lock().await;
         let NextEvent(now, sender) = calendar.pop()?;
-        self.set_time(now);
+        self.set_time(now).await;
         warn!(
             "next_event: pop out from SortQ, queue length = {:?}",
             calendar.len()
@@ -87,37 +80,43 @@ impl<G> Scheduler<G> {
     }
 }
 
-pub struct Process<G>(Arc<Mutex<Inner<G>>>);
+pub struct Process<G: Send + Sync + 'static>(Arc<Mutex<Inner<G>>>);
 
-struct Inner<G> {
-    context: SimContext<G>,
+struct Inner<G: Send + Sync + 'static> {
+    now: Arc<RwLock<Time>>,
+    shared: Arc<RwLock<G>>,
     state: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
-impl<G> Process<G> {
+impl<G: Send + Sync + 'static> Process<G> {
     #[inline]
-    pub fn new(sim: SimContext<G>, fut: impl Future<Output = ()> + Send) -> Self {
+    pub fn new(
+        now: Arc<RwLock<Time>>,
+        shared: Arc<RwLock<G>>,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
         Process(Arc::new(Mutex::new(Inner {
-            context: sim,
+            now,
+            shared,
             state: Some(Box::pin(fut)),
         })))
     }
 
     async fn now(&self) -> Time {
         let inner = self.0.lock().await;
-        inner.context.now().await
+        let now = inner.now.read().await;
+        *now
     }
-
 }
 
-impl<G> Future for Process<G> {
+impl<G: Send + Sync + 'static> Future for Process<G> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner = self.0.try_lock();
         match inner {
             Ok(mut guard) => {
-                if let Some(ref mut state) = guard.state{
+                if let Some(ref mut state) = guard.state {
                     state.as_mut().poll(cx)
                 } else {
                     Poll::Ready(())
@@ -161,8 +160,6 @@ impl Ord for NextEvent {
 
 impl Display for NextEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NextEvent")
-            .field("time", &self.0)
-            .finish()
+        f.debug_struct("NextEvent").field("time", &self.0).finish()
     }
 }

@@ -16,6 +16,7 @@ pub mod sim_new;
 pub mod switches;
 pub mod topos;
 
+// TODO: Send and Clone traits for this Shared!
 /// Globally shared data.
 pub struct Shared {
     pub rng: Mutex<SmallRng>,
