@@ -195,7 +195,7 @@ impl WFQServer {
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
             self.vtime = 0.0;
-            for time in self.finish_times.iter_mut() {
+            for time in &mut self.finish_times {
                 *time = 0.0;
             }
         } else {
