@@ -3,8 +3,8 @@
 use std::cell::RefCell;
 use std::env;
 
+use due::topos::build::build_graph;
 use log::{debug, info};
-use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
 use due::flows::flow::Flow;
@@ -31,7 +31,7 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     // 3. building a graph using a graph builder.
     //    let (graph, hosts) = build_fattree();
 
-    let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
+    let graph = build_graph(file_path);
     let hosts = vec![0, 1];
     info!("The network graph has been initialized: {:?}", graph);
 
