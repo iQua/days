@@ -1,8 +1,7 @@
+use std::collections::BinaryHeap;
 use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::{collections::BinaryHeap, pin::Pin};
 
 use log::warn;
 use tokio::sync::mpsc::unbounded_channel;
@@ -52,12 +51,7 @@ impl<G: Send + Sync + 'static> SimContext<G> {
             self.get_time().await
         );
 
-        tokio::spawn(Process::new(
-            Arc::clone(&self.now),
-            Arc::clone(&self.semaphore),
-            Arc::clone(&self.shared),
-            f,
-        ));
+        tokio::spawn(f);
     }
 
     #[inline]
@@ -98,65 +92,6 @@ impl<G: Send + Sync + 'static> SimContext<G> {
             calendar.len()
         );
         Some(sender)
-    }
-}
-
-pub struct Process<G: Send + Sync + 'static>(Arc<Mutex<Inner<G>>>);
-
-struct Inner<G: Send + Sync + 'static> {
-    now: Arc<RwLock<Time>>,
-    semaphore: Arc<Semaphore>,
-    shared: Arc<RwLock<G>>,
-    state: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-}
-
-impl<G: Send + Sync + 'static> Process<G> {
-    #[inline]
-    pub fn new(
-        now: Arc<RwLock<Time>>,
-        semaphore: Arc<Semaphore>,
-        shared: Arc<RwLock<G>>,
-        fut: impl Future<Output = ()> + Send + 'static,
-    ) -> Self {
-        Process(Arc::new(Mutex::new(Inner {
-            now,
-            semaphore,
-            shared,
-            state: Some(Box::pin(fut)),
-        })))
-    }
-
-    async fn now(&self) -> Time {
-        let inner = self.0.lock().await;
-        let now = inner.now.read().await;
-        *now
-    }
-
-    #[inline]
-    pub fn terminate(&self) {
-        // TODO
-        // delete a permit permanently in the semaphore
-    }
-}
-
-impl<G: Send + Sync + 'static> Future for Process<G> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = self.0.try_lock();
-        match inner {
-            Ok(mut guard) => {
-                if let Some(ref mut state) = guard.state {
-                    state.as_mut().poll(cx)
-                } else {
-                    Poll::Ready(())
-                }
-            }
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
     }
 }
 
