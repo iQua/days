@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use std::{collections::BinaryHeap, pin::Pin};
 
 use log::warn;
+use tokio::sync::Semaphore;
 use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
 
 pub type Time = f64;
@@ -12,8 +13,9 @@ type SortQ = BinaryHeap<NextEvent>;
 
 pub struct SimContext<G: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
-    calendar: Arc<Mutex<SortQ>>,
+    semaphore: Arc<Semaphore>,
     shared: Arc<RwLock<G>>,
+    calendar: Arc<Mutex<SortQ>>,
 }
 
 impl<G: Clone + Send + Sync + 'static> Clone for SimContext<G> {
@@ -21,8 +23,9 @@ impl<G: Clone + Send + Sync + 'static> Clone for SimContext<G> {
     fn clone(&self) -> Self {
         SimContext {
             now: Arc::clone(&self.now),
-            calendar: Arc::clone(&self.calendar),
+            semaphore: Arc::clone(&self.semaphore),
             shared: Arc::clone(&self.shared),
+            calendar: Arc::clone(&self.calendar),
         }
     }
 }
@@ -31,24 +34,34 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     pub fn new(shared: G) -> Arc<Self> {
         Arc::new(Self {
             now: Arc::new(RwLock::new(Time::default())),
+            semaphore: Arc::new(Semaphore::new(0)),
             calendar: Arc::new(Mutex::new(SortQ::default())),
             shared: Arc::new(RwLock::new(shared)),
         })
     }
 
+    #[inline]
     pub async fn activate<F>(&self, f: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.semaphore.add_permits(1);
         warn!(
             "New coroutine called sim.activate(): current time: {:?}",
             self.get_time().await
         );
+
         tokio::spawn(Process::new(
             Arc::clone(&self.now),
+            Arc::clone(&self.semaphore),
             Arc::clone(&self.shared),
             f,
         ));
+    }
+
+    #[inline]
+    pub async fn advance(&self, sender: UnboundedSender<usize>) {
+        // todo
     }
 
     fn clear(&self) {
@@ -84,6 +97,7 @@ pub struct Process<G: Send + Sync + 'static>(Arc<Mutex<Inner<G>>>);
 
 struct Inner<G: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
+    semaphore: Arc<Semaphore>,
     shared: Arc<RwLock<G>>,
     state: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
@@ -92,11 +106,13 @@ impl<G: Send + Sync + 'static> Process<G> {
     #[inline]
     pub fn new(
         now: Arc<RwLock<Time>>,
+        semaphore: Arc<Semaphore>,
         shared: Arc<RwLock<G>>,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> Self {
         Process(Arc::new(Mutex::new(Inner {
             now,
+            semaphore,
             shared,
             state: Some(Box::pin(fut)),
         })))
@@ -106,6 +122,12 @@ impl<G: Send + Sync + 'static> Process<G> {
         let inner = self.0.lock().await;
         let now = inner.now.read().await;
         *now
+    }
+
+    #[inline]
+    pub fn terminate(&self) {
+        // TODO
+        // delete a permit permanently in the semaphore
     }
 }
 
