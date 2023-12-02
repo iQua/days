@@ -55,6 +55,15 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     }
 
     #[inline]
+    pub async fn terminate<F>(&self)
+    {
+        let permit = self.semaphore.acquire().await.expect("Failed to acquire a permit.");
+        permit.forget();
+        warn!("terminate: remove one permit at time {:3}", self.get_time().await);
+    }
+
+
+    #[inline]
     pub async fn advance(&self, wait_time: Time) {
         warn!("advance: {}", wait_time);
         let (tx, mut rx) = unbounded_channel::<usize>();
