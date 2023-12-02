@@ -55,18 +55,18 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     }
 
     #[inline]
-    pub async fn terminate<F>(&self)
-    {
-        let permit = self.semaphore.acquire().await.expect("Failed to acquire a permit.");
+    pub async fn terminate<F>(&self) {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
         permit.forget();
-        warn!("terminate: remove one permit at time {:3}", self.get_time().await);
+        warn!(
+            "terminate: remove one permit at time {:3}",
+            self.get_time().await
+        );
     }
-
-    #[inline]
-    pub async fn push_event(&self, event: Event) {
-
-    }
-
 
     #[inline]
     pub async fn advance(&self, wait_time: Time) {
@@ -95,14 +95,26 @@ impl<G: Send + Sync + 'static> SimContext<G> {
         warn!("set_time: set sim time to {:?}", new_time);
     }
 
+    #[inline]
+    pub async fn push_event(&self, event: Event) {
+        let mut calendar = self.calendar.lock().await;
+        calendar.push(event);
+        warn!(
+            "push_event: push event to SortQ at time {:3}, queue length = {:?}",
+            self.get_time().await,
+            calendar.len()
+        );
+    }
+
     /// Removes the next event from the SortQ, sets the new time and return the
     /// sender to the coroutine
-    pub async fn next_event(&self) -> Option<UnboundedSender<usize>> {
+    pub async fn pop_event(&self) -> Option<UnboundedSender<usize>> {
         let mut calendar = self.calendar.lock().await;
         let Event(now, sender) = calendar.pop()?;
         self.set_time(now).await;
         warn!(
-            "next_event: pop out from SortQ, queue length = {:?}",
+            "pop_event: pop out from SortQ at time {:3}, queue length = {:?}",
+            self.get_time().await,
             calendar.len()
         );
         Some(sender)
