@@ -4,9 +4,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use log::warn;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tokio::sync::Semaphore;
-use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot::{channel, Sender};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
@@ -71,7 +71,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
     #[inline]
     pub async fn advance(&self, wait_time: Time) {
         warn!("advance: {}", wait_time);
-        let (tx, mut rx) = unbounded_channel::<usize>();
+        let (tx, rx) = channel();
         let wake_time = self.get_time().await + wait_time;
         let event = Event(wake_time, tx);
 
@@ -87,14 +87,16 @@ impl<S: Send + Sync + 'static> SimContext<S> {
             .await
             .expect("Failed to acquire a permit.");
 
-        rx.recv().await;
+        match rx.await {
+            Ok(_) => warn!(
+                "advance: complete at time {} after wait_time: {}",
+                self.get_time().await,
+                wait_time
+            ),
+            Err(_) => warn!("advance: channel was closed before a message was received"),
+        }
 
         drop(permit);
-        warn!(
-            "advance: complete at time {} after wait_time: {}",
-            self.get_time().await,
-            wait_time
-        );
     }
 
     /// Sample usage: let received_packet = sim.receive_with_permit(&mut receiver).await;
@@ -142,7 +144,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
 
     /// Removes the next event from the SortQ, sets the new time and return the
     /// sender to the coroutine
-    pub async fn pop_event(&self) -> Option<UnboundedSender<usize>> {
+    pub async fn pop_event(&self) -> Option<Sender<usize>> {
         let mut calendar = self.calendar.lock().await;
         let Event(now, sender) = calendar.pop()?;
         self.set_time(now).await;
@@ -155,7 +157,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
     }
 }
 
-pub struct Event(pub Time, pub UnboundedSender<usize>);
+pub struct Event(pub Time, pub Sender<usize>);
 
 impl PartialEq for Event {
     #[inline]
