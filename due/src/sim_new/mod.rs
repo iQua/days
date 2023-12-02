@@ -209,89 +209,49 @@ impl RandomVar {
 
     /// Resets all stored statistical data.
     pub async fn clear(&self) {
-        {
-            let mut total = self.total.write().await;
-            *total = 0;
-        }
-        {
-            let mut sum = self.sum.write().await;
-            *sum = 0.0;
-        }
-        {
-            let mut sqr = self.sqr.write().await;
-            *sqr = 0.0;
-        }
-        {
-            let mut min = self.min.write().await;
-            *min = f64::INFINITY;
-        }
-        {
-            let mut max = self.max.write().await;
-            *max = f64::NEG_INFINITY;
-        }
+        *self.total.write().await = 0;
+        *self.sum.write().await = 0.0;
+        *self.sqr.write().await = 0.0;
+        *self.min.write().await = f64::INFINITY;
+        *self.max.write().await = f64::NEG_INFINITY;
     }
 
     /// Adds another value to the statistical collection.
     pub async fn tabulate<T: Into<f64>>(&self, val: T) {
         let val: f64 = val.into();
 
-        {
-            let mut total = self.total.write().await;
-            *total += 1;
-        }
-        {
-            let mut sum = self.sum.write().await;
-            *sum += val;
-        }
-        {
-            let mut sqr = self.sqr.write().await;
-            *sqr += val.powi(2);
-        }
-        {
-            let mut min = self.min.write().await;
-            if *min > val {
-                *min = val;
-            }
-        }
-        {
-            let mut max = self.max.write().await;
-            if *max < val {
-                *max = val;
-            }
-        }
+        let mut total = self.total.write().await;
+        let mut sum = self.sum.write().await;
+        let mut sqr = self.sqr.write().await;
+        let mut min = self.min.write().await;
+        let mut max = self.max.write().await;
+
+        *total += 1;
+        *sum += val;
+        *sqr += val.powi(2);
+        *min = (*min).min(val);
+        *max = (*max).max(val);
     }
 
     /// Combines the statistical collection of two random variables into one.
     pub async fn merge(&self, other: &Self) {
-        {
-            let mut total = self.total.write().await;
-            let other_total = other.total.read().await;
-            *total += *other_total;
-        }
-        {
-            let mut sum = self.sum.write().await;
-            let other_sum = other.sum.read().await;
-            *sum += *other_sum;
-        }
-        {
-            let mut sqr = self.sqr.write().await;
-            let other_sqr = other.sqr.read().await;
-            *sqr += *other_sqr;
-        }
-        {
-            let mut min = self.min.write().await;
-            let other_min = other.min.read().await;
-            if *min > *other_min {
-                *min = *other_min;
-            }
-        }
-        {
-            let mut max = self.max.write().await;
-            let other_max = other.max.read().await;
-            if *max < *other_max {
-                *max = *other_max;
-            }
-        }
+        let mut total = self.total.write().await;
+        let mut sum = self.sum.write().await;
+        let mut sqr = self.sqr.write().await;
+        let mut min = self.min.write().await;
+        let mut max = self.max.write().await;
+
+        let other_total = *other.total.read().await;
+        let other_sum = *other.sum.read().await;
+        let other_sqr = *other.sqr.read().await;
+        let other_min = *other.min.read().await;
+        let other_max = *other.max.read().await;
+
+        *total += other_total;
+        *sum += other_sum;
+        *sqr += other_sqr;
+        *min = (*min).min(other_min);
+        *max = (*max).max(other_max);
     }
 
     /// Displays the statistics
