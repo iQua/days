@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
 
 pub type Time = f64;
-type SortQ = BinaryHeap<NextEvent>;
+type SortQ = BinaryHeap<Event>;
 
 pub struct SimContext<G: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
@@ -62,13 +62,18 @@ impl<G: Send + Sync + 'static> SimContext<G> {
         warn!("terminate: remove one permit at time {:3}", self.get_time().await);
     }
 
+    #[inline]
+    pub async fn push_event(&self, event: Event) {
+
+    }
+
 
     #[inline]
     pub async fn advance(&self, wait_time: Time) {
         warn!("advance: {}", wait_time);
         let (tx, mut rx) = unbounded_channel::<usize>();
         let wake_time = self.get_time().await + wait_time;
-        let event = NextEvent(wake_time, tx);
+        let event = Event(wake_time, tx);
 
         // adds the event to the calendar
         {
@@ -94,7 +99,7 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     /// sender to the coroutine
     pub async fn next_event(&self) -> Option<UnboundedSender<usize>> {
         let mut calendar = self.calendar.lock().await;
-        let NextEvent(now, sender) = calendar.pop()?;
+        let Event(now, sender) = calendar.pop()?;
         self.set_time(now).await;
         warn!(
             "next_event: pop out from SortQ, queue length = {:?}",
@@ -104,25 +109,25 @@ impl<G: Send + Sync + 'static> SimContext<G> {
     }
 }
 
-pub struct NextEvent(pub Time, pub UnboundedSender<usize>);
+pub struct Event(pub Time, pub UnboundedSender<usize>);
 
-impl PartialEq for NextEvent {
+impl PartialEq for Event {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl Eq for NextEvent {}
+impl Eq for Event {}
 
-impl PartialOrd for NextEvent {
+impl PartialOrd for Event {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for NextEvent {
+impl Ord for Event {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
@@ -132,8 +137,8 @@ impl Ord for NextEvent {
     }
 }
 
-impl Display for NextEvent {
+impl Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NextEvent").field("time", &self.0).finish()
+        f.debug_struct("Event").field("time", &self.0).finish()
     }
 }
