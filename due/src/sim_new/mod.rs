@@ -4,21 +4,21 @@ use std::future::Future;
 use std::sync::Arc;
 
 use log::warn;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::Semaphore;
 use tokio::sync::{mpsc::UnboundedSender, Mutex, RwLock};
 
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
 
-pub struct SimContext<G: Send + Sync + 'static> {
+pub struct SimContext<S: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
     semaphore: Arc<Semaphore>,
-    shared: Arc<RwLock<G>>,
+    shared: Arc<RwLock<S>>,
     calendar: Arc<Mutex<SortQ>>,
 }
 
-impl<G: Clone + Send + Sync + 'static> Clone for SimContext<G> {
+impl<S: Clone + Send + Sync + 'static> Clone for SimContext<S> {
     #[inline]
     fn clone(&self) -> Self {
         SimContext {
@@ -30,8 +30,8 @@ impl<G: Clone + Send + Sync + 'static> Clone for SimContext<G> {
     }
 }
 
-impl<G: Send + Sync + 'static> SimContext<G> {
-    pub fn new(shared: G) -> Arc<Self> {
+impl<S: Send + Sync + 'static> SimContext<S> {
+    pub fn new(shared: S) -> Arc<Self> {
         Arc::new(Self {
             now: Arc::new(RwLock::new(Time::default())),
             semaphore: Arc::new(Semaphore::new(0)),
@@ -97,11 +97,31 @@ impl<G: Send + Sync + 'static> SimContext<G> {
         );
     }
 
+    #[inline]
+    pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
+
+        let packet = receiver.recv().await;
+
+        drop(permit);
+        warn!(
+            "recv_with_permit: complete at time {}",
+            self.get_time().await
+        );
+        packet
+    }
+
+    #[inline]
     async fn get_time(&self) -> Time {
         let now = self.now.read().await;
         *now
     }
 
+    #[inline]
     pub async fn set_time(&self, new_time: Time) {
         let mut now = self.now.write().await;
         *now = new_time;
