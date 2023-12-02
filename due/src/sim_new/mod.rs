@@ -97,6 +97,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
         );
     }
 
+    /// Sample usage: let received_packet = sim.receive_with_permit(&mut receiver).await;
     #[inline]
     pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
         let permit = self
