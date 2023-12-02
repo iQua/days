@@ -63,7 +63,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
             .expect("Failed to acquire a permit.");
         permit.forget();
         warn!(
-            "terminate: remove one permit at time {:3}",
+            "terminate: remove one permit at time {:.3}",
             self.get_time().await
         );
     }
@@ -133,7 +133,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
         let mut calendar = self.calendar.lock().await;
         calendar.push(event);
         warn!(
-            "push_event: push event to SortQ at time {:3}, queue length = {:?}",
+            "push_event: push event to SortQ at time {:.3}, queue length = {:?}",
             self.get_time().await,
             calendar.len()
         );
@@ -146,7 +146,7 @@ impl<S: Send + Sync + 'static> SimContext<S> {
         let Event(now, sender) = calendar.pop()?;
         self.set_time(now).await;
         warn!(
-            "pop_event: pop out from SortQ at time {:3}, queue length = {:?}",
+            "pop_event: pop out from SortQ at time {:.3}, queue length = {:?}",
             self.get_time().await,
             calendar.len()
         );
@@ -185,5 +185,145 @@ impl Ord for Event {
 impl Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Event").field("time", &self.0).finish()
+    }
+}
+
+// Statistical facilities
+
+/// A simple collector for statistical data
+#[derive(Clone, Debug)]
+pub struct RandomVar {
+    total: Arc<RwLock<u32>>,
+    sum: Arc<RwLock<f64>>,
+    sqr: Arc<RwLock<f64>>,
+    min: Arc<RwLock<f64>>,
+    max: Arc<RwLock<f64>>,
+}
+
+impl RandomVar {
+    /// Creates a new random variable.
+    #[inline]
+    pub fn new() -> Self {
+        RandomVar::default()
+    }
+
+    /// Resets all stored statistical data.
+    pub async fn clear(&self) {
+        {
+            let mut total = self.total.write().await;
+            *total = 0;
+        }
+        {
+            let mut sum = self.sum.write().await;
+            *sum = 0.0;
+        }
+        {
+            let mut sqr = self.sqr.write().await;
+            *sqr = 0.0;
+        }
+        {
+            let mut min = self.min.write().await;
+            *min = f64::INFINITY;
+        }
+        {
+            let mut max = self.max.write().await;
+            *max = f64::NEG_INFINITY;
+        }
+    }
+
+    /// Adds another value to the statistical collection.
+    pub async fn tabulate<T: Into<f64>>(&self, val: T) {
+        let val: f64 = val.into();
+
+        {
+            let mut total = self.total.write().await;
+            *total += 1;
+        }
+        {
+            let mut sum = self.sum.write().await;
+            *sum += val;
+        }
+        {
+            let mut sqr = self.sqr.write().await;
+            *sqr += val.powi(2);
+        }
+        {
+            let mut min = self.min.write().await;
+            if *min > val {
+                *min = val;
+            }
+        }
+        {
+            let mut max = self.max.write().await;
+            if *max < val {
+                *max = val;
+            }
+        }
+    }
+
+    /// Combines the statistical collection of two random variables into one.
+    pub async fn merge(&self, other: &Self) {
+        {
+            let mut total = self.total.write().await;
+            let other_total = other.total.read().await;
+            *total += *other_total;
+        }
+        {
+            let mut sum = self.sum.write().await;
+            let other_sum = other.sum.read().await;
+            *sum += *other_sum;
+        }
+        {
+            let mut sqr = self.sqr.write().await;
+            let other_sqr = other.sqr.read().await;
+            *sqr += *other_sqr;
+        }
+        {
+            let mut min = self.min.write().await;
+            let other_min = other.min.read().await;
+            if *min > *other_min {
+                *min = *other_min;
+            }
+        }
+        {
+            let mut max = self.max.write().await;
+            let other_max = other.max.read().await;
+            if *max < *other_max {
+                *max = *other_max;
+            }
+        }
+    }
+
+    /// Displays the statistics
+    pub async fn display_stats(&self) {
+        let total = *self.total.read().await;
+        let sum = *self.sum.read().await;
+        let sqr = *self.sqr.read().await;
+        let min = *self.min.read().await;
+        let max = *self.max.read().await;
+
+        let mean = sum / f64::from(total);
+        let variance = sqr / f64::from(total) - mean.powi(2);
+        let std_dev = variance.sqrt();
+
+        println!(
+            "{}",
+            format_args!(
+                "RandomVar - total: {}, mean: {:.3}, std_dev: {:.3}, min: {:.3}, max: {:.3}",
+                total, mean, std_dev, min, max
+            )
+        );
+    }
+}
+
+impl Default for RandomVar {
+    fn default() -> Self {
+        RandomVar {
+            total: Arc::new(RwLock::new(0)),
+            sum: Arc::new(RwLock::new(0.0)),
+            sqr: Arc::new(RwLock::new(0.0)),
+            min: Arc::new(RwLock::new(f64::INFINITY)),
+            max: Arc::new(RwLock::new(f64::NEG_INFINITY)),
+        }
     }
 }
