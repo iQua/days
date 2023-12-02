@@ -81,7 +81,20 @@ impl<G: Send + Sync + 'static> SimContext<G> {
             calendar.push(event);
         }
 
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
+
         rx.recv().await;
+
+        drop(permit);
+        warn!(
+            "advance: complete at time {} after wait_time: {}",
+            self.get_time().await,
+            wait_time
+        );
     }
 
     async fn get_time(&self) -> Time {
