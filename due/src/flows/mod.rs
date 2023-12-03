@@ -11,7 +11,7 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::PacketSink;
 use crate::flows::source::PacketSource;
 use crate::Shared;
-use crate::sim_new::Simulator;
+use crate::sim::Simulator;
 
 #[derive(Debug)]
 pub enum EndPoint {

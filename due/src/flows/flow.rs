@@ -4,7 +4,7 @@ use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
-use crate::sim_new::{Simulator, Time};
+use crate::sim::{Simulator, Time};
 use crate::{next_flow_id, Shared};
 
 use super::route::{RandomSimplePath, RoutingProtocol};

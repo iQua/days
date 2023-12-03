@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::schedulers::Scheduler;
-use crate::sim_new::{Simulator, Time};
+use crate::sim::{Simulator, Time};
 use crate::{next_scheduler_id, Shared};
 
 pub struct Port {

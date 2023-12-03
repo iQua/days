@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use due::sim_new::Simulator;
+use due::sim::Simulator;
 use log::{debug, info, warn};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};

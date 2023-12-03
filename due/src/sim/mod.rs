@@ -1,533 +1,233 @@
-//! The core library for discrete-event simulation using stackless coroutines.
-
-use std::{
-    cell::{Cell, RefCell},
-    cmp::Ordering,
-    collections::BinaryHeap,
-    fmt::{Display, Formatter},
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex, RwLock},
-    task::{self, Context, Poll},
-};
+use std::collections::BinaryHeap;
+use std::fmt::Display;
+use std::future::Future;
+use std::sync::Arc;
 
 use log::warn;
+use rand::{SeedableRng, Rng};
+use rand::rngs::SmallRng;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot::{channel, Sender};
+use tokio::sync::{Mutex, RwLock, Semaphore, RwLockReadGuard, RwLockWriteGuard};
 
-// simple time type
 pub type Time = f64;
+type SortQ = BinaryHeap<Event>;
 
-/// Performs a single simulation run.
-///
-pub fn simulation<G, F>(shared: G, main: F) -> G
-where
-    F: FnOnce(SimContext<G>) -> Process<G>,
-{
-    // create a fresh scheduler and a handle to it
-    let sched = Scheduler::new(shared);
-    let sim = SimContext { handle: &sched };
 
-    // construct a custom context to pass into the poll()-method
-    let event_waker = StateEventWaker::new(sim);
-    let waker = unsafe { event_waker.as_waker() };
-    let mut cx = Context::from_waker(&waker);
-
-    // evaluate the passed function for the main process and schedule it
-    let root = main(sim);
-    sched.schedule(root.clone());
-
-    // pop processes until empty or the main process terminates
-    while let Some(process) = sched.next_event() {
-        warn!("while loop start - {:.3}", sched.now.get());
-        if process.poll(&mut cx).is_ready() && process == root {
-            break;
-        }
-        warn!("while loop end - {:.3}", sched.now.get());
-    }
-
-    // clear the scheduler before it is dropped to break the dependency
-    // cycle between the processes and the scheduler that we made possible
-    // by using a raw pointer for the simulation context
-    sched.clear();
-
-    // return the global data
-    sched.shared
+pub struct Simulator<S: Send + Sync + 'static> {
+    now: Arc<RwLock<Time>>,
+    semaphore: Arc<Semaphore>,
+    shared: Arc<RwLock<S>>,
+    rng: Arc<Mutex<SmallRng>>,
+    calendar: Arc<Mutex<SortQ>>,
 }
 
-// priority queue of time-process-pairs using time as the key
-type EventQ<'s, G> = BinaryHeap<NextEvent<'s, G>>;
-
-/// The (private) scheduler for processes.
-pub struct Scheduler<'s, G> {
-    /// The current simulation time.
-    now: Cell<Time>,
-
-    /// The event-calendar organized chronologically.
-    calendar: RefCell<EventQ<'s, G>>,
-
-    /// The currently active process.
-    active: RefCell<Process<'s, G>>,
-
-    /// Globally-accessible data.
-    shared: G,
-}
-
-impl<'s, G> Scheduler<'s, G> {
-    /// Creates a new scheduler.
-    #[inline]
-    pub fn new(shared: G) -> Self {
-        Self {
-            now: Cell::default(),
-            calendar: RefCell::default(),
-            active: RefCell::default(),
-            shared,
-        }
-    }
-
-    /// Clears the scheduler, dropping all of the contained processes.
-    fn clear(&self) {
-        // this is a surprisingly delicate operation because any of the
-        // processes that are still present in the event-queue may re- or
-        // deschedule processes upon drop, with the consequence of writing
-        // into the event-queue while it's being cleared (and therefore in an
-        // inconsistent state); swapping out the event queue with an empty one
-        // circumvents this issue completely, since clearing and dropping now
-        // behave like atomic operations
-
-        // atomically replace the event queue with an empty one
-        let mut events = self.calendar.replace(EventQ::default());
-
-        // now clear the old one; the calendar may not be empty after this
-        // operation if any destructors scheduled new processes
-        events.clear();
-
-        // replace the contents of the calendar with the old (empty) event queue
-        // and drop the temporary one as an optimization
-        self.calendar.replace(events);
-
-        // the user has to be actively malicious by scheduling new processes
-        // upon dropping them to make it this far and we don't have all day
-        assert!(
-            self.calendar.borrow().is_empty(),
-            "Please don't activate new processes on drop."
-        );
-
-        // replace the active process with an already terminated one
-        self.active.replace(Process::default());
-    }
-
-    /// Schedules a process at the current simulation time.
-    #[inline]
-    fn schedule(&self, process: Process<'s, G>) {
-        warn!("schedule - {:.3}", self.now.get());
-        self.schedule_in(Time::default(), process);
-    }
-
-    /// Schedules a process at a later simulation time.
-    #[inline]
-    fn schedule_in(&self, dt: Time, process: Process<'s, G>) {
-        self.calendar
-            .borrow_mut()
-            .push(NextEvent(self.now.get() + dt, process));
-        warn!(
-            "schedule_in: pushed back to EventQ with wake-up time = {:.3}; queue length = {:.3}",
-            self.now.get() + dt,
-            self.calendar.borrow().len()
-        );
-        for event in self.calendar.borrow().iter() {
-            warn!("schedule_in: EventQ = {:.3}", event);
-        }
-    }
-
-    /// Removes the process with the next event time from the calendar and
-    /// activates it.
-    #[inline]
-    fn next_event(&self) -> Option<Process<'s, G>> {
-        let NextEvent(now, process) = self.calendar.borrow_mut().pop()?;
-        self.now.set(now);
-        warn!(
-            "next_event - popped out from EventQ with sim time = {:.3}; queue length = {:?}",
-            now,
-            self.calendar.borrow().len()
-        );
-        self.active.replace(process.clone());
-        Some(process)
-    }
-}
-
-/// A light-weight handle to the scheduler.
-pub struct SimContext<'s, G = ()> {
-    pub handle: *const Scheduler<'s, G>,
-}
-
-// this allows the creation of copies
-impl<'s, G> Clone for SimContext<'s, G> {
+impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
     #[inline]
     fn clone(&self) -> Self {
-        *self
+        Simulator {
+            now: Arc::clone(&self.now),
+            semaphore: Arc::clone(&self.semaphore),
+            shared: Arc::clone(&self.shared),
+            rng: Arc::clone(&self.rng),
+            calendar: Arc::clone(&self.calendar),
+        }
     }
 }
 
-// this allows moving the context without invalidating it (copy semantics)
-impl<'s, G> Copy for SimContext<'s, G> {}
-
-impl<'s, G> SimContext<'s, G> {
-    /// Returns a (reference-counted) copy of the currently active process.
-    #[inline]
-    pub fn active(&self) -> Process<'s, G> {
-        self.sched().active.borrow().clone()
+impl<S: Send + Sync + 'static> Simulator<S> {
+    pub fn new(shared: S, seed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            now: Arc::new(RwLock::new(Time::default())),
+            semaphore: Arc::new(Semaphore::new(0)),
+            shared: Arc::new(RwLock::new(shared)),
+            rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(seed))),
+            calendar: Arc::new(Mutex::new(SortQ::default())),
+        })
     }
 
-    /// Activates a new process with the given future.
     #[inline]
-    pub fn activate<F>(&self, f: F)
+    pub async fn activate<F>(&self, f: F)
     where
-        F: Future<Output = ()> + 's,
+        F: Future<Output = ()> + Send + 'static,
     {
+        self.semaphore.add_permits(1);
         warn!(
-            "New coroutine called sim::activate() - current time = {:.3}",
-            self.now()
+            "New coroutine called sim.activate(): current time: {:?}",
+            self.now().await
         );
-        self.reactivate(Process::new(*self, f));
+
+        tokio::spawn(f);
     }
 
-    /// Reactivates a process that has been suspended with wait().
     #[inline]
-    pub fn reactivate(&self, process: Process<'s, G>) {
-        warn!("reactivate - {:.3}", self.now());
-        assert!(process.0.borrow().state.is_some());
-        self.sched().schedule(process);
+    pub async fn terminate<F>(&self) {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
+        permit.forget();
+        warn!(
+            "terminate: remove one permit at time {:.3}",
+            self.now().await
+        );
     }
 
-    /// Reactivates the currently active process after some time has passed.
     #[inline]
-    pub async fn advance(&self, dt: Time) {
-        warn!("advance - {:.3}", dt);
-        self.sched().schedule_in(dt, self.active());
-        sleep().await
-    }
+    pub async fn advance(&self, wait_time: Time) {
+        warn!("advance: {}", wait_time);
+        let (tx, rx) = channel();
+        let wake_time = self.now().await + wait_time;
+        let event = Event(wake_time, tx);
 
-    /// Returns the current simulation time.
-    #[inline]
-    pub fn now(&self) -> Time {
-        self.sched().now.get()
-    }
-
-    /// Returns a shared reference to the global data.
-    #[inline]
-    pub fn shared(&self) -> &G {
-        &self.sched().shared
-    }
-
-    /// Private function to get a safe reference to the scheduler.
-    #[inline]
-    fn sched(&self) -> &Scheduler<'s, G> {
-        // This is safe if no simulation context escapes from the closure
-        // passed to simulation() which is enforced through the use of
-        // higher-order trait-bounds.
-        unsafe { &*self.handle }
-    }
-}
-
-/// A bare-bone process type that can also be used as a waker.
-pub struct Process<'s, G>(Arc<RefCell<Inner<'s, G>>>);
-
-/// The private details of the [`Process`](struct.Process.html) type.
-struct Inner<'s, G> {
-    /// The simulation context needed to implement the `Waker` interface.
-    context: SimContext<'s, G>,
-    /// `Some` [`Future`] associated with this process or `None` if it has been
-    /// terminated externally.
-    ///
-    /// [`Future`]: https://doc.rust-lang.org/std/future/trait.Future.html
-    state: Option<Pin<Box<dyn Future<Output = ()> + 's>>>,
-}
-
-impl<'s, G> Process<'s, G> {
-    /// Combines a future and a simulation context to a process.
-    #[inline]
-    pub fn new(sim: SimContext<'s, G>, fut: impl Future<Output = ()> + 's) -> Self {
-        Process(Arc::new(RefCell::new(Inner {
-            context: sim,
-            state: Some(Box::pin(fut)),
-        })))
-    }
-
-    /// Releases the [`Future`] contained in this process.
-    ///
-    /// This will also execute all of the destructors for the local variables
-    /// initialized by this process.
-    ///
-    /// [`Future`]: https://doc.rust-lang.org/std/future/trait.Future.html
-    #[inline]
-    pub fn terminate(&self) {
-        self.0.borrow_mut().state.take();
-    }
-
-    /// Returns a `Waker` for this process.
-    #[inline]
-    pub fn waker(self) -> task::Waker {
-        unsafe { task::Waker::from_raw(self.raw_waker()) }
-    }
-
-    /// Private function for polling the process.
-    #[inline]
-    fn poll(&self, cx: &mut Context) -> Poll<()> {
-        warn!("poll - start at {}", self.0.borrow().context.now());
-        if let Some(fut) = self.0.borrow_mut().state.as_mut() {
-            fut.as_mut().poll(cx)
-        } else {
-            Poll::Ready(())
+        // adds the event to the calendar
+        {
+            let mut calendar = self.calendar.lock().await;
+            calendar.push(event);
         }
-    }
-}
 
-// Creates a terminated process.
-impl<'s, G> Default for Process<'s, G> {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
+
+        match rx.await {
+            Ok(_) => warn!(
+                "advance: complete at time {} after wait_time: {}",
+                self.now().await,
+                wait_time
+            ),
+            Err(_) => warn!("advance: channel was closed before a message was received"),
+        }
+
+        drop(permit);
+    }
+
+    /// Sample usage: let received_packet = sim.receive_with_permit(&mut receiver).await;
     #[inline]
-    fn default() -> Self {
-        Process(Arc::new(RefCell::new(Inner {
-            context: SimContext {
-                handle: std::ptr::null(),
-            },
-            state: None,
-        })))
-    }
-}
+    pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
 
-// Increases the reference counter of this process.
-impl<'s, G> Clone for Process<'s, G> {
+        let available_permits = self.semaphore.available_permits();
+        if available_permits == 0 {
+            self.pop_event();
+        }
+
+        let packet = receiver.recv().await;
+
+        drop(permit);
+        warn!(
+            "recv_with_permit: complete at time {}",
+            self.now().await
+        );
+        packet
+    }
+
     #[inline]
-    fn clone(&self) -> Self {
-        Process(self.0.clone())
+    pub async fn now(&self) -> Time {
+        let now = self.now.read().await;
+        *now
     }
-}
 
-// allows processes to be compared for equality
-impl<G> PartialEq for Process<'_, G> {
     #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+    pub async fn set_time(&self, new_time: Time) {
+        let mut now = self.now.write().await;
+        *now = new_time;
+        warn!("set_time: set sim time to {:?}", new_time);
+    }
+
+    #[inline]
+    pub async fn push_event(&self, event: Event) {
+        let mut calendar = self.calendar.lock().await;
+        calendar.push(event);
+        warn!(
+            "push_event: push event to SortQ at time {:.3}, queue length = {:?}",
+            self.now().await,
+            calendar.len()
+        );
+    }
+
+    /// Removes the next event from the SortQ, sets the new time and return the
+    /// sender to the coroutine
+    pub async fn pop_event(&self) -> Option<Sender<usize>> {
+        let mut calendar = self.calendar.lock().await;
+        let Event(now, sender) = calendar.pop()?;
+        self.set_time(now).await;
+        warn!(
+            "pop_event: pop out from SortQ at time {:.3}, queue length = {:?}",
+            self.now().await,
+            calendar.len()
+        );
+        Some(sender)
+    }
+
+    pub async fn get_rng(&self) -> SmallRng {
+        let seed: u64 = {
+            let mut rng = self.rng.lock().await;
+            rng.gen()
+        };
+        SmallRng::seed_from_u64(seed)
+    }
+
+    pub async fn read_shared(&self) -> RwLockReadGuard<'_, S>{
+        self.shared.read().await
+    } 
+
+    pub async fn write_shared(&self) -> RwLockWriteGuard<'_, S>{
+        self.shared.write().await
     }
 }
 
-// marks the equality-relation as total
-impl<G> Eq for Process<'_, G> {}
+pub struct Event(pub Time, pub Sender<usize>);
 
-/// Time-process-pair that has a total order defined based on the time.
-struct NextEvent<'p, G>(Time, Process<'p, G>);
-
-impl<G> PartialEq for NextEvent<'_, G> {
+impl PartialEq for Event {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<'s, G> Display for NextEvent<'s, G> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NextEvent").field("time", &self.0).finish()
-    }
-}
+impl Eq for Event {}
 
-impl<G> Eq for NextEvent<'_, G> {}
-
-impl<G> PartialOrd for NextEvent<'_, G> {
+impl PartialOrd for Event {
     #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<G> Ord for NextEvent<'_, G> {
+impl Ord for Event {
     #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
             .partial_cmp(&other.0)
-            .expect("illegal event time NaN")
+            .expect("invalid event wakeup time NaN")
             .reverse()
     }
 }
 
-/* **************************** specialized waker *************************** */
-
-impl<'s, G> Process<'s, G> {
-    /// Virtual function table for the waker.
-    const VTABLE: task::RawWakerVTable =
-        task::RawWakerVTable::new(Self::clone, Self::wake, Self::wake_by_ref, Self::drop);
-
-    /// Constructs a raw waker from a simulation context and a process.
-    #[inline]
-    fn raw_waker(self) -> task::RawWaker {
-        task::RawWaker::new(Arc::into_raw(self.0) as *const (), &Self::VTABLE)
-    }
-
-    unsafe fn clone(this: *const ()) -> task::RawWaker {
-        let waker = Arc::from_raw(this as *const RefCell<Inner<G>>);
-
-        // increase the reference counter once
-        let _ = Arc::into_raw(waker.clone());
-
-        // this is technically unsafe because Wakers are Send + Sync and so this
-        // call might be executed from a different thread, creating a data race
-        // hazard; we are using Arc<T> rather than Rc<T> to guard against this
-        // hazard.
-        task::RawWaker::new(Arc::into_raw(waker) as *const (), &Self::VTABLE)
-    }
-
-    unsafe fn wake(this: *const ()) {
-        let waker = Arc::from_raw(this as *const RefCell<Inner<G>>);
-
-        // this can happen if a synchronization structure forgets to clean
-        // up registered Waker objects on destruct; this would lead to
-        // hard-to-diagnose bugs if we were to ignore it
-        assert!(
-            waker.borrow().state.is_some(),
-            "Attempted to wake a terminated process."
-        );
-
-        warn!("wake - {:.3}", waker.borrow().context.now());
-        // this is technically unsafe because Wakers are Send + Sync and so this
-        // call might be executed from a different thread, creating a data race
-        // hazard; we are using Arc<T> rather than Rc<T> to guard against this
-        // hazard.
-        let sim = waker.borrow().context;
-        sim.reactivate(Process(waker));
-    }
-
-    unsafe fn wake_by_ref(this: *const ()) {
-        let waker = Arc::from_raw(this as *const RefCell<Inner<G>>);
-
-        // keep the waker alive
-        let _ = Arc::into_raw(waker.clone());
-
-        // this can happen if a synchronization structure forgets to clean
-        // up registered Waker objects on destruct; this would lead to
-        // hard-to-diagnose bugs if we were to ignore it
-        assert!(
-            waker.borrow().state.is_some(),
-            "Attempted to wake a terminated process."
-        );
-
-        // this is technically unsafe because Wakers are Send + Sync and so this
-        // call might be executed from a different thread, creating a data race
-        // hazard; we leave preventing this as an exercise to the reader!
-        let sim = waker.borrow().context;
-        sim.reactivate(Process(waker));
-    }
-
-    unsafe fn drop(this: *const ()) {
-        // this is technically unsafe because Wakers are Send + Sync and so this
-        // call might be executed from a different thread, creating a data race
-        // hazard; we leave preventing this as an exercise to the reader!
-        Arc::from_raw(this as *const RefCell<Inner<G>>);
-    }
-}
-
-/// Complex waker that is used to implement state events.
-///
-/// This is the shallow version that is created on the stack of the function
-/// running the event loop. It assumes that the stored process is the currently
-/// active one and creates the deep version when it is cloned.
-struct StateEventWaker<'s, G> {
-    context: SimContext<'s, G>,
-}
-
-impl<'s, G> StateEventWaker<'s, G> {
-    /// Virtual function table for the waker.
-    const VTABLE: task::RawWakerVTable =
-        task::RawWakerVTable::new(Self::clone, Self::wake, Self::wake_by_ref, Self::drop);
-
-    /// Creates a new (shallow) waker using only the simulation context.
-    #[inline]
-    fn new(sim: SimContext<'s, G>) -> Self {
-        StateEventWaker { context: sim }
-    }
-
-    /// Constructs a new waker using only a reference.
-    ///
-    /// This function is unsafe because it is up to the user to ensure that the
-    /// waker doesn't outlive the reference.
-    #[inline]
-    unsafe fn as_waker(&self) -> task::Waker {
-        task::Waker::from_raw(task::RawWaker::new(
-            self as *const _ as *const (),
-            &Self::VTABLE,
-        ))
-    }
-
-    unsafe fn clone(this: *const ()) -> task::RawWaker {
-        // return the currently active process as a raw waker
-        (*(this as *const Self)).context.active().raw_waker()
-    }
-
-    unsafe fn wake(_this: *const ()) {
-        // waking the active process can safely be ignored
-    }
-
-    unsafe fn wake_by_ref(_this: *const ()) {
-        // waking the active process can safely be ignored
-    }
-
-    unsafe fn drop(_this: *const ()) {
-        // memory is released in the main event loop
-    }
-}
-
-// Specialized futures
-
-/// Returns a future that unconditionally puts the calling process to sleep.
-#[inline]
-pub fn sleep() -> impl Future<Output = ()> {
-    Sleep { ready: false }
-}
-
-/// Returns a future that can be awaited to produce the currently set waker.
-#[inline]
-pub fn waker() -> impl Future<Output = task::Waker> {
-    Waker {}
-}
-
-/// Future that blocks on the first call and returns on the second one.
-struct Sleep {
-    ready: bool,
-}
-
-impl Future for Sleep {
-    type Output = ();
-
-    #[inline]
-    fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
-        if self.ready {
-            Poll::Ready(())
-        } else {
-            self.ready = true;
-            Poll::Pending
-        }
-    }
-}
-
-/// Future that returns immediately with a cloned waker.
-struct Waker;
-
-impl Future for Waker {
-    type Output = task::Waker;
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        Poll::Ready(cx.waker().clone())
+impl Display for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event").field("time", &self.0).finish()
     }
 }
 
 // Statistical facilities
 
-/// A simple collector for statistical data, inspired by SLX's random_variable.
+/// A simple collector for statistical data
 #[derive(Clone, Debug)]
 pub struct RandomVar {
-    total: Cell<u32>,
-    sum: Cell<f64>,
-    sqr: Cell<f64>,
-    min: Cell<f64>,
-    max: Cell<f64>,
+    total: Arc<RwLock<u32>>,
+    sum: Arc<RwLock<f64>>,
+    sqr: Arc<RwLock<f64>>,
+    min: Arc<RwLock<f64>>,
+    max: Arc<RwLock<f64>>,
 }
 
 impl RandomVar {
@@ -538,150 +238,82 @@ impl RandomVar {
     }
 
     /// Resets all stored statistical data.
-    pub fn clear(&self) {
-        self.total.set(0);
-        self.sum.set(0.0);
-        self.sqr.set(0.0);
-        self.min.set(f64::INFINITY);
-        self.max.set(f64::NEG_INFINITY);
+    pub async fn clear(&self) {
+        *self.total.write().await = 0;
+        *self.sum.write().await = 0.0;
+        *self.sqr.write().await = 0.0;
+        *self.min.write().await = f64::INFINITY;
+        *self.max.write().await = f64::NEG_INFINITY;
     }
 
     /// Adds another value to the statistical collection.
-    pub fn tabulate<T: Into<f64>>(&self, val: T) {
+    pub async fn tabulate<T: Into<f64>>(&self, val: T) {
         let val: f64 = val.into();
 
-        self.total.set(self.total.get() + 1);
-        self.sum.set(self.sum.get() + val);
-        self.sqr.set(self.sqr.get() + val * val);
+        let mut total = self.total.write().await;
+        let mut sum = self.sum.write().await;
+        let mut sqr = self.sqr.write().await;
+        let mut min = self.min.write().await;
+        let mut max = self.max.write().await;
 
-        if self.min.get() > val {
-            self.min.set(val);
-        }
-        if self.max.get() < val {
-            self.max.set(val);
-        }
+        *total += 1;
+        *sum += val;
+        *sqr += val.powi(2);
+        *min = (*min).min(val);
+        *max = (*max).max(val);
     }
 
     /// Combines the statistical collection of two random variables into one.
-    pub fn merge(&self, other: &Self) {
-        self.total.set(self.total.get() + other.total.get());
-        self.sum.set(self.sum.get() + other.sum.get());
-        self.sqr.set(self.sqr.get() + other.sqr.get());
+    pub async fn merge(&self, other: &Self) {
+        let mut total = self.total.write().await;
+        let mut sum = self.sum.write().await;
+        let mut sqr = self.sqr.write().await;
+        let mut min = self.min.write().await;
+        let mut max = self.max.write().await;
 
-        if self.min.get() > other.min.get() {
-            self.min.set(other.min.get());
-        }
-        if self.max.get() < other.max.get() {
-            self.max.set(other.max.get());
-        }
+        let other_total = *other.total.read().await;
+        let other_sum = *other.sum.read().await;
+        let other_sqr = *other.sqr.read().await;
+        let other_min = *other.min.read().await;
+        let other_max = *other.max.read().await;
+
+        *total += other_total;
+        *sum += other_sum;
+        *sqr += other_sqr;
+        *min = (*min).min(other_min);
+        *max = (*max).max(other_max);
+    }
+
+    /// Displays the statistics
+    pub async fn display_stats(&self) {
+        let total = *self.total.read().await;
+        let sum = *self.sum.read().await;
+        let sqr = *self.sqr.read().await;
+        let min = *self.min.read().await;
+        let max = *self.max.read().await;
+
+        let mean = sum / f64::from(total);
+        let variance = sqr / f64::from(total) - mean.powi(2);
+        let std_dev = variance.sqrt();
+
+        println!(
+            "{}",
+            format_args!(
+                "RandomVar - total: {}, mean: {:.3}, std_dev: {:.3}, min: {:.3}, max: {:.3}",
+                total, mean, std_dev, min, max
+            )
+        );
     }
 }
 
 impl Default for RandomVar {
     fn default() -> Self {
         RandomVar {
-            total: Cell::default(),
-            sum: Cell::default(),
-            sqr: Cell::default(),
-            min: Cell::new(f64::INFINITY),
-            max: Cell::new(f64::NEG_INFINITY),
+            total: Arc::new(RwLock::new(0)),
+            sum: Arc::new(RwLock::new(0.0)),
+            sqr: Arc::new(RwLock::new(0.0)),
+            min: Arc::new(RwLock::new(f64::INFINITY)),
+            max: Arc::new(RwLock::new(f64::NEG_INFINITY)),
         }
-    }
-}
-
-impl Display for RandomVar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let total = self.total.get();
-        let mean = self.sum.get() / f64::from(total);
-        let variance = self.sqr.get() / f64::from(total) - mean * mean;
-        let std_dev = variance.sqrt();
-
-        f.debug_struct("RandomVar")
-            .field("total", &total)
-            .field("mean", &mean)
-            .field("std_dev", &std_dev)
-            .field("min", &self.min.get())
-            .field("max", &self.max.get())
-            .finish()
-    }
-}
-
-// ======================
-
-pub struct NewSimContext<G> {
-    pub now: Arc<RwLock<Time>>,
-    pub shared: G,
-}
-
-pub struct NewProcess<'s, G>(Arc<Mutex<NewInner<'s, G>>>);
-
-struct NewInner<'s, G> {
-    context: NewSimContext<G>,
-    state: Option<Pin<Box<dyn Future<Output = ()> + Send + 's>>>,
-}
-
-impl<'s, G> NewProcess<'s, G> {
-    #[inline]
-    pub fn new(sim: NewSimContext<G>, fut: impl Future<Output = ()> + Send + 's) -> Self {
-        NewProcess(Arc::new(Mutex::new(NewInner {
-            context: sim,
-            state: Some(Box::pin(fut)),
-        })))
-    }
-}
-
-impl<'s, G> Future for NewProcess<'s, G> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut inner = self.0.lock().expect("unable to lock the inner.");
-        if let Some(ref mut fut) = inner.state {
-            let fut = Pin::new(fut);
-            fut.poll(cx)
-        } else {
-            Poll::Ready(())
-        }
-    }
-}
-
-impl<'s, G> Clone for NewProcess<'s, G> {
-    #[inline]
-    fn clone(&self) -> Self {
-        NewProcess(self.0.clone())
-    }
-}
-
-/// Time-process-pair that has a total order defined based on the time.
-pub struct NewNextEvent<'p, G>(pub Time, pub NewProcess<'p, G>);
-
-impl<G> PartialEq for NewNextEvent<'_, G> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<'s, G> Display for NewNextEvent<'s, G> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NextEvent").field("time", &self.0).finish()
-    }
-}
-
-impl<G> Eq for NewNextEvent<'_, G> {}
-
-impl<G> PartialOrd for NewNextEvent<'_, G> {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<G> Ord for NewNextEvent<'_, G> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .expect("illegal event time NaN")
-            .reverse()
     }
 }

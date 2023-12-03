@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
 use crate::flows::EndPoint;
-use crate::sim_new::Simulator;
+use crate::sim::Simulator;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::Shared;

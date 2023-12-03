@@ -11,7 +11,7 @@ use log::debug;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
-use crate::sim_new::{RandomVar, Simulator};
+use crate::sim::{RandomVar, Simulator};
 use crate::{next_endpoint_id, Shared};
 
 #[derive(Debug)]

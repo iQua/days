@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
-use crate::sim_new::Simulator;
+use crate::sim::Simulator;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};

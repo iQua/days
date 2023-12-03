@@ -13,7 +13,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::Scheduler;
-use crate::sim_new::Simulator;
+use crate::sim::Simulator;
 use crate::switches::SchedulingDiscipline;
 use crate::{next_element_id, num_elements, Shared};
 

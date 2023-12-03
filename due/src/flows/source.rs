@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::flow::DistributionInfo;
 use crate::flows::packet::Packet;
-use crate::sim_new::{Simulator, Time};
+use crate::sim::{Simulator, Time};
 use crate::{next_endpoint_id, Shared};
 
 #[derive(Debug)]
