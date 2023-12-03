@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use due::sim::{RandomVar, Simulator};
 use log::{debug, info};
 use petgraph::graph::UnGraph;
 
 use due::flows::flow::Flow;
+use due::sim::{RandomVar, Simulator};
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
@@ -28,9 +28,8 @@ async fn network_sim(config_path: &str, sim: Arc<Simulator<Shared>>) {
     topology.run(Arc::clone(&sim)).await;
 
     // waits for the end of this simulation
-    sim.add_permit().await;
     sim.advance(sim.read_shared().await.duration + 100.).await;
-    sim.delete_permit().await;
+    sim.terminate().await;
 }
 
 #[tokio::main]
@@ -46,10 +45,7 @@ async fn main() {
         queueing_delay: RandomVar::new(),
         duration: 10.0,
     };
-    let sim = Simulator::new(shared, seed);
 
-    // tokio::spawn(network_sim(path, Arc::clone(&sim)));
-    // sim.activate(network_sim(path, Arc::clone(&sim))).await;
-    let handle = tokio::spawn(network_sim(path, Arc::clone(&sim)));
-    handle.await.expect("Network simulation failed");
+    let sim = Simulator::new(shared, seed);
+    sim.run(network_sim(path, Arc::clone(&sim))).await;
 }

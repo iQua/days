@@ -14,10 +14,15 @@ pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
 
 pub struct Simulator<S: Send + Sync + 'static> {
+    /// the current simulation clock
     now: Arc<RwLock<Time>>,
+    /// a semaphore that represents the number of active coroutines
     semaphore: Arc<Semaphore>,
+    /// a shared data structure across all coroutines
     shared: Arc<RwLock<S>>,
+    /// a random number generator
     rng: Arc<Mutex<SmallRng>>,
+    /// a sorted queue of events, each advances the simulation clock
     calendar: Arc<Mutex<SortQ>>,
 }
 
@@ -45,12 +50,27 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         })
     }
 
+    pub async fn run<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.semaphore.add_permits(1);
+        warn!(
+            "run - initial coroutine called sim.run(): current time: {:?}",
+            self.now().await
+        );
+
+        tokio::spawn(f)
+            .await
+            .expect("The network simulation session failed");
+    }
+
     #[inline]
     pub async fn activate<F>(&self, f: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.semaphore.add_permits(1);
+        self.add_permit();
         warn!(
             "activate - new coroutine called sim.activate(): current time: {:?}",
             self.now().await
@@ -61,12 +81,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
     #[inline]
     pub async fn terminate(&self) {
-        let permit = self
-            .semaphore
-            .acquire()
-            .await
-            .expect("Failed to acquire a permit.");
-        permit.forget();
+        self.remove_permit().await;
         warn!(
             "terminate: remove one permit at time {:.3}",
             self.now().await
@@ -74,17 +89,18 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     }
 
     #[inline]
-    pub async fn add_permit(&self) {
+    fn add_permit(&self) {
         self.semaphore.add_permits(1);
     }
 
     #[inline]
-    pub async fn delete_permit(&self) {
+    async fn remove_permit(&self) {
         let permit = self
             .semaphore
             .acquire()
             .await
             .expect("Failed to acquire a permit.");
+
         permit.forget();
     }
 
