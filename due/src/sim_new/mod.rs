@@ -4,6 +4,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use log::warn;
+use rand::{SeedableRng, Rng};
+use rand::rngs::SmallRng;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{channel, Sender};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -11,32 +13,35 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
 
-pub struct SimContext<S: Send + Sync + 'static> {
+pub struct Simulator<S: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
     semaphore: Arc<Semaphore>,
     shared: Arc<RwLock<S>>,
+    rng: Arc<Mutex<SmallRng>>,
     calendar: Arc<Mutex<SortQ>>,
 }
 
-impl<S: Clone + Send + Sync + 'static> Clone for SimContext<S> {
+impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
     #[inline]
     fn clone(&self) -> Self {
-        SimContext {
+        Simulator {
             now: Arc::clone(&self.now),
             semaphore: Arc::clone(&self.semaphore),
             shared: Arc::clone(&self.shared),
+            rng: Arc::clone(&self.rng),
             calendar: Arc::clone(&self.calendar),
         }
     }
 }
 
-impl<S: Send + Sync + 'static> SimContext<S> {
-    pub fn new(shared: S) -> Arc<Self> {
+impl<S: Send + Sync + 'static> Simulator<S> {
+    pub fn new(shared: S, seed: u64) -> Arc<Self> {
         Arc::new(Self {
             now: Arc::new(RwLock::new(Time::default())),
             semaphore: Arc::new(Semaphore::new(0)),
-            calendar: Arc::new(Mutex::new(SortQ::default())),
             shared: Arc::new(RwLock::new(shared)),
+            rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(seed))),
+            calendar: Arc::new(Mutex::new(SortQ::default())),
         })
     }
 
@@ -154,6 +159,14 @@ impl<S: Send + Sync + 'static> SimContext<S> {
             calendar.len()
         );
         Some(sender)
+    }
+
+    pub async fn get_rng(&self) -> SmallRng {
+        let seed: u64 = {
+            let mut rng = self.rng.lock().await;
+            rng.gen()
+        };
+        SmallRng::seed_from_u64(seed)
     }
 }
 
