@@ -7,8 +7,8 @@ use statrs::distribution::Uniform;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
-use crate::sim::{SimContext, Time};
-use crate::{get_local_rng, Shared};
+use crate::sim_new::{Simulator, Time};
+use crate::Shared;
 
 #[derive(Debug)]
 pub struct Wire {
@@ -35,7 +35,7 @@ impl Wire {
     async fn forward_packet(
         &mut self,
         mut packet: Packet,
-        sim: SimContext<'_, Shared>,
+        sim: Simulator<Shared>,
         mut rng: SmallRng,
     ) {
         debug!(
@@ -44,7 +44,7 @@ impl Wire {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now(),
+            sim.now().await,
         );
 
         let delay_dist = Uniform::new(2.0, 2.0).unwrap();
@@ -61,7 +61,7 @@ impl Wire {
 
         match self.sender.send(packet.clone()) {
             Ok(_) => {
-                self.last_sent = sim.now();
+                self.last_sent = sim.now().await;
 
                 debug!(
                     "Wire {} sent packet {} ({} bytes) from flow {} with a packet time of {:.3} at time {:.3}.",
@@ -70,7 +70,7 @@ impl Wire {
                     packet.size,
                     packet.flow_id,
                     packet.time,
-                    sim.now(),
+                    self.last_sent,
                 );
             }
             Err(_) => {
@@ -82,16 +82,16 @@ impl Wire {
         }
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        let rng = get_local_rng(sim);
-        while let Some(packet) = self.receiver.recv().await {
-            self.forward_packet(packet, sim, rng.clone()).await;
+    pub async fn run(mut self, sim: Simulator<Shared>) {
+        let rng = sim.get_rng().await;
+        while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+            self.forward_packet(packet, sim.clone(), rng.clone()).await;
         }
 
         info!(
             "Wire {} finished running at time {}.",
             self.wire_id,
-            sim.now()
+            sim.now().await
         );
     }
 }

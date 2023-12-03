@@ -4,12 +4,12 @@ use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use due::sim_new::Simulator;
 use log::{debug, info, warn};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
 use due::flows::flow::Flow;
-use due::sim::{NewNextEvent, NewProcess, NewSimContext, RandomVar, Time};
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -17,8 +17,7 @@ use tokio::sync::Semaphore;
 
 async fn network_sim(
     config_path: &str,
-    sim: NewSimContext<Shared>,
-    tx: UnboundedSender<Option<usize>>,
+    sim: Simulator<Shared>,
 ) {
     let file_path = config_path;
 
@@ -36,7 +35,7 @@ async fn network_sim(
     let topology = Topology::new(file_path, graph, hosts, flows);
 
     // // runs the topology
-    // topology.run(sim);
+    topology.run(sim);
 
     // // waits for the end of this simulation
     // sim.advance(sim.shared().duration + 100.).await;
@@ -51,30 +50,11 @@ async fn main() {
     let seed = get_seed(&path);
 
     // initialization
-    let now: Arc<RwLock<Time>> = Arc::new(RwLock::new(Time::default()));
-    let calendar: RefCell<BinaryHeap<NewNextEvent<Shared>>> = RefCell::default();
     let shared = Shared {
-        rng: Mutex::new(SmallRng::seed_from_u64(seed)),
         queueing_delay: RandomVar::new(),
         duration: 1.5,
     };
-    let mut num_threads = 0;
+    let sim = Simulator::new(shared, seed);
 
-    // initializes the UnboundedChannel
-    let (tx, rx) = unbounded_channel::<Option<usize>>();
-
-    let sim = NewSimContext { now, shared };
-    let root = NewProcess::new(sim, network_sim(path, sim, tx.clone()));
-
-    // Now we do not add root to the calendar, but spawn it directly
-    let active: RefCell<NewProcess<Shared>> = RefCell::new(root.clone());
-    num_threads += 1;
-
-    tokio::spawn(root);
-
-    // how to keep track of total thread number?
-
-    // let semaphore = Arc::new(Semaphore::new(10));
-    // let permit = semaphore.clone().acquire_owned().await.unwrap();
-    // warn!("After owned a permit in main function.");
+    sim.activate(network_sim(config_path, sim));
 }

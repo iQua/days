@@ -10,8 +10,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::flows::packet::Packet;
 use crate::flows::sink::PacketSink;
 use crate::flows::source::PacketSource;
-use crate::sim::SimContext;
 use crate::Shared;
+use crate::sim_new::Simulator;
 
 #[derive(Debug)]
 pub enum EndPoint {
@@ -38,10 +38,10 @@ impl EndPoint {
         }
     }
 
-    pub fn activate(self, sim: SimContext<'_, Shared>) {
+    pub async fn activate(self, sim: Simulator<Shared>) {
         match self {
-            EndPoint::PacketSource(source) => sim.activate(source.run(sim)),
-            EndPoint::PacketSink(sink) => sim.activate(sink.run(sim)),
+            EndPoint::PacketSource(source) => sim.activate(source.run(sim.clone())).await,
+            EndPoint::PacketSink(sink) => sim.activate(sink.run(sim.clone())).await,
         }
     }
 }

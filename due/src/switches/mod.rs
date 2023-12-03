@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
 use crate::flows::EndPoint;
-use crate::sim::SimContext;
+use crate::sim_new::Simulator;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::Shared;
@@ -67,10 +67,10 @@ impl Element {
     }
 
     /// activates the element.
-    pub fn activate(self, sim: SimContext<'_, Shared>) {
+    pub fn activate(self, sim: Simulator<Shared>) {
         match self {
             Element::PacketSwitch(switch) => {
-                sim.activate(switch.run(sim));
+                sim.activate(switch.run(sim.clone()));
             }
             Element::Splitter(splitter) => {
                 sim.activate(splitter.run());

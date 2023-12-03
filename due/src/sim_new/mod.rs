@@ -8,10 +8,11 @@ use rand::{SeedableRng, Rng};
 use rand::rngs::SmallRng;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{channel, Sender};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, RwLockReadGuard, RwLockWriteGuard};
 
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
+
 
 pub struct Simulator<S: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
@@ -53,7 +54,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         self.semaphore.add_permits(1);
         warn!(
             "New coroutine called sim.activate(): current time: {:?}",
-            self.get_time().await
+            self.now().await
         );
 
         tokio::spawn(f);
@@ -69,7 +70,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         permit.forget();
         warn!(
             "terminate: remove one permit at time {:.3}",
-            self.get_time().await
+            self.now().await
         );
     }
 
@@ -77,7 +78,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     pub async fn advance(&self, wait_time: Time) {
         warn!("advance: {}", wait_time);
         let (tx, rx) = channel();
-        let wake_time = self.get_time().await + wait_time;
+        let wake_time = self.now().await + wait_time;
         let event = Event(wake_time, tx);
 
         // adds the event to the calendar
@@ -95,7 +96,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         match rx.await {
             Ok(_) => warn!(
                 "advance: complete at time {} after wait_time: {}",
-                self.get_time().await,
+                self.now().await,
                 wait_time
             ),
             Err(_) => warn!("advance: channel was closed before a message was received"),
@@ -113,18 +114,23 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .await
             .expect("Failed to acquire a permit.");
 
+        let available_permits = self.semaphore.available_permits();
+        if available_permits == 0 {
+            self.pop_event();
+        }
+
         let packet = receiver.recv().await;
 
         drop(permit);
         warn!(
             "recv_with_permit: complete at time {}",
-            self.get_time().await
+            self.now().await
         );
         packet
     }
 
     #[inline]
-    async fn get_time(&self) -> Time {
+    pub async fn now(&self) -> Time {
         let now = self.now.read().await;
         *now
     }
@@ -142,7 +148,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         calendar.push(event);
         warn!(
             "push_event: push event to SortQ at time {:.3}, queue length = {:?}",
-            self.get_time().await,
+            self.now().await,
             calendar.len()
         );
     }
@@ -155,7 +161,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         self.set_time(now).await;
         warn!(
             "pop_event: pop out from SortQ at time {:.3}, queue length = {:?}",
-            self.get_time().await,
+            self.now().await,
             calendar.len()
         );
         Some(sender)
@@ -167,6 +173,14 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             rng.gen()
         };
         SmallRng::seed_from_u64(seed)
+    }
+
+    pub async fn read_shared(&self) -> RwLockReadGuard<'_, S>{
+        self.shared.read().await
+    } 
+
+    pub async fn write_shared(&self) -> RwLockWriteGuard<'_, S>{
+        self.shared.write().await
     }
 }
 

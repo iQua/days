@@ -8,8 +8,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::flow::DistributionInfo;
 use crate::flows::packet::Packet;
-use crate::sim::{SimContext, Time};
-use crate::{get_local_rng, next_endpoint_id, Shared};
+use crate::sim_new::{Simulator, Time};
+use crate::{next_endpoint_id, Shared};
 
 #[derive(Debug)]
 pub struct PacketSource {
@@ -91,16 +91,16 @@ impl PacketSource {
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(mut self, sim: Simulator<Shared>) {
         debug!(
             "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
             self.endpoint_id, self.initial_delay
         );
-        let mut rng = get_local_rng(sim);
+        let mut rng = sim.get_rng().await;
 
         sim.advance(self.initial_delay).await;
 
-        while sim.now() < sim.shared().duration {
+        while sim.now().await < sim.read_shared().await.duration {
             let interval = match self.arr_dist {
                 DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut rng),
                 DistributionInfo::Uniform { low, high } => {
@@ -118,25 +118,27 @@ impl PacketSource {
                 }
             };
 
+            let now = sim.now().await;
+
             let mut packet = Packet::new(
                 packet_size,
                 self.packets_sent,
                 "PacketSource".to_string(),
                 "destination".to_string(),
                 self.flow_id(),
-                sim.now(),
+                now,
             );
 
-            packet.send(sim.now());
+            packet.send(now);
             let _ = self.sender.send(packet.clone());
 
-            self.packet_sent(sim.now(), packet);
+            self.packet_sent(now, packet);
         }
 
         debug!(
             "PacketSource {} finished running at time {}.",
             self.endpoint_id,
-            sim.now()
+            sim.now().await
         );
     }
 }

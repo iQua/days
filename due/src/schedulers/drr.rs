@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::schedulers::Scheduler;
-use crate::sim::{SimContext, Time};
+use crate::sim_new::{Simulator, Time};
 use crate::{next_scheduler_id, Shared};
 
 pub struct DRRServer {
@@ -152,7 +152,7 @@ impl DRRServer {
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(mut self, sim: Simulator<Shared>) {
         loop {
             // schedules packets by going through each queue
             for class_id in 0..self.queues.len() {
@@ -176,7 +176,7 @@ impl DRRServer {
                         let timeout = (packet.size as f64) * 8.0 / self.rate;
                         sim.advance(timeout).await;
                         let mut outbound = self.queues[class_id].pop_front().unwrap();
-                        outbound.send(sim.now());
+                        outbound.send(sim.now().await);
                         let _ = self.sender.send(packet.clone());
 
                         self.packets_waiting -= 1;
@@ -186,7 +186,7 @@ impl DRRServer {
                         // recently sent to DDRServer while sending the previous
                         // packet
                         while let Ok(packet) = self.receiver.try_recv() {
-                            self.packet_received(packet, sim.now());
+                            self.packet_received(packet, sim.now().await);
                         }
 
                         debug!(
@@ -196,7 +196,7 @@ impl DRRServer {
                             packet.packet_id,
                             packet.size,
                             packet.flow_id,
-                            sim.now(),
+                            sim.now().await,
                             self.queues[class_id].len(),
                         );
                     } else {
@@ -209,8 +209,8 @@ impl DRRServer {
 
             // waits for inbound packets from the upstream element
             if self.packets_waiting == 0 {
-                if let Some(packet) = self.receiver.recv().await {
-                    self.packet_received(packet, sim.now());
+                if let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+                    self.packet_received(packet, sim.now().await);
                 } else {
                     break;
                 }
@@ -219,7 +219,7 @@ impl DRRServer {
         info!(
             "DRRServer {} finished running at time {}.",
             self.scheduler_id,
-            sim.now()
+            sim.now().await
         );
     }
 }

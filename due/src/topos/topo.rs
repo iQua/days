@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
-use crate::sim::SimContext;
+use crate::sim_new::Simulator;
 use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};
@@ -171,9 +171,9 @@ impl Topology {
     /// Computes routing decisions for all the flows, and installs Flow
     /// Information Base tables (FIBs) of these routing decisions into all the
     /// switches.
-    fn route(&mut self, sim: SimContext<'_, Shared>) {
+    async fn route(&mut self, sim: Simulator<Shared>) {
         for flow in self.flows.iter_mut() {
-            let paths = flow.compute_paths(self.graph.clone(), sim);
+            let paths = flow.compute_paths(self.graph.clone(), sim.clone()).await;
 
             for path in paths {
                 for window in path.windows(2) {
@@ -197,26 +197,26 @@ impl Topology {
         }
     }
 
-    pub fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(mut self, sim: Simulator<Shared>) {
         // constructs the network graph with network elements
         self.connect();
         // attaches sources and sinks to hosts in the network graph
         self.attach();
         // computes shortest paths for all flows, and sets fibs for all switches
-        self.route(sim);
+        self.route(sim.clone());
 
         for flow in self.flows {
-            warn!("Flow {} will be activated at time {}", flow.id, sim.now());
-            sim.activate(flow.run(sim));
+            warn!("Flow {} will be activated at time {}", flow.id, sim.now().await);
+            sim.activate(flow.run(sim.clone()));
         }
 
         for element in self.elements {
             warn!(
                 "Element {} will be activated at time {}",
                 element.id(),
-                sim.now()
+                sim.now().await
             );
-            element.activate(sim);
+            element.activate(sim.clone());
         }
     }
 }

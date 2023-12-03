@@ -13,7 +13,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::Scheduler;
-use crate::sim::SimContext;
+use crate::sim_new::Simulator;
 use crate::switches::SchedulingDiscipline;
 use crate::{next_element_id, num_elements, Shared};
 
@@ -159,7 +159,7 @@ impl PacketSwitch {
         self.senders.insert(element_id, sender.clone());
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(mut self, sim: Simulator<Shared>) {
         // connects ports to outbound senders and activates them for execution
         match self.discipline {
             SchedulingDiscipline::DRR => {
@@ -189,7 +189,7 @@ impl PacketSwitch {
             }
         }
 
-        while let Some(packet) = self.receiver.recv().await {
+        while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
             self.packets_received += 1;
 
             debug!(
@@ -199,7 +199,7 @@ impl PacketSwitch {
                 packet.packet_id,
                 packet.size,
                 packet.flow_id,
-                sim.now(),
+                sim.now().await,
                 self.packets_received
             );
 
@@ -213,7 +213,7 @@ impl PacketSwitch {
         info!(
             "PacketSwitch {} finished running at time {}.",
             self.element_id,
-            sim.now()
+            sim.now().await
         );
     }
 }

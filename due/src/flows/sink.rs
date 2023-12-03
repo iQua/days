@@ -7,11 +7,11 @@
 //! These statistics are indexed by either the flow identifier or the source of
 //! each packet.
 
-use log::{debug, info};
+use log::debug;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
-use crate::sim::{RandomVar, SimContext};
+use crate::sim_new::{RandomVar, Simulator};
 use crate::{next_endpoint_id, Shared};
 
 #[derive(Debug)]
@@ -94,18 +94,19 @@ impl PacketSink {
         self.receiver = receiver;
     }
 
-    fn packet_received(&mut self, packet: Packet, sim: SimContext<'_, Shared>) {
-        self.arrival_times.tabulate(sim.now());
+    async fn packet_received(&mut self, packet: Packet, sim: Simulator<Shared>) {
+        let now = sim.now().await;
+        self.arrival_times.tabulate(now);
         self.inter_arrival_times
-            .tabulate(sim.now() - self.last_arrival_time);
-        self.last_arrival_time = sim.now();
+            .tabulate(now - self.last_arrival_time);
+        self.last_arrival_time = now;
         self.one_way_delays
-            .tabulate(sim.now() - packet.creation_time);
+            .tabulate(now - packet.creation_time);
         self.queueing_delays.tabulate(packet.queueing_delay);
         self.packet_sizes.tabulate(packet.size as u32);
 
         // Update global statistics about packet sizes
-        sim.shared().queueing_delay.tabulate(packet.queueing_delay);
+        sim.write_shared().await.queueing_delay.tabulate(packet.queueing_delay);
 
         debug!(
             "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -113,29 +114,34 @@ impl PacketSink {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            sim.now(),
+            now,
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        while let Some(packet) = self.receiver.recv().await {
-            self.packet_received(packet, sim);
+    pub async fn run(mut self, sim: Simulator<Shared>) {
+        // while let Some(packet) = self.receiver.recv().await {
+        //     self.packet_received(packet, sim);
+        // }
+
+        while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+            self.packet_received(packet, sim.clone());
         }
 
-        info!(
-            "PacketSink {} finished running at time {:.3}. Statistics: \n\
-            Arrival times: {:#.3} \n\
-            Inter-arrival times: {:#.3} \n\
-            One-way delays: {:#.3} \n\
-            Queueing delays: {:#.3} \n\
-            Packet sizes: {:#.3} \n",
-            self.endpoint_id,
-            sim.now(),
-            self.arrival_times,
-            self.inter_arrival_times,
-            self.one_way_delays,
-            self.queueing_delays,
-            self.packet_sizes,
-        );
+        // TODO: modify the Display for RandomVar!!!
+        // info!(
+        //     "PacketSink {} finished running at time {:.3}. Statistics: \n\
+        //     Arrival times: {:#.3} \n\
+        //     Inter-arrival times: {:#.3} \n\
+        //     One-way delays: {:#.3} \n\
+        //     Queueing delays: {:#.3} \n\
+        //     Packet sizes: {:#.3} \n",
+        //     self.endpoint_id,
+        //     sim.now().await,
+        //     self.arrival_times,
+        //     self.inter_arrival_times,
+        //     self.one_way_delays,
+        //     self.queueing_delays,
+        //     self.packet_sizes,
+        // );
     }
 }

@@ -1,6 +1,6 @@
 //! A very simple struct that represents a packet.
 
-use crate::sim::Time;
+use crate::sim_new::Time;
 
 #[derive(Debug, Clone)]
 pub struct Packet {

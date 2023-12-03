@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
-use crate::sim::{RandomVar, Time};
+use crate::sim_new::{RandomVar, Time};
 
 pub mod flows;
 pub mod schedulers;
@@ -12,6 +12,7 @@ pub mod sim_new;
 pub mod switches;
 pub mod topos;
 
+#[derive(Clone)]
 /// Globally shared data.
 pub struct Shared {
     pub queueing_delay: RandomVar,

@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::schedulers::Scheduler;
-use crate::sim::{SimContext, Time};
+use crate::sim_new::{Simulator, Time};
 use crate::{next_scheduler_id, Shared};
 
 pub struct Port {
@@ -122,11 +122,11 @@ impl Port {
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn run(mut self, sim: Simulator<Shared>) {
         loop {
             // trying to receive all the packets accumulated in the channel
             while let Ok(packet) = self.receiver.try_recv() {
-                self.packet_received(packet, sim.now());
+                self.packet_received(packet, sim.now().await);
             }
 
             if let Some(mut packet) = self.queue.pop_front() {
@@ -134,17 +134,17 @@ impl Port {
                     sim.advance(packet.size as f64 * 8.0 / self.rate).await;
                 }
 
-                packet.send(sim.now());
+                packet.send(sim.now().await);
                 let _ = self.sender.send(packet.clone());
-                self.packet_sent(packet, sim.now());
+                self.packet_sent(packet, sim.now().await);
             }
 
             if !self.queue.is_empty() {
                 // if there are packets in the queue, continue the loop
                 continue;
-            } else if let Some(packet) = self.receiver.recv().await {
+            } else if let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
                 // waits for the packet from the upstream element
-                self.packet_received(packet, sim.now());
+                self.packet_received(packet, sim.now().await);
             } else {
                 break;
             }
@@ -153,7 +153,7 @@ impl Port {
         info!(
             "Port {} finished running at time {}.",
             self.scheduler_id,
-            sim.now()
+            sim.now().await
         );
     }
 }

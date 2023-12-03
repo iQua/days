@@ -4,8 +4,8 @@ use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
-use crate::sim::{SimContext, Time};
-use crate::{get_local_rng, next_flow_id, Shared};
+use crate::sim_new::{Simulator, Time};
+use crate::{next_flow_id, Shared};
 
 use super::route::{RandomSimplePath, RoutingProtocol};
 use super::sink::PacketSink;
@@ -123,17 +123,17 @@ impl Flow {
     }
 
     // Gets the simple paths for all edges of the flow
-    pub fn compute_paths(
+    pub async fn compute_paths(
         &mut self,
         graph: UnGraph<usize, ()>,
-        sim: SimContext<'_, Shared>,
+        sim: Simulator<Shared>,
     ) -> Vec<Vec<NodeIndex>> {
         // sets the routing protocol
         self.routing = RandomSimplePath::new(graph);
 
         let mut paths = Vec::new();
 
-        let rng = get_local_rng(sim);
+        let rng = sim.get_rng().await;
 
         for (idx, edge) in self.graph.edge_references().enumerate() {
             let mut path = self
@@ -181,14 +181,14 @@ impl Flow {
         }
     }
 
-    pub async fn run(self, sim: SimContext<'_, Shared>) {
+    pub async fn run(self, sim: Simulator<Shared>) {
         for endpoint in self.endpoints {
             match endpoint {
                 EndPoint::PacketSource(source) => {
-                    sim.activate(source.run(sim));
+                    sim.activate(source.run(sim.clone()));
                 }
                 EndPoint::PacketSink(sink) => {
-                    sim.activate(sink.run(sim));
+                    sim.activate(sink.run(sim.clone()));
                 }
             }
         }
