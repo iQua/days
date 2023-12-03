@@ -186,19 +186,24 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
     /// Removes the next event from the SortQ, sets the new time and return the
     /// sender to the coroutine
-    pub async fn pop_event(&self) -> Option<Sender<usize>> {
+    pub async fn pop_event(&self) {
         let mut calendar = self.calendar.lock().await;
-        let Event(now, sender) = calendar.pop()?;
-        self.set_time(now).await;
-        warn!(
-            "pop_event: pop out from SortQ at time {:.3}, queue length = {:?}",
-            self.now().await,
-            calendar.len(),
-        );
-        for event in calendar.iter() {
-            warn!("pop_event: EventQ = {:.3}", event);
+
+        if let Some(Event(now, sender)) = calendar.pop() {
+            self.set_time(now).await;
+            warn!(
+                "pop_event: pop out from SortQ at time {:.3}, queue length = {:?}",
+                self.now().await,
+                calendar.len(),
+            );
+            for event in calendar.iter() {
+                warn!("pop_event: EventQ = {:.3}", event);
+            }
+
+            let _ = sender.send(usize::default());
+        } else {
+            warn!("Nothing in calendar to pop.")
         }
-        Some(sender)
     }
 
     pub async fn get_rng(&self) -> SmallRng {
