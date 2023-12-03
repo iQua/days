@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
 
-use log::warn;
+use log::{error, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -188,8 +188,9 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         }
     }
 
-    /// Removes the next event from the SortQ, sets the new time and return the
-    /// sender to the coroutine
+    /// Removes the next event from the SortQ, sets the new simulation time,
+    /// and sends a message to the coroutine that is waiting for advancing
+    /// the simulation clock.
     pub async fn pop_event(&self) {
         let mut calendar = self.calendar.lock().await;
 
@@ -206,7 +207,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
             let _ = sender.send(usize::default());
         } else {
-            warn!("the coroutine that previously called advance() terminated.")
+            error!("There are no events in the calendar queue.")
         }
     }
 
