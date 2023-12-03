@@ -52,7 +52,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     {
         self.semaphore.add_permits(1);
         warn!(
-            "New coroutine called sim.activate(): current time: {:?}",
+            "activate - new coroutine called sim.activate(): current time: {:?}",
             self.now().await
         );
 
@@ -74,17 +74,29 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     }
 
     #[inline]
+    pub async fn add_permit(&self) {
+        self.semaphore.add_permits(1);
+    }
+
+    #[inline]
+    pub async fn delete_permit(&self) {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire a permit.");
+        permit.forget();
+    }
+
+    #[inline]
     pub async fn advance(&self, wait_time: Time) {
-        warn!("advance: {}", wait_time);
+        warn!("advance - advance for {} seconds.", wait_time);
         let (tx, rx) = channel();
         let wake_time = self.now().await + wait_time;
         let event = Event(wake_time, tx);
 
         // adds the event to the calendar
-        {
-            let mut calendar = self.calendar.lock().await;
-            calendar.push(event);
-        }
+        self.push_event(event).await;
 
         let permit = self
             .semaphore
@@ -104,7 +116,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         drop(permit);
     }
 
-    /// Sample usage: let received_packet = sim.receive_with_permit(&mut receiver).await;
     #[inline]
     pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
         let permit = self
