@@ -159,7 +159,7 @@ impl PacketSwitch {
         self.senders.insert(element_id, sender.clone());
     }
 
-    pub async fn run(mut self, sim: Simulator<Shared>) {
+    pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
         // connects ports to outbound senders and activates them for execution
         match self.discipline {
             SchedulingDiscipline::DRR => {
@@ -172,7 +172,7 @@ impl PacketSwitch {
                         panic!("Not enough senders for ports.");
                     }
 
-                    sim.activate(p.run(sim.clone())).await;
+                    sim.activate(p.run(Arc::clone(&sim))).await;
                 }
             }
             SchedulingDiscipline::FIFO => {
@@ -184,7 +184,7 @@ impl PacketSwitch {
                     } else {
                         panic!("Not enough senders for ports.");
                     }
-                    sim.activate(p.run(sim.clone())).await;
+                    sim.activate(p.run(Arc::clone(&sim))).await;
                 }
             }
         }

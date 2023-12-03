@@ -5,13 +5,15 @@ pub mod sink;
 pub mod source;
 pub mod wire;
 
+use std::sync::Arc;
+
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::flows::packet::Packet;
 use crate::flows::sink::PacketSink;
 use crate::flows::source::PacketSource;
-use crate::Shared;
 use crate::sim::Simulator;
+use crate::Shared;
 
 #[derive(Debug)]
 pub enum EndPoint {
@@ -38,10 +40,10 @@ impl EndPoint {
         }
     }
 
-    pub async fn activate(self, sim: Simulator<Shared>) {
+    pub async fn activate(self, sim: Arc<Simulator<Shared>>) {
         match self {
-            EndPoint::PacketSource(source) => sim.activate(source.run(sim.clone())).await,
-            EndPoint::PacketSink(sink) => sim.activate(sink.run(sim.clone())).await,
+            EndPoint::PacketSource(source) => sim.activate(source.run(Arc::clone(&sim))).await,
+            EndPoint::PacketSink(sink) => sim.activate(sink.run(Arc::clone(&sim))).await,
         }
     }
 }

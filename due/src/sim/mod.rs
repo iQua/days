@@ -4,15 +4,14 @@ use std::future::Future;
 use std::sync::Arc;
 
 use log::warn;
-use rand::{SeedableRng, Rng};
 use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{channel, Sender};
-use tokio::sync::{Mutex, RwLock, Semaphore, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
 
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
-
 
 pub struct Simulator<S: Send + Sync + 'static> {
     now: Arc<RwLock<Time>>,
@@ -122,10 +121,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         let packet = receiver.recv().await;
 
         drop(permit);
-        warn!(
-            "recv_with_permit: complete at time {}",
-            self.now().await
-        );
+        warn!("recv_with_permit: complete at time {}", self.now().await);
         packet
     }
 
@@ -175,11 +171,11 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         SmallRng::seed_from_u64(seed)
     }
 
-    pub async fn read_shared(&self) -> RwLockReadGuard<'_, S>{
+    pub async fn read_shared(&self) -> RwLockReadGuard<'_, S> {
         self.shared.read().await
-    } 
+    }
 
-    pub async fn write_shared(&self) -> RwLockWriteGuard<'_, S>{
+    pub async fn write_shared(&self) -> RwLockWriteGuard<'_, S> {
         self.shared.write().await
     }
 }

@@ -152,7 +152,7 @@ impl DRRServer {
         );
     }
 
-    pub async fn run(mut self, sim: Simulator<Shared>) {
+    pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
         loop {
             // schedules packets by going through each queue
             for class_id in 0..self.queues.len() {

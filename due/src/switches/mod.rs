@@ -1,6 +1,8 @@
 pub mod splitter;
 pub mod switch;
 
+use std::sync::Arc;
+
 use serde;
 use serde::Deserialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -67,10 +69,10 @@ impl Element {
     }
 
     /// activates the element.
-    pub async fn activate(self, sim: Simulator<Shared>) {
+    pub async fn activate(self, sim: Arc<Simulator<Shared>>) {
         match self {
             Element::PacketSwitch(switch) => {
-                sim.activate(switch.run(sim.clone())).await;
+                sim.activate(switch.run(Arc::clone(&sim))).await;
             }
             Element::Splitter(splitter) => {
                 sim.activate(splitter.run()).await;

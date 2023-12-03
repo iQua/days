@@ -7,6 +7,8 @@
 //! These statistics are indexed by either the flow identifier or the source of
 //! each packet.
 
+use std::sync::Arc;
+
 use log::debug;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -94,37 +96,39 @@ impl PacketSink {
         self.receiver = receiver;
     }
 
-    async fn packet_received(&mut self, packet: Packet, sim: Simulator<Shared>) {
+    async fn packet_received(&mut self, packet: Packet, sim: Arc<Simulator<Shared>>) {
         let now = sim.now().await;
         self.arrival_times.tabulate(now).await;
         self.inter_arrival_times
-            .tabulate(now - self.last_arrival_time).await;
+            .tabulate(now - self.last_arrival_time)
+            .await;
         self.last_arrival_time = now;
         self.one_way_delays
-            .tabulate(now - packet.creation_time).await;
+            .tabulate(now - packet.creation_time)
+            .await;
         self.queueing_delays.tabulate(packet.queueing_delay).await;
         self.packet_sizes.tabulate(packet.size as u32).await;
 
         // Update global statistics about packet sizes
-        sim.write_shared().await.queueing_delay.tabulate(packet.queueing_delay).await;
+        sim.write_shared()
+            .await
+            .queueing_delay
+            .tabulate(packet.queueing_delay)
+            .await;
 
         debug!(
             "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.endpoint_id,
-            packet.packet_id,
-            packet.size,
-            packet.flow_id,
-            now,
+            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, now,
         );
     }
 
-    pub async fn run(mut self, sim: Simulator<Shared>) {
+    pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
         // while let Some(packet) = self.receiver.recv().await {
         //     self.packet_received(packet, sim);
         // }
 
         while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
-            self.packet_received(packet, sim.clone()).await;
+            self.packet_received(packet, Arc::clone(&sim)).await;
         }
 
         // TODO: modify the Display for RandomVar!!!

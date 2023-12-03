@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
@@ -126,7 +127,7 @@ impl Flow {
     pub async fn compute_paths(
         &mut self,
         graph: UnGraph<usize, ()>,
-        sim: Simulator<Shared>,
+        sim: Arc<Simulator<Shared>>,
     ) -> Vec<Vec<NodeIndex>> {
         // sets the routing protocol
         self.routing = RandomSimplePath::new(graph);
@@ -181,14 +182,14 @@ impl Flow {
         }
     }
 
-    pub async fn run(self, sim: Simulator<Shared>) {
+    pub async fn run(self, sim: Arc<Simulator<Shared>>) {
         for endpoint in self.endpoints {
             match endpoint {
                 EndPoint::PacketSource(source) => {
-                    sim.activate(source.run(sim.clone())).await;
+                    sim.activate(source.run(Arc::clone(&sim))).await;
                 }
                 EndPoint::PacketSink(sink) => {
-                    sim.activate(sink.run(sim.clone())).await;
+                    sim.activate(sink.run(Arc::clone(&sim))).await;
                 }
             }
         }

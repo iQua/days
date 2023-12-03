@@ -1,6 +1,8 @@
 //! Implements a packet generator that simulates the sending of packets with a
 //!  specified inter-arrival time distribution and a packet size distribution.
 
+use std::sync::Arc;
+
 use log::debug;
 use rand::distributions::Distribution;
 use statrs::distribution::{DiscreteUniform, Exp};
@@ -91,7 +93,7 @@ impl PacketSource {
         );
     }
 
-    pub async fn run(mut self, sim: Simulator<Shared>) {
+    pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
         debug!(
             "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
             self.endpoint_id, self.initial_delay

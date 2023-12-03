@@ -1,6 +1,7 @@
 //! Implements a simple FIFO scheduler with only one queue.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -122,7 +123,7 @@ impl Port {
         );
     }
 
-    pub async fn run(mut self, sim: Simulator<Shared>) {
+    pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
         loop {
             // trying to receive all the packets accumulated in the channel
             while let Ok(packet) = self.receiver.try_recv() {

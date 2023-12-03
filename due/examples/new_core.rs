@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use due::sim::Simulator;
+use due::sim::{RandomVar, Simulator};
 use log::{debug, info, warn};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -13,12 +13,8 @@ use due::flows::flow::Flow;
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
-use tokio::sync::Semaphore;
 
-async fn network_sim(
-    config_path: &str,
-    sim: Simulator<Shared>,
-) {
+async fn network_sim(config_path: &str, sim: Simulator<Shared>) {
     let file_path = config_path;
 
     let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
@@ -56,5 +52,23 @@ async fn main() {
     };
     let sim = Simulator::new(shared, seed);
 
-    sim.activate(network_sim(config_path, sim));
+    {
+        let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
+        let hosts = vec![0, 1];
+        info!("The network graph has been initialized: {:?}", graph);
+
+        let flows = Flow::flows_from_config(path);
+        debug!(
+            "A total of {} network flows has been initialized.",
+            flows.len()
+        );
+
+        // initializes the topology
+        let topology = Topology::new(path, graph, hosts, flows);
+
+        // // runs the topology
+        topology.run(Arc::clone(&sim));
+    }
+
+    warn!("Finish in main at time {:.3}", sim.now().await);
 }

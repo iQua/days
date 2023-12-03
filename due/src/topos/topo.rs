@@ -171,9 +171,11 @@ impl Topology {
     /// Computes routing decisions for all the flows, and installs Flow
     /// Information Base tables (FIBs) of these routing decisions into all the
     /// switches.
-    async fn route(&mut self, sim: Simulator<Shared>) {
+    async fn route(&mut self, sim: Arc<Simulator<Shared>>) {
         for flow in self.flows.iter_mut() {
-            let paths = flow.compute_paths(self.graph.clone(), sim.clone()).await;
+            let paths = flow
+                .compute_paths(self.graph.clone(), Arc::clone(&sim))
+                .await;
 
             for path in paths {
                 for window in path.windows(2) {
@@ -197,17 +199,21 @@ impl Topology {
         }
     }
 
-    pub async fn run(mut self, sim: Simulator<Shared>) {
+    pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
         // constructs the network graph with network elements
         self.connect();
         // attaches sources and sinks to hosts in the network graph
         self.attach();
         // computes shortest paths for all flows, and sets fibs for all switches
-        self.route(sim.clone()).await;
+        self.route(Arc::clone(&sim)).await;
 
         for flow in self.flows {
-            warn!("Flow {} will be activated at time {}", flow.id, sim.now().await);
-            flow.run(sim.clone()).await;
+            warn!(
+                "Flow {} will be activated at time {}",
+                flow.id,
+                sim.now().await
+            );
+            flow.run(Arc::clone(&sim)).await;
         }
 
         for element in self.elements {
@@ -216,7 +222,7 @@ impl Topology {
                 element.id(),
                 sim.now().await
             );
-            element.activate(sim.clone()).await;
+            element.activate(Arc::clone(&sim)).await;
         }
     }
 }
