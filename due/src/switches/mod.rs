@@ -67,13 +67,13 @@ impl Element {
     }
 
     /// activates the element.
-    pub fn activate(self, sim: Simulator<Shared>) {
+    pub async fn activate(self, sim: Simulator<Shared>) {
         match self {
             Element::PacketSwitch(switch) => {
-                sim.activate(switch.run(sim.clone()));
+                sim.activate(switch.run(sim.clone())).await;
             }
             Element::Splitter(splitter) => {
-                sim.activate(splitter.run());
+                sim.activate(splitter.run()).await;
             }
         }
     }

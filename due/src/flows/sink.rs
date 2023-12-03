@@ -96,17 +96,17 @@ impl PacketSink {
 
     async fn packet_received(&mut self, packet: Packet, sim: Simulator<Shared>) {
         let now = sim.now().await;
-        self.arrival_times.tabulate(now);
+        self.arrival_times.tabulate(now).await;
         self.inter_arrival_times
-            .tabulate(now - self.last_arrival_time);
+            .tabulate(now - self.last_arrival_time).await;
         self.last_arrival_time = now;
         self.one_way_delays
-            .tabulate(now - packet.creation_time);
-        self.queueing_delays.tabulate(packet.queueing_delay);
-        self.packet_sizes.tabulate(packet.size as u32);
+            .tabulate(now - packet.creation_time).await;
+        self.queueing_delays.tabulate(packet.queueing_delay).await;
+        self.packet_sizes.tabulate(packet.size as u32).await;
 
         // Update global statistics about packet sizes
-        sim.write_shared().await.queueing_delay.tabulate(packet.queueing_delay);
+        sim.write_shared().await.queueing_delay.tabulate(packet.queueing_delay).await;
 
         debug!(
             "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -124,7 +124,7 @@ impl PacketSink {
         // }
 
         while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
-            self.packet_received(packet, sim.clone());
+            self.packet_received(packet, sim.clone()).await;
         }
 
         // TODO: modify the Display for RandomVar!!!

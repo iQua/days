@@ -24,7 +24,7 @@ pub struct PacketSwitch {
     /// the capacity of each outbound port
     capacity: usize,
     /// flow_id -> class_id
-    flow_classes: Arc<dyn Fn(usize) -> usize>,
+    flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
     /// the weights of the classes
     weights: Vec<usize>,
     /// Scheduling discipline
@@ -37,7 +37,7 @@ pub struct PacketSwitch {
 
     /// the outbound ports, each of which is governed by a DRR or FIFO scheduler
     /// element_id -> Scheduler
-    ports: HashMap<usize, Box<dyn Any>>,
+    ports: HashMap<usize, Box<dyn Any + Send>>,
 
     /// senders for sending inbound packets to outbound ports
     /// element_id -> Scheduler
@@ -58,10 +58,10 @@ impl PacketSwitch {
         weights: Vec<usize>,
         fib: HashMap<usize, usize>,
         discipline: SchedulingDiscipline,
-        flow_classes: Arc<dyn Fn(usize) -> usize>,
+        flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
     ) -> PacketSwitch {
         // outbound ports
-        let ports: HashMap<usize, Box<dyn Any>> = HashMap::new();
+        let ports: HashMap<usize, Box<dyn Any + Send>> = HashMap::new();
         // the senders from the demultiplexer to ports inside the switch
         let port_senders = HashMap::new();
 
@@ -172,7 +172,7 @@ impl PacketSwitch {
                         panic!("Not enough senders for ports.");
                     }
 
-                    sim.activate(p.run(sim));
+                    sim.activate(p.run(sim.clone())).await;
                 }
             }
             SchedulingDiscipline::FIFO => {
@@ -184,7 +184,7 @@ impl PacketSwitch {
                     } else {
                         panic!("Not enough senders for ports.");
                     }
-                    sim.activate(p.run(sim));
+                    sim.activate(p.run(sim.clone())).await;
                 }
             }
         }

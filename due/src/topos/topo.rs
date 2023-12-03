@@ -203,11 +203,11 @@ impl Topology {
         // attaches sources and sinks to hosts in the network graph
         self.attach();
         // computes shortest paths for all flows, and sets fibs for all switches
-        self.route(sim.clone());
+        self.route(sim.clone()).await;
 
         for flow in self.flows {
             warn!("Flow {} will be activated at time {}", flow.id, sim.now().await);
-            sim.activate(flow.run(sim.clone()));
+            flow.run(sim.clone()).await;
         }
 
         for element in self.elements {
@@ -216,7 +216,7 @@ impl Topology {
                 element.id(),
                 sim.now().await
             );
-            element.activate(sim.clone());
+            element.activate(sim.clone()).await;
         }
     }
 }

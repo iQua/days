@@ -116,7 +116,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
-            self.pop_event();
+            self.pop_event().await;
         }
 
         let packet = receiver.recv().await;

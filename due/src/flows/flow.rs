@@ -185,10 +185,10 @@ impl Flow {
         for endpoint in self.endpoints {
             match endpoint {
                 EndPoint::PacketSource(source) => {
-                    sim.activate(source.run(sim.clone()));
+                    sim.activate(source.run(sim.clone())).await;
                 }
                 EndPoint::PacketSink(sink) => {
-                    sim.activate(sink.run(sim.clone()));
+                    sim.activate(sink.run(sim.clone())).await;
                 }
             }
         }

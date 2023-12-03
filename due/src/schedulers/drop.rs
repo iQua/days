@@ -11,7 +11,7 @@ pub enum DropStrategy {
 }
 
 /// Defines the interface for all packet drop strategies.
-pub trait PacketDrop {
+pub trait PacketDrop: Send + Sync {
     fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool;
 }
 

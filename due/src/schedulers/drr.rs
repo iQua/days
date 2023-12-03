@@ -21,7 +21,7 @@ pub struct DRRServer {
     /// a closure that maps a flow_id to a class_id, used to implement
     /// class-based Deficit Round Robin. The default uses a packet's flow_id as
     /// its class_id, which is equivalent to flow-based DRR.
-    pub flow_classes: Arc<dyn Fn(usize) -> usize>,
+    pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop>,
@@ -63,7 +63,7 @@ impl DRRServer {
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
-        flow_classes: Arc<dyn Fn(usize) -> usize>,
+        flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> DRRServer {
