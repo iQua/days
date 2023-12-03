@@ -161,8 +161,11 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         warn!(
             "push_event: push event to SortQ at time {:.3}, queue length = {:?}",
             self.now().await,
-            calendar.len()
+            calendar.len(),
         );
+        for event in calendar.iter() {
+            warn!("push_event: EventQ = {:.3}", event);
+        }
     }
 
     /// Removes the next event from the SortQ, sets the new time and return the
@@ -174,8 +177,11 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         warn!(
             "pop_event: pop out from SortQ at time {:.3}, queue length = {:?}",
             self.now().await,
-            calendar.len()
+            calendar.len(),
         );
+        for event in calendar.iter() {
+            warn!("pop_event: EventQ = {:.3}", event);
+        }
         Some(sender)
     }
 
