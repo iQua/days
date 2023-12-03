@@ -188,7 +188,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         }
     }
 
-    /// Removes the next event from the SortQ, sets the new simulation time,
+    /// Removes the next event from SortQ, sets the new simulation time,
     /// and sends a message to the coroutine that is waiting for advancing
     /// the simulation clock.
     pub async fn pop_event(&self) {
