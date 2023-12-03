@@ -126,11 +126,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         // clock should be advanced.
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
-            if let Some(sender) = self.pop_event().await {
-                if let Err(_) = sender.send(0) {
-                    warn!("the coroutine that previously called advance() terminated.");
-                }
-            }
+            self.pop_event().await;
         }
 
         match rx.await {
@@ -155,11 +151,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
-            if let Some(sender) = self.pop_event().await {
-                if let Err(_) = sender.send(0) {
-                    warn!("the coroutine that previously called advance() terminated.");
-                }
-            }
+            self.pop_event().await;
         }
 
         let packet = receiver.recv().await;
@@ -214,7 +206,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
             let _ = sender.send(usize::default());
         } else {
-            warn!("Nothing in calendar to pop.")
+            warn!("the coroutine that previously called advance() terminated.")
         }
     }
 
