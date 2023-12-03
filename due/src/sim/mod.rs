@@ -103,6 +103,11 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .acquire()
             .await
             .expect("Failed to acquire a permit.");
+        
+        let available_permits = self.semaphore.available_permits();
+        if available_permits == 0 {
+            self.pop_event().await;
+        }
 
         match rx.await {
             Ok(_) => warn!(
