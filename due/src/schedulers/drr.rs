@@ -221,5 +221,6 @@ impl DRRServer {
             self.scheduler_id,
             sim.now().await
         );
+        sim.terminate().await;
     }
 }

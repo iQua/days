@@ -60,7 +60,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     }
 
     #[inline]
-    pub async fn terminate<F>(&self) {
+    pub async fn terminate(&self) {
         let permit = self
             .semaphore
             .acquire()

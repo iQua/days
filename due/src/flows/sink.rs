@@ -131,6 +131,8 @@ impl PacketSink {
             self.packet_received(packet, Arc::clone(&sim)).await;
         }
 
+        sim.terminate().await;
+
         // TODO: modify the Display for RandomVar!!!
         // info!(
         //     "PacketSink {} finished running at time {:.3}. Statistics: \n\

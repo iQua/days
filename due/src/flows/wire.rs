@@ -93,5 +93,6 @@ impl Wire {
             self.wire_id,
             sim.now().await
         );
+        sim.terminate().await;
     }
 }

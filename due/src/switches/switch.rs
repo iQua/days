@@ -215,5 +215,6 @@ impl PacketSwitch {
             self.element_id,
             sim.now().await
         );
+        sim.terminate().await;
     }
 }
