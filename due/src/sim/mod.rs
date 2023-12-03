@@ -54,7 +54,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.semaphore.add_permits(1);
+        self.add_permit();
         warn!(
             "run - initial coroutine called sim.run(): current time: {:?}",
             self.now().await
@@ -105,11 +105,11 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     }
 
     #[inline]
-    pub async fn advance(&self, wait_time: Time) {
-        warn!("advance - advance for {} seconds.", wait_time);
+    pub async fn advance(&self, timeout: Time) {
+        warn!("advance - advance for {} seconds.", timeout);
         let (tx, rx) = channel();
-        let wake_time = self.now().await + wait_time;
-        let event = Event(wake_time, tx);
+        let wakeup_time = self.now().await + timeout;
+        let event = Event(wakeup_time, tx);
 
         // adds the event to the calendar
         self.push_event(event).await;
@@ -120,6 +120,10 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .await
             .expect("Failed to acquire a permit.");
 
+        // When all coroutines are blocked, the number of available
+        // permits in the semaphore becomes zero. In this case, the
+        // earliest advance event should be processed and the simulation
+        // clock should be advanced.
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
             self.pop_event().await;
@@ -127,9 +131,9 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
         match rx.await {
             Ok(_) => warn!(
-                "advance: complete at time {} after wait_time: {}",
+                "advance: complete at time {} after timeout: {}",
                 self.now().await,
-                wait_time
+                timeout
             ),
             Err(_) => warn!("advance: channel was closed before a message was received"),
         }
