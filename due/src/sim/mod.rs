@@ -7,10 +7,10 @@ use log::{error, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc;
-use tokio::task::yield_now;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{channel, Sender};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
+use tokio::task::yield_now;
 
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
@@ -74,7 +74,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             // earliest advance event should be processed and the simulation
             // clock should be advanced.
             let available_permits = sim.semaphore.available_permits();
-            warn!("available permits in advance: {}", available_permits);
+            warn!("available permits in process: {}", available_permits);
 
             if available_permits == 0 {
                 warn!("process: popping event at time {:.3}", sim.now().await);
@@ -87,6 +87,17 @@ impl<S: Send + Sync + 'static> Simulator<S> {
                     );
                 }
             }
+
+            // warn!("process: popping event at time {:.3}", sim.now().await);
+            // if !sim.calendar.lock().await.is_empty() {
+            //     sim.pop_event().await;
+            // } else {
+            //     warn!(
+            //         "process: no events in the calendar queue at time {:.3}",
+            //         sim.now().await
+            //     );
+            //     return;
+            // }
         }
     }
 
@@ -201,7 +212,10 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
         // notifies the simulator coroutine to process events if needed
         let available_permits = self.semaphore.available_permits();
-        warn!("available permits in advance: {}", available_permits);
+        warn!(
+            "available permits in recv_with_permit: {}",
+            available_permits
+        );
 
         if available_permits == 0 {
             let sender = self.process_sender.read().await;
