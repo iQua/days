@@ -59,7 +59,7 @@ impl Wire {
         packet.time += delay;
         sim.advance(packet.time - self.last_sent).await;
 
-        match self.sender.send(packet.clone()) {
+        match sim.send(&self.sender, packet.clone()).await {
             Ok(_) => {
                 self.last_sent = sim.now().await;
 

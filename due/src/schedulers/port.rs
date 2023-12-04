@@ -136,8 +136,8 @@ impl Port {
                 }
 
                 packet.send(sim.now().await);
-                let _ = self.sender.send(packet.clone());
-                self.packet_sent(packet, sim.now().await);
+                self.packet_sent(packet.clone(), sim.now().await);
+                let _ = sim.send(&self.sender, packet).await;
             }
 
             if !self.queue.is_empty() {

@@ -26,7 +26,6 @@ async fn network_sim(config_path: &str, sim: Arc<Simulator<Shared>>) {
 
     // // runs the topology
     topology.run(Arc::clone(&sim)).await;
-    
 }
 
 #[tokio::main]

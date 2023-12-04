@@ -6,8 +6,9 @@ use std::sync::Arc;
 use log::{error, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::oneshot::{channel, Sender};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
 use tokio::task::yield_now;
@@ -73,17 +74,20 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             // permits in the semaphore becomes zero. In this case, the
             // earliest advance event should be processed and the simulation
             // clock should be advanced.
-            warn!("process: popping event at time {:.3}", sim.now().await);
-            if !sim.calendar.lock().await.is_empty() {
-                sim.pop_event().await;
-            } else {
-                warn!(
-                    "process: no events in the calendar queue at time {:.3}",
-                    sim.now().await
-                );
-                return;
-            }
+            let available_permits = sim.semaphore.available_permits();
+            warn!("available permits in advance: {}", available_permits);
 
+            if available_permits == 0 {
+                warn!("process: popping event at time {:.3}", sim.now().await);
+                if !sim.calendar.lock().await.is_empty() {
+                    sim.pop_event().await;
+                } else {
+                    warn!(
+                        "process: no events in the calendar queue at time {:.3}",
+                        sim.now().await
+                    );
+                }
+            }
         }
     }
 
@@ -144,9 +148,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
     #[inline]
     pub async fn advance(&self, timeout: Time) {
-        // yields to the other coroutines to have an opportunity to run
-        yield_now().await;
-
         warn!("advance - advance for {} seconds.", timeout);
         let available_permits = self.semaphore.available_permits();
         warn!("available permits in advance start: {}", available_permits);
@@ -217,6 +218,21 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         drop(permit);
         warn!("recv_with_permit: complete at time {:.3}", self.now().await);
         packet
+    }
+
+    #[inline]
+    pub async fn send<P>(
+        &self,
+        sender: &UnboundedSender<P>,
+        packet: P,
+    ) -> Result<(), SendError<P>> {
+        warn!("send: started at time {:.3}", self.now().await);
+        let result = sender.send(packet);
+
+        // yields to the other coroutines to have an opportunity to run
+        yield_now().await;
+
+        result
     }
 
     #[inline]

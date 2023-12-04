@@ -177,7 +177,7 @@ impl DRRServer {
                         sim.advance(timeout).await;
                         let mut outbound = self.queues[class_id].pop_front().unwrap();
                         outbound.send(sim.now().await);
-                        let _ = self.sender.send(packet.clone());
+                        let _ = sim.send(&self.sender, packet.clone()).await;
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
