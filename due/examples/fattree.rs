@@ -41,7 +41,7 @@ async fn main() {
 
     let shared = Shared {
         queueing_delay: RandomVar::new(),
-        duration: 10.0,
+        duration: 10000.0,
     };
 
     let sim = Simulator::new(shared, seed);
