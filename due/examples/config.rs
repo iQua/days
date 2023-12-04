@@ -1,17 +1,16 @@
 //! This file is used for fattree simulation.
 
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use log::{debug, info};
-use rand::{rngs::SmallRng, SeedableRng};
 
 use due::flows::flow::Flow;
-use due::sim::{simulation, Process, RandomVar, SimContext};
+use due::sim::{RandomVar, Simulator};
 use due::topos::build::build_graph;
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
-async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
+async fn network_sim(config_path: &str, sim: Arc<Simulator<Shared>>) {
     let file_path = config_path;
 
     let graph = build_graph(file_path);
@@ -27,30 +26,27 @@ async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
     let topology = Topology::new(file_path, graph, hosts, flows);
 
     // runs the topology
-    topology.run(sim);
-
-    // waits for the end of this simulation
-    sim.advance(sim.shared().duration + 100.).await;
+    topology.run(Arc::clone(&sim)).await;
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
     let path = "configs/simple.toml";
     let seed = get_seed(&path);
 
-    let outcome = simulation(
-        Shared {
-            rng: Mutex::new(SmallRng::seed_from_u64(seed)),
-            queueing_delay: RandomVar::new(),
-            duration: 10.,
-        },
-        |sim| Process::new(sim, network_sim(path, sim)),
-    );
+    let shared = Shared {
+        queueing_delay: RandomVar::new(),
+        duration: 10.0,
+    };
+    let sim = Simulator::new(shared, seed);
+    sim.run(Arc::clone(&sim), network_sim(path, Arc::clone(&sim)))
+        .await;
 
-    println!(
-        "Statistics on queueing delay in this simulation: {:#.3}",
-        outcome.queueing_delay
-    );
+    // println!(
+    //     "Statistics on queueing delay in this simulation: {:#.3}",
+    //     outcome.queueing_delay
+    // );
 }
