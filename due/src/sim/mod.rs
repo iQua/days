@@ -7,7 +7,7 @@ use log::{error, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc;
-use tokio::task::yield_now
+use tokio::task::yield_now;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{channel, Sender};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
