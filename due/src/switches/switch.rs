@@ -189,7 +189,7 @@ impl PacketSwitch {
             }
         }
 
-        while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+        while let Some(packet) = sim.recv(&mut self.receiver).await {
             self.packets_received += 1;
 
             debug!(
@@ -215,6 +215,7 @@ impl PacketSwitch {
             self.element_id,
             sim.now().await
         );
+
         sim.terminate().await;
     }
 }

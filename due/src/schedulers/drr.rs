@@ -209,7 +209,7 @@ impl DRRServer {
 
             // waits for inbound packets from the upstream element
             if self.packets_waiting == 0 {
-                if let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+                if let Some(packet) = sim.recv(&mut self.receiver).await {
                     self.packet_received(packet, sim.now().await);
                 } else {
                     break;
@@ -221,6 +221,7 @@ impl DRRServer {
             self.scheduler_id,
             sim.now().await
         );
+
         sim.terminate().await;
     }
 }

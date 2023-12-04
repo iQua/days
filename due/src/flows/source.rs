@@ -141,6 +141,7 @@ impl PacketSource {
             self.endpoint_id,
             sim.now().await
         );
+
         sim.terminate().await;
     }
 }

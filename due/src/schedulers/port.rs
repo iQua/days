@@ -143,7 +143,7 @@ impl Port {
             if !self.queue.is_empty() {
                 // if there are packets in the queue, continue the loop
                 continue;
-            } else if let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+            } else if let Some(packet) = sim.recv(&mut self.receiver).await {
                 // waits for the packet from the upstream element
                 self.packet_received(packet, sim.now().await);
             } else {
@@ -156,6 +156,7 @@ impl Port {
             self.scheduler_id,
             sim.now().await
         );
+
         sim.terminate().await;
     }
 }

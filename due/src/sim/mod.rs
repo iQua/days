@@ -27,9 +27,11 @@ pub struct Simulator<S: Send + Sync + 'static> {
     rng: Arc<Mutex<SmallRng>>,
     /// a sorted queue of events, each advances the simulation clock
     calendar: Arc<Mutex<SortQ>>,
-    /// a channel to send a message to the process_event coroutine
+    /// a channel to send a message to the event processing coroutine
     process_sender: Arc<RwLock<mpsc::Sender<usize>>>,
     process_receiver: Arc<RwLock<mpsc::Receiver<usize>>>,
+    /// the number of alive coroutines
+    alive_count: Arc<RwLock<usize>>,
 }
 
 impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
@@ -43,6 +45,7 @@ impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
             calendar: Arc::clone(&self.calendar),
             process_sender: Arc::clone(&self.process_sender),
             process_receiver: Arc::clone(&self.process_receiver),
+            alive_count: Arc::clone(&self.alive_count),
         }
     }
 }
@@ -58,6 +61,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             calendar: Arc::new(Mutex::new(SortQ::default())),
             process_sender: Arc::new(RwLock::new(sender)),
             process_receiver: Arc::new(RwLock::new(receiver)),
+            alive_count: Arc::new(RwLock::new(0)),
         })
     }
 
@@ -69,6 +73,15 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             );
             let mut receiver = sim.process_receiver.write().await;
             receiver.recv().await;
+
+            // Terminate the simulation session if all coroutines have
+            // terminated
+            let alive_coroutines = sim.alive_count.read().await;
+            warn!("alive coroutines: {}", alive_coroutines);
+            if *alive_coroutines == 0 {
+                warn!("process: all coroutines have terminated.");
+                return;
+            }
 
             // When all coroutines are blocked, the number of available
             // permits in the semaphore becomes zero. In this case, the
@@ -112,7 +125,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.add_permit();
+        self.add_permit().await;
+
         warn!(
             "activate - new coroutine called sim.activate(): current time: {:?}",
             self.now().await
@@ -124,6 +138,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     #[inline]
     pub async fn terminate(&self) {
         self.remove_permit().await;
+
         warn!(
             "terminate: remove one permit at time {:.3}",
             self.now().await
@@ -131,8 +146,11 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     }
 
     #[inline]
-    fn add_permit(&self) {
+    async fn add_permit(&self) {
         self.semaphore.add_permits(1);
+
+        let mut alive_coroutines = self.alive_count.write().await;
+        *alive_coroutines += 1;
     }
 
     #[inline]
@@ -144,6 +162,13 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .expect("Failed to acquire a permit.");
 
         permit.forget();
+
+        let mut alive_coroutines = self.alive_count.write().await;
+        *alive_coroutines -= 1;
+
+        // notify the event processing coroutine
+        let sender = self.process_sender.read().await;
+        let _ = sender.send(0).await;
     }
 
     #[inline]
@@ -187,8 +212,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     }
 
     #[inline]
-    pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
-        warn!("recv_with_permit: started at time {:.3}", self.now().await);
+    pub async fn recv<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
+        warn!("recv: started at time {:.3}", self.now().await);
         let available_permits = self.semaphore.available_permits();
         warn!("available permits at start: {}", available_permits);
         let permit = self
@@ -199,24 +224,18 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
         // notifies the simulator coroutine to process events if needed
         let available_permits = self.semaphore.available_permits();
-        warn!(
-            "available permits in recv_with_permit: {}",
-            available_permits
-        );
+        warn!("available permits in recv: {}", available_permits);
 
         if available_permits == 0 {
             let sender = self.process_sender.read().await;
             let _ = sender.send(0).await;
         }
 
-        warn!(
-            "recv_with_permit: waiting for packets at time {:.3}",
-            self.now().await
-        );
+        warn!("recv: waiting for packets at time {:.3}", self.now().await);
         let packet = receiver.recv().await;
 
         drop(permit);
-        warn!("recv_with_permit: complete at time {:.3}", self.now().await);
+        warn!("recv: complete at time {:.3}", self.now().await);
         packet
     }
 

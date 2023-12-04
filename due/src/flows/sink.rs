@@ -123,11 +123,7 @@ impl PacketSink {
     }
 
     pub async fn run(mut self, sim: Arc<Simulator<Shared>>) {
-        // while let Some(packet) = self.receiver.recv().await {
-        //     self.packet_received(packet, sim);
-        // }
-
-        while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+        while let Some(packet) = sim.recv(&mut self.receiver).await {
             self.packet_received(packet, Arc::clone(&sim)).await;
         }
 

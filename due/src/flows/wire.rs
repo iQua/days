@@ -84,7 +84,8 @@ impl Wire {
 
     pub async fn run(mut self, sim: Simulator<Shared>) {
         let rng = sim.get_rng().await;
-        while let Some(packet) = sim.recv_with_permit(&mut self.receiver).await {
+
+        while let Some(packet) = sim.recv(&mut self.receiver).await {
             self.forward_packet(packet, sim.clone(), rng.clone()).await;
         }
 
@@ -93,6 +94,7 @@ impl Wire {
             self.wire_id,
             sim.now().await
         );
+
         sim.terminate().await;
     }
 }
