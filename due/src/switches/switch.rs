@@ -206,7 +206,7 @@ impl PacketSwitch {
             // forwards packets to their corresponding downstream elements
             let element_id = self.fib[&packet.flow_id];
             if let Some(port_sender) = self.port_senders.get(&element_id) {
-                let _ = sim.send(port_sender, packet).await;
+                let _ = port_sender.send(packet);
             }
         }
 
