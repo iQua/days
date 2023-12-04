@@ -73,31 +73,17 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             // permits in the semaphore becomes zero. In this case, the
             // earliest advance event should be processed and the simulation
             // clock should be advanced.
-            let available_permits = sim.semaphore.available_permits();
-            warn!("available permits in process: {}", available_permits);
-
-            if available_permits == 0 {
-                warn!("process: popping event at time {:.3}", sim.now().await);
-                if !sim.calendar.lock().await.is_empty() {
-                    sim.pop_event().await;
-                } else {
-                    warn!(
-                        "process: no events in the calendar queue at time {:.3}",
-                        sim.now().await
-                    );
-                }
+            warn!("process: popping event at time {:.3}", sim.now().await);
+            if !sim.calendar.lock().await.is_empty() {
+                sim.pop_event().await;
+            } else {
+                warn!(
+                    "process: no events in the calendar queue at time {:.3}",
+                    sim.now().await
+                );
+                return;
             }
 
-            // warn!("process: popping event at time {:.3}", sim.now().await);
-            // if !sim.calendar.lock().await.is_empty() {
-            //     sim.pop_event().await;
-            // } else {
-            //     warn!(
-            //         "process: no events in the calendar queue at time {:.3}",
-            //         sim.now().await
-            //     );
-            //     return;
-            // }
         }
     }
 
