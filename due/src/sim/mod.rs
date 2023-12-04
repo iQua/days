@@ -81,6 +81,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
                     "process: no events in the calendar queue at time {:.3}",
                     sim.now().await
                 );
+                return;
             }
         }
     }
