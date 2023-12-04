@@ -122,16 +122,14 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .await
             .expect("Failed to acquire a permit.");
 
-        tokio::task::yield_now().await;
-
         // When all coroutines are blocked, the number of available
         // permits in the semaphore becomes zero. In this case, the
         // earliest advance event should be processed and the simulation
         // clock should be advanced.
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
+            warn!("zero available permits in advance() at time {}.", self.now().await);
             self.pop_event().await;
-            tokio::task::yield_now().await;
         }
 
         match rx.await {
@@ -143,13 +141,12 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             Err(_) => warn!("advance: channel was closed before a message was received"),
         }
 
-        // tokio::task::yield_now().await;
         drop(permit);
     }
 
     #[inline]
     pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
-        tokio::task::yield_now().await;
+        // tokio::task::yield_now().await;
         let permit = self
             .semaphore
             .acquire()
@@ -158,6 +155,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
+            warn!("zero available permits in recv_with_permit() at time {}.", self.now().await);
             self.pop_event().await;
         }
 
@@ -167,7 +165,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         );
         let packet = receiver.recv().await;
 
-        // tokio::task::yield_now().await;
         drop(permit);
         warn!("recv_with_permit: complete at time {}", self.now().await);
         packet
