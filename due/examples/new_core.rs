@@ -28,8 +28,8 @@ async fn network_sim(config_path: &str, sim: Arc<Simulator<Shared>>) {
     topology.run(Arc::clone(&sim)).await;
 
     // waits for the end of this simulation
-    sim.advance(sim.read_shared().await.duration + 100.).await;
-    sim.terminate().await;
+    // sim.advance(sim.read_shared().await.duration + 100.).await;
+    // sim.terminate().await;
 }
 
 #[tokio::main]
@@ -47,5 +47,6 @@ async fn main() {
     };
 
     let sim = Simulator::new(shared, seed);
-    sim.run(network_sim(path, Arc::clone(&sim))).await;
+    sim.run(Arc::clone(&sim), network_sim(path, Arc::clone(&sim)))
+        .await;
 }
