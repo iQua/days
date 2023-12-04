@@ -170,27 +170,30 @@ impl WFQServer {
         let class_id = (self.flow_classes)(packet.flow_id);
 
         // adds tag (finish time) to the packet before push to the queue (a min-heap)
-        let tagged_packet = self.add_tag(packet.clone(), now);
-        self.scheduler_queue.push(tagged_packet.clone());
+        let (finish_time, tagged_packet) = self.add_tag(packet.clone(), now);
+        self.scheduler_queue.push(tagged_packet);
 
         self.byte_sizes[class_id] += packet.size;
         self.flow_queue_count[class_id] += 1;
         self.active_set.push(class_id);
 
         debug!(
-            "WFQServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "WFQServer {} received packet {} ({} bytes, finish time {:.3}) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in queue.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
+            finish_time,
             packet.flow_id,
             now,
             self.packets_received,
             self.scheduler_queue.len()
         );
+
+        self.last_update = now;
     }
 
-    fn add_tag(&mut self, packet: Packet, now: Time) -> TaggedPacket {
+    fn add_tag(&mut self, packet: Packet, now: Time) -> (f64, TaggedPacket) {
         let mut finish_time = 0.0;
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
@@ -200,8 +203,8 @@ impl WFQServer {
             }
         } else {
             let mut weight_sum = 0.0;
-            for class_id in self.active_set.clone() {
-                weight_sum += self.weights[class_id] as f64;
+            for class_id in &self.active_set {
+                weight_sum += self.weights[*class_id] as f64;
             }
 
             self.vtime += (now - self.last_update) / weight_sum;
@@ -211,18 +214,21 @@ impl WFQServer {
             self.finish_times[class_id] = finish_time;
         }
 
-        TaggedPacket {
-            packet,
-            tag: finish_time,
-        }
+        (
+            finish_time,
+            TaggedPacket {
+                packet,
+                tag: finish_time,
+            },
+        )
     }
 
-    fn update_stats(&mut self, packet: Packet, now: Time) {
+    fn update_stats(&mut self, packet: &Packet, now: Time) {
         let mut weight_sum = 0.0;
 
         // updates the virtual time based on the current set of active flow classes
-        for class_id in self.active_set.clone() {
-            weight_sum += self.weights[class_id] as f64;
+        for class_id in &self.active_set {
+            weight_sum += self.weights[*class_id] as f64;
         }
 
         self.vtime += (now - self.last_update) / weight_sum;
@@ -261,7 +267,7 @@ impl WFQServer {
 
                 self.packets_waiting -= 1;
 
-                self.update_stats(packet.clone(), sim.now());
+                self.update_stats(&packet, sim.now());
 
                 // polls for and receives all outstanding packets
                 // recently sent to WFQServer while sending the previous
