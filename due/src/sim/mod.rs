@@ -30,8 +30,6 @@ pub struct Simulator<S: Send + Sync + 'static> {
     /// a channel to send a message to the event processing coroutine
     process_sender: Arc<RwLock<mpsc::Sender<usize>>>,
     process_receiver: Arc<RwLock<mpsc::Receiver<usize>>>,
-    /// the number of alive coroutines
-    alive_count: Arc<RwLock<usize>>,
 }
 
 impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
@@ -45,7 +43,6 @@ impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
             calendar: Arc::clone(&self.calendar),
             process_sender: Arc::clone(&self.process_sender),
             process_receiver: Arc::clone(&self.process_receiver),
-            alive_count: Arc::clone(&self.alive_count),
         }
     }
 }
@@ -61,7 +58,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             calendar: Arc::new(Mutex::new(SortQ::default())),
             process_sender: Arc::new(RwLock::new(sender)),
             process_receiver: Arc::new(RwLock::new(receiver)),
-            alive_count: Arc::new(RwLock::new(0)),
         })
     }
 
@@ -73,15 +69,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             );
             let mut receiver = sim.process_receiver.write().await;
             receiver.recv().await;
-
-            // Terminate the simulation session if all coroutines have
-            // terminated
-            let alive_coroutines = sim.alive_count.read().await;
-            warn!("alive coroutines: {}", alive_coroutines);
-            if *alive_coroutines == 0 {
-                warn!("process: all coroutines have terminated.");
-                return;
-            }
 
             // When all coroutines are blocked, the number of available
             // permits in the semaphore becomes zero. In this case, the
@@ -99,6 +86,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
                         "process: no events in the calendar queue at time {:.3}",
                         sim.now().await
                     );
+                    return;
                 }
             }
         }
@@ -148,9 +136,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     #[inline]
     async fn add_permit(&self) {
         self.semaphore.add_permits(1);
-
-        let mut alive_coroutines = self.alive_count.write().await;
-        *alive_coroutines += 1;
     }
 
     #[inline]
@@ -162,9 +147,6 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .expect("Failed to acquire a permit.");
 
         permit.forget();
-
-        let mut alive_coroutines = self.alive_count.write().await;
-        *alive_coroutines -= 1;
 
         // notify the event processing coroutine
         let sender = self.process_sender.read().await;
