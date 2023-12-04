@@ -153,6 +153,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         // adds the event to the calendar
         self.push_event(event).await;
 
+        tokio::task::yield_now().await;
+
         let permit = self
             .semaphore
             .acquire()
