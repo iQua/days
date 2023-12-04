@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # builds and runs the process
-cargo build --example new_core
-./target/debug/examples/new_core &
+cargo build --example fattree
+./target/debug/examples/fattree &
 
 # gets the PID
 PID=$!
