@@ -114,6 +114,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         // adds the event to the calendar
         self.push_event(event).await;
 
+        tokio::task::yield_now().await;
+
         let permit = self
             .semaphore
             .acquire()
@@ -129,6 +131,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         let available_permits = self.semaphore.available_permits();
         if available_permits == 0 {
             self.pop_event().await;
+            tokio::task::yield_now().await;
         }
 
         match rx.await {
@@ -139,13 +142,14 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             ),
             Err(_) => warn!("advance: channel was closed before a message was received"),
         }
-        
-        tokio::task::yield_now().await;
+
+        // tokio::task::yield_now().await;
         drop(permit);
     }
 
     #[inline]
     pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
+        tokio::task::yield_now().await;
         let permit = self
             .semaphore
             .acquire()
@@ -157,9 +161,13 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             self.pop_event().await;
         }
 
-        warn!("recv_with_permit: waiting for packets at time {}", self.now().await);
+        warn!(
+            "recv_with_permit: waiting for packets at time {}",
+            self.now().await
+        );
         let packet = receiver.recv().await;
 
+        // tokio::task::yield_now().await;
         drop(permit);
         warn!("recv_with_permit: complete at time {}", self.now().await);
         packet
