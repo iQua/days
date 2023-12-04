@@ -6,9 +6,11 @@ use std::sync::Arc;
 use log::{error, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot::{channel, Sender};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
+
+use crate::Shared;
 
 pub type Time = f64;
 type SortQ = BinaryHeap<Event>;
@@ -24,6 +26,9 @@ pub struct Simulator<S: Send + Sync + 'static> {
     rng: Arc<Mutex<SmallRng>>,
     /// a sorted queue of events, each advances the simulation clock
     calendar: Arc<Mutex<SortQ>>,
+    /// a channel to send a message to the process_event coroutine
+    process_sender: Arc<RwLock<UnboundedSender<usize>>>,
+    process_receiver: Arc<RwLock<UnboundedReceiver<usize>>>,
 }
 
 impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
@@ -35,34 +40,65 @@ impl<S: Clone + Send + Sync + 'static> Clone for Simulator<S> {
             shared: Arc::clone(&self.shared),
             rng: Arc::clone(&self.rng),
             calendar: Arc::clone(&self.calendar),
+            process_sender: Arc::clone(&self.process_sender),
+            process_receiver: Arc::clone(&self.process_receiver),
         }
     }
 }
 
 impl<S: Send + Sync + 'static> Simulator<S> {
     pub fn new(shared: S, seed: u64) -> Arc<Self> {
+        let (sender, receiver) = unbounded_channel();
         Arc::new(Self {
             now: Arc::new(RwLock::new(Time::default())),
             semaphore: Arc::new(Semaphore::new(0)),
             shared: Arc::new(RwLock::new(shared)),
             rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(seed))),
             calendar: Arc::new(Mutex::new(SortQ::default())),
+            process_sender: Arc::new(RwLock::new(sender)),
+            process_receiver: Arc::new(RwLock::new(receiver)),
         })
     }
 
-    pub async fn run<F>(&self, f: F)
+    async fn process(sim: Arc<Simulator<S>>) {
+        // When all coroutines are blocked, the number of available
+        // permits in the semaphore becomes zero. In this case, the
+        // earliest advance event should be processed and the simulation
+        // clock should be advanced.
+        loop {
+            warn!(
+                "process: waiting for a message at time {:.3}",
+                sim.now().await
+            );
+            let mut receiver = sim.process_receiver.write().await;
+            receiver.recv().await;
+
+            warn!("process: popping event at time {:.3}", sim.now().await);
+            if !sim.calendar.lock().await.is_empty() {
+                sim.pop_event().await;
+            } else {
+                warn!(
+                    "process: no events in the calendar queue at time {:.3}",
+                    sim.now().await
+                );
+            }
+        }
+    }
+
+    pub async fn run<F>(&self, sim: Arc<Simulator<Shared>>, f: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.add_permit();
         warn!(
             "run - initial coroutine called sim.run(): current time: {:?}",
-            self.now().await
+            sim.now().await
         );
 
-        tokio::spawn(f)
+        tokio::spawn(f);
+
+        tokio::spawn(Simulator::process(sim))
             .await
-            .expect("The network simulation session failed");
+            .expect("The network simulation session failed.");
     }
 
     #[inline]
@@ -107,6 +143,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
     #[inline]
     pub async fn advance(&self, timeout: Time) {
         warn!("advance - advance for {} seconds.", timeout);
+        let available_permits = self.semaphore.available_permits();
+        warn!("available permits in advance start: {}", available_permits);
         let (tx, rx) = channel();
         let wakeup_time = self.now().await + timeout;
         let event = Event(wakeup_time, tx);
@@ -114,27 +152,27 @@ impl<S: Send + Sync + 'static> Simulator<S> {
         // adds the event to the calendar
         self.push_event(event).await;
 
-        tokio::task::yield_now().await;
-
         let permit = self
             .semaphore
             .acquire()
             .await
-            .expect("Failed to acquire a permit.");
+            .expect("Failed to acquire a permit in advance().");
 
         // When all coroutines are blocked, the number of available
         // permits in the semaphore becomes zero. In this case, the
         // earliest advance event should be processed and the simulation
-        // clock should be advanced.
+        // clock should be advanced. Notify the process coroutine to
+        // get this task completed.
         let available_permits = self.semaphore.available_permits();
+        warn!("available permits in advance: {}", available_permits);
         if available_permits == 0 {
-            warn!("zero available permits in advance() at time {}.", self.now().await);
-            self.pop_event().await;
+            let sender = self.process_sender.read().await;
+            let _ = sender.send(0);
         }
 
         match rx.await {
             Ok(_) => warn!(
-                "advance: complete at time {} after timeout: {}",
+                "advance: complete at time {:.3} after timeout: {:.3}",
                 self.now().await,
                 timeout
             ),
@@ -146,27 +184,37 @@ impl<S: Send + Sync + 'static> Simulator<S> {
 
     #[inline]
     pub async fn recv_with_permit<P>(&self, receiver: &mut UnboundedReceiver<P>) -> Option<P> {
-        // tokio::task::yield_now().await;
+        warn!("recv_with_permit: started at time {:.3}", self.now().await);
+        let available_permits = self.semaphore.available_permits();
+        warn!("available permits at start: {}", available_permits);
         let permit = self
             .semaphore
             .acquire()
             .await
             .expect("Failed to acquire a permit.");
 
+        // When all coroutines are blocked, the number of available permits in
+        // the semaphore becomes zero. In this case, the earliest advance event
+        // should be processed and the simulation clock should be advanced.
+        // Notify the process coroutine to get this task completed.
         let available_permits = self.semaphore.available_permits();
+        warn!(
+            "available permits in recv_with_permit: {}",
+            available_permits
+        );
         if available_permits == 0 {
-            warn!("zero available permits in recv_with_permit() at time {}.", self.now().await);
-            self.pop_event().await;
+            let sender = self.process_sender.read().await;
+            let _ = sender.send(0);
         }
 
         warn!(
-            "recv_with_permit: waiting for packets at time {}",
+            "recv_with_permit: waiting for packets at time {:.3}",
             self.now().await
         );
         let packet = receiver.recv().await;
 
         drop(permit);
-        warn!("recv_with_permit: complete at time {}", self.now().await);
+        warn!("recv_with_permit: complete at time {:.3}", self.now().await);
         packet
     }
 
