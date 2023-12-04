@@ -120,6 +120,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             .await
             .expect("Failed to acquire a permit.");
 
+        tokio::task::yield_now().await;
+
         // When all coroutines are blocked, the number of available
         // permits in the semaphore becomes zero. In this case, the
         // earliest advance event should be processed and the simulation
@@ -137,7 +139,8 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             ),
             Err(_) => warn!("advance: channel was closed before a message was received"),
         }
-
+        
+        tokio::task::yield_now().await;
         drop(permit);
     }
 
@@ -154,6 +157,7 @@ impl<S: Send + Sync + 'static> Simulator<S> {
             self.pop_event().await;
         }
 
+        warn!("recv_with_permit: waiting for packets at time {}", self.now().await);
         let packet = receiver.recv().await;
 
         drop(permit);
