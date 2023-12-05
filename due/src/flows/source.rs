@@ -1,5 +1,5 @@
-//! Implements a packet generator that simulates the sending of packets with a
-//!  specified inter-arrival time distribution and a packet size distribution.
+//! Implements a packet source that simulates the sending of packets with
+//! specific distributions of inter-arrival times and packet sizes.
 
 use log::debug;
 use rand::distributions::Distribution;

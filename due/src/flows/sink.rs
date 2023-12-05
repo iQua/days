@@ -1,11 +1,9 @@
-//! Implements a PacketSink, designed to record both arrival times and waiting
-//! times from the incoming packets.
+//! Implements a packet sink, designed to compute vital statistics from incoming
+//! packets.
 
-//! The PacketSink records a variety of statistics, including absolute arrival
+//! The packet sink records a variety of statistics, including absolute arrival
 //! times, inter-arrival times, the total number of packets and bytes received,
 //! the one-way end-to-end delays, and the total time spent waiting in queues.
-//! These statistics are indexed by either the flow identifier or the source of
-//! each packet.
 
 use log::{debug, info};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};

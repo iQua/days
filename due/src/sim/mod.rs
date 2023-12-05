@@ -1,4 +1,5 @@
-//! The core library for discrete-event simulation using stackless coroutines.
+//! A single-threaded executor designed for discrete-event simulation using
+//! stackless coroutines.
 
 use std::{
     cell::{Cell, RefCell},

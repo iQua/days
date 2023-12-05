@@ -1,3 +1,9 @@
+//! Implements all the necessary utilities for initializing, constructing, and
+//! running a network topology. These utilities include connecting network elements
+//! according to a network graph, attaching packet endpoints to hosts, computing
+//! feasible paths for all the flows, and installing Flow Information Base tables
+//! to all the switches to route these flows accordingly.
+
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -202,7 +208,7 @@ impl Topology {
         self.connect();
         // attaches sources and sinks to hosts in the network graph
         self.attach();
-        // computes shortest paths for all flows, and sets fibs for all switches
+        // computes feasible paths for all flows, and sets FIBs for all switches
         self.route(sim);
 
         for flow in self.flows {
