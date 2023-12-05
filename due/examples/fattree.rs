@@ -1,4 +1,5 @@
-//! This file is used for fattree simulation.
+//! This example shows a network simulation session involving a FatTree
+//! topology.
 
 use std::cell::RefCell;
 

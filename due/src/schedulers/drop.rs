@@ -1,3 +1,6 @@
+//! Packet drop strategies for the scheduler. Currently, only tail drop
+//! (dropping packets at the tail of the queue) has been implemented.
+
 /// Capacity unit for the packet drop strategy.
 pub enum CapacityUnit {
     Bytes,
