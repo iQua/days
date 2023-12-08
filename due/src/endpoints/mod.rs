@@ -1,9 +1,11 @@
+pub mod drop;
+pub mod drr;
 pub mod packet;
 pub mod sink;
 pub mod source;
 
-use crate::flows::sink::PacketSink;
-use crate::flows::source::PacketSource;
+use crate::endpoints::sink::PacketSink;
+use crate::endpoints::source::PacketSource;
 
 #[derive(Debug)]
 pub enum EndPoint {

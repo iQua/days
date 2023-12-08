@@ -13,7 +13,7 @@ use log::debug;
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::flows::packet::Packet;
+use crate::endpoints::packet::Packet;
 use crate::next_endpoint_id;
 
 /// A simple collector for statistical data.

@@ -2,7 +2,6 @@
 //! specific distributions of inter-arrival times and packet sizes.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use log::debug;
@@ -10,11 +9,11 @@ use rand::distributions::Distribution;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Exp};
 
-use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::Scheduler;
+use asynchronix::model::{Model, Output};
+use asynchronix::time::{MonotonicTime, Scheduler};
 
+use crate::endpoints::packet::Packet;
 use crate::flows::flow::DistributionInfo;
-use crate::flows::packet::Packet;
 use crate::next_endpoint_id;
 
 #[derive(Debug)]
@@ -127,53 +126,29 @@ impl PacketSource {
         (packet, Duration::from_secs_f64(interval))
     }
 
-    /// Sends a packet to the next element.
-    async fn send(&mut self, packet: Packet) {
-        self.output.send(packet).await;
-    }
+    pub fn run<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+            let now = current_time.as_secs_f64();
+            let (packet, interval) = self.produce_packet(now);
 
-    async fn run(&mut self, scheduler: &Scheduler<Self>) {
-        debug!(
-            "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
-            self.endpoint_id, self.initial_delay
-        );
+            // sends the packet out to the next element now
+            self.output.send(packet.clone()).await;
+            self.packet_sent(current_time, packet);
 
-        let mut current_time = Duration::from_secs_f64(self.initial_delay);
+            scheduler.schedule_event(interval, Self::run, ()).unwrap();
 
-        let (packet, _) = self.produce_packet(current_time.as_secs_f64());
-        self.packet_sent(current_time, packet.clone());
-        scheduler
-            .schedule_event(current_time, Self::send, packet)
-            .unwrap();
-
-        while current_time <= Duration::from_secs_f64(self.duration) {
-            let (packet, interval) = self.produce_packet(current_time.as_secs_f64());
-
-            current_time += interval;
-            self.packet_sent(current_time, packet.clone());
-
-            scheduler
-                .schedule_event(current_time, Self::send, packet)
-                .unwrap();
+            debug!(
+                "PacketSource {} finished running at time {}.",
+                self.endpoint_id,
+                current_time.as_secs_f64()
+            );
         }
-
-        debug!(
-            "PacketSource {} finished running at time {}.",
-            self.endpoint_id,
-            current_time.as_secs_f64()
-        );
     }
 }
 
-impl Model for PacketSource {
-    fn init(
-        mut self,
-        scheduler: &Scheduler<Self>,
-    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
-        Box::pin(async move {
-            Self::run(&mut self, scheduler).await;
-
-            self.into()
-        })
-    }
-}
+impl Model for PacketSource {}
