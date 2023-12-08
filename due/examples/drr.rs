@@ -33,7 +33,7 @@ fn main() {
         seed,
     );
     let mut drr = DRRServer::new(
-        1000.0,
+        4000.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
