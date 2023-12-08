@@ -32,7 +32,6 @@ fn main() {
     let mut sink = PacketSink::new(0, 10.0);
     let source_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
-    let source_addr = source_mbox.address();
     let sink_addr = sink_mbox.address();
 
     // Connects the output of packet source to the input of packet sink.
@@ -47,8 +46,6 @@ fn main() {
         .add_model(source, source_mbox)
         .add_model(sink, sink_mbox)
         .init(t0);
-
-    sim.send_event(PacketSource::run, (), &source_addr);
 
     sim.step_by(Duration::from_secs(20));
 
