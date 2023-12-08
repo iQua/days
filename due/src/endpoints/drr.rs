@@ -105,15 +105,15 @@ impl DRRServer {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
             self.byte_sizes.iter().sum(),
             self.queues.iter().map(|q| q.len()).sum(),
         );
-
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         // the case that this packet will be dropped.
         if should_drop_packet {
