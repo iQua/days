@@ -20,8 +20,8 @@ fn main() {
 
     let seed = 1;
 
-    // Instantiates models and their mailboxes.
-    let mut source = PacketSource::new(
+    // instantiates models and their mailboxes
+    let mut source_1 = PacketSource::new(
         0,
         1.0,
         10.0,
@@ -32,39 +32,60 @@ fn main() {
         },
         seed,
     );
+
+    let mut source_2 = PacketSource::new(
+        1,
+        2.0,
+        10.0,
+        DistributionInfo::Uniform { low: 1, high: 1 },
+        DistributionInfo::Uniform {
+            low: 1000,
+            high: 1000,
+        },
+        seed,
+    );
+
     let mut drr = DRRServer::new(
         4000.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        vec![1],
+        vec![1, 1],
     );
-    let mut sink = PacketSink::new(0, 10.0);
-    let source_mbox = Mailbox::new();
+
+    let mut sink = PacketSink::new(2, 10.0);
+    let source_1_mbox = Mailbox::new();
+    let source_2_mbox = Mailbox::new();
     let drr_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
-    let source_addr = source_mbox.address();
     let sink_addr = sink_mbox.address();
 
-    // Connects the output of packet source to the input of packet sink.
-    source.output.connect(DRRServer::packet_received, &drr_mbox);
+    // connects the output of packet sources to the input of the DRR scheduler
+    source_1
+        .output
+        .connect(DRRServer::packet_received, &drr_mbox);
+    source_2
+        .output
+        .connect(DRRServer::packet_received, &drr_mbox);
     drr.output.connect(PacketSink::packet_received, &sink_mbox);
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
-    // Instantiates the simulator.
+    // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
     let mut sim = SimInit::new()
-        .add_model(source, source_mbox)
+        .add_model(source_1, source_1_mbox)
+        .add_model(source_2, source_2_mbox)
         .add_model(drr, drr_mbox)
         .add_model(sink, sink_mbox)
         .init(t0);
 
-    sim.send_event(PacketSource::run, (), &source_addr);
+    // starts the simulation
+    sim.step_by(Duration::from_secs(100));
 
-    sim.step_by(Duration::from_secs(20));
+    // requests the packet sink to report statistics
+    sim.send_event(PacketSink::report, 2, &sink_addr);
 
-    sim.send_event(PacketSink::report, 1, &sink_addr);
     if let Some(statistics) = sink_statistics.take() {
         info!("{:#.3}", statistics);
     }

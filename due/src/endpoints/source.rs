@@ -2,14 +2,15 @@
 //! specific distributions of inter-arrival times and packet sizes.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
 use rand::distributions::Distribution;
 use rand::{rngs::SmallRng, SeedableRng};
 use statrs::distribution::{DiscreteUniform, Exp};
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::endpoints::packet::Packet;
@@ -140,15 +141,36 @@ impl PacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(current_time, packet);
 
-            scheduler.schedule_event(interval, Self::run, ()).unwrap();
-
-            debug!(
-                "PacketSource {} finished running at time {}.",
-                self.endpoint_id,
-                current_time.as_secs_f64()
-            );
+            if now + interval.as_secs_f64() <= self.duration {
+                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+            } else {
+                info!(
+                    "PacketSource {} finished running at {:.3}.",
+                    self.endpoint_id, now
+                );
+            }
         }
     }
 }
 
-impl Model for PacketSource {}
+impl Model for PacketSource {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            if self.initial_delay > 0.0 {
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(self.initial_delay), Self::run, ())
+                    .unwrap();
+            } else {
+                panic!(
+                    "PacketSource {}'s initial delay must be positive.",
+                    self.endpoint_id
+                )
+            }
+
+            self.into()
+        })
+    }
+}
