@@ -100,7 +100,7 @@ impl DRRServer {
         }
     }
 
-    pub fn id(&self) -> usize {
+    fn id(&self) -> usize {
         self.scheduler_id
     }
 

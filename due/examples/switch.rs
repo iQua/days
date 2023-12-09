@@ -71,9 +71,7 @@ fn main() {
         .connect(PacketSwitch::packet_received, &switch_mbox);
 
     // connects to the packet sink with an element id of 2
-    let mut output = Output::default();
-    output.connect(PacketSink::packet_received, &sink_mbox);
-    switch.senders.insert(2, output);
+    switch.connect(2, PacketSink::packet_received, &sink_mbox);
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
     // instantiates the simulator
