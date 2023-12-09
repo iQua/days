@@ -15,7 +15,7 @@ use crate::schedulers::port::Port;
 use crate::schedulers::Scheduler;
 use crate::sim::SimContext;
 use crate::switches::SchedulingDiscipline;
-use crate::{next_element_id, num_elements, Shared};
+use crate::{next_element_id, num_switches, Shared};
 
 pub struct PacketSwitch {
     element_id: usize,
@@ -111,7 +111,7 @@ impl PacketSwitch {
         match self.discipline {
             SchedulingDiscipline::DRR => {
                 let mut port;
-                if element_id < num_elements() {
+                if element_id < num_switches() {
                     // sends to another network element
                     port = DRRServer::new(
                         self.port_rate,
@@ -138,7 +138,7 @@ impl PacketSwitch {
             }
             SchedulingDiscipline::FIFO => {
                 let mut port;
-                if element_id < num_elements() {
+                if element_id < num_switches() {
                     // sends to another network element
                     port = Port::new(
                         self.port_rate,

@@ -96,6 +96,16 @@ impl PacketSource {
         );
     }
 
+    pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        debug!(
+            "PacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+        );
+    }
+
     fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
         let interval = match self.arr_dist {
             DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),

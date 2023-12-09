@@ -22,8 +22,10 @@ use crate::endpoints::drop::{CapacityUnit, DropStrategy};
 use crate::endpoints::drr::DRRServer;
 use crate::endpoints::flow::Flow;
 use crate::endpoints::port::Port;
+use crate::endpoints::sink::PacketSink;
+use crate::endpoints::source::PacketSource;
 use crate::endpoints::switch::PacketSwitch;
-use crate::endpoints::{Scheduler, SchedulingDiscipline};
+use crate::endpoints::{EndPoint, Scheduler, SchedulingDiscipline};
 use crate::set_num_switches;
 
 #[derive(Deserialize)]
@@ -51,8 +53,10 @@ pub struct Topology {
     hosts: Vec<usize>,
     /// A vector of PacketSwitches
     switches: Vec<PacketSwitch>,
-    /// A Vec of all flows
+    /// A vector of all flows
     flows: Vec<Flow>,
+    /// A hash map of switch mailboxes
+    switch_mailboxes: HashMap<usize, Mailbox<PacketSwitch>>,
     /// Configuration of the topology
     config: Config,
 }
@@ -65,6 +69,7 @@ impl Topology {
         flows: Vec<Flow>,
     ) -> Topology {
         set_num_switches(graph.node_count());
+        let switch_mailboxes = HashMap::new();
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
@@ -76,8 +81,9 @@ impl Topology {
                 sim_init: SimInit::new(),
                 graph: graph.clone(),
                 hosts,
-                flows,
                 switches,
+                flows,
+                switch_mailboxes,
                 config,
             }
         } else {
@@ -90,8 +96,9 @@ impl Topology {
                 sim_init: SimInit::new(),
                 graph: graph.clone(),
                 hosts,
-                flows,
                 switches,
+                flows,
+                switch_mailboxes,
                 config,
             }
         }
@@ -120,7 +127,12 @@ impl Topology {
         switches
     }
 
-    fn connect_neighbour(&mut self, upstream_id: usize, downstream_mbox: Mailbox<PacketSwitch>) {
+    fn connect_neighbours(
+        &mut self,
+        upstream_id: usize,
+        downstream_id: usize,
+        downstream_mbox: Mailbox<PacketSwitch>,
+    ) {
         let upstream_switch = &mut self.switches[upstream_id];
         let mut scheduler: Scheduler = match &self.config {
             Config::SwitchConfig(config) => match config.switch[upstream_id].discipline {
@@ -179,7 +191,7 @@ impl Topology {
             Scheduler::DRRServer(mut drr_server) => {
                 let scheduler_mbox: Mailbox<DRRServer> = Mailbox::new();
                 output.connect(DRRServer::packet_received, &scheduler_mbox);
-                upstream_switch.outputs.insert(upstream_id, output);
+                upstream_switch.outputs.insert(downstream_id, output);
                 drr_server
                     .output
                     .connect(PacketSwitch::packet_received, &downstream_mbox);
@@ -190,7 +202,7 @@ impl Topology {
             Scheduler::Port(mut port) => {
                 let scheduler_mbox: Mailbox<Port> = Mailbox::new();
                 output.connect(Port::packet_received, &scheduler_mbox);
-                upstream_switch.outputs.insert(upstream_id, output);
+                upstream_switch.outputs.insert(downstream_id, output);
                 port.output
                     .connect(PacketSwitch::packet_received, &downstream_mbox);
 
@@ -201,7 +213,7 @@ impl Topology {
 
     /// Connects a vector of packet switches according to edges in the network topology.
     fn connect(&mut self) {
-        let mut switch_mailboxes = HashMap::new();
+        self.switch_mailboxes = HashMap::new();
 
         for node_id in self.graph.node_indices() {
             let switch_mbox = Mailbox::new();
@@ -211,15 +223,17 @@ impl Topology {
                 // downstream element in the provided network graph, then
                 // connect them
                 if neighbor.index() != node_id.index() {
-                    self.connect_neighbour(neighbor.index(), switch_mbox);
+                    self.connect_neighbours(neighbor.index(), node_id.index(), switch_mbox);
                 }
             }
 
-            switch_mailboxes.insert(node_id.index(), switch_mbox);
+            self.switch_mailboxes.insert(node_id.index(), switch_mbox);
         }
+    }
 
+    fn activate_switches(&mut self) {
         for node_id in self.graph.node_indices() {
-            let switch_mbox = switch_mailboxes.get(&node_id.index()).unwrap();
+            let switch_mbox = self.switch_mailboxes.get(&node_id.index()).unwrap();
 
             self.sim_init = self
                 .sim_init
@@ -247,24 +261,41 @@ impl Topology {
             // an element in the network must be a host, as specified by the
             // network graph
             assert!(self.hosts.contains(&host_id.index()));
-
-            // locate a neighboring element in the network graph to this host
-            let mut neighbors = self.graph.neighbors(host_id);
-
+            // obtains the next endpoint
             let endpoint = endpoint_iter.next().unwrap();
 
-            if let Some(next_neighbor) = neighbors.next() {
-                if next_neighbor != host_id {
-                    self.switches[next_neighbor.index()].connect_neighbour_to_endpoint(
-                        endpoint,
-                        downlink_receiver,
-                        host_id.index(),
-                    );
-                }
+            // establishes a bi-directional connection between the endpoint and the host
+            match *endpoint {
+                EndPoint::PacketSource(mut source) => {
+                    let source_mbox: Mailbox<PacketSource> = Mailbox::new();
+                    let host_mbox = self.switch_mailboxes.get(&host_id.index()).unwrap();
 
-                self.switches[host_id.index()].connect_sender(endpoint.id(), downlink_sender);
-            } else {
-                panic!("No neighbors found for host element {}", host_id.index());
+                    source
+                        .output
+                        .connect(PacketSwitch::packet_received, host_mbox);
+
+                    let mut output = Output::default();
+                    let mut host = self.switches[host_id.index()];
+                    output.connect(PacketSource::packet_received, &source_mbox);
+                    host.outputs.insert(source.id(), output);
+                    let source_mbox: Mailbox<PacketSource> = Mailbox::new();
+
+                    self.sim_init = self.sim_init.add_model(source, source_mbox);
+                }
+                EndPoint::PacketSink(mut sink) => {
+                    let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
+                    let host_mbox = self.switch_mailboxes.get(&host_id.index()).unwrap();
+
+                    sink.output
+                        .connect(PacketSwitch::packet_received, host_mbox);
+
+                    let mut output = Output::default();
+                    let mut host = self.switches[host_id.index()];
+                    output.connect(PacketSink::packet_received, &sink_mbox);
+                    host.outputs.insert(sink.id(), output);
+
+                    self.sim_init = self.sim_init.add_model(sink, sink_mbox);
+                }
             }
         }
     }

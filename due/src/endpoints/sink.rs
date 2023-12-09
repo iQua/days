@@ -150,6 +150,8 @@ pub struct PacketSink {
     packet_sizes: RandomVar,
     /// output: packet statistics
     pub statistics: Output<PacketStatistics>,
+    /// output: outbound to packet switches
+    pub output: Output<Packet>,
 }
 
 impl Clone for PacketSink {
@@ -164,6 +166,7 @@ impl Clone for PacketSink {
             queueing_delays: RandomVar::new(),
             packet_sizes: RandomVar::new(),
             statistics: Output::default(),
+            output: Output::default(),
         }
     }
 }
@@ -180,6 +183,7 @@ impl PacketSink {
             queueing_delays: RandomVar::new(),
             packet_sizes: RandomVar::new(),
             statistics: Output::default(),
+            output: Output::default(),
         }
     }
 

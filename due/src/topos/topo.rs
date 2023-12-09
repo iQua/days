@@ -19,7 +19,7 @@ use crate::switches::splitter::Splitter;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::{Element, SchedulingDiscipline};
 use crate::topos::build::FatTreeConfig;
-use crate::{set_num_elements, Shared};
+use crate::{set_num_switches, Shared};
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -52,7 +52,7 @@ impl Topology {
         hosts: Vec<usize>,
         flows: Vec<Flow>,
     ) -> Topology {
-        set_num_elements(graph.node_count());
+        set_num_switches(graph.node_count());
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");

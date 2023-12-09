@@ -13,10 +13,7 @@ pub mod topo;
 use serde;
 use serde::Deserialize;
 
-use asynchronix::model::{Model, Output};
-
 use crate::endpoints::drr::DRRServer;
-use crate::endpoints::packet::Packet;
 use crate::endpoints::port::Port;
 use crate::endpoints::sink::PacketSink;
 use crate::endpoints::source::PacketSource;
@@ -46,20 +43,4 @@ pub enum SchedulingDiscipline {
 pub enum Scheduler {
     DRRServer(DRRServer),
     Port(Port),
-}
-
-impl Scheduler {
-    pub fn output(&self) -> Output<Packet> {
-        match self {
-            Scheduler::DRRServer(drr_server) => drr_server.output,
-            Scheduler::Port(port) => port.output,
-        }
-    }
-
-    pub fn scheduler(&self) -> impl Model {
-        match self {
-            Scheduler::DRRServer(drr_server) => drr_server,
-            Scheduler::Port(port) => port,
-        }
-    }
 }
