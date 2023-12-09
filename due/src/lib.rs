@@ -27,6 +27,11 @@ pub struct SeedConfig {
 }
 
 static SEED: AtomicUsize = AtomicUsize::new(0);
+static NUM_SWITCHES: AtomicUsize = AtomicUsize::new(0);
+static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
+static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
+static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
@@ -43,20 +48,13 @@ pub fn seed_from_config(file_path: &str) -> usize {
 pub fn get_seed() -> usize {
     SEED.load(Ordering::Relaxed)
 }
-
-static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);
-static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
-static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
-static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
-static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
-
-pub fn num_elements() -> usize {
-    NUM_ELEMENTS.load(Ordering::Relaxed)
+pub fn num_switches() -> usize {
+    NUM_SWITCHES.load(Ordering::Relaxed)
 }
 
-pub fn set_num_elements(num_elements: usize) {
-    NUM_ELEMENTS.store(num_elements, Ordering::Relaxed);
-    ENDPOINT_ID.store(num_elements, Ordering::Relaxed);
+pub fn set_num_switches(num_switches: usize) {
+    NUM_SWITCHES.store(num_switches, Ordering::Relaxed);
+    ENDPOINT_ID.store(num_switches, Ordering::Relaxed);
 }
 
 pub fn next_element_id() -> usize {

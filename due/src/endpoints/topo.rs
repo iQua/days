@@ -1,5 +1,5 @@
 //! Implements all the necessary utilities for initializing, constructing, and
-//! running a network topology. These utilities include connecting network elements
+//! running a network topology. These utilities include connecting network switches
 //! according to a network graph, attaching packet endpoints to hosts, computing
 //! feasible paths for all the flows, and installing Flow Information Base tables
 //! to all the switches to route these flows accordingly.
@@ -7,19 +7,20 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
-use log::warn;
+use log::info;
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
-use tokio::sync::mpsc::unbounded_channel;
 
-use crate::flows::flow::Flow;
-use crate::sim::SimContext;
-use crate::switches::splitter::Splitter;
-use crate::switches::switch::PacketSwitch;
-use crate::switches::{Element, SchedulingDiscipline};
-use crate::topos::build::FatTreeConfig;
-use crate::{set_num_elements, Shared};
+use asynchronix::simulation::{Mailbox, SimInit};
+use asynchronix::time::MonotonicTime;
+
+use crate::endpoints::build::FatTreeConfig;
+use crate::endpoints::flow::Flow;
+use crate::endpoints::switch::PacketSwitch;
+use crate::endpoints::SchedulingDiscipline;
+use crate::set_num_switches;
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -30,17 +31,18 @@ struct TomlSwitch {
 }
 
 #[derive(Deserialize)]
-struct ElementConfig {
-    num_splitters: usize,
+struct SwitchConfig {
     switch: Vec<TomlSwitch>,
 }
 pub struct Topology {
+    /// The simulation engine
+    sim_init: SimInit,
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
-    /// A Vec of element ids that connects to endpoints
+    /// A vector of element ids that connects to endpoints
     hosts: Vec<usize>,
-    /// A Vec of PacketSwitchs and Splitters
-    elements: Vec<Element>,
+    /// A vector of PacketSwitches
+    switches: Vec<PacketSwitch>,
     /// A Vec of all flows
     flows: Vec<Flow>,
 }
@@ -52,80 +54,66 @@ impl Topology {
         hosts: Vec<usize>,
         flows: Vec<Flow>,
     ) -> Topology {
-        set_num_elements(graph.node_count());
+        set_num_switches(graph.node_count());
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-        let elements: Vec<Element> = if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
-            Topology::init_fattree_elements(config)
-        } else {
-            let config: ElementConfig =
-                toml::from_str(&content).expect("Failed to deserialize the configuration");
-            Topology::init_elements(config)
-        };
+        let switches: Vec<PacketSwitch> =
+            if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
+                Topology::init_fattree_switches(config)
+            } else {
+                let config: SwitchConfig =
+                    toml::from_str(&content).expect("Failed to deserialize the configuration");
+                Topology::init_switches(config)
+            };
 
         Topology {
+            sim_init: SimInit::new(),
             graph: graph.clone(),
             hosts,
             flows,
-            elements,
+            switches,
         }
     }
 
-    fn init_elements(config: ElementConfig) -> Vec<Element> {
-        let mut elements: Vec<Element> = Vec::new();
+    fn init_switches(config: SwitchConfig) -> Vec<PacketSwitch> {
+        let mut switches: Vec<PacketSwitch> = Vec::new();
 
         for e in config.switch {
-            let switch = PacketSwitch::new(
-                e.port_rate,
-                e.capacity,
-                e.weights,
-                HashMap::new(),
-                e.discipline,
-                Arc::new(|flow_id| flow_id),
-            );
-            elements.push(Element::PacketSwitch(switch));
+            let switch = PacketSwitch::new(HashMap::new(), Arc::new(|flow_id| flow_id));
+            switches.push(switch);
         }
 
-        for _ in 0..config.num_splitters {
-            elements.push(Element::Splitter(Splitter::new()));
-        }
-
-        elements
+        switches
     }
 
-    fn init_fattree_elements(config: FatTreeConfig) -> Vec<Element> {
-        let mut elements: Vec<Element> = Vec::new();
+    fn init_fattree_switches(config: FatTreeConfig) -> Vec<PacketSwitch> {
+        let mut switches: Vec<PacketSwitch> = Vec::new();
         let num_switches = config.k.pow(2) * 5 / 4;
 
         for _ in 0..num_switches {
-            let switch = PacketSwitch::new(
-                config.port_rate,
-                config.capacity,
-                config.weights.clone(),
-                HashMap::new(),
-                config.discipline.clone(),
-                Arc::new(|flow_id| flow_id),
-            );
-            elements.push(Element::PacketSwitch(switch));
+            let switch = PacketSwitch::new(HashMap::new(), Arc::new(|flow_id| flow_id));
+            switches.push(switch);
         }
 
-        elements
+        switches
     }
 
-    /// Connects a vector of elements according to edges in the network topology.
+    /// Connects a vector of packet switches according to edges in the network topology.
     fn connect(&mut self) {
+        let switch_mailboxes = HashMap::new();
+
         for node_id in self.graph.node_indices() {
-            let (sender, receiver) = unbounded_channel();
-            self.elements[node_id.index()].connect_receiver(receiver);
+            let switch_mbox = Mailbox::new();
+            switch_mailboxes.insert(node_id.index(), switch_mbox);
 
             for neighbor in self.graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them
                 if neighbor.index() != node_id.index() {
-                    self.elements[neighbor.index()].connect_sender(node_id.index(), sender.clone());
+                    self.switches[neighbor.index()].connect_sender(node_id.index(), sender.clone());
                 }
             }
         }
@@ -160,14 +148,14 @@ impl Topology {
 
             if let Some(next_neighbor) = neighbors.next() {
                 if next_neighbor != host_id {
-                    self.elements[next_neighbor.index()].connect_neighbour_to_endpoint(
+                    self.switches[next_neighbor.index()].connect_neighbour_to_endpoint(
                         endpoint,
                         downlink_receiver,
                         host_id.index(),
                     );
                 }
 
-                self.elements[host_id.index()].connect_sender(endpoint.id(), downlink_sender);
+                self.switches[host_id.index()].connect_sender(endpoint.id(), downlink_sender);
             } else {
                 panic!("No neighbors found for host element {}", host_id.index());
             }
@@ -177,46 +165,36 @@ impl Topology {
     /// Computes routing decisions for all the flows, and installs Flow
     /// Information Base tables (FIBs) of these routing decisions into all the
     /// switches.
-    fn route(&mut self, sim: SimContext<'_, Shared>) {
+    fn route(&mut self) {
         for flow in self.flows.iter_mut() {
-            let paths = flow.compute_paths(self.graph.clone(), sim);
+            let paths = flow.compute_paths(self.graph.clone());
 
             for path in paths {
                 for window in path.windows(2) {
                     let node_id = window.get(0).unwrap().index();
                     let next_id = window.get(1).unwrap().index();
-
-                    match &mut self.elements[node_id] {
-                        Element::PacketSwitch(switch) => {
-                            switch.set_fib(flow.id, next_id);
-                        }
-                        _ => {
-                            warn!(
-                                "Element {} is not a packet switch when setting up the
-                                Flow Information Base table along the path in flow {}.",
-                                node_id, flow.id
-                            );
-                        }
-                    }
+                    self.switches[node_id].set_fib(flow.id, next_id);
                 }
             }
         }
     }
 
-    pub fn run(mut self, sim: SimContext<'_, Shared>) {
-        // constructs the network graph with network elements
+    pub fn run(mut self) {
+        // constructs the network graph with network switches
         self.connect();
         // attaches sources and sinks to hosts in the network graph
         self.attach();
         // computes feasible paths for all flows, and sets FIBs for all switches
-        self.route(sim);
+        self.route();
 
-        for flow in self.flows {
-            sim.activate(flow.run(sim));
-        }
+        // starts the simulation
+        let t0 = MonotonicTime::EPOCH;
+        let mut sim = self.sim_init.init(t0);
+        sim.step_by(Duration::from_secs(100));
 
-        for element in self.elements {
-            element.activate(sim);
-        }
+        info!(
+            "Simulation completed at time {:.3}.",
+            sim.time().duration_since(t0).as_secs_f64()
+        );
     }
 }

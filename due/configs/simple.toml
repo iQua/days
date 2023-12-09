@@ -1,6 +1,5 @@
 seed = 1000
 edges = [[0, 1]]
-num_splitters = 0
 
 [[switch]]
 port_rate = 8000
