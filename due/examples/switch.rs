@@ -9,10 +9,11 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
+use due::endpoints::drop::{CapacityUnit, DropStrategy};
+use due::endpoints::drr::DRRServer;
 use due::endpoints::sink::PacketSink;
 use due::endpoints::source::PacketSource;
 use due::endpoints::switch::PacketSwitch;
-use due::endpoints::SchedulingDiscipline;
 use due::flows::flow::DistributionInfo;
 
 fn main() {
@@ -46,19 +47,25 @@ fn main() {
         seed,
     );
 
-    let switch: PacketSwitch = PacketSwitch::new(
+    let mut fib = HashMap::new();
+    fib.insert(0, 1);
+    let mut switch: PacketSwitch = PacketSwitch::new(fib, Arc::new(|flow_id| flow_id));
+
+    let mut drr = DRRServer::new(
         4000.0,
         100,
-        vec![1],
-        HashMap::new(),
-        SchedulingDiscipline::DRR,
+        CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
+        DropStrategy::TailDrop,
+        vec![1, 1],
     );
 
     let mut sink = PacketSink::new(2, 10.0);
+
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let switch_mbox = Mailbox::new();
+    let drr_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
@@ -70,17 +77,24 @@ fn main() {
         .output
         .connect(PacketSwitch::packet_received, &switch_mbox);
 
+    // connects the output of the switch to the DRR scheduler
+    let switch_output = switch.outputs.get_mut(&0).unwrap();
+    switch_output.connect(DRRServer::packet_received, &drr_mbox);
+
+    // connects the DRR scheduler to the packet sink
+    drr.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
 
     // connects to the packet sink with an element id of 2
-    let sim_init = SimInit::new()
-        .add_model(source_1, source_1_mbox)
-        .add_model(source_2, source_2_mbox)
-        .add_model(switch, switch_mbox)
-        .add_model(sink, sink_mbox);
+    let mut sim_init = SimInit::new().add_model(source_1, source_1_mbox);
+    sim_init = sim_init.add_model(source_2, source_2_mbox);
+    sim_init = sim_init.add_model(switch, switch_mbox);
+    sim_init = sim_init.add_model(drr, drr_mbox);
+    sim_init = sim_init.add_model(sink, sink_mbox);
 
     let mut sim = sim_init.init(t0);
 
