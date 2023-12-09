@@ -3,14 +3,13 @@
 use std::time::Duration;
 
 use log::info;
-use rand::{rngs::SmallRng, SeedableRng};
 
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
+use due::endpoints::flow::DistributionInfo;
 use due::endpoints::sink::PacketSink;
 use due::endpoints::source::PacketSource;
-use due::flows::flow::DistributionInfo;
 
 fn main() {
     let env = env_logger::Env::default();
@@ -27,7 +26,7 @@ fn main() {
             high: 1000,
         },
     );
-    let mut sink = PacketSink::new(0, 10.0);
+    let mut sink = PacketSink::new(0);
     let source_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();

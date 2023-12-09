@@ -136,8 +136,6 @@ impl std::fmt::Display for PacketStatistics {
 pub struct PacketSink {
     endpoint_id: usize,
     flow_id: usize,
-    /// the duration of the simulation run
-    duration: f64,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -159,7 +157,6 @@ impl Clone for PacketSink {
         PacketSink {
             endpoint_id: next_endpoint_id(),
             flow_id: self.flow_id,
-            duration: self.duration,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
@@ -172,11 +169,10 @@ impl Clone for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(flow_id: usize, duration: f64) -> PacketSink {
+    pub fn new(flow_id: usize) -> PacketSink {
         PacketSink {
             endpoint_id: next_endpoint_id(),
             flow_id,
-            duration,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),

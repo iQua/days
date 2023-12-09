@@ -14,8 +14,8 @@ use statrs::distribution::{DiscreteUniform, Exp};
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+use crate::endpoints::flow::DistributionInfo;
 use crate::endpoints::packet::Packet;
-use crate::flows::flow::DistributionInfo;
 use crate::{get_seed, next_endpoint_id};
 
 #[derive(Debug)]
@@ -28,6 +28,7 @@ pub struct PacketSource {
     pkt_size_dist: DistributionInfo,
     packets_sent: usize,
     rng: SmallRng,
+
     pub output: Output<Packet>,
 }
 

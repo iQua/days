@@ -11,6 +11,7 @@ use std::sync::Arc;
 use log::warn;
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::flows::flow::Flow;
 use crate::sim::SimContext;

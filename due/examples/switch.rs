@@ -11,16 +11,14 @@ use asynchronix::time::MonotonicTime;
 
 use due::endpoints::drop::{CapacityUnit, DropStrategy};
 use due::endpoints::drr::DRRServer;
+use due::endpoints::flow::DistributionInfo;
 use due::endpoints::sink::PacketSink;
 use due::endpoints::source::PacketSource;
 use due::endpoints::switch::PacketSwitch;
-use due::flows::flow::DistributionInfo;
 
 fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
-
-    let seed = 1;
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
@@ -32,7 +30,6 @@ fn main() {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
 
     let mut source_2 = PacketSource::new(
@@ -44,7 +41,6 @@ fn main() {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
 
     let mut fib = HashMap::new();
@@ -61,7 +57,7 @@ fn main() {
         vec![1, 1],
     );
 
-    let mut sink = PacketSink::new(2, 10.0);
+    let mut sink = PacketSink::new(2);
 
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();

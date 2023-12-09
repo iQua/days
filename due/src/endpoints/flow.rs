@@ -2,7 +2,6 @@ use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
-use rand::rngs::SmallRng;
 use serde::Deserialize;
 
 use crate::endpoints::route::{RandomSimplePath, RoutingProtocol};
@@ -51,7 +50,6 @@ pub struct Flow {
     pub pkt_size_dist: DistributionInfo,
     pub endpoints: Vec<EndPoint>,
     pub routing: RandomSimplePath,
-    pub rng: SmallRng,
 }
 
 impl Flow {
@@ -170,8 +168,8 @@ impl Flow {
             self.endpoints
                 .push(EndPoint::PacketSource(PacketSource::new(
                     self.id,
-                    self.duration,
                     self.initial_delay,
+                    self.duration,
                     self.arr_dist,
                     self.pkt_size_dist,
                 )));

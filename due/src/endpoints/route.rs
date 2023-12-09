@@ -6,7 +6,11 @@ use petgraph::{
     algo::all_simple_paths,
     graph::{NodeIndex, UnGraph},
 };
-use rand::Rng;
+
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
+
+use crate::get_seed;
 
 /// Defines the interface for all routing protocols
 pub trait RoutingProtocol {
@@ -17,11 +21,18 @@ pub trait RoutingProtocol {
 #[derive(Debug)]
 pub struct RandomSimplePath {
     graph: UnGraph<usize, ()>,
+    rng: SmallRng,
 }
 
 impl RandomSimplePath {
     pub fn new(graph: UnGraph<usize, ()>) -> RandomSimplePath {
-        RandomSimplePath { graph }
+        let seed = get_seed();
+        let rng = match seed {
+            1.. => SmallRng::seed_from_u64(seed as u64),
+            _ => SmallRng::from_entropy(),
+        };
+
+        RandomSimplePath { graph, rng }
     }
 
     fn get_all_simple_paths(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<Vec<NodeIndex>> {
@@ -37,7 +48,7 @@ impl RandomSimplePath {
 impl RoutingProtocol for RandomSimplePath {
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
         let paths = self.get_all_simple_paths(start, end);
-        let rdm_idx = rng.borrow_mut().gen_range(0..paths.len());
+        let rdm_idx = self.rng.gen_range(0..paths.len());
         paths[rdm_idx].clone()
     }
 }
