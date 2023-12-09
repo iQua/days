@@ -261,7 +261,7 @@ impl Topology {
 
                 // establishes a bi-directional connection between the endpoint and the host
                 match endpoint {
-                    EndPoint::PacketSource(mut source) => {
+                    EndPoint::PacketSource(source) => {
                         let source_mbox: Mailbox<PacketSource> = Mailbox::new();
 
                         source
@@ -269,18 +269,18 @@ impl Topology {
                             .connect(PacketSwitch::packet_received, host_mbox);
 
                         let mut output = Output::default();
-                        let mut host = self.switches[host_id.index()];
+                        let host = &mut self.switches[host_id.index()];
                         output.connect(PacketSource::packet_received, &source_mbox);
                         host.outputs.insert(source.id(), output);
                     }
-                    EndPoint::PacketSink(mut sink) => {
+                    EndPoint::PacketSink(sink) => {
                         let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
 
                         sink.output
                             .connect(PacketSwitch::packet_received, host_mbox);
 
                         let mut output = Output::default();
-                        let mut host = self.switches[host_id.index()];
+                        let host = &mut self.switches[host_id.index()];
                         output.connect(PacketSink::packet_received, &sink_mbox);
                         host.outputs.insert(sink.id(), output);
                     }
