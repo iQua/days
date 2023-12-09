@@ -23,10 +23,12 @@ pub struct Shared {
 
 #[derive(Deserialize)]
 pub struct SeedConfig {
-    seed: u64,
+    seed: usize,
 }
 
-pub fn get_seed(file_path: &str) -> u64 {
+static SEED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -34,7 +36,12 @@ pub fn get_seed(file_path: &str) -> u64 {
     let config: SeedConfig =
         toml::from_str(&content).expect("Failed to deserialize the configuration");
 
+    SEED.store(config.seed, Ordering::Relaxed);
     config.seed
+}
+
+pub fn get_seed() -> usize {
+    SEED.load(Ordering::Relaxed)
 }
 
 static NUM_ELEMENTS: AtomicUsize = AtomicUsize::new(0);

@@ -1,5 +1,4 @@
-//! Implements a fair packet switch with various schedulers, as well as bounded
-//! buffers, on each of the outgoing ports.
+//! Implements a packet switch with a demultiplexer based on flow classes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +22,7 @@ pub struct PacketSwitch {
     fib: HashMap<usize, usize>,
 
     /// senders for sending inbound packets to outbound ports
-    /// element_id -> scheduler
+    /// element_id -> outputs to downstream schedulers
     pub outputs: HashMap<usize, Output<Packet>>,
 }
 

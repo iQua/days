@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use log::info;
+use rand::{rngs::SmallRng, SeedableRng};
 
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
@@ -15,8 +16,6 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    let seed = 1;
-
     // Instantiates models and their mailboxes.
     let mut source = PacketSource::new(
         0,
@@ -27,7 +26,6 @@ fn main() {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
     let mut sink = PacketSink::new(0, 10.0);
     let source_mbox = Mailbox::new();

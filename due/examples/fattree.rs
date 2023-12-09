@@ -6,11 +6,10 @@ use std::cell::RefCell;
 use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
 
-use due::flows::flow::Flow;
-use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos::build::build_fattree;
-use due::topos::topo::Topology;
-use due::{get_seed, Shared};
+use due::endpoints::build::build_fattree;
+use due::endpoints::flow::Flow;
+use due::endpoints::topo::Topology;
+use due::get_seed;
 
 async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
     let file_path = config_path;
