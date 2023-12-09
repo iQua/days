@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashMap;
 
-use due::switches::SchedulingDiscipline;
 use log::info;
 
-use asynchronix::model::Output;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
@@ -14,6 +13,7 @@ use due::endpoints::sink::PacketSink;
 use due::endpoints::source::PacketSource;
 use due::endpoints::switch::PacketSwitch;
 use due::flows::flow::DistributionInfo;
+use due::endpoints::SchedulingDiscipline;
 
 fn main() {
     let env = env_logger::Env::default();
@@ -50,7 +50,7 @@ fn main() {
         4000.0,
         100,
         vec![1],
-        vec![2],
+        HashMap::new(),
         SchedulingDiscipline::DRR,
         Arc::new(|flow_id| flow_id),
     );
@@ -71,7 +71,8 @@ fn main() {
         .connect(PacketSwitch::packet_received, &switch_mbox);
 
     // connects to the packet sink with an element id of 2
-    switch.connect(2, PacketSink::packet_received, &sink_mbox);
+    sender = switch.senders.get 
+    switch.senders[2].connect(PacketSink::packet_received, &sink_mbox);
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
     // instantiates the simulator

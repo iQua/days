@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use log::debug;
 
-use asynchronix::model::{InputFn, Model, Output};
-use asynchronix::simulation::{Address, Mailbox};
+use asynchronix::model::{Model, Output};
+use asynchronix::simulation::Mailbox;
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::endpoints::drop::{CapacityUnit, DropStrategy};
@@ -95,7 +95,7 @@ impl PacketSwitch {
         // creates a port with the specified scheduling discipline
         match self.discipline {
             SchedulingDiscipline::DRR => {
-                let mut port;
+                let port;
                 if element_id < num_elements() {
                     // sends to another network element
                     port = DRRServer::new(
@@ -119,13 +119,13 @@ impl PacketSwitch {
 
                 let drr_mbox = Mailbox::new();
                 let mut port_sender = Output::default();
-                port_sender.connect(DRRServer::packet_received, &drr_mbox);
 
+                port_sender.connect(DRRServer::packet_received, &drr_mbox);
                 self.port_senders.insert(element_id, port_sender);
                 self.ports.insert(element_id, Arc::new(Mutex::new(port)));
             }
             SchedulingDiscipline::FIFO => {
-                let mut port;
+                let port;
                 if element_id < num_elements() {
                     // sends to another network element
                     port = Port::new(
@@ -140,14 +140,12 @@ impl PacketSwitch {
 
                 let port_mbox = Mailbox::new();
                 let mut port_sender = Output::default();
+
                 port_sender.connect(Port::packet_received, &port_mbox);
                 self.port_senders.insert(element_id, port_sender);
                 self.ports.insert(element_id, Arc::new(Mutex::new(port)));
             }
         }
-
-        let sender = Output::default();
-        self.senders.insert(element_id, sender);
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
@@ -174,37 +172,26 @@ impl PacketSwitch {
         }
     }
 
-    pub async fn connect<M, F, T, S>(
-        mut self,
-        element_id: usize,
-        input: F,
-        address: impl Into<Address<M>>,
-    ) where
-        M: Model,
-        F: for<'a> InputFn<'a, M, T, S> + Copy,
-        T: Clone + Send + 'static,
-        S: Send + 'static,
-    {
-        // connects ports to outbound senders
-        match self.discipline {
-            SchedulingDiscipline::DRR => {
-                if let Some(sender) = self.senders.get_mut(&element_id) {
-                    if let Some(port) = self.ports.get_mut(&element_id) {
-                        let p = port.lock().unwrap().downcast_ref::<DRRServer>().unwrap();
-                        p.output.connect(input, address);
-                    }
-                }
-            }
-            SchedulingDiscipline::FIFO => {
-                if let Some(sender) = self.senders.get_mut(&element_id) {
-                    if let Some(port) = self.ports.get_mut(&element_id) {
-                        let p = port.lock().unwrap().downcast_ref::<Port>().unwrap();
-                        p.output.connect(input, address);
-                    }
-                }
-            }
-        }
-    }
+    // pub async fn get_sender(mut self, element_id: usize) -> &'a Output<Packet> {
+    //     match self.discipline {
+    //         SchedulingDiscipline::DRR => {
+    //             if let Some(port) = self.ports.get_mut(&element_id) {
+    //                 let p = port.lock().unwrap().downcast_ref::<DRRServer>().unwrap();
+    //                 &p.output
+    //             } else {
+    //                 panic!("No sender found for element {}.", element_id);
+    //             }
+    //         }
+    //         SchedulingDiscipline::FIFO => {
+    //             if let Some(port) = self.ports.get_mut(&element_id) {
+    //                 let p = port.lock().unwrap().downcast_ref::<Port>().unwrap();
+    //                 &p.output
+    //             } else {
+    //                 panic!("No sender found for element {}.", element_id);
+    //             }
+    //         }
+    //     }
+    // }
 }
 
 impl Model for PacketSwitch {}
