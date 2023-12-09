@@ -48,7 +48,8 @@ fn main() {
     );
 
     let mut fib = HashMap::new();
-    fib.insert(0, 1);
+    fib.insert(0, 2);
+    fib.insert(1, 2);
     let mut switch: PacketSwitch = PacketSwitch::new(fib, Arc::new(|flow_id| flow_id));
 
     let mut drr = DRRServer::new(
@@ -78,7 +79,7 @@ fn main() {
         .connect(PacketSwitch::packet_received, &switch_mbox);
 
     // connects the output of the switch to the DRR scheduler
-    let switch_output = switch.outputs.get_mut(&0).unwrap();
+    let switch_output = switch.outputs.get_mut(&2).unwrap();
     switch_output.connect(DRRServer::packet_received, &drr_mbox);
 
     // connects the DRR scheduler to the packet sink
