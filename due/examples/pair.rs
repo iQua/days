@@ -1,4 +1,4 @@
-//! The main program for running a simulation using a specific configuration.
+//! An example of connecting one packet source to one packet sink.
 
 use std::time::Duration;
 

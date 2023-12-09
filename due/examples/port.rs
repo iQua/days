@@ -1,4 +1,4 @@
-//! The main program for running a simulation using a specific configuration.
+//! An exawmple of connecting two packet sources into one FIFO scheduler.
 
 use std::time::Duration;
 

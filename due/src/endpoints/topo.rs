@@ -13,10 +13,13 @@ use log::info;
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
+use asynchronix::model::Output;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
 use crate::endpoints::build::FatTreeConfig;
+use crate::endpoints::drop::{CapacityUnit, DropStrategy};
+use crate::endpoints::drr::DRRServer;
 use crate::endpoints::flow::Flow;
 use crate::endpoints::switch::PacketSwitch;
 use crate::endpoints::SchedulingDiscipline;
@@ -34,6 +37,10 @@ struct TomlSwitch {
 struct SwitchConfig {
     switch: Vec<TomlSwitch>,
 }
+pub enum Config {
+    SwitchConfig(SwitchConfig),
+    FatTreeConfig(FatTreeConfig),
+}
 pub struct Topology {
     /// The simulation engine
     sim_init: SimInit,
@@ -45,6 +52,8 @@ pub struct Topology {
     switches: Vec<PacketSwitch>,
     /// A Vec of all flows
     flows: Vec<Flow>,
+    /// Configuration of the topology
+    config: Config,
 }
 
 impl Topology {
@@ -58,22 +67,32 @@ impl Topology {
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+        if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
+            let switches = Topology::init_fattree_switches(config);
+            let config = Config::FatTreeConfig(config);
 
-        let switches: Vec<PacketSwitch> =
-            if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
-                Topology::init_fattree_switches(config)
-            } else {
-                let config: SwitchConfig =
-                    toml::from_str(&content).expect("Failed to deserialize the configuration");
-                Topology::init_switches(config)
-            };
+            Topology {
+                sim_init: SimInit::new(),
+                graph: graph.clone(),
+                hosts,
+                flows,
+                switches,
+                config,
+            }
+        } else {
+            let config: SwitchConfig =
+                toml::from_str(&content).expect("Failed to deserialize the configuration");
+            let switches = Topology::init_switches(config);
+            let config = Config::SwitchConfig(config);
 
-        Topology {
-            sim_init: SimInit::new(),
-            graph: graph.clone(),
-            hosts,
-            flows,
-            switches,
+            Topology {
+                sim_init: SimInit::new(),
+                graph: graph.clone(),
+                hosts,
+                flows,
+                switches,
+                config,
+            }
         }
     }
 
@@ -100,28 +119,74 @@ impl Topology {
         switches
     }
 
+    fn connect_neighbour(&mut self, upstream_id: usize, downstream_mbox: Mailbox<PacketSwitch>) {
+        let upstream_switch = &mut self.switches[upstream_id];
+        let mut scheduler;
+
+        match &self.config {
+            Config::SwitchConfig(config) => {
+                scheduler = DRRServer::new(
+                    config.switch[upstream_id].port_rate,
+                    config.switch[upstream_id].capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(|flow_id| flow_id),
+                    DropStrategy::TailDrop,
+                    config.switch[upstream_id].weights.clone(),
+                );
+            }
+            Config::FatTreeConfig(config) => {
+                scheduler = DRRServer::new(
+                    config.port_rate,
+                    config.capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(|flow_id| flow_id),
+                    DropStrategy::TailDrop,
+                    config.weights.clone(),
+                );
+            }
+        }
+
+        let mut output = Output::default();
+        let scheduler_mbox = Mailbox::new();
+        output.connect(DRRServer::packet_received, &scheduler_mbox);
+        upstream_switch.outputs.insert(upstream_id, output);
+        scheduler
+            .output
+            .connect(PacketSwitch::packet_received, &downstream_mbox);
+        self.sim_init = self.sim_init.add_model(scheduler, scheduler_mbox);
+    }
+
     /// Connects a vector of packet switches according to edges in the network topology.
     fn connect(&mut self) {
-        let switch_mailboxes = HashMap::new();
+        let mut switch_mailboxes = HashMap::new();
 
         for node_id in self.graph.node_indices() {
             let switch_mbox = Mailbox::new();
-            switch_mailboxes.insert(node_id.index(), switch_mbox);
 
             for neighbor in self.graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them
                 if neighbor.index() != node_id.index() {
-                    self.switches[neighbor.index()].connect_sender(node_id.index(), sender.clone());
+                    self.connect_neighbour(neighbor.index(), switch_mbox);
                 }
             }
+
+            switch_mailboxes.insert(node_id.index(), switch_mbox);
+        }
+
+        for node_id in self.graph.node_indices() {
+            let switch_mbox = switch_mailboxes.get(&node_id.index()).unwrap();
+
+            self.sim_init = self
+                .sim_init
+                .add_model(self.switches[node_id.index()], *switch_mbox);
         }
     }
 
     /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
     fn attach(&mut self) {
-        // obtains the element_id of all end hosts (where endpoints can be
+        // obtains the upstream_id of all end hosts (where endpoints can be
         // attached to), and initializes endpoints for all flows
         let mut attach_to = Vec::new();
         for flow in self.flows.iter_mut() {
@@ -143,7 +208,6 @@ impl Topology {
             // locate a neighboring element in the network graph to this host
             let mut neighbors = self.graph.neighbors(host_id);
 
-            let (downlink_sender, downlink_receiver) = unbounded_channel();
             let endpoint = endpoint_iter.next().unwrap();
 
             if let Some(next_neighbor) = neighbors.next() {

@@ -1,4 +1,4 @@
-//! The main program for running a simulation using a specific configuration.
+//! An example of connecting a packet switch.
 
 use std::collections::HashMap;
 use std::sync::Arc;

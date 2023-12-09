@@ -1,4 +1,4 @@
-//! The main program for running a simulation using a specific configuration.
+//! An example of connecting two packet sources into one DRR scheduler.
 
 use std::sync::Arc;
 use std::time::Duration;
