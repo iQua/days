@@ -35,7 +35,7 @@ impl PacketSwitch {
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
-        for (_, element_id) in &fib {
+        for element_id in fib.values() {
             if !outputs.contains_key(element_id) {
                 outputs.insert(*element_id, Output::default());
             }
