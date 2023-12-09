@@ -8,6 +8,7 @@ use log::debug;
 
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
+use tachyonix::{channel, Sender};
 
 use crate::endpoints::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::endpoints::packet::Packet;
@@ -49,6 +50,7 @@ pub struct DRRServer {
     /// The server is considered busy sending the current packet until this time
     busy_until: f64,
 
+    pub sender: Sender<(Packet, usize)>,
     pub output: Output<Packet>,
 }
 
@@ -97,11 +99,16 @@ impl DRRServer {
             current_queue: 0,
             busy_until: 0.0,
             output: Output::default(),
+            sender: channel(100).0,
         }
     }
 
     fn id(&self) -> usize {
         self.scheduler_id
+    }
+
+    pub fn connect_sender(&mut self, sender: Sender<(Packet, usize)>) {
+        self.sender = sender;
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
@@ -155,6 +162,7 @@ impl DRRServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        let _ = self.sender.send((packet.clone(), self.scheduler_id)).await;
         self.output.send(packet).await;
     }
 

@@ -1,8 +1,8 @@
 //! The main program for running a simulation using a specific configuration.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashMap;
 
 use log::info;
 
@@ -12,8 +12,8 @@ use asynchronix::time::MonotonicTime;
 use due::endpoints::sink::PacketSink;
 use due::endpoints::source::PacketSource;
 use due::endpoints::switch::PacketSwitch;
-use due::flows::flow::DistributionInfo;
 use due::endpoints::SchedulingDiscipline;
+use due::flows::flow::DistributionInfo;
 
 fn main() {
     let env = env_logger::Env::default();
@@ -46,7 +46,7 @@ fn main() {
         seed,
     );
 
-    let mut switch = PacketSwitch::new(
+    let switch: PacketSwitch = PacketSwitch::new(
         4000.0,
         100,
         vec![1],
@@ -70,19 +70,19 @@ fn main() {
         .output
         .connect(PacketSwitch::packet_received, &switch_mbox);
 
-    // connects to the packet sink with an element id of 2
-    sender = switch.senders.get 
-    switch.senders[2].connect(PacketSink::packet_received, &sink_mbox);
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
-    let mut sim = SimInit::new()
+
+    // connects to the packet sink with an element id of 2
+    let sim_init = SimInit::new()
         .add_model(source_1, source_1_mbox)
         .add_model(source_2, source_2_mbox)
         .add_model(switch, switch_mbox)
-        .add_model(sink, sink_mbox)
-        .init(t0);
+        .add_model(sink, sink_mbox);
+
+    let mut sim = sim_init.init(t0);
 
     // starts the simulation
     sim.step_by(Duration::from_secs(100));

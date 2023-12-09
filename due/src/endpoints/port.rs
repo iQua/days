@@ -8,6 +8,7 @@ use log::debug;
 
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
+use tachyonix::{channel, Sender};
 
 use crate::endpoints::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 use crate::endpoints::packet::Packet;
@@ -29,6 +30,7 @@ pub struct Port {
     queue: VecDeque<Packet>,
     /// The FIFO server is considered busy sending the current packet until this time
     busy_until: f64,
+    pub sender: Sender<(Packet, usize)>,
     pub output: Output<Packet>,
 }
 
@@ -54,11 +56,16 @@ impl Port {
             queue: VecDeque::new(),
             busy_until: 0.0,
             output: Output::default(),
+            sender: channel(100).0,
         }
     }
 
     pub fn id(&self) -> usize {
         self.scheduler_id
+    }
+
+    pub fn connect_sender(&mut self, sender: Sender<(Packet, usize)>) {
+        self.sender = sender;
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
@@ -106,6 +113,7 @@ impl Port {
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        let _ = self.sender.send((packet.clone(), self.scheduler_id)).await;
         self.output.send(packet).await;
     }
 
@@ -154,6 +162,7 @@ impl Port {
 
                     self.packet_sent(now + timeout, packet);
                 } else {
+                    let _ = self.sender.send((packet.clone(), self.scheduler_id)).await;
                     self.output.send(packet.clone()).await;
                     self.packet_sent(now, packet);
                 }

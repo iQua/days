@@ -10,6 +10,7 @@ use log::debug;
 use asynchronix::model::{Model, Output};
 use asynchronix::simulation::Mailbox;
 use asynchronix::time::{MonotonicTime, Scheduler};
+use tachyonix::Sender;
 
 use crate::endpoints::drop::{CapacityUnit, DropStrategy};
 use crate::endpoints::drr::DRRServer;
@@ -46,7 +47,7 @@ pub struct PacketSwitch {
 
     /// senders for sending outbound packets to downstream elements
     /// element_id -> the sender to a downstream element
-    pub senders: HashMap<usize, Output<Packet>>,
+    pub senders: HashMap<usize, Sender<(Packet, usize)>>,
 }
 
 impl PacketSwitch {
@@ -91,11 +92,19 @@ impl PacketSwitch {
         &self.fib
     }
 
-    pub fn connect_sender(&mut self, element_id: usize) {
+    pub fn get_sender(&self, element_id: usize) -> Option<Sender<(Packet, usize)>> {
+        if let Some(sender) = self.senders.get(&element_id) {
+            return Some(sender.clone());
+        }
+
+        None
+    }
+
+    pub fn connect_sender(&mut self, element_id: usize, sender: Sender<(Packet, usize)>) {
         // creates a port with the specified scheduling discipline
         match self.discipline {
             SchedulingDiscipline::DRR => {
-                let port;
+                let mut port;
                 if element_id < num_elements() {
                     // sends to another network element
                     port = DRRServer::new(
@@ -122,10 +131,12 @@ impl PacketSwitch {
 
                 port_sender.connect(DRRServer::packet_received, &drr_mbox);
                 self.port_senders.insert(element_id, port_sender);
+
+                port.connect_sender(sender.clone());
                 self.ports.insert(element_id, Arc::new(Mutex::new(port)));
             }
             SchedulingDiscipline::FIFO => {
-                let port;
+                let mut port;
                 if element_id < num_elements() {
                     // sends to another network element
                     port = Port::new(
@@ -143,9 +154,12 @@ impl PacketSwitch {
 
                 port_sender.connect(Port::packet_received, &port_mbox);
                 self.port_senders.insert(element_id, port_sender);
+                port.connect_sender(sender.clone());
                 self.ports.insert(element_id, Arc::new(Mutex::new(port)));
             }
         }
+
+        self.senders.insert(element_id, sender.clone());
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
@@ -171,27 +185,6 @@ impl PacketSwitch {
             port_sender.send(packet).await;
         }
     }
-
-    // pub async fn get_sender(mut self, element_id: usize) -> &'a Output<Packet> {
-    //     match self.discipline {
-    //         SchedulingDiscipline::DRR => {
-    //             if let Some(port) = self.ports.get_mut(&element_id) {
-    //                 let p = port.lock().unwrap().downcast_ref::<DRRServer>().unwrap();
-    //                 &p.output
-    //             } else {
-    //                 panic!("No sender found for element {}.", element_id);
-    //             }
-    //         }
-    //         SchedulingDiscipline::FIFO => {
-    //             if let Some(port) = self.ports.get_mut(&element_id) {
-    //                 let p = port.lock().unwrap().downcast_ref::<Port>().unwrap();
-    //                 &p.output
-    //             } else {
-    //                 panic!("No sender found for element {}.", element_id);
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 impl Model for PacketSwitch {}
