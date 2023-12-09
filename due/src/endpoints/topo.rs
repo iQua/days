@@ -21,8 +21,9 @@ use crate::endpoints::build::FatTreeConfig;
 use crate::endpoints::drop::{CapacityUnit, DropStrategy};
 use crate::endpoints::drr::DRRServer;
 use crate::endpoints::flow::Flow;
+use crate::endpoints::port::Port;
 use crate::endpoints::switch::PacketSwitch;
-use crate::endpoints::SchedulingDiscipline;
+use crate::endpoints::{Scheduler, SchedulingDiscipline};
 use crate::set_num_switches;
 
 #[derive(Deserialize)]
@@ -121,39 +122,81 @@ impl Topology {
 
     fn connect_neighbour(&mut self, upstream_id: usize, downstream_mbox: Mailbox<PacketSwitch>) {
         let upstream_switch = &mut self.switches[upstream_id];
-        let mut scheduler;
+        let mut scheduler: Scheduler = match &self.config {
+            Config::SwitchConfig(config) => match config.switch[upstream_id].discipline {
+                SchedulingDiscipline::DRR => {
+                    let server = DRRServer::new(
+                        config.switch[upstream_id].port_rate,
+                        config.switch[upstream_id].capacity,
+                        CapacityUnit::Packets,
+                        Arc::new(|flow_id| flow_id),
+                        DropStrategy::TailDrop,
+                        config.switch[upstream_id].weights.clone(),
+                    );
 
-        match &self.config {
-            Config::SwitchConfig(config) => {
-                scheduler = DRRServer::new(
-                    config.switch[upstream_id].port_rate,
-                    config.switch[upstream_id].capacity,
-                    CapacityUnit::Packets,
-                    Arc::new(|flow_id| flow_id),
-                    DropStrategy::TailDrop,
-                    config.switch[upstream_id].weights.clone(),
-                );
-            }
-            Config::FatTreeConfig(config) => {
-                scheduler = DRRServer::new(
-                    config.port_rate,
-                    config.capacity,
-                    CapacityUnit::Packets,
-                    Arc::new(|flow_id| flow_id),
-                    DropStrategy::TailDrop,
-                    config.weights.clone(),
-                );
-            }
-        }
+                    Scheduler::DRRServer(server)
+                }
+                SchedulingDiscipline::FIFO => {
+                    let server = Port::new(
+                        config.switch[upstream_id].port_rate,
+                        config.switch[upstream_id].capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    );
+
+                    Scheduler::Port(server)
+                }
+            },
+            Config::FatTreeConfig(config) => match config.discipline {
+                SchedulingDiscipline::DRR => {
+                    let server = DRRServer::new(
+                        config.port_rate,
+                        config.capacity,
+                        CapacityUnit::Packets,
+                        Arc::new(|flow_id| flow_id),
+                        DropStrategy::TailDrop,
+                        config.weights.clone(),
+                    );
+
+                    Scheduler::DRRServer(server)
+                }
+                SchedulingDiscipline::FIFO => {
+                    let server = Port::new(
+                        config.port_rate,
+                        config.capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    );
+
+                    Scheduler::Port(server)
+                }
+            },
+        };
 
         let mut output = Output::default();
-        let scheduler_mbox = Mailbox::new();
-        output.connect(DRRServer::packet_received, &scheduler_mbox);
-        upstream_switch.outputs.insert(upstream_id, output);
-        scheduler
-            .output
-            .connect(PacketSwitch::packet_received, &downstream_mbox);
-        self.sim_init = self.sim_init.add_model(scheduler, scheduler_mbox);
+
+        match scheduler {
+            Scheduler::DRRServer(mut drr_server) => {
+                let scheduler_mbox: Mailbox<DRRServer> = Mailbox::new();
+                output.connect(DRRServer::packet_received, &scheduler_mbox);
+                upstream_switch.outputs.insert(upstream_id, output);
+                drr_server
+                    .output
+                    .connect(PacketSwitch::packet_received, &downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(drr_server, scheduler_mbox)
+            }
+
+            Scheduler::Port(mut port) => {
+                let scheduler_mbox: Mailbox<Port> = Mailbox::new();
+                output.connect(Port::packet_received, &scheduler_mbox);
+                upstream_switch.outputs.insert(upstream_id, output);
+                port.output
+                    .connect(PacketSwitch::packet_received, &downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(port, scheduler_mbox);
+            }
+        }
     }
 
     /// Connects a vector of packet switches according to edges in the network topology.
