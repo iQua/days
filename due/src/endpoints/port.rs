@@ -29,6 +29,7 @@ pub struct Port {
     queue: VecDeque<Packet>,
     /// The FIFO server is considered busy sending the current packet until this time
     busy_until: f64,
+
     pub output: Output<Packet>,
 }
 
