@@ -164,12 +164,15 @@ impl Topology {
         }
     }
 
-    fn connect_neighbours(
-        &mut self,
-        upstream_id: usize,
-        downstream_id: usize,
-        downstream_mbox: &Mailbox<PacketSwitch>,
-    ) {
+    // Initializes mailboxes for switches
+    fn init_mailboxes(&mut self) {
+        for (_, switch) in self.switches.iter() {
+            let switch_mbox: Mailbox<PacketSwitch> = Mailbox::new();
+            self.switch_mailboxes.insert(switch.id(), switch_mbox);
+        }
+    }
+
+    fn connect_neighbours(&mut self, upstream_id: usize, downstream_id: usize) {
         debug!(
             "Connecting switch {} with switch {}.",
             upstream_id, downstream_id
@@ -233,6 +236,8 @@ impl Topology {
                 let scheduler_mbox: Mailbox<DRRServer> = Mailbox::new();
                 output.connect(DRRServer::packet_received, &scheduler_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
                 drr_server
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
@@ -242,6 +247,8 @@ impl Topology {
                 let scheduler_mbox: Mailbox<Port> = Mailbox::new();
                 output.connect(Port::packet_received, &scheduler_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
                 port.output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
             }
@@ -254,21 +261,16 @@ impl Topology {
             "Connecting {} switches according to the network topology.",
             self.switches.len()
         );
-        self.switch_mailboxes = HashMap::new();
-
         for node_id in self.graph.node_indices() {
-            let switch_mbox = Mailbox::new();
-
             for neighbor in graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them
                 if neighbor.index() != node_id.index() {
-                    self.connect_neighbours(neighbor.index(), node_id.index(), &switch_mbox);
+                    self.connect_neighbours(neighbor.index(), node_id.index());
+                    self.connect_neighbours(node_id.index(), neighbor.index());
                 }
             }
-
-            self.switch_mailboxes.insert(node_id.index(), switch_mbox);
         }
     }
 
@@ -375,19 +377,11 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(switch, switch_mbox);
         }
 
-        //let source_mbox = self.source_mailboxes.remove(&2).unwrap();
-        let source_mbox = Mailbox::new();
-        let source = self.sources.remove(&2).unwrap();
-        self.sim_init = self.sim_init.add_model(source, source_mbox);
-        //let source_mbox = self.source_mailboxes.remove(&4).unwrap();
-        let source_mbox = Mailbox::new();
-        let source = self.sources.remove(&4).unwrap();
-        self.sim_init = self.sim_init.add_model(source, source_mbox);
-        // for (_, source) in self.sources {
-        //     let source_mbox = self.source_mailboxes.remove(&source.id()).unwrap();
-        //     println!("Activating source {}", source.id());
-        //     self.sim_init = self.sim_init.add_model(source, source_mbox);
-        // }
+        for (_, source) in self.sources {
+            let source_mbox = self.source_mailboxes.remove(&source.id()).unwrap();
+            println!("Activating source {}", source.id());
+            self.sim_init = self.sim_init.add_model(source, source_mbox);
+        }
 
         for (_, sink) in self.sinks {
             let sink_mbox = self.sink_mailboxes.remove(&sink.id()).unwrap();
@@ -401,6 +395,8 @@ impl Topology {
     }
 
     pub fn run(mut self, graph: UnGraph<usize, ()>) {
+        // initializes mailboxes for switches
+        self.init_mailboxes();
         // constructs the network graph with network switches
         self.connect(graph);
         // attaches sources and sinks to hosts in the network graph
