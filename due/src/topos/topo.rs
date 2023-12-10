@@ -41,6 +41,7 @@ struct TomlSwitch {
 pub struct SwitchConfig {
     switch: Vec<TomlSwitch>,
 }
+
 pub enum Config {
     SwitchConfig(SwitchConfig),
     FatTreeConfig(FatTreeConfig),
@@ -73,6 +74,7 @@ impl SinkStatistics {
         sim
     }
 }
+
 pub struct Topology {
     /// The simulation engine
     sim_init: SimInit,
@@ -129,7 +131,7 @@ impl Topology {
         }
     }
 
-    // Initializes mailboxes for switches
+    // Initializes mailboxes for switches.
     fn init_mailboxes(&mut self) {
         for (_, switch) in self.switches.iter() {
             let switch_mbox: Mailbox<PacketSwitch> = Mailbox::new();
@@ -160,7 +162,8 @@ impl Topology {
         switches
     }
 
-    /// Connects a hash map of packet switches according to edges in a network topology.
+    /// Connects a hash map of packet switches according to edges in a network
+    /// topology.
     fn connect(mut self, graph: UnGraph<usize, ()>) -> Self {
         debug!(
             "Connecting {} switches according to the network topology.",
