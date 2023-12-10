@@ -111,7 +111,7 @@ impl WFQServer {
         let mut byte_sizes = Vec::new();
         let (sender, receiver) = unbounded_channel();
 
-        for _ in weights.iter().enumerate() {
+        for _ in &weights {
             finish_times.push(0.0);
             flow_queue_count.push(0);
             byte_sizes.push(0);
@@ -284,7 +284,7 @@ impl WFQServer {
                     packet.size,
                     packet.flow_id,
                     sim.now(),
-                    self.active_set.len(),
+                    self.scheduler_queue.len(),
                 );
             } // finishes going through the queue in one round
 
