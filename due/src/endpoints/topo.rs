@@ -272,36 +272,6 @@ impl Topology {
         }
     }
 
-    /// Activates all the switches and endpoints in the topology.
-    fn activate(mut self) -> Simulation {
-        debug!(
-            "Activating all {} switches, {} packet sources, and {} packet sinks.",
-            self.switches.len(),
-            self.sources.len(),
-            self.sinks.len()
-        );
-
-        for (_, switch) in self.switches {
-            let switch_mbox = self.switch_mailboxes.remove(&switch.id()).unwrap();
-            println!("Activating switch {}", switch.id());
-            self.sim_init = self.sim_init.add_model(switch, switch_mbox);
-        }
-
-        for (_, source) in self.sources {
-            let source_mbox = self.source_mailboxes.remove(&source.id()).unwrap();
-            println!("Activating source {}", source.id());
-            self.sim_init = self.sim_init.add_model(source, source_mbox);
-        }
-
-        for (_, sink) in self.sinks {
-            let sink_mbox = self.sink_mailboxes.remove(&sink.id()).unwrap();
-            println!("Activating sink {}", sink.id());
-            self.sim_init = self.sim_init.add_model(sink, sink_mbox);
-        }
-
-        self.sim_init.init(MonotonicTime::EPOCH)
-    }
-
     /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
     fn attach(&mut self) {
         // obtains the upstream_id of all end hosts (where endpoints can be
@@ -326,6 +296,7 @@ impl Topology {
             // obtains the next packet source
             if let Some((_, source)) = source_iter.next() {
                 // obtains the host's mailbox
+                println!("host_id = {}", host_id.index());
                 let host_mbox = self.switch_mailboxes.get(&host_id.index()).unwrap();
 
                 // establishes a bi-directional connection between the packet source and the host
@@ -351,7 +322,7 @@ impl Topology {
                 // obtains the host's mailbox
                 let host_mbox = self.switch_mailboxes.get(&host_id.index()).unwrap();
 
-                // establishes a bi-directional connection between the packet source and the host
+                // establishes a bi-directional connection between the packet sink and the host
                 let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
 
                 sink.output
@@ -387,6 +358,46 @@ impl Topology {
                 }
             }
         }
+    }
+
+    /// Activates all the switches and endpoints in the topology.
+    fn activate(mut self) -> Simulation {
+        debug!(
+            "Activating all {} switches, {} packet sources, and {} packet sinks.",
+            self.switches.len(),
+            self.sources.len(),
+            self.sinks.len()
+        );
+
+        for (_, switch) in self.switches {
+            let switch_mbox = self.switch_mailboxes.remove(&switch.id()).unwrap();
+            println!("Activating switch {}", switch.id());
+            self.sim_init = self.sim_init.add_model(switch, switch_mbox);
+        }
+
+        //let source_mbox = self.source_mailboxes.remove(&2).unwrap();
+        let source_mbox = Mailbox::new();
+        let source = self.sources.remove(&2).unwrap();
+        self.sim_init = self.sim_init.add_model(source, source_mbox);
+        //let source_mbox = self.source_mailboxes.remove(&4).unwrap();
+        let source_mbox = Mailbox::new();
+        let source = self.sources.remove(&4).unwrap();
+        self.sim_init = self.sim_init.add_model(source, source_mbox);
+        // for (_, source) in self.sources {
+        //     let source_mbox = self.source_mailboxes.remove(&source.id()).unwrap();
+        //     println!("Activating source {}", source.id());
+        //     self.sim_init = self.sim_init.add_model(source, source_mbox);
+        // }
+
+        for (_, sink) in self.sinks {
+            let sink_mbox = self.sink_mailboxes.remove(&sink.id()).unwrap();
+            println!("Activating sink {}", sink.id());
+            self.sim_init = self.sim_init.add_model(sink, sink_mbox);
+        }
+
+        // Connects the output of packet source to the input of packet sink.
+
+        self.sim_init.init(MonotonicTime::EPOCH)
     }
 
     pub fn run(mut self, graph: UnGraph<usize, ()>) {

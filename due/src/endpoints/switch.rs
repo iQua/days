@@ -22,7 +22,7 @@ pub struct PacketSwitch {
     fib: HashMap<usize, usize>,
 
     /// senders for sending inbound packets to outbound ports
-    /// element_id -> outputs to downstream schedulers
+    /// element_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
 }
 

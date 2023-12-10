@@ -26,8 +26,8 @@ fn main() {
             high: 1000,
         },
     );
-    let mut sink = PacketSink::new(0);
     let source_mbox = Mailbox::new();
+    let mut sink = PacketSink::new(0);
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
