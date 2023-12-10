@@ -136,28 +136,18 @@ impl Port {
             let now = current_time.as_secs_f64();
 
             if let Some(mut packet) = self.queue.pop_front() {
-                packet.send(now);
+                packet.update(now);
+                let timeout = packet.size as f64 * 8.0 / self.rate;
 
-                if self.rate > 0.0 {
-                    let timeout = packet.size as f64 * 8.0 / self.rate;
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
+                    .unwrap();
 
-                    scheduler
-                        .schedule_event(
-                            Duration::from_secs_f64(timeout),
-                            Self::send,
-                            packet.clone(),
-                        )
-                        .unwrap();
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                    .unwrap();
 
-                    scheduler
-                        .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                        .unwrap();
-
-                    self.packet_sent(now + timeout, packet);
-                } else {
-                    self.output.send(packet.clone()).await;
-                    self.packet_sent(now, packet);
-                }
+                self.packet_sent(now + timeout, packet);
             }
         }
     }

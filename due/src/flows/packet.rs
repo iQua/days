@@ -68,7 +68,7 @@ impl Packet {
     }
 
     /// updates the queueing delay of the packet.
-    pub fn send(&mut self, time: f64) {
+    pub fn update(&mut self, time: f64) {
         self.queueing_delay += time - self.time;
         self.time = time;
     }

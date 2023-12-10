@@ -136,7 +136,7 @@ impl PacketSource {
             now,
         );
 
-        packet.send(now);
+        packet.update(now);
 
         (packet, Duration::from_secs_f64(interval))
     }

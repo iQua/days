@@ -196,7 +196,7 @@ impl DRRServer {
                 {
                     self.byte_sizes[self.current_queue] -= packet.size;
                     let mut outbound = self.queues[self.current_queue].pop_front().unwrap();
-                    outbound.send(now);
+                    outbound.update(now);
 
                     self.packets_waiting -= 1;
                     self.deficit[self.current_queue] -= packet.size;
