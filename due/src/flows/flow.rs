@@ -133,9 +133,9 @@ impl Flow {
 
         let mut paths = Vec::new();
 
-        for (idx, edge) in self.graph.edge_references().enumerate() {
+        for (edge_index, edge) in self.graph.edge_references().enumerate() {
             let mut path = self.routing.compute_route(edge.source(), edge.target());
-            let sink_id = self.sink_ids[&idx];
+            let sink_id = self.sink_ids[&edge_index];
             path.push(NodeIndex::new(sink_id));
             paths.push(path);
         }

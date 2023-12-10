@@ -15,11 +15,11 @@ use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
 use asynchronix::model::Output;
-use asynchronix::simulation::{Mailbox, SimInit, Simulation};
+use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
 use asynchronix::time::MonotonicTime;
 
 use crate::flows::flow::Flow;
-use crate::flows::sink::PacketSink;
+use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
@@ -44,6 +44,34 @@ pub struct SwitchConfig {
 pub enum Config {
     SwitchConfig(SwitchConfig),
     FatTreeConfig(FatTreeConfig),
+}
+
+#[derive(Default)]
+struct SinkStatistics {
+    // A vector of sink ids
+    sink_ids: Vec<usize>,
+    // sink id -> sink mailbox address
+    sink_addresses: HashMap<usize, Address<PacketSink>>,
+    // sink id -> sink statistics
+    sink_statistics: HashMap<usize, EventSlot<PacketStatistics>>,
+}
+
+impl SinkStatistics {
+    /// Collects and outputs the packet statistics at all sinks after the
+    /// simulation finishes.
+    pub fn collect_statistics(&mut self, mut sim: Simulation) -> Simulation {
+        for sink_id in self.sink_ids.iter() {
+            let sink_addr = self.sink_addresses.get(&sink_id).unwrap();
+            sim.send_event(PacketSink::report, *sink_id, sink_addr);
+
+            let mut sink_statistics = self.sink_statistics.remove(&sink_id).unwrap();
+            if let Some(statistics) = sink_statistics.take() {
+                info!("{:#.3}", statistics);
+            }
+        }
+
+        sim
+    }
 }
 pub struct Topology {
     /// The simulation engine
@@ -227,7 +255,7 @@ impl Topology {
     }
 
     /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
-    fn attach(mut self) -> Self {
+    fn attach(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
@@ -235,20 +263,6 @@ impl Topology {
 
         for flow in self.flows.iter_mut() {
             for (edge_index, edge) in flow.graph.edge_references().enumerate() {
-                let mut source = PacketSource::new(
-                    flow.id,
-                    flow.initial_delay,
-                    flow.duration,
-                    flow.arr_dist,
-                    flow.pkt_size_dist,
-                );
-
-                let mut sink = PacketSink::new(flow.id);
-
-                // record the packet sink ids for later construction of paths
-                // in Flow::compute_paths()
-                flow.sink_ids.insert(edge_index, sink.id());
-
                 // an element in the network must be a host, as specified by the
                 // network graph
                 assert!(self.hosts.contains(&edge.source().index()));
@@ -256,6 +270,15 @@ impl Topology {
 
                 // attaches each endpoint to its corresponding host
                 // source -> edge.source(), sink -> edge.target()
+
+                // creates a new packet source
+                let mut source = PacketSource::new(
+                    flow.id,
+                    flow.initial_delay,
+                    flow.duration,
+                    flow.arr_dist,
+                    flow.pkt_size_dist,
+                );
 
                 // obtains the host switch and its mailbox for the packet source
                 let source_host = self.switches.get_mut(&edge.source().index()).unwrap();
@@ -273,12 +296,29 @@ impl Topology {
                 // activates the packet source
                 self.sim_init = self.sim_init.add_model(source, source_mbox);
 
+                // creates a new packet sink
+                let mut sink = PacketSink::new(flow.id);
+
                 // obtains the host switch and its mailbox for the packet sink
                 let sink_host = self.switches.get_mut(&edge.target().index()).unwrap();
                 let host_mbox = self.switch_mailboxes.get(&edge.target().index()).unwrap();
 
                 // establishes a bi-directional connection between the packet sink and the host
                 let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
+
+                // record the packet sink ids for later construction of paths in
+                // Flow::compute_paths()
+                flow.sink_ids.insert(edge_index, sink.id());
+
+                // records the sink ids, sink mailbox's address and sink
+                // statistics event slot for the retrieval of packet statistics
+                // after the simulation finishes
+                stats.sink_ids.push(sink.id());
+                stats.sink_addresses.insert(sink.id(), sink_mbox.address());
+                stats
+                    .sink_statistics
+                    .insert(sink.id(), sink.statistics.connect_slot().0);
+
                 sink.output
                     .connect(PacketSwitch::packet_received, host_mbox);
                 let mut output = Output::default();
@@ -332,12 +372,14 @@ impl Topology {
     }
 
     pub fn run(mut self, graph: UnGraph<usize, ()>) {
+        let mut statistics = SinkStatistics::default();
+
         // initializes mailboxes for the packet switches
         self.init_mailboxes();
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
         // attaches sources and sinks to hosts in the network graph
-        self = self.attach();
+        self = self.attach(&mut statistics);
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route();
         // activates all the switches and initializes the simulation
@@ -345,6 +387,7 @@ impl Topology {
 
         // starts the simulation
         sim.step_by(Duration::from_secs(100));
+        sim = statistics.collect_statistics(sim);
 
         info!(
             "Simulation completed at time {:.3}.",
