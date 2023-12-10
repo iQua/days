@@ -5,6 +5,7 @@ pub mod port;
 pub mod sink;
 pub mod source;
 pub mod switch;
+pub mod wfq;
 
 use crate::endpoints::sink::PacketSink;
 use crate::endpoints::source::PacketSource;
