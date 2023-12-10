@@ -87,14 +87,13 @@ fn main() {
     let t0 = MonotonicTime::EPOCH;
 
     // connects to the packet sink with an element id of 2
-    let mut sim_init = SimInit::new();
-    sim_init = sim_init.add_model(source_1, source_1_mbox);
-    sim_init = sim_init.add_model(source_2, source_2_mbox);
-    sim_init = sim_init.add_model(switch, switch_mbox);
-    sim_init = sim_init.add_model(drr, drr_mbox);
-    sim_init = sim_init.add_model(sink, sink_mbox);
-
-    let mut sim = sim_init.init(t0);
+    let mut sim = SimInit::new()
+        .add_model(source_1, source_1_mbox)
+        .add_model(source_2, source_2_mbox)
+        .add_model(switch, switch_mbox)
+        .add_model(drr, drr_mbox)
+        .add_model(sink, sink_mbox)
+        .init(t0);
 
     // starts the simulation
     sim.step_by(Duration::from_secs(100));

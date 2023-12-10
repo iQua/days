@@ -107,6 +107,7 @@ impl PacketSource {
     }
 
     fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+        println!("In produce packet.");
         let interval = match self.arr_dist {
             DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
             DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
@@ -151,6 +152,8 @@ impl PacketSource {
             let now = current_time.as_secs_f64();
             let (packet, interval) = self.produce_packet(now);
 
+            println!("sending packet {} out.", packet.packet_id);
+
             // sends the packet out to the next element now
             self.output.send(packet.clone()).await;
             self.packet_sent(current_time, packet);
@@ -174,6 +177,12 @@ impl Model for PacketSource {
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
             if self.initial_delay > 0.0 {
+                println!(
+                    "self.initial_delay for source {} = {}",
+                    self.id(),
+                    self.initial_delay
+                );
+
                 scheduler
                     .schedule_event(Duration::from_secs_f64(self.initial_delay), Self::run, ())
                     .unwrap();

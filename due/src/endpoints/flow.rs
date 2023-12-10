@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
@@ -5,9 +6,6 @@ use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
 use crate::endpoints::route::{RandomSimplePath, RoutingProtocol};
-use crate::endpoints::EndPoint;
-use crate::endpoints::PacketSink;
-use crate::endpoints::PacketSource;
 use crate::next_flow_id;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -48,8 +46,10 @@ pub struct Flow {
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
-    pub endpoints: Vec<EndPoint>,
     pub routing: RandomSimplePath,
+
+    // edge index -> sink id
+    pub sink_ids: HashMap<usize, usize>,
 }
 
 impl Flow {
@@ -71,8 +71,8 @@ impl Flow {
             duration,
             arr_dist,
             pkt_size_dist,
-            endpoints: Vec::new(),
             routing,
+            sink_ids: HashMap::new(),
         }
     }
 
@@ -135,16 +135,7 @@ impl Flow {
 
         for (idx, edge) in self.graph.edge_references().enumerate() {
             let mut path = self.routing.compute_route(edge.source(), edge.target());
-            let sink_id = self
-                .endpoints
-                .iter()
-                .filter_map(|endpoint| match endpoint {
-                    EndPoint::PacketSink(sink) => Some(sink),
-                    _ => None,
-                })
-                .nth(idx)
-                .unwrap()
-                .id();
+            let sink_id = self.sink_ids[&idx];
             path.push(NodeIndex::new(sink_id));
             paths.push(path);
         }
@@ -160,21 +151,5 @@ impl Flow {
         }
 
         attach_to
-    }
-
-    // Initializes endpoints for the flow
-    pub fn init_endpoints(&mut self) {
-        for _ in 0..self.graph.edge_count() {
-            self.endpoints
-                .push(EndPoint::PacketSource(PacketSource::new(
-                    self.id,
-                    self.initial_delay,
-                    self.duration,
-                    self.arr_dist,
-                    self.pkt_size_dist,
-                )));
-            self.endpoints
-                .push(EndPoint::PacketSink(PacketSink::new(self.id)));
-        }
     }
 }
