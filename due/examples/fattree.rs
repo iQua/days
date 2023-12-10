@@ -3,10 +3,10 @@
 
 use log::info;
 
-use due::endpoints::build::build_fattree;
-use due::endpoints::flow::Flow;
-use due::endpoints::topo::Topology;
+use due::flows::flow::Flow;
 use due::seed_from_config;
+use due::topos::build::build_fattree;
+use due::topos::topo::Topology;
 
 fn main() {
     let env = env_logger::Env::default();

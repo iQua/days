@@ -1,25 +1,12 @@
-use std::cell::RefCell;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rand::rngs::SmallRng;
 use serde::Deserialize;
 
-use crate::sim::{RandomVar, Time};
-
-pub mod endpoints;
 pub mod flows;
 pub mod schedulers;
-pub mod sim;
 pub mod switches;
 pub mod topos;
-
-/// Globally shared data.
-pub struct Shared {
-    pub rng: RefCell<SmallRng>,
-    pub queueing_delay: RandomVar,
-    pub duration: Time,
-}
 
 #[derive(Deserialize)]
 pub struct SeedConfig {

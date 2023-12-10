@@ -1,26 +1,35 @@
 //! Implements a packet source that simulates the sending of packets with
 //! specific distributions of inter-arrival times and packet sizes.
 
-use log::debug;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use log::{debug, info};
 use rand::distributions::Distribution;
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use statrs::distribution::{DiscreteUniform, Exp};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use asynchronix::model::{InitializedModel, Model, Output};
+use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::flow::DistributionInfo;
 use crate::flows::packet::Packet;
-use crate::sim::{SimContext, Time};
-use crate::{next_endpoint_id, Shared};
+use crate::{get_seed, next_endpoint_id};
 
 #[derive(Debug)]
 pub struct PacketSource {
     endpoint_id: usize,
     flow_id: usize,
-    initial_delay: Time,
+    initial_delay: f64,
+    duration: f64,
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
     packets_sent: usize,
-    sender: UnboundedSender<Packet>,
-    receiver: UnboundedReceiver<Packet>,
+    rng: SmallRng,
+
+    pub output: Output<Packet>,
 }
 
 impl Clone for PacketSource {
@@ -29,11 +38,12 @@ impl Clone for PacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id: self.flow_id,
             initial_delay: self.initial_delay,
+            duration: self.duration,
             arr_dist: self.arr_dist,
             pkt_size_dist: self.pkt_size_dist,
             packets_sent: 0,
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
+            rng: self.rng.clone(),
+            output: Output::default(),
         }
     }
 }
@@ -41,19 +51,27 @@ impl Clone for PacketSource {
 impl PacketSource {
     pub fn new(
         flow_id: usize,
-        initial_delay: Time,
+        initial_delay: f64,
+        duration: f64,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> PacketSource {
+        let seed = get_seed();
+        let rng = match seed {
+            1.. => SmallRng::seed_from_u64(seed as u64),
+            _ => SmallRng::from_entropy(),
+        };
+
         PacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
             initial_delay,
+            duration,
             arr_dist,
             pkt_size_dist,
             packets_sent: 0,
-            sender: unbounded_channel().0,
-            receiver: unbounded_channel().1,
+            rng,
+            output: Output::default(),
         }
     }
 
@@ -65,81 +83,108 @@ impl PacketSource {
         self.flow_id
     }
 
-    pub fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
-
-    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
-
-    pub fn connect_switch(
-        &mut self,
-        sender: UnboundedSender<Packet>,
-        receiver: UnboundedReceiver<Packet>,
-    ) {
-        self.sender = sender;
-        self.receiver = receiver;
-    }
-
-    fn packet_sent(&mut self, now: Time, packet: Packet) {
+    fn packet_sent(&mut self, now: Duration, packet: Packet) {
         self.packets_sent += 1;
 
         debug!(
             "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
+            self.endpoint_id,
+            packet.packet_id,
+            packet.size,
+            now.as_secs_f64(),
+            self.packets_sent,
         );
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
         debug!(
-            "PacketSource {} will be waiting for {:.3} sec(s) at the beginning.",
-            self.endpoint_id, self.initial_delay
+            "PacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+        );
+    }
+
+    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+        let interval = match self.arr_dist {
+            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
+            DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
+                .unwrap()
+                .sample(&mut self.rng),
+        };
+
+        let packet_size = match self.pkt_size_dist {
+            DistributionInfo::Exp { lambda } => {
+                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
+            }
+            DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
+                .unwrap()
+                .sample(&mut self.rng)
+                as usize,
+        };
+
+        let src = format!("source-{}", self.endpoint_id);
+        let dst = format!("destination-{}", self.endpoint_id);
+
+        let mut packet = Packet::new(
+            packet_size,
+            self.packets_sent,
+            src,
+            dst,
+            self.flow_id(),
+            now,
         );
 
-        sim.advance(self.initial_delay).await;
+        packet.send(now);
 
-        while sim.now() < sim.shared().duration {
-            let interval = match self.arr_dist {
-                DistributionInfo::Exp { lambda } => Exp::new(lambda)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut()),
-                DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut()),
-            };
-            sim.advance(interval).await;
+        (packet, Duration::from_secs_f64(interval))
+    }
 
-            let packet_size = match self.pkt_size_dist {
-                DistributionInfo::Exp { lambda } => Exp::new(lambda)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut())
-                    as usize,
-                DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
-                    .unwrap()
-                    .sample(&mut *sim.shared().rng.borrow_mut())
-                    as usize,
-            };
+    pub fn run<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+            let now = current_time.as_secs_f64();
+            let (packet, interval) = self.produce_packet(now);
 
-            let mut packet = Packet::new(
-                packet_size,
-                self.packets_sent,
-                "PacketSource".to_string(),
-                "destination".to_string(),
-                self.flow_id(),
-                sim.now(),
-            );
+            // sends the packet out to the next element now
+            self.output.send(packet.clone()).await;
+            self.packet_sent(current_time, packet);
 
-            packet.send(sim.now());
-            let _ = self.sender.send(packet.clone());
-
-            self.packet_sent(sim.now(), packet);
+            if now + interval.as_secs_f64() <= self.duration {
+                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+            } else {
+                info!(
+                    "PacketSource {} finished running at {:.3}.",
+                    self.endpoint_id, now
+                );
+            }
         }
+    }
+}
 
-        debug!(
-            "PacketSource {} finished running at time {}.",
-            self.endpoint_id,
-            sim.now()
-        );
+impl Model for PacketSource {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            if self.initial_delay > 0.0 {
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(self.initial_delay), Self::run, ())
+                    .unwrap();
+            } else {
+                panic!(
+                    "PacketSource {}'s initial delay must be positive.",
+                    self.endpoint_id
+                )
+            }
+
+            self.into()
+        })
     }
 }

@@ -7,11 +7,11 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::endpoints::drop::{CapacityUnit, DropStrategy};
-use due::endpoints::flow::DistributionInfo;
-use due::endpoints::port::Port;
-use due::endpoints::sink::PacketSink;
-use due::endpoints::source::PacketSource;
+use due::flows::flow::DistributionInfo;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
+use due::schedulers::drop::{CapacityUnit, DropStrategy};
+use due::schedulers::port::Port;
 
 fn main() {
     let env = env_logger::Env::default();

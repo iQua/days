@@ -2,15 +2,16 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
-use log::{debug, info};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use log::debug;
+
+use asynchronix::model::{Model, Output};
+use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
+use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::schedulers::Scheduler;
-use crate::sim::{SimContext, Time};
-use crate::{next_scheduler_id, Shared};
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -21,10 +22,10 @@ pub struct DRRServer {
     /// a closure that maps a flow_id to a class_id, used to implement
     /// class-based Deficit Round Robin. The default uses a packet's flow_id as
     /// its class_id, which is equivalent to flow-based DRR.
-    pub flow_classes: Arc<dyn Fn(usize) -> usize>,
+    pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
-    drop_strategy: Box<dyn PacketDrop>,
+    drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
     /// deficit of classes, which are consecutive and start from 0
     deficit: Vec<usize>,
@@ -42,20 +43,13 @@ pub struct DRRServer {
     /// FIFO queues of classes, which are consecutive and start from 0
     queues: Vec<VecDeque<Packet>>,
 
-    /// a sender for sending outbound packets to the downstream element
-    pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving inbound packets from upstream elements
-    pub receiver: UnboundedReceiver<Packet>,
-}
+    /// the current packet class being served
+    current_queue: usize,
 
-impl Scheduler for DRRServer {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
+    /// The server is considered busy sending the current packet until this time
+    busy_until: f64,
 
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
+    pub output: Output<Packet>,
 }
 
 impl DRRServer {
@@ -63,7 +57,7 @@ impl DRRServer {
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
-        flow_classes: Arc<dyn Fn(usize) -> usize>,
+        flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> DRRServer {
@@ -72,13 +66,13 @@ impl DRRServer {
         let mut quantum = Vec::new();
         let mut byte_sizes = Vec::new();
         let mut queues = Vec::new();
-        let (sender, receiver) = unbounded_channel();
 
         let min_weight = weights.iter().min().unwrap();
 
         for (class_id, _) in weights.iter().enumerate() {
-            deficit.push(0);
-            quantum.push(min_quantum * weights[class_id] / min_weight);
+            let quantum_value = min_quantum * weights[class_id] / min_weight;
+            quantum.push(quantum_value);
+            deficit.push(quantum_value);
             byte_sizes.push(0);
             queues.push(VecDeque::new());
         }
@@ -100,8 +94,9 @@ impl DRRServer {
             packets_waiting: 0,
             byte_sizes,
             queues,
-            sender,
-            receiver,
+            current_queue: 0,
+            busy_until: 0.0,
+            output: Output::default(),
         }
     }
 
@@ -109,7 +104,10 @@ impl DRRServer {
         self.scheduler_id
     }
 
-    fn packet_received(&mut self, packet: Packet, now: Time) {
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -125,7 +123,7 @@ impl DRRServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                now
+                arrival_time
             }
             return;
         }
@@ -140,86 +138,103 @@ impl DRRServer {
 
         debug!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-            {} packets received, {} packet(s) in class queue {}.",
+            {} packets received, {} packet(s) in flow class {}.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            now,
+            arrival_time,
             self.packets_received,
             self.queues[class_id].len(),
             class_id
         );
+
+        if arrival_time > self.busy_until {
+            self.run((), scheduler);
+        }
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
-        loop {
-            // schedules packets by going through each queue
-            for class_id in 0..self.queues.len() {
-                // increases the deficit of the current queue if it is non-empty
-                if !self.queues[class_id].is_empty() {
+    pub async fn send(&mut self, packet: Packet) {
+        self.output.send(packet).await;
+    }
+
+    /// Moves on to the next queue if the current queue is empty
+    fn next_queue(&mut self) {
+        self.current_queue += 1;
+
+        if self.current_queue >= self.queues.len() {
+            // updates the deficit of each queue
+            for (class_id, queue) in self.queues.iter().enumerate() {
+                if !queue.is_empty() {
                     self.deficit[class_id] += self.quantum[class_id];
                 } else {
                     // resets to zero if the queue is empty
                     self.deficit[class_id] = 0;
                 }
+            }
 
-                let mut current_deficit = self.deficit[class_id];
+            self.current_queue = 0;
+        }
+    }
 
-                while current_deficit > 0 && !self.queues[class_id].is_empty() {
-                    let packet = self.queues[class_id].front().unwrap().clone();
+    pub fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
+        let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+        let now = current_time.as_secs_f64();
 
-                    if packet.size <= current_deficit {
-                        // sends the packet out to the next element
-                        self.byte_sizes[class_id] -= packet.size;
-
-                        let timeout = (packet.size as f64) * 8.0 / self.rate;
-                        sim.advance(timeout).await;
-                        let mut outbound = self.queues[class_id].pop_front().unwrap();
-                        outbound.send(sim.now());
-                        let _ = self.sender.send(packet.clone());
-
-                        self.packets_waiting -= 1;
-                        current_deficit -= packet.size;
-
-                        // polls for and receives all outstanding packets
-                        // recently sent to DDRServer while sending the previous
-                        // packet
-                        while let Ok(packet) = self.receiver.try_recv() {
-                            self.packet_received(packet, sim.now());
-                        }
-
-                        debug!(
-                            "DRRServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
-                                    {} packets in the class queue.",
-                            self.scheduler_id,
-                            packet.packet_id,
-                            packet.size,
-                            packet.flow_id,
-                            sim.now(),
-                            self.queues[class_id].len(),
-                        );
-                    } else {
-                        break;
-                    }
-                }
-
-                self.deficit[class_id] = current_deficit;
-            } // finishes going through each queue in one round
-
-            // waits for inbound packets from the upstream element
+        // schedules packets in the current packet class being served
+        loop {
             if self.packets_waiting == 0 {
-                if let Some(packet) = self.receiver.recv().await {
-                    self.packet_received(packet, sim.now());
+                // all packets in the queues have been processed
+                return;
+            }
+
+            if !self.queues[self.current_queue].is_empty() {
+                let packet = self.queues[self.current_queue].front().unwrap().clone();
+
+                if self.deficit[self.current_queue] > 0
+                    && packet.size <= self.deficit[self.current_queue]
+                {
+                    self.byte_sizes[self.current_queue] -= packet.size;
+                    let mut outbound = self.queues[self.current_queue].pop_front().unwrap();
+                    outbound.send(now);
+
+                    self.packets_waiting -= 1;
+                    self.deficit[self.current_queue] -= packet.size;
+
+                    // sends the packet out to the next element after a timeout
+                    let timeout = packet.size as f64 * 8.0 / self.rate;
+
+                    scheduler
+                        .schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                        .unwrap();
+
+                    // schedules the next run
+                    scheduler
+                        .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                        .unwrap();
+
+                    self.busy_until = now + timeout;
+
+                    debug!(
+                        "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                                {} packets in the class queue.",
+                        self.scheduler_id,
+                        packet.packet_id,
+                        packet.size,
+                        packet.flow_id,
+                        now + timeout,
+                        self.queues[self.current_queue].len(),
+                    );
+
+                    return;
                 } else {
-                    break;
+                    self.next_queue();
                 }
+            } else {
+                self.next_queue();
             }
         }
-        info!(
-            "DRRServer {} finished running at time {}.",
-            self.scheduler_id,
-            sim.now()
-        );
     }
 }
+
+impl Model for DRRServer {}

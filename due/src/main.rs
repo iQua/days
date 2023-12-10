@@ -5,10 +5,10 @@ use std::env;
 use log::info;
 use petgraph::graph::UnGraph;
 
-use due::endpoints::flow::Flow;
+use due::flows::flow::Flow;
 // use due::topos::build::build_graph;
-use due::endpoints::topo::Topology;
 use due::seed_from_config;
+use due::topos::topo::Topology;
 
 fn main() {
     let env = env_logger::Env::default();

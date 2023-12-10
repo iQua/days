@@ -1,5 +1,5 @@
 //! Implements all the necessary utilities for initializing, constructing, and
-//! running a network topology. These utilities include connecting network elements
+//! running a network topology. These utilities include connecting network switches
 //! according to a network graph, attaching packet endpoints to hosts, computing
 //! feasible paths for all the flows, and installing Flow Information Base tables
 //! to all the switches to route these flows accordingly.
@@ -7,19 +7,27 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
-use log::warn;
+use log::{debug, info};
 use petgraph::graph::UnGraph;
+use petgraph::visit::EdgeRef;
 use serde::Deserialize;
-use tokio::sync::mpsc::unbounded_channel;
+
+use asynchronix::model::Output;
+use asynchronix::simulation::{Mailbox, SimInit, Simulation};
+use asynchronix::time::MonotonicTime;
 
 use crate::flows::flow::Flow;
-use crate::sim::SimContext;
-use crate::switches::splitter::Splitter;
+use crate::flows::sink::PacketSink;
+use crate::flows::source::PacketSource;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy};
+use crate::schedulers::drr::DRRServer;
+use crate::schedulers::port::Port;
+use crate::set_num_switches;
 use crate::switches::switch::PacketSwitch;
-use crate::switches::{Element, SchedulingDiscipline};
+use crate::switches::SchedulingDiscipline;
 use crate::topos::build::FatTreeConfig;
-use crate::{set_num_switches, Shared};
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -30,19 +38,27 @@ struct TomlSwitch {
 }
 
 #[derive(Deserialize)]
-struct ElementConfig {
-    num_splitters: usize,
+pub struct SwitchConfig {
     switch: Vec<TomlSwitch>,
 }
+pub enum Config {
+    SwitchConfig(SwitchConfig),
+    FatTreeConfig(FatTreeConfig),
+}
 pub struct Topology {
+    /// The simulation engine
+    sim_init: SimInit,
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
-    /// A Vec of element ids that connects to endpoints
+    /// A hash map of element ids that connects to endpoints
     hosts: Vec<usize>,
-    /// A Vec of PacketSwitchs and Splitters
-    elements: Vec<Element>,
-    /// A Vec of all flows
+    /// A hash map of packet switches and their mailboxes
+    switches: HashMap<usize, PacketSwitch>,
+    switch_mailboxes: HashMap<usize, Mailbox<PacketSwitch>>,
+    /// A hash map of all flows
     flows: Vec<Flow>,
+    /// Configuration of the topology
+    config: Config,
 }
 
 impl Topology {
@@ -56,167 +72,285 @@ impl Topology {
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+        if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
+            let switches = Topology::init_fattree_switches(&config);
 
-        let elements: Vec<Element> = if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
-            Topology::init_fattree_elements(config)
+            Topology {
+                sim_init: SimInit::new(),
+                graph: graph.clone(),
+                hosts,
+                switches,
+                flows,
+                switch_mailboxes: HashMap::new(),
+                config: Config::FatTreeConfig(config),
+            }
         } else {
-            let config: ElementConfig =
+            let config: SwitchConfig =
                 toml::from_str(&content).expect("Failed to deserialize the configuration");
-            Topology::init_elements(config)
-        };
+            let switches = Topology::init_switches(&config);
 
-        Topology {
-            graph: graph.clone(),
-            hosts,
-            flows,
-            elements,
+            Topology {
+                sim_init: SimInit::new(),
+                graph: graph.clone(),
+                hosts,
+                switches,
+                flows,
+                switch_mailboxes: HashMap::new(),
+                config: Config::SwitchConfig(config),
+            }
         }
     }
 
-    fn init_elements(config: ElementConfig) -> Vec<Element> {
-        let mut elements: Vec<Element> = Vec::new();
-
-        for e in config.switch {
-            let switch = PacketSwitch::new(
-                e.port_rate,
-                e.capacity,
-                e.weights,
-                HashMap::new(),
-                e.discipline,
-                Arc::new(|flow_id| flow_id),
-            );
-            elements.push(Element::PacketSwitch(switch));
+    // Initializes mailboxes for switches
+    fn init_mailboxes(&mut self) {
+        for (_, switch) in self.switches.iter() {
+            let switch_mbox: Mailbox<PacketSwitch> = Mailbox::new();
+            self.switch_mailboxes.insert(switch.id(), switch_mbox);
         }
-
-        for _ in 0..config.num_splitters {
-            elements.push(Element::Splitter(Splitter::new()));
-        }
-
-        elements
     }
 
-    fn init_fattree_elements(config: FatTreeConfig) -> Vec<Element> {
-        let mut elements: Vec<Element> = Vec::new();
+    fn init_switches(config: &SwitchConfig) -> HashMap<usize, PacketSwitch> {
+        let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
+
+        for _ in config.switch.iter() {
+            let switch = PacketSwitch::new(HashMap::new(), Arc::new(|flow_id| flow_id));
+            switches.insert(switch.id(), switch);
+        }
+
+        switches
+    }
+
+    fn init_fattree_switches(config: &FatTreeConfig) -> HashMap<usize, PacketSwitch> {
+        let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
         let num_switches = config.k.pow(2) * 5 / 4;
 
         for _ in 0..num_switches {
-            let switch = PacketSwitch::new(
-                config.port_rate,
-                config.capacity,
-                config.weights.clone(),
-                HashMap::new(),
-                config.discipline.clone(),
-                Arc::new(|flow_id| flow_id),
-            );
-            elements.push(Element::PacketSwitch(switch));
+            let switch = PacketSwitch::new(HashMap::new(), Arc::new(|flow_id| flow_id));
+            switches.insert(switch.id(), switch);
         }
 
-        elements
+        switches
     }
 
-    /// Connects a vector of elements according to edges in the network topology.
-    fn connect(&mut self) {
-        for node_id in self.graph.node_indices() {
-            let (sender, receiver) = unbounded_channel();
-            self.elements[node_id.index()].connect_receiver(receiver);
-
-            for neighbor in self.graph.neighbors(node_id) {
+    /// Connects a hash map of packet switches according to edges in a network topology.
+    fn connect(mut self, graph: UnGraph<usize, ()>) -> Self {
+        debug!(
+            "Connecting {} switches according to the network topology.",
+            self.switches.len()
+        );
+        for node_id in graph.node_indices() {
+            for neighbor in graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
-                // connect them
+                // connect them and activate all schedulers in between
                 if neighbor.index() != node_id.index() {
-                    self.elements[neighbor.index()].connect_sender(node_id.index(), sender.clone());
+                    self = self.connect_neighbours(neighbor.index(), node_id.index());
                 }
             }
         }
+
+        self
+    }
+
+    fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
+        let discipline = match &self.config {
+            Config::SwitchConfig(config) => config.switch[upstream_id].discipline,
+            Config::FatTreeConfig(config) => config.discipline,
+        };
+
+        let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
+
+        match discipline {
+            SchedulingDiscipline::DRR => {
+                let mut drr_server = match &self.config {
+                    Config::SwitchConfig(config) => DRRServer::new(
+                        config.switch[upstream_id].port_rate,
+                        config.switch[upstream_id].capacity,
+                        CapacityUnit::Packets,
+                        Arc::new(|flow_id| flow_id),
+                        DropStrategy::TailDrop,
+                        config.switch[upstream_id].weights.clone(),
+                    ),
+                    Config::FatTreeConfig(config) => DRRServer::new(
+                        config.port_rate,
+                        config.capacity,
+                        CapacityUnit::Packets,
+                        Arc::new(|flow_id| flow_id),
+                        DropStrategy::TailDrop,
+                        config.weights.clone(),
+                    ),
+                };
+
+                let mut output = Output::default();
+                let drr_mbox: Mailbox<DRRServer> = Mailbox::new();
+                output.connect(DRRServer::packet_received, &drr_mbox);
+                upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                drr_server
+                    .output
+                    .connect(PacketSwitch::packet_received, downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(drr_server, drr_mbox);
+            }
+
+            SchedulingDiscipline::FIFO => {
+                let mut port = match &self.config {
+                    Config::SwitchConfig(config) => Port::new(
+                        config.switch[upstream_id].port_rate,
+                        config.switch[upstream_id].capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    ),
+                    Config::FatTreeConfig(config) => Port::new(
+                        config.port_rate,
+                        config.capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    ),
+                };
+
+                let mut output = Output::default();
+                let port_mbox: Mailbox<Port> = Mailbox::new();
+                output.connect(Port::packet_received, &port_mbox);
+                upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                port.output
+                    .connect(PacketSwitch::packet_received, downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(port, port_mbox);
+            }
+        }
+
+        self
     }
 
     /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
-    fn attach(&mut self) {
-        // obtains the element_id of all end hosts (where endpoints can be
-        // attached to), and initializes endpoints for all flows
-        let mut attach_to = Vec::new();
+    fn attach(mut self) -> Self {
+        info!(
+            "Attaching packet sources and sinks to their hosts in all {} flows.",
+            self.flows.len()
+        );
+
         for flow in self.flows.iter_mut() {
-            attach_to.extend(flow.get_hosts());
-            flow.init_endpoints();
-        }
+            for (edge_index, edge) in flow.graph.edge_references().enumerate() {
+                let mut source = PacketSource::new(
+                    flow.id,
+                    flow.initial_delay,
+                    flow.duration,
+                    flow.arr_dist,
+                    flow.pkt_size_dist,
+                );
 
-        let mut endpoint_iter = self
-            .flows
-            .iter_mut()
-            .flat_map(|flow| flow.endpoints.iter_mut());
+                let mut sink = PacketSink::new(flow.id);
 
-        // attaches each endpoint's sender to its corresponding host's receiver
-        for host_id in attach_to {
-            // an element in the network must be a host, as specified by the
-            // network graph
-            assert!(self.hosts.contains(&host_id.index()));
+                // record the packet sink ids for later construction of paths
+                // in Flow::compute_paths()
+                flow.sink_ids.insert(edge_index, sink.id());
 
-            // locate a neighboring element in the network graph to this host
-            let mut neighbors = self.graph.neighbors(host_id);
+                // an element in the network must be a host, as specified by the
+                // network graph
+                assert!(self.hosts.contains(&edge.source().index()));
+                assert!(self.hosts.contains(&edge.target().index()));
 
-            let (downlink_sender, downlink_receiver) = unbounded_channel();
-            let endpoint = endpoint_iter.next().unwrap();
+                // attaches each endpoint to its corresponding host
+                // source -> edge.source(), sink -> edge.target()
 
-            if let Some(next_neighbor) = neighbors.next() {
-                if next_neighbor != host_id {
-                    self.elements[next_neighbor.index()].connect_neighbour_to_endpoint(
-                        endpoint,
-                        downlink_receiver,
-                        host_id.index(),
-                    );
-                }
+                // obtains the host switch and its mailbox for the packet source
+                let source_host = self.switches.get_mut(&edge.source().index()).unwrap();
+                let host_mbox = self.switch_mailboxes.get(&edge.source().index()).unwrap();
 
-                self.elements[host_id.index()].connect_sender(endpoint.id(), downlink_sender);
-            } else {
-                panic!("No neighbors found for host element {}", host_id.index());
+                // establishes a bi-directional connection between the packet source and the host
+                let source_mbox: Mailbox<PacketSource> = Mailbox::new();
+                source
+                    .output
+                    .connect(PacketSwitch::packet_received, host_mbox);
+                let mut output = Output::default();
+                output.connect(PacketSource::packet_received, &source_mbox);
+                source_host.outputs.insert(source.id(), output);
+
+                // activates the packet source
+                self.sim_init = self.sim_init.add_model(source, source_mbox);
+
+                // obtains the host switch and its mailbox for the packet sink
+                let sink_host = self.switches.get_mut(&edge.target().index()).unwrap();
+                let host_mbox = self.switch_mailboxes.get(&edge.target().index()).unwrap();
+
+                // establishes a bi-directional connection between the packet sink and the host
+                let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
+                sink.output
+                    .connect(PacketSwitch::packet_received, host_mbox);
+                let mut output = Output::default();
+                output.connect(PacketSink::packet_received, &sink_mbox);
+                sink_host.outputs.insert(sink.id(), output);
+
+                // activates the packet sink
+                self.sim_init = self.sim_init.add_model(sink, sink_mbox);
             }
         }
+
+        self
     }
 
     /// Computes routing decisions for all the flows, and installs Flow
     /// Information Base tables (FIBs) of these routing decisions into all the
     /// switches.
-    fn route(&mut self, sim: SimContext<'_, Shared>) {
+    fn route(&mut self) {
+        info!(
+            "Computing routing decisions for all {} flows.",
+            self.flows.len()
+        );
+
         for flow in self.flows.iter_mut() {
-            let paths = flow.compute_paths(self.graph.clone(), sim);
+            let paths = flow.compute_paths(self.graph.clone());
 
             for path in paths {
                 for window in path.windows(2) {
                     let node_id = window.get(0).unwrap().index();
                     let next_id = window.get(1).unwrap().index();
-
-                    match &mut self.elements[node_id] {
-                        Element::PacketSwitch(switch) => {
-                            switch.set_fib(flow.id, next_id);
-                        }
-                        _ => {
-                            warn!(
-                                "Element {} is not a packet switch when setting up the
-                                Flow Information Base table along the path in flow {}.",
-                                node_id, flow.id
-                            );
-                        }
-                    }
+                    let switch = self.switches.get_mut(&node_id).unwrap();
+                    switch.set_fib(flow.id, next_id);
                 }
             }
         }
     }
 
-    pub fn run(mut self, sim: SimContext<'_, Shared>) {
-        // constructs the network graph with network elements
-        self.connect();
+    /// Activates all the switches and initializes the simulation
+    fn init_sim(mut self) -> Simulation {
+        info!(
+            "Activating all {} switches and initializing the simulation.",
+            self.switches.len(),
+        );
+
+        for (_, switch) in self.switches {
+            let switch_mbox = self.switch_mailboxes.remove(&switch.id()).unwrap();
+            self.sim_init = self.sim_init.add_model(switch, switch_mbox);
+        }
+
+        self.sim_init.init(MonotonicTime::EPOCH)
+    }
+
+    pub fn run(mut self, graph: UnGraph<usize, ()>) {
+        // initializes mailboxes for the packet switches
+        self.init_mailboxes();
+        // constructs the network graph by connecting the packet switches
+        self = self.connect(graph);
         // attaches sources and sinks to hosts in the network graph
-        self.attach();
+        self = self.attach();
         // computes feasible paths for all flows, and sets FIBs for all switches
-        self.route(sim);
+        self.route();
+        // activates all the switches and initializes the simulation
+        let mut sim = self.init_sim();
 
-        for flow in self.flows {
-            sim.activate(flow.run(sim));
-        }
+        // starts the simulation
+        sim.step_by(Duration::from_secs(100));
 
-        for element in self.elements {
-            element.activate(sim);
-        }
+        info!(
+            "Simulation completed at time {:.3}.",
+            sim.time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64()
+        );
     }
 }
