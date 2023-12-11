@@ -349,6 +349,7 @@ impl Topology {
             let paths = flow.compute_paths(self.graph.clone());
 
             for path in paths {
+                info!("path for flow {} is: {:?}", flow.id, path);
                 for window in path.windows(2) {
                     let node_id = window.get(0).unwrap().index();
                     let next_id = window.get(1).unwrap().index();

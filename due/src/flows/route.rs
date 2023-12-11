@@ -3,7 +3,7 @@
 //! from a set of simple paths, which are computed by the `petgraph` crate.
 
 use petgraph::{
-    algo::all_simple_paths,
+    algo::{all_simple_paths, dijkstra},
     graph::{NodeIndex, UnGraph},
 };
 
@@ -35,9 +35,9 @@ impl RandomSimplePath {
         RandomSimplePath { graph, rng }
     }
 
-    fn get_all_simple_paths(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<Vec<NodeIndex>> {
+    fn get_all_simple_paths(&mut self, start: NodeIndex, end: NodeIndex, len: usize) -> Vec<Vec<NodeIndex>> {
         let mut paths = Vec::new();
-        let result = all_simple_paths(&self.graph, start, end, 0, None);
+        let result = all_simple_paths(&self.graph, start, end, 0, Some(len));
         for path in result {
             paths.push(path);
         }
@@ -47,7 +47,9 @@ impl RandomSimplePath {
 
 impl RoutingProtocol for RandomSimplePath {
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
-        let paths = self.get_all_simple_paths(start, end);
+        let binding = dijkstra(&self.graph, start, Some(end), |_| 1);
+        let len = binding.get(&end).unwrap();
+        let paths = self.get_all_simple_paths(start, end, *len as usize);
         let rdm_idx = self.rng.gen_range(0..paths.len());
         paths[rdm_idx].clone()
     }
