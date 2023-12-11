@@ -62,10 +62,10 @@ impl SinkStatistics {
     /// simulation finishes.
     pub fn collect_statistics(&mut self, mut sim: Simulation) -> Simulation {
         for sink_id in self.sink_ids.iter() {
-            let sink_addr = self.sink_addresses.get(&sink_id).unwrap();
+            let sink_addr = self.sink_addresses.get(sink_id).unwrap();
             sim.send_event(PacketSink::report, *sink_id, sink_addr);
 
-            let mut sink_statistics = self.sink_statistics.remove(&sink_id).unwrap();
+            let mut sink_statistics = self.sink_statistics.remove(sink_id).unwrap();
             if let Some(statistics) = sink_statistics.take() {
                 info!("{:#.3}", statistics);
             }

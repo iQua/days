@@ -40,7 +40,7 @@ fn main() {
         },
     );
 
-    let mut port = Port::new(4000.0, 100, CapacityUnit::Packets, DropStrategy::TailDrop);
+    let mut port = Port::new(8000.0, 100, CapacityUnit::Packets, DropStrategy::TailDrop);
 
     let mut sink = PacketSink::new(2);
     let source_1_mbox = Mailbox::new();

@@ -34,7 +34,7 @@ fn main() {
 
     let mut source_2 = PacketSource::new(
         1,
-        2.0,
+        1.0,
         10.0,
         DistributionInfo::Uniform { low: 1, high: 1 },
         DistributionInfo::Uniform {
@@ -49,7 +49,7 @@ fn main() {
     let mut switch: PacketSwitch = PacketSwitch::new(fib, Arc::new(|flow_id| flow_id));
 
     let mut drr = DRRServer::new(
-        4000.0,
+        8000.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
