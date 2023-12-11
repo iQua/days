@@ -389,7 +389,8 @@ impl Topology {
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_by(Duration::from_secs(10+10000));
+        // TODO: how to get the total duration for the simulation?
+        sim.step_by(Duration::from_secs(10));
         sim = statistics.collect_statistics(sim);
 
         info!(
