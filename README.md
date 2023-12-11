@@ -32,7 +32,7 @@ total running time:
 sh thread_check.sh
 ```
 
-## Configaration Settings
+## Configuration Settings
 
 To set the number of threads for the simulation, there are two ways to create
 the builder `SimInit`:
@@ -55,11 +55,11 @@ To set the simulation time, there are two parts to modify. First, if
 configuration files are used, modify the `duration` of each flow. Otherwise,
 modify the `duration` of the PacketSource directly. 
 
-Second, modify the final
+Second, modify the total
 simulation time:
 
 ```
 sim.step_by(Duration::from_secs(20));
 ```
 
-where this `step_by` function will either in the example file or in the `/due/src/topos/topo.rs`.
+where this `step_by()` function will either in the example file or in the `/due/src/topos/topo.rs`.
