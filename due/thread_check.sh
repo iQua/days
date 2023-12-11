@@ -13,7 +13,7 @@ START_TIME=$(date +%s.%N)
 TASK_DIR="/proc/$PID/task"
 
 # monitors the number of threads 
-while sleep 0.01; do
+while sleep 1.; do
   if [ -d $TASK_DIR ]; then
     FORMATTED_TIME=$(printf "%.3f" $(echo "$(date +%s.%N) - $START_TIME" | bc))
     THREADS=$(ls $TASK_DIR | wc -l)
