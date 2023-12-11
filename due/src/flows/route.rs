@@ -2,10 +2,8 @@
 //! Currently, the only routing protocol implemented is to select a random candidate
 //! from a set of simple paths, which are computed by the `petgraph` crate.
 
-use petgraph::{
-    algo::{all_simple_paths, dijkstra},
-    graph::{NodeIndex, UnGraph},
-};
+use petgraph::algo::{all_simple_paths, dijkstra};
+use petgraph::graph::{NodeIndex, UnGraph};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -35,7 +33,12 @@ impl RandomSimplePath {
         RandomSimplePath { graph, rng }
     }
 
-    fn get_all_simple_paths(&mut self, start: NodeIndex, end: NodeIndex, len: usize) -> Vec<Vec<NodeIndex>> {
+    fn get_all_simple_paths(
+        &mut self,
+        start: NodeIndex,
+        end: NodeIndex,
+        len: usize,
+    ) -> Vec<Vec<NodeIndex>> {
         let mut paths = Vec::new();
         let result = all_simple_paths(&self.graph, start, end, 0, Some(len));
         for path in result {
