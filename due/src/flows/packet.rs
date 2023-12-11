@@ -71,9 +71,6 @@ impl Packet {
     pub fn update(&mut self, time: f64) {
         self.queueing_delay += time - self.time;
         self.time = time;
-        if (self.packet_id == 0 || self.packet_id == 500 || self.packet_id == 1000 || self.packet_id == 5000 || self.packet_id == 9500) && self.flow_id == 0 {
-            println!("packet {} of flow {}: time is {}, self.time is {}, queueing delay is {}.", self.packet_id, self.flow_id, time, self.time, self.queueing_delay);
-        }
     }
 }
 
