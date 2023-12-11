@@ -147,6 +147,7 @@ impl Port {
                     .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                     .unwrap();
 
+                self.busy_until = now + timeout;
                 self.packet_sent(now + timeout, packet);
             }
         }
