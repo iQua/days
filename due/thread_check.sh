@@ -2,7 +2,7 @@
 
 # builds and runs the process
 cargo build --example fattree
-RUST_LOG=info ./target/debug/examples/fattree &
+RUST_LOG=info ./target/debug/examples/fattree configs/fattree_8.toml &
 
 # gets the PID
 PID=$!
