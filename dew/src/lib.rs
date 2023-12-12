@@ -7,7 +7,6 @@ use serde::Deserialize;
 
 use crate::sim::{RandomVar, Time};
 
-pub mod endpoints;
 pub mod flows;
 pub mod schedulers;
 pub mod sim;

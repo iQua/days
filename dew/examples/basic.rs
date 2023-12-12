@@ -8,10 +8,10 @@ use log::{debug, info};
 use petgraph::graph::UnGraph;
 use rand::{rngs::SmallRng, SeedableRng};
 
-use due::flows::flow::Flow;
-use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos::topo::Topology;
-use due::Shared;
+use dew::flows::flow::Flow;
+use dew::sim::{simulation, Process, RandomVar, SimContext};
+use dew::topos::topo::Topology;
+use dew::Shared;
 
 const SEED: u64 = 1000;
 

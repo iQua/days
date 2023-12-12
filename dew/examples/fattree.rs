@@ -7,11 +7,11 @@ use std::env;
 use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
 
-use due::flows::flow::Flow;
-use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos::build::build_fattree;
-use due::topos::topo::Topology;
-use due::{get_seed, Shared};
+use dew::flows::flow::Flow;
+use dew::sim::{simulation, Process, RandomVar, SimContext};
+use dew::topos::build::build_fattree;
+use dew::topos::topo::Topology;
+use dew::{get_seed, Shared};
 
 async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path;
