@@ -390,7 +390,7 @@ impl Topology {
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_by(Duration::from_secs(10000));
+        sim.step_by(Duration::from_secs(1500));
         sim = statistics.collect_statistics(sim);
 
         info!(
