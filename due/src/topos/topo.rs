@@ -194,22 +194,28 @@ impl Topology {
         match discipline {
             SchedulingDiscipline::DRR => {
                 let mut drr_server = match &self.config {
-                    Config::SwitchConfig(config) => DRRServer::new(
-                        config.switch[upstream_id].port_rate,
-                        config.switch[upstream_id].capacity,
-                        CapacityUnit::Packets,
-                        Arc::new(|flow_id| flow_id),
-                        DropStrategy::TailDrop,
-                        config.switch[upstream_id].weights.clone(),
-                    ),
-                    Config::FatTreeConfig(config) => DRRServer::new(
-                        config.port_rate,
-                        config.capacity,
-                        CapacityUnit::Packets,
-                        Arc::new(|flow_id| flow_id),
-                        DropStrategy::TailDrop,
-                        config.weights.clone(),
-                    ),
+                    Config::SwitchConfig(config) => {
+                        let weight_len = config.switch[upstream_id].weights.len();
+                        DRRServer::new(
+                            config.switch[upstream_id].port_rate,
+                            config.switch[upstream_id].capacity,
+                            CapacityUnit::Packets,
+                            Arc::new(move |flow_id| flow_id % weight_len),
+                            DropStrategy::TailDrop,
+                            config.switch[upstream_id].weights.clone(),
+                        )
+                    }
+                    Config::FatTreeConfig(config) => {
+                        let weight_len = config.weights.len();
+                        DRRServer::new(
+                            config.port_rate,
+                            config.capacity,
+                            CapacityUnit::Packets,
+                            Arc::new(move |flow_id| flow_id % weight_len),
+                            DropStrategy::TailDrop,
+                            config.weights.clone(),
+                        )
+                    }
                 };
 
                 let mut output = Output::default();

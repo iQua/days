@@ -4,7 +4,7 @@ k = 8
 port_rate = 32000 # process 4 packets (1000 bytes) per second
 capacity = 100
 weights = [1]
-discipline = "FIFO"
+discipline = "DRR"
 
 [[flows]]
 flow_type = "PacketDistribution"
