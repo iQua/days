@@ -61,8 +61,8 @@ pub struct WFQServer {
     weights: Vec<usize>,
     /// class_id -> finish_time
     finish_times: HashMap<usize, f64>,
-    /// number of to-be-sent packets of each class
-    flow_queue_count: Vec<usize>,
+    /// number of queued packets of each flow class
+    flow_queue_count: HashMap<usize, usize>,
 
     /// set of active flow classes
     active_set: HashSet<usize>,
@@ -75,7 +75,7 @@ pub struct WFQServer {
     packets_dropped: usize,
     packets_waiting: usize,
 
-    /// the number of bytes of classes, which are consecutive and start from 0
+    /// the number of bytes currently queued in each flow class
     byte_sizes: HashMap<usize, usize>,
 
     /// min-heap of packets from all the classes, where packets are sorted according to their finish times
@@ -97,11 +97,9 @@ impl WFQServer {
         weights: Vec<usize>,
     ) -> WFQServer {
         let mut finish_times = HashMap::new();
-        let mut flow_queue_count = Vec::new();
 
         for (class_id, _) in weights.iter().enumerate() {
             finish_times.insert(class_id, 0.0);
-            flow_queue_count.push(0);
         }
 
         let packet_drop = match drop_strategy {
@@ -116,7 +114,7 @@ impl WFQServer {
             drop_strategy: Box::new(packet_drop),
             weights,
             finish_times,
-            flow_queue_count,
+            flow_queue_count: HashMap::new(),
             active_set: HashSet::new(),
             vtime: 0.0,
             last_update: 0.0,
@@ -168,7 +166,8 @@ impl WFQServer {
 
         let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
         *byte_size += packet.size;
-        self.flow_queue_count[class_id] += 1;
+        let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
+        *flow_queue_count += 1;
         self.active_set.insert(class_id);
         self.last_update = arrival_time;
 
@@ -233,8 +232,10 @@ impl WFQServer {
         // computes the new set of active flow classes
         let class_id = (self.flow_classes)(packet.flow_id);
 
-        self.flow_queue_count[class_id] -= 1;
-        if self.flow_queue_count[class_id] == 0 {
+        let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
+        *flow_queue_count -= 1;
+
+        if *flow_queue_count == 0 {
             self.active_set.remove(&class_id);
         }
 
