@@ -296,7 +296,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
 [[flows]]
 flow_type = "PacketDistribution"
-graph = [[1184, 1184]]
+graph = [[1183, 1184]]
 initial_delay = 1.0
 duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
