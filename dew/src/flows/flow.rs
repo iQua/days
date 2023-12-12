@@ -34,7 +34,7 @@ struct TomlFlow {
 #[derive(Deserialize, Debug)]
 struct TomlFlowSet {
     flow_type: FlowType,
-    flow_num: u32,
+    flow_count: u32,
     initial_delay: f64,
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
@@ -42,7 +42,7 @@ struct TomlFlowSet {
 
 #[derive(Deserialize, Debug)]
 struct FlowConfig {
-    flows: Option<Vec<TomlFlow>>,
+    flow: Option<Vec<TomlFlow>>,
     flow_set: Option<Vec<TomlFlowSet>>,
 }
 
@@ -119,7 +119,7 @@ impl Flow {
 
         let mut flows = Vec::new();
 
-        if let Some(flows_vec) = config.flows {
+        if let Some(flows_vec) = config.flow {
             for flow in flows_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
 
@@ -141,7 +141,7 @@ impl Flow {
             let mut rng = SmallRng::seed_from_u64(get_seed(file_path));
 
             for flow_set in flow_set_vec {
-                for _ in 0..flow_set.flow_num {
+                for _ in 0..flow_set.flow_count {
                     let start = rng.gen_range(0..num_edge_switches);
                     let end = {
                         let mut range = (0..start).chain((start + 1)..num_edge_switches);
