@@ -35,10 +35,6 @@ pub struct Packet {
     pub size: usize,
     /// a unique identifier
     pub packet_id: usize,
-    /// identifiers for the source
-    pub src: String,
-    /// identifiers for the destination
-    pub dst: String,
     /// the flow identifier that the packet belongs to
     pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
@@ -46,30 +42,26 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// creates a new packet.
-    pub fn new(
-        size: usize,
-        packet_id: usize,
-        src: String,
-        dst: String,
-        flow_id: usize,
-        creation_time: f64,
-    ) -> Packet {
+    /// Creates a new packet.
+    pub fn new(size: usize, packet_id: usize, flow_id: usize, creation_time: f64) -> Packet {
         Packet {
             time: creation_time,
             size,
             packet_id,
-            src,
-            dst,
             flow_id,
             creation_time,
             queueing_delay: 0.0,
         }
     }
 
-    /// updates the queueing delay of the packet.
-    pub fn update(&mut self, time: f64) {
+    /// Updates the queueing delay of the packet when it departs from a scheduler.
+    pub fn departure_update(&mut self, time: f64) {
         self.queueing_delay += time - self.time;
+        self.time = time;
+    }
+
+    /// Records the current simulation time when a packet arrives at a scheduler.
+    pub fn arrival_update(&mut self, time: f64) {
         self.time = time;
     }
 }
@@ -78,8 +70,8 @@ impl std::fmt::Display for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "id: {}, src: {}, creation time: {}, size: {}, queueing delay: {}",
-            self.packet_id, self.src, self.creation_time, self.size, self.queueing_delay
+            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}",
+            self.packet_id, self.flow_id, self.creation_time, self.size, self.queueing_delay
         )
     }
 }

@@ -104,7 +104,7 @@ impl DRRServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+    pub async fn packet_received(&mut self, mut packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -130,6 +130,7 @@ impl DRRServer {
 
         self.packets_waiting += 1;
         self.packets_received += 1;
+        packet.arrival_update(arrival_time);
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -196,7 +197,7 @@ impl DRRServer {
                 {
                     self.byte_sizes[self.current_queue] -= packet.size;
                     let mut outbound = self.queues[self.current_queue].pop_front().unwrap();
-                    outbound.update(now);
+                    outbound.departure_update(now);
 
                     self.packets_waiting -= 1;
                     self.deficit[self.current_queue] -= packet.size;
