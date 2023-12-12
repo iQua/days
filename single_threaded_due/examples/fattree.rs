@@ -2,6 +2,7 @@
 //! topology.
 
 use std::cell::RefCell;
+use std::env;
 
 use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
@@ -12,22 +13,22 @@ use due::topos::build::build_fattree;
 use due::topos::topo::Topology;
 use due::{get_seed, Shared};
 
-async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
+async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     let file_path = config_path;
 
-    let (fattree_graph, fattree_hosts) = build_fattree(file_path);
+    let (fattree_graph, fattree_hosts) = build_fattree(&file_path);
     info!(
         "The fattree graph has been initialized: {:?}",
         fattree_graph
     );
 
-    let flows = Flow::flows_from_config(file_path);
+    let flows = Flow::flows_from_config(&file_path);
     debug!(
         "A total of {} network flows has been initialized.",
         flows.len()
     );
 
-    let topology = Topology::new(file_path, fattree_graph, fattree_hosts, flows);
+    let topology = Topology::new(&file_path, fattree_graph, fattree_hosts, flows);
 
     // runs the topology
     topology.run(sim);
@@ -40,8 +41,12 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    // let path = "configs/fattree.toml";
-    let path = "configs/fattree_32.toml";
+    let args: Vec<String> = env::args().collect();
+    let path = if args.len() != 2 {
+        "configs/fattree.toml".to_string()
+    } else {
+        args[1].clone()
+    };
     let seed = get_seed(&path);
 
     let outcome = simulation(
