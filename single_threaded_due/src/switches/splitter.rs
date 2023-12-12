@@ -1,0 +1,67 @@
+//! A splitter is a utility element that forwards packets to two downstream elements.
+
+use std::collections::HashMap;
+
+use log::{debug, info};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use crate::flows::packet::Packet;
+use crate::next_element_id;
+
+#[derive(Debug)]
+pub struct Splitter {
+    element_id: usize,
+    senders: HashMap<usize, UnboundedSender<Packet>>,
+    receiver: UnboundedReceiver<Packet>,
+}
+
+impl Default for Splitter {
+    fn default() -> Self {
+        Splitter {
+            element_id: next_element_id(),
+            senders: HashMap::new(),
+            receiver: unbounded_channel().1,
+        }
+    }
+}
+
+impl Splitter {
+    pub fn new() -> Splitter {
+        Default::default()
+    }
+
+    pub fn id(&self) -> usize {
+        self.element_id
+    }
+
+    pub fn get_sender(&self, element_id: usize) -> Option<UnboundedSender<Packet>> {
+        if let Some(sender) = self.senders.get(&element_id) {
+            return Some(sender.clone());
+        }
+
+        None
+    }
+
+    pub fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
+
+    pub fn connect_sender(&mut self, element_id: usize, sender: UnboundedSender<Packet>) {
+        self.senders.insert(element_id, sender.clone());
+    }
+
+    pub async fn run(mut self) {
+        while let Some(packet) = self.receiver.recv().await {
+            debug!(
+                "Splitter {} forwarded packet {} ({} bytes).",
+                self.element_id, packet.packet_id, packet.size,
+            );
+
+            for sender in self.senders.values() {
+                let _ = sender.send(packet.clone());
+            }
+        }
+
+        info!("Splitter {} finished running.", self.element_id);
+    }
+}
