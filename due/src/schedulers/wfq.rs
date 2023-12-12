@@ -76,7 +76,7 @@ pub struct WFQServer {
     packets_waiting: usize,
 
     /// the number of bytes of classes, which are consecutive and start from 0
-    byte_sizes: Vec<usize>,
+    byte_sizes: HashMap<usize, usize>,
 
     /// min-heap of packets from all the classes, where packets are sorted according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
@@ -98,12 +98,10 @@ impl WFQServer {
     ) -> WFQServer {
         let mut finish_times = HashMap::new();
         let mut flow_queue_count = Vec::new();
-        let mut byte_sizes = Vec::new();
 
         for (class_id, _) in weights.iter().enumerate() {
             finish_times.insert(class_id, 0.0);
             flow_queue_count.push(0);
-            byte_sizes.push(0);
         }
 
         let packet_drop = match drop_strategy {
@@ -125,7 +123,7 @@ impl WFQServer {
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
-            byte_sizes,
+            byte_sizes: HashMap::new(),
             scheduler_queue: BinaryHeap::new(),
             busy_until: 0.0,
             output: Output::default(),
@@ -139,7 +137,7 @@ impl WFQServer {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
-            self.byte_sizes.iter().sum(),
+            self.byte_sizes.values().sum(),
             self.scheduler_queue.len(),
         );
 
@@ -168,7 +166,8 @@ impl WFQServer {
         // pushes the packet into a min-heap according to the packet's finish time
         self.scheduler_queue.push(tagged_packet);
 
-        self.byte_sizes[class_id] += packet.size;
+        let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+        *byte_size += packet.size;
         self.flow_queue_count[class_id] += 1;
         self.active_set.insert(class_id);
         self.last_update = arrival_time;
@@ -267,7 +266,8 @@ impl WFQServer {
             if !self.scheduler_queue.is_empty() {
                 let mut outbound = self.scheduler_queue.pop().unwrap().packet;
                 let class_id = (self.flow_classes)(outbound.flow_id);
-                self.byte_sizes[class_id] -= outbound.size;
+                let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+                *byte_size -= outbound.size;
                 outbound.departure_update(now);
 
                 self.packets_waiting -= 1;
