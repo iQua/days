@@ -1,16 +1,16 @@
-# This is a configuration file for fattre-8 with 16 flows and 10,000 seconds.
+# This is a configuration file for fattre-8 with 16 flows and 1500 seconds.
 seed = 1000
 k = 8
 port_rate = 32000 # process 4 packets (1000 bytes) per second
 capacity = 100
 weights = [1]
-discipline = "FIFO"
+discipline = "DRR"
 
 [[flows]]
 flow_type = "PacketDistribution"
 graph = [[0, 31]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -18,7 +18,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[1, 30]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -26,7 +26,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[2, 29]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -34,7 +34,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[3, 28]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -42,7 +42,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[4, 27]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -50,7 +50,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[5, 26]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -58,7 +58,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[6, 25]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -66,7 +66,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[7, 24]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -74,7 +74,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[8, 23]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -82,7 +82,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[9, 22]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -90,7 +90,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[10, 21]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -98,7 +98,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[11, 20]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -106,7 +106,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[12, 19]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -114,7 +114,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[13, 18]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -122,7 +122,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[14, 17]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
@@ -130,6 +130,6 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 flow_type = "PacketDistribution"
 graph = [[15, 16]]
 initial_delay = 1.0
-duration = 10000.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
