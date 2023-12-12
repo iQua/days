@@ -143,7 +143,7 @@ impl Topology {
         let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
 
         for _ in config.switch.iter() {
-            let switch = PacketSwitch::new(HashMap::new(), Arc::new(|flow_id| flow_id));
+            let switch = PacketSwitch::new(HashMap::new());
             switches.insert(switch.id(), switch);
         }
 
@@ -155,7 +155,7 @@ impl Topology {
         let num_switches = config.k.pow(2) * 5 / 4;
 
         for _ in 0..num_switches {
-            let switch = PacketSwitch::new(HashMap::new(), Arc::new(|flow_id| flow_id));
+            let switch = PacketSwitch::new(HashMap::new());
             switches.insert(switch.id(), switch);
         }
 

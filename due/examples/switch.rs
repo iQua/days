@@ -46,7 +46,7 @@ fn main() {
     let mut fib = HashMap::new();
     fib.insert(0, 2);
     fib.insert(1, 2);
-    let mut switch: PacketSwitch = PacketSwitch::new(fib, Arc::new(|flow_id| flow_id));
+    let mut switch: PacketSwitch = PacketSwitch::new(fib);
 
     let mut drr = DRRServer::new(
         8000.0,
