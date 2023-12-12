@@ -1,7 +1,5 @@
 //! A very simple struct that represents a packet.
 
-use crate::sim::Time;
-
 #[derive(Debug, Clone)]
 pub struct Packet {
     /// Packets in ns.rs are typically created by packet generators, and runs
@@ -16,7 +14,7 @@ pub struct Packet {
 
     /// # Example
     /// ```
-    /// use due::packets::packet::Packet;
+    /// use due::flows::packet::Packet;
     ///
     /// let mut packet = Packet::new(
     ///     1024, // packet size
@@ -30,9 +28,9 @@ pub struct Packet {
     /// println!("{:?}", packet);
     /// ```
     /// the time when the packet is sent through a channel to the next element
-    pub time: Time,
+    pub time: f64,
     /// the time when the packet is originally generated
-    pub creation_time: Time,
+    pub creation_time: f64,
     /// the size of the packet in bytes
     pub size: usize,
     /// a unique identifier
@@ -44,7 +42,7 @@ pub struct Packet {
     /// the flow identifier that the packet belongs to
     pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
-    pub queueing_delay: Time,
+    pub queueing_delay: f64,
 }
 
 impl Packet {
@@ -55,7 +53,7 @@ impl Packet {
         src: String,
         dst: String,
         flow_id: usize,
-        creation_time: Time,
+        creation_time: f64,
     ) -> Packet {
         Packet {
             time: creation_time,
@@ -70,7 +68,7 @@ impl Packet {
     }
 
     /// updates the queueing delay of the packet.
-    pub fn send(&mut self, time: f64) {
+    pub fn update(&mut self, time: f64) {
         self.queueing_delay += time - self.time;
         self.time = time;
     }
