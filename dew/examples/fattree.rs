@@ -2,7 +2,6 @@
 //! topology.
 
 use std::cell::RefCell;
-use std::env;
 
 use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
@@ -13,7 +12,7 @@ use dew::topos::build::build_fattree;
 use dew::topos::topo::Topology;
 use dew::{get_seed, Shared};
 
-async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
+async fn network_sim(config_path: &str, sim: SimContext<'_, Shared>) {
     let file_path = config_path;
 
     let (fattree_graph, fattree_hosts) = build_fattree(&file_path);
@@ -41,12 +40,7 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    let args: Vec<String> = env::args().collect();
-    let path = if args.len() != 2 {
-        "configs/fattree.toml".to_string()
-    } else {
-        args[1].clone()
-    };
+    let path = "configs/fattree.toml";
     let seed = get_seed(&path);
 
     let outcome = simulation(

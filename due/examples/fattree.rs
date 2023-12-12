@@ -2,10 +2,8 @@
 //! topology.
 
 use log::info;
-use std::env;
 
 use due::flows::flow::Flow;
-use due::seed_from_config;
 use due::topos::build::build_fattree;
 use due::topos::topo::Topology;
 
@@ -13,14 +11,7 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    let args: Vec<String> = env::args().collect();
-    let file_path = if args.len() != 2 {
-        "configs/fattree.toml"
-    } else {
-        &args[1]
-    };
-
-    let _ = seed_from_config(&file_path);
+    let file_path = "configs/fattree.toml";
 
     let (fattree_graph, fattree_hosts) = build_fattree(file_path);
     info!(
