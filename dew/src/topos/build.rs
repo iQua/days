@@ -36,7 +36,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
 
 /// This function is used to build a fattree topology and its hosts.
 pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
-    // reads the configuration file
+    // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
     // deserializes the content of the configuration

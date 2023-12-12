@@ -1,24 +1,22 @@
 //! Implements a simple FIFO scheduler with only one queue.
 
 use std::collections::VecDeque;
-use std::future::Future;
-use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use asynchronix::model::{Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
-
-use crate::endpoints::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::endpoints::packet::Packet;
-use crate::next_scheduler_id;
+use crate::flows::packet::Packet;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::schedulers::Scheduler;
+use crate::sim::{SimContext, Time};
+use crate::{next_scheduler_id, Shared};
 
 pub struct Port {
     scheduler_id: usize,
     /// the bit rate of the port (0 for unlimited)
     rate: f64,
     /// a closure that determines whether an inbound packet should be dropped or not
-    drop_strategy: Box<dyn PacketDrop + Send + Sync>,
+    drop_strategy: Box<dyn PacketDrop>,
     /// the number of packets received
     packets_received: usize,
     /// the number of dropped packets
@@ -27,10 +25,20 @@ pub struct Port {
     bytes_in_queue: usize,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
-    /// The FIFO server is considered busy sending the current packet until this time
-    busy_until: f64,
+    /// a sender for sending outbound packets
+    sender: UnboundedSender<Packet>,
+    /// a receiver for receiving inbound packets
+    receiver: UnboundedReceiver<Packet>,
+}
 
-    pub output: Output<Packet>,
+impl Scheduler for Port {
+    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
+        self.sender = sender;
+    }
+
+    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
+        self.receiver = receiver;
+    }
 }
 
 impl Port {
@@ -53,8 +61,8 @@ impl Port {
             packets_dropped: 0,
             bytes_in_queue: 0,
             queue: VecDeque::new(),
-            busy_until: 0.0,
-            output: Output::default(),
+            sender: unbounded_channel().0,
+            receiver: unbounded_channel().1,
         }
     }
 
@@ -62,10 +70,7 @@ impl Port {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
+    fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet =
             self.drop_strategy
@@ -79,7 +84,7 @@ impl Port {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                arrival_time
+                now
             }
             return;
         }
@@ -96,26 +101,17 @@ impl Port {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            arrival_time,
+            now,
             self.packets_received,
             self.queue.len()
         );
-
-        if arrival_time > self.busy_until {
-            self.run((), scheduler).await;
-        }
     }
 
-    pub async fn send(&mut self, packet: Packet) {
-        self.output.send(packet).await;
-    }
-
-    fn packet_sent(&mut self, now: f64, packet: Packet) {
+    fn packet_sent(&mut self, packet: Packet, now: Time) {
         self.bytes_in_queue -= packet.size;
-        self.busy_until = now;
 
         debug!(
-            "Port {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+            "Port {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
             {} packets in queue.",
             self.scheduler_id,
             packet.packet_id,
@@ -126,41 +122,38 @@ impl Port {
         );
     }
 
-    pub fn run<'a>(
-        &'a mut self,
-        _: (),
-        scheduler: &'a Scheduler<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
-            let now = current_time.as_secs_f64();
+    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+        loop {
+            // trying to receive all the packets accumulated in the channel
+            while let Ok(packet) = self.receiver.try_recv() {
+                self.packet_received(packet, sim.now());
+            }
 
             if let Some(mut packet) = self.queue.pop_front() {
-                packet.send(now);
-
                 if self.rate > 0.0 {
-                    let timeout = packet.size as f64 * 8.0 / self.rate;
-
-                    scheduler
-                        .schedule_event(
-                            Duration::from_secs_f64(timeout),
-                            Self::send,
-                            packet.clone(),
-                        )
-                        .unwrap();
-
-                    scheduler
-                        .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                        .unwrap();
-
-                    self.packet_sent(now + timeout, packet);
-                } else {
-                    self.output.send(packet.clone()).await;
-                    self.packet_sent(now, packet);
+                    sim.advance(packet.size as f64 * 8.0 / self.rate).await;
                 }
+
+                packet.send(sim.now());
+                let _ = self.sender.send(packet.clone());
+                self.packet_sent(packet, sim.now());
+            }
+
+            if !self.queue.is_empty() {
+                // if there are packets in the queue, continue the loop
+                continue;
+            } else if let Some(packet) = self.receiver.recv().await {
+                // waits for the packet from the upstream element
+                self.packet_received(packet, sim.now());
+            } else {
+                break;
             }
         }
+
+        info!(
+            "Port {} finished running at time {}.",
+            self.scheduler_id,
+            sim.now()
+        );
     }
 }
-
-impl Model for Port {}

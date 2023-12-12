@@ -1,4 +1,4 @@
-//! The main program for running a simulation using a specific configuration.
+//! An example of connecting two packet sources into one DRR scheduler.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,17 +8,15 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::endpoints::drop::{CapacityUnit, DropStrategy};
-use due::endpoints::drr::DRRServer;
-use due::endpoints::sink::PacketSink;
-use due::endpoints::source::PacketSource;
 use due::flows::flow::DistributionInfo;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
+use due::schedulers::drop::{CapacityUnit, DropStrategy};
+use due::schedulers::drr::DRRServer;
 
 fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
-
-    let seed = 1;
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
@@ -30,23 +28,21 @@ fn main() {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
 
     let mut source_2 = PacketSource::new(
         1,
-        2.0,
+        1.0,
         10.0,
         DistributionInfo::Uniform { low: 1, high: 1 },
         DistributionInfo::Uniform {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
 
     let mut drr = DRRServer::new(
-        4000.0,
+        8000.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
@@ -54,7 +50,7 @@ fn main() {
         vec![1, 1],
     );
 
-    let mut sink = PacketSink::new(2, 10.0);
+    let mut sink = PacketSink::new(2);
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let drr_mbox = Mailbox::new();

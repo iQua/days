@@ -1,56 +1,58 @@
-//! This example shows how to create a basic network where two packet sources
-//! send packets to a wire that adds propagation delays according to a random
-//! distribution, and then to a packet sink.
+//! A basic example of connecting one packet source to one packet sink.
 
-use std::cell::RefCell;
+use std::time::Duration;
 
-use log::{debug, info};
-use petgraph::graph::UnGraph;
-use rand::{rngs::SmallRng, SeedableRng};
+use log::info;
 
-use due::flows::flow::Flow;
-use due::sim::{simulation, Process, RandomVar, SimContext};
-use due::topos::topo::Topology;
-use due::Shared;
+use asynchronix::simulation::{Mailbox, SimInit};
+use asynchronix::time::MonotonicTime;
 
-const SEED: u64 = 1000;
-
-async fn network_sim(sim: SimContext<'_, Shared>) {
-    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
-    let hosts = vec![0, 1];
-    info!("The network graph has been initialized: {:?}", graph);
-
-    let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
-    debug!(
-        "A total of {} network flows has been initialized.",
-        flows.len()
-    );
-
-    // network elements are initialized from a configuration file
-    let topology = Topology::new("configs/simple.toml", graph, hosts, flows);
-
-    // runs the topology
-    topology.run(sim);
-
-    // waits for the end of this simulation
-    sim.advance(sim.shared().duration + 100.).await;
-}
+use due::flows::flow::DistributionInfo;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
 
 fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    let outcome = simulation(
-        Shared {
-            rng: RefCell::new(SmallRng::seed_from_u64(SEED)),
-            queueing_delay: RandomVar::new(),
-            duration: 10.,
+    // Instantiates models and their mailboxes.
+    let mut source = PacketSource::new(
+        0,
+        1.0,
+        10.0,
+        DistributionInfo::Uniform { low: 1, high: 1 },
+        DistributionInfo::Uniform {
+            low: 1000,
+            high: 1000,
         },
-        |sim| Process::new(sim, network_sim(sim)),
     );
+    let source_mbox = Mailbox::new();
+    let mut sink = PacketSink::new(0);
+    let sink_mbox = Mailbox::new();
+    let sink_addr = sink_mbox.address();
 
-    println!(
-        "Statistics on queueing delay in this simulation: {:#.3}",
-        outcome.queueing_delay
+    // Connects the output of packet source to the input of packet sink.
+    source
+        .output
+        .connect(PacketSink::packet_received, &sink_mbox);
+    let mut sink_statistics = sink.statistics.connect_slot().0;
+
+    // Instantiates the simulator.
+    let t0 = MonotonicTime::EPOCH;
+    let mut sim = SimInit::new()
+        .add_model(source, source_mbox)
+        .add_model(sink, sink_mbox)
+        .init(t0);
+
+    sim.step_by(Duration::from_secs(20));
+
+    sim.send_event(PacketSink::report, 1, &sink_addr);
+    if let Some(statistics) = sink_statistics.take() {
+        info!("{:#.3}", statistics);
+    }
+
+    info!(
+        "Simulation completed at time {:.3}.",
+        sim.time().duration_since(t0).as_secs_f64()
     );
 }

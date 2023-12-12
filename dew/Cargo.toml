@@ -1,7 +1,7 @@
 [package]
-name = "due"
+name = "dew"
 version = "0.1.0"
-description = "A Performant Discrete-Event Simulator for Network Simulations"
+description = "A Performant Discrete-Event Simulator for Network Simulations with a Single-Threaded Executor"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]
 repository = "https://github.com/iqua/due.rs"
 readme = "README.md"
@@ -13,11 +13,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-asynchronix = "0.2.0"
 env_logger = "0.10"
 log = "0.4"
 petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
 serde = { version = "1.0", features = ["derive"] }
 statrs = "0.16"
+tokio = { version = "1", features = ["full"] }
 toml = "0.8"

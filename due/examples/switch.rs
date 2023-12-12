@@ -1,4 +1,4 @@
-//! The main program for running a simulation using a specific configuration.
+//! An example of connecting a packet switch.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,18 +9,16 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::endpoints::drop::{CapacityUnit, DropStrategy};
-use due::endpoints::drr::DRRServer;
-use due::endpoints::sink::PacketSink;
-use due::endpoints::source::PacketSource;
-use due::endpoints::switch::PacketSwitch;
 use due::flows::flow::DistributionInfo;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
+use due::schedulers::drop::{CapacityUnit, DropStrategy};
+use due::schedulers::drr::DRRServer;
+use due::switches::switch::PacketSwitch;
 
 fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
-
-    let seed = 1;
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
@@ -32,28 +30,26 @@ fn main() {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
 
     let mut source_2 = PacketSource::new(
         1,
-        2.0,
+        1.0,
         10.0,
         DistributionInfo::Uniform { low: 1, high: 1 },
         DistributionInfo::Uniform {
             low: 1000,
             high: 1000,
         },
-        seed,
     );
 
     let mut fib = HashMap::new();
     fib.insert(0, 2);
     fib.insert(1, 2);
-    let mut switch: PacketSwitch = PacketSwitch::new(fib, Arc::new(|flow_id| flow_id));
+    let mut switch: PacketSwitch = PacketSwitch::new(fib);
 
     let mut drr = DRRServer::new(
-        4000.0,
+        8000.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
@@ -61,7 +57,7 @@ fn main() {
         vec![1, 1],
     );
 
-    let mut sink = PacketSink::new(2, 10.0);
+    let mut sink = PacketSink::new(2);
 
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
@@ -91,13 +87,13 @@ fn main() {
     let t0 = MonotonicTime::EPOCH;
 
     // connects to the packet sink with an element id of 2
-    let mut sim_init = SimInit::new().add_model(source_1, source_1_mbox);
-    sim_init = sim_init.add_model(source_2, source_2_mbox);
-    sim_init = sim_init.add_model(switch, switch_mbox);
-    sim_init = sim_init.add_model(drr, drr_mbox);
-    sim_init = sim_init.add_model(sink, sink_mbox);
-
-    let mut sim = sim_init.init(t0);
+    let mut sim = SimInit::new()
+        .add_model(source_1, source_1_mbox)
+        .add_model(source_2, source_2_mbox)
+        .add_model(switch, switch_mbox)
+        .add_model(drr, drr_mbox)
+        .add_model(sink, sink_mbox)
+        .init(t0);
 
     // starts the simulation
     sim.step_by(Duration::from_secs(100));
