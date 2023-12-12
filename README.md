@@ -13,7 +13,13 @@ cargo run -- configs/simple.toml
 Five examples have also been provided in `due/examples/`:
 
 ```
-cargo run --example fattree
+cargo run --example switch
+```
+
+Especailly, several fattree configuration files have been provide：
+
+```
+cargo run --example fattree configs/fattree_32.toml
 ```
 
 To run the simulation with logging information with configurable logging levels:
@@ -24,12 +30,10 @@ RUST_LOG=debug cargo run -- configs/simple.toml
 
 where the level of RUST_LOG can be warn, info, and debug.
 
-Besides, one shell file has been provided to check the number of activate
-threads during the network simulation, as well as the
-total running time:
+Besides, the following command can be used to evaluate the total running time:
 
 ```
-sh thread_check.sh
+time cargo run -- configs/simple.toml
 ```
 
 ## Configuration Settings
