@@ -68,7 +68,7 @@ pub struct WFQServer {
     active_set: HashSet<usize>,
 
     vtime: f64,
-    last_update: f64,
+    last_updated: f64,
 
     /// the number of packets received, dropped, and in the queues waiting to be sent
     packets_received: usize,
@@ -117,7 +117,7 @@ impl WFQServer {
             flow_queue_count: HashMap::new(),
             active_set: HashSet::new(),
             vtime: 0.0,
-            last_update: 0.0,
+            last_updated: 0.0,
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
@@ -169,7 +169,7 @@ impl WFQServer {
         let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
         *flow_queue_count += 1;
         self.active_set.insert(class_id);
-        self.last_update = arrival_time;
+        self.last_updated = arrival_time;
 
         debug!(
             "WFQServer {} received packet {} ({} bytes with finish time {:.3} from flow {} at time {:.3}. \
@@ -207,7 +207,7 @@ impl WFQServer {
                 .map(|class_id| self.weights[*class_id] as f64)
                 .sum();
 
-            self.vtime += (arrival_time - self.last_update) / weight_sum;
+            self.vtime += (arrival_time - self.last_updated) / weight_sum;
             let class_id = (self.flow_classes)(packet.flow_id);
             finish_time = self.vtime.max(self.finish_times[&class_id])
                 + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
@@ -227,7 +227,7 @@ impl WFQServer {
             .iter()
             .map(|class_id| self.weights[*class_id] as f64)
             .sum();
-        self.vtime += (arrival_time - self.last_update) / weight_sum;
+        self.vtime += (arrival_time - self.last_updated) / weight_sum;
 
         // computes the new set of active flow classes
         let class_id = (self.flow_classes)(packet.flow_id);
@@ -244,7 +244,7 @@ impl WFQServer {
             self.finish_times.insert(class_id, 0.0);
         }
 
-        self.last_update = arrival_time;
+        self.last_updated = arrival_time;
     }
 
     pub async fn send(&mut self, packet: Packet) {
