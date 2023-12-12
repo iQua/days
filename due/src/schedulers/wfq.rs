@@ -260,21 +260,23 @@ impl WFQServer {
             }
 
             if !self.scheduler_queue.is_empty() {
-                let packet = self.scheduler_queue.peek().unwrap().packet.clone();
-                let class_id = (self.flow_classes)(packet.flow_id);
-
-                self.byte_sizes[class_id] -= packet.size;
                 let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+                let class_id = (self.flow_classes)(outbound.flow_id);
+                self.byte_sizes[class_id] -= outbound.size;
                 outbound.departure_update(now);
 
                 self.packets_waiting -= 1;
-                self.update_stats(&packet, now);
+                self.update_stats(&outbound, now);
 
                 // sends the packet out to the next element after a timeout
-                let timeout = packet.size as f64 * 8.0 / self.rate;
+                let timeout = outbound.size as f64 * 8.0 / self.rate;
 
                 scheduler
-                    .schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                    .schedule_event(
+                        Duration::from_secs_f64(timeout),
+                        Self::send,
+                        outbound.clone(),
+                    )
                     .unwrap();
 
                 // schedules the next run
@@ -288,15 +290,13 @@ impl WFQServer {
                     "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
                             {} packets in the queue.",
                     self.scheduler_id,
-                    packet.packet_id,
-                    packet.size,
-                    packet.flow_id,
+                    outbound.packet_id,
+                    outbound.size,
+                    outbound.flow_id,
                     now + timeout,
                     self.scheduler_queue.len(),
                 );
-                return;
             }
-            return;
         }
     }
 }
