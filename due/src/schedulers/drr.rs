@@ -179,8 +179,10 @@ impl DRRServer {
     }
 
     pub fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
-        let now = current_time.as_secs_f64();
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         // schedules packets in the current packet class being served
         loop {
