@@ -3,17 +3,17 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use log::{debug, info};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use log::debug;
 
-use crate::flows::packet::Packet;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::schedulers::Scheduler;
-use crate::sim::{SimContext, Time};
-use crate::{next_scheduler_id, Shared};
+use asynchronix::model::{Model, Output};
+use asynchronix::time::{MonotonicTime, Scheduler};
 
-#[derive(Debug, Clone)]
+use crate::endpoints::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::endpoints::packet::Packet;
+use crate::next_scheduler_id;
+
 pub struct TaggedPacket {
     pub packet: Packet,
     /// tag is the finish time of the packet
@@ -50,12 +50,12 @@ pub struct WFQServer {
     rate: f64,
 
     /// a closure that maps a flow_id to a class_id, used to implement
-    /// class-based WFQ. The default uses a packet's flow_id as its class_id,
-    /// which is equivalent to flow-based WFQ.
-    pub flow_classes: Arc<dyn Fn(usize) -> usize>,
+    /// class-based Deficit Round Robin. The default uses a packet's flow_id as
+    /// its class_id, which is equivalent to flow-based DRR.
+    pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
-    drop_strategy: Box<dyn PacketDrop>,
+    drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
     /// weights of classes
     weights: Vec<usize>,
@@ -81,20 +81,10 @@ pub struct WFQServer {
     /// min-heap of packets from all the classes, where packets are sorted according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
-    /// a sender for sending outbound packets to the downstream element
-    pub sender: UnboundedSender<Packet>,
-    /// a receiver for receiving inbound packets from upstream elements
-    pub receiver: UnboundedReceiver<Packet>,
-}
+    /// The server is considered busy sending the current packet until this time
+    busy_until: f64,
 
-impl Scheduler for WFQServer {
-    fn connect_sender(&mut self, sender: UnboundedSender<Packet>) {
-        self.sender = sender;
-    }
-
-    fn connect_receiver(&mut self, receiver: UnboundedReceiver<Packet>) {
-        self.receiver = receiver;
-    }
+    pub output: Output<Packet>,
 }
 
 impl WFQServer {
@@ -102,14 +92,13 @@ impl WFQServer {
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
-        flow_classes: Arc<dyn Fn(usize) -> usize>,
+        flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> WFQServer {
         let mut finish_times = Vec::new();
         let mut flow_queue_count = Vec::new();
         let mut byte_sizes = Vec::new();
-        let (sender, receiver) = unbounded_channel();
 
         for _ in &weights {
             finish_times.push(0.0);
@@ -138,12 +127,15 @@ impl WFQServer {
             packets_waiting: 0,
             byte_sizes,
             scheduler_queue: BinaryHeap::new(),
-            sender,
-            receiver,
+            busy_until: 0.0,
+            output: Output::default(),
         }
     }
 
-    fn packet_received(&mut self, packet: Packet, now: Time) {
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -159,7 +151,7 @@ impl WFQServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                now
+                arrival_time
             }
             return;
         }
@@ -170,7 +162,7 @@ impl WFQServer {
         let class_id = (self.flow_classes)(packet.flow_id);
 
         // adds tag (finish time) to the packet before push to the queue (a min-heap)
-        let (finish_time, tagged_packet) = self.add_tag(packet.clone(), now);
+        let (finish_time, tagged_packet) = self.add_tag(packet.clone(), arrival_time);
         self.scheduler_queue.push(tagged_packet);
 
         self.byte_sizes[class_id] += packet.size;
@@ -185,15 +177,17 @@ impl WFQServer {
             packet.size,
             finish_time,
             packet.flow_id,
-            now,
+            arrival_time,
             self.packets_received,
-            self.scheduler_queue.len()
+            self.scheduler_queue.len(),
         );
 
-        self.last_update = now;
+        if arrival_time > self.busy_until {
+            self.run((), scheduler);
+        }
     }
 
-    fn add_tag(&mut self, packet: Packet, now: Time) -> (f64, TaggedPacket) {
+    fn add_tag(&mut self, packet: Packet, now: f64) -> (f64, TaggedPacket) {
         let mut finish_time = 0.0;
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
@@ -223,7 +217,7 @@ impl WFQServer {
         )
     }
 
-    fn update_stats(&mut self, packet: &Packet, now: Time) {
+    fn update_stats(&mut self, packet: &Packet, now: f64) {
         let mut weight_sum = 0.0;
 
         // updates the virtual time based on the current set of active flow classes
@@ -250,57 +244,61 @@ impl WFQServer {
         self.last_update = now;
     }
 
-    pub async fn run(mut self, sim: SimContext<'_, Shared>) {
+    pub async fn send(&mut self, packet: Packet) {
+        self.output.send(packet).await;
+    }
+
+    pub fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
+        let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+        let now = current_time.as_secs_f64();
+
+        // schedules packets in the current packet class being served
         loop {
-            // schedules packets by going through the queue
-            while !self.scheduler_queue.is_empty() {
+            if self.packets_waiting == 0 {
+                // all packets in the queues have been processed
+                return;
+            }
+
+            if !self.scheduler_queue.is_empty() {
                 let packet = self.scheduler_queue.peek().unwrap().packet.clone();
                 let class_id = (self.flow_classes)(packet.flow_id);
 
                 self.byte_sizes[class_id] -= packet.size;
-
-                let timeout = (packet.size as f64) * 8.0 / self.rate;
-                sim.advance(timeout).await;
-                let mut outbound = self.scheduler_queue.pop().unwrap();
-                outbound.packet.send(sim.now());
-                let _ = self.sender.send(packet.clone());
+                let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+                outbound.send(now);
 
                 self.packets_waiting -= 1;
+                self.update_stats(&packet, now);
 
-                self.update_stats(&packet, sim.now());
+                // sends the packet out to the next element after a timeout
+                let timeout = packet.size as f64 * 8.0 / self.rate;
 
-                // polls for and receives all outstanding packets
-                // recently sent to WFQServer while sending the previous
-                // packet
-                while let Ok(packet) = self.receiver.try_recv() {
-                    self.packet_received(packet, sim.now());
-                }
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                    .unwrap();
+
+                // schedules the next run
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                    .unwrap();
+
+                self.busy_until = now + timeout;
 
                 debug!(
-                    "WFQServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
+                    "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
                             {} packets in the queue.",
                     self.scheduler_id,
                     packet.packet_id,
                     packet.size,
                     packet.flow_id,
-                    sim.now(),
+                    now + timeout,
                     self.scheduler_queue.len(),
                 );
-            } // finishes going through the queue in one round
-
-            // waits for inbound packets from the upstream element
-            if self.packets_waiting == 0 {
-                if let Some(packet) = self.receiver.recv().await {
-                    self.packet_received(packet, sim.now());
-                } else {
-                    break;
-                }
+                return;
             }
+            return;
         }
-        info!(
-            "WFQServer {} finished running at time {}.",
-            self.scheduler_id,
-            sim.now()
-        );
     }
 }
+
+impl Model for WFQServer {}
