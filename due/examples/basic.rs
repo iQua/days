@@ -39,7 +39,7 @@ fn main() {
 
     // Instantiates the simulator.
     let t0 = MonotonicTime::EPOCH;
-    let mut sim = SimInit::with_num_threads(1)
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox)
         .add_model(sink, sink_mbox)
         .init(t0);
