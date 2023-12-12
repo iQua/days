@@ -1,7 +1,7 @@
 //! Implements a Weighted Fair Queueing (WFQ) scheduler.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,7 +65,7 @@ pub struct WFQServer {
     flow_queue_count: Vec<usize>,
 
     /// set of active flow classes
-    active_set: Vec<usize>,
+    active_set: HashSet<usize>,
 
     vtime: f64,
     last_update: f64,
@@ -119,7 +119,7 @@ impl WFQServer {
             weights,
             finish_times,
             flow_queue_count,
-            active_set: Vec::new(),
+            active_set: HashSet::new(),
             vtime: 0.0,
             last_update: 0.0,
             packets_received: 0,
@@ -167,7 +167,7 @@ impl WFQServer {
 
         self.byte_sizes[class_id] += packet.size;
         self.flow_queue_count[class_id] += 1;
-        self.active_set.push(class_id);
+        self.active_set.insert(class_id);
 
         debug!(
             "WFQServer {} received packet {} ({} bytes, finish time {:.3}) from flow {} at time {:.3}. \
@@ -232,8 +232,7 @@ impl WFQServer {
 
         self.flow_queue_count[class_id] -= 1;
         if self.flow_queue_count[class_id] == 0 {
-            let index = self.active_set.iter().position(|x| *x == class_id).unwrap();
-            self.active_set.remove(index);
+            self.active_set.remove(&class_id);
         }
 
         if self.active_set.is_empty() {
