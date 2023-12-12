@@ -1,0 +1,537 @@
+# This is a configuration file for fattre-32 with 64 flows and 1500 seconds.
+seed = 1000
+k = 32
+port_rate = 800000 # process 100 packets (1000 bytes) per second
+capacity = 10000
+weights = [1]
+discipline = "FIFO"
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[0, 16]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[8, 24]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[16, 32]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[24, 40]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[32, 48]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[40, 56]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[48, 64]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[56, 72]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[64, 80]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[72, 88]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[80, 96]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[88, 104]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[96, 112]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[104, 120]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[112, 128]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[120, 136]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[128, 144]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[136, 152]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[144, 160]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[152, 168]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[160, 176]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[168, 184]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[176, 192]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[184, 200]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[192, 208]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[200, 216]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[208, 224]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[216, 232]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[224, 240]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[232, 248]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[240, 256]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[248, 264]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[256, 272]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[264, 280]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[272, 288]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[280, 296]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[288, 304]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[296, 312]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[304, 320]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[312, 328]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[320, 336]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[328, 344]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[336, 352]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[344, 360]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[352, 368]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[360, 376]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[368, 384]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[376, 392]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[384, 400]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[392, 408]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[400, 416]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[408, 424]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[416, 432]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[424, 440]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[432, 448]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[440, 456]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[448, 464]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[456, 472]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[464, 480]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[472, 488]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[480, 496]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[488, 504]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[496, 1]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[504, 9]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[511, 17]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+
+[[flows]]
+flow_type = "PacketDistribution"
+graph = [[500, 16]]
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
