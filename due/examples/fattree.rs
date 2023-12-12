@@ -41,14 +41,14 @@ fn main() {
     env_logger::init_from_env(env);
 
     // let path = "configs/fattree.toml";
-    let path = "configs/fattree_8.toml";
+    let path = "configs/fattree_32.toml";
     let seed = get_seed(&path);
 
     let outcome = simulation(
         Shared {
             rng: RefCell::new(SmallRng::seed_from_u64(seed)),
             queueing_delay: RandomVar::new(),
-            duration: 10000.,
+            duration: 1500.,
         },
         |sim| Process::new(sim, network_sim(path, sim)),
     );
