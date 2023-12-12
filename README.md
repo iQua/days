@@ -16,54 +16,44 @@ Five examples have also been provided in `due/examples/`:
 cargo run --example switch
 ```
 
-Especailly, several fattree configuration files have been provide：
+Several configuration files with the FatTree topology have been provided as well:
 
 ```
 cargo run --example fattree configs/fattree_32.toml
 ```
 
-To run the simulation with logging information with configurable logging levels:
+To run the simulation with logging information with configurable logging levels, use the `RUST_LOG` environment variable:
 
 ```
 RUST_LOG=debug cargo run -- configs/simple.toml
 ```
 
-where the level of RUST_LOG can be warn, info, and debug.
+where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`.
 
-Besides, the following command can be used to evaluate the total running time:
+The `time` command in UNIX can be used to measure the total running time of a run:
 
 ```
 time cargo run -- configs/simple.toml
 ```
 
-## Configuration Settings
-
-To set the number of threads for the simulation, there are two ways to create
-the builder `SimInit`:
+## Setting the number of threads and the duration of each flow
 
 ```
 let mut sim = SimInit::new()
 ```
 
-or
+is the default as it creates a multi-threaded simulation, with one thread per CPU core. 
 
 ```
 let mut sim = SimInit::with_num_threads(1)
 ```
 
-where `new()` creates a builder for a multithreaded simulation running on all
-available logical threads, while `with_num_thread()` specifies the number of
-threads.
+specifies the number of threads explicitly.
 
-To set the simulation time, there are two parts to modify. First, if
-configuration files are used, modify the `duration` of each flow. Otherwise,
-modify the `duration` of the PacketSource directly. 
-
-Second, modify the total
-simulation time:
+The `duration` of each flow can be specified in the configuration file.
 
 ```
 sim.step_by(Duration::from_secs(20));
 ```
 
-where this `step_by()` function will either in the example file or in the `/due/src/topos/topo.rs`.
+can also limit the total duration of the simulation.
