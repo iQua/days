@@ -124,20 +124,7 @@ impl PacketSource {
                 as usize,
         };
 
-        let src = format!("source-{}", self.endpoint_id);
-        let dst = format!("destination-{}", self.endpoint_id);
-
-        let mut packet = Packet::new(
-            packet_size,
-            self.packets_sent,
-            src,
-            dst,
-            self.flow_id(),
-            now,
-        );
-
-        packet.update(now);
-
+        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id(), now);
         (packet, Duration::from_secs_f64(interval))
     }
 

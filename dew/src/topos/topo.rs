@@ -100,13 +100,14 @@ impl Topology {
         let num_switches = config.k.pow(2) * 5 / 4;
 
         for _ in 0..num_switches {
+            let weight_len = config.weights.len();
             let switch = PacketSwitch::new(
                 config.port_rate,
                 config.capacity,
                 config.weights.clone(),
                 HashMap::new(),
                 config.discipline.clone(),
-                Arc::new(|flow_id| flow_id),
+                Arc::new(move |flow_id| flow_id % weight_len),
             );
             elements.push(Element::PacketSwitch(switch));
         }
