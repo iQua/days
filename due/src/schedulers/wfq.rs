@@ -10,9 +10,9 @@ use log::debug;
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::endpoints::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
-use crate::endpoints::packet::Packet;
+use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
 
 pub struct TaggedPacket {
     pub packet: Packet,
@@ -265,7 +265,7 @@ impl WFQServer {
 
                 self.byte_sizes[class_id] -= packet.size;
                 let mut outbound = self.scheduler_queue.pop().unwrap().packet;
-                outbound.send(now);
+                outbound.departure_update(now);
 
                 self.packets_waiting -= 1;
                 self.update_stats(&packet, now);
