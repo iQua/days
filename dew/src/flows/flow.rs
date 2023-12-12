@@ -2,17 +2,20 @@ use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 
 use crate::sim::{SimContext, Time};
-use crate::{next_flow_id, Shared};
+use crate::topos::build::FatTreeConfig;
+use crate::{get_seed, next_flow_id, Shared};
 
 use super::route::{RandomSimplePath, RoutingProtocol};
 use super::sink::PacketSink;
 use super::source::PacketSource;
 use super::EndPoint;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename = "UPPERCASE")]
 pub enum FlowType {
     PacketDistribution,
@@ -23,14 +26,24 @@ pub enum FlowType {
 struct TomlFlow {
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
-    initial_delay: Time,
+    initial_delay: f64,
+    arr_dist: DistributionInfo,
+    pkt_size_dist: DistributionInfo,
+}
+
+#[derive(Deserialize, Debug)]
+struct TomlFlowSet {
+    flow_type: FlowType,
+    flow_num: u32,
+    initial_delay: f64,
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
 }
 
 #[derive(Deserialize, Debug)]
 struct FlowConfig {
-    flows: Vec<TomlFlow>,
+    flows: Option<Vec<TomlFlow>>,
+    flow_set: Option<Vec<TomlFlowSet>>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
@@ -106,17 +119,49 @@ impl Flow {
 
         let mut flows = Vec::new();
 
-        for flow in config.flows {
-            let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
+        if let Some(flows_vec) = config.flows {
+            for flow in flows_vec {
+                let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
 
-            flows.push(Flow::new(
-                next_flow_id(),
-                flow.flow_type,
-                graph,
-                flow.initial_delay,
-                flow.arr_dist,
-                flow.pkt_size_dist,
-            ));
+                flows.push(Flow::new(
+                    next_flow_id(),
+                    flow.flow_type,
+                    graph,
+                    flow.initial_delay,
+                    flow.arr_dist,
+                    flow.pkt_size_dist,
+                ));
+            }
+        }
+
+        if let Some(flow_set_vec) = config.flow_set {
+            let fattree_config: FatTreeConfig =
+                toml::from_str(&content).expect("Failed to deserialize the configuration");
+            let num_edge_switches = fattree_config.k.pow(2) / 2;
+            let mut rng = SmallRng::seed_from_u64(get_seed(file_path));
+
+            for flow_set in flow_set_vec {
+                for _ in 0..flow_set.flow_num {
+                    let start = rng.gen_range(0..num_edge_switches);
+                    let end = {
+                        let mut range = (0..start).chain((start + 1)..num_edge_switches);
+                        range.nth(rng.gen_range(0..num_edge_switches - 1)).unwrap()
+                    };
+                    let graph = DiGraph::<usize, ()>::from_edges(vec![(
+                        NodeIndex::new(start),
+                        NodeIndex::new(end),
+                    )]);
+
+                    flows.push(Flow::new(
+                        next_flow_id(),
+                        flow_set.flow_type,
+                        graph,
+                        flow_set.initial_delay,
+                        flow_set.arr_dist,
+                        flow_set.pkt_size_dist,
+                    ));
+                }
+            }
         }
 
         flows

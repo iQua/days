@@ -1,22 +1,24 @@
+# This is a configuration file for fattre topology.
+
 seed = 1000
 k = 4
-port_rate = 32000 # which is equal to 4000 * 8
+port_rate = 320000 # process 40 packets (1000 bytes) per second
 capacity = 100
 weights = [1]
 discipline = "FIFO"
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_num = 63
+initial_delay = 1.0
+duration = 1500.0
+arr_dist = {type = "Uniform", low = 1, high = 1}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
 
 [[flows]]
 flow_type = "PacketDistribution"
 graph = [[0, 1]]
 initial_delay = 1.0
-duration = 10.0
-arr_dist = {type = "Exp", lambda = 1.0}
-pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
-
-[[flows]]
-flow_type = "PacketDistribution"
-graph = [[1, 7]]
-initial_delay = 2.0
-duration = 10.0
+duration = 1500.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
-pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
