@@ -173,11 +173,13 @@ impl DRRServer {
                         // sends the packet out to the next element
                         self.byte_sizes[class_id] -= packet.size;
 
-                        let timeout = (packet.size as f64) * 8.0 / self.rate;
-                        sim.advance(timeout).await;
+                        if self.rate > 0.0 {
+                            sim.advance(packet.size as f64 * 8.0 / self.rate).await;
+                        }
+
                         let mut outbound = self.queues[class_id].pop_front().unwrap();
                         outbound.send(sim.now());
-                        let _ = self.sender.send(packet.clone());
+                        let _ = self.sender.send(outbound.clone());
 
                         self.packets_waiting -= 1;
                         current_deficit -= packet.size;
