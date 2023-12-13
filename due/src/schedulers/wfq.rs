@@ -69,6 +69,7 @@ pub struct WFQServer {
 
     vtime: f64,
     last_updated: f64,
+    current_time: f64,
 
     /// the number of packets received, dropped, and in the queues waiting to be sent
     packets_received: usize,
@@ -118,6 +119,7 @@ impl WFQServer {
             active_set: HashSet::new(),
             vtime: 0.0,
             last_updated: 0.0,
+            current_time: 0.0,
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
@@ -176,7 +178,7 @@ impl WFQServer {
         self.last_updated = arrival_time;
 
         debug!(
-            "WFQServer {} received packet {} ({} bytes with finish time {:.3} from flow {} at time {:.3}. \
+            "WFQServer {} received packet {} ({} bytes with finish time {:.3}) from flow {} at time {:.3}. \
             {} packets received, {} packet(s) in queue.",
             self.scheduler_id,
             packet.packet_id,
@@ -252,7 +254,8 @@ impl WFQServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        self.output.send(packet).await;
+        self.output.send(packet.clone()).await;
+        self.update_stats(&packet, self.current_time);
     }
 
     pub fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
@@ -276,11 +279,11 @@ impl WFQServer {
                 outbound.departure_update(now);
 
                 self.packets_waiting -= 1;
-                self.update_stats(&outbound, now);
 
                 // sends the packet out to the next element after a timeout
                 let timeout = outbound.size as f64 * 8.0 / self.rate;
 
+                self.current_time = now;
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(timeout),
