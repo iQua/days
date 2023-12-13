@@ -21,18 +21,18 @@ fn main() {
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
         0,
-        1.0,
+        2.5,
         10.0,
-        DistributionInfo::Uniform { low: 1, high: 1 },
+        DistributionInfo::Uniform { low: 2, high: 2 },
         DistributionInfo::Uniform {
-            low: 1000,
-            high: 1000,
+            low: 2000,
+            high: 2000,
         },
     );
 
     let mut source_2 = PacketSource::new(
         1,
-        1.0,
+        2.0,
         10.0,
         DistributionInfo::Uniform { low: 1, high: 1 },
         DistributionInfo::Uniform {
@@ -47,7 +47,7 @@ fn main() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        vec![1, 1],
+        vec![1, 2],
     );
 
     let mut sink = PacketSink::new(2);
