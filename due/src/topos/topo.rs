@@ -24,6 +24,7 @@ use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
+use crate::schedulers::wfq::WFQServer;
 use crate::set_num_switches;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
@@ -257,6 +258,45 @@ impl Topology {
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
                 self.sim_init = self.sim_init.add_model(port, port_mbox);
+            }
+
+            SchedulingDiscipline::WFQ => {
+                let mut wfq_server = match &self.config {
+                    Config::SwitchConfig(config) => {
+                        let weight_len = config.switch[upstream_id].weights.len();
+                        WFQServer::new(
+                            config.switch[upstream_id].port_rate,
+                            config.switch[upstream_id].capacity,
+                            CapacityUnit::Packets,
+                            Arc::new(move |flow_id| flow_id % weight_len),
+                            DropStrategy::TailDrop,
+                            config.switch[upstream_id].weights.clone(),
+                        )
+                    }
+                    Config::FatTreeConfig(config) => {
+                        let weight_len = config.weights.len();
+                        WFQServer::new(
+                            config.port_rate,
+                            config.capacity,
+                            CapacityUnit::Packets,
+                            Arc::new(move |flow_id| flow_id % weight_len),
+                            DropStrategy::TailDrop,
+                            config.weights.clone(),
+                        )
+                    }
+                };
+
+                let mut output = Output::default();
+                let wfq_mbox: Mailbox<WFQServer> = Mailbox::new();
+                output.connect(WFQServer::packet_received, &wfq_mbox);
+                upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                wfq_server
+                    .output
+                    .connect(PacketSwitch::packet_received, downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(wfq_server, wfq_mbox);
             }
         }
 
