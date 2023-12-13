@@ -130,7 +130,7 @@ impl PacketSource {
                 sim.now(),
             );
 
-            packet.send(sim.now());
+            packet.departure_update(sim.now());
             let _ = self.sender.send(packet.clone());
 
             self.packet_sent(sim.now(), packet);

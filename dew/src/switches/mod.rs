@@ -17,6 +17,7 @@ use crate::Shared;
 pub enum SchedulingDiscipline {
     DRR,
     FIFO,
+    WFQ,
 }
 
 pub enum Element {

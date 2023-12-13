@@ -1,6 +1,7 @@
 pub mod drop;
 pub mod drr;
 pub mod port;
+pub mod wfq;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 

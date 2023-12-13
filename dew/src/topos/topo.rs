@@ -77,13 +77,15 @@ impl Topology {
         let mut elements: Vec<Element> = Vec::new();
 
         for e in config.switch {
+            let weight_len = e.weights.len();
+
             let switch = PacketSwitch::new(
                 e.port_rate,
                 e.capacity,
                 e.weights,
                 HashMap::new(),
                 e.discipline,
-                Arc::new(|flow_id| flow_id),
+                Arc::new(move |flow_id| flow_id % weight_len),
             );
             elements.push(Element::PacketSwitch(switch));
         }
@@ -101,6 +103,7 @@ impl Topology {
 
         for _ in 0..num_switches {
             let weight_len = config.weights.len();
+
             let switch = PacketSwitch::new(
                 config.port_rate,
                 config.capacity,
