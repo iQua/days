@@ -128,7 +128,11 @@ impl WFQServer {
         }
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+    pub fn id(&self) -> usize {
+        self.scheduler_id
+    }
+
+    pub async fn packet_received(&mut self, mut packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -154,8 +158,7 @@ impl WFQServer {
 
         self.packets_waiting += 1;
         self.packets_received += 1;
-
-        let class_id = (self.flow_classes)(packet.flow_id);
+        packet.arrival_update(arrival_time);
 
         // computes a finish time and adds it as a tag to the packet
         let tagged_packet = self.tag(packet.clone(), arrival_time);
@@ -164,6 +167,7 @@ impl WFQServer {
         // pushes the packet into a min-heap according to the packet's finish time
         self.scheduler_queue.push(tagged_packet);
 
+        let class_id = (self.flow_classes)(packet.flow_id);
         let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
         *byte_size += packet.size;
         let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
