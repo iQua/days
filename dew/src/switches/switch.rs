@@ -231,8 +231,9 @@ impl PacketSwitch {
             }
         }
 
-        while let Some(packet) = self.receiver.recv().await {
+        while let Some(mut packet) = self.receiver.recv().await {
             self.packets_received += 1;
+            packet.arrival_update(sim.now());
 
             debug!(
                 "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
