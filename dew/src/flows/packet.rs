@@ -69,9 +69,14 @@ impl Packet {
         }
     }
 
-    /// updates the queueing delay of the packet.
-    pub fn send(&mut self, time: f64) {
+    /// Updates the queueing delay of the packet when it departs from a scheduler.
+    pub fn departure_update(&mut self, time: f64) {
         self.queueing_delay += time - self.time;
+        self.time = time;
+    }
+
+    /// Records the current simulation time when a packet arrives at a scheduler.
+    pub fn arrival_update(&mut self, time: f64) {
         self.time = time;
     }
 }

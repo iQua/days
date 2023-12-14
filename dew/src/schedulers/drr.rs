@@ -109,7 +109,7 @@ impl DRRServer {
         self.scheduler_id
     }
 
-    fn packet_received(&mut self, packet: Packet, now: Time) {
+    fn packet_received(&mut self, mut packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -132,6 +132,7 @@ impl DRRServer {
 
         self.packets_waiting += 1;
         self.packets_received += 1;
+        packet.arrival_update(now);
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -178,7 +179,7 @@ impl DRRServer {
                         }
 
                         let mut outbound = self.queues[class_id].pop_front().unwrap();
-                        outbound.send(sim.now());
+                        outbound.departure_update(sim.now());
                         let _ = self.sender.send(outbound.clone());
 
                         self.packets_waiting -= 1;

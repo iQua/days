@@ -70,7 +70,7 @@ impl Port {
         self.scheduler_id
     }
 
-    fn packet_received(&mut self, packet: Packet, now: Time) {
+    fn packet_received(&mut self, mut packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet =
             self.drop_strategy
@@ -93,6 +93,7 @@ impl Port {
         self.packets_received += 1;
         self.queue.push_back(packet.clone());
         self.bytes_in_queue += packet.size;
+        packet.arrival_update(now);
 
         debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -134,7 +135,7 @@ impl Port {
                     sim.advance(packet.size as f64 * 8.0 / self.rate).await;
                 }
 
-                packet.send(sim.now());
+                packet.departure_update(sim.now());
                 let _ = self.sender.send(packet.clone());
                 self.packet_sent(packet, sim.now());
             }

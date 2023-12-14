@@ -1,7 +1,7 @@
 //! Implements a Weighted Fair Queueing (WFQ) scheduler.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use log::{debug, info};
@@ -59,26 +59,27 @@ pub struct WFQServer {
 
     /// weights of classes
     weights: Vec<usize>,
-    /// finish time of the last packet served in each class
-    finish_times: Vec<f64>,
-    /// number of to-be-sent packets of each class
-    flow_queue_count: Vec<usize>,
+    /// class_id -> finish_time
+    finish_times: HashMap<usize, f64>,
+    /// number of queued packets of each flow class
+    flow_queue_count: HashMap<usize, usize>,
 
     /// set of active flow classes
-    active_set: Vec<usize>,
+    active_set: HashSet<usize>,
 
     vtime: f64,
-    last_update: f64,
+    last_updated: f64,
 
     /// the number of packets received, dropped, and in the queues waiting to be sent
     packets_received: usize,
     packets_dropped: usize,
     packets_waiting: usize,
 
-    /// the number of bytes of classes, which are consecutive and start from 0
-    byte_sizes: Vec<usize>,
+    /// the number of bytes currently queued in each flow class
+    byte_sizes: HashMap<usize, usize>,
 
-    /// min-heap of packets from all the classes, where packets are sorted according to their finish times
+    /// min-heap of packets from all the classes, where packets are sorted
+    /// according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
     /// a sender for sending outbound packets to the downstream element
@@ -106,15 +107,12 @@ impl WFQServer {
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
     ) -> WFQServer {
-        let mut finish_times = Vec::new();
-        let mut flow_queue_count = Vec::new();
-        let mut byte_sizes = Vec::new();
+        let mut finish_times = HashMap::new();
+
         let (sender, receiver) = unbounded_channel();
 
-        for _ in &weights {
-            finish_times.push(0.0);
-            flow_queue_count.push(0);
-            byte_sizes.push(0);
+        for (class_id, _) in weights.iter().enumerate() {
+            finish_times.insert(class_id, 0.0);
         }
 
         let packet_drop = match drop_strategy {
@@ -129,25 +127,29 @@ impl WFQServer {
             drop_strategy: Box::new(packet_drop),
             weights,
             finish_times,
-            flow_queue_count,
-            active_set: Vec::new(),
+            flow_queue_count: HashMap::new(),
+            active_set: HashSet::new(),
             vtime: 0.0,
-            last_update: 0.0,
+            last_updated: 0.0,
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
-            byte_sizes,
+            byte_sizes: HashMap::new(),
             scheduler_queue: BinaryHeap::new(),
             sender,
             receiver,
         }
     }
 
-    fn packet_received(&mut self, packet: Packet, now: Time) {
+    pub fn id(&self) -> usize {
+        self.scheduler_id
+    }
+
+    fn packet_received(&mut self, mut packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
-            self.byte_sizes.iter().sum(),
+            self.byte_sizes.values().sum(),
             self.scheduler_queue.len(),
         );
 
@@ -166,16 +168,22 @@ impl WFQServer {
 
         self.packets_waiting += 1;
         self.packets_received += 1;
+        packet.arrival_update(now);
 
-        let class_id = (self.flow_classes)(packet.flow_id);
+        // computes a finish time and adds it as a tag to the packet
+        let tagged_packet = self.tag(packet.clone(), now);
+        let finish_time = tagged_packet.tag;
 
-        // adds tag (finish time) to the packet before push to the queue (a min-heap)
-        let (finish_time, tagged_packet) = self.add_tag(packet.clone(), now);
+        // pushes the packet into a min-heap according to the packet's finish time
         self.scheduler_queue.push(tagged_packet);
 
-        self.byte_sizes[class_id] += packet.size;
-        self.flow_queue_count[class_id] += 1;
-        self.active_set.push(class_id);
+        let class_id = (self.flow_classes)(packet.flow_id);
+        let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+        *byte_size += packet.size;
+        let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
+        *flow_queue_count += 1;
+        self.active_set.insert(class_id);
+        self.last_updated = now;
 
         debug!(
             "WFQServer {} received packet {} ({} bytes, finish time {:.3}) from flow {} at time {:.3}. \
@@ -190,84 +198,95 @@ impl WFQServer {
             self.scheduler_queue.len()
         );
 
-        self.last_update = now;
+        self.last_updated = now;
     }
 
-    fn add_tag(&mut self, packet: Packet, now: Time) -> (f64, TaggedPacket) {
+    fn tag(&mut self, packet: Packet, now: f64) -> TaggedPacket {
         let mut finish_time = 0.0;
+
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
             self.vtime = 0.0;
-            for time in &mut self.finish_times {
-                *time = 0.0;
+
+            for (class_id, _) in self.weights.iter().enumerate() {
+                self.finish_times.insert(class_id, 0.0);
             }
         } else {
-            let mut weight_sum = 0.0;
-            for class_id in &self.active_set {
-                weight_sum += self.weights[*class_id] as f64;
-            }
+            // computes the sum of weights for flow classes in the active set
+            let weight_sum: f64 = self
+                .active_set
+                .iter()
+                .map(|class_id| self.weights[*class_id] as f64)
+                .sum();
 
-            self.vtime += (now - self.last_update) / weight_sum;
+            self.vtime += (now - self.last_updated) / weight_sum;
             let class_id = (self.flow_classes)(packet.flow_id);
-            finish_time = self.vtime.max(self.finish_times[class_id])
+            finish_time = self.vtime.max(self.finish_times[&class_id])
                 + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
-            self.finish_times[class_id] = finish_time;
+            self.finish_times.insert(class_id, finish_time);
         }
 
-        (
-            finish_time,
-            TaggedPacket {
-                packet,
-                tag: finish_time,
-            },
-        )
+        TaggedPacket {
+            packet,
+            tag: finish_time,
+        }
     }
 
     fn update_stats(&mut self, packet: &Packet, now: Time) {
-        let mut weight_sum = 0.0;
-
-        // updates the virtual time based on the current set of active flow classes
-        for class_id in &self.active_set {
-            weight_sum += self.weights[*class_id] as f64;
-        }
-
-        self.vtime += (now - self.last_update) / weight_sum;
+        let weight_sum: f64 = self
+            .active_set
+            .iter()
+            .map(|class_id| self.weights[*class_id] as f64)
+            .sum();
+        self.vtime += (now - self.last_updated) / weight_sum;
 
         // computes the new set of active flow classes
         let class_id = (self.flow_classes)(packet.flow_id);
 
-        self.flow_queue_count[class_id] -= 1;
-        if self.flow_queue_count[class_id] == 0 {
-            let index = self.active_set.iter().position(|x| *x == class_id).unwrap();
-            self.active_set.remove(index);
+        let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
+        *flow_queue_count -= 1;
+
+        if *flow_queue_count == 0 {
+            self.active_set.remove(&class_id);
         }
 
         if self.active_set.is_empty() {
             self.vtime = 0.0;
-            self.finish_times[class_id] = 0.0;
+            self.finish_times.insert(class_id, 0.0);
         }
 
-        self.last_update = now;
+        self.last_updated = now;
     }
 
     pub async fn run(mut self, sim: SimContext<'_, Shared>) {
         loop {
             // schedules packets by going through the queue
             while !self.scheduler_queue.is_empty() {
-                let packet = self.scheduler_queue.peek().unwrap().packet.clone();
-                let class_id = (self.flow_classes)(packet.flow_id);
+                let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+                let class_id = (self.flow_classes)(outbound.flow_id);
+                let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+                *byte_size -= outbound.size;
+                outbound.departure_update(sim.now());
 
-                self.byte_sizes[class_id] -= packet.size;
+                debug!(
+                    "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                            {} packets in the queue.",
+                    self.scheduler_id,
+                    outbound.packet_id,
+                    outbound.size,
+                    outbound.flow_id,
+                    sim.now(),
+                    self.scheduler_queue.len(),
+                );
 
-                let timeout = (packet.size as f64) * 8.0 / self.rate;
-                sim.advance(timeout).await;
-                let mut outbound = self.scheduler_queue.pop().unwrap();
-                outbound.packet.send(sim.now());
-                let _ = self.sender.send(packet.clone());
+                if self.rate > 0.0 {
+                    sim.advance(outbound.size as f64 * 8.0 / self.rate).await;
+                }
+
+                let _ = self.sender.send(outbound.clone());
 
                 self.packets_waiting -= 1;
-
-                self.update_stats(&packet, sim.now());
+                self.update_stats(&outbound, sim.now());
 
                 // polls for and receives all outstanding packets
                 // recently sent to WFQServer while sending the previous
@@ -280,9 +299,9 @@ impl WFQServer {
                     "WFQServer {} sent packet {} ({} bytes) from flow {} at time {:.3}. \
                             {} packets in the queue.",
                     self.scheduler_id,
-                    packet.packet_id,
-                    packet.size,
-                    packet.flow_id,
+                    outbound.packet_id,
+                    outbound.size,
+                    outbound.flow_id,
                     sim.now(),
                     self.scheduler_queue.len(),
                 );
