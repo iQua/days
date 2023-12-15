@@ -75,7 +75,7 @@ impl Packet {
         self.time = time;
     }
 
-    /// Records the current simulation time when a packet arrives at a scheduler.
+    /// Records the current simulation time when a packet arrives at a packet switch.
     pub fn arrival_update(&mut self, time: f64) {
         self.time = time;
     }

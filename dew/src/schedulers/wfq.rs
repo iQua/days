@@ -145,7 +145,7 @@ impl WFQServer {
         self.scheduler_id
     }
 
-    fn packet_received(&mut self, mut packet: Packet, now: Time) {
+    fn packet_received(&mut self, packet: Packet, now: Time) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -168,7 +168,6 @@ impl WFQServer {
 
         self.packets_waiting += 1;
         self.packets_received += 1;
-        packet.arrival_update(now);
 
         // computes a finish time and adds it as a tag to the packet
         let tagged_packet = self.tag(packet.clone(), now);
@@ -266,7 +265,6 @@ impl WFQServer {
                 let class_id = (self.flow_classes)(outbound.flow_id);
                 let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
                 *byte_size -= outbound.size;
-                outbound.departure_update(sim.now());
 
                 debug!(
                     "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -283,6 +281,7 @@ impl WFQServer {
                     sim.advance(outbound.size as f64 * 8.0 / self.rate).await;
                 }
 
+                outbound.departure_update(sim.now());
                 let _ = self.sender.send(outbound.clone());
 
                 self.packets_waiting -= 1;
