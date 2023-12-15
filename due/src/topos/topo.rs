@@ -311,14 +311,9 @@ impl Topology {
         );
 
         for flow in self.flows.iter_mut() {
-            for (edge_index, edge) in flow.graph.edge_references().enumerate() {
-                // an element in the network must be a host, as specified by the
-                // network graph
-                assert!(self.hosts.contains(&edge.source().index()));
-                assert!(self.hosts.contains(&edge.target().index()));
-
-                // attaches each endpoint to its corresponding host
-                // source -> edge.source(), sink -> edge.target()
+            for source_id in &flow.sources {
+                // a packet source must be attached to a host
+                assert!(self.hosts.contains(&source_id));
 
                 // creates a new packet source
                 let mut source = PacketSource::new(
@@ -330,8 +325,8 @@ impl Topology {
                 );
 
                 // obtains the host switch and its mailbox for the packet source
-                let source_host = self.switches.get_mut(&edge.source().index()).unwrap();
-                let host_mbox = self.switch_mailboxes.get(&edge.source().index()).unwrap();
+                let source_host = self.switches.get_mut(&source_id).unwrap();
+                let host_mbox = self.switch_mailboxes.get(&source_id).unwrap();
 
                 // establishes a bi-directional connection between the packet source and the host
                 let source_mbox: Mailbox<PacketSource> = Mailbox::new();
@@ -344,20 +339,25 @@ impl Topology {
 
                 // activates the packet source
                 self.sim_init = self.sim_init.add_model(source, source_mbox);
+            }
+
+            for sink_id in &flow.sinks {
+                // a packet sink must be attached to a host
+                assert!(self.hosts.contains(&sink_id));
 
                 // creates a new packet sink
                 let mut sink = PacketSink::new(flow.id);
 
                 // obtains the host switch and its mailbox for the packet sink
-                let sink_host = self.switches.get_mut(&edge.target().index()).unwrap();
-                let host_mbox = self.switch_mailboxes.get(&edge.target().index()).unwrap();
+                let sink_host = self.switches.get_mut(&sink_id).unwrap();
+                let host_mbox = self.switch_mailboxes.get(&sink_id).unwrap();
 
                 // establishes a bi-directional connection between the packet sink and the host
                 let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
 
                 // record the packet sink ids for later construction of paths in
                 // Flow::compute_paths()
-                flow.sink_ids.insert(edge_index, sink.id());
+                flow.sink_ids.insert(*sink_id, sink.id());
 
                 // records the sink ids, sink mailbox's address and sink
                 // statistics event slot for the retrieval of packet statistics
