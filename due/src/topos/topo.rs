@@ -18,7 +18,7 @@ use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
 use asynchronix::time::MonotonicTime;
 
 use crate::flows::collective::Collective;
-use crate::flows::flow::{Flow, FlowType};
+use crate::flows::flow::Flow;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -202,7 +202,7 @@ impl Topology {
                 for &sink in collective.sinks.iter() {
                     self.flows.push(Flow::new(
                         next_flow_id(),
-                        FlowType::PacketDistribution,
+                        collective.flow_type,
                         source,
                         sink,
                         collective.initial_delay,

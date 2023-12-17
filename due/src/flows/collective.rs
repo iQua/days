@@ -1,9 +1,9 @@
 use std::fs;
 
-use petgraph::graph::{DiGraph, UnGraph};
+use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
-use crate::flows::route::RandomSimplePath;
+use crate::flows::flow::FlowType;
 use crate::flows::DistributionInfo;
 use crate::next_collective_id;
 
@@ -18,6 +18,7 @@ pub enum CollectiveType {
 #[derive(Deserialize, Debug)]
 struct TomlCollective {
     collective_type: CollectiveType,
+    flow_type: FlowType,
     graph: Vec<(u32, u32)>,
     sources: Vec<usize>,
     sinks: Vec<usize>,
@@ -31,6 +32,7 @@ struct TomlCollective {
 pub struct Collective {
     pub id: usize,
     pub collective_type: CollectiveType,
+    pub flow_type: FlowType,
     pub graph: DiGraph<usize, ()>,
     pub sources: Vec<usize>,
     pub sinks: Vec<usize>,
@@ -38,7 +40,6 @@ pub struct Collective {
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
-    pub routing: RandomSimplePath,
 }
 
 #[derive(Deserialize, Debug)]
@@ -50,6 +51,7 @@ impl Collective {
     pub fn new(
         id: usize,
         collective_type: CollectiveType,
+        flow_type: FlowType,
         graph: DiGraph<usize, ()>,
         sources: Vec<usize>,
         sinks: Vec<usize>,
@@ -58,11 +60,10 @@ impl Collective {
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> Collective {
-        let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
-
         Collective {
             id,
             collective_type,
+            flow_type,
             graph,
             sources,
             sinks,
@@ -70,7 +71,6 @@ impl Collective {
             duration,
             arr_dist,
             pkt_size_dist,
-            routing,
         }
     }
 
@@ -91,6 +91,7 @@ impl Collective {
             collectives.push(Collective::new(
                 next_collective_id(),
                 CollectiveType::AllReduce,
+                FlowType::PacketDistribution,
                 collective_graph,
                 collective_sources,
                 collective_sinks,
@@ -123,6 +124,7 @@ impl Collective {
                 collectives.push(Collective::new(
                     next_collective_id(),
                     collective.collective_type,
+                    collective.flow_type,
                     graph,
                     collective.sources,
                     collective.sinks,
