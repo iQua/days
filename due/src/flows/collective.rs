@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
 
-use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use petgraph::graph::{DiGraph, UnGraph};
 use serde::Deserialize;
 
-use crate::flows::route::{RandomSimplePath, RoutingProtocol};
-use crate::topos::build::FatTreeConfig;
-use crate::{next_flow_id, seed_from_config};
+use crate::flows::flow::Flow;
+use crate::flows::route::RandomSimplePath;
+use crate::flows::DistributionInfo;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename = "UPPERCASE")]
@@ -41,7 +39,7 @@ struct TomlCollectiveSet {
     pkt_size_dist: DistributionInfo,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub struct Collective {
     pub id: usize,
     pub collective_type: CollectiveType,
@@ -90,7 +88,7 @@ impl Collective {
             arr_dist,
             pkt_size_dist,
             routing,
-            flow: HashMap::new(),
+            flows: HashMap::new(),
         }
     }
 
@@ -100,20 +98,20 @@ impl Collective {
         graphs: Vec<Vec<(u32, u32)>>,
         sources: Vec<Vec<usize>>,
         sinks: Vec<Vec<usize>>,
-    ) -> Vec<Flow> {
+    ) -> Vec<Collective> {
         let mut collectives = Vec::new();
 
         for (collective_id, graph) in graphs.iter().enumerate() {
             let collective_graph = DiGraph::<usize, ()>::from_edges(graph);
-            let collective_sources = sources[flow_index].clone();
-            let collective_sinks = sinks[flow_index].clone();
+            let collective_sources = sources[collective_id].clone();
+            let collective_sinks = sinks[collective_id].clone();
 
-            collectives.push(Flow::new(
+            collectives.push(Collective::new(
                 collective_id,
-                FlowType::PacketDistribution,
-                flow_graph,
-                flow_sources,
-                flow_sinks,
+                CollectiveType::AllReduce,
+                collective_graph,
+                collective_sources,
+                collective_sinks,
                 0.,
                 10.,
                 DistributionInfo::Exp { lambda: 1. },
@@ -122,6 +120,38 @@ impl Collective {
                     high: 1000,
                 },
             ));
+        }
+
+        collectives
+    }
+
+    // Initializes collectives from a configuration file.
+    pub fn collectives_from_config(file_path: &str) -> Vec<Collective> {
+        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+
+        let config: CollectiveConfig =
+            toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+        let mut collectives = Vec::new();
+
+        if let Some(collectives_vec) = config.collective {
+            for (id, collective) in collectives_vec.iter().enumerate() {
+                let graph = DiGraph::<usize, ()>::from_edges(collective.graph);
+
+                for (_, edge) in graph.edge_references().enumerate() {
+                    collectives.push(Collective::new(
+                        id,
+                        collective.collective_type,
+                        graph,
+                        collective.sources,
+                        collective.sinks,
+                        collective.initial_delay,
+                        collective.duration,
+                        collective.arr_dist,
+                        collective.pkt_size_dist,
+                    ));
+                }
+            }
         }
 
         collectives

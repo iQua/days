@@ -14,8 +14,8 @@ use statrs::distribution::{DiscreteUniform, Exp};
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::flows::flow::DistributionInfo;
 use crate::flows::packet::Packet;
+use crate::flows::DistributionInfo;
 use crate::{get_seed, next_endpoint_id};
 
 #[derive(Debug)]

@@ -1,11 +1,13 @@
 use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
+use petgraph::visit::EdgeRef;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
+use crate::flows::DistributionInfo;
 use crate::topos::build::FatTreeConfig;
 use crate::{next_flow_id, seed_from_config};
 
@@ -20,8 +22,6 @@ pub enum FlowType {
 struct TomlFlow {
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
-    sources: Vec<usize>,
-    sinks: Vec<usize>,
     initial_delay: f64,
     duration: f64,
     arr_dist: DistributionInfo,
@@ -44,22 +44,15 @@ struct FlowConfig {
     flow_set: Option<Vec<TomlFlowSet>>,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
-#[serde(tag = "type")]
-pub enum DistributionInfo {
-    Exp { lambda: f64 },
-    Uniform { low: i64, high: i64 },
-}
-
 /// A flow represents a directed edge with one packet source and one packet sink.
 #[derive(Debug)]
 pub struct Flow {
     pub id: usize,
     pub flow_type: FlowType,
     /// the id of the host switch that the source attaches to
-    pub source: usize,
+    pub source_host: usize,
     /// the id of the host switch that the sink attaches to
-    pub sink: usize,
+    pub sink_host: usize,
     // the id of PacketSink
     pub sink_id: usize,
     pub initial_delay: f64,
@@ -73,8 +66,8 @@ impl Flow {
     pub fn new(
         id: usize,
         flow_type: FlowType,
-        source: usize,
-        sink: usize,
+        source_host: usize,
+        sink_host: usize,
         initial_delay: f64,
         duration: f64,
         arr_dist: DistributionInfo,
@@ -85,8 +78,8 @@ impl Flow {
         Flow {
             id,
             flow_type,
-            source,
-            sink,
+            source_host,
+            sink_host,
             sink_id: 0,
             initial_delay,
             duration,
@@ -103,21 +96,23 @@ impl Flow {
 
         for (flow_index, graph) in graphs.iter().enumerate() {
             let flow_graph = DiGraph::<usize, ()>::from_edges(graph);
+            assert!(flow_graph.edge_references().len() == 1);
 
-            flows.push(Flow::new(
-                next_flow_id(),
-                FlowType::PacketDistribution,
-                flow_graph,
-                flow_sources,
-                flow_sinks,
-                0.,
-                10.,
-                DistributionInfo::Exp { lambda: 1. },
-                DistributionInfo::Uniform {
-                    low: 1000,
-                    high: 1000,
-                },
-            ));
+            for (_, edge) in flow_graph.edge_references().enumerate() {
+                flows.push(Flow::new(
+                    next_flow_id(),
+                    FlowType::PacketDistribution,
+                    edge.source().index(),
+                    edge.target().index(),
+                    0.,
+                    10.,
+                    DistributionInfo::Exp { lambda: 1. },
+                    DistributionInfo::Uniform {
+                        low: 1000,
+                        high: 1000,
+                    },
+                ));
+            }
         }
 
         flows
@@ -136,17 +131,18 @@ impl Flow {
             for flow in flows_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
 
-                flows.push(Flow::new(
-                    next_flow_id(),
-                    flow.flow_type,
-                    graph,
-                    flow.sources,
-                    flow.sinks,
-                    flow.initial_delay,
-                    flow.duration,
-                    flow.arr_dist,
-                    flow.pkt_size_dist,
-                ));
+                for (_, edge) in graph.edge_references().enumerate() {
+                    flows.push(Flow::new(
+                        next_flow_id(),
+                        flow.flow_type,
+                        edge.source().index(),
+                        edge.target().index(),
+                        flow.initial_delay,
+                        flow.duration,
+                        flow.arr_dist,
+                        flow.pkt_size_dist,
+                    ));
+                }
             }
         }
 
@@ -163,17 +159,12 @@ impl Flow {
                         let mut range = (0..start).chain((start + 1)..num_edge_switches);
                         range.nth(rng.gen_range(0..num_edge_switches - 1)).unwrap()
                     };
-                    let graph = DiGraph::<usize, ()>::from_edges(vec![(
-                        NodeIndex::new(start),
-                        NodeIndex::new(end),
-                    )]);
 
                     flows.push(Flow::new(
                         next_flow_id(),
                         flow_set.flow_type,
-                        graph,
-                        vec![start],
-                        vec![end],
+                        start,
+                        end,
                         flow_set.initial_delay,
                         flow_set.duration,
                         flow_set.arr_dist,
@@ -186,24 +177,19 @@ impl Flow {
         flows
     }
 
-    // Computes paths for all source-sink pairs in the flow
-    pub fn compute_paths(&mut self, graph: UnGraph<usize, ()>) -> Vec<Vec<NodeIndex>> {
-        // sets the routing protocol
+    // Given the network graph, computes the path from the packet source to the sink in the flow
+    pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
+        assert!(graph.edge_references().len() == 1);
         self.routing = RandomSimplePath::new(graph);
 
-        let mut paths = Vec::new();
+        let mut path = Vec::new();
 
-        for &source in self.sources.iter() {
-            for &sink in self.sinks.iter() {
-                let mut path = self
-                    .routing
-                    .compute_route(NodeIndex::new(source), NodeIndex::new(sink));
+        for (_, edge) in graph.edge_references().enumerate() {
+            path = self.routing.compute_route(edge.source(), edge.target());
 
-                path.push(NodeIndex::new(self.sink_ids[&sink]));
-                paths.push(path);
-            }
+            path.push(NodeIndex::new(self.sink_id));
         }
 
-        paths
+        path
     }
 }
