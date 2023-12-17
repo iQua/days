@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
@@ -52,63 +51,58 @@ pub enum DistributionInfo {
     Uniform { low: i64, high: i64 },
 }
 
+/// A flow represents a directed edge with one packet source and one packet sink.
 #[derive(Debug)]
 pub struct Flow {
     pub id: usize,
     pub flow_type: FlowType,
-    pub graph: DiGraph<usize, ()>,
-    pub sources: Vec<usize>,
-    pub sinks: Vec<usize>,
+    /// the id of the host switch that the source attaches to
+    pub source: usize,
+    /// the id of the host switch that the sink attaches to
+    pub sink: usize,
+    // the id of PacketSink
+    pub sink_id: usize,
     pub initial_delay: f64,
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
     pub routing: RandomSimplePath,
-
-    // edge index -> sink id
-    pub sink_ids: HashMap<usize, usize>,
 }
 
 impl Flow {
     pub fn new(
         id: usize,
         flow_type: FlowType,
-        graph: DiGraph<usize, ()>,
-        sources: Vec<usize>,
-        sinks: Vec<usize>,
+        source: usize,
+        sink: usize,
         initial_delay: f64,
         duration: f64,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> Flow {
         let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
+
         Flow {
             id,
             flow_type,
-            graph,
-            sources,
-            sinks,
+            source,
+            sink,
+            sink_id: 0,
             initial_delay,
             duration,
             arr_dist,
             pkt_size_dist,
             routing,
-            sink_ids: HashMap::new(),
         }
     }
 
-    // Initializes flows from a vector of directed graphs.
-    pub fn flows_from_graph(
-        graphs: Vec<Vec<(u32, u32)>>,
-        sources: Vec<Vec<usize>>,
-        sinks: Vec<Vec<usize>>,
-    ) -> Vec<Flow> {
+    // Initializes flows from a vector of directed graphs. Each directed graph
+    // only has one edge from the packet source to the packet sink.
+    pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
         let mut flows = Vec::new();
 
         for (flow_index, graph) in graphs.iter().enumerate() {
             let flow_graph = DiGraph::<usize, ()>::from_edges(graph);
-            let flow_sources = sources[flow_index].clone();
-            let flow_sinks = sinks[flow_index].clone();
 
             flows.push(Flow::new(
                 next_flow_id(),

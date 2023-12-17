@@ -56,6 +56,7 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     for edge_id in 0..num_layer_switches {
         let pod_id = edge_id / layer_switches_per_pod;
         let agg_start = num_layer_switches + pod_id * layer_switches_per_pod;
+
         for agg_id in agg_start..agg_start + layer_switches_per_pod {
             edges.push((edge_id as u32, agg_id as u32))
         }
@@ -65,6 +66,7 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     for agg_id in num_layer_switches..2 * num_layer_switches {
         let core_group = agg_id % layer_switches_per_pod;
         let core_start = 2 * num_layer_switches + core_group * core_switches_per_agg;
+
         for core_id in core_start..core_start + core_switches_per_agg {
             edges.push((agg_id as u32, core_id as u32));
         }
