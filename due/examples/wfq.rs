@@ -28,6 +28,7 @@ fn main() {
             low: 2000,
             high: 2000,
         },
+        0,
     );
 
     let mut source_2 = PacketSource::new(
@@ -39,6 +40,7 @@ fn main() {
             low: 1000,
             high: 1000,
         },
+        0,
     );
 
     let mut wfq = WFQServer::new(
