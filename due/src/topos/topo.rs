@@ -303,7 +303,7 @@ impl Topology {
         self
     }
 
-    /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
+    /// Attaches packet sources or sinks to hosts in the network graph.
     fn attach(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -311,71 +311,70 @@ impl Topology {
         );
 
         for flow in self.flows.iter_mut() {
+            // creates and attaches a packet source and sink for each source-sink pair
             for source_id in &flow.sources {
-                // a packet source must be attached to a host
-                assert!(self.hosts.contains(&source_id));
+                for sink_id in &flow.sinks {
+                    // packet sources and sinks must be attached to hosts
+                    assert!(self.hosts.contains(&source_id));
+                    assert!(self.hosts.contains(&sink_id));
 
-                // creates a new packet source
-                let mut source = PacketSource::new(
-                    flow.id,
-                    flow.initial_delay,
-                    flow.duration,
-                    flow.arr_dist,
-                    flow.pkt_size_dist,
-                );
+                    // creates a new packet source
+                    let mut source = PacketSource::new(
+                        flow.id,
+                        flow.initial_delay,
+                        flow.duration,
+                        flow.arr_dist,
+                        flow.pkt_size_dist,
+                    );
 
-                // obtains the host switch and its mailbox for the packet source
-                let source_host = self.switches.get_mut(&source_id).unwrap();
-                let host_mbox = self.switch_mailboxes.get(&source_id).unwrap();
+                    // obtains the host switch and its mailbox for the packet source
+                    let source_host = self.switches.get_mut(&source_id).unwrap();
+                    let host_mbox = self.switch_mailboxes.get(&source_id).unwrap();
 
-                // establishes a bi-directional connection between the packet source and the host
-                let source_mbox: Mailbox<PacketSource> = Mailbox::new();
-                source
-                    .output
-                    .connect(PacketSwitch::packet_received, host_mbox);
-                let mut output = Output::default();
-                output.connect(PacketSource::packet_received, &source_mbox);
-                source_host.outputs.insert(source.id(), output);
+                    // establishes a bi-directional connection between the packet source and the host
+                    let source_mbox: Mailbox<PacketSource> = Mailbox::new();
+                    source
+                        .output
+                        .connect(PacketSwitch::packet_received, host_mbox);
+                    let mut output = Output::default();
+                    output.connect(PacketSource::packet_received, &source_mbox);
+                    source_host.outputs.insert(source.id(), output);
 
-                // activates the packet source
-                self.sim_init = self.sim_init.add_model(source, source_mbox);
-            }
+                    // activates the packet source
+                    self.sim_init = self.sim_init.add_model(source, source_mbox);
 
-            for sink_id in &flow.sinks {
-                // a packet sink must be attached to a host
-                assert!(self.hosts.contains(&sink_id));
+                    // creates a new packet sink
+                    let mut sink = PacketSink::new(flow.id);
 
-                // creates a new packet sink
-                let mut sink = PacketSink::new(flow.id);
+                    // obtains the host switch and its mailbox for the packet sink
+                    let sink_host = self.switches.get_mut(&sink_id).unwrap();
+                    let host_mbox = self.switch_mailboxes.get(&sink_id).unwrap();
 
-                // obtains the host switch and its mailbox for the packet sink
-                let sink_host = self.switches.get_mut(&sink_id).unwrap();
-                let host_mbox = self.switch_mailboxes.get(&sink_id).unwrap();
+                    // establishes a bi-directional connection between the packet sink and the host
+                    let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
 
-                // establishes a bi-directional connection between the packet sink and the host
-                let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
+                    // record the packet sink ids for later construction of paths in
+                    // Flow::compute_paths()
+                    flow.sink_ids.insert(*sink_id, sink.id());
 
-                // record the packet sink ids for later construction of paths in
-                // Flow::compute_paths()
-                flow.sink_ids.insert(*sink_id, sink.id());
+                    // records the sink ids, sink mailbox's address and sink
+                    // statistics event slot for the retrieval of packet statistics
+                    // after the simulation finishes
+                    stats.sink_ids.push(sink.id());
+                    stats.sink_addresses.insert(sink.id(), sink_mbox.address());
+                    stats
+                        .sink_statistics
+                        .insert(sink.id(), sink.statistics.connect_slot().0);
 
-                // records the sink ids, sink mailbox's address and sink
-                // statistics event slot for the retrieval of packet statistics
-                // after the simulation finishes
-                stats.sink_ids.push(sink.id());
-                stats.sink_addresses.insert(sink.id(), sink_mbox.address());
-                stats
-                    .sink_statistics
-                    .insert(sink.id(), sink.statistics.connect_slot().0);
+                    sink.output
+                        .connect(PacketSwitch::packet_received, host_mbox);
+                    let mut output = Output::default();
+                    output.connect(PacketSink::packet_received, &sink_mbox);
+                    sink_host.outputs.insert(sink.id(), output);
 
-                sink.output
-                    .connect(PacketSwitch::packet_received, host_mbox);
-                let mut output = Output::default();
-                output.connect(PacketSink::packet_received, &sink_mbox);
-                sink_host.outputs.insert(sink.id(), output);
-
-                // activates the packet sink
-                self.sim_init = self.sim_init.add_model(sink, sink_mbox);
+                    // activates the packet sink
+                    self.sim_init = self.sim_init.add_model(sink, sink_mbox);
+                }
             }
         }
 

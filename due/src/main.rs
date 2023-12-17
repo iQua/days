@@ -46,7 +46,11 @@ fn main() {
 
     // 1. initializes flows directly using flows_from_graph().
     //    Example:
-    //    let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+    //    let flows = Flow::flows_from_graph(
+    //        vec![vec![(0, 1)], vec![(1, 0)]],
+    //        vec![vec![0], vec![1]],
+    //        vec![vec![1], vec![0]],
+    //    );
 
     // 2. initializes flows using a configuration file.
     //    Example:

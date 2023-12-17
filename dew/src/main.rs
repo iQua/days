@@ -45,7 +45,6 @@ async fn network_sim(config_path: String, sim: SimContext<'_, Shared>) {
     //    Example:
     let flows = Flow::flows_from_config(file_path);
 
-    // let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
     debug!(
         "A total of {} network flows has been initialized.",
         flows.len()

@@ -21,6 +21,7 @@ async fn network_sim(sim: SimContext<'_, Shared>) {
     info!("The network graph has been initialized: {:?}", graph);
 
     let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+
     debug!(
         "A total of {} network flows has been initialized.",
         flows.len()

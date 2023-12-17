@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
-use petgraph::visit::EdgeRef;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
@@ -99,18 +98,24 @@ impl Flow {
     }
 
     // Initializes flows from a vector of directed graphs.
-    pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
+    pub fn flows_from_graph(
+        graphs: Vec<Vec<(u32, u32)>>,
+        sources: Vec<Vec<usize>>,
+        sinks: Vec<Vec<usize>>,
+    ) -> Vec<Flow> {
         let mut flows = Vec::new();
 
-        for graph in graphs {
-            let flow_graph = DiGraph::<usize, ()>::from_edges(&graph);
+        for (flow_index, graph) in graphs.iter().enumerate() {
+            let flow_graph = DiGraph::<usize, ()>::from_edges(graph);
+            let flow_sources = sources[flow_index].clone();
+            let flow_sinks = sinks[flow_index].clone();
 
             flows.push(Flow::new(
                 next_flow_id(),
                 FlowType::PacketDistribution,
                 flow_graph,
-                Vec::new(),
-                Vec::new(),
+                flow_sources,
+                flow_sinks,
                 0.,
                 10.,
                 DistributionInfo::Exp { lambda: 1. },
@@ -173,8 +178,8 @@ impl Flow {
                         next_flow_id(),
                         flow_set.flow_type,
                         graph,
-                        Vec::new(),
-                        Vec::new(),
+                        vec![start],
+                        vec![end],
                         flow_set.initial_delay,
                         flow_set.duration,
                         flow_set.arr_dist,
@@ -187,18 +192,22 @@ impl Flow {
         flows
     }
 
-    // Gets the simple paths for all edges of the flow
+    // Computes paths for all source-sink pairs in the flow
     pub fn compute_paths(&mut self, graph: UnGraph<usize, ()>) -> Vec<Vec<NodeIndex>> {
         // sets the routing protocol
         self.routing = RandomSimplePath::new(graph);
 
         let mut paths = Vec::new();
 
-        for (edge_index, edge) in self.graph.edge_references().enumerate() {
-            let mut path = self.routing.compute_route(edge.source(), edge.target());
-            let sink_id = self.sink_ids[&edge_index];
-            path.push(NodeIndex::new(sink_id));
-            paths.push(path);
+        for &source in self.sources.iter() {
+            for &sink in self.sinks.iter() {
+                let mut path = self
+                    .routing
+                    .compute_route(NodeIndex::new(source), NodeIndex::new(sink));
+
+                path.push(NodeIndex::new(self.sink_ids[&sink]));
+                paths.push(path);
+            }
         }
 
         paths
