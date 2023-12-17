@@ -104,7 +104,7 @@ impl Flow {
                     FlowType::PacketDistribution,
                     edge.source().index(),
                     edge.target().index(),
-                    0.,
+                    1.,
                     10.,
                     DistributionInfo::Exp { lambda: 1. },
                     DistributionInfo::Uniform {

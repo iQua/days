@@ -39,8 +39,8 @@ fn main() {
     // 3. building a graph using a graph builder.
     //    let (graph, hosts) = build_fattree(file_path);
 
-    let graph = UnGraph::<usize, ()>::from_edges([(0, 1)]);
-    let hosts = vec![0, 1];
+    let graph = UnGraph::<usize, ()>::from_edges([(0, 1), (0, 2)]);
+    let hosts = vec![0, 1, 2];
     info!("The network graph has been initialized: {:?}", graph);
 
     // There are two ways of initializing the flows:
@@ -61,15 +61,15 @@ fn main() {
 
     // 1. initializes collectives directly using collectives_from_graph().
     //    Example:
-    //    let collectives = Collective::collectives_from_graph(
-    //        vec![vec![(0, 1)], vec![(1, 0)]],
-    //        vec![vec![0], vec![1]],
-    //        vec![vec![1], vec![0]],
-    //    );
+    let collectives = Collective::collectives_from_graph(
+        vec![vec![(0, 1), (0, 2)]],
+        vec![vec![0]],
+        vec![vec![1, 2]],
+    );
 
     // 2. initializes flows using a configuration file.
     //    Example:
-    let collectives = Collective::collectives_from_config(file_path);
+    // let collectives = Collective::collectives_from_config(file_path);
 
     info!(
         "A total of {} collective communication operations has been initialized.",

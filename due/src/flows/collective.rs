@@ -1,10 +1,8 @@
-use std::collections::HashMap;
 use std::fs;
 
 use petgraph::graph::{DiGraph, UnGraph};
 use serde::Deserialize;
 
-use crate::flows::flow::Flow;
 use crate::flows::route::RandomSimplePath;
 use crate::flows::DistributionInfo;
 use crate::next_collective_id;
@@ -40,7 +38,6 @@ pub struct Collective {
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
-    pub flows: Vec<Flow>,
     pub routing: RandomSimplePath,
 }
 
@@ -74,7 +71,6 @@ impl Collective {
             arr_dist,
             pkt_size_dist,
             routing,
-            flows: Vec::new(),
         }
     }
 
@@ -98,7 +94,7 @@ impl Collective {
                 collective_graph,
                 collective_sources,
                 collective_sinks,
-                0.,
+                1.,
                 10.,
                 DistributionInfo::Exp { lambda: 1. },
                 DistributionInfo::Uniform {

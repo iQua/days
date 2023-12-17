@@ -189,6 +189,32 @@ impl Topology {
         self
     }
 
+    /// Produces flows within all collectives in the network graph
+    fn process_collectives(&mut self) {
+        info!(
+            "Produces flows in all {} collective communication operations.",
+            self.collectives.len()
+        );
+
+        // constructs, attaches, and routes flows in each collective
+        for collective in self.collectives.iter_mut() {
+            for &source in collective.sources.iter() {
+                for &sink in collective.sinks.iter() {
+                    self.flows.push(Flow::new(
+                        next_flow_id(),
+                        FlowType::PacketDistribution,
+                        source,
+                        sink,
+                        collective.initial_delay,
+                        collective.duration,
+                        collective.arr_dist,
+                        collective.pkt_size_dist,
+                    ));
+                }
+            }
+        }
+    }
+
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let discipline = match &self.config {
             Config::SwitchConfig(config) => config.switch[upstream_id].discipline,
@@ -309,13 +335,13 @@ impl Topology {
     }
 
     /// Attaches packet sources and sinks from the flows to hosts in the network graph
-    fn attach_flows(mut self, flows: Vec<Flow>, stats: &mut SinkStatistics) -> Self {
+    fn attach_flows(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
 
-        for flow in flows.iter() {
+        for flow in self.flows.iter_mut() {
             // creates and attaches a packet source and sink for each flow
 
             // packet sources and sinks must be attached to hosts
@@ -383,34 +409,26 @@ impl Topology {
         self
     }
 
-    /// Attaches packet sources and sinks from the collectives to hosts in the network graph
-    fn attach_collectives(mut self, stats: &mut SinkStatistics) -> Self {
+    /// Computes routing decisions for all the flows, and installs Flow
+    /// Information Base tables (FIBs) of these routing decisions into all the
+    /// switches.
+    fn route_flows(&mut self) {
         info!(
-            "Attaching packet sources and sinks to their hosts in all {} collectives.",
+            "Computing routing decisions for all {} flows.",
             self.flows.len()
         );
 
-        // constructs flows in each collective first
-        for collective in self.collectives.iter_mut() {
-            for source in collective.sources {
-                for sink in collective.sinks {
-                    collective.flows.push(Flow::new(
-                        next_flow_id(),
-                        FlowType::PacketDistribution,
-                        source,
-                        sink,
-                        collective.initial_delay,
-                        collective.duration,
-                        collective.arr_dist,
-                        collective.pkt_size_dist,
-                    ));
-                }
+        for flow in self.flows.iter_mut() {
+            let path = flow.compute_path(self.graph.clone());
+
+            debug!("The path for flow {} is: {:?}", flow.id, path);
+            for window in path.windows(2) {
+                let node_id = window.get(0).unwrap().index();
+                let next_id = window.get(1).unwrap().index();
+                let switch = self.switches.get_mut(&node_id).unwrap();
+                switch.set_fib(flow.id, next_id);
             }
-
-            self = self.attach_flows(collective.flows, stats);
         }
-
-        self
     }
 
     /// Activates all the switches and initializes the simulation
@@ -434,15 +452,17 @@ impl Topology {
         // initializes mailboxes for the packet switches
         self.init_mailboxes();
 
+        // produces flows within all collectives in the network graph
+        self.process_collectives();
+
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
 
-        // attaches packet sources and sinks from flows and collectives to hosts in the network graph
-        self = self.attach_flows(self.flows, &mut statistics);
-        self = self.attach_collectives(&mut statistics);
+        // attaches packet sources and sinks from flows to hosts in the network graph
+        self = self.attach_flows(&mut statistics);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
-        self.route();
+        self.route_flows();
 
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
