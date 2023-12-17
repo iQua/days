@@ -17,7 +17,7 @@ use asynchronix::model::Output;
 use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
 use asynchronix::time::MonotonicTime;
 
-use crate::flows::collective::Collective;
+use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
@@ -200,16 +200,61 @@ impl Topology {
         for collective in self.collectives.iter_mut() {
             for &source in collective.sources.iter() {
                 for &sink in collective.sinks.iter() {
-                    self.flows.push(Flow::new(
-                        next_flow_id(),
-                        collective.flow_type,
-                        source,
-                        sink,
-                        collective.initial_delay,
-                        collective.duration,
-                        collective.arr_dist,
-                        collective.pkt_size_dist,
-                    ));
+                    match collective.collective_type {
+                        CollectiveType::Broadcast => {
+                            self.flows.push(Flow::new(
+                                next_flow_id(),
+                                collective.flow_type,
+                                source,
+                                sink,
+                                collective.initial_delay,
+                                collective.duration,
+                                collective.arr_dist,
+                                collective.pkt_size_dist,
+                                // uses collective_id as the random seed for the
+                                // flow, which ensures that all flows in the
+                                // broadcast have the same arrival and size
+                                // distribution
+                                collective.id,
+                            ));
+                        }
+                        CollectiveType::Gather => {
+                            let flow_id = next_flow_id();
+                            self.flows.push(Flow::new(
+                                flow_id,
+                                collective.flow_type,
+                                source,
+                                sink,
+                                collective.initial_delay,
+                                collective.duration,
+                                collective.arr_dist,
+                                collective.pkt_size_dist,
+                                // uses flow_id as the random seed for the flow,
+                                // which ensures that different flows have
+                                // different arrival and size distributions
+                                flow_id,
+                            ));
+                        }
+                        CollectiveType::AllReduce => {
+                            let flow_id = next_flow_id();
+                            self.flows.push(Flow::new(
+                                flow_id,
+                                collective.flow_type,
+                                source,
+                                sink,
+                                collective.initial_delay,
+                                collective.duration,
+                                collective.arr_dist,
+                                collective.pkt_size_dist,
+                                // uses the source host's id as the random seed
+                                // for the flow, which ensures that different
+                                // hosts have different arrival and size
+                                // distributions, but packet sources attached to
+                                // the same host have the same distribution
+                                flow_id,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -355,6 +400,7 @@ impl Topology {
                 flow.duration,
                 flow.arr_dist,
                 flow.pkt_size_dist,
+                flow.seed,
             );
 
             // obtains the host switch and its mailbox for the packet source

@@ -34,8 +34,11 @@ pub struct Collective {
     pub collective_type: CollectiveType,
     pub flow_type: FlowType,
     pub graph: DiGraph<usize, ()>,
+
+    /// host ids that sources and sinks attach to
     pub sources: Vec<usize>,
     pub sinks: Vec<usize>,
+
     pub initial_delay: f64,
     pub duration: f64,
     pub arr_dist: DistributionInfo,

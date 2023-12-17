@@ -53,12 +53,14 @@ pub struct Flow {
     pub source_host: usize,
     /// the id of the host switch that the sink attaches to
     pub sink_host: usize,
-    // the id of PacketSink
+    /// the id of PacketSink
     pub sink_id: usize,
     pub initial_delay: f64,
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
+    /// random seed for the packet source
+    pub seed: usize,
     pub routing: RandomSimplePath,
 }
 
@@ -72,6 +74,7 @@ impl Flow {
         duration: f64,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
+        seed: usize,
     ) -> Flow {
         let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
 
@@ -85,6 +88,7 @@ impl Flow {
             duration,
             arr_dist,
             pkt_size_dist,
+            seed,
             routing,
         }
     }
@@ -111,6 +115,7 @@ impl Flow {
                         low: 1000,
                         high: 1000,
                     },
+                    0,
                 ));
             }
         }
@@ -132,8 +137,10 @@ impl Flow {
                 let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
 
                 for (_, edge) in graph.edge_references().enumerate() {
+                    let flow_id = next_flow_id();
+
                     flows.push(Flow::new(
-                        next_flow_id(),
+                        flow_id,
                         flow.flow_type,
                         edge.source().index(),
                         edge.target().index(),
@@ -141,6 +148,8 @@ impl Flow {
                         flow.duration,
                         flow.arr_dist,
                         flow.pkt_size_dist,
+                        // uses flow_id as the random seed (added to the global seed)
+                        flow_id,
                     ));
                 }
             }
@@ -160,8 +169,9 @@ impl Flow {
                         range.nth(rng.gen_range(0..num_edge_switches - 1)).unwrap()
                     };
 
+                    let flow_id = next_flow_id();
                     flows.push(Flow::new(
-                        next_flow_id(),
+                        flow_id,
                         flow_set.flow_type,
                         start,
                         end,
@@ -169,6 +179,8 @@ impl Flow {
                         flow_set.duration,
                         flow_set.arr_dist,
                         flow_set.pkt_size_dist,
+                        // uses flow_id as the random seed (added to the global seed)
+                        flow_id,
                     ));
                 }
             }
