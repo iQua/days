@@ -179,7 +179,6 @@ impl Flow {
 
     // Given the network graph, computes the path from the packet source to the sink in the flow
     pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
-        assert!(graph.edge_references().len() == 1);
         self.routing = RandomSimplePath::new(graph);
 
         let mut path = self.routing.compute_route(

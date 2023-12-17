@@ -3,6 +3,7 @@
 
 use log::info;
 
+use due::flows::collective::Collective;
 use due::flows::flow::Flow;
 use due::topos::build::build_fattree;
 use due::topos::topo::Topology;
@@ -20,11 +21,20 @@ fn main() {
     );
 
     let flows = Flow::flows_from_config(file_path);
+    info!("A total of {} flows has been initialized.", flows.len());
+
+    let collectives = Collective::collectives_from_config(file_path);
     info!(
-        "A total of {} network flows has been initialized.",
-        flows.len()
+        "A total of {} collective communication operations has been initialized.",
+        collectives.len()
     );
 
-    let topology = Topology::new(file_path, fattree_graph.clone(), fattree_hosts, flows);
+    let topology = Topology::new(
+        file_path,
+        fattree_graph.clone(),
+        fattree_hosts,
+        flows,
+        collectives,
+    );
     topology.run(fattree_graph);
 }

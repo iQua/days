@@ -5,6 +5,7 @@ use std::env;
 use log::info;
 use petgraph::graph::UnGraph;
 
+use due::flows::collective::Collective;
 use due::flows::flow::Flow;
 // use due::topos::build::build_graph;
 use due::seed_from_config;
@@ -48,22 +49,35 @@ fn main() {
     //    Example:
     //    let flows = Flow::flows_from_graph(
     //        vec![vec![(0, 1)], vec![(1, 0)]],
-    //        vec![vec![0], vec![1]],
-    //        vec![vec![1], vec![0]],
     //    );
 
     // 2. initializes flows using a configuration file.
     //    Example:
     let flows = Flow::flows_from_config(file_path);
 
-    // let flows = Flow::flows_from_graph(vec![vec![(0, 1)], vec![(1, 0)]]);
+    info!("A total of {} flows has been initialized.", flows.len());
+
+    // There are two ways of initializing the collectives:
+
+    // 1. initializes collectives directly using collectives_from_graph().
+    //    Example:
+    //    let collectives = Collective::collectives_from_graph(
+    //        vec![vec![(0, 1)], vec![(1, 0)]],
+    //        vec![vec![0], vec![1]],
+    //        vec![vec![1], vec![0]],
+    //    );
+
+    // 2. initializes flows using a configuration file.
+    //    Example:
+    let collectives = Collective::collectives_from_config(file_path);
+
     info!(
-        "A total of {} network flows has been initialized.",
-        flows.len()
+        "A total of {} collective communication operations has been initialized.",
+        collectives.len()
     );
 
     // initializes the topology
-    let topology = Topology::new(file_path, graph.clone(), hosts, flows);
+    let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
     topology.run(graph);

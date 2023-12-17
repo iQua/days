@@ -40,10 +40,7 @@ pub struct Collective {
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
-
-    /// flow_id -> Flow
-    pub flows: HashMap<usize, Flow>,
-    /// routing protocol
+    pub flows: Vec<Flow>,
     pub routing: RandomSimplePath,
 }
 
@@ -77,7 +74,7 @@ impl Collective {
             arr_dist,
             pkt_size_dist,
             routing,
-            flows: HashMap::new(),
+            flows: Vec::new(),
         }
     }
 

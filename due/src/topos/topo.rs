@@ -17,17 +17,18 @@ use asynchronix::model::Output;
 use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
 use asynchronix::time::MonotonicTime;
 
-use crate::flows::flow::Flow;
+use crate::flows::collective::Collective;
+use crate::flows::flow::{Flow, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
-use crate::set_num_switches;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::topos::build::FatTreeConfig;
+use crate::{next_flow_id, set_num_switches};
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -85,8 +86,10 @@ pub struct Topology {
     /// A hash map of packet switches and their mailboxes
     switches: HashMap<usize, PacketSwitch>,
     switch_mailboxes: HashMap<usize, Mailbox<PacketSwitch>>,
-    /// A hash map of all flows
+    /// A vector of all flows
     flows: Vec<Flow>,
+    /// A vector of all collectives
+    collectives: Vec<Collective>,
     /// Configuration of the topology
     config: Config,
 }
@@ -97,6 +100,7 @@ impl Topology {
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         flows: Vec<Flow>,
+        collectives: Vec<Collective>,
     ) -> Topology {
         set_num_switches(graph.node_count());
 
@@ -111,6 +115,7 @@ impl Topology {
                 hosts,
                 switches,
                 flows,
+                collectives,
                 switch_mailboxes: HashMap::new(),
                 config: Config::FatTreeConfig(config),
             }
@@ -125,6 +130,7 @@ impl Topology {
                 hosts,
                 switches,
                 flows,
+                collectives,
                 switch_mailboxes: HashMap::new(),
                 config: Config::SwitchConfig(config),
             }
@@ -302,14 +308,14 @@ impl Topology {
         self
     }
 
-    /// Attaches packet sources or sinks to hosts in the network graph.
-    fn attach(mut self, stats: &mut SinkStatistics) -> Self {
+    /// Attaches packet sources and sinks from the flows to hosts in the network graph
+    fn attach_flows(mut self, flows: Vec<Flow>, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
 
-        for flow in self.flows.iter_mut() {
+        for flow in flows.iter() {
             // creates and attaches a packet source and sink for each flow
 
             // packet sources and sinks must be attached to hosts
@@ -377,26 +383,34 @@ impl Topology {
         self
     }
 
-    /// Computes routing decisions for all the flows, and installs Flow
-    /// Information Base tables (FIBs) of these routing decisions into all the
-    /// switches.
-    fn route(&mut self) {
+    /// Attaches packet sources and sinks from the collectives to hosts in the network graph
+    fn attach_collectives(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
-            "Computing routing decisions for all {} flows.",
+            "Attaching packet sources and sinks to their hosts in all {} collectives.",
             self.flows.len()
         );
 
-        for flow in self.flows.iter_mut() {
-            let path = flow.compute_path(self.graph.clone());
-
-            debug!("The path for flow {} is: {:?}", flow.id, path);
-            for window in path.windows(2) {
-                let node_id = window.get(0).unwrap().index();
-                let next_id = window.get(1).unwrap().index();
-                let switch = self.switches.get_mut(&node_id).unwrap();
-                switch.set_fib(flow.id, next_id);
+        // constructs flows in each collective first
+        for collective in self.collectives.iter_mut() {
+            for source in collective.sources {
+                for sink in collective.sinks {
+                    collective.flows.push(Flow::new(
+                        next_flow_id(),
+                        FlowType::PacketDistribution,
+                        source,
+                        sink,
+                        collective.initial_delay,
+                        collective.duration,
+                        collective.arr_dist,
+                        collective.pkt_size_dist,
+                    ));
+                }
             }
+
+            self = self.attach_flows(collective.flows, stats);
         }
+
+        self
     }
 
     /// Activates all the switches and initializes the simulation
@@ -419,12 +433,17 @@ impl Topology {
 
         // initializes mailboxes for the packet switches
         self.init_mailboxes();
+
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
-        // attaches sources and sinks to hosts in the network graph
-        self = self.attach(&mut statistics);
+
+        // attaches packet sources and sinks from flows and collectives to hosts in the network graph
+        self = self.attach_flows(self.flows, &mut statistics);
+        self = self.attach_collectives(&mut statistics);
+
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route();
+
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 
