@@ -19,6 +19,7 @@ static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
 static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
 static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
+static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
@@ -58,4 +59,8 @@ pub fn next_scheduler_id() -> usize {
 
 pub fn next_flow_id() -> usize {
     FLOW_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn next_collective_id() -> usize {
+    COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
 }

@@ -7,9 +7,9 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::flows::flow::DistributionInfo;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
+use due::flows::DistributionInfo;
 
 fn main() {
     let env = env_logger::Env::default();
