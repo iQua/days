@@ -94,7 +94,7 @@ impl Flow {
     pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
         let mut flows = Vec::new();
 
-        for (flow_index, graph) in graphs.iter().enumerate() {
+        for (_, graph) in graphs.iter().enumerate() {
             let flow_graph = DiGraph::<usize, ()>::from_edges(graph);
             assert!(flow_graph.edge_references().len() == 1);
 
@@ -182,13 +182,11 @@ impl Flow {
         assert!(graph.edge_references().len() == 1);
         self.routing = RandomSimplePath::new(graph);
 
-        let mut path = Vec::new();
-
-        for (_, edge) in graph.edge_references().enumerate() {
-            path = self.routing.compute_route(edge.source(), edge.target());
-
-            path.push(NodeIndex::new(self.sink_id));
-        }
+        let mut path = self.routing.compute_route(
+            NodeIndex::new(self.source_host),
+            NodeIndex::new(self.sink_host),
+        );
+        path.push(NodeIndex::new(self.sink_id));
 
         path
     }
