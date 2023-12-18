@@ -14,8 +14,8 @@ use statrs::distribution::{DiscreteUniform, Exp};
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::flows::flow::DistributionInfo;
 use crate::flows::packet::Packet;
+use crate::flows::DistributionInfo;
 use crate::{get_seed, next_endpoint_id};
 
 #[derive(Debug)]
@@ -27,6 +27,7 @@ pub struct PacketSource {
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
     packets_sent: usize,
+    seed: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,
@@ -43,6 +44,7 @@ impl Clone for PacketSource {
             pkt_size_dist: self.pkt_size_dist,
             packets_sent: 0,
             rng: self.rng.clone(),
+            seed: self.seed,
             output: Output::default(),
         }
     }
@@ -55,12 +57,14 @@ impl PacketSource {
         duration: f64,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
+        seed: usize,
     ) -> PacketSource {
-        let seed = get_seed();
-        let rng = match seed {
-            1.. => SmallRng::seed_from_u64(seed as u64),
+        let global_seed = get_seed();
+        let rng = match global_seed {
+            1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
+        println!("PacketSource seed: {}", (global_seed + seed) as u64);
 
         PacketSource {
             endpoint_id: next_endpoint_id(),
@@ -70,6 +74,7 @@ impl PacketSource {
             arr_dist,
             pkt_size_dist,
             packets_sent: 0,
+            seed,
             rng,
             output: Output::default(),
         }

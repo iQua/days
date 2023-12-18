@@ -53,7 +53,8 @@ impl RoutingProtocol for RandomSimplePath {
         let binding = dijkstra(&self.graph, start, Some(end), |_| 1);
         let len = binding.get(&end).unwrap();
         let paths = self.get_all_simple_paths(start, end, *len as usize);
-        let rdm_idx = self.rng.gen_range(0..paths.len());
-        paths[rdm_idx].clone()
+        let random_index = self.rng.gen_range(0..paths.len());
+
+        paths[random_index].clone()
     }
 }

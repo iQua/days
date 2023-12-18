@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use log::{debug, info};
 use petgraph::graph::UnGraph;
-use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
 use asynchronix::model::Output;
 use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
 use asynchronix::time::MonotonicTime;
 
+use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
@@ -25,10 +25,10 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
-use crate::set_num_switches;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::topos::build::FatTreeConfig;
+use crate::{next_flow_id, set_num_switches};
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -86,8 +86,10 @@ pub struct Topology {
     /// A hash map of packet switches and their mailboxes
     switches: HashMap<usize, PacketSwitch>,
     switch_mailboxes: HashMap<usize, Mailbox<PacketSwitch>>,
-    /// A hash map of all flows
+    /// A vector of all flows
     flows: Vec<Flow>,
+    /// A vector of all collectives
+    collectives: Vec<Collective>,
     /// Configuration of the topology
     config: Config,
 }
@@ -98,6 +100,7 @@ impl Topology {
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         flows: Vec<Flow>,
+        collectives: Vec<Collective>,
     ) -> Topology {
         set_num_switches(graph.node_count());
 
@@ -112,6 +115,7 @@ impl Topology {
                 hosts,
                 switches,
                 flows,
+                collectives,
                 switch_mailboxes: HashMap::new(),
                 config: Config::FatTreeConfig(config),
             }
@@ -126,6 +130,7 @@ impl Topology {
                 hosts,
                 switches,
                 flows,
+                collectives,
                 switch_mailboxes: HashMap::new(),
                 config: Config::SwitchConfig(config),
             }
@@ -182,6 +187,77 @@ impl Topology {
         }
 
         self
+    }
+
+    /// Produces flows within all collectives in the network graph
+    fn process_collectives(&mut self) {
+        info!(
+            "Produces flows in all {} collective communication operations.",
+            self.collectives.len()
+        );
+
+        // constructs, attaches, and routes flows in each collective
+        for collective in self.collectives.iter_mut() {
+            for &source in collective.sources.iter() {
+                for &sink in collective.sinks.iter() {
+                    match collective.collective_type {
+                        CollectiveType::Broadcast => {
+                            self.flows.push(Flow::new(
+                                next_flow_id(),
+                                collective.flow_type,
+                                source,
+                                sink,
+                                collective.initial_delay,
+                                collective.duration,
+                                collective.arr_dist,
+                                collective.pkt_size_dist,
+                                // uses collective_id as the random seed for the
+                                // flow, which ensures that all flows in the
+                                // broadcast have the same arrival and size
+                                // distribution
+                                collective.id,
+                            ));
+                        }
+                        CollectiveType::Gather => {
+                            let flow_id = next_flow_id();
+                            self.flows.push(Flow::new(
+                                flow_id,
+                                collective.flow_type,
+                                source,
+                                sink,
+                                collective.initial_delay,
+                                collective.duration,
+                                collective.arr_dist,
+                                collective.pkt_size_dist,
+                                // uses flow_id as the random seed for the flow,
+                                // which ensures that different flows have
+                                // different arrival and size distributions
+                                flow_id,
+                            ));
+                        }
+                        CollectiveType::AllReduce => {
+                            let flow_id = next_flow_id();
+                            self.flows.push(Flow::new(
+                                flow_id,
+                                collective.flow_type,
+                                source,
+                                sink,
+                                collective.initial_delay,
+                                collective.duration,
+                                collective.arr_dist,
+                                collective.pkt_size_dist,
+                                // uses the source host's id as the random seed
+                                // for the flow, which ensures that different
+                                // hosts have different arrival and size
+                                // distributions, but packet sources attached to
+                                // the same host have the same distribution
+                                flow_id,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
@@ -303,80 +379,77 @@ impl Topology {
         self
     }
 
-    /// Attaches packet endpoints (sources or sinks) to hosts in the network graph.
-    fn attach(mut self, stats: &mut SinkStatistics) -> Self {
+    /// Attaches packet sources and sinks from the flows to hosts in the network graph
+    fn attach_flows(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
 
         for flow in self.flows.iter_mut() {
-            for (edge_index, edge) in flow.graph.edge_references().enumerate() {
-                // an element in the network must be a host, as specified by the
-                // network graph
-                assert!(self.hosts.contains(&edge.source().index()));
-                assert!(self.hosts.contains(&edge.target().index()));
+            // creates and attaches a packet source and sink for each flow
 
-                // attaches each endpoint to its corresponding host
-                // source -> edge.source(), sink -> edge.target()
+            // packet sources and sinks must be attached to hosts
+            assert!(self.hosts.contains(&flow.source_host));
+            assert!(self.hosts.contains(&flow.sink_host));
 
-                // creates a new packet source
-                let mut source = PacketSource::new(
-                    flow.id,
-                    flow.initial_delay,
-                    flow.duration,
-                    flow.arr_dist,
-                    flow.pkt_size_dist,
-                );
+            // creates a new packet source
+            let mut source = PacketSource::new(
+                flow.id,
+                flow.initial_delay,
+                flow.duration,
+                flow.arr_dist,
+                flow.pkt_size_dist,
+                flow.seed,
+            );
 
-                // obtains the host switch and its mailbox for the packet source
-                let source_host = self.switches.get_mut(&edge.source().index()).unwrap();
-                let host_mbox = self.switch_mailboxes.get(&edge.source().index()).unwrap();
+            // obtains the host switch and its mailbox for the packet source
+            let source_host = self.switches.get_mut(&flow.source_host).unwrap();
+            let host_mbox = self.switch_mailboxes.get(&flow.source_host).unwrap();
 
-                // establishes a bi-directional connection between the packet source and the host
-                let source_mbox: Mailbox<PacketSource> = Mailbox::new();
-                source
-                    .output
-                    .connect(PacketSwitch::packet_received, host_mbox);
-                let mut output = Output::default();
-                output.connect(PacketSource::packet_received, &source_mbox);
-                source_host.outputs.insert(source.id(), output);
+            // establishes a bi-directional connection between the packet source and the host
+            let source_mbox: Mailbox<PacketSource> = Mailbox::new();
+            source
+                .output
+                .connect(PacketSwitch::packet_received, host_mbox);
+            let mut output = Output::default();
+            output.connect(PacketSource::packet_received, &source_mbox);
+            source_host.outputs.insert(source.id(), output);
 
-                // activates the packet source
-                self.sim_init = self.sim_init.add_model(source, source_mbox);
+            // activates the packet source
+            self.sim_init = self.sim_init.add_model(source, source_mbox);
 
-                // creates a new packet sink
-                let mut sink = PacketSink::new(flow.id);
+            // creates a new packet sink
+            let mut sink = PacketSink::new(flow.id);
 
-                // obtains the host switch and its mailbox for the packet sink
-                let sink_host = self.switches.get_mut(&edge.target().index()).unwrap();
-                let host_mbox = self.switch_mailboxes.get(&edge.target().index()).unwrap();
+            // obtains the host switch and its mailbox for the packet sink
+            let sink_host = self.switches.get_mut(&flow.sink_host).unwrap();
+            let host_mbox = self.switch_mailboxes.get(&flow.sink_host).unwrap();
 
-                // establishes a bi-directional connection between the packet sink and the host
-                let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
+            // establishes a bi-directional connection between the packet sink and the host
+            let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
 
-                // record the packet sink ids for later construction of paths in
-                // Flow::compute_paths()
-                flow.sink_ids.insert(edge_index, sink.id());
+            // record the packet sink ids for later construction of paths in
+            // Flow::compute_paths()
+            flow.sink_id = sink.id();
 
-                // records the sink ids, sink mailbox's address and sink
-                // statistics event slot for the retrieval of packet statistics
-                // after the simulation finishes
-                stats.sink_ids.push(sink.id());
-                stats.sink_addresses.insert(sink.id(), sink_mbox.address());
-                stats
-                    .sink_statistics
-                    .insert(sink.id(), sink.statistics.connect_slot().0);
+            // records the sink ids, sink mailbox's address and sink
+            // statistics event slot for the retrieval of packet statistics
+            // after the simulation finishes
+            stats.sink_ids.push(sink.id());
+            stats.sink_addresses.insert(sink.id(), sink_mbox.address());
+            stats
+                .sink_statistics
+                .insert(sink.id(), sink.statistics.connect_slot().0);
 
-                sink.output
-                    .connect(PacketSwitch::packet_received, host_mbox);
-                let mut output = Output::default();
-                output.connect(PacketSink::packet_received, &sink_mbox);
-                sink_host.outputs.insert(sink.id(), output);
+            sink.output
+                .connect(PacketSwitch::packet_received, host_mbox);
+            let mut output = Output::default();
+            output.connect(PacketSink::packet_received, &sink_mbox);
+            sink_host.outputs.insert(sink.id(), output);
 
-                // activates the packet sink
-                self.sim_init = self.sim_init.add_model(sink, sink_mbox);
-            }
+            // activates the packet sink
+            self.sim_init = self.sim_init.add_model(sink, sink_mbox);
         }
 
         self
@@ -385,23 +458,21 @@ impl Topology {
     /// Computes routing decisions for all the flows, and installs Flow
     /// Information Base tables (FIBs) of these routing decisions into all the
     /// switches.
-    fn route(&mut self) {
+    fn route_flows(&mut self) {
         info!(
             "Computing routing decisions for all {} flows.",
             self.flows.len()
         );
 
         for flow in self.flows.iter_mut() {
-            let paths = flow.compute_paths(self.graph.clone());
+            let path = flow.compute_path(self.graph.clone());
 
-            for path in paths {
-                debug!("The path for flow {} is: {:?}", flow.id, path);
-                for window in path.windows(2) {
-                    let node_id = window.get(0).unwrap().index();
-                    let next_id = window.get(1).unwrap().index();
-                    let switch = self.switches.get_mut(&node_id).unwrap();
-                    switch.set_fib(flow.id, next_id);
-                }
+            debug!("The path for flow {} is: {:?}", flow.id, path);
+            for window in path.windows(2) {
+                let node_id = window.get(0).unwrap().index();
+                let next_id = window.get(1).unwrap().index();
+                let switch = self.switches.get_mut(&node_id).unwrap();
+                switch.set_fib(flow.id, next_id);
             }
         }
     }
@@ -426,12 +497,19 @@ impl Topology {
 
         // initializes mailboxes for the packet switches
         self.init_mailboxes();
+
+        // produces flows within all collectives in the network graph
+        self.process_collectives();
+
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
-        // attaches sources and sinks to hosts in the network graph
-        self = self.attach(&mut statistics);
+
+        // attaches packet sources and sinks from flows to hosts in the network graph
+        self = self.attach_flows(&mut statistics);
+
         // computes feasible paths for all flows, and sets FIBs for all switches
-        self.route();
+        self.route_flows();
+
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 

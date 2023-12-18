@@ -7,9 +7,9 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::flows::flow::DistributionInfo;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
+use due::flows::DistributionInfo;
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::port::Port;
 
@@ -27,6 +27,7 @@ fn main() {
             low: 1000,
             high: 1000,
         },
+        0,
     );
 
     let mut source_2 = PacketSource::new(
@@ -38,6 +39,7 @@ fn main() {
             low: 1000,
             high: 1000,
         },
+        0,
     );
 
     let mut port = Port::new(8000.0, 100, CapacityUnit::Packets, DropStrategy::TailDrop);

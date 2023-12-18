@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
@@ -8,6 +7,7 @@ use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
+use crate::flows::DistributionInfo;
 use crate::topos::build::FatTreeConfig;
 use crate::{next_flow_id, seed_from_config};
 
@@ -44,71 +44,80 @@ struct FlowConfig {
     flow_set: Option<Vec<TomlFlowSet>>,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
-#[serde(tag = "type")]
-pub enum DistributionInfo {
-    Exp { lambda: f64 },
-    Uniform { low: i64, high: i64 },
-}
-
+/// A flow represents a directed edge with one packet source and one packet sink.
 #[derive(Debug)]
 pub struct Flow {
     pub id: usize,
     pub flow_type: FlowType,
-    pub graph: DiGraph<usize, ()>,
+    /// the id of the host switch that the source attaches to
+    pub source_host: usize,
+    /// the id of the host switch that the sink attaches to
+    pub sink_host: usize,
+    /// the id of PacketSink
+    pub sink_id: usize,
     pub initial_delay: f64,
     pub duration: f64,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
+    /// random seed for the packet source
+    pub seed: usize,
     pub routing: RandomSimplePath,
-
-    // edge index -> sink id
-    pub sink_ids: HashMap<usize, usize>,
 }
 
 impl Flow {
     pub fn new(
         id: usize,
         flow_type: FlowType,
-        graph: DiGraph<usize, ()>,
+        source_host: usize,
+        sink_host: usize,
         initial_delay: f64,
         duration: f64,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
+        seed: usize,
     ) -> Flow {
         let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
+
         Flow {
             id,
             flow_type,
-            graph,
+            source_host,
+            sink_host,
+            sink_id: 0,
             initial_delay,
             duration,
             arr_dist,
             pkt_size_dist,
+            seed,
             routing,
-            sink_ids: HashMap::new(),
         }
     }
 
-    // Initializes flows from a vector of directed graphs.
+    // Initializes flows from a vector of directed graphs. Each directed graph
+    // only has one edge from the packet source to the packet sink.
     pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
         let mut flows = Vec::new();
 
-        for graph in graphs {
-            let flow_graph = DiGraph::<usize, ()>::from_edges(&graph);
+        for (_, graph) in graphs.iter().enumerate() {
+            let flow_graph = DiGraph::<usize, ()>::from_edges(graph);
+            assert!(flow_graph.edge_references().len() == 1);
 
-            flows.push(Flow::new(
-                next_flow_id(),
-                FlowType::PacketDistribution,
-                flow_graph,
-                0.,
-                10.,
-                DistributionInfo::Exp { lambda: 1. },
-                DistributionInfo::Uniform {
-                    low: 1000,
-                    high: 1000,
-                },
-            ));
+            for (_, edge) in flow_graph.edge_references().enumerate() {
+                flows.push(Flow::new(
+                    next_flow_id(),
+                    FlowType::PacketDistribution,
+                    edge.source().index(),
+                    edge.target().index(),
+                    1.,
+                    10.,
+                    DistributionInfo::Exp { lambda: 1. },
+                    DistributionInfo::Uniform {
+                        low: 1000,
+                        high: 1000,
+                    },
+                    0,
+                ));
+            }
         }
 
         flows
@@ -126,16 +135,24 @@ impl Flow {
         if let Some(flows_vec) = config.flow {
             for flow in flows_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
+                assert!(graph.edge_references().len() == 1);
 
-                flows.push(Flow::new(
-                    next_flow_id(),
-                    flow.flow_type,
-                    graph,
-                    flow.initial_delay,
-                    flow.duration,
-                    flow.arr_dist,
-                    flow.pkt_size_dist,
-                ));
+                for (_, edge) in graph.edge_references().enumerate() {
+                    let flow_id = next_flow_id();
+
+                    flows.push(Flow::new(
+                        flow_id,
+                        flow.flow_type,
+                        edge.source().index(),
+                        edge.target().index(),
+                        flow.initial_delay,
+                        flow.duration,
+                        flow.arr_dist,
+                        flow.pkt_size_dist,
+                        // uses flow_id as the random seed (added to the global seed)
+                        flow_id,
+                    ));
+                }
             }
         }
 
@@ -152,19 +169,19 @@ impl Flow {
                         let mut range = (0..start).chain((start + 1)..num_edge_switches);
                         range.nth(rng.gen_range(0..num_edge_switches - 1)).unwrap()
                     };
-                    let graph = DiGraph::<usize, ()>::from_edges(vec![(
-                        NodeIndex::new(start),
-                        NodeIndex::new(end),
-                    )]);
 
+                    let flow_id = next_flow_id();
                     flows.push(Flow::new(
-                        next_flow_id(),
+                        flow_id,
                         flow_set.flow_type,
-                        graph,
+                        start,
+                        end,
                         flow_set.initial_delay,
                         flow_set.duration,
                         flow_set.arr_dist,
                         flow_set.pkt_size_dist,
+                        // uses flow_id as the random seed (added to the global seed)
+                        flow_id,
                     ));
                 }
             }
@@ -173,20 +190,16 @@ impl Flow {
         flows
     }
 
-    // Gets the simple paths for all edges of the flow
-    pub fn compute_paths(&mut self, graph: UnGraph<usize, ()>) -> Vec<Vec<NodeIndex>> {
-        // sets the routing protocol
+    // Given the network graph, computes the path from the packet source to the sink in the flow
+    pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
         self.routing = RandomSimplePath::new(graph);
 
-        let mut paths = Vec::new();
+        let mut path = self.routing.compute_route(
+            NodeIndex::new(self.source_host),
+            NodeIndex::new(self.sink_host),
+        );
+        path.push(NodeIndex::new(self.sink_id));
 
-        for (edge_index, edge) in self.graph.edge_references().enumerate() {
-            let mut path = self.routing.compute_route(edge.source(), edge.target());
-            let sink_id = self.sink_ids[&edge_index];
-            path.push(NodeIndex::new(sink_id));
-            paths.push(path);
-        }
-
-        paths
+        path
     }
 }
