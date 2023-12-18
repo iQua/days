@@ -135,6 +135,7 @@ impl Flow {
         if let Some(flows_vec) = config.flow {
             for flow in flows_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
+                assert!(graph.edge_references().len() == 1);
 
                 for (_, edge) in graph.edge_references().enumerate() {
                     let flow_id = next_flow_id();

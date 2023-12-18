@@ -405,7 +405,7 @@ impl Topology {
 
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
-            let host_mbox = self.switch_mailboxes.get(&flow.sink_host).unwrap();
+            let host_mbox = self.switch_mailboxes.get(&flow.source_host).unwrap();
 
             // establishes a bi-directional connection between the packet source and the host
             let source_mbox: Mailbox<PacketSource> = Mailbox::new();
