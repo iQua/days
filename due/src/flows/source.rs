@@ -64,7 +64,6 @@ impl PacketSource {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
-        println!("PacketSource seed: {}", (global_seed + seed) as u64);
 
         PacketSource {
             endpoint_id: next_endpoint_id(),
