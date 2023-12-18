@@ -41,7 +41,7 @@ flow_type = "PacketDistribution"
 graph = [[0, 1], [0, 2]]
 sources = [0]
 sinks = [1, 2]
-initial_delay = 2.0
+initial_delay = 1.0
 duration = 10.0
 arr_dist = {type = "Uniform", low = 1, high = 1}
 pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
