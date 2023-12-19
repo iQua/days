@@ -189,7 +189,7 @@ impl Topology {
         self
     }
 
-    /// Produces flows within all collectives in the network graph
+    /// Produces flows within all collectives in the network graph.
     fn process_collectives(&mut self) {
         info!(
             "Produces flows in all {} collective communication operations.",
@@ -260,6 +260,7 @@ impl Topology {
         }
     }
 
+    /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let discipline = match &self.config {
             Config::SwitchConfig(config) => config.switch[upstream_id].discipline,
@@ -379,7 +380,8 @@ impl Topology {
         self
     }
 
-    /// Attaches packet sources and sinks from the flows to hosts in the network graph
+    /// Attaches packet sources and sinks from the flows to hosts in the network
+    /// graph.
     fn attach_flows(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -477,7 +479,7 @@ impl Topology {
         }
     }
 
-    /// Activates all the switches and initializes the simulation
+    /// Activates all the switches and initializes the simulation.
     fn init_sim(mut self) -> Simulation {
         info!(
             "Activating all {} switches and initializing the simulation.",
