@@ -3,12 +3,12 @@
 use std::env;
 
 use log::info;
-use petgraph::graph::UnGraph;
+// use petgraph::graph::UnGraph;
 
 use due::flows::collective::Collective;
 use due::flows::flow::Flow;
-// use due::topos::build::build_graph;
 use due::seed_from_config;
+use due::topos::build::build_graph;
 use due::topos::topo::Topology;
 
 fn main() {
@@ -39,7 +39,7 @@ fn main() {
     // 3. building a graph using a graph builder.
     //    let (graph, hosts) = build_fattree(file_path);
 
-    let graph = UnGraph::<usize, ()>::from_edges([(0, 1), (0, 2)]);
+    let graph = build_graph(file_path);
     let hosts = vec![0, 1, 2];
     info!("The network graph has been initialized: {:?}", graph);
 
