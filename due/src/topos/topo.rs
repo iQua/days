@@ -27,7 +27,7 @@ use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::topos::build::FatTreeConfig;
+use crate::topos::build::{FatTreeConfig, TorusConfig};
 use crate::{next_flow_id, set_num_switches};
 
 #[derive(Deserialize)]
@@ -46,6 +46,7 @@ pub struct SwitchConfig {
 pub enum Config {
     SwitchConfig(SwitchConfig),
     FatTreeConfig(FatTreeConfig),
+    TorusConfig(TorusConfig),
 }
 
 #[derive(Default)]
@@ -119,6 +120,19 @@ impl Topology {
                 switch_mailboxes: HashMap::new(),
                 config: Config::FatTreeConfig(config),
             }
+        } else if let Ok(config) = toml::from_str::<TorusConfig>(&content) {
+            let switches = Topology::init_torus_switches(&config);
+
+            Topology {
+                sim_init: SimInit::new(),
+                graph: graph.clone(),
+                hosts,
+                switches,
+                flows,
+                collectives,
+                switch_mailboxes: HashMap::new(),
+                config: Config::TorusConfig(config),
+            }
         } else {
             let config: SwitchConfig =
                 toml::from_str(&content).expect("Failed to deserialize the configuration");
@@ -168,6 +182,18 @@ impl Topology {
         switches
     }
 
+    fn init_torus_switches(config: &TorusConfig) -> HashMap<usize, PacketSwitch> {
+        let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
+        let num_switches = config.n.pow(config.dim as u32);
+
+        for _ in 0..num_switches {
+            let switch = PacketSwitch::new(HashMap::new());
+            switches.insert(switch.id(), switch);
+        }
+
+        switches
+    }
+
     /// Connects a hash map of packet switches according to edges in a network
     /// topology.
     fn connect(mut self, graph: UnGraph<usize, ()>) -> Self {
@@ -200,10 +226,11 @@ impl Topology {
         for collective in self.collectives.iter_mut() {
             for &source in collective.sources.iter() {
                 for &sink in collective.sinks.iter() {
+                    let flow_id = next_flow_id();
                     match collective.collective_type {
                         CollectiveType::Broadcast => {
                             self.flows.push(Flow::new(
-                                next_flow_id(),
+                                flow_id,
                                 collective.flow_type,
                                 source,
                                 sink,
@@ -219,7 +246,6 @@ impl Topology {
                             ));
                         }
                         CollectiveType::Gather => {
-                            let flow_id = next_flow_id();
                             self.flows.push(Flow::new(
                                 flow_id,
                                 collective.flow_type,
@@ -236,7 +262,6 @@ impl Topology {
                             ));
                         }
                         CollectiveType::AllReduce => {
-                            let flow_id = next_flow_id();
                             self.flows.push(Flow::new(
                                 flow_id,
                                 collective.flow_type,
@@ -264,6 +289,7 @@ impl Topology {
         let discipline = match &self.config {
             Config::SwitchConfig(config) => config.switch[upstream_id].discipline,
             Config::FatTreeConfig(config) => config.discipline,
+            Config::TorusConfig(config) => config.discipline,
         };
 
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
@@ -283,6 +309,17 @@ impl Topology {
                         )
                     }
                     Config::FatTreeConfig(config) => {
+                        let weight_len = config.weights.len();
+                        DRRServer::new(
+                            config.port_rate,
+                            config.capacity,
+                            CapacityUnit::Packets,
+                            Arc::new(move |flow_id| flow_id % weight_len),
+                            DropStrategy::TailDrop,
+                            config.weights.clone(),
+                        )
+                    }
+                    Config::TorusConfig(config) => {
                         let weight_len = config.weights.len();
                         DRRServer::new(
                             config.port_rate,
@@ -322,6 +359,12 @@ impl Topology {
                         CapacityUnit::Packets,
                         DropStrategy::TailDrop,
                     ),
+                    Config::TorusConfig(config) => Port::new(
+                        config.port_rate,
+                        config.capacity,
+                        CapacityUnit::Packets,
+                        DropStrategy::TailDrop,
+                    ),
                 };
 
                 let mut output = Output::default();
@@ -350,6 +393,17 @@ impl Topology {
                         )
                     }
                     Config::FatTreeConfig(config) => {
+                        let weight_len = config.weights.len();
+                        WFQServer::new(
+                            config.port_rate,
+                            config.capacity,
+                            CapacityUnit::Packets,
+                            Arc::new(move |flow_id| flow_id % weight_len),
+                            DropStrategy::TailDrop,
+                            config.weights.clone(),
+                        )
+                    }
+                    Config::TorusConfig(config) => {
                         let weight_len = config.weights.len();
                         WFQServer::new(
                             config.port_rate,
