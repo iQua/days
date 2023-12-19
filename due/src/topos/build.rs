@@ -167,7 +167,7 @@ pub fn build_torus(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // initializes the graph from edges
     let graph: UnGraph<usize, ()> = UnGraph::<usize, ()>::from_edges(edges);
 
-    // distinguishes all hosts (edge switches)
+    // distinguishes all hosts
     let hosts: Vec<usize> = (0..total_node).collect();
 
     (graph, hosts)
