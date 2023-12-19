@@ -218,7 +218,7 @@ impl Topology {
     /// Produces flows within all collectives in the network graph
     fn process_collectives(&mut self) {
         info!(
-            "Produces flows in all {} collective communication operations.",
+            "Producing flows in all {} collective communication operations.",
             self.collectives.len()
         );
 
@@ -244,6 +244,10 @@ impl Topology {
                                 // distribution
                                 collective.id,
                             ));
+                            info!(
+                                "Produced Flow {} of Broadcast collective communication operation {}.",
+                                flow_id, collective.id
+                            );
                         }
                         CollectiveType::Gather => {
                             self.flows.push(Flow::new(
@@ -260,6 +264,10 @@ impl Topology {
                                 // different arrival and size distributions
                                 flow_id,
                             ));
+                            info!(
+                                "Produced Flow {} of Gather collective communication operation {}.",
+                                flow_id, collective.id
+                            );
                         }
                         CollectiveType::AllReduce => {
                             self.flows.push(Flow::new(
@@ -276,8 +284,12 @@ impl Topology {
                                 // hosts have different arrival and size
                                 // distributions, but packet sources attached to
                                 // the same host have the same distribution
-                                flow_id,
+                                source,
                             ));
+                            info!(
+                                "Produced Flow {} of AllReduce collective communication operation {}.",
+                                flow_id, collective.id
+                            );
                         }
                     }
                 }

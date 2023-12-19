@@ -150,8 +150,8 @@ impl PacketSource {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
             } else {
                 info!(
-                    "PacketSource {} finished running at {:.3}.",
-                    self.endpoint_id, now
+                    "PacketSource {} of Flow {} finished running at {:.3}.",
+                    self.endpoint_id, self.flow_id, now
                 );
             }
         }
