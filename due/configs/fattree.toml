@@ -1,4 +1,4 @@
-# This is a configuration file for fattree topology
+# This is a configuration file for the FatTree topology.
 
 seed = 1000
 k = 4

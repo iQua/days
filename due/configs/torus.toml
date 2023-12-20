@@ -1,4 +1,4 @@
-# This is a configuration file for Torus topology
+# This is a configuration file for the Torus topology.
 
 seed = 1000
 dim = 2

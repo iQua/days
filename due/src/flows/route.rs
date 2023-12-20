@@ -12,7 +12,6 @@ use crate::get_seed;
 
 /// Defines the interface for all routing protocols
 pub trait RoutingProtocol {
-    /// This function returns a shortest path between two nodes in the graph
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex>;
 }
 
@@ -49,6 +48,7 @@ impl RandomSimplePath {
 }
 
 impl RoutingProtocol for RandomSimplePath {
+    /// Returns a shortest path between two nodes in the graph.
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
         let binding = dijkstra(&self.graph, start, Some(end), |_| 1);
         let len = binding.get(&end).unwrap();

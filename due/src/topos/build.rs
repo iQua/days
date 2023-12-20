@@ -33,7 +33,7 @@ pub struct TorusConfig {
     pub discipline: SchedulingDiscipline,
 }
 
-/// This function is used to build a topology from a toml configuration file
+/// Builds a topology from a configuration file.
 pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
@@ -45,7 +45,7 @@ pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     UnGraph::<usize, ()>::from_edges(graph.edges)
 }
 
-/// This function is used to build a fattree topology and its hosts.
+/// Builds a FatTree topology and its hosts.
 pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the configuration file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
@@ -92,7 +92,7 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     (graph, hosts)
 }
 
-/// This function is used to build a Torus topology and its hosts.
+/// Builds a Torus topology and its hosts.
 pub fn build_torus(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the configuration file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
