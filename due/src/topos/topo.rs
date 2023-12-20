@@ -207,10 +207,7 @@ impl Topology {
                                 collective.flow_type,
                                 source,
                                 sink,
-                                collective.initial_delay,
-                                collective.duration,
-                                collective.arr_dist,
-                                collective.pkt_size_dist,
+                                collective.traffic,
                                 // uses collective_id as the random seed for the
                                 // flow, which ensures that all flows in the
                                 // broadcast have the same arrival and size
@@ -225,10 +222,7 @@ impl Topology {
                                 collective.flow_type,
                                 source,
                                 sink,
-                                collective.initial_delay,
-                                collective.duration,
-                                collective.arr_dist,
-                                collective.pkt_size_dist,
+                                collective.traffic,
                                 // uses flow_id as the random seed for the flow,
                                 // which ensures that different flows have
                                 // different arrival and size distributions
@@ -242,10 +236,7 @@ impl Topology {
                                 collective.flow_type,
                                 source,
                                 sink,
-                                collective.initial_delay,
-                                collective.duration,
-                                collective.arr_dist,
-                                collective.pkt_size_dist,
+                                collective.traffic,
                                 // uses the source host's id as the random seed
                                 // for the flow, which ensures that different
                                 // hosts have different arrival and size
@@ -396,14 +387,7 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let mut source = PacketSource::new(
-                flow.id,
-                flow.initial_delay,
-                flow.duration,
-                flow.arr_dist,
-                flow.pkt_size_dist,
-                flow.seed,
-            );
+            let mut source = PacketSource::new(flow.id, flow.traffic, flow.seed);
 
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();

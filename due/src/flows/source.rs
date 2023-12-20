@@ -15,17 +15,14 @@ use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
-use crate::flows::DistributionInfo;
+use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::{get_seed, next_endpoint_id};
 
 #[derive(Debug)]
 pub struct PacketSource {
     endpoint_id: usize,
     flow_id: usize,
-    initial_delay: f64,
-    duration: f64,
-    arr_dist: DistributionInfo,
-    pkt_size_dist: DistributionInfo,
+    traffic: TrafficCharacteristics,
     packets_sent: usize,
     seed: usize,
     rng: SmallRng,
@@ -38,10 +35,7 @@ impl Clone for PacketSource {
         PacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id: self.flow_id,
-            initial_delay: self.initial_delay,
-            duration: self.duration,
-            arr_dist: self.arr_dist,
-            pkt_size_dist: self.pkt_size_dist,
+            traffic: self.traffic,
             packets_sent: 0,
             rng: self.rng.clone(),
             seed: self.seed,
@@ -51,14 +45,7 @@ impl Clone for PacketSource {
 }
 
 impl PacketSource {
-    pub fn new(
-        flow_id: usize,
-        initial_delay: f64,
-        duration: f64,
-        arr_dist: DistributionInfo,
-        pkt_size_dist: DistributionInfo,
-        seed: usize,
-    ) -> PacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> PacketSource {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
@@ -68,10 +55,7 @@ impl PacketSource {
         PacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
-            initial_delay,
-            duration,
-            arr_dist,
-            pkt_size_dist,
+            traffic,
             packets_sent: 0,
             seed,
             rng,
@@ -111,14 +95,14 @@ impl PacketSource {
     }
 
     fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        let interval = match self.arr_dist {
+        let interval = match self.traffic.arr_dist {
             DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
             DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
                 .sample(&mut self.rng),
         };
 
-        let packet_size = match self.pkt_size_dist {
+        let packet_size = match self.traffic.pkt_size_dist {
             DistributionInfo::Exp { lambda } => {
                 Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
             }
@@ -146,7 +130,7 @@ impl PacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(current_time, packet);
 
-            if now + interval.as_secs_f64() <= self.duration {
+            if now + interval.as_secs_f64() <= self.traffic.duration {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
             } else {
                 info!(
@@ -164,9 +148,13 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            if self.initial_delay > 0.0 {
+            if self.traffic.initial_delay > 0.0 {
                 scheduler
-                    .schedule_event(Duration::from_secs_f64(self.initial_delay), Self::run, ())
+                    .schedule_event(
+                        Duration::from_secs_f64(self.traffic.initial_delay),
+                        Self::run,
+                        (),
+                    )
                     .unwrap();
             } else {
                 panic!(
