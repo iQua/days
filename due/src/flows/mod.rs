@@ -13,3 +13,27 @@ pub enum DistributionInfo {
     Exp { lambda: f64 },
     Uniform { low: i64, high: i64 },
 }
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct TrafficCharacteristics {
+    pub initial_delay: f64,
+    pub duration: f64,
+    pub arr_dist: DistributionInfo,
+    pub pkt_size_dist: DistributionInfo,
+}
+
+impl TrafficCharacteristics {
+    pub fn new(
+        initial_delay: f64,
+        duration: f64,
+        arr_dist: DistributionInfo,
+        pkt_size_dist: DistributionInfo,
+    ) -> Self {
+        Self {
+            initial_delay,
+            duration,
+            arr_dist,
+            pkt_size_dist,
+        }
+    }
+}

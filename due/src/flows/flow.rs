@@ -7,8 +7,8 @@ use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
-use crate::flows::DistributionInfo;
-use crate::topos::build::{FatTreeConfig, TorusConfig};
+use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::topos::build::FatTreeConfig;
 use crate::{next_flow_id, seed_from_config};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -22,20 +22,14 @@ pub enum FlowType {
 struct TomlFlow {
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
-    initial_delay: f64,
-    duration: f64,
-    arr_dist: DistributionInfo,
-    pkt_size_dist: DistributionInfo,
+    traffic: TrafficCharacteristics,
 }
 
 #[derive(Deserialize, Debug)]
 struct TomlFlowSet {
     flow_type: FlowType,
     flow_count: u32,
-    initial_delay: f64,
-    duration: f64,
-    arr_dist: DistributionInfo,
-    pkt_size_dist: DistributionInfo,
+    traffic: TrafficCharacteristics,
 }
 
 #[derive(Deserialize, Debug)]
@@ -55,10 +49,7 @@ pub struct Flow {
     pub sink_host: usize,
     /// the id of PacketSink
     pub sink_id: usize,
-    pub initial_delay: f64,
-    pub duration: f64,
-    pub arr_dist: DistributionInfo,
-    pub pkt_size_dist: DistributionInfo,
+    pub traffic: TrafficCharacteristics,
     /// random seed for the packet source
     pub seed: usize,
     pub routing: RandomSimplePath,
@@ -70,10 +61,7 @@ impl Flow {
         flow_type: FlowType,
         source_host: usize,
         sink_host: usize,
-        initial_delay: f64,
-        duration: f64,
-        arr_dist: DistributionInfo,
-        pkt_size_dist: DistributionInfo,
+        traffic: TrafficCharacteristics,
         seed: usize,
     ) -> Flow {
         let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
@@ -84,10 +72,7 @@ impl Flow {
             source_host,
             sink_host,
             sink_id: 0,
-            initial_delay,
-            duration,
-            arr_dist,
-            pkt_size_dist,
+            traffic,
             seed,
             routing,
         }
@@ -108,13 +93,15 @@ impl Flow {
                     FlowType::PacketDistribution,
                     edge.source().index(),
                     edge.target().index(),
-                    1.,
-                    10.,
-                    DistributionInfo::Exp { lambda: 1. },
-                    DistributionInfo::Uniform {
-                        low: 1000,
-                        high: 1000,
-                    },
+                    TrafficCharacteristics::new(
+                        1.,
+                        10.,
+                        DistributionInfo::Exp { lambda: 1. },
+                        DistributionInfo::Uniform {
+                            low: 1000,
+                            high: 1000,
+                        },
+                    ),
                     0,
                 ));
             }
@@ -145,10 +132,7 @@ impl Flow {
                         flow.flow_type,
                         edge.source().index(),
                         edge.target().index(),
-                        flow.initial_delay,
-                        flow.duration,
-                        flow.arr_dist,
-                        flow.pkt_size_dist,
+                        flow.traffic,
                         // uses flow_id as the random seed (added to the global seed)
                         flow_id,
                     ));
@@ -157,23 +141,17 @@ impl Flow {
         }
 
         if let Some(flow_set_vec) = config.flow_set {
-            let num_switches: usize;
-            if let Ok(_config) = toml::from_str::<FatTreeConfig>(&content) {
-                num_switches = _config.k.pow(2) / 2;
-            } else if let Ok(_config) = toml::from_str::<TorusConfig>(&content) {
-                num_switches = _config.n.pow(_config.dim as u32);
-            } else {
-                panic!("Failed to deserialize the configuration");
-            }
-
+            let fattree_config: FatTreeConfig =
+                toml::from_str(&content).expect("Failed to deserialize the configuration");
+            let num_edge_switches = fattree_config.k.pow(2) / 2;
             let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
 
             for flow_set in flow_set_vec {
                 for _ in 0..flow_set.flow_count {
-                    let start = rng.gen_range(0..num_switches);
+                    let start = rng.gen_range(0..num_edge_switches);
                     let end = {
-                        let mut range = (0..start).chain((start + 1)..num_switches);
-                        range.nth(rng.gen_range(0..num_switches - 1)).unwrap()
+                        let mut range = (0..start).chain((start + 1)..num_edge_switches);
+                        range.nth(rng.gen_range(0..num_edge_switches - 1)).unwrap()
                     };
 
                     let flow_id = next_flow_id();
@@ -182,10 +160,7 @@ impl Flow {
                         flow_set.flow_type,
                         start,
                         end,
-                        flow_set.initial_delay,
-                        flow_set.duration,
-                        flow_set.arr_dist,
-                        flow_set.pkt_size_dist,
+                        flow_set.traffic,
                         // uses flow_id as the random seed (added to the global seed)
                         flow_id,
                     ));

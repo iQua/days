@@ -10,7 +10,7 @@ use asynchronix::time::MonotonicTime;
 
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
-use due::flows::DistributionInfo;
+use due::flows::{DistributionInfo, TrafficCharacteristics};
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::wfq::WFQServer;
 
@@ -21,25 +21,29 @@ fn main() {
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
         0,
-        2.5,
-        10.0,
-        DistributionInfo::Uniform { low: 2, high: 2 },
-        DistributionInfo::Uniform {
-            low: 2000,
-            high: 2000,
-        },
+        TrafficCharacteristics::new(
+            2.5,
+            10.0,
+            DistributionInfo::Uniform { low: 2, high: 2 },
+            DistributionInfo::Uniform {
+                low: 2000,
+                high: 2000,
+            },
+        ),
         0,
     );
 
     let mut source_2 = PacketSource::new(
         1,
-        2.0,
-        10.0,
-        DistributionInfo::Uniform { low: 1, high: 1 },
-        DistributionInfo::Uniform {
-            low: 1000,
-            high: 1000,
-        },
+        TrafficCharacteristics::new(
+            2.0,
+            10.0,
+            DistributionInfo::Uniform { low: 1, high: 1 },
+            DistributionInfo::Uniform {
+                low: 1000,
+                high: 1000,
+            },
+        ),
         0,
     );
 

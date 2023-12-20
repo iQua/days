@@ -215,7 +215,7 @@ impl Topology {
         self
     }
 
-    /// Produces flows within all collectives in the network graph
+    /// Produces flows within all collectives in the network graph.
     fn process_collectives(&mut self) {
         info!(
             "Producing flows in all {} collective communication operations.",
@@ -234,10 +234,7 @@ impl Topology {
                                 collective.flow_type,
                                 source,
                                 sink,
-                                collective.initial_delay,
-                                collective.duration,
-                                collective.arr_dist,
-                                collective.pkt_size_dist,
+                                collective.traffic,
                                 // uses collective_id as the random seed for the
                                 // flow, which ensures that all flows in the
                                 // broadcast have the same arrival and size
@@ -255,10 +252,7 @@ impl Topology {
                                 collective.flow_type,
                                 source,
                                 sink,
-                                collective.initial_delay,
-                                collective.duration,
-                                collective.arr_dist,
-                                collective.pkt_size_dist,
+                                collective.traffic,
                                 // uses flow_id as the random seed for the flow,
                                 // which ensures that different flows have
                                 // different arrival and size distributions
@@ -275,10 +269,7 @@ impl Topology {
                                 collective.flow_type,
                                 source,
                                 sink,
-                                collective.initial_delay,
-                                collective.duration,
-                                collective.arr_dist,
-                                collective.pkt_size_dist,
+                                collective.traffic,
                                 // uses the source host's id as the random seed
                                 // for the flow, which ensures that different
                                 // hosts have different arrival and size
@@ -297,6 +288,7 @@ impl Topology {
         }
     }
 
+    /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let discipline = match &self.config {
             Config::SwitchConfig(config) => config.switch[upstream_id].discipline,
@@ -445,7 +437,8 @@ impl Topology {
         self
     }
 
-    /// Attaches packet sources and sinks from the flows to hosts in the network graph
+    /// Attaches packet sources and sinks from the flows to hosts in the network
+    /// graph.
     fn attach_flows(mut self, stats: &mut SinkStatistics) -> Self {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -460,14 +453,7 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let mut source = PacketSource::new(
-                flow.id,
-                flow.initial_delay,
-                flow.duration,
-                flow.arr_dist,
-                flow.pkt_size_dist,
-                flow.seed,
-            );
+            let mut source = PacketSource::new(flow.id, flow.traffic, flow.seed);
 
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
@@ -543,7 +529,7 @@ impl Topology {
         }
     }
 
-    /// Activates all the switches and initializes the simulation
+    /// Activates all the switches and initializes the simulation.
     fn init_sim(mut self) -> Simulation {
         info!(
             "Activating all {} switches and initializing the simulation.",

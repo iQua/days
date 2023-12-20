@@ -9,7 +9,7 @@ use asynchronix::time::MonotonicTime;
 
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
-use due::flows::DistributionInfo;
+use due::flows::{DistributionInfo, TrafficCharacteristics};
 
 fn main() {
     let env = env_logger::Env::default();
@@ -18,13 +18,15 @@ fn main() {
     // Instantiates models and their mailboxes.
     let mut source = PacketSource::new(
         0,
-        1.0,
-        10.0,
-        DistributionInfo::Uniform { low: 1, high: 1 },
-        DistributionInfo::Uniform {
-            low: 1000,
-            high: 1000,
-        },
+        TrafficCharacteristics::new(
+            1.0,
+            10.0,
+            DistributionInfo::Uniform { low: 1, high: 1 },
+            DistributionInfo::Uniform {
+                low: 1000,
+                high: 1000,
+            },
+        ),
         0,
     );
     let source_mbox = Mailbox::new();

@@ -4,7 +4,7 @@ use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
-use crate::flows::DistributionInfo;
+use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_collective_id;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -22,10 +22,7 @@ struct TomlCollective {
     graph: Vec<(u32, u32)>,
     sources: Vec<usize>,
     sinks: Vec<usize>,
-    initial_delay: f64,
-    duration: f64,
-    arr_dist: DistributionInfo,
-    pkt_size_dist: DistributionInfo,
+    traffic: TrafficCharacteristics,
 }
 
 #[derive(Debug)]
@@ -39,10 +36,7 @@ pub struct Collective {
     pub sources: Vec<usize>,
     pub sinks: Vec<usize>,
 
-    pub initial_delay: f64,
-    pub duration: f64,
-    pub arr_dist: DistributionInfo,
-    pub pkt_size_dist: DistributionInfo,
+    pub traffic: TrafficCharacteristics,
 }
 
 #[derive(Deserialize, Debug)]
@@ -58,10 +52,7 @@ impl Collective {
         graph: DiGraph<usize, ()>,
         sources: Vec<usize>,
         sinks: Vec<usize>,
-        initial_delay: f64,
-        duration: f64,
-        arr_dist: DistributionInfo,
-        pkt_size_dist: DistributionInfo,
+        traffic: TrafficCharacteristics,
     ) -> Collective {
         Collective {
             id,
@@ -70,10 +61,7 @@ impl Collective {
             graph,
             sources,
             sinks,
-            initial_delay,
-            duration,
-            arr_dist,
-            pkt_size_dist,
+            traffic,
         }
     }
 
@@ -98,13 +86,15 @@ impl Collective {
                 collective_graph,
                 collective_sources,
                 collective_sinks,
-                1.,
-                10.,
-                DistributionInfo::Exp { lambda: 1. },
-                DistributionInfo::Uniform {
-                    low: 1000,
-                    high: 1000,
-                },
+                TrafficCharacteristics::new(
+                    1.,
+                    10.,
+                    DistributionInfo::Exp { lambda: 1. },
+                    DistributionInfo::Uniform {
+                        low: 1000,
+                        high: 1000,
+                    },
+                ),
             ));
         }
 
@@ -131,10 +121,7 @@ impl Collective {
                     graph,
                     collective.sources,
                     collective.sinks,
-                    collective.initial_delay,
-                    collective.duration,
-                    collective.arr_dist,
-                    collective.pkt_size_dist,
+                    collective.traffic,
                 ));
             }
         }

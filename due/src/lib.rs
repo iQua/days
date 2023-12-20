@@ -36,6 +36,7 @@ pub fn seed_from_config(file_path: &str) -> usize {
 pub fn get_seed() -> usize {
     SEED.load(Ordering::Relaxed)
 }
+
 pub fn num_switches() -> usize {
     NUM_SWITCHES.load(Ordering::Relaxed)
 }
