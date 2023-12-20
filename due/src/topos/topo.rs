@@ -244,7 +244,7 @@ impl Topology {
                                 // distribution
                                 collective.id,
                             ));
-                            info!(
+                            debug!(
                                 "Produced Flow {} of Broadcast collective communication operation {}.",
                                 flow_id, collective.id
                             );
@@ -264,7 +264,7 @@ impl Topology {
                                 // different arrival and size distributions
                                 flow_id,
                             ));
-                            info!(
+                            debug!(
                                 "Produced Flow {} of Gather collective communication operation {}.",
                                 flow_id, collective.id
                             );
@@ -286,7 +286,7 @@ impl Topology {
                                 // the same host have the same distribution
                                 source,
                             ));
-                            info!(
+                            debug!(
                                 "Produced Flow {} of AllReduce collective communication operation {}.",
                                 flow_id, collective.id
                             );
