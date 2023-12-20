@@ -11,15 +11,17 @@ discipline = "FIFO"
 [[flow_set]]
 flow_type = "PacketDistribution"
 flow_count = 63
-initial_delay = 1.0
-duration = 100.0
-arr_dist = {type = "Uniform", low = 10, high = 20}
-pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+[flow_set.traffic]
+    initial_delay = 1.0
+    duration = 100.0
+    arr_dist = {type = "Uniform", low = 10, high = 20}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
 
 [[flow]]
 flow_type = "PacketDistribution"
 graph = [[0, 1]]
-initial_delay = 1.0
-duration = 100.0
-arr_dist = {type = "Uniform", low = 10, high = 20}
-pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+[flow.traffic]
+    initial_delay = 1.0
+    duration = 100.0
+    arr_dist = {type = "Uniform", low = 10, high = 20}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
