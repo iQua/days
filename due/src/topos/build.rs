@@ -14,25 +14,6 @@ struct NetworkGraph {
     edges: Vec<(u32, u32)>,
 }
 
-#[derive(Deserialize)]
-pub struct FatTreeConfig {
-    pub k: usize,
-    pub port_rate: f64,
-    pub capacity: usize,
-    pub weights: Vec<usize>,
-    pub discipline: SchedulingDiscipline,
-}
-
-#[derive(Deserialize)]
-pub struct TorusConfig {
-    pub dim: usize,
-    pub n: usize,
-    pub port_rate: f64,
-    pub capacity: usize,
-    pub weights: Vec<usize>,
-    pub discipline: SchedulingDiscipline,
-}
-
 /// Builds a topology from a configuration file.
 pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
     // reads the toml file
@@ -106,7 +87,7 @@ pub fn build_torus(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     let total_node = node_per_dim.pow(dimension) as usize;
 
     info!(
-        "The total nodes of {}D Torus is {}.",
+        "The total number of nodes in a {}D Torus topology is {}.",
         dimension,
         node_per_dim.pow(dimension)
     );
@@ -160,7 +141,7 @@ pub fn build_torus(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
             }
         }
         _ => {
-            panic!("Only support 1D, 2D, and 3D Torus.")
+            panic!("Only 1D, 2D, and 3D Torus topologies are supported.")
         }
     }
 

@@ -27,8 +27,14 @@ use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::topos::build::{FatTreeConfig, TorusConfig};
 use crate::{next_flow_id, set_num_switches};
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename = "UPPERCASE")]
+pub enum TopoCategory {
+    FatTree,
+    Torus,
+}
 
 #[derive(Deserialize)]
 struct TomlSwitch {
@@ -43,10 +49,28 @@ pub struct SwitchConfig {
     switch: Vec<TomlSwitch>,
 }
 
-pub enum Config {
-    SwitchConfig(SwitchConfig),
-    FatTreeConfig(FatTreeConfig),
-    TorusConfig(TorusConfig),
+#[derive(Deserialize)]
+pub struct FatTreeConfig {
+    pub k: usize,
+}
+
+#[derive(Deserialize)]
+pub struct TorusConfig {
+    pub dim: usize,
+    pub n: usize,
+}
+
+#[derive(Deserialize)]
+pub struct TopoConfig {
+    category: TopoCategory,
+    pub fat_tree: Option<FatTreeConfig>,
+    pub torus: Option<TorusConfig>,
+}
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub switch_config: SwitchConfig,
+    pub topology: TopoConfig,
 }
 
 #[derive(Default)]
@@ -91,8 +115,10 @@ pub struct Topology {
     flows: Vec<Flow>,
     /// A vector of all collectives
     collectives: Vec<Collective>,
+    /// Configuration of packet switches in the topology
+    switch_config: SwitchConfig,
     /// Configuration of the topology
-    config: Config,
+    topo_config: Option<TopoConfig>,
 }
 
 impl Topology {
@@ -107,7 +133,7 @@ impl Topology {
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
-        if let Ok(config) = toml::from_str::<FatTreeConfig>(&content) {
+        if let Ok(config) = toml::from_str::<Config>(&content) {
             let switches = Topology::init_fattree_switches(&config);
 
             Topology {
