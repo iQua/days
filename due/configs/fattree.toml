@@ -2,14 +2,14 @@
 
 seed = 1000
 
-[switch_config]
+[switch]
 port_rate = 320000 # process 40 packets (1000 bytes) per second
 capacity = 100
 weights = [1]
 discipline = "FIFO"
 
 [topology]
-category = "FATTREE"
+category = "FatTree"
 
 [topology.fat_tree]
 k = 4

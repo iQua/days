@@ -38,7 +38,6 @@ pub struct SwitchConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
 pub enum TopoCategory {
     FatTree,
     Torus,
@@ -63,7 +62,7 @@ pub struct TopoConfig {
 
 #[derive(Deserialize)]
 pub struct Config {
-    pub switch_config: SwitchConfig,
+    pub switch: SwitchConfig,
     pub topology: Option<TopoConfig>,
 }
 
@@ -137,7 +136,7 @@ impl Topology {
             flows,
             collectives,
             switch_mailboxes: HashMap::new(),
-            switch_config: config.switch_config,
+            switch_config: config.switch,
         }
     }
 

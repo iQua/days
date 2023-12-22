@@ -2,14 +2,15 @@
 
 seed = 1000
 
-[switch_config]
+[switch]
 port_rate = 8000
 capacity = 100
 weights = [1]
 discipline = "FIFO"
 
 [topology]
-category = "TORUS"
+category = "Torus"
+
 [topology.torus]
     dim = 2
     n = 3

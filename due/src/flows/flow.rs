@@ -11,7 +11,6 @@ use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::{next_flow_id, num_hosts, seed_from_config};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename = "UPPERCASE")]
 pub enum FlowType {
     PacketDistribution,
     TCP,

@@ -8,7 +8,6 @@ use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_collective_id;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename = "UPPERCASE")]
 pub enum CollectiveType {
     Broadcast,
     Gather,
