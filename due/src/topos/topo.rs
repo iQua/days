@@ -111,8 +111,6 @@ pub struct Topology {
     collectives: Vec<Collective>,
     /// Configuration of packet switches in the topology
     switch_config: SwitchConfig,
-    /// Configuration of the topology
-    topo_config: Option<TopoConfig>,
 }
 
 impl Topology {
@@ -140,7 +138,6 @@ impl Topology {
             collectives,
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch_config,
-            topo_config: config.topology,
         }
     }
 
