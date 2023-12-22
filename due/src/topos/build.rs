@@ -28,7 +28,7 @@ pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     match config.topology {
         Some(topo_config) => match topo_config.category {
             TopoCategory::FatTree => {
-                debug!("Initializing a Fattree graph.");
+                debug!("Initializing a FatTree graph.");
                 let fattree_config = topo_config
                     .fat_tree
                     .expect("The configuration of the FatTree topology is not valid");
@@ -59,7 +59,7 @@ pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
 /// Builds a FatTree topology and its hosts.
 pub fn build_fattree(fattree_config: FatTreeConfig) -> (UnGraph<usize, ()>, Vec<usize>) {
     let k = fattree_config.k;
-    info!("The k of fattree is {}.", k);
+    info!("The k of the FatTree is {}.", k);
 
     let num_layer_switches = k.pow(2) / 2;
     let num_core_switches = k.pow(2) / 4;
@@ -163,7 +163,7 @@ pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>
             }
         }
         _ => {
-            panic!("Only 1D, 2D, and 3D Torus topologies are supported.")
+            panic!("Supports 1D, 2D, and 3D Torus topologies only.")
         }
     }
 
