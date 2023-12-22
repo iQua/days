@@ -21,13 +21,13 @@ use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
+use crate::next_flow_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::{next_flow_id, set_num_switches};
 
 #[derive(Deserialize)]
 pub struct SwitchConfig {
@@ -123,8 +123,6 @@ impl Topology {
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
-        set_num_switches(graph.node_count());
-
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 

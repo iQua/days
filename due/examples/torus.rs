@@ -17,7 +17,7 @@ fn main() {
     let (torus_graph, torus_hosts) = build_graph(file_path);
     info!("The Torus graph has been initialized: {:?}", torus_graph);
 
-    let flows = Flow::flows_from_config(file_path, torus_graph.node_count());
+    let flows = Flow::flows_from_config(file_path);
     info!("A total of {} flows has been initialized.", flows.len());
 
     let collectives = Collective::collectives_from_config(file_path);

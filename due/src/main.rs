@@ -48,7 +48,7 @@ fn main() {
 
     // 2. initializes flows using a configuration file.
     //    Example:
-    let flows = Flow::flows_from_config(file_path, graph.node_count());
+    let flows = Flow::flows_from_config(file_path);
 
     info!("A total of {} flows has been initialized.", flows.len());
 

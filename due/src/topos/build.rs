@@ -7,6 +7,7 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::fs;
 
+use crate::set_num_switches;
 use crate::topos::topo::{Config, TopoCategory};
 
 use super::topo::{FatTreeConfig, TorusConfig};
@@ -24,7 +25,7 @@ pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
 
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    match config.topology {
+    let (graph, hosts) = match config.topology {
         Some(topo_config) => match topo_config.category {
             TopoCategory::FatTree => {
                 debug!("Initializing a Fattree graph.");
@@ -46,11 +47,16 @@ pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
             let graph_config: NetworkGraph =
                 toml::from_str(&content).expect("Failed to deserialize the configuration of graph");
 
-            let graph = UnGraph::<usize, ()>::from_edges(graph_config.edges);
-
-            (graph, graph_config.hosts)
+            (
+                UnGraph::<usize, ()>::from_edges(graph_config.edges),
+                graph_config.hosts,
+            )
         }
-    }
+    };
+
+    set_num_switches(graph.node_count());
+
+    (graph, hosts)
 }
 
 /// Builds a FatTree topology and its hosts.
