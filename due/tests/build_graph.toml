@@ -1,2 +1,9 @@
 num_elements = 2
 edges = [[1, 0]]
+hosts = [0, 1]
+
+[switch_config]
+port_rate = 8000
+capacity = 100
+weights = [1]
+discipline = "FIFO"

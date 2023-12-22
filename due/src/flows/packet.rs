@@ -19,8 +19,6 @@ pub struct Packet {
     /// let mut packet = Packet::new(
     ///     1024, // packet size
     ///     0, // packet id
-    ///     "source".to_string(),
-    ///     "destination".to_string(),
     ///     0, // flow_id
     ///     0.0, // creation time
     /// );

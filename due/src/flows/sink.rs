@@ -105,6 +105,7 @@ impl Display for RandomVar {
 #[derive(Clone, Debug)]
 pub struct PacketStatistics {
     pub endpoint_id: usize,
+    pub flow_id: usize,
     pub arrival_times: RandomVar,
     pub inter_arrival_times: RandomVar,
     pub one_way_delays: RandomVar,
@@ -116,13 +117,14 @@ impl std::fmt::Display for PacketStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "PacketSink {} finished running. Statistics: \n\
+            "PacketSink {} of Flow {} finished running. Statistics: \n\
             Arrival times: {:#.3} \n\
             Inter-arrival times: {:#.3} \n\
             One-way delays: {:#.3} \n\
             Queueing delays: {:#.3} \n\
             Packet sizes: {:#.3} \n",
             self.endpoint_id,
+            self.flow_id,
             self.arrival_times,
             self.inter_arrival_times,
             self.one_way_delays,
@@ -198,6 +200,7 @@ impl PacketSink {
     pub fn statistics(&self) -> PacketStatistics {
         PacketStatistics {
             endpoint_id: self.endpoint_id,
+            flow_id: self.flow_id,
             arrival_times: self.arrival_times.clone(),
             inter_arrival_times: self.inter_arrival_times.clone(),
             one_way_delays: self.one_way_delays.clone(),

@@ -1,54 +1,71 @@
 //! Provides builders for building specific types of topologies, or building
 //! topologies based on the information given in a TOML configuration file.
 
-use log::info;
+use core::panic;
+use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::fs;
 
-use crate::switches::SchedulingDiscipline;
+use crate::set_num_switches;
+use crate::topos::topo::{Config, TopoCategory};
+
+use super::topo::{FatTreeConfig, TorusConfig};
 
 #[derive(Deserialize)]
 struct NetworkGraph {
+    hosts: Vec<usize>,
     edges: Vec<(u32, u32)>,
 }
 
-#[derive(Deserialize)]
-pub struct FatTreeConfig {
-    pub k: usize,
-    pub port_rate: f64,
-    pub capacity: usize,
-    pub weights: Vec<usize>,
-    pub discipline: SchedulingDiscipline,
-}
-
-/// This function is used to build a topology from a toml configuration file
-pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
+/// Builds a topology from a configuration file.
+pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-    // deserializes the content of the toml configuration file
-    let graph: NetworkGraph =
-        toml::from_str(&content).expect("Failed to deserialize the configuration");
+    let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    UnGraph::<usize, ()>::from_edges(graph.edges)
+    match config.topology {
+        Some(topo_config) => match topo_config.category {
+            TopoCategory::FatTree => {
+                debug!("Initializing a FatTree graph.");
+                let fattree_config = topo_config
+                    .fat_tree
+                    .expect("The configuration of the FatTree topology is not valid");
+                build_fattree(fattree_config)
+            }
+            TopoCategory::Torus => {
+                debug!("Initializing a Torus graph.");
+                let torus_config = topo_config
+                    .torus
+                    .expect("The configuration of the Torus topology is not valid");
+                build_torus(torus_config)
+            }
+        },
+        None => {
+            let graph_config: NetworkGraph =
+                toml::from_str(&content).expect("Failed to deserialize the configuration of graph");
+            let graph = UnGraph::<usize, ()>::from_edges(graph_config.edges);
+            let hosts = graph_config.hosts;
+
+            set_num_switches(graph.node_count());
+
+            (graph, hosts)
+        }
+    }
 }
 
-/// This function is used to build a fattree topology and its hosts.
-pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
-    // reads the configuration file
-    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+/// Builds a FatTree topology and its hosts.
+pub fn build_fattree(fattree_config: FatTreeConfig) -> (UnGraph<usize, ()>, Vec<usize>) {
+    let k = fattree_config.k;
+    info!("The k of the FatTree is {}.", k);
 
-    // deserializes the content of the configuration
-    let config: FatTreeConfig =
-        toml::from_str(&content).expect("Failed to deserialize the configuration");
-
-    info!("The k of fattree is {}.", config.k);
-
-    let num_layer_switches = config.k.pow(2) / 2;
-    let num_core_switches = config.k.pow(2) / 4;
-    let layer_switches_per_pod = config.k / 2;
+    let num_layer_switches = k.pow(2) / 2;
+    let num_core_switches = k.pow(2) / 4;
+    let layer_switches_per_pod = k / 2;
     let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
+
+    set_num_switches(k.pow(2) * 5 / 4);
 
     let mut edges: Vec<(u32, u32)> = Vec::new();
 
@@ -77,6 +94,81 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
 
     // distinguishes all hosts (edge switches)
     let hosts: Vec<usize> = (0..num_layer_switches).collect();
+
+    (graph, hosts)
+}
+
+/// Builds a Torus topology and its hosts.
+pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>) {
+    let dimension = torus_config.dim as u32;
+    let node_per_dim = torus_config.n as u32;
+    let total_node = node_per_dim.pow(dimension) as usize;
+
+    set_num_switches(total_node);
+
+    info!(
+        "The total number of nodes in a {}D Torus topology is {}.",
+        dimension, total_node
+    );
+
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+
+    match dimension {
+        1 => {
+            for i in 0..node_per_dim {
+                let start = i;
+                let end = (i + 1) % node_per_dim;
+                edges.push((start, end));
+                edges.push((end, start));
+            }
+        }
+        2 => {
+            for i in 0..node_per_dim {
+                for j in 0..node_per_dim {
+                    let start = i + j * node_per_dim;
+                    let end = (i + 1) % node_per_dim + j * node_per_dim;
+                    edges.push((start, end));
+                    edges.push((end, start));
+
+                    let end = i + ((j + 1) % node_per_dim) * node_per_dim;
+                    edges.push((start, end));
+                    edges.push((end, start));
+                }
+            }
+        }
+        3 => {
+            for i in 0..node_per_dim {
+                for j in 0..node_per_dim {
+                    for k in 0..node_per_dim {
+                        let start = i + j * node_per_dim + k * node_per_dim.pow(2);
+                        let end =
+                            (i + 1) % node_per_dim + j * node_per_dim + k * node_per_dim.pow(2);
+                        edges.push((start, end));
+                        edges.push((end, start));
+
+                        let end =
+                            i + ((j + 1) % node_per_dim) * node_per_dim + k * node_per_dim.pow(2);
+                        edges.push((start, end));
+                        edges.push((end, start));
+
+                        let end =
+                            i + j * node_per_dim + ((k + 1) % node_per_dim) * node_per_dim.pow(2);
+                        edges.push((start, end));
+                        edges.push((end, start));
+                    }
+                }
+            }
+        }
+        _ => {
+            panic!("Only 1D, 2D, and 3D Torus topologies are supported.")
+        }
+    }
+
+    // initializes the graph from edges
+    let graph: UnGraph<usize, ()> = UnGraph::<usize, ()>::from_edges(edges);
+
+    // distinguishes all hosts
+    let hosts: Vec<usize> = (0..total_node).collect();
 
     (graph, hosts)
 }

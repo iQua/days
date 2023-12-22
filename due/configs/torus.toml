@@ -1,0 +1,34 @@
+# This is a configuration file for the Torus topology.
+
+seed = 1000
+
+[switch]
+port_rate = 8000
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+
+[topology]
+category = "Torus"
+
+[topology.torus]
+    dim = 2
+    n = 3
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 63
+[flow_set.traffic]
+    initial_delay = 1.0
+    duration = 100.0
+    arr_dist = {type = "Uniform", low = 10, high = 20}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+    initial_delay = 1.0
+    duration = 100.0
+    arr_dist = {type = "Uniform", low = 10, high = 20}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}

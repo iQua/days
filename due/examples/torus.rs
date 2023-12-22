@@ -1,4 +1,4 @@
-//! This example shows a network simulation session involving a FatTree
+//! This example shows a network simulation session involving a Torus
 //! topology.
 
 use log::info;
@@ -12,10 +12,10 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    let file_path = "configs/fattree.toml";
+    let file_path = "configs/torus.toml";
 
     let (graph, hosts) = build_graph(file_path);
-    info!("The FatTree graph has been initialized: {:?}", graph);
+    info!("The Torus graph has been initialized: {:?}", graph);
 
     let flows = Flow::flows_from_config(file_path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());

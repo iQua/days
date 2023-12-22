@@ -3,16 +3,14 @@ use std::fs;
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
-use crate::topos::build::FatTreeConfig;
 use crate::{next_flow_id, seed_from_config};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename = "UPPERCASE")]
 pub enum FlowType {
     PacketDistribution,
     TCP,
@@ -111,7 +109,7 @@ impl Flow {
     }
 
     // Initializes flows from a configuration file.
-    pub fn flows_from_config(file_path: &str) -> Vec<Flow> {
+    pub fn flows_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Flow> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let config: FlowConfig =
@@ -141,25 +139,18 @@ impl Flow {
         }
 
         if let Some(flow_set_vec) = config.flow_set {
-            let fattree_config: FatTreeConfig =
-                toml::from_str(&content).expect("Failed to deserialize the configuration");
-            let num_edge_switches = fattree_config.k.pow(2) / 2;
             let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
 
             for flow_set in flow_set_vec {
                 for _ in 0..flow_set.flow_count {
-                    let start = rng.gen_range(0..num_edge_switches);
-                    let end = {
-                        let mut range = (0..start).chain((start + 1)..num_edge_switches);
-                        range.nth(rng.gen_range(0..num_edge_switches - 1)).unwrap()
-                    };
+                    let host_pair = rand::seq::index::sample(&mut rng, hosts.len(), 2).into_vec();
 
                     let flow_id = next_flow_id();
                     flows.push(Flow::new(
                         flow_id,
                         flow_set.flow_type,
-                        start,
-                        end,
+                        host_pair[0],
+                        host_pair[1],
                         flow_set.traffic,
                         // uses flow_id as the random seed (added to the global seed)
                         flow_id,
