@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
-use crate::{next_flow_id, num_hosts, seed_from_config};
+use crate::{next_flow_id, seed_from_config};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename = "UPPERCASE")]
@@ -110,7 +110,7 @@ impl Flow {
     }
 
     // Initializes flows from a configuration file.
-    pub fn flows_from_config(file_path: &str) -> Vec<Flow> {
+    pub fn flows_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Flow> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let config: FlowConfig =
@@ -144,7 +144,7 @@ impl Flow {
 
             for flow_set in flow_set_vec {
                 for _ in 0..flow_set.flow_count {
-                    let host_pair = rand::seq::index::sample(&mut rng, num_hosts(), 2).into_vec();
+                    let host_pair = rand::seq::index::sample(&mut rng, hosts.len(), 2).into_vec();
 
                     let flow_id = next_flow_id();
                     flows.push(Flow::new(
