@@ -14,6 +14,7 @@ pub struct SeedConfig {
 }
 
 static SEED: AtomicUsize = AtomicUsize::new(0);
+static NUM_HOSTS: AtomicUsize = AtomicUsize::new(0);
 static NUM_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
 static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -35,6 +36,14 @@ pub fn seed_from_config(file_path: &str) -> usize {
 
 pub fn get_seed() -> usize {
     SEED.load(Ordering::Relaxed)
+}
+
+pub fn num_hosts() -> usize {
+    NUM_HOSTS.load(Ordering::Relaxed)
+}
+
+pub fn set_num_hosts(num_hosts: usize) {
+    NUM_HOSTS.store(num_hosts, Ordering::Relaxed);
 }
 
 pub fn num_switches() -> usize {

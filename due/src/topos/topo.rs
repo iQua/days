@@ -21,13 +21,13 @@ use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
-use crate::next_flow_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
+use crate::{next_flow_id, num_switches};
 
 #[derive(Deserialize)]
 pub struct SwitchConfig {
@@ -129,7 +129,7 @@ impl Topology {
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-        let switches = Topology::init_switches(graph.node_count());
+        let switches = Topology::init_switches();
 
         Topology {
             sim_init: SimInit::new(),
@@ -152,10 +152,10 @@ impl Topology {
         }
     }
 
-    fn init_switches(switch_count: usize) -> HashMap<usize, PacketSwitch> {
+    fn init_switches() -> HashMap<usize, PacketSwitch> {
         let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
 
-        for _ in 0..switch_count {
+        for _ in 0..num_switches() {
             let switch = PacketSwitch::new(HashMap::new());
             switches.insert(switch.id(), switch);
         }
