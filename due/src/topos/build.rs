@@ -7,8 +7,8 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::fs;
 
+use crate::set_num_switches;
 use crate::topos::topo::{Config, TopoCategory};
-use crate::{set_num_hosts, set_num_switches};
 
 use super::topo::{FatTreeConfig, TorusConfig};
 
@@ -48,7 +48,6 @@ pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
             let graph = UnGraph::<usize, ()>::from_edges(graph_config.edges);
             let hosts = graph_config.hosts;
 
-            set_num_hosts(hosts.len());
             set_num_switches(graph.node_count());
 
             (graph, hosts)
@@ -66,7 +65,6 @@ pub fn build_fattree(fattree_config: FatTreeConfig) -> (UnGraph<usize, ()>, Vec<
     let layer_switches_per_pod = k / 2;
     let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
 
-    set_num_hosts(num_layer_switches);
     set_num_switches(k.pow(2) * 5 / 4);
 
     let mut edges: Vec<(u32, u32)> = Vec::new();
@@ -106,7 +104,6 @@ pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>
     let node_per_dim = torus_config.n as u32;
     let total_node = node_per_dim.pow(dimension) as usize;
 
-    set_num_hosts(total_node);
     set_num_switches(total_node);
 
     info!(
@@ -163,7 +160,7 @@ pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>
             }
         }
         _ => {
-            panic!("Supports 1D, 2D, and 3D Torus topologies only.")
+            panic!("Only 1D, 2D, and 3D Torus topologies are supported.")
         }
     }
 

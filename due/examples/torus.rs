@@ -14,10 +14,10 @@ fn main() {
 
     let file_path = "configs/torus.toml";
 
-    let (torus_graph, torus_hosts) = build_graph(file_path);
-    info!("The Torus graph has been initialized: {:?}", torus_graph);
+    let (graph, hosts) = build_graph(file_path);
+    info!("The Torus graph has been initialized: {:?}", graph);
 
-    let flows = Flow::flows_from_config(file_path);
+    let flows = Flow::flows_from_config(file_path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());
 
     let collectives = Collective::collectives_from_config(file_path);
@@ -26,12 +26,6 @@ fn main() {
         collectives.len()
     );
 
-    let topology = Topology::new(
-        file_path,
-        torus_graph.clone(),
-        torus_hosts,
-        flows,
-        collectives,
-    );
-    topology.run(torus_graph);
+    let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
+    topology.run(graph);
 }

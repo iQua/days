@@ -14,13 +14,10 @@ fn main() {
 
     let file_path = "configs/fattree.toml";
 
-    let (fattree_graph, fattree_hosts) = build_graph(file_path);
-    info!(
-        "The fattree graph has been initialized: {:?}",
-        fattree_graph
-    );
+    let (graph, hosts) = build_graph(file_path);
+    info!("The FatTree graph has been initialized: {:?}", graph);
 
-    let flows = Flow::flows_from_config(file_path);
+    let flows = Flow::flows_from_config(file_path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());
 
     let collectives = Collective::collectives_from_config(file_path);
@@ -29,12 +26,6 @@ fn main() {
         collectives.len()
     );
 
-    let topology = Topology::new(
-        file_path,
-        fattree_graph.clone(),
-        fattree_hosts,
-        flows,
-        collectives,
-    );
-    topology.run(fattree_graph);
+    let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
+    topology.run(graph);
 }
