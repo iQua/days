@@ -2,44 +2,65 @@
 //! topologies based on the information given in a TOML configuration file.
 
 use core::panic;
-use log::info;
+use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 use std::fs;
 
-use crate::switches::SchedulingDiscipline;
+use crate::topos::topo::{Config, TopoCategory};
+
+use super::topo::{FatTreeConfig, TorusConfig};
 
 #[derive(Deserialize)]
 struct NetworkGraph {
+    hosts: Vec<usize>,
     edges: Vec<(u32, u32)>,
 }
 
 /// Builds a topology from a configuration file.
-pub fn build_graph(file_path: &str) -> UnGraph<usize, ()> {
+pub fn build_graph(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
     // reads the toml file
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-    // deserializes the content of the toml configuration file
-    let graph: NetworkGraph =
-        toml::from_str(&content).expect("Failed to deserialize the configuration");
+    let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-    UnGraph::<usize, ()>::from_edges(graph.edges)
+    match config.topology {
+        Some(topo_config) => match topo_config.category {
+            TopoCategory::FatTree => {
+                debug!("Initializing a Fattree graph.");
+                let fattree_config = topo_config
+                    .fat_tree
+                    .expect("The configuration of the FatTree topology is not valid");
+                build_fattree(fattree_config)
+            }
+            TopoCategory::Torus => {
+                debug!("Initializing a Torus graph.");
+                let torus_config = topo_config
+                    .torus
+                    .expect("The configuration of the Torus topology is not valid");
+                build_torus(torus_config)
+            }
+        },
+        None => {
+            // deserializes the content of the toml configuration file
+            let graph_config: NetworkGraph =
+                toml::from_str(&content).expect("Failed to deserialize the configuration of graph");
+
+            let graph = UnGraph::<usize, ()>::from_edges(graph_config.edges);
+
+            (graph, graph_config.hosts)
+        }
+    }
 }
 
 /// Builds a FatTree topology and its hosts.
-pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
-    // reads the configuration file
-    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+pub fn build_fattree(fattree_config: FatTreeConfig) -> (UnGraph<usize, ()>, Vec<usize>) {
+    let k = fattree_config.k;
+    info!("The k of fattree is {}.", k);
 
-    // deserializes the content of the configuration
-    let config: FatTreeConfig =
-        toml::from_str(&content).expect("Failed to deserialize the configuration");
-
-    info!("The k of fattree is {}.", config.k);
-
-    let num_layer_switches = config.k.pow(2) / 2;
-    let num_core_switches = config.k.pow(2) / 4;
-    let layer_switches_per_pod = config.k / 2;
+    let num_layer_switches = k.pow(2) / 2;
+    let num_core_switches = k.pow(2) / 4;
+    let layer_switches_per_pod = k / 2;
     let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
 
     let mut edges: Vec<(u32, u32)> = Vec::new();
@@ -74,16 +95,9 @@ pub fn build_fattree(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
 }
 
 /// Builds a Torus topology and its hosts.
-pub fn build_torus(file_path: &str) -> (UnGraph<usize, ()>, Vec<usize>) {
-    // reads the configuration file
-    let content = fs::read_to_string(file_path).expect("The configuration is not valid");
-
-    // deserializes the content of the configuration
-    let config: TorusConfig =
-        toml::from_str(&content).expect("Failed to deserialize the configuration");
-
-    let dimension = config.dim as u32;
-    let node_per_dim = config.n as u32;
+pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>) {
+    let dimension = torus_config.dim as u32;
+    let node_per_dim = torus_config.n as u32;
     let total_node = node_per_dim.pow(dimension) as usize;
 
     info!(

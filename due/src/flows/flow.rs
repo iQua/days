@@ -8,7 +8,6 @@ use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
-use crate::topos::build::{FatTreeConfig, TorusConfig};
 use crate::{next_flow_id, seed_from_config};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -111,7 +110,7 @@ impl Flow {
     }
 
     // Initializes flows from a configuration file.
-    pub fn flows_from_config(file_path: &str) -> Vec<Flow> {
+    pub fn flows_from_config(file_path: &str, switch_count: usize) -> Vec<Flow> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let config: FlowConfig =
@@ -141,23 +140,14 @@ impl Flow {
         }
 
         if let Some(flow_set_vec) = config.flow_set {
-            let num_switches: usize;
-            if let Ok(_config) = toml::from_str::<FatTreeConfig>(&content) {
-                num_switches = _config.k.pow(2) / 2;
-            } else if let Ok(_config) = toml::from_str::<TorusConfig>(&content) {
-                num_switches = _config.n.pow(_config.dim as u32);
-            } else {
-                panic!("Failed to deserialize the configuration");
-            }
-
             let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
 
             for flow_set in flow_set_vec {
                 for _ in 0..flow_set.flow_count {
-                    let start = rng.gen_range(0..num_switches);
+                    let start = rng.gen_range(0..switch_count);
                     let end = {
-                        let mut range = (0..start).chain((start + 1)..num_switches);
-                        range.nth(rng.gen_range(0..num_switches - 1)).unwrap()
+                        let mut range = (0..start).chain((start + 1)..switch_count);
+                        range.nth(rng.gen_range(0..switch_count - 1)).unwrap()
                     };
 
                     let flow_id = next_flow_id();

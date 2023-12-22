@@ -1,12 +1,18 @@
 # This is a configuration file for the Torus topology.
 
 seed = 1000
-dim = 2
-n = 3
+
+[switch_config]
 port_rate = 8000
 capacity = 100
 weights = [1]
 discipline = "FIFO"
+
+[topology]
+category = "TORUS"
+[topology.torus]
+    dim = 2
+    n = 3
 
 [[flow_set]]
 flow_type = "PacketDistribution"

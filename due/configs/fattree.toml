@@ -9,9 +9,10 @@ weights = [1]
 discipline = "FIFO"
 
 [topology]
-    category = "FatTree"
-    [fat_tree]
-        k = 4
+category = "FATTREE"
+
+[topology.fat_tree]
+k = 4
 
 [[flow_set]]
 flow_type = "PacketDistribution"

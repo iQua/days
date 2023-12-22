@@ -29,26 +29,20 @@ use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::{next_flow_id, set_num_switches};
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename = "UPPERCASE")]
-pub enum TopoCategory {
-    FatTree,
-    Torus,
-}
-
 #[derive(Deserialize)]
-struct TomlSwitch {
+pub struct SwitchConfig {
     port_rate: f64,
     capacity: usize,
     weights: Vec<usize>,
     discipline: SchedulingDiscipline,
 }
 
-#[derive(Deserialize)]
-pub struct SwitchConfig {
-    switch: Vec<TomlSwitch>,
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TopoCategory {
+    FatTree,
+    Torus,
 }
-
 #[derive(Deserialize)]
 pub struct FatTreeConfig {
     pub k: usize,
@@ -62,7 +56,7 @@ pub struct TorusConfig {
 
 #[derive(Deserialize)]
 pub struct TopoConfig {
-    category: TopoCategory,
+    pub category: TopoCategory,
     pub fat_tree: Option<FatTreeConfig>,
     pub torus: Option<TorusConfig>,
 }
@@ -70,7 +64,7 @@ pub struct TopoConfig {
 #[derive(Deserialize)]
 pub struct Config {
     pub switch_config: SwitchConfig,
-    pub topology: TopoConfig,
+    pub topology: Option<TopoConfig>,
 }
 
 #[derive(Default)]
@@ -133,47 +127,22 @@ impl Topology {
 
         // reads the configuration
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
-        if let Ok(config) = toml::from_str::<Config>(&content) {
-            let switches = Topology::init_fattree_switches(&config);
 
-            Topology {
-                sim_init: SimInit::new(),
-                graph: graph.clone(),
-                hosts,
-                switches,
-                flows,
-                collectives,
-                switch_mailboxes: HashMap::new(),
-                config: Config::FatTreeConfig(config),
-            }
-        } else if let Ok(config) = toml::from_str::<TorusConfig>(&content) {
-            let switches = Topology::init_torus_switches(&config);
+        let config: Config =
+            toml::from_str(&content).expect("Failed to deserialize the configuration");
 
-            Topology {
-                sim_init: SimInit::new(),
-                graph: graph.clone(),
-                hosts,
-                switches,
-                flows,
-                collectives,
-                switch_mailboxes: HashMap::new(),
-                config: Config::TorusConfig(config),
-            }
-        } else {
-            let config: SwitchConfig =
-                toml::from_str(&content).expect("Failed to deserialize the configuration");
-            let switches = Topology::init_switches(&config);
+        let switches = Topology::init_switches(graph.node_count());
 
-            Topology {
-                sim_init: SimInit::new(),
-                graph: graph.clone(),
-                hosts,
-                switches,
-                flows,
-                collectives,
-                switch_mailboxes: HashMap::new(),
-                config: Config::SwitchConfig(config),
-            }
+        Topology {
+            sim_init: SimInit::new(),
+            graph: graph.clone(),
+            hosts,
+            switches,
+            flows,
+            collectives,
+            switch_mailboxes: HashMap::new(),
+            switch_config: config.switch_config,
+            topo_config: config.topology,
         }
     }
 
@@ -185,34 +154,10 @@ impl Topology {
         }
     }
 
-    fn init_switches(config: &SwitchConfig) -> HashMap<usize, PacketSwitch> {
+    fn init_switches(switch_count: usize) -> HashMap<usize, PacketSwitch> {
         let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
 
-        for _ in config.switch.iter() {
-            let switch = PacketSwitch::new(HashMap::new());
-            switches.insert(switch.id(), switch);
-        }
-
-        switches
-    }
-
-    fn init_fattree_switches(config: &FatTreeConfig) -> HashMap<usize, PacketSwitch> {
-        let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
-        let num_switches = config.k.pow(2) * 5 / 4;
-
-        for _ in 0..num_switches {
-            let switch = PacketSwitch::new(HashMap::new());
-            switches.insert(switch.id(), switch);
-        }
-
-        switches
-    }
-
-    fn init_torus_switches(config: &TorusConfig) -> HashMap<usize, PacketSwitch> {
-        let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
-        let num_switches = config.n.pow(config.dim as u32);
-
-        for _ in 0..num_switches {
+        for _ in 0..switch_count {
             let switch = PacketSwitch::new(HashMap::new());
             switches.insert(switch.id(), switch);
         }
@@ -316,52 +261,18 @@ impl Topology {
 
     /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
-        let discipline = match &self.config {
-            Config::SwitchConfig(config) => config.switch[upstream_id].discipline,
-            Config::FatTreeConfig(config) => config.discipline,
-            Config::TorusConfig(config) => config.discipline,
-        };
-
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
-
-        match discipline {
+        let weight_len = self.switch_config.weights.len();
+        match self.switch_config.discipline {
             SchedulingDiscipline::DRR => {
-                let mut drr_server = match &self.config {
-                    Config::SwitchConfig(config) => {
-                        let weight_len = config.switch[upstream_id].weights.len();
-                        DRRServer::new(
-                            config.switch[upstream_id].port_rate,
-                            config.switch[upstream_id].capacity,
-                            CapacityUnit::Packets,
-                            Arc::new(move |flow_id| flow_id % weight_len),
-                            DropStrategy::TailDrop,
-                            config.switch[upstream_id].weights.clone(),
-                        )
-                    }
-                    Config::FatTreeConfig(config) => {
-                        let weight_len = config.weights.len();
-                        DRRServer::new(
-                            config.port_rate,
-                            config.capacity,
-                            CapacityUnit::Packets,
-                            Arc::new(move |flow_id| flow_id % weight_len),
-                            DropStrategy::TailDrop,
-                            config.weights.clone(),
-                        )
-                    }
-                    Config::TorusConfig(config) => {
-                        let weight_len = config.weights.len();
-                        DRRServer::new(
-                            config.port_rate,
-                            config.capacity,
-                            CapacityUnit::Packets,
-                            Arc::new(move |flow_id| flow_id % weight_len),
-                            DropStrategy::TailDrop,
-                            config.weights.clone(),
-                        )
-                    }
-                };
-
+                let mut drr_server = DRRServer::new(
+                    self.switch_config.port_rate,
+                    self.switch_config.capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(move |flow_id| flow_id % weight_len),
+                    DropStrategy::TailDrop,
+                    self.switch_config.weights.clone(),
+                );
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::new();
                 output.connect(DRRServer::packet_received, &drr_mbox);
@@ -376,27 +287,12 @@ impl Topology {
             }
 
             SchedulingDiscipline::FIFO => {
-                let mut port = match &self.config {
-                    Config::SwitchConfig(config) => Port::new(
-                        config.switch[upstream_id].port_rate,
-                        config.switch[upstream_id].capacity,
-                        CapacityUnit::Packets,
-                        DropStrategy::TailDrop,
-                    ),
-                    Config::FatTreeConfig(config) => Port::new(
-                        config.port_rate,
-                        config.capacity,
-                        CapacityUnit::Packets,
-                        DropStrategy::TailDrop,
-                    ),
-                    Config::TorusConfig(config) => Port::new(
-                        config.port_rate,
-                        config.capacity,
-                        CapacityUnit::Packets,
-                        DropStrategy::TailDrop,
-                    ),
-                };
-
+                let mut port = Port::new(
+                    self.switch_config.port_rate,
+                    self.switch_config.capacity,
+                    CapacityUnit::Packets,
+                    DropStrategy::TailDrop,
+                );
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::new();
                 output.connect(Port::packet_received, &port_mbox);
@@ -410,41 +306,14 @@ impl Topology {
             }
 
             SchedulingDiscipline::WFQ => {
-                let mut wfq_server = match &self.config {
-                    Config::SwitchConfig(config) => {
-                        let weight_len = config.switch[upstream_id].weights.len();
-                        WFQServer::new(
-                            config.switch[upstream_id].port_rate,
-                            config.switch[upstream_id].capacity,
-                            CapacityUnit::Packets,
-                            Arc::new(move |flow_id| flow_id % weight_len),
-                            DropStrategy::TailDrop,
-                            config.switch[upstream_id].weights.clone(),
-                        )
-                    }
-                    Config::FatTreeConfig(config) => {
-                        let weight_len = config.weights.len();
-                        WFQServer::new(
-                            config.port_rate,
-                            config.capacity,
-                            CapacityUnit::Packets,
-                            Arc::new(move |flow_id| flow_id % weight_len),
-                            DropStrategy::TailDrop,
-                            config.weights.clone(),
-                        )
-                    }
-                    Config::TorusConfig(config) => {
-                        let weight_len = config.weights.len();
-                        WFQServer::new(
-                            config.port_rate,
-                            config.capacity,
-                            CapacityUnit::Packets,
-                            Arc::new(move |flow_id| flow_id % weight_len),
-                            DropStrategy::TailDrop,
-                            config.weights.clone(),
-                        )
-                    }
-                };
+                let mut wfq_server = WFQServer::new(
+                    self.switch_config.port_rate,
+                    self.switch_config.capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(move |flow_id| flow_id % weight_len),
+                    DropStrategy::TailDrop,
+                    self.switch_config.weights.clone(),
+                );
 
                 let mut output = Output::default();
                 let wfq_mbox: Mailbox<WFQServer> = Mailbox::new();

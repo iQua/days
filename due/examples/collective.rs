@@ -14,8 +14,7 @@ fn main() {
     let file_path = "configs/collective.toml";
     let _ = seed_from_config(&file_path);
 
-    let graph = build_graph(file_path);
-    let hosts = vec![0, 1, 2, 3, 4, 5];
+    let (graph, hosts) = build_graph(file_path);
     info!("The network graph has been initialized: {:?}", graph);
 
     let collectives = Collective::collectives_from_config(file_path);
