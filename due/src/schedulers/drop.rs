@@ -25,7 +25,7 @@ pub trait PacketDrop {
     fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool;
 }
 
-// TailDrop is a packet drop strategy that drops packets when the buffer is full.
+/// TailDrop is a packet drop strategy that drops packets when the buffer is full.
 pub struct TailDrop {
     capacity: usize, // 0 for unlimited
     capacity_unit: CapacityUnit,
@@ -49,6 +49,7 @@ impl PacketDrop for TailDrop {
     }
 }
 
+/// Random Early Detection.
 pub struct RED {
     capacity: usize, // 0 for unlimited
     capacity_unit: CapacityUnit,
@@ -59,6 +60,7 @@ pub struct RED {
     avg_queue_length: usize,
     rng: SmallRng,
 }
+
 impl RED {
     pub fn new(
         capacity: usize,

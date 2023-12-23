@@ -12,7 +12,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 
 pub struct TaggedPacket {
     pub packet: Packet,
@@ -103,16 +103,20 @@ impl WFQServer {
             finish_times.insert(class_id, 0.0);
         }
 
-        let packet_drop = match drop_strategy {
-            DropStrategy::TailDrop => TailDrop::new(capacity, capacity_unit),
-            _ => unimplemented!(),
+        let scheduler_id = next_scheduler_id();
+
+        let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
+            DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
+            DropStrategy::RED => {
+                Box::new(RED::new(capacity, capacity_unit, 2, 6, 0.8, scheduler_id))
+            }
         };
 
         WFQServer {
-            scheduler_id: next_scheduler_id(),
+            scheduler_id,
             rate,
             flow_classes,
-            drop_strategy: Box::new(packet_drop),
+            drop_strategy: packet_drop,
             weights,
             finish_times,
             flow_queue_count: HashMap::new(),
