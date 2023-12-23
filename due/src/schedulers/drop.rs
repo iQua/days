@@ -1,5 +1,6 @@
 //! Packet drop strategies for the scheduler. Currently, only tail drop
 //! (dropping packets at the tail of the queue) has been implemented.
+use std::cmp;
 
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
@@ -127,7 +128,10 @@ impl PacketDrop for RED {
         let threshold_underflow = match self.capacity_unit {
             CapacityUnit::Bytes => {
                 if byte_size + packet_size >= self.min_threshold {
-                    let probability = (self.avg_queue_length - self.min_threshold) as f64
+                    let probability = cmp::max(
+                        0,
+                        self.avg_queue_length as isize - self.min_threshold as isize,
+                    ) as f64
                         / (self.max_threshold - self.min_threshold) as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
@@ -139,7 +143,10 @@ impl PacketDrop for RED {
             }
             CapacityUnit::Packets => {
                 if queue_length + 1 >= self.min_threshold {
-                    let probability = (self.avg_queue_length - self.min_threshold) as f64
+                    let probability = cmp::max(
+                        0,
+                        self.avg_queue_length as isize - self.min_threshold as isize,
+                    ) as f64
                         / (self.max_threshold - self.min_threshold) as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
