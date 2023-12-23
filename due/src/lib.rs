@@ -15,7 +15,7 @@ pub struct SeedConfig {
 
 static SEED: AtomicUsize = AtomicUsize::new(0);
 static NUM_SWITCHES: AtomicUsize = AtomicUsize::new(0);
-static ELEMENT_ID: AtomicUsize = AtomicUsize::new(0);
+static SWITCH_ID: AtomicUsize = AtomicUsize::new(0);
 static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
 static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
@@ -46,8 +46,8 @@ pub fn set_num_switches(num_switches: usize) {
     ENDPOINT_ID.store(num_switches, Ordering::Relaxed);
 }
 
-pub fn next_element_id() -> usize {
-    ELEMENT_ID.fetch_add(1, Ordering::Relaxed)
+pub fn next_switch_id() -> usize {
+    SWITCH_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn next_endpoint_id() -> usize {
