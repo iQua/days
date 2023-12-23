@@ -27,7 +27,7 @@ use crate::schedulers::port::Port;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::{next_flow_id, num_switches};
+use crate::{next_flow_id, num_switches, set_num_switches};
 
 #[derive(Deserialize)]
 pub struct SwitchConfig {
@@ -127,6 +127,7 @@ impl Topology {
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
 
+        set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
         Topology {
