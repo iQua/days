@@ -1,6 +1,13 @@
 //! Packet drop strategies for the scheduler. Currently, only tail drop
 //! (dropping packets at the tail of the queue) has been implemented.
 
+use rand::distributions::Distribution;
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
+use statrs::distribution::Uniform;
+
+use crate::get_seed;
+
 /// Capacity unit for the packet drop strategy.
 pub enum CapacityUnit {
     Bytes,
@@ -39,5 +46,107 @@ impl PacketDrop for TailDrop {
             CapacityUnit::Bytes => self.capacity > 0 && byte_size + packet_size > self.capacity,
             CapacityUnit::Packets => self.capacity > 0 && queue_length + 1 > self.capacity,
         }
+    }
+}
+
+pub struct RED {
+    capacity: usize, // 0 for unlimited
+    capacity_unit: CapacityUnit,
+    min_threshold: usize,
+    max_threshold: usize,
+    max_probability: f64,
+    weight_factor: u32,
+    avg_queue_length: usize,
+    rng: SmallRng,
+}
+impl RED {
+    pub fn new(
+        capacity: usize,
+        capacity_unit: CapacityUnit,
+        min_threshold: usize,
+        max_threshold: usize,
+        max_probability: f64,
+        seed: usize,
+    ) -> RED {
+        let global_seed = get_seed();
+        let rng = match global_seed {
+            1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
+            _ => SmallRng::from_entropy(),
+        };
+
+        RED {
+            capacity,
+            capacity_unit,
+            min_threshold,
+            max_threshold,
+            max_probability,
+            weight_factor: 9,
+            avg_queue_length: 0,
+            rng,
+        }
+    }
+}
+
+impl PacketDrop for RED {
+    fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool {
+        let alpha = 1 / usize::pow(2, self.weight_factor);
+        self.avg_queue_length = self.avg_queue_length * (1 - alpha) + queue_length * alpha;
+
+        // drops the packet if the capacity of the queue is exceeded
+        let queue_overflow = match self.capacity_unit {
+            CapacityUnit::Bytes => self.capacity > 0 && byte_size + packet_size > self.capacity,
+            CapacityUnit::Packets => self.capacity > 0 && queue_length + 1 > self.capacity,
+        };
+
+        // drops the packet if the average queue length exceeds the max_threshold
+        let threshold_overflow = match self.capacity_unit {
+            CapacityUnit::Bytes => {
+                if byte_size + packet_size > self.max_threshold {
+                    let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+
+                    drop_probability <= self.max_probability
+                } else {
+                    false
+                }
+            }
+            CapacityUnit::Packets => {
+                if queue_length + 1 > self.max_threshold {
+                    let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+
+                    drop_probability <= self.max_probability
+                } else {
+                    false
+                }
+            }
+        };
+
+        let threshold_underflow = match self.capacity_unit {
+            CapacityUnit::Bytes => {
+                if byte_size + packet_size >= self.min_threshold {
+                    let probability = (self.avg_queue_length - self.min_threshold) as f64
+                        / (self.max_threshold - self.min_threshold) as f64
+                        * self.max_probability;
+                    let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+
+                    drop_probability <= probability
+                } else {
+                    false
+                }
+            }
+            CapacityUnit::Packets => {
+                if queue_length + 1 >= self.min_threshold {
+                    let probability = (self.avg_queue_length - self.min_threshold) as f64
+                        / (self.max_threshold - self.min_threshold) as f64
+                        * self.max_probability;
+                    let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+
+                    drop_probability <= probability
+                } else {
+                    false
+                }
+            }
+        };
+
+        queue_overflow || threshold_overflow || threshold_underflow
     }
 }
