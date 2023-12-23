@@ -8,18 +8,18 @@ use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
-use crate::next_element_id;
+use crate::next_switch_id;
 
 pub struct PacketSwitch {
-    element_id: usize,
+    switch_id: usize,
     /// the number of packets received by the switch
     packets_received: usize,
     /// the flow information base (FIB) of the switch
-    /// flow_id -> element_id
+    /// flow_id -> switch_id
     fib: HashMap<usize, usize>,
 
     /// senders for sending inbound packets to outbound ports
-    /// element_id -> outputs to downstream schedulers or endpoints
+    /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
 }
 
@@ -28,14 +28,14 @@ impl PacketSwitch {
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
-        for element_id in fib.values() {
-            if !outputs.contains_key(element_id) {
-                outputs.insert(*element_id, Output::default());
+        for switch_id in fib.values() {
+            if !outputs.contains_key(switch_id) {
+                outputs.insert(*switch_id, Output::default());
             }
         }
 
         PacketSwitch {
-            element_id: next_element_id(),
+            switch_id: next_switch_id(),
             fib,
             packets_received: 0,
             outputs,
@@ -43,7 +43,7 @@ impl PacketSwitch {
     }
 
     pub fn id(&self) -> usize {
-        self.element_id
+        self.switch_id
     }
 
     pub fn set_fib(&mut self, flow_id: usize, next_id: usize) {
@@ -59,7 +59,7 @@ impl PacketSwitch {
         debug!(
             "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
                 {} packets received.",
-            self.element_id,
+            self.switch_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
@@ -68,9 +68,9 @@ impl PacketSwitch {
         );
 
         // forwards packets to their corresponding downstream elements
-        let element_id = self.fib[&packet.flow_id];
+        let switch_id = self.fib[&packet.flow_id];
 
-        if let Some(output) = self.outputs.get_mut(&element_id) {
+        if let Some(output) = self.outputs.get_mut(&switch_id) {
             output.send(packet).await;
         }
     }

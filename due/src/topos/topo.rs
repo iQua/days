@@ -164,10 +164,6 @@ impl Topology {
     /// Connects a hash map of packet switches according to edges in a network
     /// topology.
     fn connect(mut self, graph: UnGraph<usize, ()>) -> Self {
-        debug!(
-            "Connecting {} switches according to the network topology.",
-            self.switches.len()
-        );
         for node_id in graph.node_indices() {
             for neighbor in graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
