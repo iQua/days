@@ -1,3 +1,5 @@
+# An example configuration file that shows a basic setup.
+
 seed = 1000
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]

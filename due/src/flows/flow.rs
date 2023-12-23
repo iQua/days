@@ -3,6 +3,7 @@ use std::fs;
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Deserialize;
 
@@ -47,9 +48,11 @@ pub struct Flow {
     pub sink_host: usize,
     /// the id of PacketSink
     pub sink_id: usize,
+    /// traffic characteristics of the flow
     pub traffic: TrafficCharacteristics,
     /// random seed for the packet source
     pub seed: usize,
+    /// routing protocol
     pub routing: RandomSimplePath,
 }
 
@@ -112,12 +115,12 @@ impl Flow {
     pub fn flows_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Flow> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
-        let config: FlowConfig =
+        let flow_config: FlowConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
 
         let mut flows = Vec::new();
 
-        if let Some(flows_vec) = config.flow {
+        if let Some(flows_vec) = flow_config.flow {
             for flow in flows_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
                 assert!(graph.edge_references().len() == 1);
@@ -138,12 +141,13 @@ impl Flow {
             }
         }
 
-        if let Some(flow_set_vec) = config.flow_set {
+        if let Some(flow_set_vec) = flow_config.flow_set {
             let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
 
             for flow_set in flow_set_vec {
                 for _ in 0..flow_set.flow_count {
-                    let host_pair = rand::seq::index::sample(&mut rng, hosts.len(), 2).into_vec();
+                    let host_pair: Vec<usize> =
+                        hosts.choose_multiple(&mut rng, 2).cloned().collect();
 
                     let flow_id = next_flow_id();
                     flows.push(Flow::new(

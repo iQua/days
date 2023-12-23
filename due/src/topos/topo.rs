@@ -42,6 +42,7 @@ pub enum TopoCategory {
     FatTree,
     Torus,
 }
+
 #[derive(Deserialize)]
 pub struct FatTreeConfig {
     pub k: usize,

@@ -8,14 +8,12 @@ use serde::Deserialize;
 use std::fs;
 
 use crate::set_num_switches;
-use crate::topos::topo::{Config, TopoCategory};
-
-use super::topo::{FatTreeConfig, TorusConfig};
+use crate::topos::topo::{Config, FatTreeConfig, TopoCategory, TorusConfig};
 
 #[derive(Deserialize)]
 struct NetworkGraph {
-    hosts: Vec<usize>,
     edges: Vec<(u32, u32)>,
+    hosts: Vec<usize>,
 }
 
 /// Builds a topology from a configuration file.
@@ -102,13 +100,13 @@ pub fn build_fattree(fattree_config: FatTreeConfig) -> (UnGraph<usize, ()>, Vec<
 pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>) {
     let dimension = torus_config.dim as u32;
     let node_per_dim = torus_config.n as u32;
-    let total_node = node_per_dim.pow(dimension) as usize;
+    let total_nodes = node_per_dim.pow(dimension) as usize;
 
-    set_num_switches(total_node);
+    set_num_switches(total_nodes);
 
     info!(
         "The total number of nodes in a {}D Torus topology is {}.",
-        dimension, total_node
+        dimension, total_nodes
     );
 
     let mut edges: Vec<(u32, u32)> = Vec::new();
@@ -167,8 +165,8 @@ pub fn build_torus(torus_config: TorusConfig) -> (UnGraph<usize, ()>, Vec<usize>
     // initializes the graph from edges
     let graph: UnGraph<usize, ()> = UnGraph::<usize, ()>::from_edges(edges);
 
-    // distinguishes all hosts
-    let hosts: Vec<usize> = (0..total_node).collect();
+    // all the switches in a Torus topology are hosts
+    let hosts: Vec<usize> = (0..total_nodes).collect();
 
     (graph, hosts)
 }

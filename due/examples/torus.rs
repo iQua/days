@@ -26,6 +26,9 @@ fn main() {
         collectives.len()
     );
 
+    // initializes the topology
     let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
+
+    // runs the topology
     topology.run(graph);
 }
