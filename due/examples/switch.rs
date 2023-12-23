@@ -92,7 +92,7 @@ fn main() {
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
 
-    // connects to the packet sink with an element id of 2
+    // connects to the packet sink with an switch id of 2
     let mut sim = SimInit::new()
         .add_model(source_1, source_1_mbox)
         .add_model(source_2, source_2_mbox)

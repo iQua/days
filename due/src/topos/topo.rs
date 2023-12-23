@@ -100,7 +100,7 @@ pub struct Topology {
     sim_init: SimInit,
     /// Undirected graph of the topology
     graph: UnGraph<usize, ()>,
-    /// A hash map of element ids that connects to endpoints
+    /// A hash map of switch ids that connects to endpoints
     hosts: Vec<usize>,
     /// A hash map of packet switches and their mailboxes
     switches: HashMap<usize, PacketSwitch>,

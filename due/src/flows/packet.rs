@@ -2,10 +2,9 @@
 
 #[derive(Debug, Clone)]
 pub struct Packet {
-    /// Packets in ns.rs are typically created by packet generators, and runs
-    /// through a sequence of network elements such as traffic shapers,
-    /// packet-forwarding switches, or splitters. It may be entered into a queue
-    /// at an output port on each of these network elements.
+    /// Packets in Due are typically created by packet generators, and runs
+    /// through a sequence of packet-forwarding switches, or splitters. It may
+    /// be entered into a queue at an output port on each of these switches.
 
     /// Key fields include: creation time, size, packet id, flow_id, source,
     /// and destination. We do not model upper layer protocols, i.e., packets do
