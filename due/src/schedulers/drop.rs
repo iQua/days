@@ -4,6 +4,7 @@
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use serde::Deserialize;
 use statrs::distribution::Uniform;
 
 use crate::get_seed;
@@ -15,6 +16,7 @@ pub enum CapacityUnit {
 }
 
 /// The packet drop strategy.
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub enum DropStrategy {
     TailDrop,
     RED,
