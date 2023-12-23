@@ -98,7 +98,7 @@ impl Flow {
                         1.,
                         10.,
                         DistributionInfo::Exp { lambda: 1. },
-                        DistributionInfo::Uniform {
+                        DistributionInfo::DiscreteUniform {
                             low: 1000,
                             high: 1000,
                         },
