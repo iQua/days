@@ -37,7 +37,7 @@ pub struct DRRServer {
     packets_dropped: usize,
     packets_waiting: usize,
 
-    /// the number of bytes currently queued in each flow class
+    /// the number of bytes of classes, which are consecutive and start from 0
     byte_sizes: Vec<usize>,
 
     /// FIFO queues of classes, which are consecutive and start from 0
@@ -72,7 +72,8 @@ impl DRRServer {
         for weight in weights.iter() {
             let quantum_value = min_quantum * weight / min_weight;
             quantum.push(quantum_value);
-            deficit.push(quantum_value);
+            deficit.push(0);
+            byte_sizes.push(0);
             queues.push(VecDeque::new());
         }
 
