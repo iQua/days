@@ -125,9 +125,9 @@ impl PacketDrop for RED {
             }
         };
 
-        let threshold_underflow = match self.capacity_unit {
+        let threshold_normal = match self.capacity_unit {
             CapacityUnit::Bytes => {
-                if byte_size + packet_size >= self.min_threshold {
+                if byte_size + packet_size > self.min_threshold {
                     let probability = cmp::max(
                         0,
                         self.avg_queue_length as isize - self.min_threshold as isize,
@@ -142,7 +142,7 @@ impl PacketDrop for RED {
                 }
             }
             CapacityUnit::Packets => {
-                if queue_length + 1 >= self.min_threshold {
+                if queue_length + 1 > self.min_threshold {
                     let probability = cmp::max(
                         0,
                         self.avg_queue_length as isize - self.min_threshold as isize,
@@ -158,6 +158,6 @@ impl PacketDrop for RED {
             }
         };
 
-        queue_overflow || threshold_overflow || threshold_underflow
+        queue_overflow || threshold_overflow || threshold_normal
     }
 }
