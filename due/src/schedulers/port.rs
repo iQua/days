@@ -11,7 +11,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 
 pub struct Port {
     scheduler_id: usize,
@@ -40,15 +40,19 @@ impl Port {
         capacity_unit: CapacityUnit,
         drop_strategy: DropStrategy,
     ) -> Port {
-        let packet_drop = match drop_strategy {
-            DropStrategy::TailDrop => TailDrop::new(capacity, capacity_unit),
-            _ => unimplemented!(),
+        let scheduler_id = next_scheduler_id();
+
+        let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
+            DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
+            DropStrategy::RED => {
+                Box::new(RED::new(capacity, capacity_unit, 2, 6, 0.8, scheduler_id))
+            }
         };
 
         Port {
-            scheduler_id: next_scheduler_id(),
+            scheduler_id,
             rate,
-            drop_strategy: Box::new(packet_drop),
+            drop_strategy: packet_drop,
             packets_received: 0,
             packets_dropped: 0,
             bytes_in_queue: 0,
