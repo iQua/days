@@ -245,6 +245,11 @@ impl DRRServer {
                         self.queues[self.current_queue].len(),
                     );
 
+                    debug!(
+                        "DRRServer {} deficit counter changed to: {:?}.",
+                        self.scheduler_id, self.deficit
+                    );
+
                     return;
                 } else {
                     self.next_queue();
