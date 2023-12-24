@@ -1,6 +1,6 @@
 //! Implements a Deficit Round Robin (DRR) scheduler.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,8 +37,8 @@ pub struct DRRServer {
     packets_dropped: usize,
     packets_waiting: usize,
 
-    /// the number of bytes of classes, which are consecutive and start from 0
-    byte_sizes: Vec<usize>,
+    /// the number of bytes currently queued in each flow class
+    byte_sizes: HashMap<usize, usize>,
 
     /// FIFO queues of classes, which are consecutive and start from 0
     queues: Vec<VecDeque<Packet>>,
@@ -64,16 +64,14 @@ impl DRRServer {
         let min_quantum = 1500;
         let mut deficit = Vec::new();
         let mut quantum = Vec::new();
-        let mut byte_sizes = Vec::new();
         let mut queues = Vec::new();
 
         let min_weight = weights.iter().min().unwrap();
 
-        for (class_id, _) in weights.iter().enumerate() {
-            let quantum_value = min_quantum * weights[class_id] / min_weight;
+        for weight in weights.iter() {
+            let quantum_value = min_quantum * weight / min_weight;
             quantum.push(quantum_value);
             deficit.push(quantum_value);
-            byte_sizes.push(0);
             queues.push(VecDeque::new());
         }
 
@@ -92,7 +90,7 @@ impl DRRServer {
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
-            byte_sizes,
+            byte_sizes: HashMap::new(),
             queues,
             current_queue: 0,
             busy_until: 0.0,
@@ -111,7 +109,7 @@ impl DRRServer {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
-            self.byte_sizes.iter().sum(),
+            self.byte_sizes.values().sum(),
             self.queues.iter().map(|q| q.len()).sum(),
         );
 
@@ -134,8 +132,11 @@ impl DRRServer {
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
+        // pushes the packet to the back of its class queue
         self.queues[class_id].push_back(packet.clone());
-        self.byte_sizes[class_id] += packet.size;
+
+        let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+        *byte_size += packet.size;
 
         debug!(
             "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -148,6 +149,11 @@ impl DRRServer {
             self.packets_received,
             self.queues[class_id].len(),
             class_id
+        );
+
+        debug!(
+            "DRRServer {} deficit counter: {:?}.",
+            self.scheduler_id, self.deficit
         );
 
         if arrival_time > self.busy_until {
@@ -197,7 +203,8 @@ impl DRRServer {
                 if self.deficit[self.current_queue] > 0
                     && packet.size <= self.deficit[self.current_queue]
                 {
-                    self.byte_sizes[self.current_queue] -= packet.size;
+                    let byte_size = self.byte_sizes.entry(self.current_queue).or_insert(0);
+                    *byte_size -= packet.size;
                     let mut outbound = self.queues[self.current_queue].pop_front().unwrap();
                     outbound.departure_update(now);
 
