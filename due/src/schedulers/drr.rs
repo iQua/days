@@ -69,10 +69,10 @@ impl DRRServer {
 
         let min_weight = weights.iter().min().unwrap();
 
-        for (class_id, _) in weights.iter().enumerate() {
-            let quantum_value = min_quantum * weights[class_id] / min_weight;
+        for weight in weights.iter() {
+            let quantum_value = min_quantum * weight / min_weight;
             quantum.push(quantum_value);
-            deficit.push(quantum_value);
+            deficit.push(0);
             byte_sizes.push(0);
             queues.push(VecDeque::new());
         }
@@ -138,20 +138,28 @@ impl DRRServer {
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
+        // pushes the packet to the back of its class queue
         self.queues[class_id].push_back(packet.clone());
+
         self.byte_sizes[class_id] += packet.size;
 
         debug!(
-            "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "DRRServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
             {} packets received, {} packet(s) in flow class {}.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
+            class_id,
             arrival_time,
             self.packets_received,
             self.queues[class_id].len(),
             class_id
+        );
+
+        debug!(
+            "DRRServer {} deficit counter: {:?}.",
+            self.scheduler_id, self.deficit
         );
 
         if arrival_time > self.busy_until {
@@ -231,6 +239,11 @@ impl DRRServer {
                         packet.flow_id,
                         now + timeout,
                         self.queues[self.current_queue].len(),
+                    );
+
+                    debug!(
+                        "DRRServer {} deficit counter changed to: {:?}.",
+                        self.scheduler_id, self.deficit
                     );
 
                     return;

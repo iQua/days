@@ -9,7 +9,7 @@ use log::{debug, info};
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
-use statrs::distribution::{DiscreteUniform, Exp};
+use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -96,20 +96,26 @@ impl PacketSource {
 
     fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
         let interval = match self.traffic.arr_dist {
-            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
-            DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
+            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
                 .sample(&mut self.rng),
+            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
+            DistributionInfo::Uniform { low, high } => {
+                Uniform::new(low, high).unwrap().sample(&mut self.rng)
+            }
         };
 
         let packet_size = match self.traffic.pkt_size_dist {
-            DistributionInfo::Exp { lambda } => {
-                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
-            }
-            DistributionInfo::Uniform { low, high } => DiscreteUniform::new(low, high)
+            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
                 .sample(&mut self.rng)
                 as usize,
+            DistributionInfo::Exp { lambda } => {
+                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
+            }
+            DistributionInfo::Uniform { low, high } => {
+                Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
+            }
         };
 
         let packet = Packet::new(packet_size, self.packets_sent, self.flow_id(), now);

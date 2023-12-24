@@ -10,8 +10,9 @@ pub mod source;
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
 pub enum DistributionInfo {
+    DiscreteUniform { low: i64, high: i64 },
     Exp { lambda: f64 },
-    Uniform { low: i64, high: i64 },
+    Uniform { low: f64, high: f64 },
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]

@@ -24,8 +24,8 @@ fn main() {
         TrafficCharacteristics::new(
             2.5,
             10.0,
-            DistributionInfo::Uniform { low: 2, high: 2 },
-            DistributionInfo::Uniform {
+            DistributionInfo::DiscreteUniform { low: 2, high: 2 },
+            DistributionInfo::DiscreteUniform {
                 low: 2000,
                 high: 2000,
             },
@@ -38,8 +38,8 @@ fn main() {
         TrafficCharacteristics::new(
             2.0,
             10.0,
-            DistributionInfo::Uniform { low: 1, high: 1 },
-            DistributionInfo::Uniform {
+            DistributionInfo::DiscreteUniform { low: 1, high: 1 },
+            DistributionInfo::DiscreteUniform {
                 low: 1000,
                 high: 1000,
             },
