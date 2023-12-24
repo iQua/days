@@ -14,6 +14,7 @@ port_rate = 8000
 capacity = 100
 weights = [1]
 discipline = "FIFO"
+drop = "RED"
 
 [[flow_set]]
 flow_type = "PacketDistribution"

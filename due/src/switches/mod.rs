@@ -1,6 +1,5 @@
 pub mod switch;
 
-use serde;
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Deserialize)]

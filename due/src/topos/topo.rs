@@ -35,6 +35,7 @@ pub struct SwitchConfig {
     capacity: usize,
     weights: Vec<usize>,
     discipline: SchedulingDiscipline,
+    drop: DropStrategy,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -262,7 +263,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weight_len),
-                    DropStrategy::TailDrop,
+                    self.switch_config.drop,
                     self.switch_config.weights.clone(),
                 );
                 let mut output = Output::default();
@@ -283,7 +284,7 @@ impl Topology {
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
-                    DropStrategy::TailDrop,
+                    self.switch_config.drop,
                 );
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::new();
@@ -303,7 +304,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weight_len),
-                    DropStrategy::TailDrop,
+                    self.switch_config.drop,
                     self.switch_config.weights.clone(),
                 );
 
