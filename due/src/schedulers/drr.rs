@@ -71,7 +71,7 @@ impl DRRServer {
         for weight in weights.iter() {
             let quantum_value = min_quantum * weight / min_weight;
             quantum.push(quantum_value);
-            deficit.push(quantum_value);
+            deficit.push(0);
             queues.push(VecDeque::new());
         }
 
@@ -139,12 +139,13 @@ impl DRRServer {
         *byte_size += packet.size;
 
         debug!(
-            "DRRServer {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "DRRServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
             {} packets received, {} packet(s) in flow class {}.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
+            class_id,
             arrival_time,
             self.packets_received,
             self.queues[class_id].len(),
@@ -215,7 +216,11 @@ impl DRRServer {
                     let timeout = packet.size as f64 * 8.0 / self.rate;
 
                     scheduler
-                        .schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                        .schedule_event(
+                            Duration::from_secs_f64(timeout),
+                            Self::send,
+                            outbound.clone(),
+                        )
                         .unwrap();
 
                     // schedules the next run
@@ -229,9 +234,9 @@ impl DRRServer {
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
                                 {} packets in the class queue.",
                         self.scheduler_id,
-                        packet.packet_id,
-                        packet.size,
-                        packet.flow_id,
+                        outbound.packet_id,
+                        outbound.size,
+                        outbound.flow_id,
                         now + timeout,
                         self.queues[self.current_queue].len(),
                     );
