@@ -157,11 +157,6 @@ impl DRRServer {
             class_id
         );
 
-        debug!(
-            "DRRServer {} deficit counter: {:?}.",
-            self.scheduler_id, self.deficit
-        );
-
         if arrival_time > self.busy_until {
             self.run((), scheduler);
         }
@@ -239,11 +234,6 @@ impl DRRServer {
                         packet.flow_id,
                         now + timeout,
                         self.queues[self.current_queue].len(),
-                    );
-
-                    debug!(
-                        "DRRServer {} deficit counter changed to: {:?}.",
-                        self.scheduler_id, self.deficit
                     );
 
                     return;
