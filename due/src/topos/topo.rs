@@ -25,6 +25,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::sp::SPServer;
+use crate::schedulers::virtual_clock::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
@@ -38,6 +39,7 @@ pub struct SwitchConfig {
     drop: DropStrategy,
     weights: Option<Vec<usize>>,
     priorities: Option<HashMap<usize, usize>>,
+    vticks: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -325,6 +327,33 @@ impl Topology {
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
                 self.sim_init = self.sim_init.add_model(sp_server, sp_mbox);
+            }
+
+            SchedulingDiscipline::VirtualClock => {
+                let vticks = self.switch_config.vticks.as_ref().unwrap();
+                let vticks_len = vticks.len();
+                let mut virtual_clock_server = VirtualClockServer::new(
+                    self.switch_config.port_rate,
+                    self.switch_config.capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(move |flow_id| flow_id % vticks_len),
+                    self.switch_config.drop,
+                    vticks.clone(),
+                );
+
+                let mut output = Output::default();
+                let virtual_clock_mbox: Mailbox<VirtualClockServer> = Mailbox::new();
+                output.connect(VirtualClockServer::packet_received, &virtual_clock_mbox);
+                upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                virtual_clock_server
+                    .output
+                    .connect(PacketSwitch::packet_received, downstream_mbox);
+
+                self.sim_init = self
+                    .sim_init
+                    .add_model(virtual_clock_server, virtual_clock_mbox);
             }
 
             SchedulingDiscipline::WFQ => {
