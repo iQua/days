@@ -24,6 +24,7 @@ use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
+use crate::schedulers::sp::SPServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
@@ -33,9 +34,10 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 pub struct SwitchConfig {
     port_rate: f64,
     capacity: usize,
-    weights: Vec<usize>,
     discipline: SchedulingDiscipline,
     drop: DropStrategy,
+    weights: Option<Vec<usize>>,
+    priorities: Option<HashMap<usize, usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -255,16 +257,18 @@ impl Topology {
     /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
-        let weight_len = self.switch_config.weights.len();
+
         match self.switch_config.discipline {
             SchedulingDiscipline::DRR => {
+                let weights = self.switch_config.weights.as_ref().unwrap();
+                let weights_len = weights.len();
                 let mut drr_server = DRRServer::new(
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
-                    Arc::new(move |flow_id| flow_id % weight_len),
+                    Arc::new(move |flow_id| flow_id % weights_len),
                     self.switch_config.drop,
-                    self.switch_config.weights.clone(),
+                    weights.clone(),
                 );
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::new();
@@ -298,14 +302,41 @@ impl Topology {
                 self.sim_init = self.sim_init.add_model(port, port_mbox);
             }
 
+            SchedulingDiscipline::SP => {
+                let priorities = self.switch_config.priorities.as_ref().unwrap();
+                let priorities_len = priorities.len();
+                let mut sp_server = SPServer::new(
+                    self.switch_config.port_rate,
+                    self.switch_config.capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(move |flow_id| flow_id % priorities_len),
+                    self.switch_config.drop,
+                    priorities.clone(),
+                );
+
+                let mut output = Output::default();
+                let sp_mbox: Mailbox<SPServer> = Mailbox::new();
+                output.connect(SPServer::packet_received, &sp_mbox);
+                upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                sp_server
+                    .output
+                    .connect(PacketSwitch::packet_received, downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(sp_server, sp_mbox);
+            }
+
             SchedulingDiscipline::WFQ => {
+                let weights = self.switch_config.weights.as_ref().unwrap();
+                let weights_len = weights.len();
                 let mut wfq_server = WFQServer::new(
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
-                    Arc::new(move |flow_id| flow_id % weight_len),
+                    Arc::new(move |flow_id| flow_id % weights_len),
                     self.switch_config.drop,
-                    self.switch_config.weights.clone(),
+                    weights.clone(),
                 );
 
                 let mut output = Output::default();
