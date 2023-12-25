@@ -265,48 +265,43 @@ impl WFQServer {
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
-        // schedules all outstanding packets in the scheduler's queue
-        loop {
-            if !self.scheduler_queue.is_empty() {
-                let mut outbound = self.scheduler_queue.pop().unwrap().packet;
-                let class_id = (self.flow_classes)(outbound.flow_id);
-                let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
-                *byte_size -= outbound.size;
-                outbound.departure_update(now);
+        // schedules one packet with the smallest finish time
+        if !self.scheduler_queue.is_empty() {
+            let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+            let class_id = (self.flow_classes)(outbound.flow_id);
+            let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+            *byte_size -= outbound.size;
+            outbound.departure_update(now);
 
-                // sends the packet out to the next element after a timeout
-                let timeout = outbound.size as f64 * 8.0 / self.rate;
+            // sends the packet out to the next element after a timeout
+            let timeout = outbound.size as f64 * 8.0 / self.rate;
 
-                self.current_time = now;
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(timeout),
-                        Self::send,
-                        outbound.clone(),
-                    )
-                    .unwrap();
+            self.current_time = now;
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(timeout),
+                    Self::send,
+                    outbound.clone(),
+                )
+                .unwrap();
 
-                // schedules the next run
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                    .unwrap();
+            // schedules the next run
+            scheduler
+                .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
 
-                self.busy_until = now + timeout;
+            self.busy_until = now + timeout;
 
-                debug!(
-                    "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
-                            {} packets in the queue.",
-                    self.scheduler_id,
-                    outbound.packet_id,
-                    outbound.size,
-                    outbound.flow_id,
-                    now + timeout,
-                    self.scheduler_queue.len(),
-                );
-            } else {
-                // all outstanding packets in the scheduler's queue have been processed
-                return;
-            }
+            debug!(
+                "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                        {} packets in the queue.",
+                self.scheduler_id,
+                outbound.packet_id,
+                outbound.size,
+                outbound.flow_id,
+                now + timeout,
+                self.scheduler_queue.len(),
+            );
         }
     }
 }

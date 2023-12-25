@@ -165,49 +165,44 @@ impl SPServer {
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
-        // schedules packets in the current packet class being served
-        loop {
-            if let Some(current_priority) = self.next_priority() {
-                let queue = self
-                    .queues
-                    .entry(current_priority)
-                    .or_insert(VecDeque::new());
-                let mut packet = queue.pop_front().unwrap();
-                let outbound = packet.clone();
+        // schedules one packet with the highest priority
+        if let Some(current_priority) = self.next_priority() {
+            let queue = self
+                .queues
+                .entry(current_priority)
+                .or_insert(VecDeque::new());
+            let mut packet = queue.pop_front().unwrap();
+            let outbound = packet.clone();
 
-                let byte_size = self.byte_sizes.entry(current_priority).or_insert(0);
-                *byte_size -= packet.size;
-                packet.departure_update(now);
+            let byte_size = self.byte_sizes.entry(current_priority).or_insert(0);
+            *byte_size -= packet.size;
+            packet.departure_update(now);
 
-                // sends the packet out to the next element after a timeout
-                let timeout = packet.size as f64 * 8.0 / self.rate;
+            // sends the packet out to the next element after a timeout
+            let timeout = packet.size as f64 * 8.0 / self.rate;
 
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)
-                    .unwrap();
+            scheduler
+                .schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)
+                .unwrap();
 
-                // schedules the next run
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                    .unwrap();
+            // schedules the next run
+            scheduler
+                .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
 
-                self.busy_until = now + timeout;
+            self.busy_until = now + timeout;
 
-                debug!(
-                    "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.3}. \
-                            {} packets in the priority queue.",
-                    self.scheduler_id,
-                    outbound.packet_id,
-                    outbound.size,
-                    current_priority,
-                    outbound.flow_id,
-                    now + timeout,
-                    self.queues[&current_priority].len(),
-                );
-            } else {
-                // all outstanding packets in the queues have been processed
-                return;
-            }
+            debug!(
+                "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.3}. \
+                        {} packets in the priority queue.",
+                self.scheduler_id,
+                outbound.packet_id,
+                outbound.size,
+                current_priority,
+                outbound.flow_id,
+                now + timeout,
+                self.queues[&current_priority].len(),
+            );
         }
     }
 }
