@@ -71,10 +71,9 @@ pub struct WFQServer {
     last_updated: f64,
     current_time: f64,
 
-    /// the number of packets received, dropped, and in the queues waiting to be sent
+    /// the number of packets received and dropped
     packets_received: usize,
     packets_dropped: usize,
-    packets_waiting: usize,
 
     /// the number of bytes currently queued in each flow class
     byte_sizes: HashMap<usize, usize>,
@@ -126,7 +125,6 @@ impl WFQServer {
             current_time: 0.0,
             packets_received: 0,
             packets_dropped: 0,
-            packets_waiting: 0,
             byte_sizes: HashMap::new(),
             scheduler_queue: BinaryHeap::new(),
             busy_until: 0.0,
@@ -153,7 +151,7 @@ impl WFQServer {
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
-                "Port {} dropped packet {} from flow {} at time {:.3}",
+                "WFQServer {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
@@ -162,7 +160,6 @@ impl WFQServer {
             return;
         }
 
-        self.packets_waiting += 1;
         self.packets_received += 1;
         packet.arrival_update(arrival_time);
 
@@ -268,21 +265,14 @@ impl WFQServer {
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
-        // schedules packets in the current packet class being served
+        // schedules all outstanding packets in the scheduler's queue
         loop {
-            if self.packets_waiting == 0 {
-                // all packets in the queues have been processed
-                return;
-            }
-
             if !self.scheduler_queue.is_empty() {
                 let mut outbound = self.scheduler_queue.pop().unwrap().packet;
                 let class_id = (self.flow_classes)(outbound.flow_id);
                 let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
                 *byte_size -= outbound.size;
                 outbound.departure_update(now);
-
-                self.packets_waiting -= 1;
 
                 // sends the packet out to the next element after a timeout
                 let timeout = outbound.size as f64 * 8.0 / self.rate;
@@ -313,6 +303,9 @@ impl WFQServer {
                     now + timeout,
                     self.scheduler_queue.len(),
                 );
+            } else {
+                // all outstanding packets in the scheduler's queue have been processed
+                return;
             }
         }
     }

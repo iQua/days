@@ -123,7 +123,7 @@ impl DRRServer {
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
-                "Port {} dropped packet {} from flow {} at time {:.3}",
+                "DRRServer {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
