@@ -224,6 +224,8 @@ impl VirtualClockServer {
         if !self.scheduler_queue.is_empty() {
             let mut outbound = self.scheduler_queue.pop().unwrap().packet;
             let class_id = (self.flow_classes)(outbound.flow_id);
+            let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
+            *flow_queue_count -= 1;
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;
             outbound.departure_update(now);
