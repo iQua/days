@@ -150,7 +150,7 @@ impl SPServer {
 
     /// Moves on to the next non-empty priority queue if the current queue is empty.
     fn next_priority(&mut self) -> Option<usize> {
-        for (&priority, queue) in self.queues.iter() {
+        for (&priority, queue) in self.queues.iter().rev() {
             if !queue.is_empty() {
                 return Some(priority);
             }
@@ -190,8 +190,7 @@ impl SPServer {
             self.busy_until = now + timeout;
 
             debug!(
-                "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.3}. \
-                        {} packets in the priority queue.",
+                "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.3}. {} packets in the priority queue.",
                 self.scheduler_id,
                 outbound.packet_id,
                 outbound.size,

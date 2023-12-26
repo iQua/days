@@ -23,12 +23,15 @@ fn main() {
     let mut source_1 = PacketSource::new(
         0,
         TrafficCharacteristics::new(
-            2.5,
+            1.5,
             10.0,
-            DistributionInfo::DiscreteUniform { low: 2, high: 2 },
+            DistributionInfo::Uniform {
+                low: 1.5,
+                high: 1.5,
+            },
             DistributionInfo::DiscreteUniform {
-                low: 2000,
-                high: 2000,
+                low: 1000,
+                high: 1000,
             },
         ),
         0,
@@ -39,7 +42,10 @@ fn main() {
         TrafficCharacteristics::new(
             2.0,
             10.0,
-            DistributionInfo::DiscreteUniform { low: 1, high: 1 },
+            DistributionInfo::Uniform {
+                low: 2.0,
+                high: 2.0,
+            },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
                 high: 1000,
