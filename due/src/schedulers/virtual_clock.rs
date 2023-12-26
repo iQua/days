@@ -156,7 +156,7 @@ impl VirtualClockServer {
         self.packets_received += 1;
         packet.arrival_update(arrival_time);
 
-        // computes a finish time and adds it as a tag to the packet
+        // computes a virtual clock finish time and adds it as a tag to the packet
         let tagged_packet = self.tag(packet.clone(), arrival_time);
         let aux_vc = tagged_packet.tag;
 
