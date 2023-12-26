@@ -1,8 +1,7 @@
 //! Implements a Virtual Clock scheduler.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +13,35 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+
+pub struct TaggedPacket {
+    pub packet: Packet,
+    /// tag is the virtual clock finish time of the packet
+    pub tag: f64,
+}
+
+impl PartialOrd for TaggedPacket {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TaggedPacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag
+    }
+}
+
+impl Ord for TaggedPacket {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.tag
+            .partial_cmp(&other.tag)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
+    }
+}
+
+impl Eq for TaggedPacket {}
 
 pub struct VirtualClockServer {
     scheduler_id: usize,
@@ -37,19 +65,23 @@ pub struct VirtualClockServer {
     /// flow_class -> byte_size
     byte_sizes: HashMap<usize, usize>,
 
-    /// FIFO queues of classes
-    /// flow_class -> queue
-    queues: BTreeMap<usize, VecDeque<Packet>>,
+    /// min-heap of packets from all the classes, where packets are sorted
+    /// according to their virtual clock finish times
+    scheduler_queue: BinaryHeap<TaggedPacket>,
 
-    /// flow_class -> inverse of the desired rates for the corresponding flows,
-    /// in bits per second
+    /// flow_class -> vtick (inverse of the desired rates for the corresponding
+    /// flows, in bits per second)
     vticks: HashMap<usize, usize>,
 
     /// number of queued packets of each flow class
     flow_queue_count: HashMap<usize, usize>,
 
-    aux_vc: HashMap<usize, usize>,
-    v_clocks: HashMap<usize, usize>,
+    /// virtual clocks for the corresponding flows
+    /// flow_class -> virtual clock
+    v_clocks: HashMap<usize, f64>,
+
+    /// flow_class -> virtual clock finish time
+    aux_vc: HashMap<usize, f64>,
 
     /// The server is considered busy sending the current packet until this time
     busy_until: f64,
@@ -83,11 +115,11 @@ impl VirtualClockServer {
             packets_received: 0,
             packets_dropped: 0,
             byte_sizes: HashMap::new(),
-            queues: BTreeMap::new(),
+            scheduler_queue: BinaryHeap::new(),
             vticks,
             flow_queue_count: HashMap::new(),
-            aux_vc: HashMap::new(),
             v_clocks: HashMap::new(),
+            aux_vc: HashMap::new(),
             busy_until: 0.0,
             output: Output::default(),
         }
@@ -105,7 +137,7 @@ impl VirtualClockServer {
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
             self.byte_sizes.values().sum(),
-            self.queues.values().map(|q| q.len()).sum(),
+            self.scheduler_queue.len(),
         );
 
         // the case that this packet will be dropped.
@@ -124,30 +156,58 @@ impl VirtualClockServer {
         self.packets_received += 1;
         packet.arrival_update(arrival_time);
 
+        // computes a finish time and adds it as a tag to the packet
+        let tagged_packet = self.tag(packet.clone(), arrival_time);
+        let aux_vc = tagged_packet.tag;
+
+        // pushes the packet into a min-heap according to the packet's virtual clock finish time
+        self.scheduler_queue.push(tagged_packet);
+
         let class_id = (self.flow_classes)(packet.flow_id);
-
-        let queue = self.queues.entry(class_id).or_insert(VecDeque::new());
-        queue.push_back(packet.clone());
-
         let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
         *byte_size += packet.size;
+        let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
+        *flow_queue_count += 1;
 
         debug!(
-            "VirtualClockServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
-            {} packets received, {} packet(s) in flow class {}.",
+            "VirtualClockServer {} received packet {} ({} bytes with virtual clock finish time {:.3}) from flow {} belonging to class {} at time {:.3}. \
+            {} packets received, {} packet(s) in queue.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
+            aux_vc,
             packet.flow_id,
             class_id,
             arrival_time,
             self.packets_received,
-            self.queues[&class_id].len(),
-            class_id
+            self.scheduler_queue.len(),
         );
 
         if arrival_time > self.busy_until {
             self.run((), scheduler);
+        }
+    }
+
+    fn tag(&mut self, packet: Packet, arrival_time: f64) -> TaggedPacket {
+        let class_id = (self.flow_classes)(packet.flow_id);
+
+        // upon receiving the first packet from this flow_class, sets its
+        // virtual clock to the current real time
+        let v_clock = self.v_clocks.entry(class_id).or_insert(arrival_time);
+
+        // updates the virtual clock for the corresponding flow_class by
+        // multiplying vtick (the desired bit time, i.e., the inverse of the
+        // desired bits per second data rate) by the size of the packet in bits.
+        let vtick = self.vticks.get(&class_id).unwrap();
+        *v_clock += *vtick as f64 * packet.size as f64 * 8.0;
+
+        let aux_vc = self.aux_vc.entry(class_id).or_insert(0.0);
+        *aux_vc = arrival_time.max(*aux_vc);
+        *aux_vc += *vtick as f64;
+
+        TaggedPacket {
+            packet,
+            tag: *aux_vc,
         }
     }
 
@@ -160,20 +220,41 @@ impl VirtualClockServer {
             .time()
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
+        // schedules one packet with the smallest virtual clock finish time
+        if !self.scheduler_queue.is_empty() {
+            let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+            let class_id = (self.flow_classes)(outbound.flow_id);
+            let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+            *byte_size -= outbound.size;
+            outbound.departure_update(now);
 
+            // sends the packet out to the next element after a timeout
+            let timeout = outbound.size as f64 * 8.0 / self.rate;
 
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(timeout),
+                    Self::send,
+                    outbound.clone(),
+                )
+                .unwrap();
+
+            // schedules the next run
+            scheduler
+                .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
 
             self.busy_until = now + timeout;
 
             debug!(
                 "VirtualClockServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
-                        {} packets in the class queue.",
+                        {} packets in the queue.",
                 self.scheduler_id,
                 outbound.packet_id,
                 outbound.size,
                 outbound.flow_id,
                 now + timeout,
-                self.queues[].len(),
+                self.scheduler_queue.len(),
             );
         }
     }
