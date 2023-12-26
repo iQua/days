@@ -22,12 +22,15 @@ fn main() {
     let mut source_1 = PacketSource::new(
         0,
         TrafficCharacteristics::new(
-            2.5,
-            10.0,
-            DistributionInfo::DiscreteUniform { low: 2, high: 2 },
+            1.75,
+            50.0,
+            DistributionInfo::Uniform {
+                low: 1.75,
+                high: 1.75,
+            },
             DistributionInfo::DiscreteUniform {
-                low: 2000,
-                high: 2000,
+                low: 1000,
+                high: 1000,
             },
         ),
         0,
@@ -36,9 +39,12 @@ fn main() {
     let mut source_2 = PacketSource::new(
         1,
         TrafficCharacteristics::new(
-            2.0,
-            10.0,
-            DistributionInfo::DiscreteUniform { low: 1, high: 1 },
+            11.75,
+            50.0,
+            DistributionInfo::Uniform {
+                low: 1.75,
+                high: 1.75,
+            },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
                 high: 1000,
@@ -48,7 +54,7 @@ fn main() {
     );
 
     let mut wfq = WFQServer::new(
-        8000.0,
+        4600.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),

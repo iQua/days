@@ -69,7 +69,7 @@ pub struct WFQServer {
 
     vtime: f64,
     last_updated: f64,
-    current_time: f64,
+    time_packet_sent: f64,
 
     /// the number of packets received and dropped
     packets_received: usize,
@@ -122,7 +122,7 @@ impl WFQServer {
             active_set: HashSet::new(),
             vtime: 0.0,
             last_updated: 0.0,
-            current_time: 0.0,
+            time_packet_sent: 0.0,
             packets_received: 0,
             packets_dropped: 0,
             byte_sizes: HashMap::new(),
@@ -256,7 +256,7 @@ impl WFQServer {
 
     pub async fn send(&mut self, packet: Packet) {
         self.output.send(packet.clone()).await;
-        self.update_stats(&packet, self.current_time);
+        self.update_stats(&packet, self.time_packet_sent);
     }
 
     pub fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
@@ -276,7 +276,7 @@ impl WFQServer {
             // sends the packet out to the next element after a timeout
             let timeout = outbound.size as f64 * 8.0 / self.rate;
 
-            self.current_time = now;
+            self.time_packet_sent = now + timeout;
             scheduler
                 .schedule_event(
                     Duration::from_secs_f64(timeout),
