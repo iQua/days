@@ -23,9 +23,12 @@ fn main() {
     let mut source_1 = PacketSource::new(
         0,
         TrafficCharacteristics::new(
-            2.5,
+            1.75,
             10.0,
-            DistributionInfo::DiscreteUniform { low: 2, high: 2 },
+            DistributionInfo::Uniform {
+                low: 1.75,
+                high: 1.75,
+            },
             DistributionInfo::DiscreteUniform {
                 low: 2000,
                 high: 2000,
@@ -37,9 +40,12 @@ fn main() {
     let mut source_2 = PacketSource::new(
         1,
         TrafficCharacteristics::new(
-            2.0,
+            11.75,
             10.0,
-            DistributionInfo::DiscreteUniform { low: 1, high: 1 },
+            DistributionInfo::Uniform {
+                low: 1.75,
+                high: 1.75,
+            },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
                 high: 1000,
@@ -49,12 +55,12 @@ fn main() {
     );
 
     let mut vc = VirtualClockServer::new(
-        8000.0,
+        4600.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        HashMap::from([(0, 1), (1, 2)]),
+        HashMap::from([(0, 2), (1, 1)]),
     );
 
     let mut sink = PacketSink::new(2);
