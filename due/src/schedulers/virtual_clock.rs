@@ -170,11 +170,12 @@ impl VirtualClockServer {
         *flow_queue_count += 1;
 
         debug!(
-            "VirtualClockServer {} received packet {} ({} bytes with virtual clock finish time {:.3}) from flow {} belonging to class {} at time {:.3}. \
+            "VirtualClockServer {} received packet {} ({} bytes with virtual clock {} aux_vc {:.3}) from flow {} belonging to class {} at time {:.3}. \
             {} packets received, {} packet(s) in queue.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
+            self.v_clocks.get(&class_id).unwrap(),
             aux_vc,
             packet.flow_id,
             class_id,
