@@ -119,7 +119,7 @@ impl SPServer {
         // pushes the packet to the back of its priority queue
         let priority = self.priorities[&class_id];
 
-        let queue = self.queues.entry(priority).or_insert(VecDeque::new());
+        let queue = self.queues.entry(priority).or_default();
         queue.push_back(packet.clone());
 
         let byte_size = self.byte_sizes.entry(priority).or_insert(0);
@@ -167,10 +167,7 @@ impl SPServer {
 
         // schedules one packet with the highest priority
         if let Some(current_priority) = self.next_priority() {
-            let queue = self
-                .queues
-                .entry(current_priority)
-                .or_insert(VecDeque::new());
+            let queue = self.queues.entry(current_priority).or_default();
             let mut packet = queue.pop_front().unwrap();
             let outbound = packet.clone();
 
