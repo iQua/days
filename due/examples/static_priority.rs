@@ -1,5 +1,6 @@
-//! An example of connecting two packet sources into one WFQ scheduler.
+//! An example of connecting two packet sources into one Static Priority scheduler.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
-use due::schedulers::wfq::WFQServer;
+use due::schedulers::sp::SPServer;
 
 fn main() {
     let env = env_logger::Env::default();
@@ -22,11 +23,11 @@ fn main() {
     let mut source_1 = PacketSource::new(
         0,
         TrafficCharacteristics::new(
-            1.75,
-            50.0,
+            1.5,
+            10.0,
             DistributionInfo::Uniform {
-                low: 1.75,
-                high: 1.75,
+                low: 1.5,
+                high: 1.5,
             },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
@@ -39,11 +40,11 @@ fn main() {
     let mut source_2 = PacketSource::new(
         1,
         TrafficCharacteristics::new(
-            11.75,
-            50.0,
+            2.0,
+            10.0,
             DistributionInfo::Uniform {
-                low: 1.75,
-                high: 1.75,
+                low: 2.0,
+                high: 2.0,
             },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
@@ -53,30 +54,26 @@ fn main() {
         0,
     );
 
-    let mut wfq = WFQServer::new(
-        4600.0,
+    let mut sp = SPServer::new(
+        8000.0,
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        vec![1, 2],
+        HashMap::from([(0, 1), (1, 2)]),
     );
 
     let mut sink = PacketSink::new(2);
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
-    let wfq_mbox = Mailbox::new();
+    let sp_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // connects the output of packet sources to the input of the WFQ scheduler
-    source_1
-        .output
-        .connect(WFQServer::packet_received, &wfq_mbox);
-    source_2
-        .output
-        .connect(WFQServer::packet_received, &wfq_mbox);
-    wfq.output.connect(PacketSink::packet_received, &sink_mbox);
+    // connects the output of packet sources to the input of the sp scheduler
+    source_1.output.connect(SPServer::packet_received, &sp_mbox);
+    source_2.output.connect(SPServer::packet_received, &sp_mbox);
+    sp.output.connect(PacketSink::packet_received, &sink_mbox);
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
     // instantiates the simulator
@@ -84,7 +81,7 @@ fn main() {
     let mut sim = SimInit::new()
         .add_model(source_1, source_1_mbox)
         .add_model(source_2, source_2_mbox)
-        .add_model(wfq, wfq_mbox)
+        .add_model(sp, sp_mbox)
         .add_model(sink, sink_mbox)
         .init(t0);
 

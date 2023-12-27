@@ -7,5 +7,7 @@ use serde::Deserialize;
 pub enum SchedulingDiscipline {
     DRR,
     FIFO,
+    SP,
+    VirtualClock,
     WFQ,
 }
