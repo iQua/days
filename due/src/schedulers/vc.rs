@@ -11,9 +11,10 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use log::debug;
+
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
-use log::debug;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;

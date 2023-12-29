@@ -13,7 +13,7 @@ use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
-use due::schedulers::virtual_clock::VirtualClockServer;
+use due::schedulers::vc::VirtualClockServer;
 
 fn main() {
     let env = env_logger::Env::default();
