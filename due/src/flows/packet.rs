@@ -1,6 +1,11 @@
 //! A very simple struct that represents a packet.
 
 #[derive(Debug, Clone)]
+pub struct TCPAck {
+    pub sequence_num: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct Packet {
     /// Packets in Due are typically created by packet generators, and runs
     /// through a sequence of packet-forwarding switches. It may be entered into
@@ -36,6 +41,8 @@ pub struct Packet {
     pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
     pub queueing_delay: f64,
+    /// used by TCPPacketSource and TCPPacketSink
+    pub ack: Option<TCPAck>,
 }
 
 impl Packet {
@@ -48,6 +55,7 @@ impl Packet {
             flow_id,
             creation_time,
             queueing_delay: 0.0,
+            ack: None,
         }
     }
 
