@@ -1,10 +1,12 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use asynchronix::simulation::Mailbox;
 use log::{debug, info};
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
@@ -14,9 +16,51 @@ use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
+use crate::flows::flow::Flow;
 use crate::flows::packet::Packet;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::{get_seed, next_endpoint_id};
+
+/// A simple timer that expires after a timeout value.
+pub struct Timer {
+    /// the id of this timer
+    timer_id: usize,
+    timeout: f64,
+    output: Output<TimerExpiredMsg>,
+}
+
+/// The message that a timer sends to the TCPPacketSource when it expires.
+#[derive(Clone)]
+pub struct TimerExpiredMsg {
+    timer_id: usize,
+}
+
+impl Timer {
+    pub fn new(timer_id: usize, timeout: f64) -> Timer {
+        Timer {
+            timer_id,
+            timeout,
+            output: Output::default(),
+        }
+    }
+
+    pub fn activate(&mut self, scheduler: &Scheduler<Self>) {
+        scheduler
+            .schedule_event(Duration::from_secs_f64(self.timeout), Self::send, ())
+            .unwrap();
+    }
+
+    pub async fn send(&mut self) {
+        self.output
+            .send(TimerExpiredMsg {
+                timer_id: self.timer_id,
+            })
+            .await;
+    }
+}
+
+impl Model for Timer {}
 
 #[derive(Debug)]
 pub struct TCPPacketSource {
