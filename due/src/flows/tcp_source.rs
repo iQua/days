@@ -144,7 +144,6 @@ impl TCPPacketSource {
 
     fn packet_sent(&mut self, now: Duration, packet: Packet) {
         self.packets_sent += 1;
-        self.sent_size += packet.size;
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -156,14 +155,109 @@ impl TCPPacketSource {
         );
     }
 
-    pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+    pub async fn send(&mut self, packet: Packet) {
+        self.output.send(packet).await;
+    }
+
+    /// On receiving an acknowledgment packet.
+    pub fn ack_packet_received(&mut self, ack_packet: Packet, scheduler: &Scheduler<Self>) {
+        // the received packet must be an ack
+        assert!(ack_packet.ack.is_some());
+
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(
             "TCPPacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+            self.endpoint_id,
+            ack_packet.packet_id,
+            ack_packet.size,
+            ack_packet.flow_id,
+            arrival_time,
         );
+
+        let ack = ack_packet.ack.unwrap();
+        if ack.sequence_num == self.last_ack {
+            self.dupack += 1;
+        } else {
+            // fast recovery in RFC 2001 and TCP Reno
+            if self.dupack > 0 {
+                self.congestion_control.dupack_over();
+                self.dupack = 0;
+            }
+        }
+
+        if self.dupack == 3 {
+            self.congestion_control.consecutive_dupacks_received();
+
+            let resent_pkt = self.sent_packets.get_mut(&ack.sequence_num).unwrap();
+            resent_pkt.time = arrival_time;
+
+            scheduler
+                .schedule_event(Duration::from_secs_f64(0), Self::send, resent_pkt)
+                .unwrap();
+
+            debug!(
+                "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+            );
+
+            return;
+        } else if self.dupack > 3 {
+            self.congestion_control.more_dupacks_received();
+
+            if self.last_ack as f64 + self.congestion_control.get_cwnd() >= ack.sequence_num as f64
+            {
+                let resent_pkt = self.sent_packets.get_mut(&ack.sequence_num).unwrap();
+                resent_pkt.time = arrival_time;
+
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(0), Self::send, resent_pkt)
+                    .unwrap();
+
+                debug!(
+                    "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                    self.endpoint_id,
+                    resent_pkt.packet_id,
+                    resent_pkt.size,
+                    resent_pkt.flow_id,
+                    now,
+                );
+            }
+
+            return;
+        }
+
+        if self.dupack == 0 {
+            // new ack received, update the RTT estimate and the retransmission timout
+
+            let sample_rtt = now - ack_packet.creation_time;
+
+            // Jacobsen '88: Congestion Avoidance and Control
+            let sample_err = sample_rtt - self.rtt_estimate;
+            self.rtt_estimate += 0.125 * sample_err;
+            self.est_deviation += 0.25 * (sample_err.abs() - self.est_deviation);
+            self.rto = self.rtt_estimate + 4.0 * self.est_deviation;
+
+            self.last_ack = ack.sequence_num;
+            self.congestion_control.ack_received(sample_rtt, now);
+
+            debug!(
+                "TCPPacketSource {} received Ack till sequence number {} at time {:.3}.",
+                self.endpoint_id, ack.sequence_num, now,
+            );
+
+            debug!(
+                "TCPPacketSource {} congestion window size = {:.3}, last ack {}.",
+                self.endpoint_id,
+                self.congestion_control.get_cwnd(),
+                self.last_ack,
+            );
+
+            if self.sent_packets.contains_key(&ack_packet.packet_id) {
+                self.sent_packets.remove(&ack_packet.packet_id);
+            }
+        }
     }
 
     fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
