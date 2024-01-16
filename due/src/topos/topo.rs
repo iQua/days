@@ -404,7 +404,7 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let mut source = PacketSource::new(flow.id, flow.traffic, flow.seed);
+            let mut source = PacketSource::new(flow.id, flow.flow_size, flow.traffic, flow.seed);
 
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
