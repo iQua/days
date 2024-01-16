@@ -17,7 +17,6 @@ drop = "RED"
 
 [[flow_set]]
 flow_type = "PacketDistribution"
-flow_size = 20000
 flow_count = 63
 [flow_set.traffic]
     initial_delay = 1.0
@@ -27,7 +26,6 @@ flow_count = 63
 
 [[flow]]
 flow_type = "PacketDistribution"
-flow_size = 20000
 graph = [[0, 1]]
 [flow.traffic]
     initial_delay = 1.0

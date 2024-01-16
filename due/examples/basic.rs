@@ -18,10 +18,10 @@ fn main() {
     // Instantiates models and their mailboxes.
     let mut source = PacketSource::new(
         0,
-        80000,
         TrafficCharacteristics::new(
             1.0,
             Some(10.0),
+            None,
             DistributionInfo::DiscreteUniform { low: 1, high: 1 },
             DistributionInfo::DiscreteUniform {
                 low: 1000,

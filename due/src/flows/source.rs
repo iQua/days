@@ -22,7 +22,6 @@ use crate::{get_seed, next_endpoint_id};
 pub struct PacketSource {
     endpoint_id: usize,
     flow_id: usize,
-    flow_size: usize,
     traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
@@ -37,7 +36,6 @@ impl Clone for PacketSource {
         PacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id: self.flow_id,
-            flow_size: self.flow_size,
             traffic: self.traffic,
             packets_sent: 0,
             sent_size: 0,
@@ -49,12 +47,7 @@ impl Clone for PacketSource {
 }
 
 impl PacketSource {
-    pub fn new(
-        flow_id: usize,
-        flow_size: usize,
-        traffic: TrafficCharacteristics,
-        seed: usize,
-    ) -> PacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> PacketSource {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
@@ -64,7 +57,6 @@ impl PacketSource {
         PacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
-            flow_size,
             traffic,
             packets_sent: 0,
             sent_size: 0,
@@ -148,7 +140,7 @@ impl PacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(current_time, packet);
 
-            if (self.sent_size < self.flow_size)
+            if (self.sent_size < self.traffic.size)
                 & (now + interval.as_secs_f64() <= self.traffic.duration)
             {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();

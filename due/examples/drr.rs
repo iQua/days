@@ -21,10 +21,10 @@ fn main() {
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
         0,
-        80000,
         TrafficCharacteristics::new(
             2.5,
             Some(10.0),
+            None,
             DistributionInfo::DiscreteUniform { low: 2, high: 2 },
             DistributionInfo::DiscreteUniform {
                 low: 2000,
@@ -36,10 +36,10 @@ fn main() {
 
     let mut source_2 = PacketSource::new(
         1,
-        80000,
         TrafficCharacteristics::new(
             2.0,
             Some(10.0),
+            None,
             DistributionInfo::DiscreteUniform { low: 1, high: 1 },
             DistributionInfo::DiscreteUniform {
                 low: 1000,

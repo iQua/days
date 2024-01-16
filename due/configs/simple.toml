@@ -13,17 +13,16 @@ drop = "RED"
 
 [[flow]]
 flow_type = "PacketDistribution"
-flow_size = 20000
 graph = [[0, 1]]
 [flow.traffic]
     initial_delay = 1.0
     duration = 10.0
+    size = 20000
     arr_dist = {type = "Exp", lambda = 1.0}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
 
 [[flow]]
 flow_type = "PacketDistribution"
-flow_size = 20000
 graph = [[1, 0]]
 [flow.traffic]
     initial_delay = 2.0
@@ -34,7 +33,6 @@ graph = [[1, 0]]
 [[collective]]
 collective_type = "Broadcast"
 flow_type = "PacketDistribution"
-flow_size = 20000
 graph = [[0, 1], [0, 2]]
 sources = [0]
 sinks = [1, 2]
