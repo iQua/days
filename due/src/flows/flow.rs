@@ -20,6 +20,7 @@ pub enum FlowType {
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
     flow_type: FlowType,
+    flow_size: usize,
     graph: Vec<(u32, u32)>,
     traffic: TrafficCharacteristics,
 }
@@ -27,6 +28,7 @@ struct TomlFlow {
 #[derive(Deserialize, Debug)]
 struct TomlFlowSet {
     flow_type: FlowType,
+    flow_size: usize,
     flow_count: u32,
     traffic: TrafficCharacteristics,
 }
@@ -42,6 +44,8 @@ struct FlowConfig {
 pub struct Flow {
     pub id: usize,
     pub flow_type: FlowType,
+    /// flow size in bytes
+    pub flow_size: usize,
     /// the id of the host switch that the source attaches to
     pub source_host: usize,
     /// the id of the host switch that the sink attaches to
@@ -60,6 +64,7 @@ impl Flow {
     pub fn new(
         id: usize,
         flow_type: FlowType,
+        flow_size: usize,
         source_host: usize,
         sink_host: usize,
         traffic: TrafficCharacteristics,
@@ -70,6 +75,7 @@ impl Flow {
         Flow {
             id,
             flow_type,
+            flow_size,
             source_host,
             sink_host,
             sink_id: 0,
@@ -92,11 +98,12 @@ impl Flow {
                 flows.push(Flow::new(
                     next_flow_id(),
                     FlowType::PacketDistribution,
+                    10000,
                     edge.source().index(),
                     edge.target().index(),
                     TrafficCharacteristics::new(
                         1.,
-                        10.,
+                        Some(10.),
                         DistributionInfo::Exp { lambda: 1. },
                         DistributionInfo::DiscreteUniform {
                             low: 1000,
@@ -131,6 +138,7 @@ impl Flow {
                     flows.push(Flow::new(
                         flow_id,
                         flow.flow_type,
+                        flow.flow_size,
                         edge.source().index(),
                         edge.target().index(),
                         flow.traffic,
@@ -153,6 +161,7 @@ impl Flow {
                     flows.push(Flow::new(
                         flow_id,
                         flow_set.flow_type,
+                        flow_set.flow_size,
                         host_pair[0],
                         host_pair[1],
                         flow_set.traffic,
