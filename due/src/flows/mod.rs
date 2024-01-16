@@ -16,6 +16,15 @@ pub enum DistributionInfo {
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
+pub struct TomlTrafficCharacteristics {
+    pub initial_delay: f64,
+    pub duration: Option<f64>,
+    pub size: Option<usize>,
+    pub arr_dist: DistributionInfo,
+    pub pkt_size_dist: DistributionInfo,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct TrafficCharacteristics {
     pub initial_delay: f64,
     pub duration: f64,

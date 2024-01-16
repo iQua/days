@@ -8,7 +8,7 @@ use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::route::{RandomSimplePath, RoutingProtocol};
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -21,14 +21,14 @@ pub enum FlowType {
 struct TomlFlow {
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
-    traffic: TrafficCharacteristics,
+    traffic: TomlTrafficCharacteristics,
 }
 
 #[derive(Deserialize, Debug)]
 struct TomlFlowSet {
     flow_type: FlowType,
     flow_count: u32,
-    traffic: TrafficCharacteristics,
+    traffic: TomlTrafficCharacteristics,
 }
 
 #[derive(Deserialize, Debug)]
@@ -128,13 +128,19 @@ impl Flow {
 
                 for (_, edge) in graph.edge_references().enumerate() {
                     let flow_id = next_flow_id();
-
+                    let traffic = TrafficCharacteristics::new(
+                        flow.traffic.initial_delay,
+                        flow.traffic.duration,
+                        flow.traffic.size,
+                        flow.traffic.arr_dist,
+                        flow.traffic.pkt_size_dist,
+                    );
                     flows.push(Flow::new(
                         flow_id,
                         flow.flow_type,
                         edge.source().index(),
                         edge.target().index(),
-                        flow.traffic,
+                        traffic,
                         // uses flow_id as the random seed (added to the global seed)
                         flow_id,
                     ));
@@ -151,12 +157,19 @@ impl Flow {
                         hosts.choose_multiple(&mut rng, 2).cloned().collect();
 
                     let flow_id = next_flow_id();
+                    let traffic = TrafficCharacteristics::new(
+                        flow_set.traffic.initial_delay,
+                        flow_set.traffic.duration,
+                        flow_set.traffic.size,
+                        flow_set.traffic.arr_dist,
+                        flow_set.traffic.pkt_size_dist,
+                    );
                     flows.push(Flow::new(
                         flow_id,
                         flow_set.flow_type,
                         host_pair[0],
                         host_pair[1],
-                        flow_set.traffic,
+                        traffic,
                         // uses flow_id as the random seed (added to the global seed)
                         flow_id,
                     ));
