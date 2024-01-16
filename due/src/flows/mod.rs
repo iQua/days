@@ -6,6 +6,7 @@ pub mod route;
 pub mod sink;
 pub mod source;
 pub mod tcp_sink;
+pub mod tcp_source;
 
 use serde::Deserialize;
 
