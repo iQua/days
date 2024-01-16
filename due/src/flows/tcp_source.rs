@@ -19,7 +19,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::flow::Flow;
 use crate::flows::packet::Packet;
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::flows::DistributionInfo;
 use crate::{get_seed, next_endpoint_id};
 
 /// A simple timer that expires after a timeout value.
@@ -199,7 +199,11 @@ impl TCPPacketSource {
 
             debug!(
                 "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+                self.endpoint_id,
+                resent_pkt.packet_id,
+                resent_pkt.size,
+                resent_pkt.flow_id,
+                arrival_time,
             );
 
             return;
@@ -221,7 +225,7 @@ impl TCPPacketSource {
                     resent_pkt.packet_id,
                     resent_pkt.size,
                     resent_pkt.flow_id,
-                    now,
+                    arrival_time,
                 );
             }
 
@@ -231,7 +235,7 @@ impl TCPPacketSource {
         if self.dupack == 0 {
             // new ack received, update the RTT estimate and the retransmission timout
 
-            let sample_rtt = now - ack_packet.creation_time;
+            let sample_rtt = arrival_time - ack_packet.creation_time;
 
             // Jacobsen '88: Congestion Avoidance and Control
             let sample_err = sample_rtt - self.rtt_estimate;
@@ -240,11 +244,12 @@ impl TCPPacketSource {
             self.rto = self.rtt_estimate + 4.0 * self.est_deviation;
 
             self.last_ack = ack.sequence_num;
-            self.congestion_control.ack_received(sample_rtt, now);
+            self.congestion_control
+                .ack_received(sample_rtt, arrival_time);
 
             debug!(
                 "TCPPacketSource {} received Ack till sequence number {} at time {:.3}.",
-                self.endpoint_id, ack.sequence_num, now,
+                self.endpoint_id, ack.sequence_num, arrival_time,
             );
 
             debug!(
@@ -257,6 +262,51 @@ impl TCPPacketSource {
             if self.sent_packets.contains_key(&ack_packet.packet_id) {
                 self.sent_packets.remove(&ack_packet.packet_id);
             }
+        }
+    }
+
+    fn timeout_callback(&mut self, packet_id: usize, scheduler: &Scheduler<Self>) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+
+        debug!(
+            "TCPPacketSource {}'s Timer expired for packet {} at time {:.3}.",
+            self.endpoint_id, packet_id, now
+        );
+
+        // Ack of this packet has not been received before this packet's timer
+        // expired -> timeout occurs
+        if packet_id >= self.last_ack {
+            self.congestion_control.timer_expired();
+
+            // retransmits the segment
+            let resent_pkt = self.sent_packets.get_mut(&packet_id).unwrap();
+            resent_pkt.time = now;
+
+            scheduler
+                .schedule_event(Duration::from_secs_f64(0), Self::send, resent_pkt)
+                .unwrap();
+
+            resent_pkt.departure_update(now);
+            let _ = self.sender.send(resent_pkt.clone());
+
+            debug!(
+                "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+            );
+
+            //doubles the retransmission timeout
+            self.rto *= 2.0;
+
+            // starts a new timer for this segment
+            let timer = Timer::new(packet_id, self.rto);
+            debug!(
+                "TCPPacketSource {} reset a timer for packet {} with an RTO of {:.3}.",
+                self.endpoint_id, packet_id, self.rto
+            );
+            timer.activate(scheduler);
         }
     }
 
