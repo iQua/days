@@ -1,11 +1,12 @@
+pub mod cc;
 pub mod collective;
-use serde::Deserialize;
-
 pub mod flow;
 pub mod packet;
 pub mod route;
 pub mod sink;
 pub mod source;
+
+use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
