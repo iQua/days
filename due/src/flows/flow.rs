@@ -97,7 +97,7 @@ impl Flow {
                     TrafficCharacteristics::new(
                         1.,
                         Some(10.),
-                        Some(10000),
+                        None,
                         DistributionInfo::Exp { lambda: 1. },
                         DistributionInfo::DiscreteUniform {
                             low: 1000,
