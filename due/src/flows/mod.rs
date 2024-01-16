@@ -26,13 +26,13 @@ pub struct TrafficCharacteristics {
 impl TrafficCharacteristics {
     pub fn new(
         initial_delay: f64,
-        duration: f64,
+        duration: Option<f64>,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> Self {
         Self {
             initial_delay,
-            duration,
+            duration: duration.unwrap_or(f64::MAX),
             arr_dist,
             pkt_size_dist,
         }

@@ -87,7 +87,7 @@ impl Collective {
                 collective_sinks,
                 TrafficCharacteristics::new(
                     1.,
-                    10.,
+                    Some(10.),
                     DistributionInfo::Exp { lambda: 1. },
                     DistributionInfo::DiscreteUniform {
                         low: 1000,
