@@ -65,29 +65,70 @@ impl Model for Timer {}
 #[derive(Debug)]
 pub struct TCPPacketSource {
     endpoint_id: usize,
-    flow_id: usize,
-    traffic: TrafficCharacteristics,
+    /// the flow that serves as the source
+    flow: Flow,
+    /// the time when data last arrived from the flow
+    last_arrival: f64,
+    /// the congestion controller
+    congestion_control: Box<dyn CongestionControl>,
+    /// maximum segment size, in bytes
+    mss: usize,
+    /// the next sequence number to be sent, in bytes
+    next_seq: usize,
+    /// the maximum sequence number in the in-transit data buffer
+    send_buffer: usize,
+    /// the sequence number of the segment that is last acknowledged
+    last_ack: usize,
+    /// the count of duplicate acknolwedgments
+    dupack: usize,
+    /// the RTT estimate
+    rtt_estimate: f64,
+    /// the retransmission timeout
+    rto: f64,
+    /// an estimate of the RTT deviation
+    est_deviation: f64,
+    /// the in-flight packets (segments)
+    sent_packets: HashMap<usize, Packet>,
+
     packets_sent: usize,
-    sent_size: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,
 }
 
 impl TCPPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> TCPPacketSource {
+    pub fn new(
+        flow: Flow,
+        cc_algorithm: CCAlgorithm,
+        rtt_estimate: f64,
+        seed: usize,
+    ) -> TCPPacketSource {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
 
+        let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
+            CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
+            CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
+        };
+
         TCPPacketSource {
             endpoint_id: next_endpoint_id(),
-            flow_id,
-            traffic,
+            flow,
+            last_arrival: 0.0,
+            congestion_control,
+            mss: 512,
+            next_seq: 0,
+            send_buffer: 0,
+            last_ack: 0,
+            dupack: 0,
+            rtt_estimate,
+            rto: rtt_estimate * 2.0,
+            est_deviation: 0.0,
+            sent_packets: HashMap::new(),
             packets_sent: 0,
-            sent_size: 0,
             rng,
             output: Output::default(),
         }
@@ -98,7 +139,7 @@ impl TCPPacketSource {
     }
 
     pub fn flow_id(&self) -> usize {
-        self.flow_id
+        self.flow.id
     }
 
     fn packet_sent(&mut self, now: Duration, packet: Packet) {
