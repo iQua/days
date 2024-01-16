@@ -200,6 +200,7 @@ impl Topology {
                             self.flows.push(Flow::new(
                                 flow_id,
                                 collective.flow_type,
+                                collective.flow_size,
                                 source,
                                 sink,
                                 collective.traffic,
@@ -218,6 +219,7 @@ impl Topology {
                             self.flows.push(Flow::new(
                                 flow_id,
                                 collective.flow_type,
+                                collective.flow_size,
                                 source,
                                 sink,
                                 collective.traffic,
@@ -235,6 +237,7 @@ impl Topology {
                             self.flows.push(Flow::new(
                                 flow_id,
                                 collective.flow_type,
+                                collective.flow_size,
                                 source,
                                 sink,
                                 collective.traffic,

@@ -18,6 +18,7 @@ pub enum CollectiveType {
 struct TomlCollective {
     collective_type: CollectiveType,
     flow_type: FlowType,
+    flow_size: usize,
     graph: Vec<(u32, u32)>,
     sources: Vec<usize>,
     sinks: Vec<usize>,
@@ -29,6 +30,7 @@ pub struct Collective {
     pub id: usize,
     pub collective_type: CollectiveType,
     pub flow_type: FlowType,
+    pub flow_size: usize,
     pub graph: DiGraph<usize, ()>,
 
     /// host ids that sources and sinks attach to
@@ -48,6 +50,7 @@ impl Collective {
         id: usize,
         collective_type: CollectiveType,
         flow_type: FlowType,
+        flow_size: usize,
         graph: DiGraph<usize, ()>,
         sources: Vec<usize>,
         sinks: Vec<usize>,
@@ -57,6 +60,7 @@ impl Collective {
             id,
             collective_type,
             flow_type,
+            flow_size,
             graph,
             sources,
             sinks,
@@ -82,6 +86,7 @@ impl Collective {
                 next_collective_id(),
                 CollectiveType::AllReduce,
                 FlowType::PacketDistribution,
+                10000,
                 collective_graph,
                 collective_sources,
                 collective_sinks,
@@ -117,6 +122,7 @@ impl Collective {
                     next_collective_id(),
                     collective.collective_type,
                     collective.flow_type,
+                    collective.flow_size,
                     graph,
                     collective.sources,
                     collective.sinks,
