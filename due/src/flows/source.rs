@@ -24,6 +24,7 @@ pub struct PacketSource {
     flow_id: usize,
     traffic: TrafficCharacteristics,
     packets_sent: usize,
+    sent_size: usize,
     seed: usize,
     rng: SmallRng,
 
@@ -37,6 +38,7 @@ impl Clone for PacketSource {
             flow_id: self.flow_id,
             traffic: self.traffic,
             packets_sent: 0,
+            sent_size: 0,
             rng: self.rng.clone(),
             seed: self.seed,
             output: Output::default(),
@@ -57,6 +59,7 @@ impl PacketSource {
             flow_id,
             traffic,
             packets_sent: 0,
+            sent_size: 0,
             seed,
             rng,
             output: Output::default(),
@@ -73,6 +76,7 @@ impl PacketSource {
 
     fn packet_sent(&mut self, now: Duration, packet: Packet) {
         self.packets_sent += 1;
+        self.sent_size += packet.size;
 
         debug!(
             "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -136,7 +140,11 @@ impl PacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(current_time, packet);
 
-            if now + interval.as_secs_f64() <= self.traffic.duration {
+            if !self
+                .traffic
+                .size
+                .exceeded(self.sent_size, now + interval.as_secs_f64())
+            {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
             } else {
                 info!(

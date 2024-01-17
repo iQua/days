@@ -16,7 +16,7 @@ flow_type = "PacketDistribution"
 graph = [[0, 1]]
 [flow.traffic]
     initial_delay = 1.0
-    duration = 10.0
+    size = 10000
     arr_dist = {type = "Exp", lambda = 1.0}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
 

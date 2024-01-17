@@ -4,7 +4,7 @@ use petgraph::graph::DiGraph;
 use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::next_collective_id;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -21,7 +21,7 @@ struct TomlCollective {
     graph: Vec<(u32, u32)>,
     sources: Vec<usize>,
     sinks: Vec<usize>,
-    traffic: TrafficCharacteristics,
+    traffic: TomlTrafficCharacteristics,
 }
 
 #[derive(Debug)]
@@ -87,7 +87,8 @@ impl Collective {
                 collective_sinks,
                 TrafficCharacteristics::new(
                     1.,
-                    10.,
+                    Some(10.),
+                    None,
                     DistributionInfo::Exp { lambda: 1. },
                     DistributionInfo::DiscreteUniform {
                         low: 1000,
@@ -113,6 +114,8 @@ impl Collective {
             for collective in collectives_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(collective.graph);
 
+                let traffic = TrafficCharacteristics::clone(&collective.traffic);
+
                 collectives.push(Collective::new(
                     next_collective_id(),
                     collective.collective_type,
@@ -120,7 +123,7 @@ impl Collective {
                     graph,
                     collective.sources,
                     collective.sinks,
-                    collective.traffic,
+                    traffic,
                 ));
             }
         }
