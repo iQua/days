@@ -17,7 +17,7 @@ pub enum DistributionInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub enum FlowSize {
-    Size(usize),
+    Bytes(usize),
     Duration(f64),
 }
 
@@ -25,7 +25,7 @@ impl FlowSize {
     pub fn exceeded(&self, sent_size: usize, now: f64) -> bool {
         match self {
             FlowSize::Duration(duration) => now >= *duration,
-            FlowSize::Size(size) => sent_size >= *size,
+            FlowSize::Bytes(size) => sent_size >= *size,
         }
     }
 }
@@ -56,7 +56,7 @@ impl TrafficCharacteristics {
         pkt_size_dist: DistributionInfo,
     ) -> Self {
         let size = match size {
-            Some(size) => FlowSize::Size(size),
+            Some(size) => FlowSize::Bytes(size),
             None => match duration {
                 Some(duration) => FlowSize::Duration(duration),
                 None => panic!("Must specify duration or size of the flow."),
@@ -74,7 +74,7 @@ impl TrafficCharacteristics {
         Self {
             initial_delay: traffic.initial_delay,
             size: match traffic.size {
-                Some(size) => FlowSize::Size(size),
+                Some(size) => FlowSize::Bytes(size),
                 None => match traffic.duration {
                     Some(duration) => FlowSize::Duration(duration),
                     None => panic!("Must specify duration or size of the flow."),
