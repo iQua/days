@@ -20,6 +20,7 @@ pub enum FlowSize {
     Size(usize),
     Duration(f64),
 }
+
 impl FlowSize {
     pub fn reached_duration(&self, now: f64) -> bool {
         match self {
