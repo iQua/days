@@ -69,4 +69,19 @@ impl TrafficCharacteristics {
             pkt_size_dist,
         }
     }
+
+    pub fn clone(traffic: &TomlTrafficCharacteristics) -> Self {
+        Self {
+            initial_delay: traffic.initial_delay,
+            size: match traffic.size {
+                Some(size) => FlowSize::Size(size),
+                None => match traffic.duration {
+                    Some(duration) => FlowSize::Duration(duration),
+                    None => panic!("Must specify duration or size of the flow."),
+                },
+            },
+            arr_dist: traffic.arr_dist,
+            pkt_size_dist: traffic.pkt_size_dist,
+        }
+    }
 }
