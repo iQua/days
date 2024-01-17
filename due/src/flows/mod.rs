@@ -22,7 +22,7 @@ pub enum FlowSize {
 }
 
 impl FlowSize {
-    pub fn stop_flow(&self, sent_size: usize, now: f64) -> bool {
+    pub fn exceeded(&self, sent_size: usize, now: f64) -> bool {
         match self {
             FlowSize::Duration(duration) => now >= *duration,
             FlowSize::Size(size) => sent_size >= *size,
@@ -39,8 +39,6 @@ pub struct TomlTrafficCharacteristics {
     pub pkt_size_dist: DistributionInfo,
 }
 
-/// A struct to define the traffic characterististics, which is used for flow and
-/// source.
 #[derive(Debug, Clone, Copy)]
 pub struct TrafficCharacteristics {
     pub initial_delay: f64,
