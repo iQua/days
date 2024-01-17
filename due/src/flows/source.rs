@@ -143,7 +143,7 @@ impl PacketSource {
             if !self
                 .traffic
                 .size
-                .stop_flow(self.sent_size, now + interval.as_secs_f64())
+                .exceeded(self.sent_size, now + interval.as_secs_f64())
             {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
             } else {

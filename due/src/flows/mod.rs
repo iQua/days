@@ -1,14 +1,11 @@
-pub mod cc;
 pub mod collective;
+use serde::Deserialize;
+
 pub mod flow;
 pub mod packet;
 pub mod route;
 pub mod sink;
 pub mod source;
-pub mod tcp_sink;
-pub mod tcp_source;
-
-use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
@@ -20,15 +17,15 @@ pub enum DistributionInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub enum FlowSize {
-    Size(usize),
+    Bytes(usize),
     Duration(f64),
 }
 
 impl FlowSize {
-    pub fn stop_flow(&self, sent_size: usize, now: f64) -> bool {
+    pub fn exceeded(&self, sent_size: usize, now: f64) -> bool {
         match self {
             FlowSize::Duration(duration) => now >= *duration,
-            FlowSize::Size(size) => sent_size >= *size,
+            FlowSize::Bytes(size) => sent_size >= *size,
         }
     }
 }
@@ -42,8 +39,6 @@ pub struct TomlTrafficCharacteristics {
     pub pkt_size_dist: DistributionInfo,
 }
 
-/// A struct to define the traffic characterististics, which is used for flow and
-/// source.
 #[derive(Debug, Clone, Copy)]
 pub struct TrafficCharacteristics {
     pub initial_delay: f64,
@@ -61,7 +56,7 @@ impl TrafficCharacteristics {
         pkt_size_dist: DistributionInfo,
     ) -> Self {
         let size = match size {
-            Some(size) => FlowSize::Size(size),
+            Some(size) => FlowSize::Bytes(size),
             None => match duration {
                 Some(duration) => FlowSize::Duration(duration),
                 None => panic!("Must specify duration or size of the flow."),
@@ -72,6 +67,21 @@ impl TrafficCharacteristics {
             size,
             arr_dist,
             pkt_size_dist,
+        }
+    }
+
+    pub fn clone(traffic: &TomlTrafficCharacteristics) -> Self {
+        Self {
+            initial_delay: traffic.initial_delay,
+            size: match traffic.size {
+                Some(size) => FlowSize::Bytes(size),
+                None => match traffic.duration {
+                    Some(duration) => FlowSize::Duration(duration),
+                    None => panic!("Must specify duration or size of the flow."),
+                },
+            },
+            arr_dist: traffic.arr_dist,
+            pkt_size_dist: traffic.pkt_size_dist,
         }
     }
 }

@@ -128,13 +128,8 @@ impl Flow {
 
                 for (_, edge) in graph.edge_references().enumerate() {
                     let flow_id = next_flow_id();
-                    let traffic = TrafficCharacteristics::new(
-                        flow.traffic.initial_delay,
-                        flow.traffic.duration,
-                        flow.traffic.size,
-                        flow.traffic.arr_dist,
-                        flow.traffic.pkt_size_dist,
-                    );
+                    let traffic = TrafficCharacteristics::clone(&flow.traffic);
+
                     flows.push(Flow::new(
                         flow_id,
                         flow.flow_type,
@@ -157,13 +152,8 @@ impl Flow {
                         hosts.choose_multiple(&mut rng, 2).cloned().collect();
 
                     let flow_id = next_flow_id();
-                    let traffic = TrafficCharacteristics::new(
-                        flow_set.traffic.initial_delay,
-                        flow_set.traffic.duration,
-                        flow_set.traffic.size,
-                        flow_set.traffic.arr_dist,
-                        flow_set.traffic.pkt_size_dist,
-                    );
+                    let traffic = TrafficCharacteristics::clone(&flow_set.traffic);
+
                     flows.push(Flow::new(
                         flow_id,
                         flow_set.flow_type,

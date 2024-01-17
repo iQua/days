@@ -114,13 +114,8 @@ impl Collective {
             for collective in collectives_vec {
                 let graph = DiGraph::<usize, ()>::from_edges(collective.graph);
 
-                let traffic = TrafficCharacteristics::new(
-                    collective.traffic.initial_delay,
-                    collective.traffic.duration,
-                    collective.traffic.size,
-                    collective.traffic.arr_dist,
-                    collective.traffic.pkt_size_dist,
-                );
+                let traffic = TrafficCharacteristics::clone(&collective.traffic);
+
                 collectives.push(Collective::new(
                     next_collective_id(),
                     collective.collective_type,
