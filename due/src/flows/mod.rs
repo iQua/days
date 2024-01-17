@@ -18,6 +18,21 @@ pub enum DistributionInfo {
     Uniform { low: f64, high: f64 },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FlowSize {
+    Size(usize),
+    Duration(f64),
+}
+
+impl FlowSize {
+    pub fn stop_flow(&self, sent_size: usize, now: f64) -> bool {
+        match self {
+            FlowSize::Duration(duration) => now >= *duration,
+            FlowSize::Size(size) => sent_size >= *size,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct TomlTrafficCharacteristics {
     pub initial_delay: f64,
@@ -27,11 +42,12 @@ pub struct TomlTrafficCharacteristics {
     pub pkt_size_dist: DistributionInfo,
 }
 
+/// A struct to define the traffic characterististics, which is used for flow and
+/// source.
 #[derive(Debug, Clone, Copy)]
 pub struct TrafficCharacteristics {
     pub initial_delay: f64,
-    pub duration: f64,
-    pub size: usize,
+    pub size: FlowSize,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
 }
@@ -44,14 +60,16 @@ impl TrafficCharacteristics {
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
     ) -> Self {
-        if duration.is_none() & size.is_none() {
-            panic!("Must speific duration or size of the flow.");
-        }
-
+        let size = match size {
+            Some(size) => FlowSize::Size(size),
+            None => match duration {
+                Some(duration) => FlowSize::Duration(duration),
+                None => panic!("Must specify duration or size of the flow."),
+            },
+        };
         Self {
             initial_delay,
-            duration: duration.unwrap_or(f64::MAX),
-            size: size.unwrap_or(usize::MAX),
+            size,
             arr_dist,
             pkt_size_dist,
         }

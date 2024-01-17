@@ -140,8 +140,10 @@ impl PacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(current_time, packet);
 
-            if (self.sent_size < self.traffic.size)
-                & (now + interval.as_secs_f64() <= self.traffic.duration)
+            if !self
+                .traffic
+                .size
+                .stop_flow(self.sent_size, now + interval.as_secs_f64())
             {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
             } else {
