@@ -22,18 +22,6 @@ pub enum FlowSize {
 }
 
 impl FlowSize {
-    pub fn reached_duration(&self, now: f64) -> bool {
-        match self {
-            FlowSize::Duration(duration) => now >= *duration,
-            FlowSize::Size(_) => false,
-        }
-    }
-    pub fn reached_size(&self, sent_size: usize) -> bool {
-        match self {
-            FlowSize::Size(size) => sent_size >= *size,
-            FlowSize::Duration(_) => false,
-        }
-    }
     pub fn stop_flow(&self, sent_size: usize, now: f64) -> bool {
         match self {
             FlowSize::Duration(duration) => now >= *duration,
