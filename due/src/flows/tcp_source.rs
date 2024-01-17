@@ -6,7 +6,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use asynchronix::simulation::Mailbox;
 use log::{debug, info};
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
