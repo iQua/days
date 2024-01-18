@@ -233,77 +233,49 @@ impl TCPPacketSource {
         }
     }
 
-    fn timeout_reached(&mut self, scheduler: &Scheduler<Self>) {
-        // let now = scheduler
-        //     .time()
-        //     .duration_since(MonotonicTime::EPOCH)
-        //     .as_secs_f64();
+    fn timeout_reached<'a>(&'a mut self, packet_id: usize, scheduler: &'a Scheduler<Self>) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
-        // debug!(
-        //     "TCPPacketSource {}'s Timer expired for packet {} at time {:.3}.",
-        //     self.endpoint_id, packet_id, now
-        // );
+        debug!(
+            "TCPPacketSource {}'s Timer expired for packet {} at time {:.3}.",
+            self.endpoint_id, packet_id, now
+        );
 
-        // self.congestion_control.timer_expired();
+        self.congestion_control.timer_expired();
 
-        // // retransmits the segment
-        // let resent_pkt = self.sent_packets.get_mut(&packet_id).unwrap();
-        // resent_pkt.time = now;
+        // retransmits the segment
+        let resent_pkt = self.sent_packets.get_mut(&packet_id).unwrap();
+        resent_pkt.time = now;
 
-        // scheduler
-        //     .schedule_event(Duration::from_secs_f64(0.0), Self::send, resent_pkt.clone())
-        //     .unwrap();
+        scheduler
+            .schedule_event(Duration::from_secs_f64(0.0), Self::send, resent_pkt.clone())
+            .unwrap();
 
-        // debug!(
-        //     "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-        //     self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
-        // );
+        debug!(
+            "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+            self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+        );
 
-        // //doubles the retransmission timeout
-        // self.rto *= 2.0;
+        // doubles the retransmission timeout
+        self.rto *= 2.0;
 
-        // // sets a new timer for this segment
-        // let event_key = scheduler
-        //     .schedule_keyed_event(
-        //         Duration::from_secs_f64(self.rto),
-        //         Self::timeout_callback,
-        //         scheduler,
-        //     )
-        //     .unwrap();
+        // schedule a timeout event for this segment
+        let event_key = scheduler
+            .schedule_keyed_event(
+                Duration::from_secs_f64(self.rto),
+                Self::timeout_reached,
+                packet_id,
+            )
+            .unwrap();
 
-        // self.timers.insert(packet_id, event_key);
-    }
-
-    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        let interval = match self.flow.traffic.arr_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng),
-            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
-            DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng)
-            }
-        };
-
-        let packet_size = match self.flow.traffic.pkt_size_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng)
-                as usize,
-            DistributionInfo::Exp { lambda } => {
-                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
-            }
-            DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
-            }
-        };
-
-        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id(), now);
-        (packet, Duration::from_secs_f64(interval))
+        self.timeout_events.insert(packet_id, event_key);
     }
 
     fn retrieve_packet_from_flow(&mut self, now: f64) -> (f64, usize) {
-        // retrieves more packets from the (application-layer) flow
+        // retrieves packet from the (application-layer) flow
         let interval = match self.flow.traffic.arr_dist {
             DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
@@ -339,49 +311,52 @@ impl TCPPacketSource {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
 
-            let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
-            if wait_time > 0.0 {
-                self.send_buffer += packet_size;
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
-                    .unwrap();
-            }
+            if !self.flow.traffic.size.exceeded(self.next_seq, now) {
+                // waits for the next arrival of the packet of the flow
+                let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
+                if wait_time > 0.0 {
+                    self.send_buffer += packet_size;
+                    scheduler
+                        .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
+                        .unwrap();
+                }
+                // the sender can transmit up to the size of the congestion window
+                else if (self.next_seq + self.mss) as f64
+                    <= (self.send_buffer as f64)
+                        .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
+                {
+                    let packet_id = self.next_seq;
+                    let packet = Packet::new(self.mss, packet_id, self.flow_id(), now);
 
-            let packet = Packet::new(self.mss, self.next_seq, self.flow_id(), now);
+                    // sends the packet out to the next element now
+                    self.output.send(packet.clone()).await;
+                    self.packet_sent(current_time, packet.clone());
 
-            // sends the packet out to the next element now
-            self.output.send(packet.clone()).await;
-            self.packet_sent(current_time, packet);
+                    self.sent_packets.insert(packet_id, packet.clone());
 
-            self.sent_packets.insert(packet.packet_id, packet.clone());
+                    self.next_seq += packet.size;
 
-            self.next_seq += packet.size;
+                    // schedule a timeout event for this segment
+                    let event_key = scheduler
+                        .schedule_keyed_event(
+                            Duration::from_secs_f64(self.rto),
+                            Self::timeout_reached,
+                            packet_id,
+                        )
+                        .unwrap();
 
-            // schedule a timeout event for this segment
-            let event_key = scheduler
-                .schedule_keyed_event(
-                    Duration::from_secs_f64(self.rto),
-                    Self::timeout_reached,
-                    scheduler,
-                )
-                .unwrap();
-
-            self.timeout_events.insert(self.next_seq, event_key);
-
-            if !self
-                .flow
-                .traffic
-                .size
-                .stop_flow(self.next_seq, now + interval.as_secs_f64())
-            {
-                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                    self.timeout_events.insert(self.next_seq, event_key);
+                }
             } else {
-                info!(
-                    "TCPPacketSource {} of Flow {} finished running at {:.3}.",
-                    self.endpoint_id,
-                    self.flow_id(),
-                    now
-                );
+                // source can be stopped when all its sent packet either timeout or ack
+                if self.timeout_events.is_empty() {
+                    info!(
+                        "TCPPacketSource {} of Flow {} finished running at {:.3}.",
+                        self.endpoint_id,
+                        self.flow_id(),
+                        now
+                    );
+                }
             }
         }
     }
