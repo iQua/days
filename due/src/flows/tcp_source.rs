@@ -16,15 +16,14 @@ use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{EventKey, MonotonicTime, Scheduler};
 
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
-use crate::flows::flow::Flow;
 use crate::flows::packet::Packet;
-use crate::flows::DistributionInfo;
+use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::{get_seed, next_endpoint_id};
 
 pub struct TCPPacketSource {
     endpoint_id: usize,
-    /// the flow that serves as the source
-    flow: Flow,
+    flow_id: usize,
+    traffic: TrafficCharacteristics,
     /// the time when data last arrived from the flow
     last_arrival: f64,
     /// the congestion controller
@@ -58,7 +57,8 @@ pub struct TCPPacketSource {
 
 impl TCPPacketSource {
     pub fn new(
-        flow: Flow,
+        flow_id: usize,
+        traffic: TrafficCharacteristics,
         cc_algorithm: CCAlgorithm,
         rtt_estimate: f64,
         seed: usize,
@@ -76,7 +76,8 @@ impl TCPPacketSource {
 
         TCPPacketSource {
             endpoint_id: next_endpoint_id(),
-            flow,
+            flow_id,
+            traffic,
             last_arrival: 0.0,
             congestion_control,
             mss: 512,
@@ -97,10 +98,6 @@ impl TCPPacketSource {
 
     pub fn id(&self) -> usize {
         self.endpoint_id
-    }
-
-    pub fn flow_id(&self) -> usize {
-        self.flow.id
     }
 
     fn packet_sent(&mut self, now: Duration, packet: Packet) {
@@ -265,7 +262,7 @@ impl TCPPacketSource {
 
     fn retrieve_packet_from_flow(&mut self, now: f64) -> (f64, usize) {
         // retrieves packet from the (application-layer) flow
-        let interval = match self.flow.traffic.arr_dist {
+        let interval = match self.traffic.arr_dist {
             DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
                 .sample(&mut self.rng),
@@ -275,7 +272,7 @@ impl TCPPacketSource {
             }
         };
 
-        let packet_size = match self.flow.traffic.pkt_size_dist {
+        let packet_size = match self.traffic.pkt_size_dist {
             DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
                 .sample(&mut self.rng)
@@ -300,7 +297,7 @@ impl TCPPacketSource {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
 
-            if !self.flow.traffic.size.exceeded(self.next_seq, now) {
+            if !self.traffic.size.exceeded(self.next_seq, now) {
                 // waits for the next arrival of the packet of the flow
                 let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
                 self.last_arrival = now;
@@ -317,7 +314,7 @@ impl TCPPacketSource {
                         .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
                 {
                     let packet_id = self.next_seq;
-                    let packet = Packet::new(self.mss, packet_id, self.flow_id(), now);
+                    let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
 
                     // sends the packet out to the next element now
                     self.output.send(packet.clone()).await;
@@ -344,9 +341,7 @@ impl TCPPacketSource {
                 if self.timeout_events.is_empty() {
                     info!(
                         "TCPPacketSource {} of Flow {} finished running at {:.3}.",
-                        self.endpoint_id,
-                        self.flow_id(),
-                        now
+                        self.endpoint_id, self.flow_id, now
                     );
                 }
             }
@@ -360,10 +355,10 @@ impl Model for TCPPacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            if self.flow.traffic.initial_delay > 0.0 {
+            if self.traffic.initial_delay > 0.0 {
                 scheduler
                     .schedule_event(
-                        Duration::from_secs_f64(self.flow.traffic.initial_delay),
+                        Duration::from_secs_f64(self.traffic.initial_delay),
                         Self::run,
                         (),
                     )
