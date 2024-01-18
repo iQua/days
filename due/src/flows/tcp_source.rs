@@ -120,9 +120,9 @@ impl TCPPacketSource {
         self.output.send(packet).await;
     }
 
-    /// On receiving an acknowledgment packet.
+    /// On receiving an acknowledgment packet
     pub fn ack_packet_received(&mut self, ack_packet: Packet, scheduler: &Scheduler<Self>) {
-        // the received packet must be an ack
+        // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
 
         let now = scheduler.time();
@@ -262,7 +262,7 @@ impl TCPPacketSource {
         // doubles the retransmission timeout
         self.rto *= 2.0;
 
-        // schedule a timeout event for this segment
+        // schedule a new timeout event for this segment
         let event_key = scheduler
             .schedule_keyed_event(
                 Duration::from_secs_f64(self.rto),
@@ -348,7 +348,8 @@ impl TCPPacketSource {
                     self.timeout_events.insert(self.next_seq, event_key);
                 }
             } else {
-                // source can be stopped when all its sent packet either timeout or ack
+                // source can be stopped when all its sent packets either
+                // reached timeout or their acknowledgments were receieved
                 if self.timeout_events.is_empty() {
                     info!(
                         "TCPPacketSource {} of Flow {} finished running at {:.3}.",

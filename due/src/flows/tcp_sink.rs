@@ -1,4 +1,4 @@
-//! Implements a TCPSink, designed to send ack packets back to the
+//! Implements a TCPSink, designed to send acknowledgement packets back to
 //! TCPPacketSource.
 
 use std::fmt::Debug;
