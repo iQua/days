@@ -16,11 +16,11 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    // Instantiates models and their mailboxes.
+    // instantiates models and their mailboxes
     let mut source = TCPPacketSource::new(
         0,
         TrafficCharacteristics::new(
-            0.0,
+            0.1,
             Some(10.0),
             Some(2014),
             DistributionInfo::Uniform {
@@ -41,13 +41,17 @@ fn main() {
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // Connects the output of packet source to the input of packet sink.
+    // connects the output of packet source to the input of packet sink
     source
         .output
         .connect(TCPPacketSink::packet_received, &sink_mbox);
+    // connects the output of packet sink to the input of packet source to
+    // receive acknowledgment
+    sink.output
+        .connect(TCPPacketSource::ack_packet_received, &source_mbox);
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
-    // Instantiates the simulator.
+    // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
     let mut sim = SimInit::new()
         .add_model(source, source_mbox)
