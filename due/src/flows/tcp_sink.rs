@@ -61,10 +61,6 @@ impl TCPPacketSink {
         self.endpoint_id
     }
 
-    pub fn flow_id(&self) -> usize {
-        self.flow_id
-    }
-
     pub fn statistics(&self) -> PacketStatistics {
         PacketStatistics {
             endpoint_id: self.endpoint_id,

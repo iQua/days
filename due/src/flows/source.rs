@@ -70,10 +70,6 @@ impl PacketSource {
         self.endpoint_id
     }
 
-    pub fn flow_id(&self) -> usize {
-        self.flow_id
-    }
-
     fn packet_sent(&mut self, now: Duration, packet: Packet) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
@@ -122,7 +118,7 @@ impl PacketSource {
             }
         };
 
-        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id(), now);
+        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
         (packet, Duration::from_secs_f64(interval))
     }
 
