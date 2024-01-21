@@ -136,7 +136,7 @@ impl WFQServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, mut packet: Packet, scheduler: &Scheduler<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
