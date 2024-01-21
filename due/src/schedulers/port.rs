@@ -92,7 +92,6 @@ impl Port {
         self.packets_received += 1;
         self.queue.push_back(packet.clone());
         self.bytes_in_queue += packet.size;
-        packet.arrival_update(arrival_time);
 
         debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -143,8 +142,9 @@ impl Port {
                 .as_secs_f64();
 
             if let Some(mut packet) = self.queue.pop_front() {
-                packet.departure_update(now);
+                packet.queueing_delay_update(now);
                 let timeout = packet.size as f64 * 8.0 / self.rate;
+                packet.departure_update(now + timeout);
 
                 scheduler
                     .schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())

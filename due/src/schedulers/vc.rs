@@ -160,7 +160,6 @@ impl VirtualClockServer {
         }
 
         self.packets_received += 1;
-        packet.arrival_update(arrival_time);
 
         // computes a virtual clock finish time and adds it as a tag to the packet
         let tagged_packet = self.tag(packet.clone(), arrival_time);
@@ -235,10 +234,13 @@ impl VirtualClockServer {
             *flow_queue_count -= 1;
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;
-            outbound.departure_update(now);
+
+            outbound.queueing_delay_update(now);
 
             // sends the packet out to the next element after a timeout
             let timeout = outbound.size as f64 * 8.0 / self.rate;
+
+            outbound.departure_update(now + timeout);
 
             scheduler
                 .schedule_event(
