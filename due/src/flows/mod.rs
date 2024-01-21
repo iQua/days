@@ -9,6 +9,7 @@ pub mod sink;
 pub mod source;
 pub mod tcp_sink;
 pub mod tcp_source;
+pub mod wire;
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
