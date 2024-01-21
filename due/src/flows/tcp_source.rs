@@ -296,23 +296,40 @@ impl TCPPacketSource {
         async move {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
+            println!("NOW: {:.3}", now);
 
             if !self.traffic.size.exceeded(self.next_seq, now) {
-                // waits for the next arrival of the packet of the flow
-                let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
-                self.last_arrival = now;
-                if wait_time > 0.0 {
-                    self.last_arrival += wait_time;
-                    self.send_buffer += packet_size;
-                    scheduler
-                        .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
-                        .unwrap();
+                if self.next_seq >= self.send_buffer {
+                    // retrieves more packets from the (application-layer) flow
+                    let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
+                    println!("wait_time: {:.3} packet_size: {}", wait_time, packet_size);
+                    self.last_arrival = now;
+
+                    // waits for the next arrival of the packet of the flow
+                    if wait_time > 0.0 {
+                        self.last_arrival += wait_time;
+                        self.send_buffer += packet_size;
+                        scheduler
+                            .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
+                            .unwrap();
+                    }
+                    return;
                 }
+
+                println!(
+                    "{} {} {} {} {}",
+                    self.next_seq,
+                    self.mss,
+                    self.send_buffer,
+                    self.last_ack,
+                    self.congestion_control.get_cwnd()
+                );
                 // the sender can transmit up to the size of the congestion window
-                else if (self.next_seq + self.mss) as f64
+                if (self.next_seq + self.mss) as f64
                     <= (self.send_buffer as f64)
                         .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
                 {
+                    println!("YES");
                     let packet_id = self.next_seq;
                     let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
 
@@ -351,11 +368,13 @@ impl TCPPacketSource {
 
 impl Model for TCPPacketSource {
     fn init(
-        self,
+        mut self,
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
             if self.traffic.initial_delay > 0.0 {
+                self.last_arrival = self.traffic.initial_delay;
+                println!("START SOURCE {:?}", self.traffic.initial_delay);
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(self.traffic.initial_delay),
