@@ -212,6 +212,8 @@ impl TCPPacketSource {
                     .1
                     .cancel();
             }
+
+            self.run((), scheduler).await;
         }
     }
 
@@ -299,21 +301,23 @@ impl TCPPacketSource {
             println!("NOW: {:.3}", now);
 
             if !self.traffic.size.exceeded(self.next_seq, now) {
-                if self.next_seq >= self.send_buffer {
+                while self.next_seq >= self.send_buffer {
                     // retrieves more packets from the (application-layer) flow
                     let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
                     println!("wait_time: {:.3} packet_size: {}", wait_time, packet_size);
                     self.last_arrival = now;
+                    self.send_buffer += packet_size;
 
                     // waits for the next arrival of the packet of the flow
                     if wait_time > 0.0 {
                         self.last_arrival += wait_time;
-                        self.send_buffer += packet_size;
+
                         scheduler
                             .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
                             .unwrap();
+
+                        return;
                     }
-                    return;
                 }
 
                 println!(
@@ -351,15 +355,8 @@ impl TCPPacketSource {
                         .unwrap();
 
                     self.timeout_events.insert(packet_id, event_key);
-                }
-            } else {
-                // source can be stopped when all its sent packets either
-                // reached timeout or their acknowledgments were receieved
-                if self.timeout_events.is_empty() {
-                    info!(
-                        "TCPPacketSource {} of Flow {} finished running at {:.3}.",
-                        self.endpoint_id, self.flow_id, now
-                    );
+
+                    self.run((), scheduler).await;
                 }
             }
         }
@@ -373,8 +370,6 @@ impl Model for TCPPacketSource {
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
             if self.traffic.initial_delay > 0.0 {
-                self.last_arrival = self.traffic.initial_delay;
-                println!("START SOURCE {:?}", self.traffic.initial_delay);
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(self.traffic.initial_delay),
@@ -383,10 +378,7 @@ impl Model for TCPPacketSource {
                     )
                     .unwrap();
             } else {
-                panic!(
-                    "The initial delay of TCPPacketSource {}'s flow must be positive.",
-                    self.endpoint_id
-                )
+                self.run((), scheduler).await;
             }
 
             self.into()
