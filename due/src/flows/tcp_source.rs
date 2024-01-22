@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -217,7 +217,7 @@ impl TCPPacketSource {
         }
     }
 
-    fn timeout_reached<'a>(
+    fn timer_expired<'a>(
         &'a mut self,
         packet_id: usize,
         scheduler: &'a Scheduler<Self>,
@@ -253,12 +253,17 @@ impl TCPPacketSource {
             let event_key = scheduler
                 .schedule_keyed_event(
                     Duration::from_secs_f64(self.rto),
-                    Self::timeout_reached,
+                    Self::timer_expired,
                     packet_id,
                 )
                 .unwrap();
 
             self.timeout_events.insert(packet_id, event_key);
+
+            debug!(
+                "TCPPacketSource {} reset a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
+                self.endpoint_id, packet_id, self.rto, now + self.rto
+            );
         }
     }
 
@@ -298,7 +303,6 @@ impl TCPPacketSource {
         async move {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
-            println!("NOW: {:.3}", now);
 
             if !self.traffic.size.exceeded(self.next_seq, now) {
                 while self.next_seq >= self.send_buffer {
@@ -333,7 +337,6 @@ impl TCPPacketSource {
                     <= (self.send_buffer as f64)
                         .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
                 {
-                    println!("YES");
                     let packet_id = self.next_seq;
                     let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
 
@@ -349,14 +352,19 @@ impl TCPPacketSource {
                     let event_key = scheduler
                         .schedule_keyed_event(
                             Duration::from_secs_f64(self.rto),
-                            Self::timeout_reached,
+                            Self::timer_expired,
                             packet_id,
                         )
                         .unwrap();
 
                     self.timeout_events.insert(packet_id, event_key);
 
-                    self.run((), scheduler).await;
+                    debug!(
+                            "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
+                            self.endpoint_id, packet.packet_id, self.rto, now + self.rto
+                        );
+
+                    //self.run(scheduler).await;
                 }
             }
         }
