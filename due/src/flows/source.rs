@@ -158,17 +158,14 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            if self.traffic.initial_delay > 0.0 {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(self.traffic.initial_delay),
-                        Self::run,
-                        (),
-                    )
-                    .unwrap();
-            } else {
-                self.run((), scheduler).await;
-            }
+            let (_, interval) = self.produce_packet(0.0);
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.traffic.initial_delay + interval.as_secs_f64()),
+                    Self::run,
+                    (),
+                )
+                .unwrap();
 
             self.into()
         })
