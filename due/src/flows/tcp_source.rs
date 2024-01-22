@@ -6,6 +6,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
@@ -295,11 +297,7 @@ impl TCPPacketSource {
         (interval - (now - self.last_arrival), packet_size)
     }
 
-    pub fn run<'a>(
-        &'a mut self,
-        _: (),
-        scheduler: &'a Scheduler<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
+    pub fn run<'a>(&'a mut self, _: (), scheduler: &'a Scheduler<Self>) -> BoxFuture<'a, ()> {
         async move {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
@@ -308,7 +306,7 @@ impl TCPPacketSource {
                 while self.next_seq >= self.send_buffer {
                     // retrieves more packets from the (application-layer) flow
                     let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
-                    println!("wait_time: {:.3} packet_size: {}", wait_time, packet_size);
+
                     self.last_arrival = now;
                     self.send_buffer += packet_size;
 
@@ -364,10 +362,10 @@ impl TCPPacketSource {
                             self.endpoint_id, packet.packet_id, self.rto, now + self.rto
                         );
 
-                    //self.run(scheduler).await;
+                    self.run((), scheduler).await;
                 }
             }
-        }
+        }.boxed()
     }
 }
 
