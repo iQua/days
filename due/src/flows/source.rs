@@ -154,7 +154,7 @@ impl PacketSource {
 
 impl Model for PacketSource {
     fn init(
-        self,
+        mut self,
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
@@ -167,10 +167,7 @@ impl Model for PacketSource {
                     )
                     .unwrap();
             } else {
-                panic!(
-                    "PacketSource {}'s initial delay must be positive.",
-                    self.endpoint_id
-                )
+                self.run((), scheduler).await;
             }
 
             self.into()
