@@ -21,7 +21,7 @@ fn main() {
     let mut source = PacketSource::new(
         0,
         TrafficCharacteristics::new(
-            1.0,
+            1.1,
             Some(10.0),
             Some(4000),
             DistributionInfo::Uniform {
@@ -39,8 +39,8 @@ fn main() {
     let mut wire = Wire::new(
         0,
         DistributionInfo::Uniform {
-            low: 0.2,
-            high: 0.2,
+            low: 0.05,
+            high: 0.05,
         },
     );
 
@@ -68,7 +68,7 @@ fn main() {
     sim.step_by(Duration::from_secs(100));
 
     // requests the packet sink to report statistics
-    sim.send_event(PacketSink::report, 0, &sink_addr);
+    sim.send_event(PacketSink::report, 1, &sink_addr);
 
     if let Some(statistics) = sink_statistics.take() {
         info!("{:#.3}", statistics);

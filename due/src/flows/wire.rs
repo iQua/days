@@ -63,10 +63,6 @@ impl Wire {
         // updates the packet's time and advances the simulation to that time
         // before sending the packet, whose queueing delay remains unchanged
         packet.time += delay;
-        debug!(
-            "Wire {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.wire_id, packet.packet_id, packet.size, packet.flow_id, packet.time,
-        );
 
         if packet.time > now {
             scheduler
@@ -82,6 +78,11 @@ impl Wire {
     }
 
     async fn forward_packet(&mut self, packet: Packet) {
+        debug!(
+            "Wire {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
+            self.wire_id, packet.packet_id, packet.size, packet.flow_id, packet.time,
+        );
+
         self.output.send(packet).await;
     }
 }
