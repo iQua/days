@@ -21,7 +21,7 @@ fn main() {
     let mut source = PacketSource::new(
         0,
         TrafficCharacteristics::new(
-            1.1,
+            0.0,
             Some(10.0),
             Some(4000),
             DistributionInfo::Uniform {
@@ -39,8 +39,8 @@ fn main() {
     let mut wire = Wire::new(
         0,
         DistributionInfo::Uniform {
-            low: 0.05,
-            high: 0.05,
+            low: 0.2,
+            high: 0.2,
         },
     );
 
