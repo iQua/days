@@ -25,25 +25,9 @@ pub struct PacketSource {
     traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
-    seed: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,
-}
-
-impl Clone for PacketSource {
-    fn clone(&self) -> Self {
-        PacketSource {
-            endpoint_id: next_endpoint_id(),
-            flow_id: self.flow_id,
-            traffic: self.traffic,
-            packets_sent: 0,
-            sent_size: 0,
-            rng: self.rng.clone(),
-            seed: self.seed,
-            output: Output::default(),
-        }
-    }
 }
 
 impl PacketSource {
@@ -60,7 +44,6 @@ impl PacketSource {
             traffic,
             packets_sent: 0,
             sent_size: 0,
-            seed,
             rng,
             output: Output::default(),
         }

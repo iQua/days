@@ -156,23 +156,6 @@ pub struct PacketSink {
     pub output: Output<Packet>,
 }
 
-impl Clone for PacketSink {
-    fn clone(&self) -> Self {
-        PacketSink {
-            endpoint_id: next_endpoint_id(),
-            flow_id: self.flow_id,
-            arrival_times: RandomVar::new(),
-            last_arrival_time: 0.0,
-            inter_arrival_times: RandomVar::new(),
-            one_way_delays: RandomVar::new(),
-            queueing_delays: RandomVar::new(),
-            packet_sizes: RandomVar::new(),
-            statistics: Output::default(),
-            output: Output::default(),
-        }
-    }
-}
-
 impl PacketSink {
     pub fn new(flow_id: usize) -> PacketSink {
         PacketSink {
