@@ -322,14 +322,6 @@ impl TCPPacketSource {
                     }
                 }
 
-                println!(
-                    "{} {} {} {} {}",
-                    self.next_seq,
-                    self.mss,
-                    self.send_buffer,
-                    self.last_ack,
-                    self.congestion_control.get_cwnd()
-                );
                 // the sender can transmit up to the size of the congestion window
                 if (self.next_seq + self.mss) as f64
                     <= (self.send_buffer as f64)
