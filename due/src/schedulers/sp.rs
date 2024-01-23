@@ -86,7 +86,7 @@ impl SPServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, mut packet: Packet, scheduler: &Scheduler<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -111,7 +111,6 @@ impl SPServer {
         }
 
         self.packets_received += 1;
-        packet.arrival_update(arrival_time);
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -172,10 +171,13 @@ impl SPServer {
 
             let byte_size = self.byte_sizes.entry(current_priority).or_insert(0);
             *byte_size -= packet.size;
-            packet.departure_update(now);
+
+            packet.queueing_delay_update(now);
 
             // sends the packet out to the next element after a timeout
             let timeout = packet.size as f64 * 8.0 / self.rate;
+
+            packet.departure_update(now + timeout);
 
             scheduler
                 .schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)

@@ -1,6 +1,11 @@
 //! A very simple struct that represents a packet.
 
 #[derive(Debug, Clone)]
+pub struct TCPAck {
+    pub sequence_num: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct Packet {
     /// Packets in Due are typically created by packet generators, and runs
     /// through a sequence of packet-forwarding switches. It may be entered into
@@ -36,6 +41,8 @@ pub struct Packet {
     pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
     pub queueing_delay: f64,
+    /// used by TCPPacketSource and TCPPacketSink
+    pub ack: Option<TCPAck>,
 }
 
 impl Packet {
@@ -48,17 +55,17 @@ impl Packet {
             flow_id,
             creation_time,
             queueing_delay: 0.0,
+            ack: None,
         }
     }
 
     /// Updates the queueing delay of the packet when it departs from a scheduler.
-    pub fn departure_update(&mut self, time: f64) {
+    pub fn queueing_delay_update(&mut self, time: f64) {
         self.queueing_delay += time - self.time;
-        self.time = time;
     }
 
-    /// Records the current simulation time when a packet arrives at a scheduler.
-    pub fn arrival_update(&mut self, time: f64) {
+    /// Records the current simulation time when a packet departs from a component.
+    pub fn departure_update(&mut self, time: f64) {
         self.time = time;
     }
 }

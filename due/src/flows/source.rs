@@ -25,25 +25,9 @@ pub struct PacketSource {
     traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
-    seed: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,
-}
-
-impl Clone for PacketSource {
-    fn clone(&self) -> Self {
-        PacketSource {
-            endpoint_id: next_endpoint_id(),
-            flow_id: self.flow_id,
-            traffic: self.traffic,
-            packets_sent: 0,
-            sent_size: 0,
-            rng: self.rng.clone(),
-            seed: self.seed,
-            output: Output::default(),
-        }
-    }
 }
 
 impl PacketSource {
@@ -60,7 +44,6 @@ impl PacketSource {
             traffic,
             packets_sent: 0,
             sent_size: 0,
-            seed,
             rng,
             output: Output::default(),
         }
@@ -68,10 +51,6 @@ impl PacketSource {
 
     pub fn id(&self) -> usize {
         self.endpoint_id
-    }
-
-    pub fn flow_id(&self) -> usize {
-        self.flow_id
     }
 
     fn packet_sent(&mut self, now: Duration, packet: Packet) {
@@ -122,7 +101,7 @@ impl PacketSource {
             }
         };
 
-        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id(), now);
+        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
         (packet, Duration::from_secs_f64(interval))
     }
 
@@ -158,24 +137,18 @@ impl PacketSource {
 
 impl Model for PacketSource {
     fn init(
-        self,
+        mut self,
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            if self.traffic.initial_delay > 0.0 {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(self.traffic.initial_delay),
-                        Self::run,
-                        (),
-                    )
-                    .unwrap();
-            } else {
-                panic!(
-                    "PacketSource {}'s initial delay must be positive.",
-                    self.endpoint_id
+            let (_, interval) = self.produce_packet(0.0);
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.traffic.initial_delay + interval.as_secs_f64()),
+                    Self::run,
+                    (),
                 )
-            }
+                .unwrap();
 
             self.into()
         })
