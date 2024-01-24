@@ -49,6 +49,10 @@ pub struct TCPPacketSource {
     /// the scheduled events of timeouts of in-flight packets (segments)
     timeout_events: HashMap<usize, EventKey>,
 
+    /// The source is considered busy retrieving the current packet from flow
+    /// until this time
+    busy_until: f64,
+
     packets_sent: usize,
     rng: SmallRng,
 
@@ -87,6 +91,7 @@ impl TCPPacketSource {
             est_deviation: 0.0,
             sent_packets: HashMap::new(),
             timeout_events: HashMap::new(),
+            busy_until: 0.0,
             packets_sent: 0,
             rng,
             output: Output::default(),
@@ -210,7 +215,9 @@ impl TCPPacketSource {
                     .cancel();
             }
 
-            self.run((), scheduler).await;
+            if now >= self.busy_until {
+                self.run((), scheduler).await;
+            }
         }
     }
 
@@ -309,11 +316,10 @@ impl TCPPacketSource {
                     self.last_arrival = now;
                     self.send_buffer += packet_size;
 
-                    println!("{} Wait {} Now {}", self.send_buffer, wait_time, now);
-
                     // waits for the next arrival of the packet of the flow
                     if wait_time > 0.0 {
                         self.last_arrival += wait_time;
+                        self.busy_until = self.last_arrival;
 
                         scheduler
                             .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
@@ -323,14 +329,6 @@ impl TCPPacketSource {
                     }
                 }
 
-                println!(
-                    "{} {} {} {} {}",
-                    self.next_seq,
-                    self.mss,
-                    self.send_buffer,
-                    self.last_ack,
-                    self.congestion_control.get_cwnd()
-                );
                 // the sender can transmit up to the size of the congestion window
                 if (self.next_seq + self.mss) as f64
                     <= (self.send_buffer as f64)
