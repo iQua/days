@@ -1,7 +1,5 @@
-pub mod collective;
-use serde::Deserialize;
-
 pub mod cc;
+pub mod collective;
 pub mod flow;
 pub mod packet;
 pub mod route;
@@ -10,6 +8,9 @@ pub mod source;
 pub mod tcp_sink;
 pub mod tcp_source;
 pub mod wire;
+
+use crate::flows::cc::CCAlgorithm;
+use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
@@ -41,6 +42,7 @@ pub struct TomlTrafficCharacteristics {
     pub size: Option<usize>,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
+    pub tcp: Option<TCPCharacteristics>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +51,7 @@ pub struct TrafficCharacteristics {
     pub size: FlowSize,
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
+    pub tcp: Option<TCPCharacteristics>,
 }
 
 impl TrafficCharacteristics {
@@ -58,6 +61,7 @@ impl TrafficCharacteristics {
         size: Option<usize>,
         arr_dist: DistributionInfo,
         pkt_size_dist: DistributionInfo,
+        tcp: Option<TCPCharacteristics>,
     ) -> Self {
         let size = match size {
             Some(size) => FlowSize::Bytes(size),
@@ -71,6 +75,7 @@ impl TrafficCharacteristics {
             size,
             arr_dist,
             pkt_size_dist,
+            tcp,
         }
     }
 
@@ -86,6 +91,13 @@ impl TrafficCharacteristics {
             },
             arr_dist: traffic.arr_dist,
             pkt_size_dist: traffic.pkt_size_dist,
+            tcp: traffic.tcp,
         }
     }
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct TCPCharacteristics {
+    pub cc_algorithm: CCAlgorithm,
+    pub rtt_estimate: f64,
 }

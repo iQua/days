@@ -9,12 +9,12 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::flows::cc::CCAlgorithm::TCPReno;
-//use due::flows::cc::CCAlgorithm::TCPCubic;
+//use due::flows::cc::CCAlgorithm::TCPReno;
+use due::flows::cc::CCAlgorithm::TCPCubic;
 use due::flows::tcp_sink::TCPPacketSink;
 use due::flows::tcp_source::TCPPacketSource;
 use due::flows::wire::Wire;
-use due::flows::{DistributionInfo, TrafficCharacteristics};
+use due::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
 use due::schedulers::drr::DRRServer;
 
@@ -37,10 +37,11 @@ fn main() {
                 low: 512,
                 high: 512,
             },
+            Some(TCPCharacteristics {
+                cc_algorithm: TCPCubic,
+                rtt_estimate: 0.5,
+            }),
         ),
-        TCPReno,
-        //TCPCubic,
-        0.5,
         0,
     );
 

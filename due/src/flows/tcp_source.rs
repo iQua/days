@@ -58,18 +58,15 @@ pub struct TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        cc_algorithm: CCAlgorithm,
-        rtt_estimate: f64,
-        seed: usize,
-    ) -> TCPPacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> TCPPacketSource {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
+
+        let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
+        let rtt_estimate = traffic.tcp.unwrap().rtt_estimate;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
