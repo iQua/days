@@ -21,10 +21,10 @@ use crate::{get_seed, next_endpoint_id};
 #[derive(Debug)]
 pub struct DistPacketSource {
     pub endpoint_id: usize,
-    flow_id: usize,
+    pub flow_id: usize,
     pub traffic: TrafficCharacteristics,
     packets_sent: usize,
-    sent_size: usize,
+    pub sent_size: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,

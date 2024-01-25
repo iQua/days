@@ -21,9 +21,9 @@ use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::{get_seed, next_endpoint_id};
 
 pub struct TCPPacketSource {
-    endpoint_id: usize,
-    flow_id: usize,
-    traffic: TrafficCharacteristics,
+    pub endpoint_id: usize,
+    pub flow_id: usize,
+    pub traffic: TrafficCharacteristics,
     /// the time when data last arrived from the flow
     last_arrival: f64,
     /// the congestion controller
@@ -31,7 +31,7 @@ pub struct TCPPacketSource {
     /// maximum segment size, in bytes
     mss: usize,
     /// the next sequence number to be sent, in bytes
-    next_seq: usize,
+    pub next_seq: usize,
     /// the maximum sequence number in the in-transit data buffer
     send_buffer: usize,
     /// the sequence number of the segment that is last acknowledged
@@ -98,20 +98,12 @@ impl TCPPacketSource {
         }
     }
 
-    pub fn id(&self) -> usize {
-        self.endpoint_id
-    }
-
-    fn packet_sent(&mut self, now: Duration, packet: Packet) {
+    pub fn packet_sent(&mut self, now: f64, packet: Packet) {
         self.packets_sent += 1;
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.endpoint_id,
-            packet.packet_id,
-            packet.size,
-            now.as_secs_f64(),
-            self.packets_sent,
+            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
     }
 
@@ -339,7 +331,7 @@ impl TCPPacketSource {
 
                     // sends the packet out to the next element now
                     self.output.send(packet.clone()).await;
-                    self.packet_sent(current_time, packet.clone());
+                    self.packet_sent(now, packet.clone());
 
                     self.sent_packets.insert(packet_id, packet.clone());
 
