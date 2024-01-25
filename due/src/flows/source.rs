@@ -8,7 +8,7 @@ use std::time::Duration;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
-use asynchronix::model::{InitializedModel, Model};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::Scheduler;
 
 use crate::flows::dist_source::DistPacketSource;
@@ -17,6 +17,7 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
 
+#[derive(Debug)]
 pub enum PacketSource {
     DistPacketSource(DistPacketSource),
     TCPPacketSource(TCPPacketSource),
@@ -34,6 +35,13 @@ impl PacketSource {
             PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, seed))
         } else {
             PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, seed))
+        }
+    }
+
+    pub fn output(&self) -> Output<Packet> {
+        match self {
+            PacketSource::DistPacketSource(source) => source.output,
+            PacketSource::TCPPacketSource(source) => source.output,
         }
     }
 

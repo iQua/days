@@ -1,6 +1,7 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
 
+use core::fmt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -57,6 +58,15 @@ pub struct TCPPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
+}
+
+impl fmt::Debug for TCPPacketSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("")
+            .field(&self.endpoint_id)
+            .field(&self.flow_id)
+            .finish()
+    }
 }
 
 impl TCPPacketSource {
