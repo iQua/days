@@ -20,9 +20,9 @@ use crate::{get_seed, next_endpoint_id};
 
 #[derive(Debug)]
 pub struct DistPacketSource {
-    endpoint_id: usize,
+    pub endpoint_id: usize,
     flow_id: usize,
-    traffic: TrafficCharacteristics,
+    pub traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
     rng: SmallRng,
@@ -47,5 +47,109 @@ impl DistPacketSource {
             rng,
             output: Output::default(),
         }
+    }
+
+    pub fn packet_sent(&mut self, now: f64, packet: Packet) {
+        self.packets_sent += 1;
+        self.sent_size += packet.size;
+
+        debug!(
+            "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
+        );
+    }
+
+    pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        debug!(
+            "DistPacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+        );
+    }
+
+    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+        let interval = match self.traffic.arr_dist {
+            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
+                .unwrap()
+                .sample(&mut self.rng),
+            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
+            DistributionInfo::Uniform { low, high } => {
+                Uniform::new(low, high).unwrap().sample(&mut self.rng)
+            }
+        };
+
+        let packet_size = match self.traffic.pkt_size_dist {
+            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
+                .unwrap()
+                .sample(&mut self.rng)
+                as usize,
+            DistributionInfo::Exp { lambda } => {
+                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
+            }
+            DistributionInfo::Uniform { low, high } => {
+                Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
+            }
+        };
+
+        let mut packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
+        packet.time += interval;
+
+        (packet, Duration::from_secs_f64(interval))
+    }
+
+    async fn send(&mut self, packet: Packet) {
+        self.output.send(packet.clone()).await;
+        self.packet_sent(packet.time, packet);
+    }
+
+    pub fn run<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+            let now = current_time.as_secs_f64();
+
+            if !self.traffic.size.exceeded(self.sent_size, now) {
+                let (packet, interval) = self.produce_packet(now);
+
+                scheduler
+                    .schedule_event(interval, Self::send, packet.clone())
+                    .unwrap();
+
+                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+            } else {
+                info!(
+                    "DistPacketSource {} of Flow {} finished running at {:.3}.",
+                    self.endpoint_id, self.flow_id, now
+                );
+            }
+        }
+    }
+}
+
+impl Model for DistPacketSource {
+    fn init(
+        mut self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            if self.traffic.initial_delay > 0.0 {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(self.traffic.initial_delay),
+                        Self::run,
+                        (),
+                    )
+                    .unwrap();
+            } else {
+                self.run((), scheduler).await;
+            }
+
+            self.into()
+        })
     }
 }
