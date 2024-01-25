@@ -6,8 +6,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use futures::FutureExt;
 use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
@@ -51,6 +49,10 @@ pub struct TCPPacketSource {
     /// the scheduled events of timeouts of in-flight packets (segments)
     timeout_events: HashMap<usize, EventKey>,
 
+    /// The source is considered busy retrieving the current packet from flow
+    /// until this time
+    busy_until: f64,
+
     packets_sent: usize,
     rng: SmallRng,
 
@@ -58,18 +60,15 @@ pub struct TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        cc_algorithm: CCAlgorithm,
-        rtt_estimate: f64,
-        seed: usize,
-    ) -> TCPPacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> TCPPacketSource {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
+
+        let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
+        let rtt_estimate = traffic.tcp.unwrap().rtt_estimate;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
@@ -92,6 +91,7 @@ impl TCPPacketSource {
             est_deviation: 0.0,
             sent_packets: HashMap::new(),
             timeout_events: HashMap::new(),
+            busy_until: 0.0,
             packets_sent: 0,
             rng,
             output: Output::default(),
@@ -215,7 +215,9 @@ impl TCPPacketSource {
                     .cancel();
             }
 
-            self.run((), scheduler).await;
+            if now >= self.busy_until {
+                self.run((), scheduler).await;
+            }
         }
     }
 
@@ -297,12 +299,16 @@ impl TCPPacketSource {
         (interval - (now - self.last_arrival), packet_size)
     }
 
-    pub fn run<'a>(&'a mut self, _: (), scheduler: &'a Scheduler<Self>) -> BoxFuture<'a, ()> {
+    pub fn run<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
 
-            if !self.traffic.size.exceeded(self.next_seq, now) {
+            while !self.traffic.size.exceeded(self.next_seq, now) {
                 while self.next_seq >= self.send_buffer {
                     // retrieves more packets from the (application-layer) flow
                     let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
@@ -313,6 +319,7 @@ impl TCPPacketSource {
                     // waits for the next arrival of the packet of the flow
                     if wait_time > 0.0 {
                         self.last_arrival += wait_time;
+                        self.busy_until = self.last_arrival;
 
                         scheduler
                             .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
@@ -353,11 +360,11 @@ impl TCPPacketSource {
                             "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
                             self.endpoint_id, packet.packet_id, self.rto, now + self.rto
                         );
-
-                    self.run((), scheduler).await;
+                } else {
+                    return;
                 }
             }
-        }.boxed()
+        }
     }
 }
 
