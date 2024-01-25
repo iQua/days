@@ -1,5 +1,6 @@
 pub mod cc;
 pub mod collective;
+pub mod dist_source;
 pub mod flow;
 pub mod packet;
 pub mod route;
@@ -9,8 +10,9 @@ pub mod tcp_sink;
 pub mod tcp_source;
 pub mod wire;
 
-use crate::flows::cc::CCAlgorithm;
 use serde::Deserialize;
+
+use crate::flows::cc::CCAlgorithm;
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(tag = "type")]
