@@ -1,10 +1,11 @@
-//! Implements a packet source that simulates the sending of packets with
-//! specific distributions of inter-arrival times and packet sizes.
+//! Implements a general packet source that provides interfaces of all kinds of
+//! packet sources.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
@@ -21,6 +22,15 @@ use crate::get_seed;
 pub enum PacketSource {
     DistPacketSource(DistPacketSource),
     TCPPacketSource(TCPPacketSource),
+}
+
+impl std::fmt::Display for PacketSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PacketSource::DistPacketSource(_) => write!(f, "DistPacketSource {}", self.id()),
+            PacketSource::TCPPacketSource(_) => write!(f, "TCPPacketSource {}", self.id()),
+        }
+    }
 }
 
 impl PacketSource {
@@ -104,6 +114,12 @@ impl Model for PacketSource {
                 PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
                 PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
             };
+
+            debug!(
+                "{} will be waiting for {:.3} sec(s) at the beginning.",
+                format!("{self}"),
+                initial_delay
+            );
 
             if initial_delay > 0.0 {
                 scheduler
