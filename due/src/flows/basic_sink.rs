@@ -23,7 +23,7 @@ pub struct BasicPacketSink {
 impl BasicPacketSink {
     pub fn new() -> Self {
         let endpoint_id = next_endpoint_id();
-        let sink_name = format!("BasicPacketSink {endpoint_id}");
+        let sink_name = format!("PacketSink {endpoint_id}");
         BasicPacketSink {
             endpoint_id,
             packet_statistics: PacketStatistics::new(sink_name),
