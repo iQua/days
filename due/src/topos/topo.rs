@@ -410,7 +410,7 @@ impl Topology {
             // establishes a bi-directional connection between the packet source and the host
             let source_mbox: Mailbox<PacketSource> = Mailbox::new();
             source
-                .output
+                .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, &source_mbox);
@@ -420,7 +420,7 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(source, source_mbox);
 
             // creates a new packet sink
-            let mut sink = PacketSink::new(flow.id);
+            let mut sink = PacketSink::new(&source);
 
             // obtains the host switch and its mailbox for the packet sink
             let sink_host = self.switches.get_mut(&flow.sink_host).unwrap();
@@ -440,9 +440,9 @@ impl Topology {
             stats.sink_addresses.insert(sink.id(), sink_mbox.address());
             stats
                 .sink_statistics
-                .insert(sink.id(), sink.statistics.connect_slot().0);
+                .insert(sink.id(), sink.statistics().connect_slot().0);
 
-            sink.output
+            sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);
             let mut output = Output::default();
             output.connect(PacketSink::packet_received, &sink_mbox);

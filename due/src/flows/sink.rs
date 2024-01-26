@@ -13,8 +13,10 @@ use log::debug;
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
-use crate::next_endpoint_id;
+use crate::flows::source::PacketSource;
+use crate::flows::tcp_sink::TCPPacketSink;
 
 /// A simple collector for statistical data.
 #[derive(Clone, Debug)]
@@ -104,40 +106,6 @@ impl Display for RandomVar {
 
 #[derive(Clone, Debug)]
 pub struct PacketStatistics {
-    pub endpoint_id: usize,
-    pub flow_id: usize,
-    pub arrival_times: RandomVar,
-    pub inter_arrival_times: RandomVar,
-    pub one_way_delays: RandomVar,
-    pub queueing_delays: RandomVar,
-    pub packet_sizes: RandomVar,
-}
-
-impl std::fmt::Display for PacketStatistics {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "PacketSink {} of Flow {} finished running. Statistics: \n\
-            Arrival times: {:#.3} \n\
-            Inter-arrival times: {:#.3} \n\
-            One-way delays: {:#.3} \n\
-            Queueing delays: {:#.3} \n\
-            Packet sizes: {:#.3} \n",
-            self.endpoint_id,
-            self.flow_id,
-            self.arrival_times,
-            self.inter_arrival_times,
-            self.one_way_delays,
-            self.queueing_delays,
-            self.packet_sizes,
-        )
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct PacketSink {
-    endpoint_id: usize,
-    flow_id: usize,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -150,66 +118,131 @@ pub struct PacketSink {
     queueing_delays: RandomVar,
     /// the size of the packets
     packet_sizes: RandomVar,
-    /// output: packet statistics
-    pub statistics: Output<PacketStatistics>,
-    /// output: outbound to packet switches
-    pub output: Output<Packet>,
 }
 
-impl PacketSink {
-    pub fn new(flow_id: usize) -> PacketSink {
-        PacketSink {
-            endpoint_id: next_endpoint_id(),
-            flow_id,
+impl std::fmt::Display for PacketStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "Statistics: \n\
+            Arrival times: {:#.3} \n\
+            Inter-arrival times: {:#.3} \n\
+            One-way delays: {:#.3} \n\
+            Queueing delays: {:#.3} \n\
+            Packet sizes: {:#.3} \n",
+            self.arrival_times,
+            self.inter_arrival_times,
+            self.one_way_delays,
+            self.queueing_delays,
+            self.packet_sizes,
+        )
+    }
+}
+
+impl PacketStatistics {
+    pub fn new() -> Self {
+        PacketStatistics {
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),
             one_way_delays: RandomVar::new(),
             queueing_delays: RandomVar::new(),
             packet_sizes: RandomVar::new(),
-            statistics: Output::default(),
-            output: Output::default(),
+        }
+    }
+
+    pub fn update(&mut self, packet: &Packet, now: f64) {
+        self.arrival_times.tabulate(now);
+        self.inter_arrival_times
+            .tabulate(now - self.last_arrival_time);
+        self.last_arrival_time = now;
+        self.one_way_delays.tabulate(now - packet.creation_time);
+        self.queueing_delays.tabulate(packet.queueing_delay);
+        self.packet_sizes.tabulate(packet.size as u32);
+    }
+}
+
+#[derive(Debug)]
+pub enum PacketSink {
+    BasicPacketSink(BasicPacketSink),
+    TCPPacketSink(TCPPacketSink),
+}
+
+impl std::fmt::Display for PacketSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PacketSink::BasicPacketSink(_) => write!(f, "PacketSink {}", self.id()),
+            PacketSink::TCPPacketSink(_) => write!(f, "TCPPacketSink {}", self.id()),
+        }
+    }
+}
+
+impl PacketSink {
+    pub fn new(source: &PacketSource) -> Self {
+        match source {
+            PacketSource::DistPacketSource(_) => {
+                PacketSink::BasicPacketSink(BasicPacketSink::new())
+            }
+            PacketSource::TCPPacketSource(_) => PacketSink::TCPPacketSink(TCPPacketSink::new()),
         }
     }
 
     pub fn id(&self) -> usize {
-        self.endpoint_id
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.endpoint_id,
+            PacketSink::TCPPacketSink(sink) => sink.endpoint_id,
+        }
     }
 
-    pub fn statistics(&self) -> PacketStatistics {
-        PacketStatistics {
-            endpoint_id: self.endpoint_id,
-            flow_id: self.flow_id,
-            arrival_times: self.arrival_times.clone(),
-            inter_arrival_times: self.inter_arrival_times.clone(),
-            one_way_delays: self.one_way_delays.clone(),
-            queueing_delays: self.queueing_delays.clone(),
-            packet_sizes: self.packet_sizes.clone(),
+    pub fn output(&self) -> Output<Packet> {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.output,
+            PacketSink::TCPPacketSink(sink) => sink.output,
+        }
+    }
+
+    pub fn statistics(&self) -> Output<PacketStatistics> {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.statistics,
+            PacketSink::TCPPacketSink(sink) => sink.statistics,
         }
     }
 
     pub async fn report(&mut self, endpoint_id: usize) {
-        assert_eq!(endpoint_id, self.endpoint_id);
-        debug!("PacketSink {} reporting upon request.", endpoint_id);
-        self.statistics.send(self.statistics()).await;
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.report(endpoint_id).await,
+            PacketSink::TCPPacketSink(sink) => sink.report(endpoint_id).await,
+        }
+    }
+
+    async fn wrap_up(&mut self, packet: Packet, now: f64) {
+        match self {
+            PacketSink::BasicPacketSink(_) => (),
+            PacketSink::TCPPacketSink(sink) => sink.wrap_up(packet, now).await,
+        }
     }
 
     pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        self.arrival_times.tabulate(arrival_time);
-        self.inter_arrival_times
-            .tabulate(arrival_time - self.last_arrival_time);
-        self.last_arrival_time = arrival_time;
-        self.one_way_delays
-            .tabulate(arrival_time - packet.creation_time);
-        self.queueing_delays.tabulate(packet.queueing_delay);
-        self.packet_sizes.tabulate(packet.size as u32);
+
+        match self {
+            PacketSink::BasicPacketSink(sink) => {
+                sink.packet_statistics.update(&packet, arrival_time)
+            }
+            PacketSink::TCPPacketSink(sink) => sink.packet_statistics.update(&packet, arrival_time),
+        };
 
         debug!(
-            "PacketSink {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+            "{} received packet {} ({} bytes) from flow {} at time {:.3}.",
+            format!("{self}"),
+            packet.packet_id,
+            packet.size,
+            packet.flow_id,
+            arrival_time,
         );
+
+        self.wrap_up(packet, arrival_time);
     }
 }
 

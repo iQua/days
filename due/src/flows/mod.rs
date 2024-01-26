@@ -1,3 +1,4 @@
+pub mod basic_sink;
 pub mod cc;
 pub mod collective;
 pub mod dist_source;
