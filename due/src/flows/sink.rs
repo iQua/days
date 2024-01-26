@@ -194,10 +194,10 @@ impl PacketSink {
         }
     }
 
-    pub fn output(&self) -> Output<Packet> {
+    pub fn packet_statistics(&self) -> PacketStatistics {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.output,
-            PacketSink::TCPPacketSink(sink) => sink.output,
+            PacketSink::BasicPacketSink(sink) => sink.packet_statistics,
+            PacketSink::TCPPacketSink(sink) => sink.packet_statistics,
         }
     }
 
@@ -208,11 +208,19 @@ impl PacketSink {
         }
     }
 
-    pub async fn report(&mut self, endpoint_id: usize) {
+    pub fn output(&self) -> Output<Packet> {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.report(endpoint_id).await,
-            PacketSink::TCPPacketSink(sink) => sink.report(endpoint_id).await,
+            PacketSink::BasicPacketSink(sink) => sink.output,
+            PacketSink::TCPPacketSink(sink) => sink.output,
         }
+    }
+
+    pub async fn report(&mut self, endpoint_id: usize) {
+        assert_eq!(endpoint_id, self.id());
+        debug!("{} reporting upon request.", format!("{self}"));
+        self.statistics()
+            .send(self.packet_statistics().clone())
+            .await;
     }
 
     async fn wrap_up(&mut self, packet: Packet, now: f64) {

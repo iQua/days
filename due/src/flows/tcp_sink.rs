@@ -39,12 +39,6 @@ impl TCPPacketSink {
         }
     }
 
-    pub async fn report(&mut self, endpoint_id: usize) {
-        assert_eq!(endpoint_id, self.endpoint_id);
-        debug!("TCPPacketSink {} reporting upon request.", endpoint_id);
-        self.statistics.send(self.packet_statistics.clone()).await;
-    }
-
     pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
         // inserts the packet into the receive buffer and sorts based on the
         // sequence number of the packet (packet_id)

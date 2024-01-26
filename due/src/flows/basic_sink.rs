@@ -3,8 +3,6 @@
 
 use std::fmt::Debug;
 
-use log::debug;
-
 use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
@@ -30,12 +28,6 @@ impl BasicPacketSink {
             statistics: Output::default(),
             output: Output::default(),
         }
-    }
-
-    pub async fn report(&mut self, endpoint_id: usize) {
-        assert_eq!(endpoint_id, self.endpoint_id);
-        debug!("BasicPacketSink {} reporting upon request.", endpoint_id);
-        self.statistics.send(self.packet_statistics.clone()).await;
     }
 }
 
