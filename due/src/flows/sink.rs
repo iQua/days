@@ -106,6 +106,7 @@ impl Display for RandomVar {
 
 #[derive(Clone, Debug)]
 pub struct PacketStatistics {
+    sink_name: String,
     /// the arrival times of the packets
     arrival_times: RandomVar,
     /// the last arrival time
@@ -124,12 +125,13 @@ impl std::fmt::Display for PacketStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Statistics: \n\
+            "{} recorded statistics: \n\
             Arrival times: {:#.3} \n\
             Inter-arrival times: {:#.3} \n\
             One-way delays: {:#.3} \n\
             Queueing delays: {:#.3} \n\
             Packet sizes: {:#.3} \n",
+            self.sink_name,
             self.arrival_times,
             self.inter_arrival_times,
             self.one_way_delays,
@@ -140,8 +142,9 @@ impl std::fmt::Display for PacketStatistics {
 }
 
 impl PacketStatistics {
-    pub fn new() -> Self {
+    pub fn new(sink_name: String) -> Self {
         PacketStatistics {
+            sink_name,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
             inter_arrival_times: RandomVar::new(),

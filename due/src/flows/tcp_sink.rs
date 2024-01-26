@@ -29,9 +29,11 @@ pub struct TCPPacketSink {
 
 impl TCPPacketSink {
     pub fn new() -> TCPPacketSink {
+        let endpoint_id = next_endpoint_id();
+        let sink_name = format!("TCPPacketSink {endpoint_id}");
         TCPPacketSink {
-            endpoint_id: next_endpoint_id(),
-            packet_statistics: PacketStatistics::new(),
+            endpoint_id,
+            packet_statistics: PacketStatistics::new(sink_name),
             recv_buffer: Vec::new(),
             next_seq_expected: 0,
             statistics: Output::default(),
