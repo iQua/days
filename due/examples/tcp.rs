@@ -11,8 +11,8 @@ use asynchronix::time::MonotonicTime;
 
 //use due::flows::cc::CCAlgorithm::TCPReno;
 use due::flows::cc::CCAlgorithm::TCPCubic;
-use due::flows::tcp_sink::TCPPacketSink;
-use due::flows::tcp_source::TCPPacketSource;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
 use due::flows::wire::Wire;
 use due::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 use due::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -23,7 +23,7 @@ fn main() {
     env_logger::init_from_env(env);
 
     // instantiates models and their mailboxes
-    let mut source = TCPPacketSource::new(
+    let mut source = PacketSource::new(
         0,
         TrafficCharacteristics::new(
             0.0,
@@ -63,7 +63,7 @@ fn main() {
         },
     );
 
-    let mut sink = TCPPacketSink::new(0);
+    let mut sink = PacketSink::new(&source);
 
     let source_mbox = Mailbox::new();
     let server_mbox = Mailbox::new();
@@ -76,10 +76,9 @@ fn main() {
         .output
         .connect(DRRServer::packet_received, &server_mbox);
     server.output.connect(Wire::packet_received, &wire_mbox);
-    wire.output
-        .connect(TCPPacketSink::packet_received, &sink_mbox);
+    wire.output.connect(PacketSink::packet_received, &sink_mbox);
     sink.output
-        .connect(TCPPacketSource::ack_packet_received, &source_mbox);
+        .connect(PacketSource::packet_received, &source_mbox);
 
     let mut sink_statistics = sink.statistics.connect_slot().0;
 
