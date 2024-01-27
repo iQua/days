@@ -48,11 +48,7 @@ impl DistPacketSource {
         }
     }
 
-    pub fn packet_sent(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    pub fn packet_sent(&mut self, packet: Packet, now: f64) -> (bool, Duration) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
 
@@ -60,6 +56,8 @@ impl DistPacketSource {
             "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
+
+        (false, Duration::default())
     }
 
     pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
@@ -102,36 +100,15 @@ impl DistPacketSource {
         (packet, Duration::from_secs_f64(interval))
     }
 
-    pub fn send_packet(&mut self, scheduler: &Scheduler<Self>) {
-        let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
-        let now = current_time.as_secs_f64();
-
+    pub fn prepare_next_run(&self, now: f64) -> Duration {
         let (packet, interval) = self.produce_packet(now);
-
-        if !self
-            .traffic
-            .size
-            .exceeded(self.sent_size + packet.size, now + interval.as_secs_f64())
-        {
-            scheduler
-                .schedule_event(interval, Self::send, packet)
-                .unwrap();
-
-            scheduler
-                .schedule_event(interval, Self::send_packet, scheduler)
-                .unwrap();
-        }
+        interval
     }
 
-    pub fn send<'a>(
-        &'a mut self,
-        packet: Packet,
-        scheduler: &'a Scheduler<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            self.output.send(packet.clone()).await;
-            self.packet_sent(packet, scheduler);
-        }
+    pub fn send_packet_event(&self, now: f64) -> (bool, Packet, Duration) {
+        // self.output.send(packet.clone()).await;
+        let (packet, interval) = self.produce_packet(now);
+        (true, packet, interval)
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
