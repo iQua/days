@@ -12,6 +12,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
+use async_recursion::async_recursion;
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{EventKey, MonotonicTime, Scheduler};
 
@@ -107,12 +108,36 @@ impl TCPPacketSource {
         }
     }
 
-    pub fn packet_sent(&mut self, now: f64, packet: Packet) {
+    pub fn packet_sent(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
         self.packets_sent += 1;
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
+        );
+
+        self.sent_packets.insert(packet.packet_id, packet.clone());
+
+        self.next_seq += packet.size;
+
+        // schedule a timeout event for this segment
+        let event_key = scheduler
+            .schedule_keyed_event(
+                Duration::from_secs_f64(self.rto),
+                Self::timer_expired,
+                packet.packet_id,
+            )
+            .unwrap();
+
+        self.timeout_events.insert(packet.packet_id, event_key);
+
+        debug!(
+            "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
+            self.endpoint_id, packet.packet_id, self.rto, now + self.rto
         );
     }
 
@@ -300,6 +325,50 @@ impl TCPPacketSource {
         (interval - (now - self.last_arrival), packet_size)
     }
 
+    #[async_recursion]
+    pub async fn send_packet(&mut self, now: f64, scheduler: &Scheduler<Self>) {
+        while self.next_seq >= self.send_buffer {
+            // retrieves more packets from the (application-layer) flow
+            let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
+
+            self.last_arrival = now;
+            self.send_buffer += packet_size;
+
+            // waits for the next arrival of the packet of the flow
+            if wait_time > 0.0 {
+                self.last_arrival += wait_time;
+                self.busy_until = self.last_arrival;
+
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
+                    .unwrap();
+
+                return;
+            }
+        }
+
+        // the sender can transmit up to the size of the congestion window
+        if (self.next_seq + self.mss) as f64
+            <= (self.send_buffer as f64)
+                .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
+        {
+            let packet_id = self.next_seq;
+            let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
+
+            // sends the packet out to the next element now
+            self.output.send(packet.clone()).await;
+            self.packet_sent(packet, scheduler);
+
+            self.send_packet(now, scheduler).await;
+
+            return;
+        }
+    }
+
+    pub fn traffic_exceeded(&self, now: f64) -> bool {
+        self.traffic.size.exceeded(self.next_seq, now)
+    }
+
     pub fn run<'a>(
         &'a mut self,
         _: (),
@@ -309,61 +378,8 @@ impl TCPPacketSource {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
 
-            while !self.traffic.size.exceeded(self.next_seq, now) {
-                while self.next_seq >= self.send_buffer {
-                    // retrieves more packets from the (application-layer) flow
-                    let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
-
-                    self.last_arrival = now;
-                    self.send_buffer += packet_size;
-
-                    // waits for the next arrival of the packet of the flow
-                    if wait_time > 0.0 {
-                        self.last_arrival += wait_time;
-                        self.busy_until = self.last_arrival;
-
-                        scheduler
-                            .schedule_event(Duration::from_secs_f64(wait_time), Self::run, ())
-                            .unwrap();
-
-                        return;
-                    }
-                }
-
-                // the sender can transmit up to the size of the congestion window
-                if (self.next_seq + self.mss) as f64
-                    <= (self.send_buffer as f64)
-                        .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
-                {
-                    let packet_id = self.next_seq;
-                    let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
-
-                    // sends the packet out to the next element now
-                    self.output.send(packet.clone()).await;
-                    self.packet_sent(now, packet.clone());
-
-                    self.sent_packets.insert(packet_id, packet.clone());
-
-                    self.next_seq += packet.size;
-
-                    // schedule a timeout event for this segment
-                    let event_key = scheduler
-                        .schedule_keyed_event(
-                            Duration::from_secs_f64(self.rto),
-                            Self::timer_expired,
-                            packet_id,
-                        )
-                        .unwrap();
-
-                    self.timeout_events.insert(packet_id, event_key);
-
-                    debug!(
-                            "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-                            self.endpoint_id, packet.packet_id, self.rto, now + self.rto
-                        );
-                } else {
-                    return;
-                }
+            if !self.traffic_exceeded(now) {
+                self.send_packet(now, scheduler).await;
             }
         }
     }

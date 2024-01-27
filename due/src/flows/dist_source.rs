@@ -48,7 +48,11 @@ impl DistPacketSource {
         }
     }
 
-    pub fn packet_sent(&mut self, now: f64, packet: Packet) {
+    pub fn packet_sent(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
         self.packets_sent += 1;
         self.sent_size += packet.size;
 
@@ -98,9 +102,29 @@ impl DistPacketSource {
         (packet, Duration::from_secs_f64(interval))
     }
 
-    async fn send(&mut self, packet: Packet) {
-        self.output.send(packet.clone()).await;
-        self.packet_sent(packet.time, packet);
+    pub fn send_packet(&mut self, now: f64, scheduler: &Scheduler<Self>) {
+        let (packet, interval) = self.produce_packet(now);
+
+        scheduler
+            .schedule_event(interval, Self::send, packet)
+            .unwrap();
+
+        scheduler.schedule_event(interval, Self::run, ()).unwrap();
+    }
+
+    pub fn send<'a>(
+        &'a mut self,
+        packet: Packet,
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            self.output.send(packet.clone()).await;
+            self.packet_sent(packet, scheduler);
+        }
+    }
+
+    pub fn traffic_exceeded(&self, now: f64) -> bool {
+        self.traffic.size.exceeded(self.sent_size, now)
     }
 
     pub fn run<'a>(
@@ -112,14 +136,8 @@ impl DistPacketSource {
             let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
             let now = current_time.as_secs_f64();
 
-            if !self.traffic.size.exceeded(self.sent_size, now) {
-                let (packet, interval) = self.produce_packet(now);
-
-                scheduler
-                    .schedule_event(interval, Self::send, packet.clone())
-                    .unwrap();
-
-                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+            if !self.traffic_exceeded(now) {
+                self.send_packet(now, scheduler);
             } else {
                 info!(
                     "DistPacketSource {} of Flow {} finished running at {:.3}.",

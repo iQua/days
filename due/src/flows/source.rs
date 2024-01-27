@@ -10,7 +10,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
 use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::Scheduler;
+use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
@@ -71,19 +71,15 @@ impl PacketSource {
 
     fn traffic_exceeded(&self, now: f64) -> bool {
         match self {
-            PacketSource::DistPacketSource(source) => {
-                source.traffic.size.exceeded(source.sent_size, now)
-            }
-            PacketSource::TCPPacketSource(source) => {
-                source.traffic.size.exceeded(source.next_seq, now)
-            }
+            PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
+            PacketSource::TCPPacketSource(source) => source.traffic_exceeded(now),
         }
     }
 
-    fn packet_sent(&mut self, now: f64, packet: Packet) {
+    async fn send_packet(&mut self, now: f64, scheduler: &Scheduler<Self>) {
         match self {
-            PacketSource::DistPacketSource(source) => source.packet_sent(now, packet),
-            PacketSource::TCPPacketSource(source) => source.packet_sent(now, packet),
+            PacketSource::DistPacketSource(source) => source.send_packet(now, scheduler),
+            PacketSource::TCPPacketSource(source) => source.send_packet(now, scheduler).await,
         }
     }
 
@@ -96,10 +92,20 @@ impl PacketSource {
         }
     }
 
-    pub async fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        match self {
-            PacketSource::DistPacketSource(source) => source.run((), scheduler).await,
-            PacketSource::TCPPacketSource(source) => source.run((), scheduler).await,
+    pub fn run<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+            let now = current_time.as_secs_f64();
+
+            if !self.traffic_exceeded(now) {
+                self.send_packet(now, scheduler).await;
+            } else {
+                debug!("{} finished running at {:.3}.", format!("{self}"), now);
+            }
         }
     }
 }
