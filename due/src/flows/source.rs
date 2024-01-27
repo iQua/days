@@ -76,10 +76,10 @@ impl PacketSource {
         }
     }
 
-    async fn send_packet(&mut self, now: f64, scheduler: &Scheduler<Self>) {
+    async fn send_packet(&mut self, scheduler: &Scheduler<Self>) {
         match self {
-            PacketSource::DistPacketSource(source) => source.send_packet(now, scheduler),
-            PacketSource::TCPPacketSource(source) => source.send_packet(now, scheduler).await,
+            PacketSource::DistPacketSource(source) => source.send_packet(scheduler),
+            PacketSource::TCPPacketSource(source) => source.send_packet((), scheduler).await,
         }
     }
 
@@ -102,7 +102,7 @@ impl PacketSource {
             let now = current_time.as_secs_f64();
 
             if !self.traffic_exceeded(now) {
-                self.send_packet(now, scheduler).await;
+                self.send_packet(scheduler).await;
             } else {
                 debug!("{} finished running at {:.3}.", format!("{self}"), now);
             }

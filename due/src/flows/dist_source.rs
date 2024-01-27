@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -102,14 +102,25 @@ impl DistPacketSource {
         (packet, Duration::from_secs_f64(interval))
     }
 
-    pub fn send_packet(&mut self, now: f64, scheduler: &Scheduler<Self>) {
+    pub fn send_packet(&mut self, scheduler: &Scheduler<Self>) {
+        let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
+        let now = current_time.as_secs_f64();
+
         let (packet, interval) = self.produce_packet(now);
 
-        scheduler
-            .schedule_event(interval, Self::send, packet)
-            .unwrap();
+        if !self
+            .traffic
+            .size
+            .exceeded(self.sent_size + packet.size, now + interval.as_secs_f64())
+        {
+            scheduler
+                .schedule_event(interval, Self::send, packet)
+                .unwrap();
 
-        scheduler.schedule_event(interval, Self::run, ()).unwrap();
+            scheduler
+                .schedule_event(interval, Self::send_packet, scheduler)
+                .unwrap();
+        }
     }
 
     pub fn send<'a>(
@@ -125,26 +136,6 @@ impl DistPacketSource {
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
         self.traffic.size.exceeded(self.sent_size, now)
-    }
-
-    pub fn run<'a>(
-        &'a mut self,
-        _: (),
-        scheduler: &'a Scheduler<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
-            let now = current_time.as_secs_f64();
-
-            if !self.traffic_exceeded(now) {
-                self.send_packet(now, scheduler);
-            } else {
-                info!(
-                    "DistPacketSource {} of Flow {} finished running at {:.3}.",
-                    self.endpoint_id, self.flow_id, now
-                );
-            }
-        }
     }
 }
 
