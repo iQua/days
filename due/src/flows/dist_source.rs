@@ -1,7 +1,6 @@
 //! Implements a packet source that simulates the sending of packets with
 //! specific distributions of inter-arrival times and packet sizes.
 
-use std::future::Future;
 use std::time::Duration;
 
 use log::debug;
@@ -48,7 +47,7 @@ impl DistPacketSource {
         }
     }
 
-    pub fn packet_sent(&mut self, packet: Packet, now: f64) -> (bool, Duration) {
+    pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
 
@@ -70,7 +69,7 @@ impl DistPacketSource {
         );
     }
 
-    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+    pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
         let interval = match self.traffic.arr_dist {
             DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
                 .unwrap()
@@ -100,9 +99,9 @@ impl DistPacketSource {
         (packet, Duration::from_secs_f64(interval))
     }
 
-    pub fn prepare_next_run(&self, now: f64) -> Duration {
+    pub fn schedule_next_run(&self, now: f64) -> (bool, Duration) {
         let (packet, interval) = self.produce_packet(now);
-        interval
+        (true, interval)
     }
 
     pub fn send_packet_event(&self, now: f64) -> (bool, Packet, Duration) {
