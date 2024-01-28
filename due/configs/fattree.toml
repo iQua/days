@@ -6,7 +6,7 @@ seed = 1000
 category = "FatTree"
 
 [topology.fat_tree]
-    k = 4
+    k = 16
 
 [switch]
 port_rate = 320000 # process 40 packets (1000 bytes) per second
@@ -17,7 +17,7 @@ drop = "RED"
 
 [[flow_set]]
 flow_type = "PacketDistribution"
-flow_count = 63
+flow_count = 511
 [flow_set.traffic]
     initial_delay = 1.0
     duration = 1500.0
