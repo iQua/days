@@ -31,16 +31,18 @@ fn main() {
         ),
         0,
     );
+
+    let mut sink = PacketSink::new(&source);
+
     let source_mbox = Mailbox::new();
-    let mut sink = PacketSink::new(0);
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
     // connects the output of packet source to the input of packet sink
     source
-        .output
+        .output()
         .connect(PacketSink::packet_received, &sink_mbox);
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;

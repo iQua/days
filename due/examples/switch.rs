@@ -67,7 +67,7 @@ fn main() {
         vec![1, 1],
     );
 
-    let mut sink = PacketSink::new(2);
+    let mut sink = PacketSink::new(&source_1);
 
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
@@ -78,10 +78,10 @@ fn main() {
 
     // connects the output of packet sources to the input of the DRR scheduler
     source_1
-        .output
+        .output()
         .connect(PacketSwitch::packet_received, &switch_mbox);
     source_2
-        .output
+        .output()
         .connect(PacketSwitch::packet_received, &switch_mbox);
 
     // connects the output of the switch to the DRR scheduler
@@ -91,7 +91,7 @@ fn main() {
     // connects the DRR scheduler to the packet sink
     drr.output.connect(PacketSink::packet_received, &sink_mbox);
 
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;

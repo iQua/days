@@ -52,7 +52,7 @@ fn main() {
 
     let mut port = Port::new(8000.0, 100, CapacityUnit::Packets, DropStrategy::TailDrop);
 
-    let mut sink = PacketSink::new(2);
+    let mut sink = PacketSink::new(&source_1);
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let port_mbox = Mailbox::new();
@@ -60,10 +60,10 @@ fn main() {
     let sink_addr = sink_mbox.address();
 
     // connects the output of packet sources to the input of the DRR scheduler
-    source_1.output.connect(Port::packet_received, &port_mbox);
-    source_2.output.connect(Port::packet_received, &port_mbox);
+    source_1.output().connect(Port::packet_received, &port_mbox);
+    source_2.output().connect(Port::packet_received, &port_mbox);
     port.output.connect(PacketSink::packet_received, &sink_mbox);
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;

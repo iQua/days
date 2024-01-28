@@ -1,3 +1,5 @@
+//! An example of connecting a TCP packet source to a TCP packet sink.
+
 use std::time::Duration;
 
 use log::info;
@@ -6,8 +8,8 @@ use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
 use due::flows::cc::CCAlgorithm::TCPReno;
-use due::flows::tcp_sink::TCPPacketSink;
-use due::flows::tcp_source::TCPPacketSource;
+use due::flows::sink::PacketSink;
+use due::flows::source::PacketSource;
 use due::flows::wire::Wire;
 use due::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 
@@ -16,7 +18,7 @@ fn main() {
     env_logger::init_from_env(env);
 
     // Instantiates models and their mailboxes.
-    let mut source = TCPPacketSource::new(
+    let mut source = PacketSource::new(
         0,
         TrafficCharacteristics::new(
             0.0,
@@ -46,7 +48,7 @@ fn main() {
         },
     );
 
-    let mut sink = TCPPacketSink::new(0);
+    let mut sink = PacketSink::new(&source);
 
     let source_mbox = Mailbox::new();
     let wire_mbox = Mailbox::new();
@@ -54,13 +56,12 @@ fn main() {
     let sink_addr = sink_mbox.address();
 
     // Connects the output of packet source to the input of packet sink.
-    source.output.connect(Wire::packet_received, &wire_mbox);
+    source.output().connect(Wire::packet_received, &wire_mbox);
 
-    wire.output
-        .connect(TCPPacketSink::packet_received, &sink_mbox);
+    wire.output.connect(PacketSink::packet_received, &sink_mbox);
 
-    sink.output
-        .connect(TCPPacketSource::ack_packet_received, &source_mbox);
+    sink.output()
+        .connect(PacketSource::packet_received, &source_mbox);
 
     // Instantiates the simulator.
     let t0 = MonotonicTime::EPOCH;
@@ -72,7 +73,7 @@ fn main() {
 
     sim.step_by(Duration::from_secs(10));
 
-    sim.send_event(TCPPacketSink::report, 1, &sink_addr);
+    sim.send_event(PacketSink::report, 1, &sink_addr);
 
     info!(
         "Simulation completed at time {:.3}.",

@@ -73,14 +73,14 @@ fn main() {
 
     // connects components
     source
-        .output
+        .output()
         .connect(DRRServer::packet_received, &server_mbox);
     server.output.connect(Wire::packet_received, &wire_mbox);
     wire.output.connect(PacketSink::packet_received, &sink_mbox);
-    sink.output
+    sink.output()
         .connect(PacketSource::packet_received, &source_mbox);
 
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
@@ -95,7 +95,7 @@ fn main() {
     sim.step_by(Duration::from_secs(20));
 
     // requests the packet sink to report statistics
-    sim.send_event(TCPPacketSink::report, 1, &sink_addr);
+    sim.send_event(PacketSink::report, 1, &sink_addr);
     if let Some(statistics) = sink_statistics.take() {
         info!("{:#.3}", statistics);
     }
