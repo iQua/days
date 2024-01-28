@@ -17,6 +17,9 @@ pub struct PacketSwitch {
     /// the flow information base (FIB) of the switch
     /// flow_id -> switch_id
     fib: HashMap<usize, usize>,
+    /// the reverse flow information base (FIB) of the switch, used by TCP
+    /// flow_id -> switch_id
+    r_fib: HashMap<usize, usize>,
 
     /// senders for sending inbound packets to outbound ports
     /// switch_id -> outputs to downstream schedulers or endpoints
@@ -24,7 +27,7 @@ pub struct PacketSwitch {
 }
 
 impl PacketSwitch {
-    pub fn new(fib: HashMap<usize, usize>) -> PacketSwitch {
+    pub fn new(fib: HashMap<usize, usize>, r_fib: HashMap<usize, usize>) -> PacketSwitch {
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
@@ -37,6 +40,7 @@ impl PacketSwitch {
         PacketSwitch {
             switch_id: next_switch_id(),
             fib,
+            r_fib,
             packets_received: 0,
             outputs,
         }
@@ -50,28 +54,48 @@ impl PacketSwitch {
         self.fib.insert(flow_id, next_id);
     }
 
+    pub fn set_r_fib(&mut self, flow_id: usize, next_id: usize) {
+        self.r_fib.insert(flow_id, next_id);
+    }
+
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        self.packets_received += 1;
+        if packet.ack.is_none() {
+            self.packets_received += 1;
 
-        debug!(
-            "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            debug!(
+                "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
                 {} packets received.",
-            self.switch_id,
-            packet.packet_id,
-            packet.size,
-            packet.flow_id,
-            arrival_time,
-            self.packets_received
-        );
+                self.switch_id,
+                packet.packet_id,
+                packet.size,
+                packet.flow_id,
+                arrival_time,
+                self.packets_received
+            );
 
-        // forwards packets to their corresponding downstream elements
-        let switch_id = self.fib[&packet.flow_id];
+            // forwards packets that are not acknowledgment to their
+            // corresponding downstream elements
+            let switch_id = self.fib[&packet.flow_id];
 
-        if let Some(output) = self.outputs.get_mut(&switch_id) {
-            output.send(packet).await;
+            if let Some(output) = self.outputs.get_mut(&switch_id) {
+                output.send(packet).await;
+            }
+        } else {
+            debug!(
+                "PacketSwitch {} received Ack of packet {} ({} bytes) from flow {} at time {:.3}.",
+                self.switch_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+            );
+
+            // forwards acknowledgment packets to their corresponding
+            // upstream elements
+            let switch_id = self.r_fib[&packet.flow_id];
+
+            if let Some(output) = self.outputs.get_mut(&switch_id) {
+                output.send(packet).await;
+            }
         }
     }
 }

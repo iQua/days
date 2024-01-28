@@ -159,7 +159,7 @@ impl Topology {
         let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
 
         for _ in 0..num_switches() {
-            let switch = PacketSwitch::new(HashMap::new());
+            let switch = PacketSwitch::new(HashMap::new(), HashMap::new());
             switches.insert(switch.id(), switch);
         }
 
@@ -402,8 +402,16 @@ impl Topology {
 
             // creates a new packet source
             let mut source = PacketSource::new(flow.id, flow.traffic, flow.seed);
+            // records the PacketSource id for adding it as the start of the
+            // flow's path in later construction of the path in
+            // Flow::compute_path()
+            flow.source_id = source.id();
+
             // creates a new packet sink
             let mut sink = PacketSink::new(&source);
+            // records the PacketSink id for adding it as the end of the flow's
+            // path in later construction of the path in Flow::compute_path()
+            flow.sink_id = sink.id();
 
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
@@ -428,10 +436,6 @@ impl Topology {
 
             // establishes a bi-directional connection between the packet sink and the host
             let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
-
-            // record the packet sink ids for later construction of paths in
-            // Flow::compute_paths()
-            flow.sink_id = sink.id();
 
             // records the sink ids, sink mailbox's address and sink
             // statistics event slot for the retrieval of packet statistics
@@ -471,8 +475,18 @@ impl Topology {
             for window in path.windows(2) {
                 let node_id = window.get(0).unwrap().index();
                 let next_id = window.get(1).unwrap().index();
-                let switch = self.switches.get_mut(&node_id).unwrap();
-                switch.set_fib(flow.id, next_id);
+
+                // FIBs do not include PacketSource
+                if node_id != path.first().unwrap().index() {
+                    let switch = self.switches.get_mut(&node_id).unwrap();
+                    switch.set_fib(flow.id, next_id);
+                }
+
+                // reverse FIBs do not include PacketSink
+                if next_id != path.last().unwrap().index() {
+                    let switch = self.switches.get_mut(&next_id).unwrap();
+                    switch.set_r_fib(flow.id, node_id);
+                }
             }
         }
     }
