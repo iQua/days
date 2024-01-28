@@ -85,20 +85,33 @@ impl PacketSource {
     //     }
     // }
 
-    pub fn schedule_next_run(&self, now: f64) -> (bool, Duration) {
-        match self {
-            PacketSource::DistPacketSource(source) => source.schedule_next_run(now),
-            PacketSource::TCPPacketSource(source) => (false, Duration::default()),
-        }
-    }
-
-    pub fn before_sending_packet(&self, now: f64) -> (bool, Duration) {
+    /// Returns whether PacketSource should take some actions before producing a
+    /// packet.
+    pub fn pre_produce_packet(&self, now: f64) -> (bool, Duration) {
         match self {
             PacketSource::DistPacketSource(source) => (false, Duration::default()),
-            PacketSource::TCPPacketSource(source) => source.before_sending_packet(now),
+            PacketSource::TCPPacketSource(source) => source.retrieve_packets_from_flow(now),
         }
     }
 
+    /// Returns whether PacketSource should produce a new packet at this point.
+    fn should_produce_packet(&self, now: f64) -> bool {
+        match self {
+            PacketSource::DistPacketSource(source) => true,
+            PacketSource::TCPPacketSource(source) => source.should_produce_packet(now),
+        }
+    }
+
+    /// Returns a new packet and when to send out this packet.
+    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+        match self {
+            PacketSource::DistPacketSource(source) => source.produce_packet(now),
+            PacketSource::TCPPacketSource(source) => source.produce_packet(now),
+        }
+    }
+
+    /// Returns whether PacketSource should schedule a wrap-up event for the
+    /// sent packet.
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
         match self {
             PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
@@ -113,7 +126,11 @@ impl PacketSource {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             match self {
+                // no wrap-up event after sending out a packet in DisPacketSource
                 PacketSource::DistPacketSource(_) => (),
+                // the wrap-up event after sending out a packet in
+                // TCPPacketSource is the timeout event, that is,
+                // TCPPacketSource set a timer for each sent packet
                 PacketSource::TCPPacketSource(source) => {
                     let now = scheduler
                         .time()
@@ -121,7 +138,7 @@ impl PacketSource {
                         .as_secs_f64();
                     let interval = source.timer_expired(packet_id, now).await;
 
-                    // schedule a new timeout event for this segment
+                    // schedules a new timeout event for this packet
                     let event_key = scheduler
                         .schedule_keyed_event(interval, Self::wrap_up_packet_event, packet_id)
                         .unwrap();
@@ -139,22 +156,17 @@ impl PacketSource {
         }
     }
 
-    fn should_produce_packet(&self, now: f64) -> bool {
-        match self {
-            PacketSource::DistPacketSource(source) => true,
-            PacketSource::TCPPacketSource(source) => source.should_produce_packet(now),
-        }
-    }
-
-    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        match self {
-            PacketSource::DistPacketSource(source) => source.produce_packet(now),
-            PacketSource::TCPPacketSource(source) => source.produce_packet(now),
-        }
-    }
-
     async fn send_packet(&mut self, packet: Packet) {
         self.output().send(packet).await;
+    }
+
+    /// Returns whether PacketSource should return from the current while loop
+    /// and schedule a new run().
+    pub fn schedule_next_run(&self, now: f64) -> (bool, Duration) {
+        match self {
+            PacketSource::DistPacketSource(source) => source.schedule_next_run(now),
+            PacketSource::TCPPacketSource(source) => source.schedule_next_run(now),
+        }
     }
 
     pub fn run<'a>(
@@ -167,7 +179,7 @@ impl PacketSource {
             let now = current_time.as_secs_f64();
 
             while !self.traffic_exceeded(now) {
-                let (schedule_new_run, interval) = self.before_sending_packet(now);
+                let (schedule_new_run, interval) = self.pre_produce_packet(now);
                 if schedule_new_run {
                     scheduler.schedule_event(interval, Self::run, ()).unwrap();
 
@@ -177,8 +189,11 @@ impl PacketSource {
                 if self.should_produce_packet(now) {
                     let (packet, interval) = self.produce_packet(now);
                     if interval == Duration::default() {
+                        // sends the packet now if interval is 0
                         self.output().send(packet.clone()).await;
                     } else {
+                        // schedules an event to send the packet if interval is
+                        // more than 0
                         scheduler
                             .schedule_event(interval, Self::send_packet, packet.clone())
                             .unwrap();
@@ -200,7 +215,9 @@ impl PacketSource {
 
                 let (schedule_next_run, interval) = self.schedule_next_run(now);
                 if schedule_next_run {
-                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                    if interval != Duration::default() {
+                        scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                    }
                     return;
                 }
             }

@@ -104,12 +104,6 @@ impl DistPacketSource {
         (true, interval)
     }
 
-    pub fn send_packet_event(&self, now: f64) -> (bool, Packet, Duration) {
-        // self.output.send(packet.clone()).await;
-        let (packet, interval) = self.produce_packet(now);
-        (true, packet, interval)
-    }
-
     pub fn traffic_exceeded(&self, now: f64) -> bool {
         self.traffic.size.exceeded(self.sent_size, now)
     }

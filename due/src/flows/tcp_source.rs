@@ -106,31 +106,7 @@ impl TCPPacketSource {
         }
     }
 
-    pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
-        self.packets_sent += 1;
-
-        debug!(
-            "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
-        );
-
-        self.sent_packets.insert(packet.packet_id, packet.clone());
-
-        self.next_seq += packet.size;
-
-        (true, Duration::from_secs_f64(self.rto))
-    }
-
-    pub fn finish_wrap_up(&mut self, packet: Packet, event_key: EventKey, now: f64) {
-        self.timeout_events.insert(packet.packet_id, event_key);
-
-        debug!(
-            "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-            self.endpoint_id, packet.packet_id, self.rto, now + self.rto
-        );
-    }
-
-    /// On receiving an acknowledgment packet
+    /// On receiving an acknowledgment packet.
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, scheduler: &Scheduler<Self>) {
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
@@ -236,6 +212,31 @@ impl TCPPacketSource {
         }
     }
 
+    pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
+        self.packets_sent += 1;
+
+        debug!(
+            "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
+        );
+
+        self.sent_packets.insert(packet.packet_id, packet.clone());
+
+        self.next_seq += packet.size;
+
+        (true, Duration::from_secs_f64(self.rto))
+    }
+
+    pub fn finish_wrap_up(&mut self, packet: Packet, event_key: EventKey, now: f64) {
+        self.timeout_events.insert(packet.packet_id, event_key);
+
+        debug!(
+            "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
+            self.endpoint_id, packet.packet_id, self.rto, now + self.rto
+        );
+    }
+
+    /// On a packet reaches timeout. Returns the updated timeout of this packet.
     pub async fn timer_expired(&mut self, packet_id: usize, now: f64) -> Duration {
         debug!(
             "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}.",
@@ -261,6 +262,7 @@ impl TCPPacketSource {
         Duration::from_secs_f64(self.rto)
     }
 
+    /// Reset a timer for a packet that reached timeout.
     pub fn reset_timer(&mut self, packet_id: usize, event_key: EventKey, now: f64) {
         self.timeout_events.insert(packet_id, event_key);
 
@@ -270,39 +272,33 @@ impl TCPPacketSource {
             );
     }
 
-    fn retrieve_packet_from_flow(&mut self, now: f64) -> (f64, usize) {
-        // retrieves packet from the (application-layer) flow
-        let interval = match self.traffic.arr_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng),
-            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
-            DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng)
-            }
-        };
-
-        let packet_size = match self.traffic.pkt_size_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng)
-                as usize,
-            DistributionInfo::Exp { lambda } => {
-                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
-            }
-            DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
-            }
-        };
-
-        (interval - (now - self.last_arrival), packet_size)
-    }
-
-    pub fn before_sending_packet(&self, now: f64) -> (bool, Duration) {
+    // Retrieves packets from the (application-layer) flow.
+    pub fn retrieve_packets_from_flow(&self, now: f64) -> (bool, Duration) {
         while self.next_seq >= self.send_buffer {
-            // retrieves more packets from the (application-layer) flow
-            let (wait_time, packet_size) = self.retrieve_packet_from_flow(now);
+            let interval = match self.traffic.arr_dist {
+                DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
+                    .unwrap()
+                    .sample(&mut self.rng),
+                DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
+                DistributionInfo::Uniform { low, high } => {
+                    Uniform::new(low, high).unwrap().sample(&mut self.rng)
+                }
+            };
 
+            let packet_size = match self.traffic.pkt_size_dist {
+                DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
+                    .unwrap()
+                    .sample(&mut self.rng)
+                    as usize,
+                DistributionInfo::Exp { lambda } => {
+                    Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
+                }
+                DistributionInfo::Uniform { low, high } => {
+                    Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
+                }
+            };
+
+            let wait_time = interval - (now - self.last_arrival);
             self.last_arrival = now;
             self.send_buffer += packet_size;
 
@@ -330,6 +326,14 @@ impl TCPPacketSource {
         let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
 
         (packet, Duration::default())
+    }
+
+    pub fn schedule_next_run(&self, now: f64) -> (bool, Duration) {
+        if self.should_produce_packet(now) {
+            (false, Duration::default())
+        } else {
+            (true, Duration::default())
+        }
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
