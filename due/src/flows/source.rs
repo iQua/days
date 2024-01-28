@@ -1,108 +1,201 @@
-//! Implements a packet source that simulates the sending of packets with
-//! specific distributions of inter-arrival times and packet sizes.
+//! Implements a general packet source that provides interfaces of all kinds of
+//! packet sources.
 
+use std::borrow::BorrowMut;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use log::{debug, info};
-use rand::distributions::Distribution;
+use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
-use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
-use crate::{get_seed, next_endpoint_id};
+use crate::flows::tcp_source::TCPPacketSource;
+use crate::flows::TrafficCharacteristics;
+use crate::get_seed;
 
 #[derive(Debug)]
-pub struct PacketSource {
-    endpoint_id: usize,
-    flow_id: usize,
-    traffic: TrafficCharacteristics,
-    packets_sent: usize,
-    sent_size: usize,
-    rng: SmallRng,
+pub enum PacketSource {
+    DistPacketSource(DistPacketSource),
+    TCPPacketSource(TCPPacketSource),
+}
 
-    pub output: Output<Packet>,
+impl std::fmt::Display for PacketSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PacketSource::DistPacketSource(_) => write!(f, "DistPacketSource {}", self.id()),
+            PacketSource::TCPPacketSource(_) => write!(f, "TCPPacketSource {}", self.id()),
+        }
+    }
 }
 
 impl PacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> PacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
 
-        PacketSource {
-            endpoint_id: next_endpoint_id(),
-            flow_id,
-            traffic,
-            packets_sent: 0,
-            sent_size: 0,
-            rng,
-            output: Output::default(),
+        if traffic.tcp.is_some() {
+            PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
+        } else {
+            PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
+        }
+    }
+
+    pub fn output(&mut self) -> &mut Output<Packet> {
+        match self {
+            PacketSource::DistPacketSource(source) => source.output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.output.borrow_mut(),
         }
     }
 
     pub fn id(&self) -> usize {
-        self.endpoint_id
+        match self {
+            PacketSource::DistPacketSource(source) => source.endpoint_id,
+            PacketSource::TCPPacketSource(source) => source.endpoint_id,
+        }
     }
 
-    fn packet_sent(&mut self, now: Duration, packet: Packet) {
-        self.packets_sent += 1;
-        self.sent_size += packet.size;
-
-        debug!(
-            "PacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.endpoint_id,
-            packet.packet_id,
-            packet.size,
-            now.as_secs_f64(),
-            self.packets_sent,
-        );
+    pub fn flow_id(&self) -> usize {
+        match self {
+            PacketSource::DistPacketSource(source) => source.flow_id,
+            PacketSource::TCPPacketSource(source) => source.flow_id,
+        }
     }
 
-    pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        debug!(
-            "PacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
-        );
+    fn traffic_exceeded(&self, now: f64) -> bool {
+        match self {
+            PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
+            PacketSource::TCPPacketSource(source) => source.traffic_exceeded(now),
+        }
     }
 
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+        match self {
+            PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
+            PacketSource::TCPPacketSource(source) => {
+                if source.ack_packet_received(packet, now).await {
+                    self.run((), scheduler).await;
+                }
+            }
+        }
+    }
+
+    /// Returns whether PacketSource should return from the current while loop
+    /// before producing a packet.
+    pub fn early_return(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
+        match self {
+            PacketSource::DistPacketSource(_) => false,
+            PacketSource::TCPPacketSource(source) => {
+                let (should_return, interval) = source.retrieve_packets_from_flow(now);
+                if should_return {
+                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                }
+                return should_return;
+            }
+        }
+    }
+
+    /// Returns whether PacketSource should produce a new packet at this point.
+    fn should_produce_packet(&mut self) -> bool {
+        match self {
+            PacketSource::DistPacketSource(_) => true,
+            PacketSource::TCPPacketSource(source) => source.should_produce_packet(),
+        }
+    }
+
+    /// Returns a new packet and when to send out this packet.
     fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        let interval = match self.traffic.arr_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng),
-            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
-            DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng)
-            }
-        };
+        match self {
+            PacketSource::DistPacketSource(source) => source.produce_packet(now),
+            PacketSource::TCPPacketSource(source) => source.produce_packet(now),
+        }
+    }
 
-        let packet_size = match self.traffic.pkt_size_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng)
-                as usize,
-            DistributionInfo::Exp { lambda } => {
-                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
-            }
-            DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
-            }
-        };
+    pub fn wrap_up_packet_event<'a>(
+        &'a mut self,
+        packet_id: usize,
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            match self {
+                // no wrap-up event after sending out a packet in DisPacketSource
+                PacketSource::DistPacketSource(_) => (),
+                // the wrap-up event after sending out a packet in
+                // TCPPacketSource is the timeout event scheduled for this
+                // packet
+                PacketSource::TCPPacketSource(source) => {
+                    let now = scheduler
+                        .time()
+                        .duration_since(MonotonicTime::EPOCH)
+                        .as_secs_f64();
+                    source.timer_expired(packet_id, now).await;
 
-        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
-        (packet, Duration::from_secs_f64(interval))
+                    // schedules a new timeout event for this packet
+                    let event_key = scheduler
+                        .schedule_keyed_event(
+                            Duration::from_secs_f64(source.rto),
+                            Self::wrap_up_packet_event,
+                            packet_id,
+                        )
+                        .unwrap();
+
+                    source.reset_timer(packet_id, event_key, now);
+                }
+            }
+        }
+    }
+
+    /// Wraps up after sending out a packet.
+    fn wrap_up(&mut self, packet: &Packet, now: f64, scheduler: &Scheduler<Self>) {
+        match self {
+            PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
+            PacketSource::TCPPacketSource(source) => {
+                source.packet_sent(packet, now);
+                let event_key = scheduler
+                    .schedule_keyed_event(
+                        Duration::from_secs_f64(source.rto),
+                        Self::wrap_up_packet_event,
+                        packet.packet_id,
+                    )
+                    .unwrap();
+
+                source.finish_wrap_up(packet, event_key, now);
+            }
+        }
+    }
+
+    async fn send_packet(&mut self, packet: Packet) {
+        self.output().send(packet).await;
+    }
+
+    /// Returns whether PacketSource should return from the current while loop.
+    fn wrap_up_run(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
+        match self {
+            PacketSource::DistPacketSource(_) => {
+                let (_, interval) = self.produce_packet(now);
+                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                true
+            }
+            PacketSource::TCPPacketSource(source) => {
+                if source.tcp_send_packet {
+                    source.tcp_send_packet = false;
+                    return false;
+                }
+                true
+            }
+        }
     }
 
     pub fn run<'a>(
@@ -111,27 +204,56 @@ impl PacketSource {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
-            let now = current_time.as_secs_f64();
-            let (packet, interval) = self.produce_packet(now);
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
 
-            // sends the packet out to the next element now
-            self.output.send(packet.clone()).await;
-            self.packet_sent(current_time, packet);
+            while !self.traffic_exceeded(now) {
+                if self.early_return(now, scheduler) {
+                    return;
+                }
 
-            if !self
-                .traffic
-                .size
-                .exceeded(self.sent_size, now + interval.as_secs_f64())
-            {
-                scheduler.schedule_event(interval, Self::run, ()).unwrap();
-            } else {
-                info!(
-                    "PacketSource {} of Flow {} finished running at {:.3}.",
-                    self.endpoint_id, self.flow_id, now
-                );
+                if self.should_produce_packet() {
+                    let (packet, interval) = self.produce_packet(now);
+                    if interval == Duration::default() {
+                        // sends the packet now if interval is 0
+                        self.send_packet(packet.clone()).await;
+                    } else {
+                        // schedules an event to send the packet if interval is
+                        // more than 0
+                        scheduler
+                            .schedule_event(interval, Self::send_packet, packet.clone())
+                            .unwrap();
+                    }
+
+                    self.wrap_up(&packet, now, scheduler);
+                }
+
+                if self.wrap_up_run(now, scheduler) {
+                    return;
+                }
+            }
+
+            if self.traffic_exceeded(now) {
+                debug!("{} finished running at {:.3}.", format!("{self}"), now);
             }
         }
+    }
+
+    fn advance_initial_delay(&self) -> f64 {
+        let initial_delay = match &self {
+            PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
+            PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
+        };
+
+        debug!(
+            "{} will be waiting for {:.3} sec(s) at the beginning.",
+            format!("{self}"),
+            initial_delay
+        );
+
+        initial_delay
     }
 }
 
@@ -141,14 +263,15 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            let (_, interval) = self.produce_packet(0.0);
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(self.traffic.initial_delay + interval.as_secs_f64()),
-                    Self::run,
-                    (),
-                )
-                .unwrap();
+            let initial_delay = self.advance_initial_delay();
+
+            if initial_delay > 0.0 {
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
+                    .unwrap();
+            } else {
+                self.run((), scheduler).await;
+            }
 
             self.into()
         })

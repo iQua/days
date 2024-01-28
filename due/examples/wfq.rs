@@ -66,7 +66,8 @@ fn main() {
         vec![1, 2],
     );
 
-    let mut sink = PacketSink::new(2);
+    let mut sink = PacketSink::new(&source_1);
+
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let wfq_mbox = Mailbox::new();
@@ -75,13 +76,13 @@ fn main() {
 
     // connects the output of packet sources to the input of the WFQ scheduler
     source_1
-        .output
+        .output()
         .connect(WFQServer::packet_received, &wfq_mbox);
     source_2
-        .output
+        .output()
         .connect(WFQServer::packet_received, &wfq_mbox);
     wfq.output.connect(PacketSink::packet_received, &sink_mbox);
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;

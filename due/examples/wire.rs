@@ -45,7 +45,7 @@ fn main() {
         },
     );
 
-    let mut sink = PacketSink::new(0);
+    let mut sink = PacketSink::new(&source);
 
     let source_mbox = Mailbox::new();
     let wire_mbox = Mailbox::new();
@@ -53,9 +53,9 @@ fn main() {
     let sink_addr = sink_mbox.address();
 
     // connects the output of packet source to the input of the wire
-    source.output.connect(Wire::packet_received, &wire_mbox);
+    source.output().connect(Wire::packet_received, &wire_mbox);
     wire.output.connect(PacketSink::packet_received, &sink_mbox);
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;

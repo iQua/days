@@ -67,7 +67,8 @@ fn main() {
         HashMap::from([(0, 2), (1, 1)]),
     );
 
-    let mut sink = PacketSink::new(2);
+    let mut sink = PacketSink::new(&source_1);
+
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let vc_mbox = Mailbox::new();
@@ -76,13 +77,13 @@ fn main() {
 
     // connects the output of packet sources to the input of the Virtual Clock scheduler
     source_1
-        .output
+        .output()
         .connect(VirtualClockServer::packet_received, &vc_mbox);
     source_2
-        .output
+        .output()
         .connect(VirtualClockServer::packet_received, &vc_mbox);
     vc.output.connect(PacketSink::packet_received, &sink_mbox);
-    let mut sink_statistics = sink.statistics.connect_slot().0;
+    let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
