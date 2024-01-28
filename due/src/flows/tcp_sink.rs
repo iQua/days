@@ -85,7 +85,7 @@ impl TCPPacketSink {
             }),
         };
 
-        // sends the Ack packet out to the TCPPacketSource now
+        // sends the acknowledgment packet out to the TCPPacketSource now
         self.output.send(acknowledgment.clone()).await;
 
         debug!(
