@@ -12,7 +12,6 @@ use std::fmt::{Debug, Display, Formatter};
 use log::debug;
 
 use asynchronix::model::{Model, Output};
-use asynchronix::simulation::EventSlot;
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
@@ -199,10 +198,10 @@ impl PacketSink {
         }
     }
 
-    pub fn statistics_event_slot(&mut self) -> EventSlot<PacketStatistics> {
+    pub fn statistics(&mut self) -> &mut Output<PacketStatistics> {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.statistics.connect_slot().0,
-            PacketSink::TCPPacketSink(sink) => sink.statistics.connect_slot().0,
+            PacketSink::BasicPacketSink(sink) => sink.statistics.borrow_mut(),
+            PacketSink::TCPPacketSink(sink) => sink.statistics.borrow_mut(),
         }
     }
 
