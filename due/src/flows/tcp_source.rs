@@ -47,9 +47,12 @@ pub struct TCPPacketSource {
     /// the scheduled events of timeouts of in-flight packets (segments)
     timeout_events: HashMap<usize, EventKey>,
 
-    /// The source is considered busy retrieving the current packet from flow
+    /// the source is considered busy retrieving the current packet from flow
     /// until this time
     busy_until: f64,
+    /// whether the source can send a packet before reaching the size of
+    /// congestion window
+    pub send_packet: bool,
 
     packets_sent: usize,
     rng: SmallRng,
@@ -94,6 +97,7 @@ impl TCPPacketSource {
             timeout_events: HashMap::new(),
             busy_until: 0.0,
             packets_sent: 0,
+            send_packet: false,
             rng,
             output: Output::default(),
         }
@@ -300,11 +304,13 @@ impl TCPPacketSource {
         (false, Duration::default())
     }
 
-    pub fn should_produce_packet(&self) -> bool {
+    pub fn should_produce_packet(&mut self) -> bool {
         // the sender can transmit up to the size of the congestion window
-        (self.next_seq + self.mss) as f64
+        self.send_packet = (self.next_seq + self.mss) as f64
             <= (self.send_buffer as f64)
-                .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
+                .min(self.last_ack as f64 + self.congestion_control.get_cwnd());
+
+        self.send_packet
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
@@ -312,14 +318,6 @@ impl TCPPacketSource {
         let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
 
         (packet, Duration::default())
-    }
-
-    pub fn schedule_next_run(&self) -> (bool, Duration) {
-        if self.should_produce_packet() {
-            (false, Duration::default())
-        } else {
-            (true, Duration::default())
-        }
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {

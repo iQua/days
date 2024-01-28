@@ -86,11 +86,6 @@ impl DistPacketSource {
         (packet, Duration::from_secs_f64(interval))
     }
 
-    pub fn schedule_next_run(&mut self, now: f64) -> (bool, Duration) {
-        let (_, interval) = self.produce_packet(now);
-        (true, interval)
-    }
-
     pub fn traffic_exceeded(&self, now: f64) -> bool {
         self.traffic.size.exceeded(self.sent_size, now)
     }

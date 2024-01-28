@@ -92,7 +92,7 @@ impl PacketSource {
         }
     }
 
-    /// Returns whether PacketSource should return from the current while loop
+    /// Returns whether PacketSource should return from the current run() event
     /// before producing a packet.
     pub fn early_return(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
         match self {
@@ -108,7 +108,7 @@ impl PacketSource {
     }
 
     /// Returns whether PacketSource should produce a new packet at this point.
-    fn should_produce_packet(&self) -> bool {
+    fn should_produce_packet(&mut self) -> bool {
         match self {
             PacketSource::DistPacketSource(_) => true,
             PacketSource::TCPPacketSource(source) => source.should_produce_packet(),
@@ -180,12 +180,21 @@ impl PacketSource {
         self.output().send(packet).await;
     }
 
-    /// Returns whether PacketSource should return from the current while loop
-    /// and schedule a new run().
-    fn schedule_next_run(&mut self, now: f64) -> (bool, Duration) {
+    /// Returns whether PacketSource should return from the current while loop.
+    fn wrap_up_run(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
         match self {
-            PacketSource::DistPacketSource(source) => source.schedule_next_run(now),
-            PacketSource::TCPPacketSource(source) => source.schedule_next_run(),
+            PacketSource::DistPacketSource(_) => {
+                let (_, interval) = self.produce_packet(now);
+                scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                true
+            }
+            PacketSource::TCPPacketSource(source) => {
+                if source.send_packet {
+                    source.send_packet = false;
+                    return false;
+                }
+                true
+            }
         }
     }
 
@@ -221,11 +230,7 @@ impl PacketSource {
                     self.wrap_up(&packet, now, scheduler);
                 }
 
-                let (schedule_next_run, interval) = self.schedule_next_run(now);
-                if schedule_next_run {
-                    if interval != Duration::default() {
-                        scheduler.schedule_event(interval, Self::run, ()).unwrap();
-                    }
+                if self.wrap_up_run(now, scheduler) {
                     return;
                 }
             }
