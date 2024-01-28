@@ -153,6 +153,7 @@ impl PacketSource {
         }
     }
 
+    /// Wraps up after sending out a packet.
     fn wrap_up(&mut self, packet: &Packet, now: f64, scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
@@ -172,10 +173,7 @@ impl PacketSource {
     }
 
     async fn send_packet(&mut self, packet: Packet) {
-        match self {
-            PacketSource::DistPacketSource(source) => source.output.send(packet).await,
-            PacketSource::TCPPacketSource(source) => source.output.send(packet).await,
-        }
+        self.output().send(packet).await;
     }
 
     /// Returns whether PacketSource should return from the current while loop
