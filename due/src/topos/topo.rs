@@ -411,9 +411,7 @@ impl Topology {
 
             // establishes a bi-directional connection between the packet source and the host
             let source_mbox: Mailbox<PacketSource> = Mailbox::new();
-            source
-                .output()
-                .connect(PacketSwitch::packet_received, host_mbox);
+            source.output_connect_switch(host_mbox);
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, &source_mbox);
             source_host.outputs.insert(source.id(), output);

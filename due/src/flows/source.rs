@@ -10,6 +10,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
 use asynchronix::model::{InitializedModel, Model, Output};
+use asynchronix::simulation::Mailbox;
 use asynchronix::time::{EventKey, MonotonicTime, Scheduler};
 
 use crate::flows::dist_source::DistPacketSource;
@@ -17,6 +18,7 @@ use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
+use crate::switches::switch::PacketSwitch;
 
 #[derive(Debug)]
 pub enum PacketSource {
@@ -48,11 +50,19 @@ impl PacketSource {
         }
     }
 
-    pub fn output(&self) -> Output<Packet> {
+    pub fn output_connect_switch(self, address: &Mailbox<PacketSwitch>) {
         match self {
-            PacketSource::DistPacketSource(source) => source.output,
-            PacketSource::TCPPacketSource(source) => source.output,
-        }
+            PacketSource::DistPacketSource(mut source) => {
+                source
+                    .output
+                    .connect(PacketSwitch::packet_received, address);
+            }
+            PacketSource::TCPPacketSource(mut source) => {
+                source
+                    .output
+                    .connect(PacketSwitch::packet_received, address);
+            }
+        };
     }
 
     pub fn id(&self) -> usize {
