@@ -42,9 +42,9 @@ impl PacketSource {
         };
 
         if traffic.tcp.is_some() {
-            PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, seed))
+            PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
         } else {
-            PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, seed))
+            PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
         }
     }
 
@@ -76,29 +76,31 @@ impl PacketSource {
         }
     }
 
-    // pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-    //     match self {
-    //         PacketSource::DistPacketSource(source) => source.packet_received(packet, scheduler),
-    //         PacketSource::TCPPacketSource(source) => {
-    //             source.ack_packet_received(packet, scheduler).await
-    //         }
-    //     }
-    // }
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+        match self {
+            PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
+            PacketSource::TCPPacketSource(source) => source.ack_packet_received(packet, now).await,
+        }
+    }
 
     /// Returns whether PacketSource should take some actions before producing a
     /// packet.
-    pub fn pre_produce_packet(&self, now: f64) -> (bool, Duration) {
+    pub fn pre_produce_packet(&mut self, now: f64) -> (bool, Duration) {
         match self {
-            PacketSource::DistPacketSource(source) => (false, Duration::default()),
+            PacketSource::DistPacketSource(_) => (false, Duration::default()),
             PacketSource::TCPPacketSource(source) => source.retrieve_packets_from_flow(now),
         }
     }
 
     /// Returns whether PacketSource should produce a new packet at this point.
-    fn should_produce_packet(&self, now: f64) -> bool {
+    fn should_produce_packet(&self) -> bool {
         match self {
-            PacketSource::DistPacketSource(source) => true,
-            PacketSource::TCPPacketSource(source) => source.should_produce_packet(now),
+            PacketSource::DistPacketSource(_) => true,
+            PacketSource::TCPPacketSource(source) => source.should_produce_packet(),
         }
     }
 
@@ -151,7 +153,7 @@ impl PacketSource {
 
     pub fn finish_wrap_up(&mut self, packet: Packet, event_key: EventKey, now: f64) {
         match self {
-            PacketSource::DistPacketSource(source) => (),
+            PacketSource::DistPacketSource(_) => (),
             PacketSource::TCPPacketSource(source) => source.finish_wrap_up(packet, event_key, now),
         }
     }
@@ -162,10 +164,10 @@ impl PacketSource {
 
     /// Returns whether PacketSource should return from the current while loop
     /// and schedule a new run().
-    pub fn schedule_next_run(&self, now: f64) -> (bool, Duration) {
+    pub fn schedule_next_run(&mut self, now: f64) -> (bool, Duration) {
         match self {
             PacketSource::DistPacketSource(source) => source.schedule_next_run(now),
-            PacketSource::TCPPacketSource(source) => source.schedule_next_run(now),
+            PacketSource::TCPPacketSource(source) => source.schedule_next_run(),
         }
     }
 
@@ -175,8 +177,10 @@ impl PacketSource {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let current_time = scheduler.time().duration_since(MonotonicTime::EPOCH);
-            let now = current_time.as_secs_f64();
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
 
             while !self.traffic_exceeded(now) {
                 let (schedule_new_run, interval) = self.pre_produce_packet(now);
@@ -186,7 +190,7 @@ impl PacketSource {
                     return;
                 }
 
-                if self.should_produce_packet(now) {
+                if self.should_produce_packet() {
                     let (packet, interval) = self.produce_packet(now);
                     if interval == Duration::default() {
                         // sends the packet now if interval is 0
@@ -235,6 +239,7 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
+            let source_name = format!("{self}");
             let initial_delay = match self {
                 PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
                 PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
@@ -242,8 +247,7 @@ impl Model for PacketSource {
 
             debug!(
                 "{} will be waiting for {:.3} sec(s) at the beginning.",
-                format!("{self}"),
-                initial_delay
+                source_name, initial_delay
             );
 
             if initial_delay > 0.0 {

@@ -8,16 +8,15 @@ use std::time::Duration;
 use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use asynchronix::model::{Model, Output};
-use asynchronix::time::{EventKey, MonotonicTime, Scheduler};
+use asynchronix::time::EventKey;
 
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
-use crate::{get_seed, next_endpoint_id};
+use crate::next_endpoint_id;
 
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
@@ -68,13 +67,7 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> TCPPacketSource {
-        let global_seed = get_seed();
-        let rng = match global_seed {
-            1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
-            _ => SmallRng::from_entropy(),
-        };
-
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
         let rtt_estimate = traffic.tcp.unwrap().rtt_estimate;
 
@@ -107,14 +100,9 @@ impl TCPPacketSource {
     }
 
     /// On receiving an acknowledgment packet.
-    pub async fn ack_packet_received(&mut self, ack_packet: Packet, scheduler: &Scheduler<Self>) {
+    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) {
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
-
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
 
         debug!(
             "TCPPacketSource {} received Ack of packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -273,7 +261,7 @@ impl TCPPacketSource {
     }
 
     // Retrieves packets from the (application-layer) flow.
-    pub fn retrieve_packets_from_flow(&self, now: f64) -> (bool, Duration) {
+    pub fn retrieve_packets_from_flow(&mut self, now: f64) -> (bool, Duration) {
         while self.next_seq >= self.send_buffer {
             let interval = match self.traffic.arr_dist {
                 DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
@@ -314,7 +302,7 @@ impl TCPPacketSource {
         (false, Duration::default())
     }
 
-    pub fn should_produce_packet(&self, now: f64) -> bool {
+    pub fn should_produce_packet(&self) -> bool {
         // the sender can transmit up to the size of the congestion window
         (self.next_seq + self.mss) as f64
             <= (self.send_buffer as f64)
@@ -328,8 +316,8 @@ impl TCPPacketSource {
         (packet, Duration::default())
     }
 
-    pub fn schedule_next_run(&self, now: f64) -> (bool, Duration) {
-        if self.should_produce_packet(now) {
+    pub fn schedule_next_run(&self) -> (bool, Duration) {
+        if self.should_produce_packet() {
             (false, Duration::default())
         } else {
             (true, Duration::default())
