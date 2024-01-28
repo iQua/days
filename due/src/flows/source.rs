@@ -93,7 +93,11 @@ impl PacketSource {
             .as_secs_f64();
         match self {
             PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
-            PacketSource::TCPPacketSource(source) => source.ack_packet_received(packet, now).await,
+            PacketSource::TCPPacketSource(source) => {
+                if source.ack_packet_received(packet, now).await {
+                    self.run((), scheduler).await;
+                }
+            }
         }
     }
 

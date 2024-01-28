@@ -99,8 +99,8 @@ impl TCPPacketSource {
         }
     }
 
-    /// On receiving an acknowledgment packet.
-    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) {
+    /// Returns whether PacketSource should proceed another run().
+    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
 
@@ -133,7 +133,7 @@ impl TCPPacketSource {
                 self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
             );
 
-            return;
+            return false;
         } else if self.dupack > 3 {
             self.congestion_control.more_dupacks_received();
 
@@ -154,7 +154,7 @@ impl TCPPacketSource {
                 );
             }
 
-            return;
+            return false;
         }
 
         if self.dupack == 0 {
@@ -195,9 +195,11 @@ impl TCPPacketSource {
             }
 
             if now >= self.busy_until {
-                //self.send_packet((), scheduler);
+                return true;
             }
         }
+
+        false
     }
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
