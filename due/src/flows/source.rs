@@ -133,18 +133,22 @@ impl PacketSource {
                 // no wrap-up event after sending out a packet in DisPacketSource
                 PacketSource::DistPacketSource(_) => (),
                 // the wrap-up event after sending out a packet in
-                // TCPPacketSource is the timeout event, that is,
-                // TCPPacketSource set a timer for each sent packet
+                // TCPPacketSource is the timeout event scheduled for this
+                // packet
                 PacketSource::TCPPacketSource(source) => {
                     let now = scheduler
                         .time()
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
-                    let interval = source.timer_expired(packet_id, now).await;
+                    source.timer_expired(packet_id, now).await;
 
                     // schedules a new timeout event for this packet
                     let event_key = scheduler
-                        .schedule_keyed_event(interval, Self::wrap_up_packet_event, packet_id)
+                        .schedule_keyed_event(
+                            Duration::from_secs_f64(source.rto),
+                            Self::wrap_up_packet_event,
+                            packet_id,
+                        )
                         .unwrap();
 
                     source.reset_timer(packet_id, event_key, now);

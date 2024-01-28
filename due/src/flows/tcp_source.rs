@@ -224,8 +224,8 @@ impl TCPPacketSource {
         );
     }
 
-    /// On a packet reaches timeout. Returns the updated timeout of this packet.
-    pub async fn timer_expired(&mut self, packet_id: usize, now: f64) -> Duration {
+    /// On a packet reaches timeout.
+    pub async fn timer_expired(&mut self, packet_id: usize, now: f64) {
         debug!(
             "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}.",
             self.endpoint_id, packet_id, now
@@ -246,11 +246,9 @@ impl TCPPacketSource {
 
         // doubles the retransmission timeout
         self.rto *= 2.0;
-
-        Duration::from_secs_f64(self.rto)
     }
 
-    /// Reset a timer for a packet that reached timeout.
+    /// Resets a timer for a packet that reached timeout.
     pub fn reset_timer(&mut self, packet_id: usize, event_key: EventKey, now: f64) {
         self.timeout_events.insert(packet_id, event_key);
 
