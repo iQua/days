@@ -39,7 +39,7 @@ pub struct TCPPacketSource {
     /// the RTT estimate
     rtt_estimate: f64,
     /// the retransmission timeout
-    rto: f64,
+    pub rto: f64,
     /// an estimate of the RTT deviation
     est_deviation: f64,
     /// the in-flight packets (segments)
@@ -202,7 +202,7 @@ impl TCPPacketSource {
         false
     }
 
-    pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
+    pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
 
         debug!(
@@ -213,11 +213,9 @@ impl TCPPacketSource {
         self.sent_packets.insert(packet.packet_id, packet.clone());
 
         self.next_seq += packet.size;
-
-        (true, Duration::from_secs_f64(self.rto))
     }
 
-    pub fn finish_wrap_up(&mut self, packet: Packet, event_key: EventKey, now: f64) {
+    pub fn finish_wrap_up(&mut self, packet: &Packet, event_key: EventKey, now: f64) {
         self.timeout_events.insert(packet.packet_id, event_key);
 
         debug!(

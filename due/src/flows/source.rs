@@ -11,7 +11,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
 use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::{EventKey, MonotonicTime, Scheduler};
+use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
@@ -123,15 +123,6 @@ impl PacketSource {
         }
     }
 
-    /// Returns whether PacketSource should schedule a wrap-up event for the
-    /// sent packet.
-    pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
-        match self {
-            PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
-            PacketSource::TCPPacketSource(source) => source.packet_sent(packet, now),
-        }
-    }
-
     pub fn wrap_up_packet_event<'a>(
         &'a mut self,
         packet_id: usize,
@@ -162,10 +153,21 @@ impl PacketSource {
         }
     }
 
-    pub fn finish_wrap_up(&mut self, packet: Packet, event_key: EventKey, now: f64) {
+    fn wrap_up(&mut self, packet: &Packet, now: f64, scheduler: &Scheduler<Self>) {
         match self {
-            PacketSource::DistPacketSource(_) => (),
-            PacketSource::TCPPacketSource(source) => source.finish_wrap_up(packet, event_key, now),
+            PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
+            PacketSource::TCPPacketSource(source) => {
+                source.packet_sent(packet, now);
+                let event_key = scheduler
+                    .schedule_keyed_event(
+                        Duration::from_secs_f64(source.rto),
+                        Self::wrap_up_packet_event,
+                        packet.packet_id,
+                    )
+                    .unwrap();
+
+                source.finish_wrap_up(packet, event_key, now);
+            }
         }
     }
 
@@ -178,7 +180,7 @@ impl PacketSource {
 
     /// Returns whether PacketSource should return from the current while loop
     /// and schedule a new run().
-    pub fn schedule_next_run(&mut self, now: f64) -> (bool, Duration) {
+    fn schedule_next_run(&mut self, now: f64) -> (bool, Duration) {
         match self {
             PacketSource::DistPacketSource(source) => source.schedule_next_run(now),
             PacketSource::TCPPacketSource(source) => source.schedule_next_run(),
@@ -214,18 +216,7 @@ impl PacketSource {
                             .unwrap();
                     }
 
-                    let (wrap_up, interval) = self.packet_sent(&packet, now);
-                    if wrap_up {
-                        let event_key = scheduler
-                            .schedule_keyed_event(
-                                interval,
-                                Self::wrap_up_packet_event,
-                                packet.packet_id,
-                            )
-                            .unwrap();
-
-                        self.finish_wrap_up(packet, event_key, now);
-                    }
+                    self.wrap_up(&packet, now, scheduler);
                 }
 
                 let (schedule_next_run, interval) = self.schedule_next_run(now);

@@ -39,7 +39,7 @@ impl DistPacketSource {
         }
     }
 
-    pub fn packet_sent(&mut self, packet: &Packet, now: f64) -> (bool, Duration) {
+    pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
 
@@ -47,8 +47,6 @@ impl DistPacketSource {
             "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
-
-        (false, Duration::default())
     }
 
     pub fn packet_received(&mut self, packet: Packet, now: f64) {
