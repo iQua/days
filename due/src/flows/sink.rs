@@ -10,14 +10,15 @@ use std::fmt::{Debug, Display, Formatter};
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
-use asynchronix::simulation::EventSlot;
+use asynchronix::model::Model;
+use asynchronix::simulation::{EventSlot, Mailbox};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
+use crate::switches::switch::PacketSwitch;
 
 /// A simple collector for statistical data.
 #[derive(Clone, Debug)]
@@ -205,13 +206,16 @@ impl PacketSink {
         }
     }
 
-    pub fn output(&self) -> Output<Packet> {
+    pub fn output_connect_switch(&mut self, address: &Mailbox<PacketSwitch>) {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.output,
-            PacketSink::TCPPacketSink(sink) => sink.output,
-        }
+            PacketSink::BasicPacketSink(sink) => {
+                sink.output.connect(PacketSwitch::packet_received, address);
+            }
+            PacketSink::TCPPacketSink(sink) => {
+                sink.output.connect(PacketSwitch::packet_received, address);
+            }
+        };
     }
-
     pub async fn report(&mut self, endpoint_id: usize) {
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", format!("{self}"));

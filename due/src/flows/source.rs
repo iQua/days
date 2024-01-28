@@ -9,7 +9,7 @@ use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
-use asynchronix::model::{InitializedModel, Model, Output};
+use asynchronix::model::{InitializedModel, Model};
 use asynchronix::simulation::Mailbox;
 use asynchronix::time::{EventKey, MonotonicTime, Scheduler};
 
@@ -50,14 +50,14 @@ impl PacketSource {
         }
     }
 
-    pub fn output_connect_switch(self, address: &Mailbox<PacketSwitch>) {
+    pub fn output_connect_switch(&mut self, address: &Mailbox<PacketSwitch>) {
         match self {
-            PacketSource::DistPacketSource(mut source) => {
+            PacketSource::DistPacketSource(source) => {
                 source
                     .output
                     .connect(PacketSwitch::packet_received, address);
             }
-            PacketSource::TCPPacketSource(mut source) => {
+            PacketSource::TCPPacketSource(source) => {
                 source
                     .output
                     .connect(PacketSwitch::packet_received, address);
