@@ -29,7 +29,7 @@ pub struct TCPPacketSource {
     /// maximum segment size, in bytes
     mss: usize,
     /// the next sequence number to be sent, in bytes
-    pub next_seq: usize,
+    next_seq: usize,
     /// the maximum sequence number in the in-transit data buffer
     send_buffer: usize,
     /// the sequence number of the segment that is last acknowledged
@@ -52,7 +52,7 @@ pub struct TCPPacketSource {
     busy_until: f64,
     /// whether the source can send a packet before reaching the size of
     /// congestion window
-    pub send_packet: bool,
+    pub tcp_send_packet: bool,
 
     packets_sent: usize,
     rng: SmallRng,
@@ -97,7 +97,7 @@ impl TCPPacketSource {
             timeout_events: HashMap::new(),
             busy_until: 0.0,
             packets_sent: 0,
-            send_packet: false,
+            tcp_send_packet: false,
             rng,
             output: Output::default(),
         }
@@ -306,11 +306,11 @@ impl TCPPacketSource {
 
     pub fn should_produce_packet(&mut self) -> bool {
         // the sender can transmit up to the size of the congestion window
-        self.send_packet = (self.next_seq + self.mss) as f64
+        self.tcp_send_packet = (self.next_seq + self.mss) as f64
             <= (self.send_buffer as f64)
                 .min(self.last_ack as f64 + self.congestion_control.get_cwnd());
 
-        self.send_packet
+        self.tcp_send_packet
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {

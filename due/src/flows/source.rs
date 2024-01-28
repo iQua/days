@@ -92,7 +92,7 @@ impl PacketSource {
         }
     }
 
-    /// Returns whether PacketSource should return from the current run() event
+    /// Returns whether PacketSource should return from the current while loop
     /// before producing a packet.
     pub fn early_return(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
         match self {
@@ -189,8 +189,8 @@ impl PacketSource {
                 true
             }
             PacketSource::TCPPacketSource(source) => {
-                if source.send_packet {
-                    source.send_packet = false;
+                if source.tcp_send_packet {
+                    source.tcp_send_packet = false;
                     return false;
                 }
                 true
