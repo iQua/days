@@ -92,12 +92,18 @@ impl PacketSource {
         }
     }
 
-    /// Returns whether PacketSource should take some actions before producing a
-    /// packet.
-    pub fn pre_produce_packet(&mut self, now: f64) -> (bool, Duration) {
+    /// Returns whether PacketSource should return from the current while loop
+    /// before producing a packet.
+    pub fn early_return(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
         match self {
-            PacketSource::DistPacketSource(_) => (false, Duration::default()),
-            PacketSource::TCPPacketSource(source) => source.retrieve_packets_from_flow(now),
+            PacketSource::DistPacketSource(_) => false,
+            PacketSource::TCPPacketSource(source) => {
+                let (should_return, interval) = source.retrieve_packets_from_flow(now);
+                if should_return {
+                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                }
+                return should_return;
+            }
         }
     }
 
@@ -191,10 +197,7 @@ impl PacketSource {
                 .as_secs_f64();
 
             while !self.traffic_exceeded(now) {
-                let (schedule_new_run, interval) = self.pre_produce_packet(now);
-                if schedule_new_run {
-                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
-
+                if self.early_return(now, scheduler) {
                     return;
                 }
 
