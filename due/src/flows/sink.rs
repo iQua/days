@@ -197,10 +197,10 @@ impl PacketSink {
         }
     }
 
-    pub fn packet_statistics(&self) -> PacketStatistics {
+    pub fn packet_statistics(&self) -> &PacketStatistics {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.packet_statistics,
-            PacketSink::TCPPacketSink(sink) => sink.packet_statistics,
+            PacketSink::BasicPacketSink(sink) => &sink.packet_statistics,
+            PacketSink::TCPPacketSink(sink) => &sink.packet_statistics,
         }
     }
 

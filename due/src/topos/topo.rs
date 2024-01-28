@@ -402,6 +402,8 @@ impl Topology {
 
             // creates a new packet source
             let mut source = PacketSource::new(flow.id, flow.traffic, flow.seed);
+            // creates a new packet sink
+            let mut sink = PacketSink::new(&source);
 
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
@@ -418,9 +420,6 @@ impl Topology {
 
             // activates the packet source
             self.sim_init = self.sim_init.add_model(source, source_mbox);
-
-            // creates a new packet sink
-            let mut sink = PacketSink::new(&source);
 
             // obtains the host switch and its mailbox for the packet sink
             let sink_host = self.switches.get_mut(&flow.sink_host).unwrap();

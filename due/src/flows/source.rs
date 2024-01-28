@@ -159,7 +159,10 @@ impl PacketSource {
     }
 
     async fn send_packet(&mut self, packet: Packet) {
-        self.output().send(packet).await;
+        match self {
+            PacketSource::DistPacketSource(source) => source.output.send(packet).await,
+            PacketSource::TCPPacketSource(source) => source.output.send(packet).await,
+        }
     }
 
     /// Returns whether PacketSource should return from the current while loop
@@ -194,7 +197,7 @@ impl PacketSource {
                     let (packet, interval) = self.produce_packet(now);
                     if interval == Duration::default() {
                         // sends the packet now if interval is 0
-                        self.output().send(packet.clone()).await;
+                        self.send_packet(packet.clone()).await;
                     } else {
                         // schedules an event to send the packet if interval is
                         // more than 0
@@ -231,6 +234,21 @@ impl PacketSource {
             }
         }
     }
+
+    fn advance_initial_delay(&self) -> f64 {
+        let initial_delay = match &self {
+            PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
+            PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
+        };
+
+        debug!(
+            "{} will be waiting for {:.3} sec(s) at the beginning.",
+            format!("{self}"),
+            initial_delay
+        );
+
+        initial_delay
+    }
 }
 
 impl Model for PacketSource {
@@ -239,16 +257,7 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            let source_name = format!("{self}");
-            let initial_delay = match self {
-                PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
-                PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
-            };
-
-            debug!(
-                "{} will be waiting for {:.3} sec(s) at the beginning.",
-                source_name, initial_delay
-            );
+            let initial_delay = self.advance_initial_delay();
 
             if initial_delay > 0.0 {
                 scheduler
