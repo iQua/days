@@ -411,7 +411,10 @@ impl Topology {
 
             // establishes a bi-directional connection between the packet source and the host
             let source_mbox: Mailbox<PacketSource> = Mailbox::new();
-            source.output_connect_switch(host_mbox);
+            source
+                .output()
+                .connect(PacketSwitch::packet_received, host_mbox);
+            //source.output_connect_switch(host_mbox);
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, &source_mbox);
             source_host.outputs.insert(source.id(), output);
@@ -439,7 +442,8 @@ impl Topology {
                 .sink_statistics
                 .insert(sink.id(), sink.statistics_event_slot());
 
-            sink.output_connect_switch(host_mbox);
+            sink.output()
+                .connect(PacketSwitch::packet_received, host_mbox);
             let mut output = Output::default();
             output.connect(PacketSink::packet_received, &sink_mbox);
             sink_host.outputs.insert(sink.id(), output);
