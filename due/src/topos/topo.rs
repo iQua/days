@@ -439,7 +439,7 @@ impl Topology {
             stats.sink_addresses.insert(sink.id(), sink_mbox.address());
             stats
                 .sink_statistics
-                .insert(sink.id(), sink.statistics().connect_slot().0);
+                .insert(sink.id(), sink.statistics_event_slot());
 
             sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);

@@ -11,6 +11,7 @@ use std::fmt::{Debug, Display, Formatter};
 use log::debug;
 
 use asynchronix::model::{Model, Output};
+use asynchronix::simulation::EventSlot;
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
@@ -197,17 +198,10 @@ impl PacketSink {
         }
     }
 
-    pub fn packet_statistics(&self) -> &PacketStatistics {
+    pub fn statistics_event_slot(&mut self) -> EventSlot<PacketStatistics> {
         match self {
-            PacketSink::BasicPacketSink(sink) => &sink.packet_statistics,
-            PacketSink::TCPPacketSink(sink) => &sink.packet_statistics,
-        }
-    }
-
-    pub fn statistics(&self) -> Output<PacketStatistics> {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.statistics,
-            PacketSink::TCPPacketSink(sink) => sink.statistics,
+            PacketSink::BasicPacketSink(sink) => sink.statistics.connect_slot().0,
+            PacketSink::TCPPacketSink(sink) => sink.statistics.connect_slot().0,
         }
     }
 
@@ -221,9 +215,14 @@ impl PacketSink {
     pub async fn report(&mut self, endpoint_id: usize) {
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", format!("{self}"));
-        self.statistics()
-            .send(self.packet_statistics().clone())
-            .await;
+        match self {
+            PacketSink::BasicPacketSink(sink) => {
+                sink.statistics.send(sink.packet_statistics.clone()).await
+            }
+            PacketSink::TCPPacketSink(sink) => {
+                sink.statistics.send(sink.packet_statistics.clone()).await
+            }
+        }
     }
 
     async fn wrap_up(&mut self, packet: Packet, now: f64) {
@@ -233,7 +232,7 @@ impl PacketSink {
         }
     }
 
-    pub fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -253,7 +252,7 @@ impl PacketSink {
             arrival_time,
         );
 
-        self.wrap_up(packet, arrival_time);
+        self.wrap_up(packet, arrival_time).await;
     }
 }
 
