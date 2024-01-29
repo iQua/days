@@ -283,7 +283,7 @@ impl TCPPacketSource {
             );
     }
 
-    // Retrieves packets from the (application-layer) flow.
+    /// Retrieves packets from the (application-layer) flow.
     pub fn retrieve_packets_from_flow(&mut self, now: f64) -> (bool, Duration) {
         while self.next_seq >= self.send_buffer {
             let interval = match self.traffic.arr_dist {

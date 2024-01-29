@@ -116,7 +116,7 @@ impl PacketSource {
                 if should_return {
                     scheduler.schedule_event(interval, Self::run, ()).unwrap();
                 }
-                return should_return;
+                should_return
             }
         }
     }

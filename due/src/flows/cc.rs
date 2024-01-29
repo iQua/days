@@ -41,7 +41,7 @@ impl TCPReno {
 }
 
 impl CongestionControl for TCPReno {
-    // Actions to be taken when a new ack has been received
+    /// Actions to be taken when a new acknowledgment has been received.
     fn ack_received(&mut self, _rtt: f64, _current_time: f64) {
         if self.cwnd <= self.ssthresh {
             // slow start
@@ -52,27 +52,29 @@ impl CongestionControl for TCPReno {
         }
     }
 
-    // Actions to be taken when a timer expired
+    /// Actions to be taken when a timer expired.
     fn timer_expired(&mut self) {
         self.ssthresh = (2.0 * self.mss).max(self.cwnd / 2.0);
         // sets the congestion window to 1 segment
         self.cwnd = self.mss;
     }
 
-    // Actions to be taken when a new ack is received after previous dupacks
+    /// Actions to be taken when a new acknowledgment is received after previous
+    /// dupacks.
     fn dupack_over(&mut self) {
         // RFC 2001 and TCP Reno
         self.cwnd = self.ssthresh;
     }
 
-    // Actions to be taken when three consecutive dupacks are received
+    /// Actions to be taken when three consecutive dupacks are received.
     fn consecutive_dupacks_received(&mut self) {
         // fast retransmit in RFC 2001 and TCP Reno
         self.ssthresh = (2.0 * self.mss).max(self.cwnd / 2.0);
         self.cwnd = self.ssthresh + 3.0 * self.mss;
     }
 
-    // Actions to be taken when more than three consecutive dupacks are received
+    /// Actions to be taken when more than three consecutive dupacks are
+    /// received.
     fn more_dupacks_received(&mut self) {
         // fast retransmit in RFC 2001 and TCP Reno
         self.cwnd += self.mss;
@@ -126,7 +128,7 @@ impl TCPCubic {
         }
     }
 
-    // Resets the states in CUBIC
+    /// Resets the states in CUBIC.
     pub fn cubic_reset(&mut self) {
         self.w_last_max = 0.0;
         self.epoch_start = 0.0;
@@ -137,7 +139,7 @@ impl TCPCubic {
         self.ack_cnt = 0;
     }
 
-    // Updates CUBIC parameters upon the arrival of a new ack
+    /// Updates CUBIC parameters upon the arrival of a new acknowledgment.
     pub fn cubic_update(&mut self, current_time: f64) {
         self.ack_cnt += 1;
         if self.epoch_start <= 0.0 {
@@ -163,7 +165,7 @@ impl TCPCubic {
         }
     }
 
-    // CUBIC actions in TCP mode
+    /// CUBIC actions in TCP mode.
     pub fn cubic_tcp_friendliness(&mut self) {
         self.w_tcp += 3.0 * self.beta / (2.0 - self.beta) * (self.ack_cnt as f64 / self.cwnd);
         self.ack_cnt = 0;
@@ -177,7 +179,7 @@ impl TCPCubic {
 }
 
 impl CongestionControl for TCPCubic {
-    // Actions to be taken when a new ack has been received
+    /// Actions to be taken when a new acknowledgment has been received.
     fn ack_received(&mut self, rtt: f64, current_time: f64) {
         if self.d_min > 0.0 {
             self.d_min = self.d_min.min(rtt);
@@ -200,25 +202,27 @@ impl CongestionControl for TCPCubic {
         }
     }
 
-    // Actions to be taken when a timer expired
+    /// Actions to be taken when a timer expired.
     fn timer_expired(&mut self) {
         // sets the congestion window to 1 segment
         self.cwnd = self.mss;
         self.cubic_reset();
     }
 
-    // Actions to be taken when a new ack is received after previous dupacks
+    /// Actions to be taken when a new acknowledgment is received after previous
+    /// dupacks.
     fn dupack_over(&mut self) {
         self.cwnd = self.ssthresh;
     }
 
-    // Actions to be taken when three consecutive dupacks are received
+    /// Actions to be taken when three consecutive dupacks are received.
     fn consecutive_dupacks_received(&mut self) {
         self.ssthresh = (2.0 * self.mss).max(self.cwnd / 2.0);
         self.cwnd = self.ssthresh + 3.0 * self.mss;
     }
 
-    // Actions to be taken when more than three consecutive dupacks are received
+    /// Actions to be taken when more than three consecutive dupacks are
+    /// received.
     fn more_dupacks_received(&mut self) {
         self.cwnd += self.mss;
     }
