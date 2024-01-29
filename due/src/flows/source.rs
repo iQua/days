@@ -85,8 +85,22 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
             PacketSource::TCPPacketSource(source) => {
-                if source.ack_packet_received(packet, now).await {
+                let action = source.ack_packet_received(packet, now).await;
+                if action.proceed_run {
                     self.run((), scheduler).await;
+                } else if action.set_timer {
+                    let packet_id = action.packet_id.unwrap();
+
+                    // schedules a timeout event for this packet
+                    let event_key = scheduler
+                        .schedule_keyed_event(
+                            Duration::from_secs_f64(source.rto),
+                            Self::wrap_up_packet_event,
+                            packet_id,
+                        )
+                        .unwrap();
+
+                    source.finish_wrap_up(packet_id, event_key, now);
                 }
             }
         }
@@ -163,6 +177,8 @@ impl PacketSource {
             PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
             PacketSource::TCPPacketSource(source) => {
                 source.packet_sent(packet, now);
+
+                // schedules a timeout event for this packet
                 let event_key = scheduler
                     .schedule_keyed_event(
                         Duration::from_secs_f64(source.rto),
@@ -171,7 +187,7 @@ impl PacketSource {
                     )
                     .unwrap();
 
-                source.finish_wrap_up(packet, event_key, now);
+                source.finish_wrap_up(packet.packet_id, event_key, now);
             }
         }
     }

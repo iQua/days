@@ -18,6 +18,17 @@ use crate::flows::packet::Packet;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 
+/// Defines the action that PacketSource should take after TCPPacketSource
+/// receives an acknowledgment.
+pub struct AckAction {
+    /// whether PacketSource should proceed another run()  
+    pub proceed_run: bool,
+    /// whether PacketSource should set a timer (schedule a timeout event)
+    pub set_timer: bool,
+    /// the packet id of the timer that will be set
+    pub packet_id: Option<usize>,
+}
+
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
@@ -103,8 +114,9 @@ impl TCPPacketSource {
         }
     }
 
-    /// Returns whether PacketSource should proceed another run().
-    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
+    /// Returns the action that PacketSource should take after TCPPacketSource
+    /// handles an acknowledgment.
+    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> AckAction {
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
 
@@ -136,29 +148,24 @@ impl TCPPacketSource {
                 "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
                 self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
             );
-
-            return false;
         } else if self.dupack > 3 {
             self.congestion_control.more_dupacks_received();
 
+            // transmits a new packet, if allowed by the new value of cwnd
             if self.last_ack as f64 + self.congestion_control.get_cwnd() >= ack.sequence_num as f64
+                && !self.traffic.size.exceeded(self.next_seq, now)
             {
-                let resent_pkt = self.sent_packets.get_mut(&ack.sequence_num).unwrap();
-                resent_pkt.time = now;
+                let (packet, _) = self.produce_packet(now);
 
-                self.output.send(resent_pkt.clone()).await;
+                self.output.send(packet.clone()).await;
+                self.packet_sent(&packet, now);
 
-                debug!(
-                    "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                    self.endpoint_id,
-                    resent_pkt.packet_id,
-                    resent_pkt.size,
-                    resent_pkt.flow_id,
-                    now,
-                );
+                return AckAction {
+                    proceed_run: false,
+                    set_timer: true,
+                    packet_id: Some(packet.packet_id),
+                };
             }
-
-            return false;
         }
 
         if self.dupack == 0 {
@@ -205,11 +212,19 @@ impl TCPPacketSource {
                 .retain(|&packet_id, _| packet_id > ack_packet.packet_id);
 
             if now >= self.busy_until {
-                return true;
+                return AckAction {
+                    proceed_run: true,
+                    set_timer: false,
+                    packet_id: None,
+                };
             }
         }
 
-        false
+        AckAction {
+            proceed_run: false,
+            set_timer: false,
+            packet_id: None,
+        }
     }
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
@@ -225,12 +240,12 @@ impl TCPPacketSource {
         self.next_seq += packet.size;
     }
 
-    pub fn finish_wrap_up(&mut self, packet: &Packet, event_key: EventKey, now: f64) {
-        self.timeout_events.insert(packet.packet_id, event_key);
+    pub fn finish_wrap_up(&mut self, packet_id: usize, event_key: EventKey, now: f64) {
+        self.timeout_events.insert(packet_id, event_key);
 
         debug!(
             "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-            self.endpoint_id, packet.packet_id, self.rto, now + self.rto
+            self.endpoint_id, packet_id, self.rto, now + self.rto
         );
     }
 
@@ -320,8 +335,7 @@ impl TCPPacketSource {
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        let packet_id = self.next_seq;
-        let packet = Packet::new(self.mss, packet_id, self.flow_id, now);
+        let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
 
         (packet, Duration::default())
     }
