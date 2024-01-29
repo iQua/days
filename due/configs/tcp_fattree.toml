@@ -17,10 +17,10 @@ drop = "RED"
 
 [[flow_set]]
 flow_type = "PacketDistribution"
-flow_count = 50
+flow_count = 500
 [flow_set.traffic]
     initial_delay = 1.0
-    duration = 50.0
+    duration = 150.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
     pkt_size_dist = {type = "Uniform", low = 512, high = 512}
 [flow_set.traffic.tcp]
