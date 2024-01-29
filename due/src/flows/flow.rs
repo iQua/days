@@ -46,6 +46,8 @@ pub struct Flow {
     pub source_host: usize,
     /// the id of the host switch that the sink attaches to
     pub sink_host: usize,
+    /// the id of PacketSource
+    pub source_id: usize,
     /// the id of PacketSink
     pub sink_id: usize,
     /// traffic characteristics of the flow
@@ -72,6 +74,7 @@ impl Flow {
             flow_type,
             source_host,
             sink_host,
+            source_id: 0,
             sink_id: 0,
             traffic,
             seed,
@@ -79,8 +82,8 @@ impl Flow {
         }
     }
 
-    // Initializes flows from a vector of directed graphs. Each directed graph
-    // only has one edge from the packet source to the packet sink.
+    /// Initializes flows from a vector of directed graphs. Each directed graph
+    /// only has one edge from the packet source to the packet sink.
     pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
         let mut flows = Vec::new();
 
@@ -113,7 +116,7 @@ impl Flow {
         flows
     }
 
-    // Initializes flows from a configuration file.
+    /// Initializes flows from a configuration file.
     pub fn flows_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Flow> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
@@ -171,14 +174,17 @@ impl Flow {
         flows
     }
 
-    // Given the network graph, computes the path from the packet source to the sink in the flow
+    /// Given the network graph, computes the path from the PacketSource to the
+    /// PacketSink in the flow.
     pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
         self.routing = RandomSimplePath::new(graph);
 
-        let mut path = self.routing.compute_route(
+        let mut path = vec![NodeIndex::new(self.source_id)];
+
+        path.append(&mut self.routing.compute_route(
             NodeIndex::new(self.source_host),
             NodeIndex::new(self.sink_host),
-        );
+        ));
         path.push(NodeIndex::new(self.sink_id));
 
         path
