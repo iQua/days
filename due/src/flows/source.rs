@@ -153,7 +153,8 @@ impl PacketSource {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             match self {
-                // no wrap-up event after sending out a packet in DisPacketSource
+                // no wrap-up event after sending out a packet in
+                // DistPacketSource
                 PacketSource::DistPacketSource(_) => (),
                 // the wrap-up event after sending out a packet in
                 // TCPPacketSource is the timeout event scheduled for this

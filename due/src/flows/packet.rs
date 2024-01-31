@@ -7,14 +7,14 @@ pub struct TCPAck {
 
 #[derive(Debug, Clone)]
 pub struct Packet {
-    /// Packets in Due are typically created by packet generators, and runs
-    /// through a sequence of packet-forwarding switches. It may be entered into
-    /// a queue at an output port on each of these switches.
+    /// Packets in Due are typically created by packet sources, and run through
+    /// a sequence of packet-forwarding switches. It may be entered into a queue
+    /// at an output port on each of these switches.
 
-    /// Key fields include: creation time, size, packet id, flow_id, source,
-    /// and destination. We do not model upper layer protocols, i.e., packets do
-    /// not contain a payload. The size (in bytes) field is used to determine
-    /// its transmission time.
+    /// Key fields include: creation time, size, packet id, flow_id, source, and
+    /// destination. We do not model upper layer protocols, i.e., packets do not
+    /// contain a payload. The size (in bytes) field is used to determine its
+    /// transmission time.
 
     /// # Example
     /// ```

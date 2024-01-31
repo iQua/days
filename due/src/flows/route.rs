@@ -1,6 +1,7 @@
-//! The routing protocols that are used to compute the path that each flow takes.
-//! Currently, the only routing protocol implemented is to select a random candidate
-//! from a set of simple paths, which are computed by the `petgraph` crate.
+//! The routing protocols that are used to compute the path that each flow
+//! takes. Currently, the only routing protocol implemented is to select a
+//! random candidate from a set of simple paths, which are computed by the
+//! `petgraph` crate.
 
 use petgraph::algo::{all_simple_paths, dijkstra};
 use petgraph::graph::{NodeIndex, UnGraph};

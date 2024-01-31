@@ -174,7 +174,7 @@ impl TCPPacketSource {
         }
 
         if self.dupack == 0 {
-            // new acknowledgment received, update the RTT estimate and the
+            // new acknowledgment received, updates the RTT estimate and the
             // retransmission timeout
             let sample_rtt = now - ack_packet.creation_time;
 
