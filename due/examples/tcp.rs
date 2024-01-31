@@ -9,6 +9,7 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
+use due::flows::flow::FlowType;
 //use due::flows::cc::CCAlgorithm::TCPReno;
 use due::flows::cc::CCAlgorithm::TCPCubic;
 use due::flows::sink::PacketSink;
@@ -25,6 +26,7 @@ fn main() {
     // instantiates models and their mailboxes
     let mut source = PacketSource::new(
         0,
+        FlowType::TCP,
         TrafficCharacteristics::new(
             0.0,
             Some(10.0),

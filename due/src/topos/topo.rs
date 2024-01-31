@@ -401,7 +401,7 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let mut source = PacketSource::new(flow.id, flow.traffic, flow.seed);
+            let mut source = PacketSource::new(flow.id, flow.flow_type, flow.traffic, flow.seed);
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
             // Flow::compute_path()
