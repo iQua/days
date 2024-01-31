@@ -14,6 +14,7 @@ use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::dist_source::DistPacketSource;
+use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
@@ -35,17 +36,25 @@ impl std::fmt::Display for PacketSource {
 }
 
 impl PacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, seed: usize) -> Self {
+    pub fn new(
+        flow_id: usize,
+        flow_type: FlowType,
+        traffic: TrafficCharacteristics,
+        seed: usize,
+    ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
             _ => SmallRng::from_entropy(),
         };
 
-        if traffic.tcp.is_some() {
-            PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
-        } else {
-            PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
+        match flow_type {
+            FlowType::PacketDistribution => {
+                PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
+            }
+            FlowType::TCP => {
+                PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
+            }
         }
     }
 
