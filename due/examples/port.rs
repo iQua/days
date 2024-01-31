@@ -62,10 +62,11 @@ fn main() {
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // connects the output of packet sources to the input of the DRR scheduler
+    // connects the output of packet sources to the input of the FIFO scheduler
     source_1.output().connect(Port::packet_received, &port_mbox);
     source_2.output().connect(Port::packet_received, &port_mbox);
     port.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator

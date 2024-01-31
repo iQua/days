@@ -86,6 +86,7 @@ fn main() {
         .output()
         .connect(VirtualClockServer::packet_received, &vc_mbox);
     vc.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator

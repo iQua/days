@@ -18,7 +18,7 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    // Instantiates models and their mailboxes.
+    // instantiates models
     let mut source = PacketSource::new(
         0,
         FlowType::TCP,
@@ -52,20 +52,21 @@ fn main() {
 
     let mut sink = PacketSink::new(&source);
 
+    // instantiates models' mailboxes
     let source_mbox = Mailbox::new();
     let wire_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // Connects the output of packet source to the input of packet sink.
+    // connects TCP packet source -> wire -> TCP packet sink
     source.output().connect(Wire::packet_received, &wire_mbox);
-
     wire.output.connect(PacketSink::packet_received, &sink_mbox);
 
+    // connects TCP packet sink -> TCP packet source for sending acknowledgments
     sink.output()
         .connect(PacketSource::packet_received, &source_mbox);
 
-    // Instantiates the simulator.
+    // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
     let mut sim = SimInit::new()
         .add_model(source, source_mbox)

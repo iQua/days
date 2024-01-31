@@ -60,7 +60,8 @@ pub struct VirtualClockServer {
     /// its class_id, which is equivalent to flow-based Virtual Clock.
     pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
-    /// a closure that determines whether an inbound packet should be dropped or not
+    /// a closure that determines whether an inbound packet should be dropped or
+    /// not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
     /// the number of packets received and dropped
@@ -89,7 +90,7 @@ pub struct VirtualClockServer {
     /// flow_class -> virtual clock finish time
     aux_vc: HashMap<usize, f64>,
 
-    /// The server is considered busy sending the current packet until this time
+    /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
     pub output: Output<Packet>,
@@ -146,7 +147,7 @@ impl VirtualClockServer {
             self.scheduler_queue.len(),
         );
 
-        // the case that this packet will be dropped.
+        // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
@@ -159,13 +160,16 @@ impl VirtualClockServer {
             return;
         }
 
+        // the case that this packet will not be dropped
         self.packets_received += 1;
 
-        // computes a virtual clock finish time and adds it as a tag to the packet
+        // computes a virtual clock finish time and adds it as a tag to the
+        // packet
         let tagged_packet = self.tag(packet.clone(), arrival_time);
         let aux_vc = tagged_packet.tag;
 
-        // pushes the packet into a min-heap according to the packet's virtual clock finish time
+        // pushes the packet into a min-heap according to the packet's virtual
+        // clock finish time
         self.scheduler_queue.push(tagged_packet);
 
         let class_id = (self.flow_classes)(packet.flow_id);
@@ -203,7 +207,7 @@ impl VirtualClockServer {
 
         // updates the virtual clock for the corresponding flow_class by
         // multiplying vtick (the desired bit time, i.e., the inverse of the
-        // desired bits per second data rate) by the size of the packet in bits.
+        // desired bits per second data rate) by the size of the packet in bits
         let vtick = self.vticks.get(&class_id).unwrap();
         *v_clock += *vtick as f64 * packet.size as f64 * 8.0;
 

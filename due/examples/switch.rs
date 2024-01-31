@@ -21,7 +21,7 @@ fn main() {
     let env = env_logger::Env::default();
     env_logger::init_from_env(env);
 
-    // instantiates models and their mailboxes
+    // instantiates models
     let mut source_1 = PacketSource::new(
         0,
         FlowType::PacketDistribution,
@@ -72,6 +72,7 @@ fn main() {
 
     let mut sink = PacketSink::new(&source_1);
 
+    // instantiates models' mailboxes
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let switch_mbox = Mailbox::new();
@@ -79,7 +80,7 @@ fn main() {
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // connects the output of packet sources to the input of the DRR scheduler
+    // connects the output of packet sources to the input of the switch
     source_1
         .output()
         .connect(PacketSwitch::packet_received, &switch_mbox);

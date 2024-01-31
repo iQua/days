@@ -85,6 +85,7 @@ fn main() {
         .output()
         .connect(WFQServer::packet_received, &wfq_mbox);
     wfq.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator

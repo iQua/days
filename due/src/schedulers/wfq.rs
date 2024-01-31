@@ -54,7 +54,8 @@ pub struct WFQServer {
     /// as its class_id, which is equivalent to flow-based WFQ.
     pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
-    /// a closure that determines whether an inbound packet should be dropped or not
+    /// a closure that determines whether an inbound packet should be dropped or
+    /// not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
     /// weights of classes
@@ -64,7 +65,7 @@ pub struct WFQServer {
     /// number of queued packets of each flow class
     flow_queue_count: HashMap<usize, usize>,
 
-    /// set of active flow classes
+    /// the set of active flow classes
     active_set: HashSet<usize>,
 
     vtime: f64,
@@ -78,10 +79,11 @@ pub struct WFQServer {
     /// the number of bytes currently queued in each flow class
     byte_sizes: HashMap<usize, usize>,
 
-    /// min-heap of packets from all the classes, where packets are sorted according to their finish times
+    /// a min-heap of packets from all the classes, where packets are sorted
+    /// according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
-    /// The server is considered busy sending the current packet until this time
+    /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
     pub output: Output<Packet>,
@@ -147,7 +149,7 @@ impl WFQServer {
             self.scheduler_queue.len(),
         );
 
-        // the case that this packet will be dropped.
+        // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
@@ -160,6 +162,7 @@ impl WFQServer {
             return;
         }
 
+        // the case that this packet will not be dropped
         self.packets_received += 1;
 
         // computes a finish time and adds it as a tag to the packet

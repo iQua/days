@@ -89,8 +89,8 @@ impl PacketSwitch {
                 self.switch_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
             );
 
-            // forwards acknowledgment packets to their corresponding
-            // upstream elements
+            // forwards acknowledgment packets to their corresponding upstream
+            // elements
             let switch_id = self.r_fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {

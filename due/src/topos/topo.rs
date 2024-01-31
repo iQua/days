@@ -1,8 +1,8 @@
 //! Implements all the necessary utilities for initializing, constructing, and
-//! running a network topology. These utilities include connecting network switches
-//! according to a network graph, attaching packet endpoints to hosts, computing
-//! feasible paths for all the flows, and installing Flow Information Base tables
-//! to all the switches to route these flows accordingly.
+//! running a network topology. These utilities include connecting network
+//! switches according to a network graph, attaching packet endpoints to hosts,
+//! computing feasible paths for all the flows, and installing Flow Information
+//! Base tables to all the switches to route these flows accordingly.
 
 use std::collections::HashMap;
 use std::fs;
@@ -74,11 +74,11 @@ pub struct Config {
 
 #[derive(Default)]
 struct SinkStatistics {
-    // A vector of sink ids
+    /// a vector of sink ids
     sink_ids: Vec<usize>,
-    // sink id -> sink mailbox address
+    /// sink id -> sink mailbox address
     sink_addresses: HashMap<usize, Address<PacketSink>>,
-    // sink id -> sink statistics
+    /// sink id -> sink statistics
     sink_statistics: HashMap<usize, EventSlot<PacketStatistics>>,
 }
 
@@ -101,20 +101,21 @@ impl SinkStatistics {
 }
 
 pub struct Topology {
-    /// The simulation engine
+    /// the simulation engine
     sim_init: SimInit,
-    /// Undirected graph of the topology
+    /// undirected graph of the topology
     graph: UnGraph<usize, ()>,
-    /// A hash map of switch ids that connects to endpoints
+    /// a hash map of switch ids that connects to endpoints
     hosts: Vec<usize>,
-    /// A hash map of packet switches and their mailboxes
+    /// switch id -> switch
     switches: HashMap<usize, PacketSwitch>,
+    /// switch id -> switch mailbox
     switch_mailboxes: HashMap<usize, Mailbox<PacketSwitch>>,
-    /// A vector of all flows
+    /// a vector of all flows
     flows: Vec<Flow>,
-    /// A vector of all collectives
+    /// a vector of all collectives
     collectives: Vec<Collective>,
-    /// Configuration of packet switches in the topology
+    /// configuration of packet switches in the topology
     switch_config: SwitchConfig,
 }
 
@@ -422,7 +423,7 @@ impl Topology {
             source
                 .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
-            //source.output_connect_switch(host_mbox);
+
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, &source_mbox);
             source_host.outputs.insert(source.id(), output);
@@ -434,12 +435,13 @@ impl Topology {
             let sink_host = self.switches.get_mut(&flow.sink_host).unwrap();
             let host_mbox = self.switch_mailboxes.get(&flow.sink_host).unwrap();
 
-            // establishes a bi-directional connection between the packet sink and the host
+            // establishes a bi-directional connection between the packet sink
+            // and the host
             let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
 
-            // records the sink ids, sink mailbox's address and sink
-            // statistics event slot for the retrieval of packet statistics
-            // after the simulation finishes
+            // records the sink ids, sink mailbox's address and sink statistics
+            // event slot for the retrieval of packet statistics after the
+            // simulation finishes
             stats.sink_ids.push(sink.id());
             stats.sink_addresses.insert(sink.id(), sink_mbox.address());
             stats
