@@ -155,6 +155,11 @@ impl TCPPacketSource {
             if self.last_ack as f64 + self.congestion_control.get_cwnd() >= ack.sequence_num as f64
                 && !self.traffic.size.exceeded(self.next_seq, now)
             {
+                debug!(
+                    "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
+                    self.endpoint_id, self.next_seq, self.mss, now,
+                );
+
                 let (packet, _) = self.produce_packet(now);
 
                 self.output.send(packet.clone()).await;
