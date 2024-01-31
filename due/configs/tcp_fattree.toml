@@ -6,35 +6,23 @@ seed = 1000
 category = "FatTree"
 
 [topology.fat_tree]
-    k = 4
+    k = 32
 
 [switch]
-port_rate = 163840 # process 40 packets (512 bytes) per second
-capacity = 100
+port_rate = 10000000000 # 10Gbps
+capacity = 1000
 weights = [1]
 discipline = "FIFO"
 drop = "RED"
 
 [[flow_set]]
-flow_type = "PacketDistribution"
-flow_count = 500
+flow_type = "TCP"
+flow_count = 64
 [flow_set.traffic]
-    initial_delay = 1.0
-    duration = 150.0
-    arr_dist = {type = "Uniform", low = 1, high = 1}
-    pkt_size_dist = {type = "Uniform", low = 512, high = 512}
+    initial_delay = 0.0
+    duration = 10.0
+    arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
+    pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
 [flow_set.traffic.tcp]
-    cc_algorithm = "TCPCubic"
-    rtt_estimate = 0.5
-
-[[flow]]
-flow_type = "PacketDistribution"
-graph = [[0, 1]]
-[flow.traffic]
-    initial_delay = 1.0
-    duration = 50.0
-    arr_dist = {type = "Uniform", low = 1, high = 1}
-    pkt_size_dist = {type = "Uniform", low = 512, high = 512}
-[flow.traffic.tcp]
-    cc_algorithm = "TCPCubic"
+    cc_algorithm = "TCPReno"
     rtt_estimate = 0.5

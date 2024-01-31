@@ -9,6 +9,7 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
+use due::flows::flow::FlowType;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
@@ -22,6 +23,7 @@ fn main() {
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
         0,
+        FlowType::PacketDistribution,
         TrafficCharacteristics::new(
             1.75,
             Some(50.0),
@@ -41,6 +43,7 @@ fn main() {
 
     let mut source_2 = PacketSource::new(
         1,
+        FlowType::PacketDistribution,
         TrafficCharacteristics::new(
             11.75,
             Some(50.0),
