@@ -79,6 +79,7 @@ fn main() {
         .output()
         .connect(DRRServer::packet_received, &drr_mbox);
     drr.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator

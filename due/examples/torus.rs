@@ -1,5 +1,4 @@
-//! This example shows a network simulation session involving a Torus
-//! topology.
+//! This example shows a network simulation session involving a Torus topology.
 
 use log::info;
 

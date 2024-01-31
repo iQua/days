@@ -57,6 +57,7 @@ fn main() {
     // connects the output of packet source to the input of the wire
     source.output().connect(Wire::packet_received, &wire_mbox);
     wire.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator

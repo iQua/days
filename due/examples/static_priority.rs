@@ -77,7 +77,8 @@ fn main() {
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // connects the output of packet sources to the input of the sp scheduler
+    // connects the output of packet sources to the input of the Static Priority
+    // scheduler
     source_1
         .output()
         .connect(SPServer::packet_received, &sp_mbox);
@@ -85,6 +86,7 @@ fn main() {
         .output()
         .connect(SPServer::packet_received, &sp_mbox);
     sp.output.connect(PacketSink::packet_received, &sink_mbox);
+
     let mut sink_statistics = sink.statistics().connect_slot().0;
 
     // instantiates the simulator
