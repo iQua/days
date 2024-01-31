@@ -17,7 +17,8 @@ pub struct Port {
     scheduler_id: usize,
     /// the bit rate of the port (0 for unlimited)
     rate: f64,
-    /// a closure that determines whether an inbound packet should be dropped or not
+    /// a closure that determines whether an inbound packet should be dropped or
+    /// not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
     /// the number of packets received
     packets_received: usize,
@@ -27,7 +28,7 @@ pub struct Port {
     bytes_in_queue: usize,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
-    /// The FIFO server is considered busy sending the current packet until this time
+    /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
     pub output: Output<Packet>,
@@ -75,7 +76,7 @@ impl Port {
             self.drop_strategy
                 .should_drop(packet.size, self.bytes_in_queue, self.queue.len());
 
-        // the case that this packet will be dropped.
+        // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
@@ -88,7 +89,7 @@ impl Port {
             return;
         }
 
-        // the case that this packet will not be dropped.
+        // the case that this packet will not be dropped
         self.packets_received += 1;
         self.queue.push_back(packet.clone());
         self.bytes_in_queue += packet.size;

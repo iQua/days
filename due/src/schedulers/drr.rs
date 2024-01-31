@@ -24,7 +24,8 @@ pub struct DRRServer {
     /// its class_id, which is equivalent to flow-based DRR.
     pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
-    /// a closure that determines whether an inbound packet should be dropped or not
+    /// a closure that determines whether an inbound packet should be dropped or
+    /// not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
     /// deficit of classes, which are consecutive and start from 0
@@ -46,7 +47,7 @@ pub struct DRRServer {
     /// the current packet class being served
     current_queue: usize,
 
-    /// The server is considered busy sending the current packet until this time
+    /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
     pub output: Output<Packet>,
@@ -119,7 +120,7 @@ impl DRRServer {
             self.queues.iter().map(|q| q.len()).sum(),
         );
 
-        // the case that this packet will be dropped.
+        // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
@@ -132,6 +133,7 @@ impl DRRServer {
             return;
         }
 
+        // the case that this packet will not be dropped
         self.packets_waiting += 1;
         self.packets_received += 1;
 
@@ -165,7 +167,7 @@ impl DRRServer {
         self.output.send(packet).await;
     }
 
-    /// Moves on to the next queue if the current queue is empty
+    /// Moves on to the next queue if the current queue is empty.
     fn next_queue(&mut self) {
         self.current_queue += 1;
 

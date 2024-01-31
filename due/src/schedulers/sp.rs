@@ -21,8 +21,8 @@ pub struct SPServer {
     rate: f64,
 
     /// a closure that maps a flow_id to a class_id, used to implement
-    /// class-based Static Priority. The default uses a packet's flow_id as
-    /// its class_id, which is equivalent to flow-based SP.
+    /// class-based Static Priority. The default uses a packet's flow_id as its
+    /// class_id, which is equivalent to flow-based SP.
     pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
     /// a closure that determines whether an inbound packet should be dropped or not
@@ -97,7 +97,7 @@ impl SPServer {
             self.queues.values().map(|q| q.len()).sum(),
         );
 
-        // the case that this packet will be dropped.
+        // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
@@ -110,6 +110,7 @@ impl SPServer {
             return;
         }
 
+        // the case that this packet will not be dropped
         self.packets_received += 1;
 
         let class_id = (self.flow_classes)(packet.flow_id);
