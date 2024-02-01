@@ -62,16 +62,7 @@ impl TCPPacketSink {
 
         self.recv_buffer = merged_stats;
 
-        if self.recv_buffer.len() == 1 {
-            // in-order delivery: all data up to but not including
-            // `next_seq_expected` have been received
-            self.next_seq_expected = packet.packet_id + packet.size;
-        } else {
-            // out-of-order delivery or retransmissions: needs to go through the
-            // receive buffer and find out what the last in-order packet's
-            // sequence number is
-            self.next_seq_expected = self.recv_buffer[0].1;
-        }
+        self.next_seq_expected = self.recv_buffer[0].1;
 
         let acknowledgment = Packet {
             time: packet.time,
