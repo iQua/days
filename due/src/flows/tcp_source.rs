@@ -199,20 +199,20 @@ impl TCPPacketSource {
                 self.last_ack,
             );
 
-            // this acknowledgment should acknowledge all the intermediate
-            // segments sent between the lost packet and the receipt of the
-            // first duplicate ACK, if any
-            for (packet_id, _) in self.sent_packets.iter_mut() {
-                // cancels the events scheduled for the timeout of all the
-                // intermediate segments
-                if packet_id <= &ack_packet.packet_id {
-                    self.timeout_events
-                        .remove_entry(packet_id)
-                        .unwrap()
-                        .1
-                        .cancel();
-                }
-            }
+            // // this acknowledgment should acknowledge all the intermediate
+            // // segments sent between the lost packet and the receipt of the
+            // // first duplicate ACK, if any
+            // for (packet_id, _) in self.sent_packets.iter_mut() {
+            //     // cancels the events scheduled for the timeout of all the
+            //     // intermediate segments
+            //     if packet_id <= &ack_packet.packet_id {
+            //         self.timeout_events
+            //             .remove_entry(packet_id)
+            //             .unwrap()
+            //             .1
+            //             .cancel();
+            //     }
+            // }
             self.sent_packets
                 .retain(|&packet_id, _| packet_id > ack_packet.packet_id);
 

@@ -100,16 +100,16 @@ impl PacketSource {
                 } else if action.set_timer {
                     let packet_id = action.packet_id.unwrap();
 
-                    // schedules a timeout event for this packet
-                    let event_key = scheduler
-                        .schedule_keyed_event(
-                            Duration::from_secs_f64(source.rto),
-                            Self::wrap_up_packet_event,
-                            packet_id,
-                        )
-                        .unwrap();
+                    // // schedules a timeout event for this packet
+                    // let event_key = scheduler
+                    //     .schedule_keyed_event(
+                    //         Duration::from_secs_f64(source.rto),
+                    //         Self::wrap_up_packet_event,
+                    //         packet_id,
+                    //     )
+                    //     .unwrap();
 
-                    source.finish_wrap_up(packet_id, event_key, now);
+                    // source.finish_wrap_up(packet_id, event_key, now);
                 }
             }
         }
@@ -188,16 +188,16 @@ impl PacketSource {
             PacketSource::TCPPacketSource(source) => {
                 source.packet_sent(packet, now);
 
-                // schedules a timeout event for this packet
-                let event_key = scheduler
-                    .schedule_keyed_event(
-                        Duration::from_secs_f64(source.rto),
-                        Self::wrap_up_packet_event,
-                        packet.packet_id,
-                    )
-                    .unwrap();
+                // // schedules a timeout event for this packet
+                // let event_key = scheduler
+                //     .schedule_keyed_event(
+                //         Duration::from_secs_f64(source.rto),
+                //         Self::wrap_up_packet_event,
+                //         packet.packet_id,
+                //     )
+                //     .unwrap();
 
-                source.finish_wrap_up(packet.packet_id, event_key, now);
+                // source.finish_wrap_up(packet.packet_id, event_key, now);
             }
         }
     }
