@@ -98,7 +98,7 @@ impl PacketSource {
                 if action.proceed_run {
                     self.run((), scheduler).await;
                 } else if action.set_timer {
-                    let packet_id = action.packet_id.unwrap();
+                    let _packet_id = action.packet_id.unwrap();
 
                     // // schedules a timeout event for this packet
                     // let event_key = scheduler
@@ -182,7 +182,7 @@ impl PacketSource {
     }
 
     /// Wraps up after sending out a packet.
-    fn wrap_up(&mut self, packet: &Packet, now: f64, scheduler: &Scheduler<Self>) {
+    fn wrap_up(&mut self, packet: &Packet, now: f64, _scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
             PacketSource::TCPPacketSource(source) => {

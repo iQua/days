@@ -214,7 +214,7 @@ impl TCPPacketSource {
             //     }
             // }
             self.sent_packets
-                .retain(|&packet_id, _| packet_id > ack_packet.packet_id);
+                .retain(|&packet_id, _| packet_id >= ack.sequence_num);
 
             if now >= self.busy_until {
                 return AckAction {
