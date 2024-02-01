@@ -42,9 +42,20 @@ impl TCPPacketSink {
     }
 
     pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
+        let sequence_num = packet.packet_id;
+
+        let mut send_ack = true;
+        for (start, end) in self.recv_buffer.iter() {
+            if sequence_num >= *start && sequence_num + packet.size <= *end {
+                // this packet was received before, no need to send
+                // acknowledgment
+                send_ack = false;
+                break;
+            }
+        }
+
         // inserts the packet into the receive buffer and sorts based on the
         // sequence number of the packet (packet_id)
-        let sequence_num = packet.packet_id;
         self.recv_buffer
             .push((sequence_num, sequence_num + packet.size));
         self.recv_buffer.sort();
@@ -64,25 +75,27 @@ impl TCPPacketSink {
 
         self.next_seq_expected = self.recv_buffer[0].1;
 
-        let acknowledgment = Packet {
-            time: packet.time,
-            creation_time: packet.creation_time,
-            size: 40,
-            packet_id: packet.packet_id,
-            flow_id: packet.flow_id,
-            queueing_delay: packet.queueing_delay,
-            ack: Some(TCPAck {
-                sequence_num: self.next_seq_expected,
-            }),
-        };
+        if send_ack {
+            let acknowledgment = Packet {
+                time: packet.time,
+                creation_time: packet.creation_time,
+                size: 40,
+                packet_id: packet.packet_id,
+                flow_id: packet.flow_id,
+                queueing_delay: packet.queueing_delay,
+                ack: Some(TCPAck {
+                    sequence_num: self.next_seq_expected,
+                }),
+            };
 
-        // sends the acknowledgment packet out to the TCPPacketSource now
-        self.output.send(acknowledgment.clone()).await;
+            // sends the acknowledgment packet out to the TCPPacketSource now
+            self.output.send(acknowledgment.clone()).await;
 
-        debug!(
-            "TCPPacketSink {} sent Ack packet {} ({} bytes) at time {:.3}.",
-            self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
-        );
+            debug!(
+                "TCPPacketSink {} sent Ack packet {} ({} bytes) at time {:.3}.",
+                self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
+            );
+        }
     }
 }
 
