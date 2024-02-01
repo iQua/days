@@ -136,8 +136,10 @@ impl TCPPacketSource {
             }
         }
 
-        if self.dupack == 3 {
-            self.congestion_control.consecutive_dupacks_received();
+        if self.dupack >= 3 {
+            if self.dupack == 3 {
+                self.congestion_control.consecutive_dupacks_received();
+            }
 
             let resent_pkt = self.sent_packets.get_mut(&ack.sequence_num).unwrap();
             resent_pkt.time = now;
@@ -148,28 +150,31 @@ impl TCPPacketSource {
                 "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
                 self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
             );
-        } else if self.dupack > 3 {
-            self.congestion_control.more_dupacks_received();
 
-            // transmits a new packet, if allowed by the new value of cwnd
-            if self.last_ack as f64 + self.congestion_control.get_cwnd() >= ack.sequence_num as f64
-                && !self.traffic.size.exceeded(self.next_seq, now)
-            {
-                debug!(
-                    "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
-                    self.endpoint_id, self.next_seq, self.mss, now,
-                );
+            if self.dupack > 3 {
+                self.congestion_control.more_dupacks_received();
 
-                let (packet, _) = self.produce_packet(now);
+                // transmits a new packet, if allowed by the new value of cwnd
+                if self.last_ack as f64 + self.congestion_control.get_cwnd()
+                    >= ack.sequence_num as f64
+                    && !self.traffic.size.exceeded(self.next_seq, now)
+                {
+                    debug!(
+                        "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
+                        self.endpoint_id, self.next_seq, self.mss, now,
+                    );
 
-                self.output.send(packet.clone()).await;
-                self.packet_sent(&packet, now);
+                    let (packet, _) = self.produce_packet(now);
 
-                return AckAction {
-                    proceed_run: false,
-                    set_timer: true,
-                    packet_id: Some(packet.packet_id),
-                };
+                    self.output.send(packet.clone()).await;
+                    self.packet_sent(&packet, now);
+
+                    return AckAction {
+                        proceed_run: false,
+                        set_timer: true,
+                        packet_id: Some(packet.packet_id),
+                    };
+                }
             }
         }
 
