@@ -5,7 +5,7 @@
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 
-/// Defines the interface for all routing protocols
+/// Defines the interface for all routing protocols.
 pub trait RoutingProtocol {
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex>;
 }
