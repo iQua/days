@@ -27,10 +27,7 @@ impl RoutingProtocol for ShortestPath {
         let path = astar(&self.graph, start, |n| n == end, |_| 1, |_| 0);
 
         match path {
-            Some((cost, path)) => {
-                println!("The total cost was {}: {:?}", cost, path);
-                path
-            }
+            Some((_, path)) => path,
             None => panic!("No path can be found."),
         }
     }
