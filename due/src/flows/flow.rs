@@ -7,7 +7,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Deserialize;
 
-use crate::flows::route::{RandomSimplePath, RoutingProtocol};
+use crate::flows::route::{RoutingProtocol, ShortestPath};
 use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config};
 
@@ -55,7 +55,7 @@ pub struct Flow {
     /// random seed for the packet source
     pub seed: usize,
     /// routing protocol
-    pub routing: RandomSimplePath,
+    pub routing: ShortestPath,
 }
 
 impl Flow {
@@ -67,7 +67,7 @@ impl Flow {
         traffic: TrafficCharacteristics,
         seed: usize,
     ) -> Flow {
-        let routing = RandomSimplePath::new(UnGraph::<usize, ()>::new_undirected().clone());
+        let routing = ShortestPath::new(UnGraph::<usize, ()>::new_undirected().clone());
 
         Flow {
             id,
@@ -177,7 +177,7 @@ impl Flow {
     /// Given the network graph, computes the path from the PacketSource to the
     /// PacketSink in the flow.
     pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
-        self.routing = RandomSimplePath::new(graph);
+        self.routing = ShortestPath::new(graph);
 
         let mut path = vec![NodeIndex::new(self.source_id)];
 
