@@ -48,11 +48,11 @@ pub struct TCPPacketSource {
     /// the count of duplicate acknolwedgments
     dupack: usize,
     /// the RTT estimate
-    rtt_estimate: f64,
+    rtt_var: f64,
+    /// smoothed RTT
+    smoothed_rtt: f64,
     /// the retransmission timeout
     pub rto: f64,
-    /// an estimate of the RTT deviation
-    est_deviation: f64,
     /// the in-flight packets (segments)
     sent_packets: HashMap<usize, Packet>,
     /// the scheduled events of timeouts of in-flight packets (segments)
@@ -83,7 +83,6 @@ impl fmt::Debug for TCPPacketSource {
 impl TCPPacketSource {
     pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
-        let rtt_estimate = traffic.tcp.unwrap().rtt_estimate;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
@@ -101,9 +100,9 @@ impl TCPPacketSource {
             send_buffer: 0,
             last_ack: 0,
             dupack: 0,
-            rtt_estimate,
-            rto: rtt_estimate * 2.0,
-            est_deviation: 0.0,
+            rtt_var: 0.0,
+            smoothed_rtt: 0.0,
+            rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_events: HashMap::new(),
             busy_until: 0.0,
@@ -183,11 +182,34 @@ impl TCPPacketSource {
             // retransmission timeout
             let sample_rtt = now - ack_packet.creation_time;
 
-            // Jacobsen '88: Congestion Avoidance and Control
-            let sample_err = sample_rtt - self.rtt_estimate;
-            self.rtt_estimate += 0.125 * sample_err;
-            self.est_deviation += 0.25 * (sample_err.abs() - self.est_deviation);
-            self.rto = self.rtt_estimate + 4.0 * self.est_deviation;
+            // Authoritative sources for RTO calculation
+
+            // RFC 6298: Computing TCP's Retransmission Timer
+
+            // This RFC specifically focuses on the RTO algorithm and updates
+            // the way RTO is calculated. It obsoletes the RTO calculation
+            // described in RFC 2988. The updated algorithm is commonly referred
+            // to as the "Karn/Partridge Algorithm."
+
+            let alpha = 0.125;
+            let beta = 0.25;
+
+            // calculates the deviation (RTTVAR) of the RTT to account for
+            // variations in the network
+            if self.rtt_var == 0.0 {
+                self.rtt_var = sample_rtt / 2.0;
+            } else {
+                let deviation = self.smoothed_rtt - sample_rtt;
+                self.rtt_var = (1.0 - beta) * self.rtt_var + beta * deviation.abs();
+            }
+
+            // computes a smoothed round-trip time (SRTT)
+            if self.smoothed_rtt == 0.0 {
+                self.smoothed_rtt = sample_rtt;
+            } else {
+                self.smoothed_rtt = (1.0 - alpha) * self.smoothed_rtt + alpha * sample_rtt;
+            }
+            self.rto = f64::max(1.0, self.smoothed_rtt + 4.0 * self.rtt_var);
 
             self.last_ack = ack.sequence_num;
             self.congestion_control.ack_received(sample_rtt, now);

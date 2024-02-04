@@ -36,7 +36,6 @@ fn main() {
             },
             Some(TCPCharacteristics {
                 cc_algorithm: TCPReno,
-                rtt_estimate: 0.5,
             }),
         ),
         0,

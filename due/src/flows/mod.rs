@@ -102,5 +102,4 @@ impl TrafficCharacteristics {
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
-    pub rtt_estimate: f64,
 }

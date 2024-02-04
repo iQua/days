@@ -41,7 +41,6 @@ fn main() {
             },
             Some(TCPCharacteristics {
                 cc_algorithm: TCPCubic,
-                rtt_estimate: 0.5,
             }),
         ),
         0,

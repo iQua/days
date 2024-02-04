@@ -25,4 +25,3 @@ flow_count = 64
     pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
 [flow_set.traffic.tcp]
     cc_algorithm = "TCPReno"
-    rtt_estimate = 0.5
