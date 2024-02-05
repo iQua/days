@@ -180,7 +180,7 @@ impl PacketSource {
 
     /// Returns whether PacketSource should produce a new packet at this point.
     fn should_produce_packet(&mut self, now: f64) -> bool {
-        if !self.traffic_exceeded(now) {
+        if self.traffic_exceeded(now) {
             return false;
         }
 
