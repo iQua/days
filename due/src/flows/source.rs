@@ -115,7 +115,7 @@ impl PacketSource {
                     )
                     .unwrap();
 
-                // schedules a application packet source to send packets to
+                // schedules an application packet source to send packets to
                 // TCPPacketSource
                 let (packet, interval) = source
                     .app_packet_source
