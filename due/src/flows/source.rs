@@ -94,23 +94,24 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
             PacketSource::TCPPacketSource(source) => {
-                let action = source.ack_packet_received(packet, now).await;
-                if action.proceed_run {
+                if source.ack_packet_received(packet, now).await {
                     self.run((), scheduler).await;
-                } else if action.set_timer {
-                    let packet_id = action.packet_id.unwrap();
-
-                    // schedules a timeout event for this packet
-                    let event_key = scheduler
-                        .schedule_keyed_event(
-                            Duration::from_secs_f64(source.rto),
-                            Self::wrap_up_packet_event,
-                            packet_id,
-                        )
-                        .unwrap();
-
-                    source.finish_wrap_up(packet_id, event_key, now);
                 }
+            }
+        }
+    }
+
+    fn prepare_run(&mut self, scheduler: &Scheduler<Self>) {
+        match self {
+            PacketSource::DistPacketSource(_) => {}
+            PacketSource::TCPPacketSource(_) => {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(0.05),
+                        Self::periodic_timer_event,
+                        (),
+                    )
+                    .unwrap();
             }
         }
     }
@@ -146,9 +147,9 @@ impl PacketSource {
         }
     }
 
-    pub fn wrap_up_packet_event<'a>(
+    pub fn periodic_timer_event<'a>(
         &'a mut self,
-        packet_id: usize,
+        _: (),
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
@@ -164,40 +165,27 @@ impl PacketSource {
                         .time()
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
-                    source.timer_expired(packet_id, now).await;
+                    source.periodic_timer_event(now).await;
 
-                    // schedules a new timeout event for this packet
-                    let event_key = scheduler
-                        .schedule_keyed_event(
-                            Duration::from_secs_f64(source.rto),
-                            Self::wrap_up_packet_event,
-                            packet_id,
+                    // schedules the next period timeout event
+                    scheduler
+                        .schedule_event(
+                            Duration::from_secs_f64(0.05),
+                            Self::periodic_timer_event,
+                            (),
                         )
                         .unwrap();
-
-                    source.reset_timer(packet_id, event_key, now);
                 }
             }
         }
     }
 
     /// Wraps up after sending out a packet.
-    fn wrap_up(&mut self, packet: &Packet, now: f64, scheduler: &Scheduler<Self>) {
+    fn wrap_up(&mut self, packet: &Packet, now: f64) {
         match self {
             PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
             PacketSource::TCPPacketSource(source) => {
                 source.packet_sent(packet, now);
-
-                // schedules a timeout event for this packet
-                let event_key = scheduler
-                    .schedule_keyed_event(
-                        Duration::from_secs_f64(source.rto),
-                        Self::wrap_up_packet_event,
-                        packet.packet_id,
-                    )
-                    .unwrap();
-
-                source.finish_wrap_up(packet.packet_id, event_key, now);
             }
         }
     }
@@ -235,6 +223,8 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
+            self.prepare_run(scheduler);
+
             while !self.traffic_exceeded(now) {
                 if self.early_return(now, scheduler) {
                     return;
@@ -253,7 +243,7 @@ impl PacketSource {
                             .unwrap();
                     }
 
-                    self.wrap_up(&packet, now, scheduler);
+                    self.wrap_up(&packet, now);
                 }
 
                 if self.wrap_up_run(now, scheduler) {

@@ -2,7 +2,8 @@
 //! support for various congestion control mechanisms.
 
 use core::fmt;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
 use log::debug;
@@ -11,23 +12,40 @@ use rand::rngs::SmallRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use asynchronix::model::{Model, Output};
-use asynchronix::time::EventKey;
 
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 
-/// Defines the action that PacketSource should take after TCPPacketSource
-/// receives an acknowledgment.
-pub struct AckAction {
-    /// whether PacketSource should proceed another run()  
-    pub proceed_run: bool,
-    /// whether PacketSource should set a timer (schedule a timeout event)
-    pub set_timer: bool,
-    /// the packet id of the timer that will be set
-    pub packet_id: Option<usize>,
+#[derive(Debug, Clone)]
+pub struct PacketTimeout {
+    pub packet_id: usize,
+    pub timeout: f64,
 }
+
+impl PartialOrd for PacketTimeout {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PacketTimeout {
+    fn eq(&self, other: &Self) -> bool {
+        self.timeout == other.timeout
+    }
+}
+
+impl Ord for PacketTimeout {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timeout
+            .partial_cmp(&other.timeout)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
+    }
+}
+
+impl Eq for PacketTimeout {}
 
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
@@ -55,8 +73,9 @@ pub struct TCPPacketSource {
     pub rto: f64,
     /// the in-flight packets (segments)
     sent_packets: HashMap<usize, Packet>,
-    /// the scheduled events of timeouts of in-flight packets (segments)
-    timeout_events: HashMap<usize, EventKey>,
+    /// min-heap of in-flight packets, where packets are sorted according to
+    /// their timeout
+    timeout_queue: BinaryHeap<PacketTimeout>,
 
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
@@ -104,7 +123,7 @@ impl TCPPacketSource {
             smoothed_rtt: 0.0,
             rto: 1.0,
             sent_packets: HashMap::new(),
-            timeout_events: HashMap::new(),
+            timeout_queue: BinaryHeap::new(),
             busy_until: 0.0,
             packets_sent: 0,
             tcp_send_packet: false,
@@ -115,7 +134,7 @@ impl TCPPacketSource {
 
     /// Returns the action that PacketSource should take after TCPPacketSource
     /// handles an acknowledgment.
-    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> AckAction {
+    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
 
@@ -123,6 +142,12 @@ impl TCPPacketSource {
             "TCPPacketSource {} received Ack of packet {} ({} bytes) from flow {} at time {:.3}.",
             self.endpoint_id, ack_packet.packet_id, ack_packet.size, ack_packet.flow_id, now,
         );
+
+        if self.sent_packets.contains_key(&ack_packet.packet_id) {
+            self.sent_packets.remove(&ack_packet.packet_id);
+            self.timeout_queue
+                .retain(|packet| packet.packet_id != ack_packet.packet_id);
+        }
 
         let ack = ack_packet.ack.unwrap();
         if ack.sequence_num == self.last_ack {
@@ -168,11 +193,7 @@ impl TCPPacketSource {
                     self.output.send(packet.clone()).await;
                     self.packet_sent(&packet, now);
 
-                    return AckAction {
-                        proceed_run: false,
-                        set_timer: true,
-                        packet_id: Some(packet.packet_id),
-                    };
+                    return false;
                 }
             }
         }
@@ -229,34 +250,17 @@ impl TCPPacketSource {
             // this acknowledgment should acknowledge all the intermediate
             // segments sent between the lost packet and the receipt of the
             // first duplicate ACK, if any
-            for (packet_id, _) in self.sent_packets.iter_mut() {
-                // cancels the events scheduled for the timeout of all the
-                // intermediate segments
-                if packet_id <= &ack_packet.packet_id {
-                    self.timeout_events
-                        .remove_entry(packet_id)
-                        .unwrap()
-                        .1
-                        .cancel();
-                }
-            }
             self.sent_packets
                 .retain(|&packet_id, _| packet_id >= ack.sequence_num);
+            self.timeout_queue
+                .retain(|packet| packet.packet_id >= ack.sequence_num);
 
             if now >= self.busy_until {
-                return AckAction {
-                    proceed_run: true,
-                    set_timer: false,
-                    packet_id: None,
-                };
+                return true;
             }
         }
 
-        AckAction {
-            proceed_run: false,
-            set_timer: false,
-            packet_id: None,
-        }
+        false
     }
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
@@ -270,49 +274,66 @@ impl TCPPacketSource {
         self.sent_packets.insert(packet.packet_id, packet.clone());
 
         self.next_seq += packet.size;
-    }
 
-    pub fn finish_wrap_up(&mut self, packet_id: usize, event_key: EventKey, now: f64) {
-        self.timeout_events.insert(packet_id, event_key);
+        self.timeout_queue.push(PacketTimeout {
+            packet_id: packet.packet_id,
+            timeout: self.rto + now,
+        });
 
         debug!(
             "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-            self.endpoint_id, packet_id, self.rto, now + self.rto
+            self.endpoint_id, packet.packet_id, self.rto, self.rto + now
         );
     }
 
     /// On a packet reaches timeout.
-    pub async fn timer_expired(&mut self, packet_id: usize, now: f64) {
-        debug!(
-            "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}.",
-            self.endpoint_id, packet_id, now
-        );
+    pub async fn periodic_timer_event(&mut self, now: f64) {
+        while !self.timeout_queue.is_empty() {
+            let timeout_time = self.timeout_queue.peek().unwrap().timeout;
+            if timeout_time <= now {
+                let timeout_packet = self.timeout_queue.pop().unwrap();
+                debug!(
+                    "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}.",
+                    self.endpoint_id, timeout_packet.packet_id, timeout_packet.timeout,
+                );
 
-        self.congestion_control.timer_expired();
+                self.congestion_control.timer_expired();
 
-        // retransmits the segment
-        let resent_pkt = self.sent_packets.get_mut(&packet_id).unwrap();
-        resent_pkt.time = now;
+                // retransmits the segment
+                let resent_pkt = self
+                    .sent_packets
+                    .get_mut(&timeout_packet.packet_id)
+                    .unwrap();
 
-        self.output.send(resent_pkt.clone()).await;
+                resent_pkt.departure_update(timeout_packet.timeout);
+                
+                self.output.send(resent_pkt.clone()).await;
 
-        debug!(
-            "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-            self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
-        );
+                debug!(
+                    "Due to timeout, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                    self.endpoint_id,
+                    resent_pkt.packet_id,
+                    resent_pkt.size,
+                    resent_pkt.flow_id,
+                    timeout_packet.timeout, 
+                );
+                
+                // doubles the retransmission timeout
+                self.rto *= 2.0;
 
-        // doubles the retransmission timeout
-        self.rto *= 2.0;
-    }
+                self.timeout_queue.push(PacketTimeout {
+                    packet_id: timeout_packet.packet_id,
+                    timeout: self.rto + timeout_packet.timeout,
+                });
 
-    /// Resets a timer for a packet that reached timeout.
-    pub fn reset_timer(&mut self, packet_id: usize, event_key: EventKey, now: f64) {
-        self.timeout_events.insert(packet_id, event_key);
-
-        debug!(
-                "TCPPacketSource {} reset a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-                self.endpoint_id, packet_id, self.rto, now + self.rto
-            );
+                debug!(
+                    "TCPPacketSource {} reset a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
+                    self.endpoint_id, timeout_packet.packet_id, self.rto, self.rto + timeout_packet.timeout
+                );
+            } else {
+                return;
+            }
+        }
     }
 
     /// Retrieves packets from the (application-layer) flow.
