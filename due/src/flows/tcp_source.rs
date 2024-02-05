@@ -96,7 +96,7 @@ pub struct TCPPacketSource {
 
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
-    busy_until: f64,
+    pub busy_until: f64,
     /// whether the source can send a packet before reaching the size of
     /// congestion window
     pub tcp_send_packet: bool,

@@ -142,12 +142,17 @@ impl PacketSource {
                         .time()
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
-                    if source.next_seq >= source.send_buffer {
-                        source.send_buffer += packet.size;
-                    }
 
                     let (new_packet, interval) =
                         source.app_packet_source.app_source.produce_packet(now);
+
+                    if source.next_seq >= source.send_buffer {
+                        source.send_buffer += packet.size;
+                        source.busy_until = now;
+                        if source.next_seq < source.send_buffer {
+                            self.run((), scheduler).await;
+                        }
+                    }
 
                     // schedules the next packet from the (application-layer)
                     // flow
