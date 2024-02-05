@@ -152,27 +152,27 @@ impl PacketSource {
                     let (new_packet, interval) =
                         source.app_packet_source.app_source.produce_packet(now);
 
-                    if source.next_seq >= source.send_buffer {
-                        // this packet can be retrieved by the TCPPacketSource
-                        source.send_buffer += packet.size;
+                    // lets TCPPacketSource retrieve this packet
+                    source.send_buffer += packet.size;
 
-                        if source.next_seq < source.send_buffer {
-                            // the TCPPacketSource could send new packet at this
-                            // point, if the size of the congestion window
-                            // allows
-                            self.run((), scheduler).await;
-                        } else {
-                            // the TCPPacketSource is considered busy retrieving
-                            // the next packet from the (application-layer) flow
-                            source.busy_until = now + interval.as_secs_f64();
-                        }
+                    if !source.app_packet_source.app_source.traffic_exceeded(now) {
+                        // schedules the next packet from the
+                        // (application-layer) flow
+                        scheduler
+                            .schedule_event(interval, Self::app_packet_arrive, new_packet)
+                            .unwrap();
                     }
 
-                    // schedules the next packet from the (application-layer)
-                    // flow
-                    scheduler
-                        .schedule_event(interval, Self::app_packet_arrive, new_packet)
-                        .unwrap();
+                    if source.next_seq < source.send_buffer {
+                        // the TCPPacketSource could send new packet at this
+                        // point, if the size of the congestion window
+                        // allows
+                        self.run((), scheduler).await;
+                    } else {
+                        // the TCPPacketSource is considered busy retrieving
+                        // the next packet from the (application-layer) flow
+                        source.busy_until = now + interval.as_secs_f64();
+                    }
                 }
             }
         }
