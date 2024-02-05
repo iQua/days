@@ -29,7 +29,7 @@ fn main() {
         FlowType::TCP,
         TrafficCharacteristics::new(
             0.0,
-            Some(10.0),
+            None,
             Some(3014),
             DistributionInfo::Uniform {
                 low: 0.1,
@@ -96,7 +96,7 @@ fn main() {
     sim.step_by(Duration::from_secs(20));
 
     // requests the packet sink to report statistics
-    sim.send_event(PacketSink::report, 1, &sink_addr);
+    sim.send_event(PacketSink::report, 2, &sink_addr);
     if let Some(statistics) = sink_statistics.take() {
         info!("{:#.3}", statistics);
     }
