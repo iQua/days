@@ -7,15 +7,14 @@ use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
 use log::debug;
-use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
-use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
 use asynchronix::model::{Model, Output};
 
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::flows::dist_source::DistPacketSource;
+use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
 
 #[derive(Debug, Clone)]
@@ -47,20 +46,36 @@ impl Ord for PacketTimeout {
 
 impl Eq for PacketTimeout {}
 
+/// An application packet source.
+pub struct AppPacketSource {
+    // currently implements the application packet source as a
+    // distribution-based packet source, but it can be implemented as any type
+    // of source later
+    pub app_source: DistPacketSource,
+}
+
+impl AppPacketSource {
+    pub fn new(
+        flow_id: usize,
+        traffic: TrafficCharacteristics,
+        rng: SmallRng,
+    ) -> AppPacketSource {  
+        AppPacketSource { app_source: DistPacketSource::new(flow_id, traffic, rng) }
+    }
+}
+
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub traffic: TrafficCharacteristics,
-    /// the time when data last arrived from the flow
-    last_arrival: f64,
     /// the congestion controller
     congestion_control: Box<dyn CongestionControl + Send + Sync>,
     /// maximum segment size, in bytes
     mss: usize,
     /// the next sequence number to be sent, in bytes
-    next_seq: usize,
+    pub next_seq: usize,
     /// the maximum sequence number in the in-transit data buffer
-    send_buffer: usize,
+    pub send_buffer: usize,
     /// the sequence number of the segment that is last acknowledged
     last_ack: usize,
     /// the count of duplicate acknolwedgments
@@ -77,6 +92,8 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
+    pub app_packet_source: AppPacketSource,
+
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     busy_until: f64,
@@ -85,7 +102,6 @@ pub struct TCPPacketSource {
     pub tcp_send_packet: bool,
 
     packets_sent: usize,
-    rng: SmallRng,
 
     pub output: Output<Packet>,
 }
@@ -112,7 +128,6 @@ impl TCPPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
             traffic,
-            last_arrival: 0.0,
             congestion_control,
             mss: 512,
             next_seq: 0,
@@ -124,10 +139,10 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
+            app_packet_source: AppPacketSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             tcp_send_packet: false,
-            rng,
             output: Output::default(),
         }
     }
@@ -286,7 +301,7 @@ impl TCPPacketSource {
         );
     }
 
-    /// On a packet reaches timeout.
+    /// On a periodic timer event occurs.
     pub async fn periodic_timer_event(&mut self, now: f64) {
         while !self.timeout_queue.is_empty() {
             let timeout_time = self.timeout_queue.peek().unwrap().timeout;
@@ -334,48 +349,6 @@ impl TCPPacketSource {
                 return;
             }
         }
-    }
-
-    /// Retrieves packets from the (application-layer) flow.
-    pub fn retrieve_packets_from_flow(&mut self, now: f64) -> (bool, Duration) {
-        while self.next_seq >= self.send_buffer {
-            let interval = match self.traffic.arr_dist {
-                DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                    .unwrap()
-                    .sample(&mut self.rng),
-                DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
-                DistributionInfo::Uniform { low, high } => {
-                    Uniform::new(low, high).unwrap().sample(&mut self.rng)
-                }
-            };
-
-            let packet_size = match self.traffic.pkt_size_dist {
-                DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                    .unwrap()
-                    .sample(&mut self.rng)
-                    as usize,
-                DistributionInfo::Exp { lambda } => {
-                    Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
-                }
-                DistributionInfo::Uniform { low, high } => {
-                    Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
-                }
-            };
-
-            let wait_time = interval - (now - self.last_arrival);
-            self.last_arrival = now;
-            self.send_buffer += packet_size;
-
-            // waits for the next arrival of the packet of the flow
-            if wait_time > 0.0 {
-                self.last_arrival += wait_time;
-                self.busy_until = self.last_arrival;
-
-                return (true, Duration::from_secs_f64(wait_time));
-            }
-        }
-
-        (false, Duration::default())
     }
 
     pub fn should_produce_packet(&mut self) -> bool {

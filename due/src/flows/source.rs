@@ -101,32 +101,60 @@ impl PacketSource {
         }
     }
 
-    fn prepare_run(&mut self, scheduler: &Scheduler<Self>) {
+    fn prepare_run(&mut self, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(_) => {}
-            PacketSource::TCPPacketSource(_) => {
+            PacketSource::TCPPacketSource(source) => {
                 scheduler
                     .schedule_event(
-                        Duration::from_secs_f64(0.05),
+                        Duration::from_secs_f64(initial_delay + 0.05),
                         Self::periodic_timer_event,
                         (),
+                    )
+                    .unwrap();
+
+                let (packet, interval) = source
+                    .app_packet_source
+                    .app_source
+                    .produce_packet(initial_delay);
+
+                scheduler
+                    .schedule_event(
+                        interval + Duration::from_secs_f64(initial_delay),
+                        Self::app_packet_arrive,
+                        packet,
                     )
                     .unwrap();
             }
         }
     }
 
-    /// Returns whether PacketSource should return from the current while loop
-    /// before producing a packet.
-    pub fn early_return(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
-        match self {
-            PacketSource::DistPacketSource(_) => false,
-            PacketSource::TCPPacketSource(source) => {
-                let (should_return, interval) = source.retrieve_packets_from_flow(now);
-                if should_return {
-                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
+    fn app_packet_arrive<'a>(
+        &'a mut self,
+        packet: Packet,
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            match self {
+                PacketSource::DistPacketSource(_) => (),
+                PacketSource::TCPPacketSource(source) => {
+                    let now = scheduler
+                        .time()
+                        .duration_since(MonotonicTime::EPOCH)
+                        .as_secs_f64();
+                    if source.next_seq >= source.send_buffer {
+                        source.send_buffer += packet.size;
+                    }
+
+                    let (new_packet, interval) =
+                        source.app_packet_source.app_source.produce_packet(now);
+
+                    // schedules the next packet from the (application-layer)
+                    // flow
+                    scheduler
+                        .schedule_event(interval, Self::app_packet_arrive, new_packet)
+                        .unwrap();
                 }
-                should_return
             }
         }
     }
@@ -147,27 +175,23 @@ impl PacketSource {
         }
     }
 
-    pub fn periodic_timer_event<'a>(
+    fn periodic_timer_event<'a>(
         &'a mut self,
         _: (),
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             match self {
-                // no wrap-up event after sending out a packet in
-                // DistPacketSource
                 PacketSource::DistPacketSource(_) => (),
-                // the wrap-up event after sending out a packet in
-                // TCPPacketSource is the timeout event scheduled for this
-                // packet
                 PacketSource::TCPPacketSource(source) => {
                     let now = scheduler
                         .time()
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
+
                     source.periodic_timer_event(now).await;
 
-                    // schedules the next period timeout event
+                    // schedules the next periodic timer event
                     scheduler
                         .schedule_event(
                             Duration::from_secs_f64(0.05),
@@ -225,13 +249,7 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            self.prepare_run(scheduler);
-
             while !self.traffic_exceeded(now) {
-                if self.early_return(now, scheduler) {
-                    return;
-                }
-
                 if self.should_produce_packet() {
                     let (packet, interval) = self.produce_packet(now);
                     if interval == Duration::default() {
@@ -288,6 +306,8 @@ impl Model for PacketSource {
             } else {
                 self.run((), scheduler).await;
             }
+
+            self.prepare_run(initial_delay, scheduler);
 
             self.into()
         })
