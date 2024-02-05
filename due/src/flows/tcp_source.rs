@@ -3,6 +3,7 @@
 
 use core::fmt;
 use std::cmp::Ordering;
+use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
@@ -190,8 +191,8 @@ impl TCPPacketSource {
                 self.congestion_control.more_dupacks_received();
 
                 // transmits a new packet, if allowed by the new value of cwnd
-                if self.last_ack as f64 + self.congestion_control.get_cwnd()
-                    >= ack.sequence_num as f64
+                if self.last_ack + self.congestion_control.get_cwnd()
+                    >= ack.sequence_num
                     && !self.traffic.size.exceeded(self.next_seq, now)
                 {
                     debug!(
@@ -348,9 +349,8 @@ impl TCPPacketSource {
 
     pub fn should_produce_packet(&mut self) -> bool {
         // the sender can transmit up to the size of the congestion window
-        (self.next_seq + self.mss) as f64
-            <= (self.send_buffer as f64)
-                .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
+        self.next_seq + self.mss
+            <= min(self.send_buffer,self.last_ack + self.congestion_control.get_cwnd())
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
