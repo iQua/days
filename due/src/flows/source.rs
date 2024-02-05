@@ -165,7 +165,11 @@ impl PacketSource {
     }
 
     /// Returns whether PacketSource should produce a new packet at this point.
-    fn should_produce_packet(&mut self) -> bool {
+    fn should_produce_packet(&mut self, now: f64) -> bool {
+        if !self.traffic_exceeded(now) {
+            return false;
+        }
+
         match self {
             PacketSource::DistPacketSource(_) => true,
             PacketSource::TCPPacketSource(source) => source.should_produce_packet(),
@@ -226,20 +230,14 @@ impl PacketSource {
     }
 
     /// Returns whether PacketSource should return from the current while loop.
-    fn wrap_up_run(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
+    fn wrap_up(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
         match self {
             PacketSource::DistPacketSource(_) => {
                 let (_, interval) = self.produce_packet(now);
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
                 true
             }
-            PacketSource::TCPPacketSource(source) => {
-                if source.tcp_send_packet {
-                    source.tcp_send_packet = false;
-                    return false;
-                }
-                true
-            }
+            PacketSource::TCPPacketSource(_) => true,
         }
     }
 
@@ -254,22 +252,20 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            while !self.traffic_exceeded(now) {
-                if self.should_produce_packet() {
-                    let (packet, interval) = self.produce_packet(now);
-                    if interval == Duration::default() {
-                        // sends the packet now if interval is 0
-                        self.send_packet(packet, scheduler).await;
-                    } else {
-                        // schedules an event to send the packet if interval is
-                        // more than 0
-                        scheduler
-                            .schedule_event(interval, Self::send_packet, packet)
-                            .unwrap();
-                    }
+            while self.should_produce_packet(now) {
+                let (packet, interval) = self.produce_packet(now);
+                if interval == Duration::default() {
+                    // sends the packet now if interval is 0
+                    self.send_packet(packet, scheduler).await;
+                } else {
+                    // schedules an event to send the packet if interval is more
+                    // than 0
+                    scheduler
+                        .schedule_event(interval, Self::send_packet, packet)
+                        .unwrap();
                 }
 
-                if self.wrap_up_run(now, scheduler) {
+                if self.wrap_up(now, scheduler) {
                     return;
                 }
             }

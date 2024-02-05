@@ -97,9 +97,6 @@ pub struct TCPPacketSource {
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
-    /// whether the source can send a packet before reaching the size of
-    /// congestion window
-    pub tcp_send_packet: bool,
 
     packets_sent: usize,
 
@@ -142,7 +139,6 @@ impl TCPPacketSource {
             app_packet_source: AppPacketSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
-            tcp_send_packet: false,
             output: Output::default(),
         }
     }
@@ -353,11 +349,9 @@ impl TCPPacketSource {
 
     pub fn should_produce_packet(&mut self) -> bool {
         // the sender can transmit up to the size of the congestion window
-        self.tcp_send_packet = (self.next_seq + self.mss) as f64
+        (self.next_seq + self.mss) as f64
             <= (self.send_buffer as f64)
-                .min(self.last_ack as f64 + self.congestion_control.get_cwnd());
-
-        self.tcp_send_packet
+                .min(self.last_ack as f64 + self.congestion_control.get_cwnd())
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
