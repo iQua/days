@@ -295,7 +295,7 @@ impl TCPPacketSource {
 
     /// Checks if any sent packet reached timeout at regularly occurring
     /// intervals.
-    pub async fn periodic_timer_event(&mut self, now: f64) {
+    pub async fn timer_tick(&mut self, now: f64) {
         while !self.timeout_queue.is_empty() {
             let timeout_time = self.timeout_queue.peek().unwrap().timeout;
             if timeout_time <= now {

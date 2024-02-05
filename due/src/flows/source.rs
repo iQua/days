@@ -212,7 +212,7 @@ impl PacketSource {
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
 
-                    source.periodic_timer_event(now).await;
+                    source.timer_tick(now).await;
 
                     // schedules the next periodic timer event
                     scheduler
