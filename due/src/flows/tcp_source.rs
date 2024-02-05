@@ -2,8 +2,8 @@
 //! support for various congestion control mechanisms.
 
 use core::fmt;
-use std::cmp::Ordering;
 use std::cmp::min;
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
@@ -13,8 +13,8 @@ use rand::rngs::SmallRng;
 use asynchronix::model::{Model, Output};
 
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
-use crate::flows::packet::Packet;
 use crate::flows::dist_source::DistPacketSource;
+use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
 
@@ -56,12 +56,10 @@ pub struct AppPacketSource {
 }
 
 impl AppPacketSource {
-    pub fn new(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        rng: SmallRng,
-    ) -> AppPacketSource {  
-        AppPacketSource { app_source: DistPacketSource::new(flow_id, traffic, rng) }
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> AppPacketSource {
+        AppPacketSource {
+            app_source: DistPacketSource::new(flow_id, traffic, rng),
+        }
     }
 }
 
@@ -191,8 +189,7 @@ impl TCPPacketSource {
                 self.congestion_control.more_dupacks_received();
 
                 // transmits a new packet, if allowed by the new value of cwnd
-                if self.last_ack + self.congestion_control.get_cwnd()
-                    >= ack.sequence_num
+                if self.last_ack + self.congestion_control.get_cwnd() >= ack.sequence_num
                     && !self.traffic.size.exceeded(self.next_seq, now)
                 {
                     debug!(
@@ -317,7 +314,7 @@ impl TCPPacketSource {
                     .unwrap();
 
                 resent_pkt.departure_update(timeout_packet.timeout);
-                
+
                 self.output.send(resent_pkt.clone()).await;
 
                 debug!(
@@ -328,7 +325,7 @@ impl TCPPacketSource {
                     resent_pkt.flow_id,
                     timeout_packet.timeout, 
                 );
-                
+
                 // doubles the retransmission timeout
                 self.rto *= 2.0;
 
@@ -350,7 +347,11 @@ impl TCPPacketSource {
     pub fn should_produce_packet(&mut self) -> bool {
         // the sender can transmit up to the size of the congestion window
         self.next_seq + self.mss
-            <= min(self.send_buffer,self.last_ack + self.congestion_control.get_cwnd())
+            <= min(
+                self.send_buffer,
+                self.last_ack + self.congestion_control.get_cwnd(),
+            )
+            && self.next_seq < self.send_buffer
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
