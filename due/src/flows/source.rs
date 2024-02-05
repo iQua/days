@@ -105,6 +105,8 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(_) => {}
             PacketSource::TCPPacketSource(source) => {
+                // schedules a periodic timer to notify TCPPacketSource to
+                // check if any of its sent packet reaches timeout
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(initial_delay + 0.05),
@@ -113,6 +115,8 @@ impl PacketSource {
                     )
                     .unwrap();
 
+                // schedules a application packet source to send packets to
+                // TCPPacketSource
                 let (packet, interval) = source
                     .app_packet_source
                     .app_source
@@ -125,6 +129,8 @@ impl PacketSource {
                         packet,
                     )
                     .unwrap();
+
+                source.busy_until = interval.as_secs_f64() + initial_delay;
             }
         }
     }
@@ -147,10 +153,18 @@ impl PacketSource {
                         source.app_packet_source.app_source.produce_packet(now);
 
                     if source.next_seq >= source.send_buffer {
+                        // this packet can be retrieved by the TCPPacketSource
                         source.send_buffer += packet.size;
-                        source.busy_until = now;
+
                         if source.next_seq < source.send_buffer {
+                            // the TCPPacketSource could send new packet at this
+                            // point, if the size of the congestion window
+                            // allows
                             self.run((), scheduler).await;
+                        } else {
+                            // the TCPPacketSource is considered busy retrieving
+                            // the next packet from the (application-layer) flow
+                            source.busy_until = now + interval.as_secs_f64();
                         }
                     }
 
@@ -237,7 +251,7 @@ impl PacketSource {
                 scheduler.schedule_event(interval, Self::run, ()).unwrap();
                 true
             }
-            PacketSource::TCPPacketSource(_) => true,
+            PacketSource::TCPPacketSource(_) => false,
         }
     }
 

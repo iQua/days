@@ -143,7 +143,7 @@ impl TCPPacketSource {
         }
     }
 
-    /// Returns the action that PacketSource should take after TCPPacketSource
+    /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
         // the received packet must be an acknowledgment
@@ -203,8 +203,6 @@ impl TCPPacketSource {
 
                     self.output.send(packet.clone()).await;
                     self.packet_sent(&packet, now);
-
-                    return false;
                 }
             }
         }
