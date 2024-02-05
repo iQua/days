@@ -180,18 +180,20 @@ impl PacketSource {
         }
     }
 
-    /// Wraps up after sending out a packet.
-    fn wrap_up(&mut self, packet: &Packet, now: f64) {
+    async fn send_packet(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
+        self.output().send(packet.clone()).await;
+
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+
         match self {
-            PacketSource::DistPacketSource(source) => source.packet_sent(packet, now),
+            PacketSource::DistPacketSource(source) => source.packet_sent(&packet, now),
             PacketSource::TCPPacketSource(source) => {
-                source.packet_sent(packet, now);
+                source.packet_sent(&packet, now);
             }
         }
-    }
-
-    async fn send_packet(&mut self, packet: Packet) {
-        self.output().send(packet).await;
     }
 
     /// Returns whether PacketSource should return from the current while loop.
@@ -234,16 +236,14 @@ impl PacketSource {
                     let (packet, interval) = self.produce_packet(now);
                     if interval == Duration::default() {
                         // sends the packet now if interval is 0
-                        self.send_packet(packet.clone()).await;
+                        self.send_packet(packet, scheduler).await;
                     } else {
                         // schedules an event to send the packet if interval is
                         // more than 0
                         scheduler
-                            .schedule_event(interval, Self::send_packet, packet.clone())
+                            .schedule_event(interval, Self::send_packet, packet)
                             .unwrap();
                     }
-
-                    self.wrap_up(&packet, now);
                 }
 
                 if self.wrap_up_run(now, scheduler) {
