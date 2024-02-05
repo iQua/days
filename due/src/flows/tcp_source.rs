@@ -79,7 +79,7 @@ pub struct TCPPacketSource {
     last_ack: usize,
     /// the count of duplicate acknolwedgments
     dupack: usize,
-    /// the RTT estimate
+    /// deviation of the RTT
     rtt_var: f64,
     /// smoothed RTT
     smoothed_rtt: f64,
