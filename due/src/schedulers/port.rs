@@ -45,9 +45,14 @@ impl Port {
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
-            DropStrategy::RED => {
-                Box::new(RED::new(capacity, capacity_unit, 2, 6, 0.8, scheduler_id))
-            }
+            DropStrategy::RED => Box::new(RED::new(
+                capacity,
+                capacity_unit,
+                0.7,
+                0.9,
+                0.8,
+                scheduler_id,
+            )),
         };
 
         Port {
@@ -79,13 +84,10 @@ impl Port {
         // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
-            debug! {
+            debug!(
                 "Port {} dropped packet {} from flow {} at time {:.3}",
-                self.scheduler_id,
-                packet.packet_id,
-                packet.flow_id,
-                arrival_time
-            }
+                self.scheduler_id, packet.packet_id, packet.flow_id, arrival_time
+            );
             return;
         }
 

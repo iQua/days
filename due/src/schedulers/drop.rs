@@ -52,12 +52,12 @@ impl PacketDrop for TailDrop {
     }
 }
 
-/// Random Early Detection.
+/// Random Early Detection, as defined in RFC 2309
 pub struct RED {
     capacity: usize, // 0 for unlimited
     capacity_unit: CapacityUnit,
-    min_threshold: usize,
-    max_threshold: usize,
+    min_threshold: f64,
+    max_threshold: f64,
     max_probability: f64,
     weight_factor: u32,
     avg_queue_length: usize,
@@ -68,8 +68,8 @@ impl RED {
     pub fn new(
         capacity: usize,
         capacity_unit: CapacityUnit,
-        min_threshold: usize,
-        max_threshold: usize,
+        min_threshold: f64,
+        max_threshold: f64,
         max_probability: f64,
         seed: usize,
     ) -> RED {
@@ -106,8 +106,11 @@ impl PacketDrop for RED {
         // drops the packet if the average queue length exceeds the max_threshold
         let threshold_overflow = match self.capacity_unit {
             CapacityUnit::Bytes => {
-                if byte_size + packet_size > self.max_threshold {
+                if byte_size + packet_size
+                    > (self.max_threshold * self.capacity as f64).floor() as usize
+                {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    println!("bytes overflow: drop_probability = {}", drop_probability);
 
                     drop_probability <= self.max_probability
                 } else {
@@ -115,8 +118,9 @@ impl PacketDrop for RED {
                 }
             }
             CapacityUnit::Packets => {
-                if queue_length + 1 > self.max_threshold {
+                if queue_length + 1 > (self.max_threshold * self.capacity as f64).floor() as usize {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    println!("overflow: drop_probability = {}", drop_probability);
 
                     drop_probability <= self.max_probability
                 } else {
@@ -127,14 +131,18 @@ impl PacketDrop for RED {
 
         let threshold_normal = match self.capacity_unit {
             CapacityUnit::Bytes => {
-                if byte_size + packet_size > self.min_threshold {
+                if byte_size + packet_size
+                    > (self.min_threshold * self.capacity as f64).floor() as usize
+                {
                     let probability = cmp::max(
                         0,
                         self.avg_queue_length as isize - self.min_threshold as isize,
                     ) as f64
-                        / (self.max_threshold - self.min_threshold) as f64
+                        / (self.max_threshold - self.min_threshold)
+                        * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    println!("bytes normal: drop_probability = {}", drop_probability);
 
                     drop_probability <= probability
                 } else {
@@ -142,15 +150,14 @@ impl PacketDrop for RED {
                 }
             }
             CapacityUnit::Packets => {
-                if queue_length + 1 > self.min_threshold {
-                    let probability = cmp::max(
-                        0,
-                        self.avg_queue_length as isize - self.min_threshold as isize,
-                    ) as f64
-                        / (self.max_threshold - self.min_threshold) as f64
+                if queue_length + 1 > (self.min_threshold * self.capacity as f64).floor() as usize {
+                    let probability = f64::max(
+                        0.0,
+                        self.avg_queue_length as f64 - self.min_threshold * self.capacity as f64,
+                    ) / (self.max_threshold - self.min_threshold) as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-
+                    println!("normal: drop_probability = {}", drop_probability);
                     drop_probability <= probability
                 } else {
                     false
