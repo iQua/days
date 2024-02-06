@@ -192,7 +192,7 @@ impl TCPPacketSource {
 
                 // transmits a new packet, if allowed by the new value of cwnd
                 if self.last_ack + self.congestion_control.get_cwnd() >= ack.sequence_num
-                    && !self.traffic.size.exceeded(self.next_seq, now)
+                    && self.next_seq < self.send_buffer
                 {
                     debug!(
                         "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
