@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
 
 use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -84,7 +84,7 @@ impl Port {
         // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
-            debug!(
+            info!(
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id, packet.packet_id, packet.flow_id, arrival_time
             );

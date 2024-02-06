@@ -15,7 +15,7 @@ fn main() {
     let file_path = "configs/fattree.toml";
 
     let (graph, hosts) = build_graph(file_path);
-    info!("The FatTree graph has been initialized: {:?}", graph);
+    info!("The FatTree graph has been initialized.");
 
     let flows = Flow::flows_from_config(file_path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());

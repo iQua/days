@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
 use rand::rngs::SmallRng;
 
 use asynchronix::model::{Model, Output};
@@ -327,7 +327,7 @@ impl TCPPacketSource {
 
                 self.output.send(resent_pkt.clone()).await;
 
-                debug!(
+                info!(
                     "Due to timeout, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
                     self.endpoint_id,
                     resent_pkt.packet_id,
@@ -346,7 +346,7 @@ impl TCPPacketSource {
 
                 self.timeout_queue.push(revised_timeout);
 
-                debug!(
+                info!(
                     "TCPPacketSource {} reset a timer for packet {} with a RTO of {:.3}.",
                     self.endpoint_id, packet_timeout.packet_id, revised_rto
                 );
