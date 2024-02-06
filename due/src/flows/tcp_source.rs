@@ -177,15 +177,15 @@ impl TCPPacketSource {
                 self.congestion_control.consecutive_dupacks_received();
             }
 
-            let resent_pkt = self.sent_packets.get_mut(&ack.sequence_num).unwrap();
-            resent_pkt.time = now;
+            if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
+                resent_pkt.time = now;
+                self.output.send(resent_pkt.clone()).await;
 
-            self.output.send(resent_pkt.clone()).await;
-
-            debug!(
-                "TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
-            );
+                debug!(
+                    "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                    self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+                );
+            }
 
             if self.dupack > 3 {
                 self.congestion_control.more_dupacks_received();

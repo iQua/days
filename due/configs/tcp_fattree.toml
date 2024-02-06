@@ -1,6 +1,6 @@
 # An example configuration file for using TCP in a FatTree topology.
 
-seed = 1000
+seed = 100
 
 [topology]
 category = "FatTree"
@@ -17,10 +17,10 @@ drop = "RED"
 
 [[flow_set]]
 flow_type = "TCP"
-flow_count = 64
+flow_count = 200
 [flow_set.traffic]
     initial_delay = 0.0
-    duration = 10.0
+    duration = 0.1
     arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
     pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
 [flow_set.traffic.tcp]
