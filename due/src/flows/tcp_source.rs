@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
 use rand::rngs::SmallRng;
 
 use asynchronix::model::{Model, Output};
@@ -21,6 +21,7 @@ use crate::next_endpoint_id;
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
     pub packet_id: usize,
+    pub rto: f64,
     pub timeout: f64,
 }
 
@@ -288,6 +289,7 @@ impl TCPPacketSource {
 
         self.timeout_queue.push(PacketTimeout {
             packet_id: packet.packet_id,
+            rto: self.rto,
             timeout: self.rto + now,
         });
 
@@ -303,10 +305,10 @@ impl TCPPacketSource {
         while !self.timeout_queue.is_empty() {
             let timeout_time = self.timeout_queue.peek().unwrap().timeout;
             if timeout_time <= now {
-                let timeout_packet = self.timeout_queue.pop().unwrap();
+                let packet_timeout = self.timeout_queue.pop().unwrap();
                 debug!(
                     "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}.",
-                    self.endpoint_id, timeout_packet.packet_id, timeout_packet.timeout,
+                    self.endpoint_id, packet_timeout.packet_id, packet_timeout.timeout,
                 );
 
                 self.congestion_control.timer_expired();
@@ -314,33 +316,35 @@ impl TCPPacketSource {
                 // retransmits the segment
                 let resent_pkt = self
                     .sent_packets
-                    .get_mut(&timeout_packet.packet_id)
+                    .get_mut(&packet_timeout.packet_id)
                     .unwrap();
 
-                resent_pkt.departure_update(timeout_packet.timeout);
+                resent_pkt.departure_update(packet_timeout.timeout);
 
                 self.output.send(resent_pkt.clone()).await;
 
-                debug!(
+                info!(
                     "Due to timeout, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
                     self.endpoint_id,
                     resent_pkt.packet_id,
                     resent_pkt.size,
                     resent_pkt.flow_id,
-                    timeout_packet.timeout, 
+                    packet_timeout.timeout, 
                 );
+                
+                let revised_rto = packet_timeout.rto * 2.0;
 
-                // doubles the retransmission timeout
-                self.rto *= 2.0;
+                let revised_timeout = PacketTimeout {
+                    packet_id: packet_timeout.packet_id,
+                    rto: revised_rto,
+                    timeout: packet_timeout.timeout + revised_rto,
+                };
 
-                self.timeout_queue.push(PacketTimeout {
-                    packet_id: timeout_packet.packet_id,
-                    timeout: self.rto + timeout_packet.timeout,
-                });
+                self.timeout_queue.push(revised_timeout);
 
-                debug!(
-                    "TCPPacketSource {} reset a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-                    self.endpoint_id, timeout_packet.packet_id, self.rto, self.rto + timeout_packet.timeout
+                info!(
+                    "TCPPacketSource {} reset a timer for packet {} with a RTO of {:.3}.",
+                    self.endpoint_id, packet_timeout.packet_id, revised_rto
                 );
             } else {
                 return;
