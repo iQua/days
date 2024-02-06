@@ -92,6 +92,10 @@ impl RED {
 
 impl PacketDrop for RED {
     fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool {
+        if self.capacity == 0 {
+            return false; // unlimited
+        }
+
         let alpha = 1 / usize::pow(2, self.weight_factor);
         self.avg_queue_length = self.avg_queue_length * (1 - alpha) + queue_length * alpha;
 
@@ -108,7 +112,6 @@ impl PacketDrop for RED {
                     > (self.max_threshold * self.capacity as f64).floor() as usize
                 {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    println!("bytes overflow: drop_probability = {}", drop_probability);
 
                     drop_probability <= self.max_probability
                 } else {
@@ -118,7 +121,6 @@ impl PacketDrop for RED {
             CapacityUnit::Packets => {
                 if queue_length + 1 > (self.max_threshold * self.capacity as f64).floor() as usize {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    println!("overflow: drop_probability = {}", drop_probability);
 
                     drop_probability <= self.max_probability
                 } else {
@@ -139,7 +141,6 @@ impl PacketDrop for RED {
                         * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    println!("bytes normal: drop_probability = {}", drop_probability);
 
                     drop_probability <= probability
                 } else {
@@ -155,7 +156,7 @@ impl PacketDrop for RED {
                         * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    println!("normal: drop_probability = {}", drop_probability);
+
                     drop_probability <= probability
                 } else {
                     false
