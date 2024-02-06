@@ -79,13 +79,6 @@ impl PacketSource {
         }
     }
 
-    fn traffic_exceeded(&self, now: f64) -> bool {
-        match self {
-            PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
-            PacketSource::TCPPacketSource(source) => source.traffic_exceeded(now),
-        }
-    }
-
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler
             .time()
@@ -161,6 +154,8 @@ impl PacketSource {
                         scheduler
                             .schedule_event(interval, Self::app_packet_arrive, new_packet)
                             .unwrap();
+                    } else {
+                        source.traffic_exceeded = true;
                     }
 
                     if source.next_seq < source.send_buffer {
@@ -180,12 +175,8 @@ impl PacketSource {
 
     /// Returns whether PacketSource should produce a new packet at this point.
     fn should_produce_packet(&mut self, now: f64) -> bool {
-        if self.traffic_exceeded(now) {
-            return false;
-        }
-
         match self {
-            PacketSource::DistPacketSource(_) => true,
+            PacketSource::DistPacketSource(source) => !source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => source.should_produce_packet(),
         }
     }
@@ -255,6 +246,16 @@ impl PacketSource {
         }
     }
 
+    /// Returns whether PacketSource should stop running.
+    fn stop_run(&self, now: f64) -> bool {
+        match self {
+            PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
+            PacketSource::TCPPacketSource(source) => {
+                source.traffic_exceeded && source.next_seq + source.mss > source.send_buffer
+            }
+        }
+    }
+
     pub fn run<'a>(
         &'a mut self,
         _: (),
@@ -284,7 +285,7 @@ impl PacketSource {
                 }
             }
 
-            if self.traffic_exceeded(now) {
+            if self.stop_run(now) {
                 debug!("{} finished running at {:.3}.", format!("{self}"), now);
             }
         }

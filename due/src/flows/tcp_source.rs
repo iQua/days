@@ -67,10 +67,11 @@ pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub traffic: TrafficCharacteristics,
+    pub traffic_exceeded: bool,
     /// the congestion controller
     congestion_control: Box<dyn CongestionControl + Send + Sync>,
     /// maximum segment size, in bytes
-    mss: usize,
+    pub mss: usize,
     /// the next sequence number to be sent, in bytes
     pub next_seq: usize,
     /// the maximum sequence number in the in-transit data buffer
@@ -124,6 +125,7 @@ impl TCPPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
             traffic,
+            traffic_exceeded: false,
             congestion_control,
             mss: 512,
             next_seq: 0,
@@ -190,7 +192,7 @@ impl TCPPacketSource {
 
                 // transmits a new packet, if allowed by the new value of cwnd
                 if self.last_ack + self.congestion_control.get_cwnd() >= ack.sequence_num
-                    && !self.traffic.size.exceeded(self.next_seq, now)
+                    && self.next_seq < self.send_buffer
                 {
                     debug!(
                         "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
@@ -358,10 +360,6 @@ impl TCPPacketSource {
         let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
 
         (packet, Duration::default())
-    }
-
-    pub fn traffic_exceeded(&self, now: f64) -> bool {
-        self.traffic.size.exceeded(self.next_seq, now)
     }
 }
 
