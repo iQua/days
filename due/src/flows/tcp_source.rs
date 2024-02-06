@@ -71,7 +71,7 @@ pub struct TCPPacketSource {
     /// the congestion controller
     congestion_control: Box<dyn CongestionControl + Send + Sync>,
     /// maximum segment size, in bytes
-    mss: usize,
+    pub mss: usize,
     /// the next sequence number to be sent, in bytes
     pub next_seq: usize,
     /// the maximum sequence number in the in-transit data buffer

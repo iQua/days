@@ -250,7 +250,9 @@ impl PacketSource {
     fn stop_run(&self, now: f64) -> bool {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
-            PacketSource::TCPPacketSource(source) => source.traffic_exceeded,
+            PacketSource::TCPPacketSource(source) => {
+                source.traffic_exceeded && source.next_seq + source.mss > source.send_buffer
+            }
         }
     }
 
