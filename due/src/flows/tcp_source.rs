@@ -307,8 +307,12 @@ impl TCPPacketSource {
             if timeout_time <= now {
                 let packet_timeout = self.timeout_queue.pop().unwrap();
                 debug!(
-                    "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}.",
-                    self.endpoint_id, packet_timeout.packet_id, packet_timeout.timeout,
+                    "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}, \
+                    with a current RTO of {:.3}.",
+                    self.endpoint_id,
+                    packet_timeout.packet_id,
+                    packet_timeout.timeout,
+                    packet_timeout.rto,
                 );
 
                 self.congestion_control.timer_expired();
