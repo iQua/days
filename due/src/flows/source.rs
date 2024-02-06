@@ -82,7 +82,7 @@ impl PacketSource {
     fn traffic_exceeded(&self, now: f64) -> bool {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
-            PacketSource::TCPPacketSource(source) => source.traffic_exceeded(now),
+            PacketSource::TCPPacketSource(source) => source.traffic_exceeded,
         }
     }
 
@@ -161,6 +161,8 @@ impl PacketSource {
                         scheduler
                             .schedule_event(interval, Self::app_packet_arrive, new_packet)
                             .unwrap();
+                    } else {
+                        source.traffic_exceeded = true;
                     }
 
                     if source.next_seq < source.send_buffer {

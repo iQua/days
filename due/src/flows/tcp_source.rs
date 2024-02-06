@@ -67,6 +67,7 @@ pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub traffic: TrafficCharacteristics,
+    pub traffic_exceeded: bool,
     /// the congestion controller
     congestion_control: Box<dyn CongestionControl + Send + Sync>,
     /// maximum segment size, in bytes
@@ -124,6 +125,7 @@ impl TCPPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
             traffic,
+            traffic_exceeded: false,
             congestion_control,
             mss: 512,
             next_seq: 0,
@@ -358,10 +360,6 @@ impl TCPPacketSource {
         let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
 
         (packet, Duration::default())
-    }
-
-    pub fn traffic_exceeded(&self, now: f64) -> bool {
-        self.traffic.size.exceeded(self.next_seq, now)
     }
 }
 
