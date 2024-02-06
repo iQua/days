@@ -239,7 +239,9 @@ impl TCPPacketSource {
             } else {
                 self.smoothed_rtt = (1.0 - alpha) * self.smoothed_rtt + alpha * sample_rtt;
             }
-            self.rto = f64::max(1.0, self.smoothed_rtt + 4.0 * self.rtt_var);
+
+            // the clock granularity, G in RFC 6298, is always set as 100 msec as suggested by RFC 6298
+            self.rto = f64::max(1.0, self.smoothed_rtt + f64::max(0.1, 4.0 * self.rtt_var));
 
             self.last_ack = ack.sequence_num;
             self.congestion_control.ack_received(sample_rtt, now);

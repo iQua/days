@@ -100,9 +100,12 @@ impl PacketSource {
             PacketSource::TCPPacketSource(source) => {
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
+
+                // as suggested by RFC 6298, the clock granuarity, i.e., the
+                // interval of this periodic timer, is always 100 msec
                 scheduler
                     .schedule_event(
-                        Duration::from_secs_f64(initial_delay + 0.05),
+                        Duration::from_secs_f64(initial_delay + 0.1),
                         Self::periodic_timer_event,
                         (),
                     )
