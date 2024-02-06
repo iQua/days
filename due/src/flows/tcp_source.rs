@@ -151,7 +151,7 @@ impl TCPPacketSource {
         assert!(ack_packet.ack.is_some());
 
         debug!(
-            "TCPPacketSource {} received Ack of packet {} ({} bytes) from flow {} at time {:.3}.",
+            "TCPPacketSource {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
             self.endpoint_id, ack_packet.packet_id, ack_packet.size, ack_packet.flow_id, now,
         );
 
@@ -245,7 +245,7 @@ impl TCPPacketSource {
             self.congestion_control.ack_received(sample_rtt, now);
 
             debug!(
-                "TCPPacketSource {} received Ack till sequence number {} at time {:.3}.",
+                "TCPPacketSource {} received ack till sequence number {} at time {:.3}.",
                 self.endpoint_id, ack.sequence_num, now,
             );
 

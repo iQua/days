@@ -85,7 +85,7 @@ impl PacketSwitch {
             }
         } else {
             debug!(
-                "PacketSwitch {} received Ack of packet {} ({} bytes) from flow {} at time {:.3}.",
+                "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
                 self.switch_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
             );
 
