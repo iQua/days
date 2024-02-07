@@ -62,9 +62,14 @@ impl SPServer {
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
-            DropStrategy::RED => {
-                Box::new(RED::new(capacity, capacity_unit, 2, 6, 0.8, scheduler_id))
-            }
+            DropStrategy::RED => Box::new(RED::new(
+                capacity,
+                capacity_unit,
+                0.7,
+                0.9,
+                0.8,
+                scheduler_id,
+            )),
         };
 
         SPServer {
@@ -138,7 +143,7 @@ impl SPServer {
             class_id
         );
 
-        if arrival_time > self.busy_until {
+        if arrival_time >= self.busy_until {
             self.run((), scheduler);
         }
     }
