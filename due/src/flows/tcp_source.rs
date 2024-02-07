@@ -333,9 +333,9 @@ impl TCPPacketSource {
                     resent_pkt.packet_id,
                     resent_pkt.size,
                     resent_pkt.flow_id,
-                    packet_timeout.timeout, 
+                    packet_timeout.timeout,
                 );
-                
+
                 let revised_rto = packet_timeout.rto * 2.0;
 
                 let revised_timeout = PacketTimeout {
