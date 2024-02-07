@@ -81,7 +81,7 @@ impl TCPPacketSink {
         self.output.send(acknowledgment.clone()).await;
 
         debug!(
-            "TCPPacketSink {} sent Ack packet {} ({} bytes) at time {:.3}.",
+            "TCPPacketSink {} sent ack packet {} ({} bytes) at time {:.3}.",
             self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
         );
     }

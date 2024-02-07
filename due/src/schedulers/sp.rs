@@ -143,7 +143,7 @@ impl SPServer {
             class_id
         );
 
-        if arrival_time > self.busy_until {
+        if arrival_time >= self.busy_until {
             self.run((), scheduler);
         }
     }

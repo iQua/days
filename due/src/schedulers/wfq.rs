@@ -198,7 +198,7 @@ impl WFQServer {
             self.scheduler_queue.len(),
         );
 
-        if arrival_time > self.busy_until {
+        if arrival_time >= self.busy_until {
             self.run((), scheduler);
         }
     }
