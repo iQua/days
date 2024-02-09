@@ -363,7 +363,7 @@ impl TCPPacketSource {
                 self.send_buffer,
                 self.last_ack + self.congestion_control.get_cwnd(),
             )
-            && self.next_seq <= self.send_buffer
+            && self.next_seq < self.send_buffer
     }
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
