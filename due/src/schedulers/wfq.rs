@@ -153,9 +153,20 @@ impl WFQServer {
             self.byte_sizes.values().sum(),
             self.scheduler_queue.len(),
         );
-
+        if packet.flow_id == 0 {
+            println!(
+                "Packet from flow 0 received: packet_id = {}",
+                packet.packet_id
+            );
+        }
         // the case that this packet will be dropped
         if should_drop_packet {
+            if packet.flow_id == 0 {
+                println!(
+                    "Packet from flow 0 dropped: packet_id = {}",
+                    packet.packet_id
+                );
+            }
             self.packets_dropped += 1;
             debug! {
                 "WFQServer {} dropped packet {} from flow {} at time {:.3}",
