@@ -1,6 +1,7 @@
 # An example configuration file for using TCP in a FatTree topology.
 
 seed = 100
+mailbox_capacity = 100
 
 [topology]
 category = "FatTree"
