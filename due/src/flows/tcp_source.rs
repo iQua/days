@@ -49,17 +49,43 @@ impl Ord for PacketTimeout {
 impl Eq for PacketTimeout {}
 
 /// An application packet source.
-pub struct AppPacketSource {
-    // currently implements the application packet source as a
-    // distribution-based packet source, but it can be implemented as any type
-    // of source later
-    pub app_source: DistPacketSource,
+pub enum AppDataSource {
+    // the data source from the application is implemented as a distribution-based packet source,
+    // but it can be trace-driven, etc., in the future
+    DistDataSource(DistPacketSource),
 }
 
-impl AppPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> AppPacketSource {
-        AppPacketSource {
-            app_source: DistPacketSource::new(flow_id, traffic, rng),
+pub enum AppDataType {
+    DistData,
+}
+
+impl AppDataSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+        let app_type = AppDataType::DistData;
+
+        match app_type {
+            AppDataType::DistData => {
+                AppDataSource::DistDataSource(DistPacketSource::new(flow_id, traffic, rng))
+            }
+        }
+    }
+
+    pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+        let (packet, duration) = match self {
+            AppDataSource::DistDataSource(source) => source.produce_packet(now),
+        };
+
+        // the packet has just been produced, update statistics about traffic production
+        match self {
+            AppDataSource::DistDataSource(source) => source.packet_sent(&packet, now),
+        };
+
+        (packet, duration)
+    }
+
+    pub fn traffic_exceeded(&self, now: f64) -> bool {
+        match self {
+            AppDataSource::DistDataSource(source) => source.traffic_exceeded(now),
         }
     }
 }
@@ -93,7 +119,7 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub app_packet_source: AppPacketSource,
+    pub datasource: AppDataSource,
 
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
@@ -138,7 +164,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            app_packet_source: AppPacketSource::new(flow_id, traffic, rng.clone()),
+            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             output: Output::default(),
