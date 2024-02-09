@@ -288,7 +288,9 @@ impl TCPPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.app_packet_source.app_source.packet_sent(packet, now);
-
+        if packet.flow_id == 0 {
+            println!("Packet sent from flow 0: packet_id = {}", packet.packet_id);
+        }
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
