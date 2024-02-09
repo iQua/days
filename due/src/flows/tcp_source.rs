@@ -150,12 +150,7 @@ impl TCPPacketSource {
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
-        if ack_packet.flow_id == 0 {
-            println!(
-                "Ack packet from flow 0 received: packet_id = {}",
-                ack_packet.packet_id
-            );
-        }
+
         debug!(
             "TCPPacketSource {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
             self.endpoint_id, ack_packet.packet_id, ack_packet.size, ack_packet.flow_id, now,
@@ -204,12 +199,7 @@ impl TCPPacketSource {
                         "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
                         self.endpoint_id, self.next_seq, self.mss, now,
                     );
-                    if self.flow_id == 0 {
-                        println!(
-                            "about to produce a new packet at TCP source at time {}",
-                            now
-                        );
-                    }
+
                     let (packet, _) = self.produce_packet(now);
 
                     self.output.send(packet.clone()).await;
@@ -288,9 +278,7 @@ impl TCPPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.app_packet_source.app_source.packet_sent(packet, now);
-        if packet.flow_id == 0 {
-            println!("Packet sent from flow 0: packet_id = {}", packet.packet_id);
-        }
+
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
@@ -371,26 +359,6 @@ impl TCPPacketSource {
 
     pub fn should_produce_packet(&mut self) -> bool {
         // the sender can transmit up to the size of the congestion window
-        if self.app_packet_source.app_source.flow_id == 0 {
-            println!(
-                "self.next_seq = {}, mss = {}, send_buffer = {}",
-                self.next_seq, self.mss, self.send_buffer
-            );
-            println!(
-                "self.last_ack = {}, cwnd = {}",
-                self.last_ack,
-                self.congestion_control.get_cwnd()
-            );
-            println!(
-                "should produce packet? {}",
-                self.next_seq + self.mss
-                    <= min(
-                        self.send_buffer,
-                        self.last_ack + self.congestion_control.get_cwnd(),
-                    )
-                    && self.next_seq <= self.send_buffer
-            );
-        }
         self.next_seq + self.mss
             <= min(
                 self.send_buffer,
@@ -401,9 +369,7 @@ impl TCPPacketSource {
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
         let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
-        if self.flow_id == 0 {
-            println!("packet produced at TCP source at time {}", now);
-        }
+
         (packet, Duration::default())
     }
 }
