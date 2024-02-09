@@ -99,7 +99,7 @@ pub struct TCPPacketSource {
     /// until this time
     pub busy_until: f64,
 
-    packets_sent: usize,
+    pub packets_sent: usize,
 
     pub output: Output<Packet>,
 }
@@ -199,7 +199,12 @@ impl TCPPacketSource {
                         "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
                         self.endpoint_id, self.next_seq, self.mss, now,
                     );
-
+                    if self.flow_id == 0 {
+                        println!(
+                            "about to produce a new packet at TCP source at time {}",
+                            now
+                        );
+                    }
                     let (packet, _) = self.produce_packet(now);
 
                     self.output.send(packet.clone()).await;
@@ -277,6 +282,7 @@ impl TCPPacketSource {
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
+        self.app_packet_source.app_source.packet_sent(packet, now);
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -368,7 +374,9 @@ impl TCPPacketSource {
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
         let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
-
+        if self.flow_id == 0 {
+            println!("packet produced at TCP source at time {}", now);
+        }
         (packet, Duration::default())
     }
 }

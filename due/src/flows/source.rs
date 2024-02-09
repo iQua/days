@@ -147,7 +147,9 @@ impl PacketSource {
 
                     let (new_packet, interval) =
                         source.app_packet_source.app_source.produce_packet(now);
-
+                    if new_packet.flow_id == 0 {
+                        println!("Flow id = 0, app packet arrived at {:.4}", now);
+                    }
                     // lets TCPPacketSource retrieve this packet
                     source.send_buffer += packet.size;
 
@@ -158,6 +160,12 @@ impl PacketSource {
                             .schedule_event(interval, Self::app_packet_arrive, new_packet)
                             .unwrap();
                     } else {
+                        if source.flow_id == 0 {
+                            println!(
+                                "flow id = {}, packet exceeded, {} sent, now = {}.",
+                                source.flow_id, source.packets_sent, now
+                            );
+                        }
                         source.traffic_exceeded = true;
                     }
 
@@ -165,6 +173,9 @@ impl PacketSource {
                         // the TCPPacketSource could send new packet at this
                         // point, if the size of the congestion window
                         // allows
+                        if source.flow_id == 0 {
+                            println!("TCPPacketSource is available at {}.", now);
+                        }
                         self.run((), scheduler).await;
                     } else {
                         // the TCPPacketSource is considered busy retrieving
@@ -271,6 +282,12 @@ impl PacketSource {
                 .as_secs_f64();
 
             while self.should_produce_packet(now) {
+                if self.flow_id() == 0 {
+                    println!(
+                        "Before calling produce_packet in tcp source at time {}.",
+                        now
+                    );
+                }
                 let (packet, interval) = self.produce_packet(now);
                 if interval == Duration::default() {
                     // sends the packet now if interval is 0
