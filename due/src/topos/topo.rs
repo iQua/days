@@ -40,7 +40,6 @@ pub struct SwitchConfig {
     weights: Option<Vec<usize>>,
     priorities: Option<HashMap<usize, usize>>,
     vticks: Option<HashMap<usize, usize>>,
-    mailbox_capacity: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -151,9 +150,8 @@ impl Topology {
 
     // Initializes mailboxes for switches.
     fn init_mailboxes(&mut self) {
-        let mailbox_capacity = self.switch_config.mailbox_capacity.unwrap_or(16);
         for (_, switch) in self.switches.iter() {
-            let switch_mbox: Mailbox<PacketSwitch> = Mailbox::with_capacity(mailbox_capacity);
+            let switch_mbox: Mailbox<PacketSwitch> = Mailbox::new();
             self.switch_mailboxes.insert(switch.id(), switch_mbox);
         }
     }

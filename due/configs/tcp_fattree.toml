@@ -14,7 +14,6 @@ capacity = 1000
 weights = [1]
 discipline = "WFQ"
 drop = "RED"
-mailbox_capacity = 100
 
 [[flow_set]]
 flow_type = "TCP"
