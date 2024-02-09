@@ -145,6 +145,11 @@ impl PacketSource {
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
 
+                    source
+                        .app_packet_source
+                        .app_source
+                        .packet_sent(&packet, now);
+
                     let (new_packet, interval) =
                         source.app_packet_source.app_source.produce_packet(now);
 

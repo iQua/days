@@ -277,7 +277,6 @@ impl TCPPacketSource {
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
-        self.app_packet_source.app_source.packet_sent(packet, now);
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
