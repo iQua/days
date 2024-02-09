@@ -99,7 +99,7 @@ pub struct TCPPacketSource {
     /// until this time
     pub busy_until: f64,
 
-    pub packets_sent: usize,
+    packets_sent: usize,
 
     pub output: Output<Packet>,
 }

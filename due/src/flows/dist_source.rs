@@ -19,8 +19,8 @@ pub struct DistPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub traffic: TrafficCharacteristics,
-    pub packets_sent: usize,
-    pub sent_size: usize,
+    packets_sent: usize,
+    sent_size: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,

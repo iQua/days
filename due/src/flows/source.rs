@@ -120,13 +120,13 @@ impl PacketSource {
 
                 scheduler
                     .schedule_event(
-                        interval + Duration::from_secs_f64(initial_delay),
+                        Duration::from_secs_f64(initial_delay) + interval,
                         Self::app_packet_arrive,
                         packet,
                     )
                     .unwrap();
 
-                source.busy_until = interval.as_secs_f64() + initial_delay;
+                source.busy_until = initial_delay + interval.as_secs_f64();
             }
         }
     }
