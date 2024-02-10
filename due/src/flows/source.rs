@@ -113,27 +113,24 @@ impl PacketSource {
 
                 // schedules an application packet source to send packets to
                 // TCPPacketSource
-                let (packet, interval) = source
-                    .app_packet_source
-                    .app_source
-                    .produce_packet(initial_delay);
+                let (packet, interval) = source.datasource.produce_packet(initial_delay);
 
                 scheduler
                     .schedule_event(
-                        interval + Duration::from_secs_f64(initial_delay),
-                        Self::app_packet_arrive,
+                        Duration::from_secs_f64(initial_delay) + interval,
+                        Self::fetch_app_data,
                         packet,
                     )
                     .unwrap();
 
-                source.busy_until = interval.as_secs_f64() + initial_delay;
+                source.busy_until = initial_delay + interval.as_secs_f64();
             }
         }
     }
 
-    fn app_packet_arrive<'a>(
+    fn fetch_app_data<'a>(
         &'a mut self,
-        packet: Packet,
+        _packet: Packet,
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
@@ -145,17 +142,16 @@ impl PacketSource {
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
 
-                    let (new_packet, interval) =
-                        source.app_packet_source.app_source.produce_packet(now);
+                    let (data, interval) = source.datasource.produce_packet(now);
 
-                    // lets TCPPacketSource retrieve this packet
-                    source.send_buffer += packet.size;
+                    // TCPPacketSource now owns the data from the application
+                    source.send_buffer += data.size;
 
-                    if !source.app_packet_source.app_source.traffic_exceeded(now) {
+                    if !source.datasource.traffic_exceeded(now) {
                         // schedules the next packet from the
-                        // (application-layer) flow
+                        // application layer
                         scheduler
-                            .schedule_event(interval, Self::app_packet_arrive, new_packet)
+                            .schedule_event(interval, Self::fetch_app_data, data)
                             .unwrap();
                     } else {
                         source.traffic_exceeded = true;

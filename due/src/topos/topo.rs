@@ -72,6 +72,11 @@ pub struct Config {
     pub topology: Option<TopoConfig>,
 }
 
+#[derive(Deserialize)]
+struct MailboxConfig {
+    mailbox_capacity: Option<usize>,
+}
+
 #[derive(Default)]
 struct SinkStatistics {
     /// a vector of sink ids
@@ -92,7 +97,7 @@ impl SinkStatistics {
 
             let mut sink_statistics = self.sink_statistics.remove(sink_id).unwrap();
             if let Some(statistics) = sink_statistics.take() {
-                info!("{:#.3}", statistics);
+                debug!("{:#.3}", statistics);
             }
         }
 
@@ -117,6 +122,8 @@ pub struct Topology {
     collectives: Vec<Collective>,
     /// configuration of packet switches in the topology
     switch_config: SwitchConfig,
+    /// the capacity of every mailbox
+    mailbox_capacity: usize,
 }
 
 impl Topology {
@@ -133,6 +140,15 @@ impl Topology {
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
 
+        let mailbox_config: MailboxConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of mailbox capacity");
+        // uses 16 as the default value and limits the maximial capacity to
+        // usize::MAX/2 + 1 as it is designed in asynchronix
+        let mailbox_capacity = mailbox_config
+            .mailbox_capacity
+            .unwrap_or(16)
+            .min(usize::MAX / 2 + 1);
+
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
@@ -145,13 +161,14 @@ impl Topology {
             collectives,
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
+            mailbox_capacity,
         }
     }
 
     // Initializes mailboxes for switches.
     fn init_mailboxes(&mut self) {
         for (_, switch) in self.switches.iter() {
-            let switch_mbox: Mailbox<PacketSwitch> = Mailbox::new();
+            let switch_mbox: Mailbox<PacketSwitch> = Mailbox::with_capacity(self.mailbox_capacity);
             self.switch_mailboxes.insert(switch.id(), switch_mbox);
         }
     }
@@ -274,7 +291,7 @@ impl Topology {
                     weights.clone(),
                 );
                 let mut output = Output::default();
-                let drr_mbox: Mailbox<DRRServer> = Mailbox::new();
+                let drr_mbox: Mailbox<DRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(DRRServer::packet_received, &drr_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
 
@@ -294,7 +311,7 @@ impl Topology {
                     self.switch_config.drop,
                 );
                 let mut output = Output::default();
-                let port_mbox: Mailbox<Port> = Mailbox::new();
+                let port_mbox: Mailbox<Port> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(Port::packet_received, &port_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
 
@@ -318,7 +335,7 @@ impl Topology {
                 );
 
                 let mut output = Output::default();
-                let sp_mbox: Mailbox<SPServer> = Mailbox::new();
+                let sp_mbox: Mailbox<SPServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(SPServer::packet_received, &sp_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
 
@@ -343,7 +360,8 @@ impl Topology {
                 );
 
                 let mut output = Output::default();
-                let virtual_clock_mbox: Mailbox<VirtualClockServer> = Mailbox::new();
+                let virtual_clock_mbox: Mailbox<VirtualClockServer> =
+                    Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(VirtualClockServer::packet_received, &virtual_clock_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
 
@@ -370,7 +388,7 @@ impl Topology {
                 );
 
                 let mut output = Output::default();
-                let wfq_mbox: Mailbox<WFQServer> = Mailbox::new();
+                let wfq_mbox: Mailbox<WFQServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(WFQServer::packet_received, &wfq_mbox);
                 upstream_switch.outputs.insert(downstream_id, output);
 
@@ -419,7 +437,7 @@ impl Topology {
             let host_mbox = self.switch_mailboxes.get(&flow.source_host).unwrap();
 
             // establishes a bi-directional connection between the packet source and the host
-            let source_mbox: Mailbox<PacketSource> = Mailbox::new();
+            let source_mbox: Mailbox<PacketSource> = Mailbox::with_capacity(self.mailbox_capacity);
             source
                 .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
@@ -437,7 +455,7 @@ impl Topology {
 
             // establishes a bi-directional connection between the packet sink
             // and the host
-            let sink_mbox: Mailbox<PacketSink> = Mailbox::new();
+            let sink_mbox: Mailbox<PacketSink> = Mailbox::with_capacity(self.mailbox_capacity);
 
             // records the sink ids, sink mailbox's address and sink statistics
             // event slot for the retrieval of packet statistics after the

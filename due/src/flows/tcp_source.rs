@@ -12,8 +12,8 @@ use rand::rngs::SmallRng;
 
 use asynchronix::model::{Model, Output};
 
+use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
-use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
@@ -48,22 +48,6 @@ impl Ord for PacketTimeout {
 
 impl Eq for PacketTimeout {}
 
-/// An application packet source.
-pub struct AppPacketSource {
-    // currently implements the application packet source as a
-    // distribution-based packet source, but it can be implemented as any type
-    // of source later
-    pub app_source: DistPacketSource,
-}
-
-impl AppPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> AppPacketSource {
-        AppPacketSource {
-            app_source: DistPacketSource::new(flow_id, traffic, rng),
-        }
-    }
-}
-
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
@@ -93,7 +77,7 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub app_packet_source: AppPacketSource,
+    pub datasource: AppDataSource,
 
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
@@ -138,7 +122,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            app_packet_source: AppPacketSource::new(flow_id, traffic, rng.clone()),
+            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             output: Output::default(),
