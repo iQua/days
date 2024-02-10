@@ -97,7 +97,7 @@ impl SinkStatistics {
 
             let mut sink_statistics = self.sink_statistics.remove(sink_id).unwrap();
             if let Some(statistics) = sink_statistics.take() {
-                info!("{:#.3}", statistics);
+                debug!("{:#.3}", statistics);
             }
         }
 
