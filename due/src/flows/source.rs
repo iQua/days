@@ -111,15 +111,14 @@ impl PacketSource {
                     )
                     .unwrap();
 
-                // schedules an application packet source to send packets to
-                // TCPPacketSource
-                let (packet, interval) = source.datasource.produce_packet(initial_delay);
+                // schedules AppDataSource to send data to TCPPacketSource
+                let (data, interval) = source.datasource.produce_data(initial_delay);
 
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(initial_delay) + interval,
                         Self::fetch_app_data,
-                        packet,
+                        data,
                     )
                     .unwrap();
 
@@ -130,7 +129,7 @@ impl PacketSource {
 
     fn fetch_app_data<'a>(
         &'a mut self,
-        _packet: Packet,
+        data: Packet,
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
@@ -142,16 +141,19 @@ impl PacketSource {
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
 
-                    let (data, interval) = source.datasource.produce_packet(now);
+                    // AppDataSource sends data at this point, update statistics
+                    // about its traffic production
+                    source.datasource.data_sent(&data, now);
 
                     // TCPPacketSource now owns the data from the application
                     source.send_buffer += data.size;
 
+                    let (new_data, interval) = source.datasource.produce_data(now);
+
                     if !source.datasource.traffic_exceeded(now) {
-                        // schedules the next packet from the
-                        // application layer
+                        // schedules AppDataSource to send next data
                         scheduler
-                            .schedule_event(interval, Self::fetch_app_data, data)
+                            .schedule_event(interval, Self::fetch_app_data, new_data)
                             .unwrap();
                     } else {
                         source.traffic_exceeded = true;
