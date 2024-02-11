@@ -80,10 +80,19 @@ impl DistPacketSource {
             }
         };
 
-        let mut packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
-        packet.time += interval;
+        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
 
         (packet, Duration::from_secs_f64(interval))
+    }
+
+    pub async fn send_packet(&mut self, now: f64) -> Duration {
+        let (packet, interval) = self.produce_packet(now);
+
+        self.output.send(packet.clone()).await;
+
+        self.packet_sent(&packet, now);
+
+        interval
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {

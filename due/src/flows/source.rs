@@ -111,26 +111,28 @@ impl PacketSource {
                     )
                     .unwrap();
 
-                // schedules an application packet source to send packets to
-                // TCPPacketSource
-                let (packet, interval) = source.datasource.produce_packet(initial_delay);
+                // lets AppDataSource to send data to TCPPacketSource
+                let (data, interval) = source.datasource.produce_data(initial_delay);
 
+                // TCPPacketSource now owns the data from the application
+                source.send_buffer += data.size;
+                source.busy_until = initial_delay;
+
+                // schedules AppDataSource to send next data
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(initial_delay) + interval,
                         Self::fetch_app_data,
-                        packet,
+                        (),
                     )
                     .unwrap();
-
-                source.busy_until = initial_delay + interval.as_secs_f64();
             }
         }
     }
 
     fn fetch_app_data<'a>(
         &'a mut self,
-        _packet: Packet,
+        _: (),
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
@@ -142,23 +144,22 @@ impl PacketSource {
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
 
-                    let (data, interval) = source.datasource.produce_packet(now);
+                    let (data, interval) = source.datasource.produce_data(now);
 
                     // TCPPacketSource now owns the data from the application
                     source.send_buffer += data.size;
 
                     if !source.datasource.traffic_exceeded(now) {
-                        // schedules the next packet from the
-                        // application layer
+                        // schedules AppDataSource to send next data
                         scheduler
-                            .schedule_event(interval, Self::fetch_app_data, data)
+                            .schedule_event(interval, Self::fetch_app_data, ())
                             .unwrap();
                     } else {
                         source.traffic_exceeded = true;
                     }
 
                     if source.next_seq < source.send_buffer {
-                        // the TCPPacketSource could send new packet at this
+                        // the TCPPacketSource could send a new packet at this
                         // point, if the size of the congestion window
                         // allows
                         self.run((), scheduler).await;
@@ -169,22 +170,6 @@ impl PacketSource {
                     }
                 }
             }
-        }
-    }
-
-    /// Returns whether PacketSource should produce a new packet at this point.
-    fn should_produce_packet(&mut self, now: f64) -> bool {
-        match self {
-            PacketSource::DistPacketSource(source) => !source.traffic_exceeded(now),
-            PacketSource::TCPPacketSource(source) => source.should_produce_packet(),
-        }
-    }
-
-    /// Returns a new packet and when to send out this packet.
-    fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        match self {
-            PacketSource::DistPacketSource(source) => source.produce_packet(now),
-            PacketSource::TCPPacketSource(source) => source.produce_packet(now),
         }
     }
 
@@ -217,31 +202,20 @@ impl PacketSource {
         }
     }
 
-    async fn send_packet(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        self.output().send(packet.clone()).await;
-
+    async fn send_packet(&mut self, scheduler: &Scheduler<Self>) {
         let now = scheduler
             .time()
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
         match self {
-            PacketSource::DistPacketSource(source) => source.packet_sent(&packet, now),
-            PacketSource::TCPPacketSource(source) => {
-                source.packet_sent(&packet, now);
+            PacketSource::DistPacketSource(source) => {
+                let interval = source.send_packet(now).await;
+                if !source.traffic_exceeded(now) {
+                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                }
             }
-        }
-    }
-
-    /// Returns whether PacketSource should return from the current while loop.
-    fn wrap_up(&mut self, now: f64, scheduler: &Scheduler<Self>) -> bool {
-        match self {
-            PacketSource::DistPacketSource(_) => {
-                let (_, interval) = self.produce_packet(now);
-                scheduler.schedule_event(interval, Self::run, ()).unwrap();
-                true
-            }
-            PacketSource::TCPPacketSource(_) => false,
+            PacketSource::TCPPacketSource(source) => source.send_packet(now).await,
         }
     }
 
@@ -250,7 +224,9 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
-                source.traffic_exceeded && source.next_seq + source.mss > source.send_buffer
+                source.traffic_exceeded
+                    && source.next_seq + source.mss > source.send_buffer
+                    && source.next_seq == source.last_ack
             }
         }
     }
@@ -266,23 +242,7 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            while self.should_produce_packet(now) {
-                let (packet, interval) = self.produce_packet(now);
-                if interval == Duration::default() {
-                    // sends the packet now if interval is 0
-                    self.send_packet(packet, scheduler).await;
-                } else {
-                    // schedules an event to send the packet if interval is more
-                    // than 0
-                    scheduler
-                        .schedule_event(interval, Self::send_packet, packet)
-                        .unwrap();
-                }
-
-                if self.wrap_up(now, scheduler) {
-                    return;
-                }
-            }
+            self.send_packet(scheduler).await;
 
             if self.stop_run(now) {
                 debug!("{} finished running at {:.3}.", format!("{self}"), now);
@@ -314,6 +274,8 @@ impl Model for PacketSource {
         Box::pin(async move {
             let initial_delay = self.advance_initial_delay();
 
+            self.prepare_run(initial_delay, scheduler);
+
             if initial_delay > 0.0 {
                 scheduler
                     .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
@@ -321,8 +283,6 @@ impl Model for PacketSource {
             } else {
                 self.run((), scheduler).await;
             }
-
-            self.prepare_run(initial_delay, scheduler);
 
             self.into()
         })
