@@ -15,6 +15,8 @@ edition = "2021"
 [dependencies]
 asynchronix = "0.2.0"
 env_logger = "0.10"
+indicatif = "0.17.7"
+indicatif-log-bridge = "0.2.2"
 log = "0.4"
 petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
