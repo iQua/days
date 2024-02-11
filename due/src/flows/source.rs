@@ -141,7 +141,7 @@ impl PacketSource {
                         .duration_since(MonotonicTime::EPOCH)
                         .as_secs_f64();
 
-                    // AppDataSource sends data at this point, update statistics
+                    // AppDataSource sends data at this point, updates statistics
                     // about its traffic production
                     source.datasource.data_sent(&data, now);
 
