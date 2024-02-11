@@ -29,11 +29,9 @@ impl AppDataSource {
     }
 
     pub fn produce_data(&mut self, now: f64) -> (Packet, Duration) {
-        let (packet, duration) = match self {
+        match self {
             AppDataSource::DistDataSource(source) => source.produce_packet(now),
-        };
-
-        (packet, duration)
+        }
     }
 
     pub fn data_sent(&mut self, packet: &Packet, now: f64) {
