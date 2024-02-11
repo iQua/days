@@ -159,7 +159,7 @@ impl PacketSource {
                     }
 
                     if source.next_seq < source.send_buffer {
-                        // the TCPPacketSource could send new packet at this
+                        // the TCPPacketSource could send a new packet at this
                         // point, if the size of the congestion window
                         // allows
                         self.run((), scheduler).await;
