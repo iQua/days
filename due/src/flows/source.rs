@@ -202,20 +202,7 @@ impl PacketSource {
         }
     }
 
-    async fn send_packet(&mut self, scheduler: &Scheduler<Self>) -> Duration {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
-
-        match self {
-            PacketSource::DistPacketSource(source) => source.send_packet(now).await,
-            PacketSource::TCPPacketSource(source) => source.send_packet(now).await,
-        }
-    }
-
-    /// Returns whether PacketSource should return from the current while loop.
-    fn wrap_up(&mut self, interval: Duration, scheduler: &Scheduler<Self>) {
+    async fn send_packet(&mut self, scheduler: &Scheduler<Self>) {
         let now = scheduler
             .time()
             .duration_since(MonotonicTime::EPOCH)
@@ -223,11 +210,12 @@ impl PacketSource {
 
         match self {
             PacketSource::DistPacketSource(source) => {
+                let interval = source.send_packet(now).await;
                 if !source.traffic_exceeded(now) {
                     scheduler.schedule_event(interval, Self::run, ()).unwrap();
                 }
             }
-            PacketSource::TCPPacketSource(_) => {}
+            PacketSource::TCPPacketSource(source) => source.send_packet(now).await,
         }
     }
 
@@ -236,7 +224,9 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
-                source.traffic_exceeded && source.next_seq + source.mss > source.send_buffer
+                source.traffic_exceeded
+                    && source.next_seq + source.mss > source.send_buffer
+                    && source.next_seq == source.last_ack
             }
         }
     }
@@ -252,8 +242,7 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            let interval = self.send_packet(scheduler).await;
-            self.wrap_up(interval, scheduler);
+            self.send_packet(scheduler).await;
 
             if self.stop_run(now) {
                 debug!("{} finished running at {:.3}.", format!("{self}"), now);

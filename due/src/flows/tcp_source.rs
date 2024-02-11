@@ -5,7 +5,6 @@ use core::fmt;
 use std::cmp::min;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::time::Duration;
 
 use log::debug;
 use rand::rngs::SmallRng;
@@ -62,7 +61,7 @@ pub struct TCPPacketSource {
     /// the maximum sequence number in the in-transit data buffer
     pub send_buffer: usize,
     /// the sequence number of the segment that is last acknowledged
-    last_ack: usize,
+    pub last_ack: usize,
     /// the count of duplicate acknolwedgments
     dupack: usize,
     /// deviation of the RTT
@@ -339,7 +338,7 @@ impl TCPPacketSource {
         }
     }
 
-    pub async fn send_packet(&mut self, now: f64) -> Duration {
+    pub async fn send_packet(&mut self, now: f64) {
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
             && self.next_seq + self.mss
@@ -352,8 +351,6 @@ impl TCPPacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);
         }
-
-        Duration::default()
     }
 }
 
