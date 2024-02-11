@@ -184,8 +184,7 @@ impl TCPPacketSource {
                         self.endpoint_id, self.next_seq, self.mss, now,
                     );
 
-                    let (packet, _) = self.produce_packet(now);
-
+                    let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
                     self.output.send(packet.clone()).await;
                     self.packet_sent(&packet, now);
                 }
@@ -340,20 +339,21 @@ impl TCPPacketSource {
         }
     }
 
-    pub fn should_produce_packet(&mut self) -> bool {
+    pub async fn send_packet(&mut self, now: f64) -> Duration {
         // the sender can transmit up to the size of the congestion window
-        self.next_seq + self.mss
-            <= min(
-                self.send_buffer,
-                self.last_ack + self.congestion_control.get_cwnd(),
-            )
-            && self.next_seq < self.send_buffer
-    }
+        while self.next_seq < self.send_buffer
+            && self.next_seq + self.mss
+                <= min(
+                    self.send_buffer,
+                    self.last_ack + self.congestion_control.get_cwnd(),
+                )
+        {
+            let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+            self.output.send(packet.clone()).await;
+            self.packet_sent(&packet, now);
+        }
 
-    pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
-        let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
-
-        (packet, Duration::default())
+        Duration::default()
     }
 }
 
