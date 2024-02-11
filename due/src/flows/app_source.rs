@@ -30,15 +30,16 @@ impl AppDataSource {
     }
 
     pub fn produce_data(&mut self, now: f64) -> (Packet, Duration) {
-        match self {
+        let (packet, duration) = match self {
             AppDataSource::DistDataSource(source) => source.produce_packet(now),
-        }
-    }
+        };
 
-    pub fn data_sent(&mut self, packet: &Packet, now: f64) {
+        // the packet has just been produced, update statistics about traffic production
         match self {
-            AppDataSource::DistDataSource(source) => source.packet_sent(packet, now),
-        }
+            AppDataSource::DistDataSource(source) => source.packet_sent(&packet, now),
+        };
+
+        (packet, duration)
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
