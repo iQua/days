@@ -38,7 +38,6 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 struct SimProgress {
     progress_bar: ProgressBar,
     progress_interval: f64,
-    multi_progress: MultiProgress,
 }
 
 impl SimProgress {
@@ -61,7 +60,6 @@ impl SimProgress {
         SimProgress {
             progress_bar: pg,
             progress_interval,
-            multi_progress: multi,
         }
     }
 
@@ -71,19 +69,14 @@ impl SimProgress {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            if self.progress_bar.position() >= 1500 {
-                self.progress_bar.finish();
-                self.multi_progress.remove(&self.progress_bar);
-            } else {
-                self.progress_bar.inc(self.progress_interval as u64);
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(self.progress_interval),
-                        Self::run,
-                        (),
-                    )
-                    .unwrap();
-            }
+            self.progress_bar.inc(self.progress_interval as u64);
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.progress_interval),
+                    Self::run,
+                    (),
+                )
+                .unwrap();
         }
     }
 }
