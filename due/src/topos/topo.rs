@@ -47,7 +47,7 @@ impl SimProgress {
 
         LogWrapper::new(multi.clone(), logger);
 
-        let progress_bar = ProgressBar::new(100);
+        let progress_bar = ProgressBar::new(1500);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
