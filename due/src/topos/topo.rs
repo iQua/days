@@ -37,11 +37,11 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 
 struct Progress {
     progress_bar: ProgressBar,
-    progress_interval: f64,
+    progress_interval: u64,
 }
 
 impl Progress {
-    fn new(progress_interval: f64) -> Progress {
+    fn new(progress_interval: u64) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
@@ -64,13 +64,13 @@ impl Progress {
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        self.progress_bar.inc(self.progress_interval as u64);
+        self.progress_bar.inc(self.progress_interval);
         if self.progress_bar.position() >= 1500 {
             self.progress_bar.finish_and_clear();
         } else {
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(self.progress_interval),
+                    Duration::from_secs_f64(self.progress_interval as f64),
                     Self::run,
                     (),
                 )
@@ -93,7 +93,7 @@ impl Model for Progress {
 
 #[derive(Deserialize)]
 struct ProgressConfig {
-    progress: Option<f64>,
+    progress: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -190,7 +190,7 @@ pub struct Topology {
     /// the capacity of every mailbox
     mailbox_capacity: usize,
     /// The interval of updating the progress bar
-    progress: f64,
+    progress: u64,
 }
 
 impl Topology {
@@ -221,7 +221,7 @@ impl Topology {
 
         let pb_config: ProgressConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of progress bar");
-        let progress = pb_config.progress.unwrap_or(1.0);
+        let progress = pb_config.progress.unwrap_or(1);
 
         Topology {
             sim_init: SimInit::new(),
