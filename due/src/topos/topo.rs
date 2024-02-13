@@ -63,24 +63,18 @@ impl SimProgress {
         }
     }
 
-    pub fn run<'a>(
-        &'a mut self,
-        _: (),
-        scheduler: &'a Scheduler<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            self.progress_bar.inc(self.progress_interval as u64);
-            if self.progress_bar.position() >= 1500 {
-                self.progress_bar.finish_and_clear();
-            } else {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(self.progress_interval),
-                        Self::run,
-                        (),
-                    )
-                    .unwrap();
-            }
+    fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
+        self.progress_bar.inc(self.progress_interval as u64);
+        if self.progress_bar.position() >= 1500 {
+            self.progress_bar.finish_and_clear();
+        } else {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.progress_interval),
+                    Self::run,
+                    (),
+                )
+                .unwrap();
         }
     }
 }
@@ -91,7 +85,7 @@ impl Model for SimProgress {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            self.run((), scheduler).await;
+            self.run((), scheduler);
             self.into()
         })
     }
