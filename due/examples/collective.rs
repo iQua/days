@@ -8,14 +8,14 @@ use due::topos::build::build_graph;
 use due::topos::topo::Topology;
 
 fn main() {
-    let env = env_logger::Env::default();
+    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     let file_path = "configs/collective.toml";
     let _ = seed_from_config(&file_path);
 
     let (graph, hosts) = build_graph(file_path);
-    info!("The network graph has been initialized: {:?}", graph);
+    info!("The network graph has been initialized.");
 
     let collectives = Collective::collectives_from_config(file_path);
 

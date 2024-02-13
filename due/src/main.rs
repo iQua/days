@@ -12,7 +12,7 @@ use due::topos::build::build_graph;
 use due::topos::topo::Topology;
 
 fn main() {
-    let env = env_logger::Env::default();
+    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     let args: Vec<String> = env::args().collect();
@@ -36,7 +36,7 @@ fn main() {
     //    let hosts = vec![0, 1];
 
     let (graph, hosts) = build_graph(file_path);
-    info!("The network graph has been initialized: {:?}", graph);
+    info!("The network graph has been initialized.");
 
     // There are two ways of initializing the flows:
 

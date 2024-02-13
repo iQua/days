@@ -13,7 +13,7 @@ use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
 
 fn main() {
-    let env = env_logger::Env::default();
+    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     // instantiates models and their mailboxes
