@@ -70,13 +70,17 @@ impl SimProgress {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             self.progress_bar.inc(self.progress_interval as u64);
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(self.progress_interval),
-                    Self::run,
-                    (),
-                )
-                .unwrap();
+            if self.progress_bar.position() >= 1500 {
+                self.progress_bar.finish_and_clear();
+            } else {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(self.progress_interval),
+                        Self::run,
+                        (),
+                    )
+                    .unwrap();
+            }
         }
     }
 }
@@ -593,9 +597,9 @@ impl Topology {
     /// Creates and activates a progress bar to illustrate the progress of the
     /// simulation run.
     fn activate_progress_bar(mut self) -> Self {
-        let progress_bar = SimProgress::new(self.progress);
+        let progress = SimProgress::new(self.progress);
         let progress_mbox: Mailbox<SimProgress> = Mailbox::with_capacity(self.mailbox_capacity);
-        self.sim_init = self.sim_init.add_model(progress_bar, progress_mbox);
+        self.sim_init = self.sim_init.add_model(progress, progress_mbox);
 
         self
     }
