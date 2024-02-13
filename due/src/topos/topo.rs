@@ -35,13 +35,13 @@ use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::{next_flow_id, num_switches, set_num_switches};
 
-struct SimProgress {
+struct Progress {
     progress_bar: ProgressBar,
     progress_interval: f64,
 }
 
-impl SimProgress {
-    fn new(progress_interval: f64) -> SimProgress {
+impl Progress {
+    fn new(progress_interval: f64) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
@@ -57,7 +57,7 @@ impl SimProgress {
 
         let pg = multi.add(progress_bar);
 
-        SimProgress {
+        Progress {
             progress_bar: pg,
             progress_interval,
         }
@@ -79,7 +79,7 @@ impl SimProgress {
     }
 }
 
-impl Model for SimProgress {
+impl Model for Progress {
     fn init(
         mut self,
         scheduler: &Scheduler<Self>,
@@ -591,8 +591,8 @@ impl Topology {
     /// Creates and activates a progress bar to illustrate the progress of the
     /// simulation run.
     fn activate_progress_bar(mut self) -> Self {
-        let progress = SimProgress::new(self.progress);
-        let progress_mbox: Mailbox<SimProgress> = Mailbox::with_capacity(self.mailbox_capacity);
+        let progress = Progress::new(self.progress);
+        let progress_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
         self.sim_init = self.sim_init.add_model(progress, progress_mbox);
 
         self
