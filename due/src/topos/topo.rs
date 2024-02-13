@@ -6,16 +6,20 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif_log_bridge::LogWrapper;
 use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
-use asynchronix::model::Output;
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
-use asynchronix::time::MonotonicTime;
+use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
@@ -30,6 +34,67 @@ use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::{next_flow_id, num_switches, set_num_switches};
+
+struct Progress {
+    progress_bar: ProgressBar,
+    progress_interval: f64,
+}
+
+impl Progress {
+    fn new(progress_interval: f64) -> Progress {
+        let multi = MultiProgress::new();
+        let logger = env_logger::Builder::from_default_env().build();
+
+        LogWrapper::new(multi.clone(), logger);
+
+        let progress_bar = ProgressBar::new(1500);
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
+            )
+            .unwrap(),
+        );
+
+        let pg = multi.add(progress_bar);
+
+        Progress {
+            progress_bar: pg,
+            progress_interval,
+        }
+    }
+
+    fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
+        self.progress_bar.inc(self.progress_interval as u64);
+        if self.progress_bar.position() >= 1500 {
+            self.progress_bar.finish_and_clear();
+        } else {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.progress_interval),
+                    Self::run,
+                    (),
+                )
+                .unwrap();
+        }
+    }
+}
+
+impl Model for Progress {
+    fn init(
+        mut self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            self.run((), scheduler);
+            self.into()
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ProgressConfig {
+    progress: Option<f64>,
+}
 
 #[derive(Deserialize)]
 pub struct SwitchConfig {
@@ -124,6 +189,8 @@ pub struct Topology {
     switch_config: SwitchConfig,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
+    /// The interval of updating the progress bar
+    progress: f64,
 }
 
 impl Topology {
@@ -152,6 +219,10 @@ impl Topology {
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
+        let pb_config: ProgressConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of progress bar");
+        let progress = pb_config.progress.unwrap_or(1.0);
+
         Topology {
             sim_init: SimInit::new(),
             graph: graph.clone(),
@@ -162,6 +233,7 @@ impl Topology {
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
             mailbox_capacity,
+            progress,
         }
     }
 
@@ -509,6 +581,21 @@ impl Topology {
                 }
             }
         }
+
+        info!(
+            "Routing decisions for all {} flows have been finalized.",
+            self.flows.len()
+        );
+    }
+
+    /// Creates and activates a progress bar to illustrate the progress of the
+    /// simulation run.
+    fn activate_progress_bar(mut self) -> Self {
+        let progress = Progress::new(self.progress);
+        let progress_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
+        self.sim_init = self.sim_init.add_model(progress, progress_mbox);
+
+        self
     }
 
     /// Activates all the switches and initializes the simulation.
@@ -543,6 +630,9 @@ impl Topology {
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
+
+        // creates and activates a progress bar
+        self = self.activate_progress_bar();
 
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();

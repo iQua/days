@@ -2,6 +2,7 @@
 
 seed = 100
 mailbox_capacity = 100
+progress = 2.0
 
 [topology]
 category = "FatTree"
