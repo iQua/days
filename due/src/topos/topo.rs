@@ -35,6 +35,7 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 #[derive(Deserialize)]
 struct ProgressConfig {
     progress: Option<u64>,
+    duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -130,8 +131,10 @@ pub struct Topology {
     switch_config: SwitchConfig,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
-    /// The interval of updating the progress bar
+    /// the interval of updating the progress bar
     progress: u64,
+    /// the duration of the simulation run
+    duration: u64,
 }
 
 impl Topology {
@@ -163,6 +166,7 @@ impl Topology {
         let pb_config: ProgressConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of progress bar");
         let progress = pb_config.progress.unwrap_or(1);
+        let duration = pb_config.duration.unwrap_or(1500);
 
         Topology {
             sim_init: SimInit::new(),
@@ -175,6 +179,7 @@ impl Topology {
             switch_config: config.switch,
             mailbox_capacity,
             progress,
+            duration,
         }
     }
 
@@ -532,7 +537,7 @@ impl Topology {
     /// Creates and activates a progress bar to illustrate the progress of the
     /// simulation run.
     fn activate_progress_bar(mut self) -> Self {
-        let progress = Progress::new(self.progress);
+        let progress = Progress::new(self.progress, self.duration);
         let progress_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
         self.sim_init = self.sim_init.add_model(progress, progress_mbox);
 
@@ -575,11 +580,13 @@ impl Topology {
         // creates and activates a progress bar
         self = self.activate_progress_bar();
 
+        let duration = self.duration;
+
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_by(Duration::from_secs(1500));
+        sim.step_by(Duration::from_secs(duration));
         sim = statistics.collect_statistics(sim);
 
         info!(

@@ -16,16 +16,17 @@ use asynchronix::time::Scheduler;
 pub struct Progress {
     progress_bar: ProgressBar,
     progress_interval: u64,
+    duration: u64,
 }
 
 impl Progress {
-    pub fn new(progress_interval: u64) -> Progress {
+    pub fn new(progress_interval: u64, duration: u64) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
         LogWrapper::new(multi.clone(), logger);
 
-        let progress_bar = ProgressBar::new(1500);
+        let progress_bar = ProgressBar::new(duration);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
@@ -38,12 +39,13 @@ impl Progress {
         Progress {
             progress_bar: pg,
             progress_interval,
+            duration,
         }
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
         self.progress_bar.inc(self.progress_interval);
-        if self.progress_bar.position() >= 1500 {
+        if self.progress_bar.position() >= self.duration {
             self.progress_bar.finish_and_clear();
         } else {
             scheduler
