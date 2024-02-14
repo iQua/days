@@ -165,7 +165,7 @@ impl Topology {
 
         let pb_config: ProgressConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let duration = pb_config.duration.unwrap_or(1500.);
+        let duration = pb_config.duration.unwrap_or(1.);
         let progress = pb_config.progress.unwrap_or(duration / 100.);
 
         Topology {
