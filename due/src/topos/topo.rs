@@ -586,13 +586,13 @@ impl Topology {
         // creates and activates a progress coroutine
         self = self.activate_progress(report_mbox);
 
-        let _duration = self.duration;
+        let duration = self.duration;
 
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 
         // starts the simulation
-        let _ = sim.step_until(MonotonicTime::EPOCH + Duration::from_secs_f64(_duration));
+        let _ = sim.step_until(MonotonicTime::EPOCH + Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
         info!(
