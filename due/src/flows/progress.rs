@@ -12,7 +12,7 @@ use indicatif_log_bridge::LogWrapper;
 use log::debug;
 
 use asynchronix::model::{InitializedModel, Model};
-use asynchronix::time::Scheduler;
+use asynchronix::time::{MonotonicTime, Scheduler};
 
 pub struct Progress {
     progress_bar: ProgressBar,
@@ -56,7 +56,7 @@ impl Progress {
         }
     }
 
-    pub fn report_received(&mut self, report: Report) {
+    pub fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
         debug!("Progress received report from {}", report.name);
         if report.finished {
             self.finished_sources += 1;
@@ -65,14 +65,35 @@ impl Progress {
                 self.finished_sources, self.num_sources
             );
             if self.finished_sources == self.num_sources {
-                //self.progress_bar.finish_and_clear();
                 self.finished = true;
+
+                self.progress_bar.inc(
+                    (self.duration / self.progress_interval) as u64 - self.progress_bar.position(),
+                );
+
+                let now = scheduler
+                    .time()
+                    .duration_since(MonotonicTime::EPOCH)
+                    .as_secs_f64();
+
+                scheduler
+                    .schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
+                    .unwrap();
             }
         }
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        if true {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+
+        if self.finished {
+            if now == self.duration {
+                self.progress_bar.finish_and_clear();
+            }
+        } else {
             self.progress_bar.inc(1);
             if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
                 self.progress_bar.finish_and_clear();
