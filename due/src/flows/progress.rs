@@ -61,17 +61,11 @@ impl Progress {
 
 impl Model for Progress {
     fn init(
-        self,
+        mut self,
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(self.progress_interval),
-                    Self::run,
-                    (),
-                )
-                .unwrap();
+            self.run((), scheduler);
             self.into()
         })
     }
