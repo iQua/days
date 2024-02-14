@@ -592,7 +592,7 @@ impl Topology {
         let mut sim = self.init_sim();
 
         // starts the simulation
-        let _ = sim.step_until(MonotonicTime::EPOCH + Duration::from_secs_f64(duration));
+        sim.step_by(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
         info!(
