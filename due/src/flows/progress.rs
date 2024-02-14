@@ -20,10 +20,12 @@ pub struct Progress {
     duration: f64,
     num_sources: usize,
     finished_sources: usize,
+    finished: bool,
 }
 
+#[derive(Clone)]
 pub struct Report {
-    pub id: usize,
+    pub name: String,
     pub finished: bool,
 }
 
@@ -50,30 +52,40 @@ impl Progress {
             duration,
             num_sources,
             finished_sources: 0,
+            finished: false,
         }
     }
 
     pub fn report_received(&mut self, report: Report) {
-        debug!("Progress received report from {}", report.id);
+        debug!("Progress received report from {}", report.name);
         if report.finished {
             self.finished_sources += 1;
+            debug!(
+                "{} / {} sources are finished",
+                self.finished_sources, self.num_sources
+            );
+            if self.finished_sources == self.num_sources {
+                self.progress_bar.finish_and_clear();
+                self.finished = true;
+            }
         }
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        self.progress_bar.inc(1);
-        if self.finished_sources == self.num_sources {
-            self.progress_bar.finish_and_clear();
-        } else if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
-            self.progress_bar.finish_and_clear();
-        } else {
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(self.progress_interval),
-                    Self::run,
-                    (),
-                )
-                .unwrap();
+        if !self.finished {
+            self.progress_bar.inc(1);
+            if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
+                self.progress_bar.finish_and_clear();
+                self.finished = true;
+            } else {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(self.progress_interval),
+                        Self::run,
+                        (),
+                    )
+                    .unwrap();
+            }
         }
     }
 }

@@ -16,6 +16,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
@@ -62,6 +63,13 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.output.borrow_mut(),
+        }
+    }
+
+    pub fn report_output(&mut self) -> &mut Output<Report> {
+        match self {
+            PacketSource::DistPacketSource(source) => source.report_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.report_output.borrow_mut(),
         }
     }
 
@@ -245,7 +253,15 @@ impl PacketSource {
             self.send_packet(scheduler).await;
 
             if self.stop_run(now) {
-                debug!("{} finished running at {:.3}.", format!("{self}"), now);
+                let name = format!("{self}");
+                debug!("{} finished running at {:.3}.", name, now);
+
+                self.report_output()
+                    .send(Report {
+                        name,
+                        finished: true,
+                    })
+                    .await;
             }
         }
     }
