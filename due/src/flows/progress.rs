@@ -10,6 +10,7 @@ use std::time::Duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
+use rusqlite::{Connection, Result};
 
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -56,8 +57,19 @@ impl Progress {
         }
     }
 
+    fn log_report(&mut self, report: Report) -> Result<()> {
+        let _conn = Connection::open("statistics.db")?;
+
+        debug!("Progress logged report from {}", report.name);
+
+        Ok(())
+    }
+
     pub fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
         debug!("Progress received report from {}", report.name);
+
+        let _ = self.log_report(report.clone());
+
         if report.finished {
             self.finished_sources += 1;
             debug!(
