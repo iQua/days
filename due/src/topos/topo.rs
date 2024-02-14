@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use std::time::Duration;
 
 use log::{debug, info};
 use petgraph::graph::UnGraph;
@@ -586,13 +585,13 @@ impl Topology {
         // creates and activates a progress coroutine
         self = self.activate_progress(report_mbox);
 
-        let duration = self.duration;
+        let _duration = self.duration as i64;
 
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_by(Duration::from_secs_f64(duration));
+        let _ = sim.step_until(MonotonicTime::new(10000, 0));
         sim = statistics.collect_statistics(sim);
 
         info!(
