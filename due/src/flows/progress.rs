@@ -65,14 +65,14 @@ impl Progress {
                 self.finished_sources, self.num_sources
             );
             if self.finished_sources == self.num_sources {
-                self.progress_bar.finish_and_clear();
+                //self.progress_bar.finish_and_clear();
                 self.finished = true;
             }
         }
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        if !self.finished {
+        if true {
             self.progress_bar.inc(1);
             if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
                 self.progress_bar.finish_and_clear();
