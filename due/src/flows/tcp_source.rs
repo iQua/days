@@ -14,6 +14,7 @@ use asynchronix::model::{Model, Output};
 use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
 
@@ -85,6 +86,7 @@ pub struct TCPPacketSource {
     packets_sent: usize,
 
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -125,6 +127,7 @@ impl TCPPacketSource {
             busy_until: 0.0,
             packets_sent: 0,
             output: Output::default(),
+            report_output: Output::default(),
         }
     }
 

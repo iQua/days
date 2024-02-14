@@ -11,6 +11,7 @@ use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 
@@ -24,6 +25,7 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
 }
 
 impl DistPacketSource {
@@ -36,6 +38,7 @@ impl DistPacketSource {
             sent_size: 0,
             rng,
             output: Output::default(),
+            report_output: Output::default(),
         }
     }
 

@@ -2,7 +2,7 @@
 
 seed = 100
 mailbox_capacity = 100
-progress = 2.0
+duration = 0.1
 
 [topology]
 category = "FatTree"
@@ -19,7 +19,7 @@ drop = "RED"
 
 [[flow_set]]
 flow_type = "TCP"
-flow_count = 200
+flow_count = 100
 [flow_set.traffic]
     initial_delay = 0.0
     duration = 0.1
