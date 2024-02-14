@@ -537,7 +537,7 @@ impl Topology {
     /// Creates and activates a progress bar to illustrate the progress of the
     /// simulation run.
     fn activate_progress_bar(mut self) -> Self {
-        let progress = Progress::new(self.progress, self.duration);
+        let progress = Progress::new(self.progress, self.duration, self.flows.len());
         let progress_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
         self.sim_init = self.sim_init.add_model(progress, progress_mbox);
 

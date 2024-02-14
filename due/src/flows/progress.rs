@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
+use log::debug;
 
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::Scheduler;
@@ -17,10 +18,17 @@ pub struct Progress {
     progress_bar: ProgressBar,
     progress_interval: f64,
     duration: f64,
+    num_sources: usize,
+    finished_sources: usize,
+}
+
+pub struct Report {
+    pub id: usize,
+    pub finished: bool,
 }
 
 impl Progress {
-    pub fn new(progress_interval: f64, duration: f64) -> Progress {
+    pub fn new(progress_interval: f64, duration: f64, num_sources: usize) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
@@ -40,12 +48,23 @@ impl Progress {
             progress_bar: pg,
             progress_interval,
             duration,
+            num_sources,
+            finished_sources: 0,
+        }
+    }
+
+    pub fn report_received(&mut self, report: Report) {
+        debug!("Progress received report from {}", report.id);
+        if report.finished {
+            self.finished_sources += 1;
         }
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
         self.progress_bar.inc(1);
-        if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
+        if self.finished_sources == self.num_sources {
+            self.progress_bar.finish_and_clear();
+        } else if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
             self.progress_bar.finish_and_clear();
         } else {
             scheduler
