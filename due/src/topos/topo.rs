@@ -163,8 +163,8 @@ impl Topology {
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
-        let pb_config: ProgressConfig = toml::from_str(&content)
-            .expect("Failed to deserialize the configuration of progress bar");
+        let pb_config: ProgressConfig =
+            toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
         let progress = pb_config.progress.unwrap_or(1);
         let duration = pb_config.duration.unwrap_or(1500);
 
