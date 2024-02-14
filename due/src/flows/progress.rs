@@ -15,18 +15,18 @@ use asynchronix::time::Scheduler;
 
 pub struct Progress {
     progress_bar: ProgressBar,
-    progress_interval: u64,
-    duration: u64,
+    progress_interval: f64,
+    duration: f64,
 }
 
 impl Progress {
-    pub fn new(progress_interval: u64, duration: u64) -> Progress {
+    pub fn new(progress_interval: f64, duration: f64) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
         LogWrapper::new(multi.clone(), logger);
 
-        let progress_bar = ProgressBar::new(duration);
+        let progress_bar = ProgressBar::new((duration / progress_interval) as u64);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
@@ -44,12 +44,16 @@ impl Progress {
     }
 
     fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        self.progress_bar.inc(self.progress_interval);
-        if self.progress_bar.position() >= self.duration {
+        self.progress_bar.inc(1);
+        if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
             self.progress_bar.finish_and_clear();
         } else {
             scheduler
-                .schedule_event(Duration::from_secs(self.progress_interval), Self::run, ())
+                .schedule_event(
+                    Duration::from_secs_f64(self.progress_interval),
+                    Self::run,
+                    (),
+                )
                 .unwrap();
         }
     }
@@ -57,11 +61,17 @@ impl Progress {
 
 impl Model for Progress {
     fn init(
-        mut self,
+        self,
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            self.run((), scheduler);
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.progress_interval),
+                    Self::run,
+                    (),
+                )
+                .unwrap();
             self.into()
         })
     }

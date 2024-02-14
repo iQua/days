@@ -34,8 +34,8 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 
 #[derive(Deserialize)]
 struct ProgressConfig {
-    progress: Option<u64>,
-    duration: Option<u64>,
+    progress: Option<f64>,
+    duration: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -132,9 +132,9 @@ pub struct Topology {
     /// the capacity of every mailbox
     mailbox_capacity: usize,
     /// the interval of updating the progress bar
-    progress: u64,
+    progress: f64,
     /// the duration of the simulation run
-    duration: u64,
+    duration: f64,
 }
 
 impl Topology {
@@ -165,8 +165,8 @@ impl Topology {
 
         let pb_config: ProgressConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let progress = pb_config.progress.unwrap_or(1);
-        let duration = pb_config.duration.unwrap_or(1500);
+        let duration = pb_config.duration.unwrap_or(1500.);
+        let progress = pb_config.progress.unwrap_or(duration / 100.);
 
         Topology {
             sim_init: SimInit::new(),
@@ -586,7 +586,7 @@ impl Topology {
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_by(Duration::from_secs(duration));
+        sim.step_by(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
         info!(

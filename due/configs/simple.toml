@@ -3,6 +3,8 @@
 seed = 1000
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
+progress = 0.01
+duration = 0.1
 
 [switch]
 port_rate = 8000
