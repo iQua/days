@@ -49,11 +49,7 @@ impl Progress {
             self.progress_bar.finish_and_clear();
         } else {
             scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(self.progress_interval as f64),
-                    Self::run,
-                    (),
-                )
+                .schedule_event(Duration::from_secs(self.progress_interval), Self::run, ())
                 .unwrap();
         }
     }
