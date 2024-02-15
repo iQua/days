@@ -8,6 +8,7 @@ use asynchronix::model::{Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::next_switch_id;
 
 pub struct PacketSwitch {
@@ -24,6 +25,7 @@ pub struct PacketSwitch {
     /// senders for sending inbound packets to outbound ports
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
+    pub report_output: Output<Report>,
 }
 
 impl PacketSwitch {
@@ -43,6 +45,7 @@ impl PacketSwitch {
             r_fib,
             packets_received: 0,
             outputs,
+            report_output: Output::default(),
         }
     }
 

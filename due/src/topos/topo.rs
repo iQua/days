@@ -547,6 +547,12 @@ impl Topology {
     /// Creates and activates a progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
     fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
+        for (_, switch) in self.switches.iter_mut() {
+            switch
+                .report_output
+                .connect(Progress::report_received, &report_mbox);
+        }
+
         let progress = Progress::new(self.progress, self.duration, self.flows.len());
         self.sim_init = self.sim_init.add_model(progress, report_mbox);
 
