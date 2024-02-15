@@ -1,10 +1,13 @@
 //! Implements a packet switch with a demultiplexer based on flow classes.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
@@ -25,11 +28,23 @@ pub struct PacketSwitch {
     /// senders for sending inbound packets to outbound ports
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
+
+    report_interval: f64,
     pub report_output: Output<Report>,
 }
 
+impl std::fmt::Display for PacketSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "PacketSwitch {}", self.id())
+    }
+}
+
 impl PacketSwitch {
-    pub fn new(fib: HashMap<usize, usize>, r_fib: HashMap<usize, usize>) -> PacketSwitch {
+    pub fn new(
+        fib: HashMap<usize, usize>,
+        r_fib: HashMap<usize, usize>,
+        report_interval: f64,
+    ) -> PacketSwitch {
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
@@ -45,6 +60,7 @@ impl PacketSwitch {
             r_fib,
             packets_received: 0,
             outputs,
+            report_interval,
             report_output: Output::default(),
         }
     }
@@ -101,6 +117,47 @@ impl PacketSwitch {
             }
         }
     }
+
+    fn send_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let name = format!("{self}");
+            self.report_output
+                .send(Report {
+                    name,
+                    finished: false,
+                })
+                .await;
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
-impl Model for PacketSwitch {}
+impl Model for PacketSwitch {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+
+            self.into()
+        })
+    }
+}

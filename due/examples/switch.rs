@@ -59,7 +59,7 @@ fn main() {
     let mut fib = HashMap::new();
     fib.insert(0, 2);
     fib.insert(1, 2);
-    let mut switch: PacketSwitch = PacketSwitch::new(fib.clone(), fib);
+    let mut switch: PacketSwitch = PacketSwitch::new(fib.clone(), fib, 0.01);
 
     let mut drr = DRRServer::new(
         8000.0,

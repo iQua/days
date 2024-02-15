@@ -160,13 +160,13 @@ impl Topology {
             .unwrap_or(16)
             .min(usize::MAX / 2 + 1);
 
-        set_num_switches(graph.node_count());
-        let switches = Topology::init_switches();
-
         let pb_config: ProgressConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
         let duration = pb_config.duration.unwrap_or(1.);
         let progress = pb_config.progress.unwrap_or(duration / 100.);
+
+        set_num_switches(graph.node_count());
+        let switches = Topology::init_switches(progress);
 
         Topology {
             sim_init: SimInit::new(),
@@ -191,11 +191,11 @@ impl Topology {
         }
     }
 
-    fn init_switches() -> HashMap<usize, PacketSwitch> {
+    fn init_switches(report_interval: f64) -> HashMap<usize, PacketSwitch> {
         let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
 
         for _ in 0..num_switches() {
-            let switch = PacketSwitch::new(HashMap::new(), HashMap::new());
+            let switch = PacketSwitch::new(HashMap::new(), HashMap::new(), report_interval);
             switches.insert(switch.id(), switch);
         }
 
