@@ -29,7 +29,9 @@ pub struct PacketSwitch {
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
 
+    /// the interval of sending a periodic report to the progress coroutine
     report_interval: f64,
+    /// the sender for sedning reports
     pub report_output: Output<Report>,
 }
 
@@ -118,6 +120,7 @@ impl PacketSwitch {
         }
     }
 
+    /// Sends a perioid report of current statistics to the progress coroutine.
     fn send_report<'a>(
         &'a mut self,
         _: (),
