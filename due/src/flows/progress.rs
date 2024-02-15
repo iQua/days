@@ -57,10 +57,58 @@ impl Progress {
         }
     }
 
+    fn create_database(&self) -> Result<()> {
+        let conn = Connection::open("statistics.db")?;
+
+        conn.execute(
+            "CREATE TABLE sources (
+                name TEXT NOT NULL,
+                data BLOB
+            )",
+            (), // empty list of parameters.
+        )?;
+
+        conn.execute(
+            "CREATE TABLE switches (
+                name TEXT NOT NULL,
+                data BLOB
+            )",
+            (), // empty list of parameters.
+        )?;
+
+        conn.execute(
+            "CREATE TABLE sinks (
+                name TEXT NOT NULL,
+                data BLOB
+            )",
+            (), // empty list of parameters.
+        )?;
+
+        Ok(())
+    }
+
     fn log_report(&mut self, report: Report) -> Result<()> {
-        let _conn = Connection::open("statistics.db")?;
+        let conn = Connection::open("statistics.db")?;
 
         debug!("Progress logged report from {}", report.name);
+
+        let data: Option<f64> = None;
+        if report.name.contains("Source") {
+            conn.execute(
+                "INSERT INTO sources (name, data) VALUES (?1, ?2)",
+                (&report.name, data),
+            )?;
+        } else if report.name.contains("Switch") {
+            conn.execute(
+                "INSERT INTO switchs (name, data) VALUES (?1, ?2)",
+                (&report.name, data),
+            )?;
+        } else if report.name.contains("Sink") {
+            conn.execute(
+                "INSERT INTO sinks (name, data) VALUES (?1, ?2)",
+                (&report.name, data),
+            )?;
+        }
 
         Ok(())
     }
@@ -129,6 +177,8 @@ impl Model for Progress {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
+            let _ = self.create_database();
+
             self.run((), scheduler);
             self.into()
         })
