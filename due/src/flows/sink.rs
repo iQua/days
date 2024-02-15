@@ -16,6 +16,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 
@@ -209,6 +210,13 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.output.borrow_mut(),
+        }
+    }
+
+    pub fn report_output(&mut self) -> &mut Output<Report> {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.report_output.borrow_mut(),
+            PacketSink::TCPPacketSink(sink) => sink.report_output.borrow_mut(),
         }
     }
 

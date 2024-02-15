@@ -8,6 +8,7 @@ use log::debug;
 use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::{Packet, TCPAck};
+use crate::flows::progress::Report;
 use crate::flows::sink::PacketStatistics;
 use crate::next_endpoint_id;
 
@@ -25,6 +26,7 @@ pub struct TCPPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
 }
 
 impl TCPPacketSink {
@@ -38,6 +40,7 @@ impl TCPPacketSink {
             next_seq_expected: 0,
             statistics: Output::default(),
             output: Output::default(),
+            report_output: Output::default(),
         }
     }
 

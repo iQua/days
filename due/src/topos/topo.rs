@@ -492,6 +492,10 @@ impl Topology {
 
             sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);
+
+            sink.report_output()
+                .connect(Progress::report_received, &report_mbox);
+
             let mut output = Output::default();
             output.connect(PacketSink::packet_received, &sink_mbox);
             sink_host.outputs.insert(sink.id(), output);

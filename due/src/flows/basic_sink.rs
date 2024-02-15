@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::flows::sink::PacketStatistics;
 use crate::next_endpoint_id;
 
@@ -18,6 +19,7 @@ pub struct BasicPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
 }
 
 impl BasicPacketSink {
@@ -29,6 +31,7 @@ impl BasicPacketSink {
             packet_statistics: PacketStatistics::new(sink_name),
             statistics: Output::default(),
             output: Output::default(),
+            report_output: Output::default(),
         }
     }
 }
