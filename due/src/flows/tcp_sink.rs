@@ -9,21 +9,21 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::progress::Report;
-use crate::flows::sink::PacketStatistics;
+use crate::flows::sink::PacketSinkStatistics;
 use crate::next_endpoint_id;
 
 #[derive(Debug)]
 pub struct TCPPacketSink {
     pub endpoint_id: usize,
     /// the statistics of received packets
-    pub packet_statistics: PacketStatistics,
+    pub packet_statistics: PacketSinkStatistics,
     /// the receive buffer, which is a priority queue that is sorted based on
     /// the sequence number of the packet (packet_id)
     recv_buffer: Vec<(usize, usize)>,
     /// the next sequence number expected to be received
     next_seq_expected: usize,
     /// output: packet statistics
-    pub statistics: Output<PacketStatistics>,
+    pub statistics: Output<PacketSinkStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
     pub report_output: Output<Report>,
@@ -35,7 +35,7 @@ impl TCPPacketSink {
         let sink_name = format!("TCPPacketSink {endpoint_id}");
         TCPPacketSink {
             endpoint_id,
-            packet_statistics: PacketStatistics::new(sink_name),
+            packet_statistics: PacketSinkStatistics::new(sink_name),
             recv_buffer: Vec::new(),
             next_seq_expected: 0,
             statistics: Output::default(),

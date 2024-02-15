@@ -20,7 +20,7 @@ use asynchronix::time::MonotonicTime;
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
 use crate::flows::progress::Progress;
-use crate::flows::sink::{PacketSink, PacketStatistics};
+use crate::flows::sink::{PacketSink, PacketSinkStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
@@ -91,7 +91,7 @@ struct SinkStatistics {
     /// sink id -> sink mailbox address
     sink_addresses: HashMap<usize, Address<PacketSink>>,
     /// sink id -> sink statistics
-    sink_statistics: HashMap<usize, EventSlot<PacketStatistics>>,
+    sink_statistics: HashMap<usize, EventSlot<PacketSinkStatistics>>,
 }
 
 impl SinkStatistics {
