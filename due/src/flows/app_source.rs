@@ -19,13 +19,21 @@ pub enum AppDataType {
 }
 
 impl AppDataSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+    pub fn new(
+        flow_id: usize,
+        traffic: TrafficCharacteristics,
+        report_interval: f64,
+        rng: SmallRng,
+    ) -> Self {
         let app_type = AppDataType::DistData;
 
         match app_type {
-            AppDataType::DistData => {
-                AppDataSource::DistDataSource(DistPacketSource::new(flow_id, traffic, rng))
-            }
+            AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
+                flow_id,
+                traffic,
+                report_interval,
+                rng,
+            )),
         }
     }
 

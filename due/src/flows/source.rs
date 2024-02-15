@@ -41,6 +41,7 @@ impl PacketSource {
         flow_id: usize,
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
+        report_interval: f64,
         seed: usize,
     ) -> Self {
         let global_seed = get_seed();
@@ -50,12 +51,18 @@ impl PacketSource {
         };
 
         match flow_type {
-            FlowType::PacketDistribution => {
-                PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
-            }
-            FlowType::TCP => {
-                PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
-            }
+            FlowType::PacketDistribution => PacketSource::DistPacketSource(DistPacketSource::new(
+                flow_id,
+                traffic,
+                report_interval,
+                rng,
+            )),
+            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
+                flow_id,
+                traffic,
+                report_interval,
+                rng,
+            )),
         }
     }
 
@@ -70,6 +77,13 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.report_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.report_output.borrow_mut(),
+        }
+    }
+
+    pub fn report_interval(&self) -> f64 {
+        match self {
+            PacketSource::DistPacketSource(source) => source.report_interval,
+            PacketSource::TCPPacketSource(source) => source.report_interval,
         }
     }
 
@@ -227,6 +241,31 @@ impl PacketSource {
         }
     }
 
+    /// Sends a perioid report of current statistics to the progress coroutine.
+    fn send_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let name = format!("{self}");
+            self.report_output()
+                .send(Report {
+                    name,
+                    finished: false,
+                })
+                .await;
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval()),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
+
     /// Returns whether PacketSource should stop running.
     fn stop_run(&self, now: f64) -> bool {
         match self {
@@ -299,6 +338,14 @@ impl Model for PacketSource {
             } else {
                 self.run((), scheduler).await;
             }
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval()),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
 
             self.into()
         })

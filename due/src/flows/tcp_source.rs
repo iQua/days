@@ -86,6 +86,10 @@ pub struct TCPPacketSource {
     packets_sent: usize,
 
     pub output: Output<Packet>,
+
+    /// the interval of sending a periodic report to the progress coroutine
+    pub report_interval: f64,
+    /// the sender for sedning reports
     pub report_output: Output<Report>,
 }
 
@@ -99,7 +103,12 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
+    pub fn new(
+        flow_id: usize,
+        traffic: TrafficCharacteristics,
+        report_interval: f64,
+        rng: SmallRng,
+    ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
@@ -123,10 +132,11 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
+            datasource: AppDataSource::new(flow_id, traffic, report_interval, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             output: Output::default(),
+            report_interval,
             report_output: Output::default(),
         }
     }

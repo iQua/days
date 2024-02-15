@@ -25,11 +25,20 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
+
+    /// the interval of sending a periodic report to the progress coroutine
+    pub report_interval: f64,
+    /// the sender for sedning reports
     pub report_output: Output<Report>,
 }
 
 impl DistPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> DistPacketSource {
+    pub fn new(
+        flow_id: usize,
+        traffic: TrafficCharacteristics,
+        report_interval: f64,
+        rng: SmallRng,
+    ) -> DistPacketSource {
         DistPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
@@ -38,6 +47,7 @@ impl DistPacketSource {
             sent_size: 0,
             rng,
             output: Output::default(),
+            report_interval,
             report_output: Output::default(),
         }
     }
