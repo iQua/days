@@ -2,6 +2,7 @@
 //! packet sources.
 
 use std::borrow::BorrowMut;
+use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -17,9 +18,64 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
 use crate::flows::progress::Report;
+use crate::flows::statistics::RandomVar;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
+
+#[derive(Clone, Debug)]
+pub struct PacketSourceStatistics {
+    source_name: String,
+    /// the number of sent packets
+    sent_packets: usize,
+    /// the sent times of the packets
+    sent_times: RandomVar,
+    /// the last sent time
+    last_sent_time: f64,
+    /// the inter-sent times of the packets
+    inter_sent_times: RandomVar,
+    /// the size of the packets
+    packet_sizes: RandomVar,
+}
+
+impl Display for PacketSourceStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{} recorded statistics: \n\
+            Sent packets: {} \n\
+            Sent times: {:#.3} \n\
+            Inter-sent times: {:#.3} \n\
+            Packet sizes: {:#.3} \n",
+            self.source_name,
+            self.sent_packets,
+            self.sent_times,
+            self.inter_sent_times,
+            self.packet_sizes,
+        )
+    }
+}
+
+impl PacketSourceStatistics {
+    pub fn new(source_name: String) -> Self {
+        PacketSourceStatistics {
+            source_name,
+            sent_packets: 0,
+            sent_times: RandomVar::new(),
+            last_sent_time: 0.0,
+            inter_sent_times: RandomVar::new(),
+            packet_sizes: RandomVar::new(),
+        }
+    }
+
+    pub fn update(&mut self, packet: &Packet, now: f64) {
+        self.sent_packets += 1;
+        self.sent_times.tabulate(now);
+        self.inter_sent_times.tabulate(now - self.last_sent_time);
+        self.last_sent_time = now;
+        self.packet_sizes.tabulate(packet.size as u32);
+    }
+}
 
 #[derive(Debug)]
 pub enum PacketSource {
