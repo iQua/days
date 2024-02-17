@@ -12,6 +12,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
 use crate::flows::progress::Report;
+use crate::flows::source::PacketSourceStatistics;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 
@@ -26,6 +27,8 @@ pub struct DistPacketSource {
 
     pub output: Output<Packet>,
 
+    /// the statistics of sent packets
+    pub packet_statistics: PacketSourceStatistics,
     /// the interval of sending a periodic report to the progress coroutine
     pub report_interval: f64,
     /// the sender for sedning reports
@@ -39,14 +42,18 @@ impl DistPacketSource {
         report_interval: f64,
         rng: SmallRng,
     ) -> DistPacketSource {
+        let endpoint_id = next_endpoint_id();
+        let source_name = format!("DistPacketSource {endpoint_id}");
+
         DistPacketSource {
-            endpoint_id: next_endpoint_id(),
+            endpoint_id,
             flow_id,
             traffic,
             packets_sent: 0,
             sent_size: 0,
             rng,
             output: Output::default(),
+            packet_statistics: PacketSourceStatistics::new(source_name),
             report_interval,
             report_output: Output::default(),
         }
@@ -55,6 +62,8 @@ impl DistPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
+
+        self.packet_statistics.update(&packet, now);
 
         debug!(
             "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
