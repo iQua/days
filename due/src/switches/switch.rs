@@ -1,6 +1,7 @@
 //! Implements a packet switch with a demultiplexer based on flow classes.
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -12,7 +13,69 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
 use crate::flows::progress::Report;
+use crate::flows::statistics::RandomVar;
 use crate::next_switch_id;
+
+#[derive(Clone, Debug)]
+pub struct PacketSwitchStatistics {
+    switch_name: String,
+    /// the arrival times of the packets
+    arrival_times: RandomVar,
+    /// the last arrival time
+    last_arrival_time: f64,
+    /// the inter-arrival times of the packets
+    inter_arrival_times: RandomVar,
+    /// the one-way end-to-end delays of the packets
+    one_way_delays: RandomVar,
+    /// the total time spent waiting in queues
+    queueing_delays: RandomVar,
+    /// the size of the packets
+    packet_sizes: RandomVar,
+}
+
+impl Display for PacketSwitchStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{} recorded statistics: \n\
+            Arrival times: {:#.3} \n\
+            Inter-arrival times: {:#.3} \n\
+            One-way delays: {:#.3} \n\
+            Queueing delays: {:#.3} \n\
+            Packet sizes: {:#.3} \n",
+            self.switch_name,
+            self.arrival_times,
+            self.inter_arrival_times,
+            self.one_way_delays,
+            self.queueing_delays,
+            self.packet_sizes,
+        )
+    }
+}
+
+impl PacketSwitchStatistics {
+    pub fn new(switch_name: String) -> Self {
+        PacketSwitchStatistics {
+            switch_name,
+            arrival_times: RandomVar::new(),
+            last_arrival_time: 0.0,
+            inter_arrival_times: RandomVar::new(),
+            one_way_delays: RandomVar::new(),
+            queueing_delays: RandomVar::new(),
+            packet_sizes: RandomVar::new(),
+        }
+    }
+
+    pub fn update(&mut self, packet: &Packet, now: f64) {
+        self.arrival_times.tabulate(now);
+        self.inter_arrival_times
+            .tabulate(now - self.last_arrival_time);
+        self.last_arrival_time = now;
+        self.one_way_delays.tabulate(now - packet.creation_time);
+        self.queueing_delays.tabulate(packet.queueing_delay);
+        self.packet_sizes.tabulate(packet.size as u32);
+    }
+}
 
 pub struct PacketSwitch {
     switch_id: usize,
