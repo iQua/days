@@ -92,6 +92,8 @@ pub struct PacketSwitch {
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
 
+    /// the statistics of received packets
+    pub packet_statistics: PacketSwitchStatistics,
     /// the interval of sending a periodic report to the progress coroutine
     report_interval: f64,
     /// the sender for sedning reports
@@ -110,6 +112,9 @@ impl PacketSwitch {
         r_fib: HashMap<usize, usize>,
         report_interval: f64,
     ) -> PacketSwitch {
+        let switch_id = next_switch_id();
+        let switch_name = format!("PacketSwitch {switch_id}");
+
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
@@ -120,11 +125,12 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            switch_id: next_switch_id(),
+            switch_id,
             fib,
             r_fib,
             packets_received: 0,
             outputs,
+            packet_statistics: PacketSwitchStatistics::new(switch_name),
             report_interval,
             report_output: Output::default(),
         }
@@ -143,11 +149,15 @@ impl PacketSwitch {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         if packet.ack.is_none() {
             self.packets_received += 1;
+
+            self.packet_statistics.update(&packet, now);
 
             debug!(
                 "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -156,7 +166,7 @@ impl PacketSwitch {
                 packet.packet_id,
                 packet.size,
                 packet.flow_id,
-                arrival_time,
+                now,
                 self.packets_received
             );
 
@@ -170,7 +180,7 @@ impl PacketSwitch {
         } else {
             debug!(
                 "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.switch_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+                self.switch_id, packet.packet_id, packet.size, packet.flow_id, now,
             );
 
             // forwards acknowledgment packets to their corresponding upstream
