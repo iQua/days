@@ -19,11 +19,14 @@ pub struct BasicPacketSink {
     pub statistics: Output<PacketSinkStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    /// the interval of sending a periodic report to the progress coroutine
+    pub report_interval: f64,
+    /// the sender for sedning reports
     pub report_output: Output<Report>,
 }
 
 impl BasicPacketSink {
-    pub fn new() -> Self {
+    pub fn new(report_interval: f64) -> Self {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("PacketSink {endpoint_id}");
         BasicPacketSink {
@@ -31,6 +34,7 @@ impl BasicPacketSink {
             packet_statistics: PacketSinkStatistics::new(sink_name),
             statistics: Output::default(),
             output: Output::default(),
+            report_interval,
             report_output: Output::default(),
         }
     }

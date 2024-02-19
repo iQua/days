@@ -26,11 +26,14 @@ pub struct TCPPacketSink {
     pub statistics: Output<PacketSinkStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    /// the interval of sending a periodic report to the progress coroutine
+    pub report_interval: f64,
+    /// the sender for sedning reports
     pub report_output: Output<Report>,
 }
 
 impl TCPPacketSink {
-    pub fn new() -> TCPPacketSink {
+    pub fn new(report_interval: f64) -> TCPPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("TCPPacketSink {endpoint_id}");
         TCPPacketSink {
@@ -40,6 +43,7 @@ impl TCPPacketSink {
             next_seq_expected: 0,
             statistics: Output::default(),
             output: Output::default(),
+            report_interval,
             report_output: Output::default(),
         }
     }

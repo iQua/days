@@ -7,10 +7,13 @@
 
 use std::borrow::BorrowMut;
 use std::fmt::{Debug, Display};
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
@@ -97,12 +100,14 @@ impl std::fmt::Display for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(source: &PacketSource) -> Self {
+    pub fn new(source: &PacketSource, report_interval: f64) -> Self {
         match source {
             PacketSource::DistPacketSource(_) => {
-                PacketSink::BasicPacketSink(BasicPacketSink::new())
+                PacketSink::BasicPacketSink(BasicPacketSink::new(report_interval))
             }
-            PacketSource::TCPPacketSource(_) => PacketSink::TCPPacketSink(TCPPacketSink::new()),
+            PacketSource::TCPPacketSource(_) => {
+                PacketSink::TCPPacketSink(TCPPacketSink::new(report_interval))
+            }
         }
     }
 
@@ -131,6 +136,13 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.report_output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.report_output.borrow_mut(),
+        }
+    }
+
+    pub fn report_interval(&self) -> f64 {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.report_interval,
+            PacketSink::TCPPacketSink(sink) => sink.report_interval,
         }
     }
 
@@ -176,6 +188,48 @@ impl PacketSink {
 
         self.wrap_up(packet, arrival_time).await;
     }
+
+    /// Sends a perioid report of current statistics to the progress coroutine.
+    fn send_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let name = format!("{self}");
+            self.report_output()
+                .send(Report {
+                    name,
+                    finished: false,
+                })
+                .await;
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval()),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
-impl Model for PacketSink {}
+impl Model for PacketSink {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval()),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+
+            self.into()
+        })
+    }
+}
