@@ -100,13 +100,13 @@ impl std::fmt::Display for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(source: &PacketSource, report_interval: f64) -> Self {
+    pub fn new(source: &PacketSource) -> Self {
         match source {
-            PacketSource::DistPacketSource(_) => {
-                PacketSink::BasicPacketSink(BasicPacketSink::new(report_interval))
+            PacketSource::DistPacketSource(source) => {
+                PacketSink::BasicPacketSink(BasicPacketSink::new(source.report_interval))
             }
-            PacketSource::TCPPacketSource(_) => {
-                PacketSink::TCPPacketSink(TCPPacketSink::new(report_interval))
+            PacketSource::TCPPacketSource(source) => {
+                PacketSink::TCPPacketSink(TCPPacketSink::new(source.report_interval))
             }
         }
     }
