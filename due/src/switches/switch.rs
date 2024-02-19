@@ -12,7 +12,7 @@ use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::progress::{PacketStatistics, Report};
 use crate::flows::statistics::RandomVar;
 use crate::next_switch_id;
 
@@ -201,9 +201,12 @@ impl PacketSwitch {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let name = format!("{self}");
+            let statistics =
+                PacketStatistics::PacketSwitchStatistics(self.packet_statistics.clone());
             self.report_output
                 .send(Report {
                     name,
+                    statistics,
                     finished: false,
                 })
                 .await;

@@ -15,6 +15,10 @@ use rusqlite::{Connection, Result};
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+use crate::flows::sink::PacketSinkStatistics;
+use crate::flows::source::PacketSourceStatistics;
+use crate::switches::switch::PacketSwitchStatistics;
+
 pub struct Progress {
     progress_bar: ProgressBar,
     progress_interval: f64,
@@ -27,7 +31,15 @@ pub struct Progress {
 #[derive(Clone)]
 pub struct Report {
     pub name: String,
+    pub statistics: PacketStatistics,
     pub finished: bool,
+}
+
+#[derive(Clone)]
+pub enum PacketStatistics {
+    PacketSourceStatistics(PacketSourceStatistics),
+    PacketSwitchStatistics(PacketSwitchStatistics),
+    PacketSinkStatistics(PacketSinkStatistics),
 }
 
 impl Progress {

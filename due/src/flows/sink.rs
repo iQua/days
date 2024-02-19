@@ -18,7 +18,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::progress::{PacketStatistics, Report};
 use crate::flows::source::PacketSource;
 use crate::flows::statistics::RandomVar;
 use crate::flows::tcp_sink::TCPPacketSink;
@@ -197,9 +197,18 @@ impl PacketSink {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let name = format!("{self}");
+            let statistics = match self {
+                PacketSink::BasicPacketSink(sink) => {
+                    PacketStatistics::PacketSinkStatistics(sink.packet_statistics.clone())
+                }
+                PacketSink::TCPPacketSink(sink) => {
+                    PacketStatistics::PacketSinkStatistics(sink.packet_statistics.clone())
+                }
+            };
             self.report_output()
                 .send(Report {
                     name,
+                    statistics,
                     finished: false,
                 })
                 .await;

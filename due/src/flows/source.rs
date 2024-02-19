@@ -17,7 +17,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::progress::{PacketStatistics, Report};
 use crate::flows::statistics::RandomVar;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
@@ -305,9 +305,18 @@ impl PacketSource {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let name = format!("{self}");
+            let statistics = match self {
+                PacketSource::DistPacketSource(source) => {
+                    PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                }
+                PacketSource::TCPPacketSource(source) => {
+                    PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                }
+            };
             self.report_output()
                 .send(Report {
                     name,
+                    statistics,
                     finished: false,
                 })
                 .await;
@@ -349,11 +358,20 @@ impl PacketSource {
 
             if self.stop_run(now) {
                 let name = format!("{self}");
+                let statistics = match self {
+                    PacketSource::DistPacketSource(source) => {
+                        PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                    }
+                    PacketSource::TCPPacketSource(source) => {
+                        PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                    }
+                };
                 debug!("{} finished running at {:.3}.", name, now);
 
                 self.report_output()
                     .send(Report {
                         name,
+                        statistics,
                         finished: true,
                     })
                     .await;
