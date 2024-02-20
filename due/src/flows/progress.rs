@@ -3,11 +3,11 @@
 //! network elements (switches, packet sources, and packet sinks) into a SQLite
 //! database.
 
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use anyhow::Ok;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
@@ -61,7 +61,8 @@ impl Progress {
 
         let pg = multi.add(progress_bar);
 
-        let db_pool = Self::create_database();
+        let db_url = String::from("sqlite://statistics.db");
+        let db_pool = Self::create_database(&db_url).unwrap();
 
         Progress {
             progress_bar: pg,
@@ -70,32 +71,53 @@ impl Progress {
             num_sources,
             finished_sources: 0,
             finished: false,
-            db_pool: db_pool.unwrap(),
+            db_pool,
         }
     }
 
     #[tokio::main]
-    async fn create_database() -> anyhow::Result<SqlitePool> {
-        Sqlite::create_database("statistics.db").await?;
+    async fn create_database(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+        if Sqlite::database_exists(&db_url).await.unwrap_or(false) {
+            match fs::remove_file(&db_url) {
+                Ok(_) => debug!("Existing database is deleted."),
+                Err(error) => panic!("Error {} occurred when deleting existing database.", error),
+            }
+        }
+        match Sqlite::create_database(&db_url).await {
+            Ok(_) => debug!("Created database {} to log packet statistics.", &db_url),
+            Err(error) => panic!("Error {} occurred when creating a database", error),
+        }
 
         let db_pool = SqlitePool::connect("statistics.db").await?;
 
-        sqlx::query("CREATE TABLE sources (name TEXT NOT NULL, data BLOB)")
-            .execute(&db_pool)
-            .await?;
+        let source_qry = "CREATE TABLE sources
+        (
+            name        TEXT    NOT NULL,
+            data        BLOB,
+            finished    BOOLEAN NOT NULL DEFAULT 0
+        )";
+        sqlx::query(source_qry).execute(&db_pool).await?;
 
-        sqlx::query("CREATE TABLE switches (name TEXT NOT NULL, data BLOB)")
-            .execute(&db_pool)
-            .await?;
+        let switch_qry = "CREATE TABLE switches
+        (
+            name        TEXT    NOT NULL,
+            data        BLOB,
+            finished    BOOLEAN NOT NULL DEFAULT 0
+        )";
+        sqlx::query(switch_qry).execute(&db_pool).await?;
 
-        sqlx::query("CREATE TABLE sinks (name TEXT NOT NULL, data BLOB)")
-            .execute(&db_pool)
-            .await?;
+        let sink_qry = "CREATE TABLE sinks
+        (
+            name        TEXT    NOT NULL,
+            data        BLOB,
+            finished    BOOLEAN NOT NULL DEFAULT 0
+        )";
+        sqlx::query(sink_qry).execute(&db_pool).await?;
 
         Ok(db_pool)
     }
 
-    async fn log_report(&mut self, report: Report) -> anyhow::Result<()> {
+    async fn log_report(&mut self, report: Report) -> Result<(), sqlx::Error> {
         debug!("Progress logged report from {}", report.name);
 
         let data: Option<f64> = None;
