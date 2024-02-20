@@ -13,16 +13,16 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0"
 asynchronix = "0.2.0"
-diesel = { version = "2.1.0", features = ["sqlite"] }
-dotenvy = "0.15"
 env_logger = "0.10"
 indicatif = "0.17"
 indicatif-log-bridge = "0.2"
-libsqlite3-sys = { version = "0.27.0", features = ["bundled"] }
 log = "0.4"
 petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
 serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.7", features = [ "runtime-tokio", "sqlite"] }
 statrs = "0.16"
+tokio = { version = "1", features = ["full"] }
 toml = "0.8"

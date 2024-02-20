@@ -7,10 +7,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use anyhow::Ok;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
-use rusqlite::{Connection, Result};
+use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -26,6 +27,7 @@ pub struct Progress {
     num_sources: usize,
     finished_sources: usize,
     finished: bool,
+    db_pool: SqlitePool,
 }
 
 #[derive(Clone)]
@@ -59,6 +61,8 @@ impl Progress {
 
         let pg = multi.add(progress_bar);
 
+        let db_pool = Self::create_database();
+
         Progress {
             progress_bar: pg,
             progress_interval,
@@ -66,60 +70,53 @@ impl Progress {
             num_sources,
             finished_sources: 0,
             finished: false,
+            db_pool: db_pool.unwrap(),
         }
     }
 
-    fn create_database(&self) -> Result<()> {
-        let conn = Connection::open("statistics.db")?;
+    #[tokio::main]
+    async fn create_database() -> anyhow::Result<SqlitePool> {
+        Sqlite::create_database("statistics.db").await?;
 
-        conn.execute(
-            "CREATE TABLE sources (
-                name TEXT NOT NULL,
-                data BLOB
-            )",
-            (), // empty list of parameters.
-        )?;
+        let db_pool = SqlitePool::connect("statistics.db").await?;
 
-        conn.execute(
-            "CREATE TABLE switches (
-                name TEXT NOT NULL,
-                data BLOB
-            )",
-            (), // empty list of parameters.
-        )?;
+        sqlx::query("CREATE TABLE sources (name TEXT NOT NULL, data BLOB)")
+            .execute(&db_pool)
+            .await?;
 
-        conn.execute(
-            "CREATE TABLE sinks (
-                name TEXT NOT NULL,
-                data BLOB
-            )",
-            (), // empty list of parameters.
-        )?;
+        sqlx::query("CREATE TABLE switches (name TEXT NOT NULL, data BLOB)")
+            .execute(&db_pool)
+            .await?;
 
-        Ok(())
+        sqlx::query("CREATE TABLE sinks (name TEXT NOT NULL, data BLOB)")
+            .execute(&db_pool)
+            .await?;
+
+        Ok(db_pool)
     }
 
-    fn log_report(&mut self, report: Report) -> Result<()> {
-        let conn = Connection::open("statistics.db")?;
-
+    async fn log_report(&mut self, report: Report) -> anyhow::Result<()> {
         debug!("Progress logged report from {}", report.name);
 
         let data: Option<f64> = None;
         if report.name.contains("Source") {
-            conn.execute(
-                "INSERT INTO sources (name, data) VALUES (?1, ?2)",
-                (&report.name, data),
-            )?;
+            sqlx::query("INSERT INTO sources (name, data) VALUES (?1, ?2)")
+                .bind(&report.name)
+                .bind(data)
+                .execute(&self.db_pool)
+                .await?;
         } else if report.name.contains("Switch") {
-            conn.execute(
-                "INSERT INTO switchs (name, data) VALUES (?1, ?2)",
-                (&report.name, data),
-            )?;
+            sqlx::query("INSERT INTO switchs (name, data) VALUES (?1, ?2)")
+                .bind(&report.name)
+                .bind(data)
+                .execute(&self.db_pool)
+                .await?;
         } else if report.name.contains("Sink") {
-            conn.execute(
-                "INSERT INTO sinks (name, data) VALUES (?1, ?2)",
-                (&report.name, data),
-            )?;
+            sqlx::query("INSERT INTO sinks (name, data) VALUES (?1, ?2)")
+                .bind(&report.name)
+                .bind(data)
+                .execute(&self.db_pool)
+                .await?;
         }
 
         Ok(())
@@ -189,8 +186,6 @@ impl Model for Progress {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            let _ = self.create_database();
-
             self.run((), scheduler);
             self.into()
         })
