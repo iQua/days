@@ -14,13 +14,15 @@ edition = "2021"
 
 [dependencies]
 asynchronix = "0.2.0"
+diesel = { version = "2.1.0", features = ["sqlite"] }
+dotenvy = "0.15"
 env_logger = "0.10"
 indicatif = "0.17"
 indicatif-log-bridge = "0.2"
+libsqlite3-sys = { version = "0.27.0", features = ["bundled"] }
 log = "0.4"
 petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
-rusqlite = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 statrs = "0.16"
 toml = "0.8"
