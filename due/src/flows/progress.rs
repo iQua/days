@@ -3,7 +3,7 @@
 //! network elements (switches, packet sources, and packet sinks) into a SQLite
 //! database.
 
-use std::fs;
+use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -76,67 +76,75 @@ impl Progress {
     }
 
     #[tokio::main]
-    async fn create_database(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    async fn create_database(db_url: &str) -> Result<SqlitePool, Box<dyn Error>> {
         if Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-            match fs::remove_file(&db_url) {
-                Ok(_) => debug!("Existing database is deleted."),
-                Err(error) => panic!("Error {} occurred when deleting existing database.", error),
+            match Sqlite::create_database(&db_url).await {
+                Ok(_) => debug!("Created database {} to log packet statistics.", &db_url),
+                Err(error) => panic!("Error {} occurred when creating a database", error),
             }
         }
-        match Sqlite::create_database(&db_url).await {
-            Ok(_) => debug!("Created database {} to log packet statistics.", &db_url),
-            Err(error) => panic!("Error {} occurred when creating a database", error),
-        }
 
-        let db_pool = SqlitePool::connect("statistics.db").await?;
+        let db_pool = SqlitePool::connect(&db_url).await?;
 
-        let source_qry = "CREATE TABLE sources
+        sqlx::query!(
+            "CREATE TABLE IF NOT EXISTS sources
         (
             name        TEXT    NOT NULL,
             data        BLOB,
-            finished    BOOLEAN NOT NULL DEFAULT 0
-        )";
-        sqlx::query(source_qry).execute(&db_pool).await?;
+            finished    BOOLEAN NOT NULL
+        )",
+        )
+        .execute(&db_pool)
+        .await?;
 
-        let switch_qry = "CREATE TABLE switches
+        sqlx::query!(
+            "CREATE TABLE IF NOT EXISTS switches
         (
             name        TEXT    NOT NULL,
             data        BLOB,
-            finished    BOOLEAN NOT NULL DEFAULT 0
-        )";
-        sqlx::query(switch_qry).execute(&db_pool).await?;
+            finished    BOOLEAN NOT NULL
+        )",
+        )
+        .execute(&db_pool)
+        .await?;
 
-        let sink_qry = "CREATE TABLE sinks
+        sqlx::query!(
+            "CREATE TABLE IF NOT EXISTS sinks
         (
             name        TEXT    NOT NULL,
             data        BLOB,
-            finished    BOOLEAN NOT NULL DEFAULT 0
-        )";
-        sqlx::query(sink_qry).execute(&db_pool).await?;
+            finished    BOOLEAN NOT NULL
+        )",
+        )
+        .execute(&db_pool)
+        .await?;
 
         Ok(db_pool)
     }
 
-    async fn log_report(&mut self, report: Report) -> Result<(), sqlx::Error> {
+    async fn log_report(&mut self, report: Report) -> Result<(), Box<dyn Error>> {
         debug!("Progress logged report from {}", report.name);
 
         let data: Option<f64> = None;
         if report.name.contains("Source") {
-            sqlx::query("INSERT INTO sources (name, data) VALUES (?1, ?2)")
+            sqlx::query("INSERT INTO sources (name, data, finished) VALUES ($1, $2, $3)")
                 .bind(&report.name)
                 .bind(data)
+                .bind(false)
                 .execute(&self.db_pool)
                 .await?;
         } else if report.name.contains("Switch") {
-            sqlx::query("INSERT INTO switchs (name, data) VALUES (?1, ?2)")
+            sqlx::query("INSERT INTO switchs (name, data, finished) VALUES ($1, $2, $3)")
                 .bind(&report.name)
                 .bind(data)
+                .bind(false)
                 .execute(&self.db_pool)
                 .await?;
         } else if report.name.contains("Sink") {
-            sqlx::query("INSERT INTO sinks (name, data) VALUES (?1, ?2)")
+            sqlx::query("INSERT INTO sinks (name, data, finished) VALUES ($1, $2, $3)")
                 .bind(&report.name)
                 .bind(data)
+                .bind(false)
                 .execute(&self.db_pool)
                 .await?;
         }
