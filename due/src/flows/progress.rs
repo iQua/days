@@ -77,7 +77,7 @@ impl Progress {
 
     #[tokio::main]
     async fn create_database(db_url: &str) -> Result<SqlitePool, Box<dyn Error>> {
-        if Sqlite::database_exists(&db_url).await.unwrap_or(false) {
+        if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
             match Sqlite::create_database(&db_url).await {
                 Ok(_) => debug!("Created database {} to log packet statistics.", &db_url),
                 Err(error) => panic!("Error {} occurred when creating a database", error),
@@ -86,38 +86,71 @@ impl Progress {
 
         let db_pool = SqlitePool::connect(&db_url).await?;
 
-        sqlx::query!(
-            "CREATE TABLE IF NOT EXISTS sources
-        (
-            name        TEXT    NOT NULL,
-            data        BLOB,
-            finished    BOOLEAN NOT NULL
-        )",
-        )
-        .execute(&db_pool)
-        .await?;
+        let randomvar_fields = vec!["total", "mean", "std_dev", "min", "max"];
 
-        sqlx::query!(
-            "CREATE TABLE IF NOT EXISTS switches
-        (
-            name        TEXT    NOT NULL,
-            data        BLOB,
-            finished    BOOLEAN NOT NULL
-        )",
-        )
-        .execute(&db_pool)
-        .await?;
+        // creates a table for logging statistics of PacketSource
+        let mut query_str: String = "CREATE TABLE IF NOT EXISTS sources(
+        id              INTEGER NOT NULL,
+        time            REAL    NOT NULL,
+        sent_packets    INTEGER NOT NULL,
+        last_sent_time  REAL    NOT NULL,
+        finished        BOOLEAN NOT NULL,"
+            .to_owned();
+        let randomvar_vars = vec!["sent_time", "inter_sent_times", "packet_sizes"];
+        for var in randomvar_vars.iter() {
+            for field in randomvar_fields.iter() {
+                query_str.push_str(&format!("{var}_{field} REAL NOT NULL,"));
+            }
+        }
+        query_str.pop();
+        query_str.push_str(")");
+        sqlx::query(&query_str).execute(&db_pool).await?;
 
-        sqlx::query!(
-            "CREATE TABLE IF NOT EXISTS sinks
-        (
-            name        TEXT    NOT NULL,
-            data        BLOB,
-            finished    BOOLEAN NOT NULL
-        )",
-        )
-        .execute(&db_pool)
-        .await?;
+        // creates a table for logging statistics of PacketSwitch
+        let mut query_str: String = "CREATE TABLE IF NOT EXISTS switches(
+        id                  INTEGER NOT NULL,
+        time                REAL    NOT NULL,
+        last_arrival_time   REAL    NOT NULL,
+        finished            BOOLEAN NOT NULL,"
+            .to_owned();
+        let randomvar_vars = vec![
+            "arrival_time",
+            "inter_arrival_times",
+            "one_way_delays",
+            "queueing_delays",
+            "packet_sizes",
+        ];
+        for var in randomvar_vars.iter() {
+            for field in randomvar_fields.iter() {
+                query_str.push_str(&format!("{var}_{field} REAL NOT NULL,"));
+            }
+        }
+        query_str.pop();
+        query_str.push_str(")");
+        sqlx::query(&query_str).execute(&db_pool).await?;
+
+        // creates a table for logging statistics of PacketSink
+        let mut query_str: String = "CREATE TABLE IF NOT EXISTS sinks(
+        id                  INTEGER NOT NULL,
+        time                REAL    NOT NULL,
+        last_arrival_time   REAL    NOT NULL,
+        finished            BOOLEAN NOT NULL,"
+            .to_owned();
+        let randomvar_vars = vec![
+            "arrival_time",
+            "inter_arrival_times",
+            "one_way_delays",
+            "queueing_delays",
+            "packet_sizes",
+        ];
+        for var in randomvar_vars.iter() {
+            for field in randomvar_fields.iter() {
+                query_str.push_str(&format!("{var}_{field} REAL NOT NULL,"));
+            }
+        }
+        query_str.pop();
+        query_str.push_str(")");
+        sqlx::query(&query_str).execute(&db_pool).await?;
 
         Ok(db_pool)
     }
@@ -125,7 +158,7 @@ impl Progress {
     async fn log_report(&mut self, report: Report) -> Result<(), Box<dyn Error>> {
         debug!("Progress logged report from {}", report.name);
 
-        let data: Option<f64> = None;
+        let data = 1.0;
         if report.name.contains("Source") {
             sqlx::query("INSERT INTO sources (name, data, finished) VALUES ($1, $2, $3)")
                 .bind(&report.name)
