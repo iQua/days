@@ -197,6 +197,7 @@ impl PacketSink {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let name = format!("{self}");
+            let id = self.id() as u32;
             let statistics = match self {
                 PacketSink::BasicPacketSink(sink) => {
                     PacketStatistics::PacketSinkStatistics(sink.packet_statistics.clone())
@@ -208,6 +209,7 @@ impl PacketSink {
             self.report_output()
                 .send(Report {
                     name,
+                    id,
                     statistics,
                     finished: false,
                 })

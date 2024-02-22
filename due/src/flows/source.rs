@@ -305,6 +305,7 @@ impl PacketSource {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let name = format!("{self}");
+            let id = self.id() as u32;
             let statistics = match self {
                 PacketSource::DistPacketSource(source) => {
                     PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
@@ -316,6 +317,7 @@ impl PacketSource {
             self.report_output()
                 .send(Report {
                     name,
+                    id,
                     statistics,
                     finished: false,
                 })
@@ -358,6 +360,7 @@ impl PacketSource {
 
             if self.stop_run(now) {
                 let name = format!("{self}");
+                let id = self.id() as u32;
                 let statistics = match self {
                     PacketSource::DistPacketSource(source) => {
                         PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
@@ -371,6 +374,7 @@ impl PacketSource {
                 self.report_output()
                     .send(Report {
                         name,
+                        id,
                         statistics,
                         finished: true,
                     })

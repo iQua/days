@@ -206,6 +206,7 @@ impl PacketSwitch {
             self.report_output
                 .send(Report {
                     name,
+                    id: self.switch_id as u32,
                     statistics,
                     finished: false,
                 })

@@ -3,6 +3,7 @@
 //! network elements (switches, packet sources, and packet sinks) into a SQLite
 //! database.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
@@ -28,11 +29,13 @@ pub struct Progress {
     finished_sources: usize,
     finished: bool,
     db_pool: SqlitePool,
+    db_tables: HashMap<String, (String, usize)>,
 }
 
 #[derive(Clone)]
 pub struct Report {
     pub name: String,
+    pub id: u32,
     pub statistics: PacketStatistics,
     pub finished: bool,
 }
@@ -62,7 +65,7 @@ impl Progress {
         let pg = multi.add(progress_bar);
 
         let db_url = String::from("sqlite://statistics.db");
-        let db_pool = Self::create_database(&db_url).unwrap();
+        let (db_pool, db_tables) = Self::create_database(&db_url).unwrap();
 
         Progress {
             progress_bar: pg,
@@ -72,47 +75,64 @@ impl Progress {
             finished_sources: 0,
             finished: false,
             db_pool,
+            db_tables,
         }
     }
 
     #[tokio::main]
-    async fn create_database(db_url: &str) -> Result<SqlitePool, Box<dyn Error>> {
+    async fn create_database(
+        db_url: &str,
+    ) -> Result<(SqlitePool, HashMap<String, (String, usize)>), Box<dyn Error>> {
+        let db_pool = SqlitePool::connect(&db_url).await?;
         if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
             match Sqlite::create_database(&db_url).await {
                 Ok(_) => debug!("Created database {} to log packet statistics.", &db_url),
                 Err(error) => panic!("Error {} occurred when creating a database", error),
             }
+        } else {
+            for table in vec!["sources", "switches", "sinks"] {
+                sqlx::query(&format!("DROP TABLE {table}"))
+                    .execute(&db_pool)
+                    .await
+                    .expect("Failed to drop table.");
+            }
         }
 
-        let db_pool = SqlitePool::connect(&db_url).await?;
-
+        let mut db_tables: HashMap<String, (String, usize)> = Default::default();
         let randomvar_fields = vec!["total", "mean", "std_dev", "min", "max"];
 
         // creates a table for logging statistics of PacketSource
-        let mut query_str: String = "CREATE TABLE IF NOT EXISTS sources(
+        let mut query_str = "CREATE TABLE IF NOT EXISTS sources(
         id              INTEGER NOT NULL,
         time            REAL    NOT NULL,
         sent_packets    INTEGER NOT NULL,
         last_sent_time  REAL    NOT NULL,
         finished        BOOLEAN NOT NULL,"
             .to_owned();
+        let mut table_column = "id, time, sent_packets, last_sent_time, finished".to_owned();
+        let mut num_column = 5;
         let randomvar_vars = vec!["sent_time", "inter_sent_times", "packet_sizes"];
         for var in randomvar_vars.iter() {
             for field in randomvar_fields.iter() {
                 query_str.push_str(&format!("{var}_{field} REAL NOT NULL,"));
+                table_column.push_str(&format!(",{var}_{field}"));
+                num_column += 5;
             }
         }
         query_str.pop();
         query_str.push_str(")");
         sqlx::query(&query_str).execute(&db_pool).await?;
+        db_tables.insert("sources".to_string(), (table_column, num_column));
 
         // creates a table for logging statistics of PacketSwitch
-        let mut query_str: String = "CREATE TABLE IF NOT EXISTS switches(
+        let mut query_str = "CREATE TABLE IF NOT EXISTS switches(
         id                  INTEGER NOT NULL,
         time                REAL    NOT NULL,
         last_arrival_time   REAL    NOT NULL,
         finished            BOOLEAN NOT NULL,"
             .to_owned();
+        let mut table_column = "id, time, last_arrival_time, finished".to_owned();
+        let mut num_column = 4;
         let randomvar_vars = vec![
             "arrival_time",
             "inter_arrival_times",
@@ -123,19 +143,24 @@ impl Progress {
         for var in randomvar_vars.iter() {
             for field in randomvar_fields.iter() {
                 query_str.push_str(&format!("{var}_{field} REAL NOT NULL,"));
+                table_column.push_str(&format!(",{var}_{field}"));
+                num_column += 5;
             }
         }
         query_str.pop();
         query_str.push_str(")");
         sqlx::query(&query_str).execute(&db_pool).await?;
+        db_tables.insert("switches".to_string(), (table_column, num_column));
 
         // creates a table for logging statistics of PacketSink
-        let mut query_str: String = "CREATE TABLE IF NOT EXISTS sinks(
+        let mut query_str = "CREATE TABLE IF NOT EXISTS sinks(
         id                  INTEGER NOT NULL,
         time                REAL    NOT NULL,
         last_arrival_time   REAL    NOT NULL,
         finished            BOOLEAN NOT NULL,"
             .to_owned();
+        let mut table_column = "id, time, last_arrival_time, finished".to_owned();
+        let mut num_column = 4;
         let randomvar_vars = vec![
             "arrival_time",
             "inter_arrival_times",
@@ -146,13 +171,16 @@ impl Progress {
         for var in randomvar_vars.iter() {
             for field in randomvar_fields.iter() {
                 query_str.push_str(&format!("{var}_{field} REAL NOT NULL,"));
+                table_column.push_str(&format!(",{var}_{field}"));
+                num_column += 5;
             }
         }
         query_str.pop();
         query_str.push_str(")");
         sqlx::query(&query_str).execute(&db_pool).await?;
+        db_tables.insert("sinks".to_string(), (table_column, num_column));
 
-        Ok(db_pool)
+        Ok((db_pool, db_tables))
     }
 
     async fn log_report(&mut self, report: Report) -> Result<(), Box<dyn Error>> {
@@ -160,22 +188,28 @@ impl Progress {
 
         let data = 1.0;
         if report.name.contains("Source") {
-            sqlx::query("INSERT INTO sources (name, data, finished) VALUES ($1, $2, $3)")
-                .bind(&report.name)
+            let mut query_str = "INSERT INTO sources (".to_owned();
+            let (column, num_column) = self.db_tables.get("sources").unwrap();
+            query_str.push_str(&format!("{column}) VALUES (,"));
+            for i in 1..=num_column.clone() {
+                query_str.push_str(&format!("${i}),"));
+            }
+            sqlx::query("INSERT INTO sources (id, data, finished) VALUES ($1, $2, $3)")
+                .bind(&report.id)
                 .bind(data)
                 .bind(false)
                 .execute(&self.db_pool)
                 .await?;
         } else if report.name.contains("Switch") {
-            sqlx::query("INSERT INTO switchs (name, data, finished) VALUES ($1, $2, $3)")
-                .bind(&report.name)
+            sqlx::query("INSERT INTO switchs (id, data, finished) VALUES ($1, $2, $3)")
+                .bind(&report.id)
                 .bind(data)
                 .bind(false)
                 .execute(&self.db_pool)
                 .await?;
         } else if report.name.contains("Sink") {
-            sqlx::query("INSERT INTO sinks (name, data, finished) VALUES ($1, $2, $3)")
-                .bind(&report.name)
+            sqlx::query("INSERT INTO sinks (id, data, finished) VALUES ($1, $2, $3)")
+                .bind(&report.id)
                 .bind(data)
                 .bind(false)
                 .execute(&self.db_pool)
