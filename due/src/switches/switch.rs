@@ -26,16 +26,8 @@ pub struct PacketSwitch {
     pub outputs: HashMap<usize, Output<Packet>>,
 }
 
-impl std::fmt::Display for PacketSwitch {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "PacketSwitch {}", self.id())
-    }
-}
-
 impl PacketSwitch {
     pub fn new(fib: HashMap<usize, usize>, r_fib: HashMap<usize, usize>) -> PacketSwitch {
-        let switch_id = next_switch_id();
-
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
@@ -46,7 +38,7 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            switch_id,
+            switch_id: next_switch_id(),
             fib,
             r_fib,
             packets_received: 0,
