@@ -7,7 +7,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
 use crate::flows::progress::Report;
-use crate::flows::sink::PacketSinkStatistics;
+use crate::flows::sink::{PacketSinkReport, PacketSinkStatistics};
 use crate::next_endpoint_id;
 
 #[derive(Debug)]
@@ -19,6 +19,8 @@ pub struct BasicPacketSink {
     pub statistics: Output<PacketSinkStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    /// the report of a report interval
+    pub report: PacketSinkReport,
     /// the interval of sending a periodic report to the progress coroutine
     pub report_interval: f64,
     /// the sender for sedning reports
@@ -34,6 +36,7 @@ impl BasicPacketSink {
             packet_statistics: PacketSinkStatistics::new(sink_name),
             statistics: Output::default(),
             output: Output::default(),
+            report: PacketSinkReport::new(endpoint_id as u32, 0.0),
             report_interval,
             report_output: Output::default(),
         }

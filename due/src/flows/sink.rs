@@ -18,10 +18,54 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
-use crate::flows::progress::{PacketStatistics, Report};
+use crate::flows::progress::Report;
 use crate::flows::source::PacketSource;
 use crate::flows::statistics::RandomVar;
 use crate::flows::tcp_sink::TCPPacketSink;
+
+#[derive(Clone, Debug)]
+pub struct PacketSinkReport {
+    element_type: String,
+    id: u32,
+    /// the start time of this report interval
+    start_time: f64,
+    /// the end time of this report interval
+    end_time: f64,
+    /// the number of received packets in this report interval
+    received_packets: u32,
+    /// the size of received packets in this report interval
+    received_sizes: u32,
+    /// the mean of queueing delays of received packets in this report interval
+    queueing_delay_mean: f64,
+    /// the mean of one-way end-to-end delays of received packets in this report interval
+    one_way_delay_mean: f64,
+}
+
+impl PacketSinkReport {
+    pub fn new(id: u32, start_time: f64) -> Self {
+        PacketSinkReport {
+            element_type: "PacketSink".to_string(),
+            id,
+            start_time,
+            end_time: 0.0,
+            received_packets: 0,
+            received_sizes: 0,
+            queueing_delay_mean: 0.0,
+            one_way_delay_mean: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, packet: &Packet, now: f64) {
+        let num_packets = self.received_packets as f64;
+        self.queueing_delay_mean =
+            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
+        self.one_way_delay_mean = (self.one_way_delay_mean * num_packets + now
+            - packet.creation_time)
+            / (num_packets + 1.0);
+        self.received_packets += 1;
+        self.received_sizes += packet.size as u32;
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PacketSinkStatistics {
@@ -167,14 +211,20 @@ impl PacketSink {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
-                sink.packet_statistics.update(&packet, arrival_time)
+                sink.packet_statistics.update(&packet, now);
+                sink.report.update(&packet, now);
             }
-            PacketSink::TCPPacketSink(sink) => sink.packet_statistics.update(&packet, arrival_time),
+            PacketSink::TCPPacketSink(sink) => {
+                sink.packet_statistics.update(&packet, now);
+                sink.report.update(&packet, now);
+            }
         };
 
         debug!(
@@ -183,10 +233,10 @@ impl PacketSink {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            arrival_time,
+            now,
         );
 
-        self.wrap_up(packet, arrival_time).await;
+        self.wrap_up(packet, now).await;
     }
 
     /// Sends a perioid report of current statistics to the progress coroutine.
@@ -196,23 +246,27 @@ impl PacketSink {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let name = format!("{self}");
-            let id = self.id() as u32;
-            let statistics = match self {
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            let report = match self {
                 PacketSink::BasicPacketSink(sink) => {
-                    PacketStatistics::PacketSinkStatistics(sink.packet_statistics.clone())
+                    let mut basic_report = sink.report.clone();
+                    basic_report.end_time = now;
+                    sink.report = PacketSinkReport::new(sink.endpoint_id as u32, now);
+                    basic_report
                 }
                 PacketSink::TCPPacketSink(sink) => {
-                    PacketStatistics::PacketSinkStatistics(sink.packet_statistics.clone())
+                    let mut tcp_report = sink.report.clone();
+                    tcp_report.end_time = now;
+                    sink.report = PacketSinkReport::new(sink.endpoint_id as u32, now);
+                    tcp_report
                 }
             };
             self.report_output()
-                .send(Report {
-                    name,
-                    id,
-                    statistics,
-                    finished: false,
-                })
+                .send(Report::PacketSinkReport(report))
                 .await;
 
             scheduler
