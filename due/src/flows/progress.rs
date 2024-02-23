@@ -96,7 +96,7 @@ impl Progress {
         let table_column =
             "id, start_time, end_time, sent_packets, packet_sizes, ack_bytes, finished".to_string();
         let num_column = 7;
-        sqlx::query(
+        sqlx::query!(
             "CREATE TABLE IF NOT EXISTS sources(
                 id              INTEGER NOT NULL,
                 start_time      REAL    NOT NULL,
@@ -117,7 +117,7 @@ impl Progress {
         forwarded_sizes,throughput_mean,queueing_delay_mean"
             .to_string();
         let num_column = 11;
-        sqlx::query(
+        sqlx::query!(
             "CREATE TABLE IF NOT EXISTS switches(
                 id                     INTEGER NOT NULL,
                 start_time             REAL    NOT NULL,
@@ -141,7 +141,7 @@ impl Progress {
         received_sizes, queueing_delay_mean, one_way_delay_mean"
             .to_string();
         let num_column = 7;
-        sqlx::query(
+        sqlx::query!(
             "CREATE TABLE IF NOT EXISTS sinks(
                 id                     INTEGER NOT NULL,
                 start_time             REAL    NOT NULL,
