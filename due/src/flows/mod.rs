@@ -9,7 +9,6 @@ pub mod progress;
 pub mod route;
 pub mod sink;
 pub mod source;
-pub mod statistics;
 pub mod tcp_sink;
 pub mod tcp_source;
 pub mod wire;
