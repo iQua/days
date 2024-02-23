@@ -152,7 +152,7 @@ impl Display for RandomVar {
 }
 
 #[derive(Clone, Debug)]
-pub struct PacketSinkStatistics {
+pub struct PacketStatistics {
     sink_name: String,
     /// the arrival times of the packets
     arrival_times: RandomVar,
@@ -168,7 +168,7 @@ pub struct PacketSinkStatistics {
     packet_sizes: RandomVar,
 }
 
-impl Display for PacketSinkStatistics {
+impl Display for PacketStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -188,9 +188,9 @@ impl Display for PacketSinkStatistics {
     }
 }
 
-impl PacketSinkStatistics {
+impl PacketStatistics {
     pub fn new(sink_name: String) -> Self {
-        PacketSinkStatistics {
+        PacketStatistics {
             sink_name,
             arrival_times: RandomVar::new(),
             last_arrival_time: 0.0,
@@ -246,7 +246,7 @@ impl PacketSink {
         }
     }
 
-    pub fn statistics(&mut self) -> &mut Output<PacketSinkStatistics> {
+    pub fn statistics(&mut self) -> &mut Output<PacketStatistics> {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.statistics.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.statistics.borrow_mut(),

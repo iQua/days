@@ -7,16 +7,16 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
 use crate::flows::progress::Report;
-use crate::flows::sink::{PacketSinkReport, PacketSinkStatistics};
+use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
     pub endpoint_id: usize,
     /// the statistics of received packets
-    pub packet_statistics: PacketSinkStatistics,
+    pub packet_statistics: PacketStatistics,
     /// output: packet statistics
-    pub statistics: Output<PacketSinkStatistics>,
+    pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
     /// the report of a report interval
@@ -33,7 +33,7 @@ impl BasicPacketSink {
         let sink_name = format!("PacketSink {endpoint_id}");
         BasicPacketSink {
             endpoint_id,
-            packet_statistics: PacketSinkStatistics::new(sink_name),
+            packet_statistics: PacketStatistics::new(sink_name),
             statistics: Output::default(),
             output: Output::default(),
             report: PacketSinkReport::new(endpoint_id as u32, 0.0),
