@@ -417,6 +417,7 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % weights_len),
                     self.switch_config.drop,
                     weights.clone(),
+                    self.progress,
                 );
 
                 let mut output = Output::default();
