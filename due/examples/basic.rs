@@ -15,6 +15,7 @@ use due::flows::{DistributionInfo, TrafficCharacteristics};
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
+    let report_interval = 1.0;
 
     // instantiates models and their mailboxes
     let mut source = PacketSource::new(
@@ -31,7 +32,7 @@ fn main() {
             },
             None,
         ),
-        1.0,
+        report_interval,
         0,
     );
 

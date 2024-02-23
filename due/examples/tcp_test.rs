@@ -17,6 +17,7 @@ use due::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
+    let report_interval = 1.0;
 
     // instantiates models
     let mut source = PacketSource::new(
@@ -38,7 +39,7 @@ fn main() {
                 cc_algorithm: TCPReno,
             }),
         ),
-        1.0,
+        report_interval,
         0,
     );
 

@@ -18,6 +18,7 @@ use due::schedulers::drr::DRRServer;
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
+    let report_interval = 2.0;
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
@@ -34,7 +35,7 @@ fn main() {
             },
             None,
         ),
-        2.0,
+        report_interval,
         0,
     );
 
@@ -52,7 +53,7 @@ fn main() {
             },
             None,
         ),
-        2.0,
+        report_interval,
         0,
     );
 
@@ -63,6 +64,7 @@ fn main() {
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
         vec![1, 2],
+        report_interval,
     );
 
     let mut sink = PacketSink::new(&source_1);
