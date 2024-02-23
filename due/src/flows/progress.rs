@@ -19,7 +19,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
-use crate::switches::switch::PacketSwitchReport;
+use crate::schedulers::SchedulerReport;
 
 pub struct Progress {
     progress_bar: ProgressBar,
@@ -35,7 +35,7 @@ pub struct Progress {
 #[derive(Clone)]
 pub enum Report {
     PacketSourceReport(PacketSourceReport),
-    PacketSwitchReport(PacketSwitchReport),
+    SchedulerReport(SchedulerReport),
     PacketSinkReport(PacketSinkReport),
 }
 
@@ -112,7 +112,9 @@ impl Progress {
         db_tables.insert("sources".to_string(), (table_column, num_column));
 
         // creates a table for logging statistics of PacketSwitch
-        let table_column = "id, start_time, end_time, received_packets, dropped_packets,forwarded_packets,queue_length,received_sizes,forwarded_sizes,throughput_mean,queueing_delay_mean"
+        let table_column = "id, start_time, end_time, received_packets,
+        dropped_packets,forwarded_packets,queue_length,received_sizes,
+        forwarded_sizes,throughput_mean,queueing_delay_mean"
             .to_string();
         let num_column = 11;
         sqlx::query(
@@ -135,7 +137,8 @@ impl Progress {
         db_tables.insert("switches".to_string(), (table_column, num_column));
 
         // creates a table for logging statistics of PacketSink
-        let table_column = "id, start_time, end_time, received_packets, received_sizes,queueing_delay_mean, one_way_delay_mean"
+        let table_column = "id, start_time, end_time, received_packets,
+        received_sizes, queueing_delay_mean, one_way_delay_mean"
             .to_string();
         let num_column = 7;
         sqlx::query(
@@ -180,9 +183,9 @@ impl Progress {
                     .execute(&self.db_pool)
                     .await?;
             }
-            Report::PacketSwitchReport(switch_report) => {
+            Report::SchedulerReport(switch_report) => {
                 debug!(
-                    "Progress received report from PacketSwitch {}",
+                    "Progress received report from Scheduler {}",
                     switch_report.id
                 );
                 let mut query_str = "INSERT INTO switches (".to_owned();
@@ -267,7 +270,7 @@ impl Progress {
                     }
                 }
             }
-            Report::PacketSwitchReport(_) => {}
+            Report::SchedulerReport(_) => {}
             Report::PacketSinkReport(_) => {}
         }
     }

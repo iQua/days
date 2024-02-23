@@ -2,16 +2,19 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::SchedulerReport;
 
 pub struct Port {
     scheduler_id: usize,
@@ -32,6 +35,13 @@ pub struct Port {
     busy_until: f64,
 
     pub output: Output<Packet>,
+
+    /// the report of a report interval
+    pub report: SchedulerReport,
+    /// the interval of sending a periodic report to the progress coroutine
+    report_interval: f64,
+    /// the sender for sedning reports
+    pub report_output: Output<Report>,
 }
 
 impl Port {
@@ -40,6 +50,7 @@ impl Port {
         capacity: usize,
         capacity_unit: CapacityUnit,
         drop_strategy: DropStrategy,
+        report_interval: f64,
     ) -> Port {
         let scheduler_id = next_scheduler_id();
 
@@ -65,6 +76,9 @@ impl Port {
             queue: VecDeque::new(),
             busy_until: 0.0,
             output: Output::default(),
+            report: SchedulerReport::new(scheduler_id as u32, 0.0),
+            report_interval,
+            report_output: Output::default(),
         }
     }
 
@@ -75,6 +89,8 @@ impl Port {
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        self.report.receive_update(&packet);
 
         // drops the packet if the buffer is full
         let should_drop_packet =
@@ -161,6 +177,49 @@ impl Port {
             }
         }
     }
+
+    /// Sends a perioid report of current statistics to the progress coroutine.
+    fn send_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            self.report.end_time = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            let report = Report::SchedulerReport(self.report.clone());
+
+            self.report_output.send(report).await;
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
-impl Model for Port {}
+impl Model for Port {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+
+            self.into()
+        })
+    }
+}
