@@ -1,7 +1,7 @@
 //! Implements a packet switch with a demultiplexer based on flow classes.
 
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -12,68 +12,58 @@ use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
-use crate::flows::progress::{PacketStatistics, Report};
-use crate::flows::statistics::RandomVar;
+use crate::flows::progress::Report;
 use crate::next_switch_id;
 
 #[derive(Clone, Debug)]
-pub struct PacketSwitchStatistics {
-    switch_name: String,
-    /// the arrival times of the packets
-    arrival_times: RandomVar,
-    /// the last arrival time
-    last_arrival_time: f64,
-    /// the inter-arrival times of the packets
-    inter_arrival_times: RandomVar,
-    /// the one-way end-to-end delays of the packets
-    one_way_delays: RandomVar,
-    /// the total time spent waiting in queues
-    queueing_delays: RandomVar,
-    /// the size of the packets
-    packet_sizes: RandomVar,
+pub struct PacketSwitchReport {
+    pub id: u32,
+    /// the start time of this report interval
+    pub start_time: f64,
+    /// the end time of this report interval
+    pub end_time: f64,
+    /// the number of received packets in this report interval
+    pub received_packets: u32,
+    pub dropped_packets: u32,
+    pub forwarded_packets: u32,
+    pub queue_length: u32,
+    /// the size of received packets in this report interval
+    pub received_sizes: u32,
+    pub forwarded_sizes: u32,
+    pub throughput_mean: f64,
+    /// the mean of queueing delays of the packets
+    pub queueing_delay_mean: f64,
 }
 
-impl Display for PacketSwitchStatistics {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "{} recorded statistics: \n\
-            Arrival times: {:#.3} \n\
-            Inter-arrival times: {:#.3} \n\
-            One-way delays: {:#.3} \n\
-            Queueing delays: {:#.3} \n\
-            Packet sizes: {:#.3} \n",
-            self.switch_name,
-            self.arrival_times,
-            self.inter_arrival_times,
-            self.one_way_delays,
-            self.queueing_delays,
-            self.packet_sizes,
-        )
-    }
-}
-
-impl PacketSwitchStatistics {
-    pub fn new(switch_name: String) -> Self {
-        PacketSwitchStatistics {
-            switch_name,
-            arrival_times: RandomVar::new(),
-            last_arrival_time: 0.0,
-            inter_arrival_times: RandomVar::new(),
-            one_way_delays: RandomVar::new(),
-            queueing_delays: RandomVar::new(),
-            packet_sizes: RandomVar::new(),
+impl PacketSwitchReport {
+    pub fn new(id: u32, start_time: f64) -> Self {
+        PacketSwitchReport {
+            id,
+            start_time,
+            end_time: 0.0,
+            received_packets: 0,
+            dropped_packets: 0,
+            forwarded_packets: 0,
+            queue_length: 0,
+            received_sizes: 0,
+            forwarded_sizes: 0,
+            throughput_mean: 0.0,
+            queueing_delay_mean: 0.0,
         }
     }
 
-    pub fn update(&mut self, packet: &Packet, now: f64) {
-        self.arrival_times.tabulate(now);
-        self.inter_arrival_times
-            .tabulate(now - self.last_arrival_time);
-        self.last_arrival_time = now;
-        self.one_way_delays.tabulate(now - packet.creation_time);
-        self.queueing_delays.tabulate(packet.queueing_delay);
-        self.packet_sizes.tabulate(packet.size as u32);
+    pub fn receive_update(&mut self, packet: &Packet) {
+        self.received_packets += 1;
+        self.received_sizes += packet.size as u32;
+    }
+
+    pub fn forward_update(&mut self, packet: &Packet) {
+        self.forwarded_packets += 1;
+        self.forwarded_sizes += packet.size as u32;
+    }
+
+    pub fn drop_update(&mut self, packet: &Packet) {
+        self.dropped_packets += 1;
     }
 }
 
@@ -92,8 +82,8 @@ pub struct PacketSwitch {
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
 
-    /// the statistics of received packets
-    pub packet_statistics: PacketSwitchStatistics,
+    /// the report of a report interval
+    pub report: PacketSwitchReport,
     /// the interval of sending a periodic report to the progress coroutine
     report_interval: f64,
     /// the sender for sedning reports
@@ -130,7 +120,7 @@ impl PacketSwitch {
             r_fib,
             packets_received: 0,
             outputs,
-            packet_statistics: PacketSwitchStatistics::new(switch_name),
+            report: PacketSwitchReport::new(switch_id as u32, 0.0),
             report_interval,
             report_output: Output::default(),
         }
@@ -157,7 +147,7 @@ impl PacketSwitch {
         if packet.ack.is_none() {
             self.packets_received += 1;
 
-            self.packet_statistics.update(&packet, now);
+            self.report.receive_update(&packet);
 
             debug!(
                 "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -200,17 +190,14 @@ impl PacketSwitch {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let name = format!("{self}");
-            let statistics =
-                PacketStatistics::PacketSwitchStatistics(self.packet_statistics.clone());
-            self.report_output
-                .send(Report {
-                    name,
-                    id: self.switch_id as u32,
-                    statistics,
-                    finished: false,
-                })
-                .await;
+            self.report.end_time = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            let report = Report::PacketSwitchReport(self.report.clone());
+
+            self.report_output.send(report).await;
 
             scheduler
                 .schedule_event(
