@@ -3,16 +3,20 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 use log::debug;
 
 use crate::flows::packet::Packet;
+use crate::flows::progress::Report;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::SchedulerReport;
 
 pub struct SPServer {
     scheduler_id: usize,
@@ -47,6 +51,13 @@ pub struct SPServer {
     busy_until: f64,
 
     pub output: Output<Packet>,
+
+    /// the report of a report interval
+    pub report: SchedulerReport,
+    /// the interval of sending a periodic report to the progress coroutine
+    report_interval: f64,
+    /// the sender for sedning reports
+    pub report_output: Output<Report>,
 }
 
 impl SPServer {
@@ -57,6 +68,7 @@ impl SPServer {
         flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
         priorities: HashMap<usize, usize>,
+        report_interval: f64,
     ) -> SPServer {
         let scheduler_id = next_scheduler_id();
 
@@ -84,6 +96,9 @@ impl SPServer {
             priorities,
             busy_until: 0.0,
             output: Output::default(),
+            report: SchedulerReport::new(scheduler_id as u32, 0.0),
+            report_interval,
+            report_output: Output::default(),
         }
     }
 
@@ -105,6 +120,7 @@ impl SPServer {
         // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
+            self.report.dropped_packets += 1;
             debug! {
                 "SPServer {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
@@ -117,6 +133,8 @@ impl SPServer {
 
         // the case that this packet will not be dropped
         self.packets_received += 1;
+
+        self.report.receive_update(&packet);
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -149,6 +167,7 @@ impl SPServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        self.report.forward_update(&packet);
         self.output.send(packet).await;
     }
 
@@ -208,6 +227,52 @@ impl SPServer {
             );
         }
     }
+
+    /// Sends a perioid report of current statistics to the progress coroutine.
+    fn send_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            self.report.end_time = now;
+            let report = Report::SchedulerReport(self.report.clone());
+            self.report_output.send(report).await;
+
+            // resets the report
+            self.report = SchedulerReport::new(self.scheduler_id as u32, now);
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
-impl Model for SPServer {}
+impl Model for SPServer {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(self.report_interval),
+                    Self::send_report,
+                    (),
+                )
+                .unwrap();
+
+            self.into()
+        })
+    }
+}
