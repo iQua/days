@@ -44,17 +44,22 @@ impl SchedulerReport {
         }
     }
 
+    /// Updates the report when receiving a packet.
     pub fn receive_update(&mut self, packet: &Packet) {
         self.received_packets += 1;
         self.received_sizes += packet.size as u32;
+        self.queue_length += packet.size as u32;
     }
 
+    /// Updates the report when forwarding a packet.
     pub fn forward_update(&mut self, packet: &Packet) {
+        let num_packets = self.forwarded_packets as f64;
+        self.queueing_delay_mean =
+            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
+
         self.forwarded_packets += 1;
         self.forwarded_sizes += packet.size as u32;
-    }
-
-    pub fn drop_update(&mut self) {
-        self.dropped_packets += 1;
+        self.queue_length -= packet.size as u32;
+        self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.start_time);
     }
 }

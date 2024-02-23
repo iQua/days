@@ -90,8 +90,6 @@ impl Port {
         let now = scheduler.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        self.report.receive_update(&packet);
-
         // drops the packet if the buffer is full
         let should_drop_packet =
             self.drop_strategy
@@ -100,6 +98,7 @@ impl Port {
         // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
+            self.report.dropped_packets += 1;
             debug!(
                 "Port {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id, packet.packet_id, packet.flow_id, arrival_time
@@ -111,6 +110,8 @@ impl Port {
         self.packets_received += 1;
         self.queue.push_back(packet.clone());
         self.bytes_in_queue += packet.size;
+
+        self.report.receive_update(&packet);
 
         debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -130,6 +131,7 @@ impl Port {
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        self.report.forward_update(&packet);
         self.output.send(packet).await;
     }
 
