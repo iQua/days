@@ -565,8 +565,8 @@ impl Topology {
 
     /// Creates and activates a progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
-    fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
-        let progress = Progress::new(self.progress, self.duration, self.flows.len());
+    async fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
+        let progress = Progress::new(self.progress, self.duration, self.flows.len()).await;
         self.sim_init = self.sim_init.add_model(progress, report_mbox);
 
         self
@@ -587,7 +587,7 @@ impl Topology {
         self.sim_init.init(MonotonicTime::EPOCH)
     }
 
-    pub fn run(mut self, graph: UnGraph<usize, ()>) {
+    pub async fn run(mut self, graph: UnGraph<usize, ()>) {
         let mut statistics = SinkStatistics::default();
 
         // initializes mailboxes for the packet switches
@@ -607,7 +607,7 @@ impl Topology {
         self.route_flows();
 
         // creates and activates a progress coroutine
-        self = self.activate_progress(report_mbox);
+        self = self.activate_progress(report_mbox).await;
 
         let duration = self.duration;
 

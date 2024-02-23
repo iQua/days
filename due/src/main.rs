@@ -11,7 +11,8 @@ use due::seed_from_config;
 use due::topos::build::build_graph;
 use due::topos::topo::Topology;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
@@ -73,5 +74,5 @@ fn main() {
     let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
-    topology.run(graph);
+    topology.run(graph).await;
 }

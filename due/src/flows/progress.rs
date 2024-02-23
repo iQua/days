@@ -40,7 +40,7 @@ pub enum Report {
 }
 
 impl Progress {
-    pub fn new(progress_interval: f64, duration: f64, num_sources: usize) -> Progress {
+    pub async fn new(progress_interval: f64, duration: f64, num_sources: usize) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
@@ -56,8 +56,8 @@ impl Progress {
 
         let pg = multi.add(progress_bar);
 
-        let db_url = String::from("sqlite://statistics.db");
-        let (db_pool, db_tables) = Self::create_database(&db_url).unwrap();
+        let db_url = String::from("sqlite://output.db");
+        let (db_pool, db_tables) = Self::create_database(&db_url).await.unwrap();
 
         Progress {
             progress_bar: pg,
@@ -71,28 +71,24 @@ impl Progress {
         }
     }
 
-    #[tokio::main]
     async fn create_database(
         db_url: &str,
     ) -> Result<(SqlitePool, HashMap<String, (String, usize)>), Box<dyn Error>> {
-        let db_pool = SqlitePool::connect(&db_url).await?;
         if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-            match Sqlite::create_database(&db_url).await {
-                Ok(_) => debug!("Created database {} to log packet statistics.", &db_url),
-                Err(error) => panic!("Error {} occurred when creating a database", error),
-            }
-        } else {
-            for table in vec!["sources", "switches", "sinks"] {
-                sqlx::query(&format!("DROP TABLE {table}"))
-                    .execute(&db_pool)
-                    .await
-                    .expect("Failed to drop table.");
-            }
+            Sqlite::create_database(&db_url).await?;
+            debug!("Created database {} to log outputs.", &db_url);
+        }
+        let db_pool = SqlitePool::connect(&db_url).await?;
+
+        for table in vec!["sources", "switches", "sinks"] {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+                .execute(&db_pool)
+                .await?;
         }
 
         let mut db_tables: HashMap<String, (String, usize)> = Default::default();
 
-        // creates a table for logging statistics of PacketSource
+        // creates a table for logging reports of PacketSource
         let table_column =
             "id, start_time, end_time, sent_packets, packet_sizes, ack_bytes, finished".to_string();
         let num_column = 7;
@@ -111,7 +107,7 @@ impl Progress {
         .await?;
         db_tables.insert("sources".to_string(), (table_column, num_column));
 
-        // creates a table for logging statistics of PacketSwitch
+        // creates a table for logging reports of PacketSwitch
         let table_column = "id, start_time, end_time, received_packets,
         dropped_packets,forwarded_packets,queue_length,received_sizes,
         forwarded_sizes,throughput_mean,queueing_delay_mean"
@@ -136,7 +132,7 @@ impl Progress {
         .await?;
         db_tables.insert("switches".to_string(), (table_column, num_column));
 
-        // creates a table for logging statistics of PacketSink
+        // creates a table for logging reports of PacketSink
         let table_column = "id, start_time, end_time, received_packets,
         received_sizes, queueing_delay_mean, one_way_delay_mean"
             .to_string();

@@ -8,12 +8,13 @@ use due::flows::flow::Flow;
 use due::topos::build::build_graph;
 use due::topos::topo::Topology;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
-    //let file_path = "configs/tcp_simple.toml";
-    let file_path = "configs/tcp_fattree.toml";
+    let file_path = "configs/tcp_simple.toml";
+    //let file_path = "configs/tcp_fattree.toml";
 
     let (graph, hosts) = build_graph(file_path);
     info!("The FatTree graph has been initialized.");
@@ -31,5 +32,5 @@ fn main() {
     let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
-    topology.run(graph);
+    topology.run(graph).await;
 }
