@@ -388,6 +388,7 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % vticks_len),
                     self.switch_config.drop,
                     vticks.clone(),
+                    self.progress,
                 );
 
                 let mut output = Output::default();
