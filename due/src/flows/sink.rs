@@ -25,26 +25,24 @@ use crate::flows::tcp_sink::TCPPacketSink;
 
 #[derive(Clone, Debug)]
 pub struct PacketSinkReport {
-    element_type: String,
-    id: u32,
+    pub id: u32,
     /// the start time of this report interval
-    start_time: f64,
+    pub start_time: f64,
     /// the end time of this report interval
-    end_time: f64,
+    pub end_time: f64,
     /// the number of received packets in this report interval
-    received_packets: u32,
+    pub received_packets: u32,
     /// the size of received packets in this report interval
-    received_sizes: u32,
+    pub received_sizes: u32,
     /// the mean of queueing delays of received packets in this report interval
-    queueing_delay_mean: f64,
+    pub queueing_delay_mean: f64,
     /// the mean of one-way end-to-end delays of received packets in this report interval
-    one_way_delay_mean: f64,
+    pub one_way_delay_mean: f64,
 }
 
 impl PacketSinkReport {
     pub fn new(id: u32, start_time: f64) -> Self {
         PacketSinkReport {
-            element_type: "PacketSink".to_string(),
             id,
             start_time,
             end_time: 0.0,

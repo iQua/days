@@ -24,25 +24,23 @@ use crate::get_seed;
 
 #[derive(Clone, Debug)]
 pub struct PacketSourceReport {
-    element_type: String,
-    id: u32,
+    pub id: u32,
     /// the start time of this report interval
-    start_time: f64,
+    pub start_time: f64,
     /// the end time of this report interval
-    end_time: f64,
+    pub end_time: f64,
     /// the number of sent packets in this report interval
-    sent_packets: u32,
+    pub sent_packets: u32,
     /// the size of sent packets in this report interval
-    packet_sizes: u32,
+    pub packet_sizes: u32,
     /// the number of acknowledged bytes in this report interval
-    ack_bytes: u32,
-    finished: bool,
+    pub ack_bytes: u32,
+    pub finished: bool,
 }
 
 impl PacketSourceReport {
     pub fn new(id: u32, start_time: f64) -> Self {
         PacketSourceReport {
-            element_type: "PacketSource".to_string(),
             id,
             start_time,
             end_time: 0.0,
