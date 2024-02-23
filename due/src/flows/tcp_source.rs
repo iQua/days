@@ -113,7 +113,6 @@ impl TCPPacketSource {
         rng: SmallRng,
     ) -> TCPPacketSource {
         let endpoint_id = next_endpoint_id();
-        let source_name = format!("TCPPacketSource {endpoint_id}");
 
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 

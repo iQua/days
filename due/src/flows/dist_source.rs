@@ -43,7 +43,6 @@ impl DistPacketSource {
         rng: SmallRng,
     ) -> DistPacketSource {
         let endpoint_id = next_endpoint_id();
-        let source_name = format!("DistPacketSource {endpoint_id}");
 
         DistPacketSource {
             endpoint_id,

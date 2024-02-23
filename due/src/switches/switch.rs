@@ -62,7 +62,7 @@ impl PacketSwitchReport {
         self.forwarded_sizes += packet.size as u32;
     }
 
-    pub fn drop_update(&mut self, packet: &Packet) {
+    pub fn drop_update(&mut self) {
         self.dropped_packets += 1;
     }
 }
@@ -103,7 +103,6 @@ impl PacketSwitch {
         report_interval: f64,
     ) -> PacketSwitch {
         let switch_id = next_switch_id();
-        let switch_name = format!("PacketSwitch {switch_id}");
 
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
