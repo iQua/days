@@ -187,14 +187,17 @@ impl Port {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            self.report.end_time = scheduler
+            let now = scheduler
                 .time()
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
+            self.report.end_time = now;
             let report = Report::SchedulerReport(self.report.clone());
-
             self.report_output.send(report).await;
+
+            // resets the report
+            self.report = SchedulerReport::new(self.scheduler_id as u32, now);
 
             scheduler
                 .schedule_event(
