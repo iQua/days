@@ -15,7 +15,7 @@ use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
 use crate::flows::progress::Report;
-use crate::flows::source::PacketSourceStatistics;
+use crate::flows::source::PacketSourceReport;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
 
@@ -88,8 +88,8 @@ pub struct TCPPacketSource {
 
     pub output: Output<Packet>,
 
-    /// the statistics of sent packets
-    pub packet_statistics: PacketSourceStatistics,
+    /// the report of a report interval
+    pub report: PacketSourceReport,
     /// the interval of sending a periodic report to the progress coroutine
     pub report_interval: f64,
     /// the sender for sedning reports
@@ -142,7 +142,7 @@ impl TCPPacketSource {
             busy_until: 0.0,
             packets_sent: 0,
             output: Output::default(),
-            packet_statistics: PacketSourceStatistics::new(source_name),
+            report: PacketSourceReport::new(endpoint_id as u32, 0.0),
             report_interval,
             report_output: Output::default(),
         }
@@ -280,7 +280,7 @@ impl TCPPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
 
-        self.packet_statistics.update(&packet, now);
+        self.report.update(&packet);
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",

@@ -2,7 +2,7 @@
 //! packet sources.
 
 use std::borrow::BorrowMut;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -17,63 +17,50 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
-use crate::flows::progress::{PacketStatistics, Report};
-use crate::flows::statistics::RandomVar;
+use crate::flows::progress::Report;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
 
 #[derive(Clone, Debug)]
-pub struct PacketSourceStatistics {
-    source_name: String,
-    /// the number of sent packets
-    sent_packets: usize,
-    /// the sent times of the packets
-    sent_times: RandomVar,
-    /// the last sent time
-    last_sent_time: f64,
-    /// the inter-sent times of the packets
-    inter_sent_times: RandomVar,
-    /// the size of the packets
-    packet_sizes: RandomVar,
+pub struct PacketSourceReport {
+    element_type: String,
+    id: u32,
+    /// the start time of this report interval
+    start_time: f64,
+    /// the end time of this report interval
+    end_time: f64,
+    /// the number of sent packets in this report interval
+    sent_packets: u32,
+    /// the size of sent packets in this report interval
+    packet_sizes: u32,
+    /// the number of acknowledged bytes in this report interval
+    ack_bytes: u32,
+    finished: bool,
 }
 
-impl Display for PacketSourceStatistics {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "{} recorded statistics: \n\
-            Sent packets: {} \n\
-            Sent times: {:#.3} \n\
-            Inter-sent times: {:#.3} \n\
-            Packet sizes: {:#.3} \n",
-            self.source_name,
-            self.sent_packets,
-            self.sent_times,
-            self.inter_sent_times,
-            self.packet_sizes,
-        )
-    }
-}
-
-impl PacketSourceStatistics {
-    pub fn new(source_name: String) -> Self {
-        PacketSourceStatistics {
-            source_name,
+impl PacketSourceReport {
+    pub fn new(id: u32, start_time: f64) -> Self {
+        PacketSourceReport {
+            element_type: "PacketSource".to_string(),
+            id,
+            start_time,
+            end_time: 0.0,
             sent_packets: 0,
-            sent_times: RandomVar::new(),
-            last_sent_time: 0.0,
-            inter_sent_times: RandomVar::new(),
-            packet_sizes: RandomVar::new(),
+            packet_sizes: 0,
+            ack_bytes: 0,
+            finished: false,
         }
     }
 
-    pub fn update(&mut self, packet: &Packet, now: f64) {
+    pub fn update(&mut self, packet: &Packet) {
         self.sent_packets += 1;
-        self.sent_times.tabulate(now);
-        self.inter_sent_times.tabulate(now - self.last_sent_time);
-        self.last_sent_time = now;
-        self.packet_sizes.tabulate(packet.size as u32);
+        self.packet_sizes += packet.size as u32;
+    }
+
+    pub fn last_update(&mut self, end_time: f64, ack_bytes: u32) {
+        self.end_time = end_time;
+        self.ack_bytes = ack_bytes;
     }
 }
 
@@ -174,8 +161,12 @@ impl PacketSource {
 
     fn prepare_run(&mut self, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
-            PacketSource::DistPacketSource(_) => {}
+            PacketSource::DistPacketSource(source) => {
+                source.report = PacketSourceReport::new(source.endpoint_id as u32, initial_delay);
+            }
             PacketSource::TCPPacketSource(source) => {
+                source.report = PacketSourceReport::new(source.endpoint_id as u32, initial_delay);
+
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
 
@@ -304,23 +295,32 @@ impl PacketSource {
         scheduler: &'a Scheduler<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let name = format!("{self}");
-            let id = self.id() as u32;
-            let statistics = match self {
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            let report = match self {
                 PacketSource::DistPacketSource(source) => {
-                    PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                    let mut dist_report = source.report.clone();
+                    dist_report.last_update(now, 0 as u32);
+
+                    source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
+
+                    dist_report
                 }
                 PacketSource::TCPPacketSource(source) => {
-                    PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                    let mut tcp_report = source.report.clone();
+                    tcp_report.last_update(now, source.last_ack as u32);
+
+                    source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
+
+                    tcp_report
                 }
             };
+
             self.report_output()
-                .send(Report {
-                    name,
-                    id,
-                    statistics,
-                    finished: false,
-                })
+                .send(Report::PacketSourceReport(report))
                 .await;
 
             scheduler
@@ -360,24 +360,25 @@ impl PacketSource {
 
             if self.stop_run(now) {
                 let name = format!("{self}");
-                let id = self.id() as u32;
-                let statistics = match self {
+
+                let mut report = match self {
                     PacketSource::DistPacketSource(source) => {
-                        PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                        let mut dist_report = source.report.clone();
+                        dist_report.last_update(now, 0 as u32);
+                        dist_report
                     }
                     PacketSource::TCPPacketSource(source) => {
-                        PacketStatistics::PacketSourceStatistics(source.packet_statistics.clone())
+                        let mut tcp_report = source.report.clone();
+                        tcp_report.last_update(now, source.last_ack as u32);
+                        tcp_report
                     }
                 };
+                report.finished = true;
+
                 debug!("{} finished running at {:.3}.", name, now);
 
                 self.report_output()
-                    .send(Report {
-                        name,
-                        id,
-                        statistics,
-                        finished: true,
-                    })
+                    .send(Report::PacketSourceReport(report))
                     .await;
             }
         }
