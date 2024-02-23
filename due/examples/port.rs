@@ -33,7 +33,7 @@ fn main() {
             },
             None,
         ),
-        0.01,
+        1.0,
         0,
     );
 
@@ -51,11 +51,17 @@ fn main() {
             },
             None,
         ),
-        0.01,
+        1.0,
         0,
     );
 
-    let mut port = Port::new(8000.0, 100, CapacityUnit::Packets, DropStrategy::TailDrop);
+    let mut port = Port::new(
+        8000.0,
+        100,
+        CapacityUnit::Packets,
+        DropStrategy::TailDrop,
+        1.0,
+    );
 
     let mut sink = PacketSink::new(&source_1);
     let source_1_mbox = Mailbox::new();

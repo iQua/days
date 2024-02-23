@@ -38,7 +38,7 @@ fn main() {
                 cc_algorithm: TCPReno,
             }),
         ),
-        0.01,
+        1.0,
         0,
     );
 
