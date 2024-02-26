@@ -348,6 +348,10 @@ impl WFQServer {
             self.report.end_time = now;
             let report = Report::SchedulerReport(self.report.clone());
             self.report_output.send(report).await;
+            debug!(
+                "WFQServer {} sent a periodic report at time {:.3}.",
+                self.scheduler_id, now
+            );
 
             // resets the report
             self.report = SchedulerReport::new(self.scheduler_id as u32, now);

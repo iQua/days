@@ -320,6 +320,11 @@ impl PacketSource {
             self.report_output()
                 .send(Report::PacketSourceReport(report))
                 .await;
+            debug!(
+                "{} sent a periodic report at time {:.3}.",
+                format!("{self}"),
+                now
+            );
 
             scheduler
                 .schedule_event(
