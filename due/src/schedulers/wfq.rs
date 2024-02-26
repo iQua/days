@@ -96,7 +96,7 @@ pub struct WFQServer {
     pub report: SchedulerReport,
     /// the interval of sending a periodic report to the progress coroutine
     report_interval: f64,
-    /// the sender for sending reports
+    /// the sender for sending periodic reports
     pub report_output: Output<Report>,
 }
 
