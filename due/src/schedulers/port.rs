@@ -201,7 +201,7 @@ impl Port {
             );
 
             // resets the report
-            self.report = SchedulerReport::new(self.scheduler_id as u32, now);
+            self.report = self.report.reset(now);
 
             scheduler
                 .schedule_event(

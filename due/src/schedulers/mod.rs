@@ -44,6 +44,13 @@ impl SchedulerReport {
         }
     }
 
+    pub fn reset(&mut self, start_time: f64) -> SchedulerReport {
+        let queue_length = self.queue_length;
+        let mut new_report = SchedulerReport::new(self.id, start_time);
+        new_report.queue_length = queue_length;
+        new_report
+    }
+
     /// Updates the report when receiving a packet.
     pub fn receive_update(&mut self, packet: &Packet) {
         self.received_packets += 1;
