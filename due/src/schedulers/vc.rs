@@ -318,7 +318,6 @@ impl VirtualClockServer {
                 self.scheduler_id, now
             );
 
-            // resets the report
             self.report = self.report.reset(now);
 
             scheduler
