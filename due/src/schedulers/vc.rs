@@ -103,7 +103,7 @@ pub struct VirtualClockServer {
     pub report: SchedulerReport,
     /// the interval of sending a periodic report to the progress coroutine
     report_interval: f64,
-    /// the sender for sedning reports
+    /// the sender for sending reports
     pub report_output: Output<Report>,
 }
 
