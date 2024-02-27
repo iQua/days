@@ -160,10 +160,10 @@ impl PacketSource {
     fn prepare_run(&mut self, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => {
-                source.report = PacketSourceReport::new(source.endpoint_id as u32, initial_delay);
+                source.report.start_time = initial_delay;
             }
             PacketSource::TCPPacketSource(source) => {
-                source.report = PacketSourceReport::new(source.endpoint_id as u32, initial_delay);
+                source.report.start_time = initial_delay;
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
