@@ -156,6 +156,7 @@ impl Progress {
     }
 
     async fn log_report(&mut self, report: Report) -> Result<(), Box<dyn Error>> {
+        println!("!!!LOG");
         match report {
             Report::PacketSourceReport(source_report) => {
                 debug!(
@@ -232,8 +233,8 @@ impl Progress {
         Ok(())
     }
 
-    pub fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
-        let _ = self.log_report(report.clone());
+    pub async fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
+        let _ = self.log_report(report.clone()).await;
 
         match report {
             Report::PacketSourceReport(source_report) => {
