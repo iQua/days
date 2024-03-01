@@ -3,6 +3,8 @@
 seed = 100
 mailbox_capacity = 100
 duration = 0.1
+progress = 0.01
+db_path = "./tcp_fattree.db"
 
 [topology]
 category = "FatTree"
