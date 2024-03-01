@@ -298,41 +298,43 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            let report = match self {
-                PacketSource::DistPacketSource(source) => {
-                    let mut dist_report = source.report.clone();
-                    dist_report.last_update(now, 0 as u32);
+            if !self.stop_run(now) {
+                let report = match self {
+                    PacketSource::DistPacketSource(source) => {
+                        let mut dist_report = source.report.clone();
+                        dist_report.last_update(now, 0 as u32);
 
-                    source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
+                        source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
 
-                    dist_report
-                }
-                PacketSource::TCPPacketSource(source) => {
-                    let mut tcp_report = source.report.clone();
-                    tcp_report.last_update(now, source.last_ack as u32);
+                        dist_report
+                    }
+                    PacketSource::TCPPacketSource(source) => {
+                        let mut tcp_report = source.report.clone();
+                        tcp_report.last_update(now, source.last_ack as u32);
 
-                    source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
+                        source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
 
-                    tcp_report
-                }
-            };
+                        tcp_report
+                    }
+                };
 
-            self.report_output()
-                .send(Report::PacketSourceReport(report))
-                .await;
-            debug!(
-                "{} sent a periodic report at time {:.3}.",
-                format!("{self}"),
-                now
-            );
+                self.report_output()
+                    .send(Report::PacketSourceReport(report))
+                    .await;
+                debug!(
+                    "{} sent a periodic report at time {:.3}.",
+                    format!("{self}"),
+                    now
+                );
 
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(self.report_interval()),
-                    Self::send_report,
-                    (),
-                )
-                .unwrap();
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(self.report_interval()),
+                        Self::send_report,
+                        (),
+                    )
+                    .unwrap();
+            }
         }
     }
 
