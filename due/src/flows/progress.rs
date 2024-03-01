@@ -4,7 +4,6 @@
 //! database.
 
 use std::collections::HashMap;
-use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -12,7 +11,7 @@ use std::time::Duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
+use rusqlite::Connection;
 
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -28,7 +27,7 @@ pub struct Progress {
     num_sources: usize,
     finished_sources: usize,
     finished: bool,
-    db_pool: SqlitePool,
+    db_conn: Connection,
     db_tables: HashMap<String, (String, usize)>,
 }
 
@@ -40,7 +39,12 @@ pub enum Report {
 }
 
 impl Progress {
-    pub async fn new(progress_interval: f64, duration: f64, num_sources: usize) -> Progress {
+    pub fn new(
+        progress_interval: f64,
+        duration: f64,
+        num_sources: usize,
+        db_path: &str,
+    ) -> Progress {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
@@ -56,8 +60,7 @@ impl Progress {
 
         let pg = multi.add(progress_bar);
 
-        let db_url = String::from("sqlite://output.db");
-        let (db_pool, db_tables) = Self::create_database(&db_url).await.unwrap();
+        let (db_conn, db_tables) = Self::create_database(&db_path);
 
         Progress {
             progress_bar: pg,
@@ -66,24 +69,25 @@ impl Progress {
             num_sources,
             finished_sources: 0,
             finished: false,
-            db_pool,
+            db_conn,
             db_tables,
         }
     }
 
-    async fn create_database(
-        db_url: &str,
-    ) -> Result<(SqlitePool, HashMap<String, (String, usize)>), Box<dyn Error>> {
-        if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-            Sqlite::create_database(&db_url).await?;
-            debug!("Created database {} to log outputs.", &db_url);
-        }
-        let db_pool = SqlitePool::connect(&db_url).await?;
+    fn create_database(db_path: &str) -> (Connection, HashMap<String, (String, usize)>) {
+        let conn = match Connection::open(&db_path) {
+            Ok(conn) => conn,
+            Err(e) => panic!(
+                "Error {} occurred when creating database {} to log output",
+                e, &db_path
+            ),
+        };
 
         for table in vec!["sources", "switches", "sinks"] {
-            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-                .execute(&db_pool)
-                .await?;
+            match conn.execute(&format!("DROP TABLE IF EXISTS {table}"), ()) {
+                Ok(_) => {}
+                Err(e) => panic!("Error {} occurred when dropping table {}", e, table),
+            };
         }
 
         let mut db_tables: HashMap<String, (String, usize)> = Default::default();
@@ -92,7 +96,7 @@ impl Progress {
         let table_column =
             "id, start_time, end_time, sent_packets, packet_sizes, ack_bytes, finished".to_string();
         let num_column = 7;
-        sqlx::query!(
+        match conn.execute(
             "CREATE TABLE IF NOT EXISTS sources(
                 id              INTEGER NOT NULL,
                 start_time      REAL    NOT NULL,
@@ -102,9 +106,11 @@ impl Progress {
                 ack_bytes       INTEGER NOT NULL,
                 finished        BOOLEAN NOT NULL
             )",
-        )
-        .execute(&db_pool)
-        .await?;
+            (),
+        ) {
+            Ok(_) => {}
+            Err(e) => panic!("Error {} occurred when creating table sources", e),
+        };
         db_tables.insert("sources".to_string(), (table_column, num_column));
 
         // creates a table for logging reports of PacketSwitch
@@ -113,7 +119,7 @@ impl Progress {
         forwarded_sizes,throughput_mean,queueing_delay_mean"
             .to_string();
         let num_column = 11;
-        sqlx::query!(
+        match conn.execute(
             "CREATE TABLE IF NOT EXISTS switches(
                 id                     INTEGER NOT NULL,
                 start_time             REAL    NOT NULL,
@@ -127,9 +133,11 @@ impl Progress {
                 throughput_mean        REAL    NOT NULL,
                 queueing_delay_mean    REAL    NOT NULL
             )",
-        )
-        .execute(&db_pool)
-        .await?;
+            (),
+        ) {
+            Ok(_) => {}
+            Err(e) => panic!("Error {} occurred when creating table switches", e),
+        };
         db_tables.insert("switches".to_string(), (table_column, num_column));
 
         // creates a table for logging reports of PacketSink
@@ -137,7 +145,7 @@ impl Progress {
         received_sizes, queueing_delay_mean, one_way_delay_mean"
             .to_string();
         let num_column = 7;
-        sqlx::query!(
+        match conn.execute(
             "CREATE TABLE IF NOT EXISTS sinks(
                 id                     INTEGER NOT NULL,
                 start_time             REAL    NOT NULL,
@@ -147,94 +155,105 @@ impl Progress {
                 queueing_delay_mean    REAL    NOT NULL,
                 one_way_delay_mean     REAL    NOT NULL
             )",
-        )
-        .execute(&db_pool)
-        .await?;
+            (),
+        ) {
+            Ok(_) => {}
+            Err(e) => panic!("Error {} occurred when creating table sinks", e),
+        };
         db_tables.insert("sinks".to_string(), (table_column, num_column));
 
-        Ok((db_pool, db_tables))
+        (conn, db_tables)
     }
 
-    async fn log_report(&mut self, report: Report) -> Result<(), Box<dyn Error>> {
-        println!("!!!LOG");
+    fn generate_insert_query_string(&self, element_type: &str) -> String {
+        let mut query_str = format!("INSERT INTO {element_type} (");
+
+        let (column, num_column) = self.db_tables.get(element_type).unwrap();
+        query_str.push_str(&format!("{column}) VALUES ( ?1"));
+        for i in 2..=num_column.clone() {
+            query_str.push_str(&format!(", ?{i}"));
+        }
+        query_str.push_str(")");
+        query_str
+    }
+
+    fn log_report(&mut self, report: Report) {
         match report {
             Report::PacketSourceReport(source_report) => {
                 debug!(
                     "Progress received report from PacketSource {}",
                     source_report.id
                 );
-                let mut query_str = "INSERT INTO sources (".to_owned();
-                let (column, num_column) = self.db_tables.get("sources").unwrap();
-                query_str.push_str(&format!("{column}) VALUES ( $1"));
-                for i in 2..=num_column.clone() {
-                    query_str.push_str(&format!(", ${i})"));
-                }
-                sqlx::query(&query_str)
-                    .bind(source_report.id)
-                    .bind(source_report.start_time)
-                    .bind(source_report.end_time)
-                    .bind(source_report.sent_packets)
-                    .bind(source_report.packet_sizes)
-                    .bind(source_report.ack_bytes)
-                    .bind(source_report.finished)
-                    .execute(&self.db_pool)
-                    .await?;
+                let query_str = self.generate_insert_query_string("sources");
+                match self.db_conn.execute(
+                    &query_str,
+                    (
+                        source_report.id,
+                        source_report.start_time,
+                        source_report.end_time,
+                        source_report.sent_packets,
+                        source_report.packet_sizes,
+                        source_report.ack_bytes,
+                        source_report.finished,
+                    ),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => panic!("Error {} occurred when inserting data into sources", e),
+                };
             }
             Report::SchedulerReport(switch_report) => {
                 debug!(
                     "Progress received report from Scheduler {}",
                     switch_report.id
                 );
-                let mut query_str = "INSERT INTO switches (".to_owned();
-                let (column, num_column) = self.db_tables.get("switches").unwrap();
-                query_str.push_str(&format!("{column}) VALUES ( $1"));
-                for i in 2..=num_column.clone() {
-                    query_str.push_str(&format!(", ${i})"));
-                }
-                sqlx::query(&query_str)
-                    .bind(switch_report.id)
-                    .bind(switch_report.start_time)
-                    .bind(switch_report.end_time)
-                    .bind(switch_report.received_packets)
-                    .bind(switch_report.dropped_packets)
-                    .bind(switch_report.forwarded_packets)
-                    .bind(switch_report.queue_length)
-                    .bind(switch_report.received_sizes)
-                    .bind(switch_report.forwarded_sizes)
-                    .bind(switch_report.throughput_mean)
-                    .bind(switch_report.queueing_delay_mean)
-                    .execute(&self.db_pool)
-                    .await?;
+                let query_str = self.generate_insert_query_string("switches");
+                match self.db_conn.execute(
+                    &query_str,
+                    (
+                        switch_report.id,
+                        switch_report.start_time,
+                        switch_report.end_time,
+                        switch_report.received_packets,
+                        switch_report.dropped_packets,
+                        switch_report.forwarded_packets,
+                        switch_report.queue_length,
+                        switch_report.received_sizes,
+                        switch_report.forwarded_sizes,
+                        switch_report.throughput_mean,
+                        switch_report.queueing_delay_mean,
+                    ),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => panic!("Error {} occurred when inserting data into switches", e),
+                };
             }
             Report::PacketSinkReport(sink_report) => {
                 debug!(
                     "Progress received report from PacketSink {}",
                     sink_report.id
                 );
-                let mut query_str = "INSERT INTO sinks (".to_owned();
-                let (column, num_column) = self.db_tables.get("sinks").unwrap();
-                query_str.push_str(&format!("{column}) VALUES ( $1"));
-                for i in 2..=num_column.clone() {
-                    query_str.push_str(&format!(", ${i})"));
-                }
-                sqlx::query(&query_str)
-                    .bind(sink_report.id)
-                    .bind(sink_report.start_time)
-                    .bind(sink_report.end_time)
-                    .bind(sink_report.received_packets)
-                    .bind(sink_report.received_sizes)
-                    .bind(sink_report.queueing_delay_mean)
-                    .bind(sink_report.one_way_delay_mean)
-                    .execute(&self.db_pool)
-                    .await?;
+                let query_str = self.generate_insert_query_string("sinks");
+                match self.db_conn.execute(
+                    &query_str,
+                    (
+                        sink_report.id,
+                        sink_report.start_time,
+                        sink_report.end_time,
+                        sink_report.received_packets,
+                        sink_report.received_sizes,
+                        sink_report.queueing_delay_mean,
+                        sink_report.one_way_delay_mean,
+                    ),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => panic!("Error {} occurred when inserting data into sinks", e),
+                };
             }
         }
-
-        Ok(())
     }
 
-    pub async fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
-        let _ = self.log_report(report.clone()).await;
+    pub fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
+        self.log_report(report.clone());
 
         match report {
             Report::PacketSourceReport(source_report) => {

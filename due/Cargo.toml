@@ -20,8 +20,7 @@ indicatif-log-bridge = "0.2"
 log = "0.4"
 petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
+rusqlite = "0.31"
 serde = { version = "1.0", features = ["derive"] }
-sqlx = { version = "0.7", features = [ "runtime-tokio", "sqlite"] }
 statrs = "0.16"
-tokio = { version = "1", features = ["full"] }
 toml = "0.8"

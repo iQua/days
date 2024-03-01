@@ -36,6 +36,7 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 struct ProgressConfig {
     progress: Option<f64>,
     duration: Option<f64>,
+    db_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +136,8 @@ pub struct Topology {
     progress: f64,
     /// the duration of the simulation run
     duration: f64,
+    /// the path of the SQLite database used for recording outputs
+    db_path: String,
 }
 
 impl Topology {
@@ -164,6 +167,7 @@ impl Topology {
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
         let duration = pb_config.duration.unwrap_or(1.);
         let progress = pb_config.progress.unwrap_or(duration / 100.);
+        let db_path = pb_config.db_path.unwrap_or("./output.db".to_string());
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
@@ -180,6 +184,7 @@ impl Topology {
             mailbox_capacity,
             progress,
             duration,
+            db_path,
         }
     }
 
@@ -538,7 +543,6 @@ impl Topology {
         for flow in self.flows.iter_mut() {
             let path = flow.compute_path(self.graph.clone());
 
-            debug!("The path for flow {} is: {:?}", flow.id, path);
             for window in path.windows(2) {
                 let node_id = window.get(0).unwrap().index();
                 let next_id = window.get(1).unwrap().index();
@@ -565,8 +569,13 @@ impl Topology {
 
     /// Creates and activates a progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
-    async fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
-        let progress = Progress::new(self.progress, self.duration, self.flows.len()).await;
+    fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
+        let progress = Progress::new(
+            self.progress,
+            self.duration,
+            self.flows.len(),
+            &self.db_path,
+        );
         self.sim_init = self.sim_init.add_model(progress, report_mbox);
 
         self
@@ -587,7 +596,7 @@ impl Topology {
         self.sim_init.init(MonotonicTime::EPOCH)
     }
 
-    pub async fn run(mut self, graph: UnGraph<usize, ()>) {
+    pub fn run(mut self, graph: UnGraph<usize, ()>) {
         let mut statistics = SinkStatistics::default();
 
         // initializes mailboxes for the packet switches
@@ -607,7 +616,7 @@ impl Topology {
         self.route_flows();
 
         // creates and activates a progress coroutine
-        self = self.activate_progress(report_mbox).await;
+        self = self.activate_progress(report_mbox);
 
         let duration = self.duration;
 
