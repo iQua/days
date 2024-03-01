@@ -3,6 +3,6 @@
 **/target/
 **/Cargo.lock
 
-due/output.db
+*.db
 *.db-shm
 *.db-wal
