@@ -16,6 +16,7 @@ use log::debug;
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
+use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
@@ -23,7 +24,7 @@ use crate::flows::progress::Report;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
     pub id: u32,
     /// the start time of this report interval

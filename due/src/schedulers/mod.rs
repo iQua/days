@@ -5,9 +5,11 @@ pub mod sp;
 pub mod vc;
 pub mod wfq;
 
+use serde::Serialize;
+
 use crate::flows::packet::Packet;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SchedulerReport {
     pub id: u32,
     /// the start time of this report interval

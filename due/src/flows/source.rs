@@ -13,6 +13,7 @@ use rand::SeedableRng;
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
+use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
@@ -22,7 +23,7 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
     pub id: u32,
     /// the start time of this report interval
