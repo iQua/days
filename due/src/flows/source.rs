@@ -358,9 +358,11 @@ impl PacketSource {
                     }
                 };
 
-                debug!("{} finished running at {:.3}.", name, now);
-
+                // notifies the Progress coroutine that the packet source
+                // finished running
                 self.finish_msg_output().send(FinishMsg {}).await;
+
+                debug!("{} finished running at {:.3}.", name, now);
             }
         }
     }

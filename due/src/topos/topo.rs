@@ -571,7 +571,7 @@ impl Topology {
         );
     }
 
-    /// Creates and activates a progress coroutine to generate a progress bar and
+    /// Creates and activates a Progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
     fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
         let progress = Progress::new(self.progress, self.duration, self.flows.len());
@@ -614,7 +614,7 @@ impl Topology {
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
 
-        // creates and activates a progress coroutine
+        // creates and activates a Progress coroutine
         self = self.activate_progress(report_mbox);
 
         let duration = self.duration;
