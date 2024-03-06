@@ -12,8 +12,8 @@ use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 use log::debug;
 
+use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::SchedulerReport;
@@ -56,8 +56,9 @@ pub struct SPServer {
     pub report: SchedulerReport,
     /// the interval of sending a periodic report to the progress coroutine
     report_interval: f64,
-    /// the sender for sending periodic reports
-    pub report_output: Output<Report>,
+    /// a report logger used for logging periodic reports to a SQLite database
+    /// or a JSON file
+    report_logger: ReportLogger,
 }
 
 impl SPServer {
@@ -69,6 +70,7 @@ impl SPServer {
         drop_strategy: DropStrategy,
         priorities: HashMap<usize, usize>,
         report_interval: f64,
+        report_logger: ReportLogger,
     ) -> SPServer {
         let scheduler_id = next_scheduler_id();
 
@@ -98,7 +100,7 @@ impl SPServer {
             output: Output::default(),
             report: SchedulerReport::new(scheduler_id as u32, 0.0),
             report_interval,
-            report_output: Output::default(),
+            report_logger,
         }
     }
 
@@ -228,8 +230,7 @@ impl SPServer {
         }
     }
 
-    /// Sends a perioid report of current statistics to the progress coroutine.
-    fn send_report<'a>(
+    fn log_report<'a>(
         &'a mut self,
         _: (),
         scheduler: &'a Scheduler<Self>,
@@ -241,10 +242,10 @@ impl SPServer {
                 .as_secs_f64();
 
             self.report.end_time = now;
-            let report = Report::SchedulerReport(self.report.clone());
-            self.report_output.send(report).await;
+            self.report_logger
+                .log_report(Report::SchedulerReport(self.report.clone()));
             debug!(
-                "SPServer {} sent a periodic report at time {:.3}.",
+                "SPServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
             );
 
@@ -253,7 +254,7 @@ impl SPServer {
             scheduler
                 .schedule_event(
                     Duration::from_secs_f64(self.report_interval),
-                    Self::send_report,
+                    Self::log_report,
                     (),
                 )
                 .unwrap();
@@ -270,7 +271,7 @@ impl Model for SPServer {
             scheduler
                 .schedule_event(
                     Duration::from_secs_f64(self.report_interval),
-                    Self::send_report,
+                    Self::log_report,
                     (),
                 )
                 .unwrap();

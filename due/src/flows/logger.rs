@@ -1,6 +1,7 @@
 //! Implements a report logger to log periodic reports of sources, schedulers,
 //! and sinks to a SQLite database or three JSON files.
 
+use log::info;
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ pub enum Report {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all(deserialize = "lowercase"))]
 pub enum LogType {
     DB,
     JSON,
@@ -38,7 +40,7 @@ impl ReportLogger {
         let log_path = match log_type {
             LogType::DB => log_path.unwrap_or("./output.db".to_string()),
             LogType::JSON => log_path.unwrap_or("./output/".to_string()),
-            LogType::NONE => log_path.unwrap_or("".to_string()),
+            LogType::NONE => String::default(),
         };
 
         match log_type {
@@ -74,6 +76,11 @@ impl ReportLoggerDB {
         if log_path[log_path.len() - 3..].to_string() != ".db" {
             db_path.push_str(".db");
         }
+
+        info!(
+            "Outputs of this simulation run will be logged to a SQLite database {}.",
+            &db_path
+        );
 
         ReportLoggerDB {
             db_path: db_path.clone(),
@@ -293,6 +300,11 @@ impl ReportLoggerJson {
 
             log_files.insert(element.to_string(), file_name.clone());
         }
+
+        info!(
+            "Outputs of this simulation run will be logged to three JSON files under directory {}.",
+            &log_dir
+        );
 
         ReportLoggerJson { log_files }
     }

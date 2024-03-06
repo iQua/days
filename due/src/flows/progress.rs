@@ -50,6 +50,13 @@ impl Progress {
         }
     }
 
+    /// Sets up progress interval and duration from a configuration file.
+    pub fn setup(progress: Option<f64>, duration: Option<f64>) -> (f64, f64) {
+        let duration = duration.unwrap_or(1500.);
+        let progress_interval = progress.unwrap_or(duration / 100.);
+        (progress_interval, duration)
+    }
+
     pub fn finish_msg_received(&mut self, finish_msg: FinishMsg, scheduler: &Scheduler<Self>) {
         self.finished_sources += 1;
         debug!(

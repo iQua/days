@@ -19,6 +19,7 @@ use asynchronix::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
+use crate::flows::logger::{LogType, ReportLogger};
 use crate::flows::progress::Progress;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
@@ -36,7 +37,12 @@ use crate::{next_flow_id, num_switches, set_num_switches};
 struct ProgressConfig {
     progress: Option<f64>,
     duration: Option<f64>,
-    db_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LogConfig {
+    log_path: Option<String>,
+    log_type: Option<LogType>,
 }
 
 #[derive(Deserialize)]
@@ -136,8 +142,9 @@ pub struct Topology {
     progress: f64,
     /// the duration of the simulation run
     duration: f64,
-    /// the path of the SQLite database used for recording outputs
-    db_path: String,
+    /// a report logger used for logging periodic reports to a SQLite database
+    /// or a JSON file
+    report_logger: ReportLogger,
 }
 
 impl Topology {
@@ -165,9 +172,11 @@ impl Topology {
 
         let pb_config: ProgressConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let duration = pb_config.duration.unwrap_or(1.);
-        let progress = pb_config.progress.unwrap_or(duration / 100.);
-        let db_path = pb_config.db_path.unwrap_or("./output.db".to_string());
+        let (progress, duration) = Progress::setup(pb_config.progress, pb_config.duration);
+
+        let log_config: LogConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of logging outputs");
+        let report_logger = ReportLogger::new(log_config.log_path, log_config.log_type);
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
@@ -184,7 +193,7 @@ impl Topology {
             mailbox_capacity,
             progress,
             duration,
-            db_path,
+            report_logger,
         }
     }
 
@@ -320,6 +329,7 @@ impl Topology {
                     self.switch_config.drop,
                     weights.clone(),
                     self.progress,
+                    self.report_logger.clone(),
                 );
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -341,6 +351,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     self.switch_config.drop,
                     self.progress,
+                    self.report_logger.clone(),
                 );
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -350,9 +361,6 @@ impl Topology {
                 let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
                 port.output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
-
-                port.report_output
-                    .connect(Progress::report_received, report_mbox);
 
                 self.sim_init = self.sim_init.add_model(port, port_mbox);
             }
@@ -368,6 +376,7 @@ impl Topology {
                     self.switch_config.drop,
                     priorities.clone(),
                     self.progress,
+                    self.report_logger.clone(),
                 );
 
                 let mut output = Output::default();
@@ -394,6 +403,7 @@ impl Topology {
                     self.switch_config.drop,
                     vticks.clone(),
                     self.progress,
+                    self.report_logger.clone(),
                 );
 
                 let mut output = Output::default();
@@ -423,6 +433,7 @@ impl Topology {
                     self.switch_config.drop,
                     weights.clone(),
                     self.progress,
+                    self.report_logger.clone(),
                 );
 
                 let mut output = Output::default();
@@ -517,9 +528,6 @@ impl Topology {
             sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);
 
-            sink.report_output()
-                .connect(Progress::report_received, report_mbox);
-
             let mut output = Output::default();
             output.connect(PacketSink::packet_received, &sink_mbox);
             sink_host.outputs.insert(sink.id(), output);
@@ -570,12 +578,7 @@ impl Topology {
     /// Creates and activates a progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
     fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
-        let progress = Progress::new(
-            self.progress,
-            self.duration,
-            self.flows.len(),
-            &self.db_path,
-        );
+        let progress = Progress::new(self.progress, self.duration, self.flows.len());
         self.sim_init = self.sim_init.add_model(progress, report_mbox);
 
         self
