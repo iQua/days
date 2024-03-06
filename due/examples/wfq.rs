@@ -9,6 +9,7 @@ use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
 use due::flows::flow::FlowType;
+use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
@@ -39,6 +40,7 @@ fn main() {
             None,
         ),
         report_interval,
+        ReportLogger::default(),
         0,
     );
 
@@ -60,6 +62,7 @@ fn main() {
             None,
         ),
         report_interval,
+        ReportLogger::default(),
         0,
     );
 
@@ -71,9 +74,10 @@ fn main() {
         DropStrategy::TailDrop,
         vec![1, 2],
         report_interval,
+        ReportLogger::default(),
     );
 
-    let mut sink = PacketSink::new(&source_1);
+    let mut sink = PacketSink::new(&source_1, ReportLogger::default());
 
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();

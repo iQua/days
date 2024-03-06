@@ -12,6 +12,7 @@ use asynchronix::time::MonotonicTime;
 use due::flows::flow::FlowType;
 //use due::flows::cc::CCAlgorithm::TCPReno;
 use due::flows::cc::CCAlgorithm::TCPCubic;
+use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::wire::Wire;
@@ -45,6 +46,7 @@ fn main() {
             }),
         ),
         report_interval,
+        ReportLogger::default(),
         0,
     );
 
@@ -57,6 +59,7 @@ fn main() {
         DropStrategy::TailDrop,
         vec![1],
         report_interval,
+        ReportLogger::default(),
     );
 
     let mut wire = Wire::new(
@@ -67,7 +70,7 @@ fn main() {
         },
     );
 
-    let mut sink = PacketSink::new(&source);
+    let mut sink = PacketSink::new(&source, ReportLogger::default());
 
     let source_mbox = Mailbox::new();
     let server_mbox = Mailbox::new();

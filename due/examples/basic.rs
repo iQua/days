@@ -8,6 +8,7 @@ use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
 use due::flows::flow::FlowType;
+use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
@@ -33,10 +34,11 @@ fn main() {
             None,
         ),
         report_interval,
+        ReportLogger::default(),
         0,
     );
 
-    let mut sink = PacketSink::new(&source);
+    let mut sink = PacketSink::new(&source, ReportLogger::default());
 
     let source_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
