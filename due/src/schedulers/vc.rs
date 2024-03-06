@@ -101,7 +101,7 @@ pub struct VirtualClockServer {
 
     /// the report of a report interval
     pub report: SchedulerReport,
-    /// the interval of sending a periodic report to the progress coroutine
+    /// the interval of generating a periodic report
     report_interval: f64,
     /// a report logger used for logging periodic reports to a SQLite database
     /// or a JSON file
