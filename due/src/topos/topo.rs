@@ -218,21 +218,19 @@ impl Topology {
 
     /// Connects a hash map of packet switches according to edges in a network
     /// topology.
-    fn connect(mut self, graph: UnGraph<usize, ()>) -> (Self, Mailbox<Progress>) {
-        let report_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
-
+    fn connect(mut self, graph: UnGraph<usize, ()>) -> Self {
         for node_id in graph.node_indices() {
             for neighbor in graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them and activate all schedulers in between
                 if neighbor.index() != node_id.index() {
-                    self = self.connect_neighbours(neighbor.index(), node_id.index(), &report_mbox);
+                    self = self.connect_neighbours(neighbor.index(), node_id.index());
                 }
             }
         }
 
-        (self, report_mbox)
+        self
     }
 
     /// Produces flows within all collectives in the network graph.
@@ -309,12 +307,7 @@ impl Topology {
     }
 
     /// Connects two adjacent switches in the network graph.
-    fn connect_neighbours(
-        mut self,
-        upstream_id: usize,
-        downstream_id: usize,
-        report_mbox: &Mailbox<Progress>,
-    ) -> Self {
+    fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
 
         match self.switch_config.discipline {
@@ -455,11 +448,13 @@ impl Topology {
 
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
-    fn attach_flows(mut self, stats: &mut SinkStatistics, report_mbox: &Mailbox<Progress>) -> Self {
+    fn attach_flows(mut self, stats: &mut SinkStatistics) -> (Self, Mailbox<Progress>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
+
+        let report_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
 
         for flow in self.flows.iter_mut() {
             // creates and attaches a packet source and sink for each flow
@@ -474,6 +469,7 @@ impl Topology {
                 flow.flow_type,
                 flow.traffic,
                 self.progress,
+                self.report_logger.clone(),
                 flow.seed,
             );
             // records the PacketSource id for adding it as the start of the
@@ -498,8 +494,8 @@ impl Topology {
                 .connect(PacketSwitch::packet_received, host_mbox);
 
             source
-                .report_output()
-                .connect(Progress::report_received, report_mbox);
+                .finish_msg_output()
+                .connect(Progress::finish_msg_received, &report_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, &source_mbox);
@@ -536,7 +532,7 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(sink, sink_mbox);
         }
 
-        self
+        (self, report_mbox)
     }
 
     /// Computes routing decisions for all the flows, and installs Flow
@@ -608,12 +604,12 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        let report_mbox: Mailbox<Progress>;
         // constructs the network graph by connecting the packet switches
-        (self, report_mbox) = self.connect(graph);
+        self = self.connect(graph);
 
+        let report_mbox: Mailbox<Progress>;
         // attaches packet sources and sinks from flows to hosts in the network graph
-        self = self.attach_flows(&mut statistics, &report_mbox);
+        (self, report_mbox) = self.attach_flows(&mut statistics);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();

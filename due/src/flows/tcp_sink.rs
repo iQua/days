@@ -55,7 +55,7 @@ impl TCPPacketSink {
         self.report.end_time = now;
 
         self.report_logger
-            .log_report(Report::PacketSinkReport(self.report));
+            .log_report(Report::PacketSinkReport(self.report.clone()));
         debug!(
             "TCPPacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

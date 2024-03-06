@@ -17,8 +17,9 @@ use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
+use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::progress::FinishMsg;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
@@ -36,7 +37,6 @@ pub struct PacketSourceReport {
     pub packet_sizes: u32,
     /// the number of acknowledged bytes in this report interval
     pub ack_bytes: u32,
-    pub finished: bool,
 }
 
 impl PacketSourceReport {
@@ -48,7 +48,6 @@ impl PacketSourceReport {
             sent_packets: 0,
             packet_sizes: 0,
             ack_bytes: 0,
-            finished: false,
         }
     }
 
@@ -84,6 +83,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         report_interval: f64,
+        report_logger: ReportLogger,
         seed: usize,
     ) -> Self {
         let global_seed = get_seed();
@@ -97,12 +97,14 @@ impl PacketSource {
                 flow_id,
                 traffic,
                 report_interval,
+                report_logger,
                 rng,
             )),
             FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
                 flow_id,
                 traffic,
                 report_interval,
+                report_logger,
                 rng,
             )),
         }
@@ -115,10 +117,10 @@ impl PacketSource {
         }
     }
 
-    pub fn report_output(&mut self) -> &mut Output<Report> {
+    pub fn finish_msg_output(&mut self) -> &mut Output<FinishMsg> {
         match self {
-            PacketSource::DistPacketSource(source) => source.report_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.report_output.borrow_mut(),
+            PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
         }
     }
 
@@ -287,8 +289,7 @@ impl PacketSource {
         }
     }
 
-    /// Sends a perioid report of current statistics to the progress coroutine.
-    fn send_report<'a>(
+    fn log_report<'a>(
         &'a mut self,
         _: (),
         scheduler: &'a Scheduler<Self>,
@@ -300,38 +301,19 @@ impl PacketSource {
                 .as_secs_f64();
 
             if !self.stop_run(now) {
-                let report = match self {
+                match self {
                     PacketSource::DistPacketSource(source) => {
-                        let mut dist_report = source.report.clone();
-                        dist_report.last_update(now, 0 as u32);
-
-                        source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
-
-                        dist_report
+                        source.log_report(now);
                     }
                     PacketSource::TCPPacketSource(source) => {
-                        let mut tcp_report = source.report.clone();
-                        tcp_report.last_update(now, source.last_ack as u32);
-
-                        source.report = PacketSourceReport::new(source.endpoint_id as u32, now);
-
-                        tcp_report
+                        source.log_report(now);
                     }
                 };
-
-                self.report_output()
-                    .send(Report::PacketSourceReport(report))
-                    .await;
-                debug!(
-                    "{} sent a periodic report at time {:.3}.",
-                    format!("{self}"),
-                    now
-                );
 
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(self.report_interval()),
-                        Self::send_report,
+                        Self::log_report,
                         (),
                     )
                     .unwrap();
@@ -367,25 +349,18 @@ impl PacketSource {
             if self.stop_run(now) {
                 let name = format!("{self}");
 
-                let mut report = match self {
+                match self {
                     PacketSource::DistPacketSource(source) => {
-                        let mut dist_report = source.report.clone();
-                        dist_report.last_update(now, 0 as u32);
-                        dist_report
+                        source.log_report(now);
                     }
                     PacketSource::TCPPacketSource(source) => {
-                        let mut tcp_report = source.report.clone();
-                        tcp_report.last_update(now, source.last_ack as u32);
-                        tcp_report
+                        source.log_report(now);
                     }
                 };
-                report.finished = true;
 
                 debug!("{} finished running at {:.3}.", name, now);
 
-                self.report_output()
-                    .send(Report::PacketSourceReport(report))
-                    .await;
+                self.finish_msg_output().send(FinishMsg {}).await;
             }
         }
     }
@@ -427,7 +402,7 @@ impl Model for PacketSource {
             scheduler
                 .schedule_event(
                     Duration::from_secs_f64(self.report_interval()),
-                    Self::send_report,
+                    Self::log_report,
                     (),
                 )
                 .unwrap();

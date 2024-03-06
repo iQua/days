@@ -12,6 +12,7 @@ use log::debug;
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+#[derive(Clone, Debug)]
 pub struct FinishMsg {}
 
 pub struct Progress {
@@ -57,7 +58,7 @@ impl Progress {
         (progress_interval, duration)
     }
 
-    pub fn finish_msg_received(&mut self, finish_msg: FinishMsg, scheduler: &Scheduler<Self>) {
+    pub fn finish_msg_received(&mut self, _finish_msg: FinishMsg, scheduler: &Scheduler<Self>) {
         self.finished_sources += 1;
         debug!(
             "{} / {} sources are finished.",

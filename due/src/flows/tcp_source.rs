@@ -13,8 +13,9 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
+use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::progress::FinishMsg;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
@@ -87,13 +88,15 @@ pub struct TCPPacketSource {
     packets_sent: usize,
 
     pub output: Output<Packet>,
+    pub finish_msg_output: Output<FinishMsg>,
 
     /// the report of a report interval
     pub report: PacketSourceReport,
-    /// the interval of sending a periodic report to the progress coroutine
+    /// the interval of generating a periodic report
     pub report_interval: f64,
-    /// the sender for sending periodic reports
-    pub report_output: Output<Report>,
+    /// a report logger used for logging periodic reports to a SQLite database
+    /// or a JSON file
+    report_logger: ReportLogger,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -110,6 +113,7 @@ impl TCPPacketSource {
         flow_id: usize,
         traffic: TrafficCharacteristics,
         report_interval: f64,
+        report_logger: ReportLogger,
         rng: SmallRng,
     ) -> TCPPacketSource {
         let endpoint_id = next_endpoint_id();
@@ -137,13 +141,14 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource: AppDataSource::new(flow_id, traffic, report_interval, rng.clone()),
+            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             output: Output::default(),
+            finish_msg_output: Output::default(),
             report: PacketSourceReport::new(endpoint_id as u32, 0.0),
             report_interval,
-            report_output: Output::default(),
+            report_logger,
         }
     }
 
@@ -372,6 +377,20 @@ impl TCPPacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);
         }
+    }
+
+    pub fn log_report(&mut self, now: f64) {
+        self.report.last_update(now, self.last_ack as u32);
+
+        self.report_logger
+            .log_report(Report::PacketSourceReport(self.report.clone()));
+        debug!(
+            "TCPPacketSource {} logged a periodic report at time {:.3}.",
+            self.endpoint_id, now
+        );
+
+        // resets the report
+        self.report = PacketSourceReport::new(self.endpoint_id as u32, now);
     }
 }
 

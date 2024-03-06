@@ -4,6 +4,7 @@ use rand::rngs::SmallRng;
 use std::time::Duration;
 
 use crate::flows::dist_source::DistPacketSource;
+use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 
@@ -19,19 +20,15 @@ pub enum AppDataType {
 }
 
 impl AppDataSource {
-    pub fn new(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        report_interval: f64,
-        rng: SmallRng,
-    ) -> Self {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
         let app_type = AppDataType::DistData;
 
         match app_type {
             AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
                 flow_id,
                 traffic,
-                report_interval,
+                f64::MAX,
+                ReportLogger::default(),
                 rng,
             )),
         }
