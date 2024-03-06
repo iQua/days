@@ -1,14 +1,13 @@
 //! Implements a TCPSink, designed to send acknowledgement packets back to
 //! TCPPacketSource.
 
-use std::fmt::Debug;
-
 use log::debug;
+use std::fmt::Debug;
 
 use asynchronix::model::{Model, Output};
 
+use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::{Packet, TCPAck};
-use crate::flows::progress::Report;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
 
@@ -28,14 +27,15 @@ pub struct TCPPacketSink {
     pub output: Output<Packet>,
     /// the report of a report interval
     pub report: PacketSinkReport,
-    /// the interval of sending a periodic report to the progress coroutine
+    /// the interval of generating a periodic report
     pub report_interval: f64,
-    /// the sender for sending periodic reports
-    pub report_output: Output<Report>,
+    /// a report logger used for logging periodic reports to a SQLite database
+    /// or a JSON file
+    report_logger: ReportLogger,
 }
 
 impl TCPPacketSink {
-    pub fn new(report_interval: f64) -> TCPPacketSink {
+    pub fn new(report_interval: f64, report_logger: ReportLogger) -> TCPPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("TCPPacketSink {endpoint_id}");
         TCPPacketSink {
@@ -47,8 +47,22 @@ impl TCPPacketSink {
             output: Output::default(),
             report: PacketSinkReport::new(endpoint_id as u32, 0.0),
             report_interval,
-            report_output: Output::default(),
+            report_logger,
         }
+    }
+
+    pub fn log_report(&mut self, now: f64) {
+        self.report.end_time = now;
+
+        self.report_logger
+            .log_report(Report::PacketSinkReport(self.report));
+        debug!(
+            "TCPPacketSink {} logged a periodic report at time {:.3}.",
+            self.endpoint_id, now
+        );
+
+        // resets the report
+        self.report = PacketSinkReport::new(self.endpoint_id as u32, now);
     }
 
     pub async fn wrap_up(&mut self, packet: Packet, now: f64) {

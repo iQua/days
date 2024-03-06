@@ -482,7 +482,7 @@ impl Topology {
             flow.source_id = source.id();
 
             // creates a new packet sink
-            let mut sink = PacketSink::new(&source);
+            let mut sink = PacketSink::new(&source, self.report_logger.clone());
             // records the PacketSink id for adding it as the end of the flow's
             // path in later construction of the path in Flow::compute_path()
             flow.sink_id = sink.id();

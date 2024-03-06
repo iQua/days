@@ -19,8 +19,8 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
+use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 
@@ -229,13 +229,13 @@ impl std::fmt::Display for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(source: &PacketSource) -> Self {
+    pub fn new(source: &PacketSource, report_logger: ReportLogger) -> Self {
         match source {
-            PacketSource::DistPacketSource(source) => {
-                PacketSink::BasicPacketSink(BasicPacketSink::new(source.report_interval))
-            }
+            PacketSource::DistPacketSource(source) => PacketSink::BasicPacketSink(
+                BasicPacketSink::new(source.report_interval, report_logger),
+            ),
             PacketSource::TCPPacketSource(source) => {
-                PacketSink::TCPPacketSink(TCPPacketSink::new(source.report_interval))
+                PacketSink::TCPPacketSink(TCPPacketSink::new(source.report_interval, report_logger))
             }
         }
     }
@@ -258,13 +258,6 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.output.borrow_mut(),
-        }
-    }
-
-    pub fn report_output(&mut self) -> &mut Output<Report> {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.report_output.borrow_mut(),
-            PacketSink::TCPPacketSink(sink) => sink.report_output.borrow_mut(),
         }
     }
 
@@ -324,8 +317,7 @@ impl PacketSink {
         self.wrap_up(packet, now).await;
     }
 
-    /// Sends a perioid report of current statistics to the progress coroutine.
-    fn send_report<'a>(
+    fn log_report<'a>(
         &'a mut self,
         _: (),
         scheduler: &'a Scheduler<Self>,
@@ -336,33 +328,19 @@ impl PacketSink {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            let report = match self {
+            match self {
                 PacketSink::BasicPacketSink(sink) => {
-                    let mut basic_report = sink.report.clone();
-                    basic_report.end_time = now;
-                    sink.report = PacketSinkReport::new(sink.endpoint_id as u32, now);
-                    basic_report
+                    sink.log_report(now);
                 }
                 PacketSink::TCPPacketSink(sink) => {
-                    let mut tcp_report = sink.report.clone();
-                    tcp_report.end_time = now;
-                    sink.report = PacketSinkReport::new(sink.endpoint_id as u32, now);
-                    tcp_report
+                    sink.log_report(now);
                 }
-            };
-            self.report_output()
-                .send(Report::PacketSinkReport(report))
-                .await;
-            debug!(
-                "{} sent a periodic report at time {:.3}.",
-                format!("{self}"),
-                now
-            );
+            }
 
             scheduler
                 .schedule_event(
                     Duration::from_secs_f64(self.report_interval()),
-                    Self::send_report,
+                    Self::log_report,
                     (),
                 )
                 .unwrap();
@@ -379,7 +357,7 @@ impl Model for PacketSink {
             scheduler
                 .schedule_event(
                     Duration::from_secs_f64(self.report_interval()),
-                    Self::send_report,
+                    Self::log_report,
                     (),
                 )
                 .unwrap();
