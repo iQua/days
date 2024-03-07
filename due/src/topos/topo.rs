@@ -43,6 +43,7 @@ struct ProgressConfig {
 struct LogConfig {
     log_path: Option<String>,
     log_type: Option<LogType>,
+    log_interval: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +146,8 @@ pub struct Topology {
     /// a report logger used for logging periodic reports to a SQLite database
     /// or a JSON file
     report_logger: ReportLogger,
+    /// the interval of generating periodic reports
+    report_interval: f64,
 }
 
 impl Topology {
@@ -177,6 +180,7 @@ impl Topology {
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
         let report_logger = ReportLogger::new(log_config.log_path, log_config.log_type);
+        let report_interval = log_config.log_interval.unwrap_or(progress);
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
@@ -194,6 +198,7 @@ impl Topology {
             progress,
             duration,
             report_logger,
+            report_interval,
         }
     }
 
@@ -464,14 +469,8 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let mut source = PacketSource::new(
-                flow.id,
-                flow.flow_type,
-                flow.traffic,
-                self.progress,
-                self.report_logger.clone(),
-                flow.seed,
-            );
+            let mut source = PacketSource::new(flow.id, flow.flow_type, flow.traffic, flow.seed);
+            source.set_report_logger(self.report_logger.clone(), self.report_interval);
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
             // Flow::compute_path()
