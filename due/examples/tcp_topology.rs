@@ -12,8 +12,8 @@ fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
-    let file_path = "configs/tcp_simple.toml";
-    //let file_path = "configs/tcp_fattree.toml";
+    //let file_path = "configs/tcp_simple.toml";
+    let file_path = "configs/tcp_fattree.toml";
 
     let (graph, hosts) = build_graph(file_path);
     info!("The FatTree graph has been initialized.");

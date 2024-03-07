@@ -67,7 +67,7 @@ impl ReportLogger {
 
 #[derive(Clone, Debug)]
 pub struct DatabaseLogger {
-    db_path: String,
+    db_lock: Arc<Mutex<Connection>>,
     db_queries: HashMap<String, String>,
 }
 
@@ -83,13 +83,15 @@ impl DatabaseLogger {
             &db_path
         );
 
+        let (db_lock, db_queries) = Self::create_database(&db_path);
+
         DatabaseLogger {
-            db_path: db_path.clone(),
-            db_queries: Self::create_database(&db_path),
+            db_lock,
+            db_queries,
         }
     }
 
-    pub fn create_database(db_path: &str) -> HashMap<String, String> {
+    pub fn create_database(db_path: &str) -> (Arc<Mutex<Connection>>, HashMap<String, String>) {
         let conn = match Connection::open(&db_path) {
             Ok(conn) => conn,
             Err(e) => panic!(
@@ -175,14 +177,7 @@ impl DatabaseLogger {
         let query_str = Self::generate_insert_query_str("sinks", &table_column, num_column);
         db_queries.insert("sinks".to_string(), query_str);
 
-        if let Err(e) = conn.close() {
-            panic!(
-                "Error '{:?}' occurred when closing the SQLite connection of {}",
-                e, &db_path
-            );
-        };
-
-        db_queries
+        (Arc::new(Mutex::new(conn)), db_queries)
     }
 
     fn generate_insert_query_str(element_type: &str, column: &str, num_column: usize) -> String {
@@ -197,77 +192,70 @@ impl DatabaseLogger {
     }
 
     pub fn log_report(&self, report: Report) {
-        let db_conn = match Connection::open(&self.db_path) {
-            Ok(conn) => conn,
-            Err(e) => panic!(
-                "Error '{}' occurred when opening the database {} to log output",
-                e, &self.db_path
-            ),
-        };
+        let db_lock = Arc::clone(&self.db_lock);
+        loop {
+            let mut conn_lock = db_lock.try_lock();
+            if let Ok(ref mut db_conn) = conn_lock {
+                match report {
+                    Report::PacketSourceReport(source_report) => {
+                        let query_str = self.db_queries.get("sources").unwrap().to_string();
+                        if let Err(e) = db_conn.execute(
+                            &query_str,
+                            (
+                                source_report.id,
+                                source_report.start_time,
+                                source_report.end_time,
+                                source_report.sent_packets,
+                                source_report.packet_sizes,
+                                source_report.ack_bytes,
+                            ),
+                        ) {
+                            panic!("Error '{}' occurred when logging a source report", e);
+                        };
+                    }
+                    Report::SchedulerReport(switch_report) => {
+                        let query_str = self.db_queries.get("switches").unwrap().to_string();
+                        if let Err(e) = db_conn.execute(
+                            &query_str,
+                            (
+                                switch_report.id,
+                                switch_report.start_time,
+                                switch_report.end_time,
+                                switch_report.received_packets,
+                                switch_report.dropped_packets,
+                                switch_report.forwarded_packets,
+                                switch_report.queue_length,
+                                switch_report.received_sizes,
+                                switch_report.forwarded_sizes,
+                                switch_report.throughput_mean,
+                                switch_report.queueing_delay_mean,
+                            ),
+                        ) {
+                            panic!("Error '{}' occurred when logging a switch report", e);
+                        };
+                    }
+                    Report::PacketSinkReport(sink_report) => {
+                        let query_str = self.db_queries.get("sinks").unwrap().to_string();
+                        if let Err(e) = db_conn.execute(
+                            &query_str,
+                            (
+                                sink_report.id,
+                                sink_report.start_time,
+                                sink_report.end_time,
+                                sink_report.received_packets,
+                                sink_report.received_sizes,
+                                sink_report.queueing_delay_mean,
+                                sink_report.one_way_delay_mean,
+                            ),
+                        ) {
+                            panic!("Error '{}' occurred when logging a sink report", e);
+                        };
+                    }
+                }
 
-        match report {
-            Report::PacketSourceReport(source_report) => {
-                let query_str = self.db_queries.get("sources").unwrap().to_string();
-                if let Err(e) = db_conn.execute(
-                    &query_str,
-                    (
-                        source_report.id,
-                        source_report.start_time,
-                        source_report.end_time,
-                        source_report.sent_packets,
-                        source_report.packet_sizes,
-                        source_report.ack_bytes,
-                    ),
-                ) {
-                    panic!("Error '{}' occurred when logging a source report", e);
-                };
-            }
-            Report::SchedulerReport(switch_report) => {
-                let query_str = self.db_queries.get("switches").unwrap().to_string();
-                if let Err(e) = db_conn.execute(
-                    &query_str,
-                    (
-                        switch_report.id,
-                        switch_report.start_time,
-                        switch_report.end_time,
-                        switch_report.received_packets,
-                        switch_report.dropped_packets,
-                        switch_report.forwarded_packets,
-                        switch_report.queue_length,
-                        switch_report.received_sizes,
-                        switch_report.forwarded_sizes,
-                        switch_report.throughput_mean,
-                        switch_report.queueing_delay_mean,
-                    ),
-                ) {
-                    panic!("Error '{}' occurred when logging a switch report", e);
-                };
-            }
-            Report::PacketSinkReport(sink_report) => {
-                let query_str = self.db_queries.get("sinks").unwrap().to_string();
-                if let Err(e) = db_conn.execute(
-                    &query_str,
-                    (
-                        sink_report.id,
-                        sink_report.start_time,
-                        sink_report.end_time,
-                        sink_report.received_packets,
-                        sink_report.received_sizes,
-                        sink_report.queueing_delay_mean,
-                        sink_report.one_way_delay_mean,
-                    ),
-                ) {
-                    panic!("Error '{}' occurred when logging a sink report", e);
-                };
+                break;
             }
         }
-
-        if let Err(e) = db_conn.close() {
-            panic!(
-                "Error '{:?}' occurred when closing the SQLite connection of {}",
-                e, &self.db_path
-            );
-        };
     }
 }
 
