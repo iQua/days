@@ -8,7 +8,6 @@ use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
 use due::flows::flow::FlowType;
-use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
@@ -18,7 +17,6 @@ use due::schedulers::port::Port;
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
-    let report_interval = 1.0;
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
@@ -35,8 +33,6 @@ fn main() {
             },
             None,
         ),
-        report_interval,
-        ReportLogger::default(),
         0,
     );
 
@@ -54,21 +50,12 @@ fn main() {
             },
             None,
         ),
-        report_interval,
-        ReportLogger::default(),
         0,
     );
 
-    let mut port = Port::new(
-        8000.0,
-        100,
-        CapacityUnit::Packets,
-        DropStrategy::TailDrop,
-        report_interval,
-        ReportLogger::default(),
-    );
+    let mut port = Port::new(8000.0, 100, CapacityUnit::Packets, DropStrategy::TailDrop);
 
-    let mut sink = PacketSink::new(&source_1, ReportLogger::default());
+    let mut sink = PacketSink::new(&source_1);
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let port_mbox = Mailbox::new();

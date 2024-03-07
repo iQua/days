@@ -4,7 +4,6 @@ use rand::rngs::SmallRng;
 use std::time::Duration;
 
 use crate::flows::dist_source::DistPacketSource;
-use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 
@@ -24,13 +23,9 @@ impl AppDataSource {
         let app_type = AppDataType::DistData;
 
         match app_type {
-            AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
-                flow_id,
-                traffic,
-                f64::MAX,
-                ReportLogger::default(),
-                rng,
-            )),
+            AppDataType::DistData => {
+                AppDataSource::DistDataSource(DistPacketSource::new(flow_id, traffic, rng))
+            }
         }
     }
 

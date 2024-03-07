@@ -82,8 +82,6 @@ impl PacketSource {
         flow_id: usize,
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
-        report_interval: f64,
-        report_logger: ReportLogger,
         seed: usize,
     ) -> Self {
         let global_seed = get_seed();
@@ -93,20 +91,25 @@ impl PacketSource {
         };
 
         match flow_type {
-            FlowType::PacketDistribution => PacketSource::DistPacketSource(DistPacketSource::new(
-                flow_id,
-                traffic,
-                report_interval,
-                report_logger,
-                rng,
-            )),
-            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
-                flow_id,
-                traffic,
-                report_interval,
-                report_logger,
-                rng,
-            )),
+            FlowType::PacketDistribution => {
+                PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
+            }
+            FlowType::TCP => {
+                PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
+            }
+        }
+    }
+
+    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                source.report_logger = report_logger;
+                source.report_interval = report_interval;
+            }
+            PacketSource::TCPPacketSource(source) => {
+                source.report_logger = report_logger;
+                source.report_interval = report_interval;
+            }
         }
     }
 

@@ -26,11 +26,11 @@ pub struct BasicPacketSink {
     pub report_interval: f64,
     /// a report logger used for logging periodic reports to a SQLite database
     /// or a JSON file
-    report_logger: ReportLogger,
+    pub report_logger: ReportLogger,
 }
 
 impl BasicPacketSink {
-    pub fn new(report_interval: f64, report_logger: ReportLogger) -> Self {
+    pub fn new() -> Self {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("PacketSink {endpoint_id}");
         BasicPacketSink {
@@ -39,8 +39,8 @@ impl BasicPacketSink {
             statistics: Output::default(),
             output: Output::default(),
             report: PacketSinkReport::new(endpoint_id as u32, 0.0),
-            report_interval,
-            report_logger,
+            report_interval: f64::MAX,
+            report_logger: ReportLogger::default(),
         }
     }
 

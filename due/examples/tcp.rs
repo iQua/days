@@ -12,7 +12,6 @@ use asynchronix::time::MonotonicTime;
 use due::flows::flow::FlowType;
 //use due::flows::cc::CCAlgorithm::TCPReno;
 use due::flows::cc::CCAlgorithm::TCPCubic;
-use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::wire::Wire;
@@ -23,7 +22,6 @@ use due::schedulers::drr::DRRServer;
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
-    let report_interval = 0.1;
 
     // instantiates models and their mailboxes
     let mut source = PacketSource::new(
@@ -45,8 +43,6 @@ fn main() {
                 cc_algorithm: TCPCubic,
             }),
         ),
-        report_interval,
-        ReportLogger::default(),
         0,
     );
 
@@ -58,8 +54,6 @@ fn main() {
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
         vec![1],
-        report_interval,
-        ReportLogger::default(),
     );
 
     let mut wire = Wire::new(
@@ -70,7 +64,7 @@ fn main() {
         },
     );
 
-    let mut sink = PacketSink::new(&source, ReportLogger::default());
+    let mut sink = PacketSink::new(&source);
 
     let source_mbox = Mailbox::new();
     let server_mbox = Mailbox::new();

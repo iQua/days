@@ -229,13 +229,24 @@ impl std::fmt::Display for PacketSink {
 }
 
 impl PacketSink {
-    pub fn new(source: &PacketSource, report_logger: ReportLogger) -> Self {
+    pub fn new(source: &PacketSource) -> Self {
         match source {
-            PacketSource::DistPacketSource(source) => PacketSink::BasicPacketSink(
-                BasicPacketSink::new(source.report_interval, report_logger),
-            ),
-            PacketSource::TCPPacketSource(source) => {
-                PacketSink::TCPPacketSink(TCPPacketSink::new(source.report_interval, report_logger))
+            PacketSource::DistPacketSource(_) => {
+                PacketSink::BasicPacketSink(BasicPacketSink::new())
+            }
+            PacketSource::TCPPacketSource(_) => PacketSink::TCPPacketSink(TCPPacketSink::new()),
+        }
+    }
+
+    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
+        match self {
+            PacketSink::BasicPacketSink(sink) => {
+                sink.report_logger = report_logger;
+                sink.report_interval = report_interval;
+            }
+            PacketSink::TCPPacketSink(sink) => {
+                sink.report_logger = report_logger;
+                sink.report_interval = report_interval;
             }
         }
     }

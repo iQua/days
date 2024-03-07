@@ -95,9 +95,9 @@ pub struct WFQServer {
     /// the report of a report interval
     pub report: SchedulerReport,
     /// the interval of generating a periodic report
-    report_interval: f64,
+    pub report_interval: f64,
     /// the sender for sending periodic reports
-    report_logger: ReportLogger,
+    pub report_logger: ReportLogger,
 }
 
 impl WFQServer {
@@ -108,8 +108,6 @@ impl WFQServer {
         flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
         weights: Vec<usize>,
-        report_interval: f64,
-        report_logger: ReportLogger,
     ) -> WFQServer {
         let mut finish_times = HashMap::new();
 
@@ -150,9 +148,14 @@ impl WFQServer {
             busy_until: 0.0,
             output: Output::default(),
             report: SchedulerReport::new(scheduler_id as u32, 0.0),
-            report_interval,
-            report_logger,
+            report_interval: f64::MAX,
+            report_logger: ReportLogger::default(),
         }
+    }
+
+    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
+        self.report_logger = report_logger;
+        self.report_interval = report_interval;
     }
 
     pub fn id(&self) -> usize {

@@ -9,7 +9,6 @@ use asynchronix::time::MonotonicTime;
 
 use due::flows::cc::CCAlgorithm::TCPReno;
 use due::flows::flow::FlowType;
-use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::wire::Wire;
@@ -18,7 +17,6 @@ use due::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
-    let report_interval = 1.0;
 
     // instantiates models
     let mut source = PacketSource::new(
@@ -40,8 +38,6 @@ fn main() {
                 cc_algorithm: TCPReno,
             }),
         ),
-        report_interval,
-        ReportLogger::default(),
         0,
     );
 
@@ -53,7 +49,7 @@ fn main() {
         },
     );
 
-    let mut sink = PacketSink::new(&source, ReportLogger::default());
+    let mut sink = PacketSink::new(&source);
 
     // instantiates models' mailboxes
     let source_mbox = Mailbox::new();

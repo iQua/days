@@ -10,7 +10,6 @@ use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
 use due::flows::flow::FlowType;
-use due::flows::logger::ReportLogger;
 use due::flows::sink::PacketSink;
 use due::flows::source::PacketSource;
 use due::flows::{DistributionInfo, TrafficCharacteristics};
@@ -21,7 +20,6 @@ use due::switches::switch::PacketSwitch;
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
-    let report_interval = 1.0;
 
     // instantiates models
     let mut source_1 = PacketSource::new(
@@ -38,8 +36,6 @@ fn main() {
             },
             None,
         ),
-        report_interval,
-        ReportLogger::default(),
         0,
     );
 
@@ -57,8 +53,6 @@ fn main() {
             },
             None,
         ),
-        report_interval,
-        ReportLogger::default(),
         0,
     );
 
@@ -74,11 +68,9 @@ fn main() {
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
         vec![1, 1],
-        report_interval,
-        ReportLogger::default(),
     );
 
-    let mut sink = PacketSink::new(&source_1, ReportLogger::default());
+    let mut sink = PacketSink::new(&source_1);
 
     // instantiates models' mailboxes
     let source_1_mbox = Mailbox::new();

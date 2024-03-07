@@ -35,17 +35,11 @@ pub struct DistPacketSource {
     pub report_interval: f64,
     /// a report logger used for logging periodic reports to a SQLite database
     /// or a JSON file
-    report_logger: ReportLogger,
+    pub report_logger: ReportLogger,
 }
 
 impl DistPacketSource {
-    pub fn new(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        report_interval: f64,
-        report_logger: ReportLogger,
-        rng: SmallRng,
-    ) -> DistPacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> DistPacketSource {
         let endpoint_id = next_endpoint_id();
 
         DistPacketSource {
@@ -58,8 +52,8 @@ impl DistPacketSource {
             output: Output::default(),
             finish_msg_output: Output::default(),
             report: PacketSourceReport::new(endpoint_id as u32, 0.0),
-            report_interval,
-            report_logger,
+            report_interval: f64::MAX,
+            report_logger: ReportLogger::default(),
         }
     }
 

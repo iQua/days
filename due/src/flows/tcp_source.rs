@@ -96,7 +96,7 @@ pub struct TCPPacketSource {
     pub report_interval: f64,
     /// a report logger used for logging periodic reports to a SQLite database
     /// or a JSON file
-    report_logger: ReportLogger,
+    pub report_logger: ReportLogger,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -109,13 +109,7 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        report_interval: f64,
-        report_logger: ReportLogger,
-        rng: SmallRng,
-    ) -> TCPPacketSource {
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
         let endpoint_id = next_endpoint_id();
 
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
@@ -147,8 +141,8 @@ impl TCPPacketSource {
             output: Output::default(),
             finish_msg_output: Output::default(),
             report: PacketSourceReport::new(endpoint_id as u32, 0.0),
-            report_interval,
-            report_logger,
+            report_interval: f64::MAX,
+            report_logger: ReportLogger::default(),
         }
     }
 

@@ -326,9 +326,9 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % weights_len),
                     self.switch_config.drop,
                     weights.clone(),
-                    self.progress,
-                    self.report_logger.clone(),
                 );
+                drr_server.set_report_logger(self.report_logger.clone(), self.report_interval);
+
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(DRRServer::packet_received, &drr_mbox);
@@ -348,9 +348,9 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     self.switch_config.drop,
-                    self.progress,
-                    self.report_logger.clone(),
                 );
+                port.set_report_logger(self.report_logger.clone(), self.report_interval);
+
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(Port::packet_received, &port_mbox);
@@ -373,9 +373,8 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % priorities_len),
                     self.switch_config.drop,
                     priorities.clone(),
-                    self.progress,
-                    self.report_logger.clone(),
                 );
+                sp_server.set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let sp_mbox: Mailbox<SPServer> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -400,9 +399,9 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % vticks_len),
                     self.switch_config.drop,
                     vticks.clone(),
-                    self.progress,
-                    self.report_logger.clone(),
                 );
+                virtual_clock_server
+                    .set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let virtual_clock_mbox: Mailbox<VirtualClockServer> =
@@ -430,9 +429,8 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % weights_len),
                     self.switch_config.drop,
                     weights.clone(),
-                    self.progress,
-                    self.report_logger.clone(),
                 );
+                wfq_server.set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let wfq_mbox: Mailbox<WFQServer> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -477,7 +475,8 @@ impl Topology {
             flow.source_id = source.id();
 
             // creates a new packet sink
-            let mut sink = PacketSink::new(&source, self.report_logger.clone());
+            let mut sink = PacketSink::new(&source);
+            sink.set_report_logger(self.report_logger.clone(), self.report_interval);
             // records the PacketSink id for adding it as the end of the flow's
             // path in later construction of the path in Flow::compute_path()
             flow.sink_id = sink.id();

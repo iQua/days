@@ -102,10 +102,10 @@ pub struct VirtualClockServer {
     /// the report of a report interval
     pub report: SchedulerReport,
     /// the interval of generating a periodic report
-    report_interval: f64,
+    pub report_interval: f64,
     /// a report logger used for logging periodic reports to a SQLite database
     /// or a JSON file
-    report_logger: ReportLogger,
+    pub report_logger: ReportLogger,
 }
 
 impl VirtualClockServer {
@@ -116,8 +116,6 @@ impl VirtualClockServer {
         flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
         vticks: HashMap<usize, usize>,
-        report_interval: f64,
-        report_logger: ReportLogger,
     ) -> VirtualClockServer {
         let scheduler_id = next_scheduler_id();
 
@@ -149,9 +147,14 @@ impl VirtualClockServer {
             busy_until: 0.0,
             output: Output::default(),
             report: SchedulerReport::new(scheduler_id as u32, 0.0),
-            report_interval,
-            report_logger,
+            report_interval: f64::MAX,
+            report_logger: ReportLogger::default(),
         }
+    }
+
+    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
+        self.report_logger = report_logger;
+        self.report_interval = report_interval;
     }
 
     pub fn id(&self) -> usize {
