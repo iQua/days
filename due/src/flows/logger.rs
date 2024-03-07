@@ -23,15 +23,15 @@ pub enum Report {
 #[derive(Deserialize)]
 #[serde(rename_all(deserialize = "lowercase"))]
 pub enum LogType {
-    DB,
+    DataBase,
     JSON,
     NONE,
 }
 
 #[derive(Clone, Debug)]
 pub enum ReportLogger {
-    ReportLoggerDB(ReportLoggerDB),
-    ReportLoggerJson(ReportLoggerJson),
+    DatabaseLogger(DatabaseLogger),
+    JsonLogger(JsonLogger),
     ReportLoggerNone(ReportLoggerNone),
 }
 
@@ -39,14 +39,14 @@ impl ReportLogger {
     pub fn new(log_path: Option<String>, log_type: Option<LogType>) -> Self {
         let log_type = log_type.unwrap_or(LogType::NONE);
         let log_path = match log_type {
-            LogType::DB => log_path.unwrap_or("./output.db".to_string()),
+            LogType::DataBase => log_path.unwrap_or("./output.db".to_string()),
             LogType::JSON => log_path.unwrap_or("./output/".to_string()),
             LogType::NONE => String::default(),
         };
 
         match log_type {
-            LogType::DB => ReportLogger::ReportLoggerDB(ReportLoggerDB::new(&log_path)),
-            LogType::JSON => ReportLogger::ReportLoggerJson(ReportLoggerJson::new(&log_path)),
+            LogType::DataBase => ReportLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
+            LogType::JSON => ReportLogger::JsonLogger(JsonLogger::new(&log_path)),
             LogType::NONE => ReportLogger::ReportLoggerNone(ReportLoggerNone {}),
         }
     }
@@ -58,20 +58,20 @@ impl ReportLogger {
 
     pub fn log_report(&self, report: Report) {
         match self {
-            ReportLogger::ReportLoggerDB(report_logger) => report_logger.log_report(report),
-            ReportLogger::ReportLoggerJson(report_logger) => report_logger.log_report(report),
+            ReportLogger::DatabaseLogger(report_logger) => report_logger.log_report(report),
+            ReportLogger::JsonLogger(report_logger) => report_logger.log_report(report),
             ReportLogger::ReportLoggerNone(_) => {}
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct ReportLoggerDB {
+pub struct DatabaseLogger {
     db_path: String,
     db_queries: HashMap<String, String>,
 }
 
-impl ReportLoggerDB {
+impl DatabaseLogger {
     pub fn new(log_path: &str) -> Self {
         let mut db_path = log_path.to_string();
         if log_path[log_path.len() - 3..].to_string() != ".db" {
@@ -83,7 +83,7 @@ impl ReportLoggerDB {
             &db_path
         );
 
-        ReportLoggerDB {
+        DatabaseLogger {
             db_path: db_path.clone(),
             db_queries: Self::create_database(&db_path),
         }
@@ -272,12 +272,12 @@ impl ReportLoggerDB {
 }
 
 #[derive(Clone, Debug)]
-pub struct ReportLoggerJson {
+pub struct JsonLogger {
     log_file_paths: HashMap<String, String>,
     log_file_locks: HashMap<String, Arc<Mutex<File>>>,
 }
 
-impl ReportLoggerJson {
+impl JsonLogger {
     pub fn new(log_path: &str) -> Self {
         let mut log_dir = log_path.to_string();
         if log_dir.chars().last().unwrap() != '/' {
@@ -316,7 +316,7 @@ impl ReportLoggerJson {
             &log_dir
         );
 
-        ReportLoggerJson {
+        JsonLogger {
             log_file_paths,
             log_file_locks,
         }
