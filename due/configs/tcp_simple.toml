@@ -6,7 +6,9 @@ edges = [[0, 1]]
 hosts = [0, 1]
 progress = 2.0
 duration = 10.0
-db_path = "./tcp.db"
+log_path = "./tcp_output"
+log_type = "json"
+
 
 [switch]
 port_rate = 4096
