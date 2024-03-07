@@ -23,9 +23,9 @@ pub enum Report {
 #[derive(Deserialize)]
 #[serde(rename_all(deserialize = "lowercase"))]
 pub enum LogType {
-    DataBase,
+    Database,
     JSON,
-    NONE,
+    None,
 }
 
 #[derive(Clone, Debug)]
@@ -37,17 +37,17 @@ pub enum ReportLogger {
 
 impl ReportLogger {
     pub fn new(log_path: Option<String>, log_type: Option<LogType>) -> Self {
-        let log_type = log_type.unwrap_or(LogType::NONE);
+        let log_type = log_type.unwrap_or(LogType::None);
         let log_path = match log_type {
-            LogType::DataBase => log_path.unwrap_or("./output.db".to_string()),
+            LogType::Database => log_path.unwrap_or("./output.db".to_string()),
             LogType::JSON => log_path.unwrap_or("./output/".to_string()),
-            LogType::NONE => String::default(),
+            LogType::None => String::default(),
         };
 
         match log_type {
-            LogType::DataBase => ReportLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
+            LogType::Database => ReportLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
             LogType::JSON => ReportLogger::JsonLogger(JsonLogger::new(&log_path)),
-            LogType::NONE => ReportLogger::ReportLoggerNone(ReportLoggerNone {}),
+            LogType::None => ReportLogger::ReportLoggerNone(ReportLoggerNone {}),
         }
     }
 
