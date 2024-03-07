@@ -18,8 +18,7 @@ discipline = "FIFO"
 drop = "RED"
 
 [[flow]]
-flow_type = "PacketDistribution"
-#flow_type = "TCP"
+flow_type = "TCP"
 graph = [[0, 1]]
 [flow.traffic]
     initial_delay = 0.0

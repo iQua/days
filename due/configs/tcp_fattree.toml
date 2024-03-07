@@ -6,8 +6,8 @@ duration = 0.1
 progress = 0.01
 log_path = "./tcp_fattree"
 #log_type = "none"
-#log_type = "json"
-log_type = "database"
+log_type = "json"
+#log_type = "database"
 log_interval =  0.02
 
 [topology]
