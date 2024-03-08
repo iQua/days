@@ -1,17 +1,54 @@
 //! Implements a report logger to log periodic reports of sources, schedulers,
 //! and sinks to a SQLite database or three JSON files.
 
-use log::info;
-use rusqlite::Connection;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use lazy_static::lazy_static;
+use log::info;
+use rusqlite::Connection;
+use serde::Deserialize;
+
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
+
+pub struct PeriodicLogger {
+    report_logger: ReportLogger,
+    report_interval: f64,
+}
+
+impl PeriodicLogger {
+    pub fn new() -> PeriodicLogger {
+        PeriodicLogger {
+            report_logger: ReportLogger::default(),
+            report_interval: f64::MAX,
+        }
+    }
+
+    pub fn get_instance() -> Arc<PeriodicLogger> {
+        lazy_static! {
+            static ref INSTANCE: Mutex<Option<Arc<PeriodicLogger>>> = Mutex::new(None);
+        }
+
+        let mut instance = INSTANCE.lock().unwrap();
+        if instance.is_none() {
+            *instance = Some(Arc::new(PeriodicLogger::new()));
+        }
+        Arc::clone(instance.as_ref().unwrap())
+    }
+
+    pub fn log_report(report: Report) {
+        let report_logger = &PeriodicLogger::get_instance().report_logger;
+        report_logger.log_report(report);
+    }
+
+    pub fn get_report_interval() -> f64 {
+        PeriodicLogger::get_instance().report_interval
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Report {

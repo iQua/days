@@ -19,7 +19,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
-use crate::flows::logger::ReportLogger;
+use crate::flows::logger::PeriodicLogger;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
@@ -238,19 +238,6 @@ impl PacketSink {
         }
     }
 
-    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
-        match self {
-            PacketSink::BasicPacketSink(sink) => {
-                sink.report_logger = report_logger;
-                sink.report_interval = report_interval;
-            }
-            PacketSink::TCPPacketSink(sink) => {
-                sink.report_logger = report_logger;
-                sink.report_interval = report_interval;
-            }
-        }
-    }
-
     pub fn id(&self) -> usize {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.endpoint_id,
@@ -269,13 +256,6 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.output.borrow_mut(),
-        }
-    }
-
-    pub fn report_interval(&self) -> f64 {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.report_interval,
-            PacketSink::TCPPacketSink(sink) => sink.report_interval,
         }
     }
 
@@ -350,7 +330,7 @@ impl PacketSink {
 
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(self.report_interval()),
+                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )
@@ -367,7 +347,7 @@ impl Model for PacketSink {
         Box::pin(async move {
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(self.report_interval()),
+                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )

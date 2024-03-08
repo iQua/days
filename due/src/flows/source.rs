@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
-use crate::flows::logger::ReportLogger;
+use crate::flows::logger::PeriodicLogger;
 use crate::flows::packet::Packet;
 use crate::flows::progress::FinishMsg;
 use crate::flows::tcp_source::TCPPacketSource;
@@ -100,19 +100,6 @@ impl PacketSource {
         }
     }
 
-    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
-        match self {
-            PacketSource::DistPacketSource(source) => {
-                source.report_logger = report_logger;
-                source.report_interval = report_interval;
-            }
-            PacketSource::TCPPacketSource(source) => {
-                source.report_logger = report_logger;
-                source.report_interval = report_interval;
-            }
-        }
-    }
-
     pub fn output(&mut self) -> &mut Output<Packet> {
         match self {
             PacketSource::DistPacketSource(source) => source.output.borrow_mut(),
@@ -124,13 +111,6 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
-        }
-    }
-
-    pub fn report_interval(&self) -> f64 {
-        match self {
-            PacketSource::DistPacketSource(source) => source.report_interval,
-            PacketSource::TCPPacketSource(source) => source.report_interval,
         }
     }
 
@@ -315,7 +295,7 @@ impl PacketSource {
 
                 scheduler
                     .schedule_event(
-                        Duration::from_secs_f64(self.report_interval()),
+                        Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
                         Self::log_report,
                         (),
                     )
@@ -406,7 +386,7 @@ impl Model for PacketSource {
 
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(self.report_interval()),
+                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )

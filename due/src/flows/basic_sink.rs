@@ -6,7 +6,7 @@ use std::fmt::Debug;
 
 use asynchronix::model::{Model, Output};
 
-use crate::flows::logger::{Report, ReportLogger};
+use crate::flows::logger::{PeriodicLogger, Report};
 use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
@@ -22,11 +22,6 @@ pub struct BasicPacketSink {
     pub output: Output<Packet>,
     /// the report of a report interval
     pub report: PacketSinkReport,
-    /// the interval of generating a periodic report
-    pub report_interval: f64,
-    /// a report logger used for logging periodic reports to a SQLite database
-    /// or a JSON file
-    pub report_logger: ReportLogger,
 }
 
 impl BasicPacketSink {
@@ -39,16 +34,13 @@ impl BasicPacketSink {
             statistics: Output::default(),
             output: Output::default(),
             report: PacketSinkReport::new(endpoint_id as u32, 0.0),
-            report_interval: f64::MAX,
-            report_logger: ReportLogger::default(),
         }
     }
 
     pub fn log_report(&mut self, now: f64) {
         self.report.end_time = now;
 
-        self.report_logger
-            .log_report(Report::PacketSinkReport(self.report.clone()));
+        PeriodicLogger::log_report(Report::PacketSinkReport(self.report.clone()));
         debug!(
             "PacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

@@ -143,11 +143,6 @@ pub struct Topology {
     progress: f64,
     /// the duration of the simulation run
     duration: f64,
-    /// a report logger used for logging periodic reports to a SQLite database
-    /// or a JSON file
-    report_logger: ReportLogger,
-    /// the interval of generating periodic reports
-    report_interval: f64,
 }
 
 impl Topology {
@@ -197,8 +192,6 @@ impl Topology {
             mailbox_capacity,
             progress,
             duration,
-            report_logger,
-            report_interval,
         }
     }
 
@@ -327,7 +320,6 @@ impl Topology {
                     self.switch_config.drop,
                     weights.clone(),
                 );
-                drr_server.set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -349,7 +341,6 @@ impl Topology {
                     CapacityUnit::Packets,
                     self.switch_config.drop,
                 );
-                port.set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -374,7 +365,6 @@ impl Topology {
                     self.switch_config.drop,
                     priorities.clone(),
                 );
-                sp_server.set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let sp_mbox: Mailbox<SPServer> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -400,8 +390,6 @@ impl Topology {
                     self.switch_config.drop,
                     vticks.clone(),
                 );
-                virtual_clock_server
-                    .set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let virtual_clock_mbox: Mailbox<VirtualClockServer> =
@@ -430,7 +418,6 @@ impl Topology {
                     self.switch_config.drop,
                     weights.clone(),
                 );
-                wfq_server.set_report_logger(self.report_logger.clone(), self.report_interval);
 
                 let mut output = Output::default();
                 let wfq_mbox: Mailbox<WFQServer> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -468,7 +455,6 @@ impl Topology {
 
             // creates a new packet source
             let mut source = PacketSource::new(flow.id, flow.flow_type, flow.traffic, flow.seed);
-            source.set_report_logger(self.report_logger.clone(), self.report_interval);
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
             // Flow::compute_path()
@@ -476,7 +462,6 @@ impl Topology {
 
             // creates a new packet sink
             let mut sink = PacketSink::new(&source);
-            sink.set_report_logger(self.report_logger.clone(), self.report_interval);
             // records the PacketSink id for adding it as the end of the flow's
             // path in later construction of the path in Flow::compute_path()
             flow.sink_id = sink.id();

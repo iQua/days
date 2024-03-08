@@ -13,7 +13,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
-use crate::flows::logger::{Report, ReportLogger};
+use crate::flows::logger::{PeriodicLogger, Report};
 use crate::flows::packet::Packet;
 use crate::flows::progress::FinishMsg;
 use crate::flows::source::PacketSourceReport;
@@ -92,11 +92,6 @@ pub struct TCPPacketSource {
 
     /// the report of a report interval
     pub report: PacketSourceReport,
-    /// the interval of generating a periodic report
-    pub report_interval: f64,
-    /// a report logger used for logging periodic reports to a SQLite database
-    /// or a JSON file
-    pub report_logger: ReportLogger,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -141,8 +136,6 @@ impl TCPPacketSource {
             output: Output::default(),
             finish_msg_output: Output::default(),
             report: PacketSourceReport::new(endpoint_id as u32, 0.0),
-            report_interval: f64::MAX,
-            report_logger: ReportLogger::default(),
         }
     }
 
@@ -376,8 +369,7 @@ impl TCPPacketSource {
     pub fn log_report(&mut self, now: f64) {
         self.report.last_update(now, self.last_ack as u32);
 
-        self.report_logger
-            .log_report(Report::PacketSourceReport(self.report.clone()));
+        PeriodicLogger::log_report(Report::PacketSourceReport(self.report.clone()));
         debug!(
             "TCPPacketSource {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

@@ -12,7 +12,7 @@ use log::debug;
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::flows::logger::{Report, ReportLogger};
+use crate::flows::logger::{PeriodicLogger, Report};
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
@@ -94,10 +94,6 @@ pub struct WFQServer {
 
     /// the report of a report interval
     pub report: SchedulerReport,
-    /// the interval of generating a periodic report
-    pub report_interval: f64,
-    /// the sender for sending periodic reports
-    pub report_logger: ReportLogger,
 }
 
 impl WFQServer {
@@ -148,14 +144,7 @@ impl WFQServer {
             busy_until: 0.0,
             output: Output::default(),
             report: SchedulerReport::new(scheduler_id as u32, 0.0),
-            report_interval: f64::MAX,
-            report_logger: ReportLogger::default(),
         }
-    }
-
-    pub fn set_report_logger(&mut self, report_logger: ReportLogger, report_interval: f64) {
-        self.report_logger = report_logger;
-        self.report_interval = report_interval;
     }
 
     pub fn id(&self) -> usize {
@@ -349,8 +338,7 @@ impl WFQServer {
                 .as_secs_f64();
 
             self.report.end_time = now;
-            self.report_logger
-                .log_report(Report::SchedulerReport(self.report.clone()));
+            PeriodicLogger::log_report(Report::SchedulerReport(self.report.clone()));
             debug!(
                 "WFQServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
@@ -360,7 +348,7 @@ impl WFQServer {
 
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(self.report_interval),
+                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )
@@ -377,7 +365,7 @@ impl Model for WFQServer {
         Box::pin(async move {
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(self.report_interval),
+                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )
