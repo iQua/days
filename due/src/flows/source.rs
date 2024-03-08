@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
-use crate::flows::logger::PeriodicLogger;
+use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
 use crate::flows::progress::FinishMsg;
 use crate::flows::tcp_source::TCPPacketSource;
@@ -295,7 +295,7 @@ impl PacketSource {
 
                 scheduler
                     .schedule_event(
-                        Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
+                        Duration::from_secs_f64(ReportLogger::get_report_interval()),
                         Self::log_report,
                         (),
                     )
@@ -386,7 +386,7 @@ impl Model for PacketSource {
 
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )

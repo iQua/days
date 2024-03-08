@@ -22,15 +22,15 @@ lazy_static! {
     pub static ref REPORT_INTERVAL: RwLock<f64> = RwLock::new(f64::MAX);
 }
 
-pub struct PeriodicLogger {
-    report_logger: ReportLogger,
+pub struct ReportLogger {
+    report_logger: PeriodicLogger,
     report_interval: f64,
 }
 
-impl PeriodicLogger {
-    pub fn new() -> PeriodicLogger {
-        PeriodicLogger {
-            report_logger: ReportLogger::new(
+impl ReportLogger {
+    pub fn new() -> ReportLogger {
+        ReportLogger {
+            report_logger: PeriodicLogger::new(
                 LOG_PATH.read().unwrap().clone(),
                 *LOG_TYPE.read().unwrap(),
             ),
@@ -60,25 +60,25 @@ impl PeriodicLogger {
         *report_interval_static = report_interval;
     }
 
-    pub fn get_instance() -> Arc<PeriodicLogger> {
+    pub fn get_instance() -> Arc<ReportLogger> {
         lazy_static! {
-            static ref INSTANCE: Mutex<Option<Arc<PeriodicLogger>>> = Mutex::new(None);
+            static ref INSTANCE: Mutex<Option<Arc<ReportLogger>>> = Mutex::new(None);
         }
 
         let mut instance = INSTANCE.lock().unwrap();
         if instance.is_none() {
-            *instance = Some(Arc::new(PeriodicLogger::new()));
+            *instance = Some(Arc::new(ReportLogger::new()));
         }
         Arc::clone(instance.as_ref().unwrap())
     }
 
     pub fn log_report(report: Report) {
-        let report_logger = &PeriodicLogger::get_instance().report_logger;
+        let report_logger = &ReportLogger::get_instance().report_logger;
         report_logger.log_report(report);
     }
 
     pub fn get_report_interval() -> f64 {
-        PeriodicLogger::get_instance().report_interval
+        ReportLogger::get_instance().report_interval
     }
 }
 
@@ -98,31 +98,31 @@ pub enum LogType {
 }
 
 #[derive(Debug)]
-pub enum ReportLogger {
+pub enum PeriodicLogger {
     DatabaseLogger(DatabaseLogger),
     JsonLogger(JsonLogger),
-    ReportLoggerNone(ReportLoggerNone),
+    PeriodicLoggerNone(PeriodicLoggerNone),
 }
 
-impl ReportLogger {
+impl PeriodicLogger {
     pub fn new(log_path: String, log_type: LogType) -> Self {
         match log_type {
-            LogType::Database => ReportLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
-            LogType::JSON => ReportLogger::JsonLogger(JsonLogger::new(&log_path)),
-            LogType::None => ReportLogger::ReportLoggerNone(ReportLoggerNone {}),
+            LogType::Database => PeriodicLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
+            LogType::JSON => PeriodicLogger::JsonLogger(JsonLogger::new(&log_path)),
+            LogType::None => PeriodicLogger::PeriodicLoggerNone(PeriodicLoggerNone {}),
         }
     }
 
     /// Returns a void report logger that doesn't log.
     pub fn default() -> Self {
-        ReportLogger::ReportLoggerNone(ReportLoggerNone {})
+        PeriodicLogger::PeriodicLoggerNone(PeriodicLoggerNone {})
     }
 
     pub fn log_report(&self, report: Report) {
         match self {
-            ReportLogger::DatabaseLogger(report_logger) => report_logger.log_report(report),
-            ReportLogger::JsonLogger(report_logger) => report_logger.log_report(report),
-            ReportLogger::ReportLoggerNone(_) => {}
+            PeriodicLogger::DatabaseLogger(report_logger) => report_logger.log_report(report),
+            PeriodicLogger::JsonLogger(report_logger) => report_logger.log_report(report),
+            PeriodicLogger::PeriodicLoggerNone(_) => {}
         }
     }
 }
@@ -380,6 +380,6 @@ impl JsonLogger {
 }
 
 #[derive(Debug)]
-pub struct ReportLoggerNone {}
+pub struct PeriodicLoggerNone {}
 
-impl ReportLoggerNone {}
+impl PeriodicLoggerNone {}

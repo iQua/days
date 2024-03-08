@@ -13,7 +13,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
-use crate::flows::logger::{PeriodicLogger, Report};
+use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::Packet;
 use crate::flows::progress::FinishMsg;
 use crate::flows::source::PacketSourceReport;
@@ -369,7 +369,7 @@ impl TCPPacketSource {
     pub fn log_report(&mut self, now: f64) {
         self.report.last_update(now, self.last_ack as u32);
 
-        PeriodicLogger::log_report(Report::PacketSourceReport(self.report.clone()));
+        ReportLogger::log_report(Report::PacketSourceReport(self.report.clone()));
         debug!(
             "TCPPacketSource {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

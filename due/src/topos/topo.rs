@@ -19,7 +19,7 @@ use asynchronix::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
-use crate::flows::logger::{LogType, PeriodicLogger};
+use crate::flows::logger::{LogType, ReportLogger};
 use crate::flows::progress::Progress;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
@@ -176,7 +176,7 @@ impl Topology {
             .expect("Failed to deserialize the configuration of logging outputs");
         let report_interval = log_config.log_interval.unwrap_or(progress);
         // initializes the singleton of the logger of reports
-        PeriodicLogger::init(log_config.log_path, log_config.log_type, report_interval);
+        ReportLogger::init(log_config.log_path, log_config.log_type, report_interval);
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();

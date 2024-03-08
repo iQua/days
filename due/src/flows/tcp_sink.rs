@@ -6,7 +6,7 @@ use std::fmt::Debug;
 
 use asynchronix::model::{Model, Output};
 
-use crate::flows::logger::{PeriodicLogger, Report};
+use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
@@ -47,7 +47,7 @@ impl TCPPacketSink {
     pub fn log_report(&mut self, now: f64) {
         self.report.end_time = now;
 
-        PeriodicLogger::log_report(Report::PacketSinkReport(self.report.clone()));
+        ReportLogger::log_report(Report::PacketSinkReport(self.report.clone()));
         debug!(
             "TCPPacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

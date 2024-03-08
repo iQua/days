@@ -19,7 +19,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
-use crate::flows::logger::PeriodicLogger;
+use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
@@ -330,7 +330,7 @@ impl PacketSink {
 
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )
@@ -347,7 +347,7 @@ impl Model for PacketSink {
         Box::pin(async move {
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )

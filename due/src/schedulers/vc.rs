@@ -18,7 +18,7 @@ use log::debug;
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::flows::logger::{PeriodicLogger, Report};
+use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
@@ -303,7 +303,7 @@ impl VirtualClockServer {
                 .as_secs_f64();
 
             self.report.end_time = now;
-            PeriodicLogger::log_report(Report::SchedulerReport(self.report.clone()));
+            ReportLogger::log_report(Report::SchedulerReport(self.report.clone()));
             debug!(
                 "VirtualClockServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
@@ -313,7 +313,7 @@ impl VirtualClockServer {
 
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )
@@ -330,7 +330,7 @@ impl Model for VirtualClockServer {
         Box::pin(async move {
             scheduler
                 .schedule_event(
-                    Duration::from_secs_f64(PeriodicLogger::get_report_interval()),
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
                     Self::log_report,
                     (),
                 )
