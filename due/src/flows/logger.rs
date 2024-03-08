@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::Write;
+use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 
 use lazy_static::lazy_static;
@@ -15,6 +16,11 @@ use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
 
+lazy_static! {
+    pub static ref REPORT_LOGGER: RwLock<ReportLogger> = RwLock::new(ReportLogger::default());
+    pub static ref REPORT_INTERVAL: RwLock<f64> = RwLock::new(f64::MAX);
+}
+
 pub struct PeriodicLogger {
     report_logger: ReportLogger,
     report_interval: f64,
@@ -23,8 +29,19 @@ pub struct PeriodicLogger {
 impl PeriodicLogger {
     pub fn new() -> PeriodicLogger {
         PeriodicLogger {
-            report_logger: ReportLogger::default(),
-            report_interval: f64::MAX,
+            report_logger: *REPORT_LOGGER.read().unwrap(),
+            report_interval: *REPORT_INTERVAL.read().unwrap(),
+        }
+    }
+
+    pub fn init(report_logger: ReportLogger, report_interval: f64) {
+        {
+            let mut report_logger_static = REPORT_LOGGER.write().unwrap();
+            *report_logger_static = report_logger;
+        }
+        {
+            let mut report_interval_static = REPORT_INTERVAL.write().unwrap();
+            *report_interval_static = report_interval;
         }
     }
 
