@@ -97,7 +97,7 @@ pub enum LogType {
     None,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ReportLogger {
     DatabaseLogger(DatabaseLogger),
     JsonLogger(JsonLogger),
@@ -321,10 +321,9 @@ impl DatabaseLogger {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct JsonLogger {
-    log_file_paths: HashMap<String, String>,
-    log_file_locks: HashMap<String, Arc<Mutex<File>>>,
+    log_files: HashMap<String, File>,
 }
 
 impl JsonLogger {
@@ -340,12 +339,9 @@ impl JsonLogger {
             );
         };
 
-        let mut log_file_paths: HashMap<String, String> = Default::default();
-        let mut log_file_locks: HashMap<String, Arc<Mutex<File>>> = Default::default();
+        let mut log_files: HashMap<String, File> = Default::default();
         for element in vec!["sources", "switches", "sinks"] {
             let file_name = format!("{log_dir}{element}.json");
-            log_file_paths.insert(element.to_string(), file_name.clone());
-
             if let Err(e) = File::create(&file_name) {
                 panic!(
                     "Error '{}' occurred when creating a log file {}",
@@ -357,8 +353,7 @@ impl JsonLogger {
                 .append(true)
                 .open(file_name)
                 .unwrap();
-            let log_lock = Arc::new(Mutex::new(log_file));
-            log_file_locks.insert(element.to_string(), log_lock);
+            log_files.insert(element.to_string(), log_file);
         }
 
         info!(
@@ -366,48 +361,32 @@ impl JsonLogger {
             &log_dir
         );
 
-        JsonLogger {
-            log_file_paths,
-            log_file_locks,
-        }
+        JsonLogger { log_files }
     }
 
     pub fn log_report(&self, report: Report) {
-        let (log_file_path, log_file_lock, report_json) = match report {
+        let (mut log_file, report_json) = match report {
             Report::PacketSourceReport(report) => (
-                self.log_file_paths.get("sources").unwrap(),
-                self.log_file_locks.get("sources").unwrap(),
+                self.log_files.get("sources").unwrap(),
                 serde_json::to_string_pretty(&report).unwrap(),
             ),
             Report::SchedulerReport(report) => (
-                self.log_file_paths.get("switches").unwrap(),
-                self.log_file_locks.get("switches").unwrap(),
+                self.log_files.get("switches").unwrap(),
                 serde_json::to_string_pretty(&report).unwrap(),
             ),
             Report::PacketSinkReport(report) => (
-                self.log_file_paths.get("sinks").unwrap(),
-                self.log_file_locks.get("sinks").unwrap(),
+                self.log_files.get("sinks").unwrap(),
                 serde_json::to_string_pretty(&report).unwrap(),
             ),
         };
 
-        let log_file_lock = Arc::clone(log_file_lock);
-        loop {
-            let mut log_lock = log_file_lock.try_lock();
-            if let Ok(ref mut log_file) = log_lock {
-                if let Err(e) = writeln!(**log_file, "{}", report_json) {
-                    panic!(
-                        "Error '{}' occurred when writing to log file {}",
-                        e, log_file_path
-                    );
-                };
-                break;
-            }
-        }
+        if let Err(e) = writeln!(log_file, "{}", report_json) {
+            panic!("Error '{}' occurred when writing to a log file", e);
+        };
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ReportLoggerNone {}
 
 impl ReportLoggerNone {}
