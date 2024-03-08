@@ -17,7 +17,8 @@ use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
 
 lazy_static! {
-    pub static ref REPORT_LOGGER: RwLock<ReportLogger> = RwLock::new(ReportLogger::default());
+    pub static ref LOG_PATH: RwLock<String> = RwLock::new(String::default());
+    pub static ref LOG_TYPE: RwLock<LogType> = RwLock::new(LogType::None);
     pub static ref REPORT_INTERVAL: RwLock<f64> = RwLock::new(f64::MAX);
 }
 
@@ -29,20 +30,34 @@ pub struct PeriodicLogger {
 impl PeriodicLogger {
     pub fn new() -> PeriodicLogger {
         PeriodicLogger {
-            report_logger: *REPORT_LOGGER.read().unwrap(),
+            report_logger: ReportLogger::new(
+                LOG_PATH.read().unwrap().clone(),
+                *LOG_TYPE.read().unwrap(),
+            ),
             report_interval: *REPORT_INTERVAL.read().unwrap(),
         }
     }
 
-    pub fn init(report_logger: ReportLogger, report_interval: f64) {
-        {
-            let mut report_logger_static = REPORT_LOGGER.write().unwrap();
-            *report_logger_static = report_logger;
+    pub fn init(log_path: Option<String>, log_type: Option<LogType>, report_interval: f64) {
+        if log_type.is_some() {
+            let mut log_type_static = LOG_TYPE.write().unwrap();
+            *log_type_static = log_type.unwrap();
         }
-        {
-            let mut report_interval_static = REPORT_INTERVAL.write().unwrap();
-            *report_interval_static = report_interval;
+
+        let mut log_path_static = LOG_PATH.write().unwrap();
+        if log_path.is_some() {
+            *log_path_static = log_path.unwrap();
+        } else {
+            let default_log_path = match *LOG_TYPE.read().unwrap() {
+                LogType::Database => log_path.unwrap_or("./output.db".to_string()),
+                LogType::JSON => log_path.unwrap_or("./output/".to_string()),
+                LogType::None => String::default(),
+            };
+            *log_path_static = default_log_path;
         }
+
+        let mut report_interval_static = REPORT_INTERVAL.write().unwrap();
+        *report_interval_static = report_interval;
     }
 
     pub fn get_instance() -> Arc<PeriodicLogger> {
@@ -74,7 +89,7 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all(deserialize = "lowercase"))]
 pub enum LogType {
     Database,
@@ -90,14 +105,7 @@ pub enum ReportLogger {
 }
 
 impl ReportLogger {
-    pub fn new(log_path: Option<String>, log_type: Option<LogType>) -> Self {
-        let log_type = log_type.unwrap_or(LogType::None);
-        let log_path = match log_type {
-            LogType::Database => log_path.unwrap_or("./output.db".to_string()),
-            LogType::JSON => log_path.unwrap_or("./output/".to_string()),
-            LogType::None => String::default(),
-        };
-
+    pub fn new(log_path: String, log_type: LogType) -> Self {
         match log_type {
             LogType::Database => ReportLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
             LogType::JSON => ReportLogger::JsonLogger(JsonLogger::new(&log_path)),
