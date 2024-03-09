@@ -17,12 +17,12 @@ use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
-use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
-use crate::flows::progress::FinishMsg;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
+use crate::utils::logger::ReportLogger;
+use crate::utils::progress::FinishMsg;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {

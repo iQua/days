@@ -6,10 +6,10 @@ use std::fmt::Debug;
 
 use asynchronix::model::{Model, Output};
 
-use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
+use crate::utils::logger::{Report, ReportLogger};
 
 #[derive(Debug)]
 pub struct TCPPacketSink {

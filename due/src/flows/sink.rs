@@ -19,10 +19,10 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
-use crate::flows::logger::ReportLogger;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
+use crate::utils::logger::ReportLogger;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {

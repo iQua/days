@@ -16,6 +16,21 @@ use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
 
+#[derive(Clone, Debug)]
+pub enum Report {
+    PacketSourceReport(PacketSourceReport),
+    SchedulerReport(SchedulerReport),
+    PacketSinkReport(PacketSinkReport),
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all(deserialize = "lowercase"))]
+pub enum LogType {
+    Database,
+    JSON,
+    None,
+}
+
 lazy_static! {
     pub static ref LOG_PATH: RwLock<String> = RwLock::new(String::default());
     pub static ref LOG_TYPE: RwLock<LogType> = RwLock::new(LogType::None);
@@ -80,21 +95,6 @@ impl ReportLogger {
     pub fn get_report_interval() -> f64 {
         ReportLogger::get_instance().report_interval
     }
-}
-
-#[derive(Clone, Debug)]
-pub enum Report {
-    PacketSourceReport(PacketSourceReport),
-    SchedulerReport(SchedulerReport),
-    PacketSinkReport(PacketSinkReport),
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all(deserialize = "lowercase"))]
-pub enum LogType {
-    Database,
-    JSON,
-    None,
 }
 
 #[derive(Debug)]

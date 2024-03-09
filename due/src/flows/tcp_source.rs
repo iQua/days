@@ -13,12 +13,12 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
-use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::Packet;
-use crate::flows::progress::FinishMsg;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
+use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::progress::FinishMsg;
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {

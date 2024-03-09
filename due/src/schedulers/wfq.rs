@@ -12,11 +12,11 @@ use log::debug;
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
-use crate::flows::logger::{Report, ReportLogger};
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::SchedulerReport;
+use crate::utils::logger::{Report, ReportLogger};
 
 pub struct TaggedPacket {
     pub packet: Packet,

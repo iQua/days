@@ -19,8 +19,6 @@ use asynchronix::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
-use crate::flows::logger::{LogType, ReportLogger};
-use crate::flows::progress::Progress;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -31,6 +29,8 @@ use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
+use crate::utils::logger::{LogType, ReportLogger};
+use crate::utils::progress::Progress;
 use crate::{next_flow_id, num_switches, set_num_switches};
 
 #[derive(Deserialize)]
