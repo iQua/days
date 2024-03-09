@@ -32,7 +32,7 @@ impl ReportLogger {
         ReportLogger {
             report_logger: PeriodicLogger::new(
                 LOG_PATH.read().unwrap().clone(),
-                *LOG_TYPE.read().unwrap(),
+                LOG_TYPE.read().unwrap().clone(),
             ),
             report_interval: *REPORT_INTERVAL.read().unwrap(),
         }
@@ -89,7 +89,7 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all(deserialize = "lowercase"))]
 pub enum LogType {
     Database,
@@ -101,7 +101,7 @@ pub enum LogType {
 pub enum PeriodicLogger {
     DatabaseLogger(DatabaseLogger),
     JsonLogger(JsonLogger),
-    PeriodicLoggerNone(PeriodicLoggerNone),
+    NoneLogger(NoneLogger),
 }
 
 impl PeriodicLogger {
@@ -109,20 +109,20 @@ impl PeriodicLogger {
         match log_type {
             LogType::Database => PeriodicLogger::DatabaseLogger(DatabaseLogger::new(&log_path)),
             LogType::JSON => PeriodicLogger::JsonLogger(JsonLogger::new(&log_path)),
-            LogType::None => PeriodicLogger::PeriodicLoggerNone(PeriodicLoggerNone {}),
+            LogType::None => PeriodicLogger::NoneLogger(NoneLogger {}),
         }
     }
 
     /// Returns a void report logger that doesn't log.
     pub fn default() -> Self {
-        PeriodicLogger::PeriodicLoggerNone(PeriodicLoggerNone {})
+        PeriodicLogger::NoneLogger(NoneLogger {})
     }
 
     pub fn log_report(&self, report: Report) {
         match self {
             PeriodicLogger::DatabaseLogger(report_logger) => report_logger.log_report(report),
             PeriodicLogger::JsonLogger(report_logger) => report_logger.log_report(report),
-            PeriodicLogger::PeriodicLoggerNone(_) => {}
+            PeriodicLogger::NoneLogger(_) => {}
         }
     }
 }
@@ -380,6 +380,6 @@ impl JsonLogger {
 }
 
 #[derive(Debug)]
-pub struct PeriodicLoggerNone {}
+pub struct NoneLogger {}
 
-impl PeriodicLoggerNone {}
+impl NoneLogger {}
