@@ -17,7 +17,7 @@ fn main() {
     let (graph, hosts) = build_graph(file_path);
     info!("The network graph has been initialized.");
 
-    let collectives = Collective::collectives_from_config(file_path);
+    let collectives = Collective::collectives_from_config(file_path, &hosts);
 
     info!(
         "A total of {} collective communication operations has been initialized.",

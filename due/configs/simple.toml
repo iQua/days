@@ -34,8 +34,9 @@ graph = [[1, 0]]
 [[collective]]
 collective_type = "Broadcast"
 flow_type = "PacketDistribution"
+flow_count = 2
 graph = [[0, 1], [0, 2]]
-sources = [0]
+sources = [0, 0]
 sinks = [1, 2]
 [collective.traffic]
     initial_delay = 1.0
