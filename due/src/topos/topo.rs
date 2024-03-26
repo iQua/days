@@ -29,7 +29,7 @@ use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::utils::logger::{LogType, ReportLogger};
+use crate::utils::logger::ReportLogger;
 use crate::utils::progress::Progress;
 use crate::{next_flow_id, num_switches, set_num_switches};
 
@@ -42,7 +42,6 @@ struct ProgressConfig {
 #[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
-    log_type: Option<LogType>,
     log_interval: Option<f64>,
 }
 
@@ -176,7 +175,7 @@ impl Topology {
             .expect("Failed to deserialize the configuration of logging outputs");
         let report_interval = log_config.log_interval.unwrap_or(progress);
         // initializes the singleton of the logger of reports
-        ReportLogger::init(log_config.log_path, log_config.log_type, report_interval);
+        ReportLogger::init(log_config.log_path, report_interval);
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();

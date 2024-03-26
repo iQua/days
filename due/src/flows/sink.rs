@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use log::debug;
+use struct_field_names_as_array::FieldNamesAsSlice;
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -24,7 +25,7 @@ use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::utils::logger::ReportLogger;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, FieldNamesAsSlice)]
 pub struct PacketSinkReport {
     pub id: u32,
     /// the start time of this report interval

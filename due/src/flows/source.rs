@@ -10,6 +10,7 @@ use std::time::Duration;
 use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use struct_field_names_as_array::FieldNamesAsSlice;
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -24,7 +25,7 @@ use crate::get_seed;
 use crate::utils::logger::ReportLogger;
 use crate::utils::progress::FinishMsg;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, FieldNamesAsSlice)]
 pub struct PacketSourceReport {
     pub id: u32,
     /// the start time of this report interval
