@@ -6,11 +6,10 @@ pub mod vc;
 pub mod wfq;
 
 use serde::Serialize;
-use struct_field_names_as_array::FieldNamesAsSlice;
 
 use crate::flows::packet::Packet;
 
-#[derive(Clone, Debug, Serialize, FieldNamesAsSlice)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SchedulerReport {
     pub id: u32,
     /// the start time of this report interval

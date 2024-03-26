@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use csv::Writer;
 use lazy_static::lazy_static;
 use log::info;
-use struct_field_names_as_array::FieldNamesAsSlice;
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
@@ -122,7 +121,7 @@ impl CsvLogger {
         };
     }
 
-    fn write_to_csv<T>(&self, element_type: &str, headers: &[&str], reports: &Vec<T>)
+    fn write_to_csv<T>(&self, element_type: &str, reports: &Vec<T>)
     where
         T: serde::Serialize,
     {
@@ -137,13 +136,6 @@ impl CsvLogger {
             }
         };
 
-        if let Err(e) = csv_writer.write_record(headers) {
-            panic!(
-                "Error '{}' occurred when writing headers to csv file {}",
-                e, &csv_file
-            );
-        }
-
         for report in reports {
             if let Err(e) = csv_writer.serialize(report) {
                 panic!(
@@ -155,16 +147,13 @@ impl CsvLogger {
     }
 
     pub fn generate_output_files(&mut self) {
-        let headers = PacketSourceReport::FIELD_NAMES_AS_SLICE;
         let reports = SOURCE_REPORTS.read().unwrap();
-        self.write_to_csv("sources", headers, &reports);
+        self.write_to_csv("sources", &reports);
 
-        let headers = SchedulerReport::FIELD_NAMES_AS_SLICE;
         let reports = SCHEDULER_REPORTS.read().unwrap();
-        self.write_to_csv("switches", headers, &reports);
+        self.write_to_csv("switches", &reports);
 
-        let headers = PacketSinkReport::FIELD_NAMES_AS_SLICE;
         let reports = SINK_REPORTS.read().unwrap();
-        self.write_to_csv("sinks", headers, &reports);
+        self.write_to_csv("sinks", &reports);
     }
 }

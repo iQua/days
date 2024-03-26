@@ -24,5 +24,4 @@ petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
 serde = { version = "1.0", features = ["derive"] }
 statrs = "0.16"
-struct-field-names-as-array = "0.3"
 toml = "0.8"
