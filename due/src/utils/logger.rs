@@ -100,6 +100,11 @@ impl ReportLogger {
     pub fn get_report_interval() -> f64 {
         ReportLogger::get_instance().report_interval
     }
+
+    pub fn generate_output_files() {
+        let report_logger = &ReportLogger::get_instance().report_logger;
+        report_logger.generate_output_files();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -178,7 +183,7 @@ impl CsvLogger {
         }
     }
 
-    pub fn generate_output_files(&mut self) {
+    pub fn generate_output_files(&self) {
         let reports = SOURCE_REPORTS.read().unwrap();
         self.write_to_csv(ElementType::Source, &reports);
 

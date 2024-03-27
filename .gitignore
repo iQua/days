@@ -3,5 +3,5 @@
 **/target/
 **/Cargo.lock
 
-*.db
-*.json
+# These are files related to logged outputs
+*.csv

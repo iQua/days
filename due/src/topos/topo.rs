@@ -615,5 +615,8 @@ impl Topology {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64()
         );
+
+        // generates three CSV files containing statistics of this simulation run
+        ReportLogger::generate_output_files();
     }
 }
