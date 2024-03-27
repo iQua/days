@@ -32,9 +32,6 @@ lazy_static! {
     pub static ref SOURCE_REPORTS: RwLock<Vec<PacketSourceReport>> = RwLock::new(Vec::new());
     pub static ref SCHEDULER_REPORTS: RwLock<Vec<SchedulerReport>> = RwLock::new(Vec::new());
     pub static ref SINK_REPORTS: RwLock<Vec<PacketSinkReport>> = RwLock::new(Vec::new());
-    pub static ref SET_SOURCE_FILE_HEADER: RwLock<bool> = RwLock::new(true);
-    pub static ref SET_SCHEDULER_FILE_HEADER: RwLock<bool> = RwLock::new(true);
-    pub static ref SET_SINK_FILE_HEADER: RwLock<bool> = RwLock::new(true);
 }
 
 pub struct ReportLogger {
@@ -146,34 +143,29 @@ impl CsvLogger {
     {
         let log_dir = LOG_FILES_DIR.read().unwrap();
 
-        let (set_header, csv_file_name) = match element {
+        let csv_file_name = match element {
             ElementType::Source => {
-                let mut set_header_bool = SET_SOURCE_FILE_HEADER.write().unwrap();
-                let set_header = set_header_bool.clone();
-                *set_header_bool = false;
-                (set_header, format!("{log_dir}sources.csv"))
+                format!("{log_dir}sources.csv")
             }
             ElementType::Scheduler => {
-                let mut set_header_bool = SET_SCHEDULER_FILE_HEADER.write().unwrap();
-                let set_header = set_header_bool.clone();
-                *set_header_bool = false;
-                (set_header, format!("{log_dir}switches.csv"))
+                format!("{log_dir}switches.csv")
             }
             ElementType::Sink => {
-                let mut set_header_bool = SET_SINK_FILE_HEADER.write().unwrap();
-                let set_header = set_header_bool.clone();
-                *set_header_bool = false;
-                (set_header, format!("{log_dir}sinks.csv"))
+                format!("{log_dir}sinks.csv")
             }
         };
 
         let csv_file = OpenOptions::new()
-            .write(true)
             .append(true)
             .open(&csv_file_name)
             .unwrap();
+        let write_header = if csv_file.metadata().unwrap().len() == 0 {
+            true
+        } else {
+            false
+        };
         let mut csv_writer = WriterBuilder::new()
-            .has_headers(set_header)
+            .has_headers(write_header)
             .from_writer(csv_file);
 
         for report in reports {
