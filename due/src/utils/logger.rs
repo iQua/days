@@ -20,6 +20,12 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
 }
 
+enum ElementType {
+    Source,
+    Scheduler,
+    Sink,
+}
+
 lazy_static! {
     pub static ref LOG_FILES_DIR: RwLock<String> = RwLock::new(String::default());
     pub static ref REPORT_INTERVAL: RwLock<f64> = RwLock::new(f64::MAX);
@@ -111,7 +117,7 @@ impl CsvLogger {
                 let mut reports = SOURCE_REPORTS.write().unwrap();
                 reports.push(report);
                 if reports.len() >= max_log_num {
-                    self.write_to_csv("source", &reports);
+                    self.write_to_csv(ElementType::Source, &reports);
                     reports.clear();
                 }
             }
@@ -119,7 +125,7 @@ impl CsvLogger {
                 let mut reports = SCHEDULER_REPORTS.write().unwrap();
                 reports.push(report);
                 if reports.len() >= max_log_num {
-                    self.write_to_csv("scheduler", &reports);
+                    self.write_to_csv(ElementType::Scheduler, &reports);
                     reports.clear();
                 }
             }
@@ -127,34 +133,38 @@ impl CsvLogger {
                 let mut reports = SINK_REPORTS.write().unwrap();
                 reports.push(report);
                 if reports.len() >= max_log_num {
-                    self.write_to_csv("sink", &reports);
+                    self.write_to_csv(ElementType::Sink, &reports);
                     reports.clear();
                 }
             }
         };
     }
 
-    fn write_to_csv<T>(&self, element: &str, reports: &Vec<T>)
+    fn write_to_csv<T>(&self, element: ElementType, reports: &Vec<T>)
     where
         T: serde::Serialize,
     {
         let log_dir = LOG_FILES_DIR.read().unwrap();
 
-        let (set_header, csv_file_name) = if element == "source" {
-            let mut set_header_bool = SET_SOURCE_FILE_HEADER.write().unwrap();
-            let set_header = set_header_bool.clone();
-            *set_header_bool = false;
-            (set_header, format!("{log_dir}sources.csv"))
-        } else if element == "scheduler" {
-            let mut set_header_bool = SET_SCHEDULER_FILE_HEADER.write().unwrap();
-            let set_header = set_header_bool.clone();
-            *set_header_bool = false;
-            (set_header, format!("{log_dir}switches.csv"))
-        } else {
-            let mut set_header_bool = SET_SINK_FILE_HEADER.write().unwrap();
-            let set_header = set_header_bool.clone();
-            *set_header_bool = false;
-            (set_header, format!("{log_dir}sinks.csv"))
+        let (set_header, csv_file_name) = match element {
+            ElementType::Source => {
+                let mut set_header_bool = SET_SOURCE_FILE_HEADER.write().unwrap();
+                let set_header = set_header_bool.clone();
+                *set_header_bool = false;
+                (set_header, format!("{log_dir}sources.csv"))
+            }
+            ElementType::Scheduler => {
+                let mut set_header_bool = SET_SCHEDULER_FILE_HEADER.write().unwrap();
+                let set_header = set_header_bool.clone();
+                *set_header_bool = false;
+                (set_header, format!("{log_dir}switches.csv"))
+            }
+            ElementType::Sink => {
+                let mut set_header_bool = SET_SINK_FILE_HEADER.write().unwrap();
+                let set_header = set_header_bool.clone();
+                *set_header_bool = false;
+                (set_header, format!("{log_dir}sinks.csv"))
+            }
         };
 
         let csv_file = OpenOptions::new()
@@ -178,13 +188,13 @@ impl CsvLogger {
 
     pub fn generate_output_files(&mut self) {
         let reports = SOURCE_REPORTS.read().unwrap();
-        self.write_to_csv("source", &reports);
+        self.write_to_csv(ElementType::Source, &reports);
 
         let reports = SCHEDULER_REPORTS.read().unwrap();
-        self.write_to_csv("scheduler", &reports);
+        self.write_to_csv(ElementType::Scheduler, &reports);
 
         let reports = SINK_REPORTS.read().unwrap();
-        self.write_to_csv("sink", &reports);
+        self.write_to_csv(ElementType::Sink, &reports);
 
         let log_dir = LOG_FILES_DIR.read().unwrap();
         info!(
