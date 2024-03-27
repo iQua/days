@@ -1,7 +1,6 @@
 //! Implements a report logger to log periodic reports of sources, schedulers,
 //! and sinks to three CSV files.
 
-use std::collections::HashMap;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
@@ -22,7 +21,7 @@ pub enum Report {
 }
 
 lazy_static! {
-    pub static ref LOG_PATH: RwLock<String> = RwLock::new(String::default());
+    pub static ref LOG_FILES_DIR: RwLock<String> = RwLock::new(String::default());
     pub static ref REPORT_INTERVAL: RwLock<f64> = RwLock::new(f64::MAX);
     pub static ref SOURCE_REPORTS: RwLock<Vec<PacketSourceReport>> = RwLock::new(Vec::new());
     pub static ref SCHEDULER_REPORTS: RwLock<Vec<SchedulerReport>> = RwLock::new(Vec::new());
@@ -40,7 +39,7 @@ pub struct ReportLogger {
 impl ReportLogger {
     pub fn new() -> ReportLogger {
         ReportLogger {
-            report_logger: CsvLogger::new(LOG_PATH.read().unwrap().clone()),
+            report_logger: CsvLogger {},
             report_interval: *REPORT_INTERVAL.read().unwrap(),
         }
     }
@@ -71,7 +70,7 @@ impl ReportLogger {
             &log_dir
         );
 
-        let mut log_path_static = LOG_PATH.write().unwrap();
+        let mut log_path_static = LOG_FILES_DIR.write().unwrap();
         *log_path_static = log_dir;
 
         let mut report_interval_static = REPORT_INTERVAL.write().unwrap();
@@ -101,39 +100,36 @@ impl ReportLogger {
 }
 
 #[derive(Clone, Debug)]
-pub struct CsvLogger {
-    log_files: HashMap<String, String>,
-}
+pub struct CsvLogger {}
 
 impl CsvLogger {
-    pub fn new(log_dir: String) -> Self {
-        let mut log_files: HashMap<String, String> = Default::default();
-        for element in vec!["sources", "switches", "sinks"] {
-            let file_name = format!("{log_dir}{element}.csv");
-            log_files.insert(element.to_string(), file_name.clone());
-        }
-
-        info!(
-            "Outputs of this simulation run will be logged to three csv files under directory {}.",
-            &log_dir
-        );
-
-        CsvLogger { log_files }
-    }
-
     pub fn log_report(&self, report: Report) {
+        let max_log_num = 10000;
+
         match report {
             Report::PacketSourceReport(report) => {
                 let mut reports = SOURCE_REPORTS.write().unwrap();
                 reports.push(report);
+                if reports.len() >= max_log_num {
+                    self.write_to_csv("source", &reports);
+                    reports.clear();
+                }
             }
             Report::SchedulerReport(report) => {
                 let mut reports = SCHEDULER_REPORTS.write().unwrap();
                 reports.push(report);
+                if reports.len() >= max_log_num {
+                    self.write_to_csv("scheduler", &reports);
+                    reports.clear();
+                }
             }
             Report::PacketSinkReport(report) => {
                 let mut reports = SINK_REPORTS.write().unwrap();
                 reports.push(report);
+                if reports.len() >= max_log_num {
+                    self.write_to_csv("sink", &reports);
+                    reports.clear();
+                }
             }
         };
     }
@@ -142,23 +138,23 @@ impl CsvLogger {
     where
         T: serde::Serialize,
     {
-        let csv_file_name = self.log_files.get(element).unwrap();
+        let log_dir = LOG_FILES_DIR.read().unwrap();
 
-        let set_header = if element == "source" {
+        let (set_header, csv_file_name) = if element == "source" {
             let mut set_header_bool = SET_SOURCE_FILE_HEADER.write().unwrap();
             let set_header = set_header_bool.clone();
             *set_header_bool = false;
-            set_header
-        } else if element == "switch" {
+            (set_header, format!("{log_dir}sources.csv"))
+        } else if element == "scheduler" {
             let mut set_header_bool = SET_SCHEDULER_FILE_HEADER.write().unwrap();
             let set_header = set_header_bool.clone();
             *set_header_bool = false;
-            set_header
+            (set_header, format!("{log_dir}switches.csv"))
         } else {
             let mut set_header_bool = SET_SINK_FILE_HEADER.write().unwrap();
             let set_header = set_header_bool.clone();
             *set_header_bool = false;
-            set_header
+            (set_header, format!("{log_dir}sinks.csv"))
         };
 
         let csv_file = OpenOptions::new()
@@ -185,9 +181,15 @@ impl CsvLogger {
         self.write_to_csv("source", &reports);
 
         let reports = SCHEDULER_REPORTS.read().unwrap();
-        self.write_to_csv("switch", &reports);
+        self.write_to_csv("scheduler", &reports);
 
         let reports = SINK_REPORTS.read().unwrap();
         self.write_to_csv("sink", &reports);
+
+        let log_dir = LOG_FILES_DIR.read().unwrap();
+        info!(
+            "Wrote outputs of this simulation run to three csv files under directory {}.",
+            &log_dir
+        );
     }
 }
