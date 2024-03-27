@@ -2,11 +2,11 @@
 //! and sinks to three CSV files.
 
 use std::collections::HashMap;
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, File, OpenOptions};
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 
-use csv::Writer;
+use csv::WriterBuilder;
 use lazy_static::lazy_static;
 use log::info;
 
@@ -27,6 +27,9 @@ lazy_static! {
     pub static ref SOURCE_REPORTS: RwLock<Vec<PacketSourceReport>> = RwLock::new(Vec::new());
     pub static ref SCHEDULER_REPORTS: RwLock<Vec<SchedulerReport>> = RwLock::new(Vec::new());
     pub static ref SINK_REPORTS: RwLock<Vec<PacketSinkReport>> = RwLock::new(Vec::new());
+    pub static ref SET_SOURCE_FILE_HEADER: RwLock<bool> = RwLock::new(true);
+    pub static ref SET_SCHEDULER_FILE_HEADER: RwLock<bool> = RwLock::new(true);
+    pub static ref SET_SINK_FILE_HEADER: RwLock<bool> = RwLock::new(true);
 }
 
 pub struct ReportLogger {
@@ -43,8 +46,33 @@ impl ReportLogger {
     }
 
     pub fn init(log_path: Option<String>, report_interval: f64) {
+        let mut log_dir = log_path.unwrap_or("./output/".to_string());
+        if log_dir.chars().last().unwrap() != '/' {
+            log_dir.push('/');
+        }
+
+        if let Err(e) = create_dir_all(&log_dir) {
+            panic!(
+                "Error '{}' occurred when creating a directory {} for log files",
+                e, &log_dir
+            );
+        };
+        for element in vec!["sources", "switches", "sinks"] {
+            let file_name = format!("{log_dir}{element}.csv");
+            if let Err(e) = File::create(&file_name) {
+                panic!(
+                    "Error '{}' occurred when creating a log file {}",
+                    e, &file_name
+                );
+            };
+        }
+        info!(
+            "Outputs of this simulation run will be logged to three CSV files under directory {}.",
+            &log_dir
+        );
+
         let mut log_path_static = LOG_PATH.write().unwrap();
-        *log_path_static = log_path.unwrap_or("./output/".to_string());
+        *log_path_static = log_dir;
 
         let mut report_interval_static = REPORT_INTERVAL.write().unwrap();
         *report_interval_static = report_interval;
@@ -78,18 +106,7 @@ pub struct CsvLogger {
 }
 
 impl CsvLogger {
-    pub fn new(log_path: String) -> Self {
-        let mut log_dir = log_path.to_string();
-        if log_dir.chars().last().unwrap() != '/' {
-            log_dir.push('/');
-        }
-        if let Err(e) = create_dir_all(&log_dir) {
-            panic!(
-                "Error '{}' occurred when creating a directory {} for log files",
-                e, &log_dir
-            );
-        };
-
+    pub fn new(log_dir: String) -> Self {
         let mut log_files: HashMap<String, String> = Default::default();
         for element in vec!["sources", "switches", "sinks"] {
             let file_name = format!("{log_dir}{element}.csv");
@@ -121,26 +138,43 @@ impl CsvLogger {
         };
     }
 
-    fn write_to_csv<T>(&self, element_type: &str, reports: &Vec<T>)
+    fn write_to_csv<T>(&self, element: &str, reports: &Vec<T>)
     where
         T: serde::Serialize,
     {
-        let csv_file = self.log_files.get(element_type).unwrap();
-        let mut csv_writer = match Writer::from_path(csv_file) {
-            Ok(wtr) => wtr,
-            Err(e) => {
-                panic!(
-                    "Error '{}' occurred when writing to csv file {}",
-                    e, &csv_file
-                );
-            }
+        let csv_file_name = self.log_files.get(element).unwrap();
+
+        let set_header = if element == "source" {
+            let mut set_header_bool = SET_SOURCE_FILE_HEADER.write().unwrap();
+            let set_header = set_header_bool.clone();
+            *set_header_bool = false;
+            set_header
+        } else if element == "switch" {
+            let mut set_header_bool = SET_SCHEDULER_FILE_HEADER.write().unwrap();
+            let set_header = set_header_bool.clone();
+            *set_header_bool = false;
+            set_header
+        } else {
+            let mut set_header_bool = SET_SINK_FILE_HEADER.write().unwrap();
+            let set_header = set_header_bool.clone();
+            *set_header_bool = false;
+            set_header
         };
+
+        let csv_file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&csv_file_name)
+            .unwrap();
+        let mut csv_writer = WriterBuilder::new()
+            .has_headers(set_header)
+            .from_writer(csv_file);
 
         for report in reports {
             if let Err(e) = csv_writer.serialize(report) {
                 panic!(
                     "Error '{}' occurred when writing a report to csv file {}",
-                    e, &csv_file
+                    e, &csv_file_name
                 );
             }
         }
@@ -148,12 +182,12 @@ impl CsvLogger {
 
     pub fn generate_output_files(&mut self) {
         let reports = SOURCE_REPORTS.read().unwrap();
-        self.write_to_csv("sources", &reports);
+        self.write_to_csv("source", &reports);
 
         let reports = SCHEDULER_REPORTS.read().unwrap();
-        self.write_to_csv("switches", &reports);
+        self.write_to_csv("switch", &reports);
 
         let reports = SINK_REPORTS.read().unwrap();
-        self.write_to_csv("sinks", &reports);
+        self.write_to_csv("sink", &reports);
     }
 }
