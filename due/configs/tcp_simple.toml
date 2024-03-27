@@ -7,8 +7,6 @@ hosts = [0, 1]
 progress = 2.0
 duration = 10.0
 log_path = "./tcp_output"
-#log_type = "json"
-log_type = "database"
 
 [switch]
 port_rate = 4096
