@@ -29,8 +29,7 @@ pub struct DistPacketSource {
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
 
-    /// the report of a report interval
-    pub report: PacketSourceReport,
+    pub report_start_time: f64,
 }
 
 impl DistPacketSource {
@@ -46,15 +45,13 @@ impl DistPacketSource {
             rng,
             output: Output::default(),
             finish_msg_output: Output::default(),
-            report: PacketSourceReport::new(endpoint_id as u32, 0.0),
+            report_start_time: 0.0,
         }
     }
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
-
-        self.report.update(&packet);
 
         debug!(
             "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -113,15 +110,25 @@ impl DistPacketSource {
     }
 
     pub fn log_report(&mut self, now: f64) {
-        self.report.last_update(now, 0);
-        ReportLogger::log_report(Report::PacketSourceReport(self.report.clone()));
+        let report = PacketSourceReport {
+            id: self.endpoint_id,
+            start_time: self.report_start_time,
+            end_time: now,
+            sent_packets: self.packets_sent,
+            packet_sizes: self.sent_size,
+            ack_bytes: 0,
+        };
+
+        ReportLogger::log_report(Report::PacketSourceReport(report));
         debug!(
             "DistPacketSource {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now
         );
 
-        // resets the report
-        self.report = PacketSourceReport::new(self.endpoint_id as u32, now);
+        // resets the statistics of report
+        self.report_start_time = now;
+        self.packets_sent = 0;
+        self.sent_size = 0;
     }
 }
 

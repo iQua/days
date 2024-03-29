@@ -26,40 +26,17 @@ use crate::utils::progress::FinishMsg;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
-    pub id: u32,
+    pub id: usize,
     /// the start time of this report interval
     pub start_time: f64,
     /// the end time of this report interval
     pub end_time: f64,
     /// the number of sent packets in this report interval
-    pub sent_packets: u32,
+    pub sent_packets: usize,
     /// the size of sent packets in this report interval
-    pub packet_sizes: u32,
+    pub packet_sizes: usize,
     /// the number of acknowledged bytes in this report interval
-    pub ack_bytes: u32,
-}
-
-impl PacketSourceReport {
-    pub fn new(id: u32, start_time: f64) -> Self {
-        PacketSourceReport {
-            id,
-            start_time,
-            end_time: 0.0,
-            sent_packets: 0,
-            packet_sizes: 0,
-            ack_bytes: 0,
-        }
-    }
-
-    pub fn update(&mut self, packet: &Packet) {
-        self.sent_packets += 1;
-        self.packet_sizes += packet.size as u32;
-    }
-
-    pub fn last_update(&mut self, end_time: f64, ack_bytes: u32) {
-        self.end_time = end_time;
-        self.ack_bytes = ack_bytes;
-    }
+    pub ack_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -146,10 +123,10 @@ impl PacketSource {
     fn prepare_run(&mut self, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => {
-                source.report.start_time = initial_delay;
+                source.report_start_time = initial_delay;
             }
             PacketSource::TCPPacketSource(source) => {
-                source.report.start_time = initial_delay;
+                source.report_start_time = initial_delay;
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
