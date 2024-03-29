@@ -26,44 +26,19 @@ use crate::utils::logger::ReportLogger;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
-    pub id: u32,
+    pub id: usize,
     /// the start time of this report interval
     pub start_time: f64,
     /// the end time of this report interval
     pub end_time: f64,
     /// the number of received packets in this report interval
-    pub received_packets: u32,
+    pub received_packets: usize,
     /// the size of received packets in this report interval
-    pub received_sizes: u32,
+    pub received_sizes: usize,
     /// the mean of queueing delays of received packets in this report interval
     pub queueing_delay_mean: f64,
     /// the mean of one-way end-to-end delays of received packets in this report interval
     pub one_way_delay_mean: f64,
-}
-
-impl PacketSinkReport {
-    pub fn new(id: u32, start_time: f64) -> Self {
-        PacketSinkReport {
-            id,
-            start_time,
-            end_time: 0.0,
-            received_packets: 0,
-            received_sizes: 0,
-            queueing_delay_mean: 0.0,
-            one_way_delay_mean: 0.0,
-        }
-    }
-
-    pub fn update(&mut self, packet: &Packet, now: f64) {
-        let num_packets = self.received_packets as f64;
-        self.queueing_delay_mean =
-            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
-        self.one_way_delay_mean = (self.one_way_delay_mean * num_packets + now
-            - packet.creation_time)
-            / (num_packets + 1.0);
-        self.received_packets += 1;
-        self.received_sizes += packet.size as u32;
-    }
 }
 
 /// A simple collector for statistical data.
@@ -288,11 +263,11 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => {
                 sink.packet_statistics.update(&packet, now);
-                sink.report.update(&packet, now);
+                sink.update_report_statistics(&packet, now);
             }
             PacketSink::TCPPacketSink(sink) => {
                 sink.packet_statistics.update(&packet, now);
-                sink.report.update(&packet, now);
+                sink.update_report_statistics(&packet, now);
             }
         };
 
