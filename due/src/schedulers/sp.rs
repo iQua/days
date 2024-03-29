@@ -32,9 +32,10 @@ pub struct SPServer {
     /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
-    /// the number of packets received and dropped
+    /// the number of packets received, dropped, and forwarded
     packets_received: usize,
     packets_dropped: usize,
+    packets_forwarded: usize,
 
     /// the number of bytes of classes, which are consecutive and start from 0
     /// flow_class -> byte_size
@@ -52,8 +53,13 @@ pub struct SPServer {
 
     pub output: Output<Packet>,
 
-    /// the report of a report interval
-    pub report: SchedulerReport,
+    /// the statictics of a preiodic report
+    report_start_time: f64,
+    queue_length: usize,
+    received_sizes: usize,
+    forwarded_sizes: usize,
+    throughput_mean: f64,
+    queueing_delay_mean: f64,
 }
 
 impl SPServer {
@@ -86,12 +92,18 @@ impl SPServer {
             drop_strategy: packet_drop,
             packets_received: 0,
             packets_dropped: 0,
+            packets_forwarded: 0,
             byte_sizes: HashMap::new(),
             queues: BTreeMap::new(),
             priorities,
             busy_until: 0.0,
             output: Output::default(),
-            report: SchedulerReport::new(scheduler_id as u32, 0.0),
+            report_start_time: 0.0,
+            queue_length: 0,
+            received_sizes: 0,
+            forwarded_sizes: 0,
+            throughput_mean: 0.0,
+            queueing_delay_mean: 0.0,
         }
     }
 
@@ -113,7 +125,6 @@ impl SPServer {
         // the case that this packet will be dropped
         if should_drop_packet {
             self.packets_dropped += 1;
-            self.report.dropped_packets += 1;
             debug! {
                 "SPServer {} dropped packet {} from flow {} at time {:.3}",
                 self.scheduler_id,
@@ -126,8 +137,9 @@ impl SPServer {
 
         // the case that this packet will not be dropped
         self.packets_received += 1;
-
-        self.report.receive_update(&packet);
+        self.packets_received += 1;
+        self.received_sizes += packet.size;
+        self.queue_length += packet.size;
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -160,7 +172,14 @@ impl SPServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        self.report.forward_update(&packet);
+        let num_packets = self.packets_forwarded as f64;
+        self.queueing_delay_mean =
+            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
+        self.packets_forwarded += 1;
+        self.forwarded_sizes += packet.size;
+        self.queue_length -= packet.size;
+        self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
+
         self.output.send(packet).await;
     }
 
@@ -232,14 +251,35 @@ impl SPServer {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            self.report.end_time = now;
-            ReportLogger::log_report(Report::SchedulerReport(self.report.clone()));
+            let report = SchedulerReport {
+                id: self.scheduler_id,
+                start_time: self.report_start_time,
+                end_time: now,
+                received_packets: self.packets_received,
+                dropped_packets: self.packets_dropped,
+                forwarded_packets: self.packets_forwarded,
+                queue_length: self.queue_length,
+                received_sizes: self.received_sizes,
+                forwarded_sizes: self.forwarded_sizes,
+                throughput_mean: self.throughput_mean,
+                queueing_delay_mean: self.queueing_delay_mean,
+            };
+
+            ReportLogger::log_report(Report::SchedulerReport(report));
             debug!(
                 "SPServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
             );
 
-            self.report = self.report.reset(now);
+            // resets the statistics of report
+            self.report_start_time = now;
+            self.packets_received = 0;
+            self.packets_dropped = 0;
+            self.packets_forwarded = 0;
+            self.received_sizes = 0;
+            self.forwarded_sizes = 0;
+            self.throughput_mean = 0.0;
+            self.queueing_delay_mean = 0.0;
 
             scheduler
                 .schedule_event(
