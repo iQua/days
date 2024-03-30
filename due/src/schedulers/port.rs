@@ -29,8 +29,6 @@ pub struct Port {
     packets_dropped: usize,
     /// the number of forwarded packets
     packets_forwarded: usize,
-    /// the total byte sizes in the queue
-    bytes_in_queue: usize,
     /// the packet queue of the port
     queue: VecDeque<Packet>,
     /// the server is considered busy sending the current packet until this time
@@ -75,7 +73,6 @@ impl Port {
             packets_received: 0,
             packets_dropped: 0,
             packets_forwarded: 0,
-            bytes_in_queue: 0,
             queue: VecDeque::new(),
             busy_until: 0.0,
             output: Output::default(),
@@ -99,7 +96,7 @@ impl Port {
         // drops the packet if the buffer is full
         let should_drop_packet =
             self.drop_strategy
-                .should_drop(packet.size, self.bytes_in_queue, self.queue.len());
+                .should_drop(packet.size, self.queue_length, self.queue.len());
 
         // the case that this packet will be dropped
         if should_drop_packet {
@@ -114,7 +111,6 @@ impl Port {
         // the case that this packet will not be dropped
         self.update_report_statistics_after_receive(&packet);
         self.queue.push_back(packet.clone());
-        self.bytes_in_queue += packet.size;
 
         debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -138,7 +134,6 @@ impl Port {
     }
 
     fn packet_sent(&mut self, now: f64, packet: Packet) {
-        self.bytes_in_queue -= packet.size;
         self.busy_until = now;
 
         debug!(
