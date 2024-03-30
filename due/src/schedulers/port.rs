@@ -109,7 +109,7 @@ impl Port {
         }
 
         // the case that this packet will not be dropped
-        self.update_report_statistics_after_receive(&packet);
+        self.on_packet_received(&packet);
         self.queue.push_back(packet.clone());
 
         debug!(
@@ -129,7 +129,7 @@ impl Port {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        self.update_report_statistics_after_forward(&packet);
+        self.on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
 
@@ -196,7 +196,7 @@ impl Port {
                 self.scheduler_id, now
             );
 
-            self.reset_report_statistics(now);
+            self.reset_stats(now);
 
             scheduler
                 .schedule_event(
@@ -210,13 +210,13 @@ impl Port {
 }
 
 impl ReportStatistics for Port {
-    fn update_report_statistics_after_receive(&mut self, packet: &Packet) {
+    fn on_packet_received(&mut self, packet: &Packet) {
         self.packets_received += 1;
         self.received_sizes += packet.size;
         self.queue_length += packet.size;
     }
 
-    fn update_report_statistics_after_forward(&mut self, packet: &Packet) {
+    fn on_packet_forwarded(&mut self, packet: &Packet) {
         let num_packets = self.packets_forwarded as f64;
         self.queueing_delay_mean =
             (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
@@ -242,7 +242,7 @@ impl ReportStatistics for Port {
         }
     }
 
-    fn reset_report_statistics(&mut self, now: f64) {
+    fn reset_stats(&mut self, now: f64) {
         self.report_start_time = now;
         self.packets_received = 0;
         self.packets_dropped = 0;

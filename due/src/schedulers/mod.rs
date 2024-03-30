@@ -29,14 +29,11 @@ pub struct SchedulerReport {
     pub queueing_delay_mean: f64,
 }
 
-/// Defines the interface for all schedulers to update statictics in their periodic
+/// Defines the interface for all schedulers to update statistics in their periodic
 /// reports.
 pub trait ReportStatistics {
-    fn update_report_statistics_after_receive(&mut self, packet: &Packet);
-
-    fn update_report_statistics_after_forward(&mut self, packet: &Packet);
-
+    fn on_packet_received(&mut self, packet: &Packet);
+    fn on_packet_forwarded(&mut self, packet: &Packet);
     fn generate_report(&self, now: f64) -> SchedulerReport;
-
-    fn reset_report_statistics(&mut self, now: f64);
+    fn reset_stats(&mut self, now: f64);
 }
