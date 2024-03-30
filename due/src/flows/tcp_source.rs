@@ -14,9 +14,11 @@ use asynchronix::model::{Model, Output};
 use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::source::PacketSourceReport;
 use crate::flows::TrafficCharacteristics;
 use crate::next_endpoint_id;
+use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::progress::FinishMsg;
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
@@ -84,9 +86,12 @@ pub struct TCPPacketSource {
     pub busy_until: f64,
 
     packets_sent: usize,
+    sent_size: usize,
 
     pub output: Output<Packet>,
-    pub report_output: Output<Report>,
+    pub finish_msg_output: Output<FinishMsg>,
+
+    pub report_start_time: f64,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -126,8 +131,10 @@ impl TCPPacketSource {
             datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
+            sent_size: 0,
             output: Output::default(),
-            report_output: Output::default(),
+            finish_msg_output: Output::default(),
+            report_start_time: 0.0,
         }
     }
 
@@ -262,6 +269,7 @@ impl TCPPacketSource {
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
+        self.sent_size += packet.size;
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -354,6 +362,28 @@ impl TCPPacketSource {
             self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);
         }
+    }
+
+    pub fn log_report(&mut self, now: f64) {
+        let report = PacketSourceReport {
+            id: self.endpoint_id,
+            start_time: self.report_start_time,
+            end_time: now,
+            sent_packets: self.packets_sent,
+            packet_sizes: self.sent_size,
+            ack_bytes: self.last_ack,
+        };
+
+        ReportLogger::log_report(Report::PacketSourceReport(report));
+        debug!(
+            "TCPPacketSource {} logged a periodic report at time {:.3}.",
+            self.endpoint_id, now
+        );
+
+        // resets the statistics of report
+        self.report_start_time = now;
+        self.packets_sent = 0;
+        self.sent_size = 0;
     }
 }
 

@@ -7,6 +7,7 @@ pub mod flows;
 pub mod schedulers;
 pub mod switches;
 pub mod topos;
+pub mod utils;
 
 #[derive(Deserialize)]
 pub struct SeedConfig {

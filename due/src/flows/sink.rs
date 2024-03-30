@@ -8,16 +8,38 @@
 use std::borrow::BorrowMut;
 use std::cell::Cell;
 use std::fmt::{Debug, Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
+use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
+use crate::utils::logger::ReportLogger;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PacketSinkReport {
+    pub id: usize,
+    /// the start time of this report interval
+    pub start_time: f64,
+    /// the end time of this report interval
+    pub end_time: f64,
+    /// the number of received packets in this report interval
+    pub received_packets: usize,
+    /// the size of received packets in this report interval
+    pub received_sizes: usize,
+    /// the mean of queueing delays of received packets in this report interval
+    pub queueing_delay_mean: f64,
+    /// the mean of one-way end-to-end delays of received packets in this report interval
+    pub one_way_delay_mean: f64,
+}
 
 /// A simple collector for statistical data.
 #[derive(Clone, Debug)]
@@ -122,7 +144,7 @@ pub struct PacketStatistics {
     packet_sizes: RandomVar,
 }
 
-impl std::fmt::Display for PacketStatistics {
+impl Display for PacketStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -233,14 +255,20 @@ impl PacketSink {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
-                sink.packet_statistics.update(&packet, arrival_time)
+                sink.packet_statistics.update(&packet, now);
+                sink.update_report_stats(&packet, now);
             }
-            PacketSink::TCPPacketSink(sink) => sink.packet_statistics.update(&packet, arrival_time),
+            PacketSink::TCPPacketSink(sink) => {
+                sink.packet_statistics.update(&packet, now);
+                sink.update_report_stats(&packet, now);
+            }
         };
 
         debug!(
@@ -249,11 +277,61 @@ impl PacketSink {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            arrival_time,
+            now,
         );
 
-        self.wrap_up(packet, arrival_time).await;
+        self.wrap_up(packet, now).await;
+    }
+
+    fn log_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            match self {
+                PacketSink::BasicPacketSink(sink) => {
+                    sink.log_report(now);
+                }
+                PacketSink::TCPPacketSink(sink) => {
+                    sink.log_report(now);
+                }
+            }
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                    Self::log_report,
+                    (),
+                )
+                .unwrap();
+        }
     }
 }
 
-impl Model for PacketSink {}
+impl Model for PacketSink {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            let report_interval = ReportLogger::get_report_interval();
+            if report_interval < f64::MAX {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(report_interval),
+                        Self::log_report,
+                        (),
+                    )
+                    .unwrap();
+            }
+
+            self.into()
+        })
+    }
+}

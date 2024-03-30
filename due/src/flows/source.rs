@@ -2,6 +2,7 @@
 //! packet sources.
 
 use std::borrow::BorrowMut;
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -12,14 +13,31 @@ use rand::SeedableRng;
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
+use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
+use crate::utils::logger::ReportLogger;
+use crate::utils::progress::FinishMsg;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PacketSourceReport {
+    pub id: usize,
+    /// the start time of this report interval
+    pub start_time: f64,
+    /// the end time of this report interval
+    pub end_time: f64,
+    /// the number of sent packets in this report interval
+    pub sent_packets: usize,
+    /// the size of sent packets in this report interval
+    pub packet_sizes: usize,
+    /// the number of acknowledged bytes in this report interval
+    pub ack_bytes: usize,
+}
 
 #[derive(Debug)]
 pub enum PacketSource {
@@ -66,10 +84,10 @@ impl PacketSource {
         }
     }
 
-    pub fn report_output(&mut self) -> &mut Output<Report> {
+    pub fn finish_msg_output(&mut self) -> &mut Output<FinishMsg> {
         match self {
-            PacketSource::DistPacketSource(source) => source.report_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.report_output.borrow_mut(),
+            PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
         }
     }
 
@@ -104,8 +122,12 @@ impl PacketSource {
 
     fn prepare_run(&mut self, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
-            PacketSource::DistPacketSource(_) => {}
+            PacketSource::DistPacketSource(source) => {
+                source.report_start_time = initial_delay;
+            }
             PacketSource::TCPPacketSource(source) => {
+                source.report_start_time = initial_delay;
+
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
 
@@ -227,6 +249,38 @@ impl PacketSource {
         }
     }
 
+    fn log_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            if !self.stop_run(now) {
+                match self {
+                    PacketSource::DistPacketSource(source) => {
+                        source.log_report(now);
+                    }
+                    PacketSource::TCPPacketSource(source) => {
+                        source.log_report(now);
+                    }
+                };
+
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                        Self::log_report,
+                        (),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
     /// Returns whether PacketSource should stop running.
     fn stop_run(&self, now: f64) -> bool {
         match self {
@@ -254,14 +308,23 @@ impl PacketSource {
 
             if self.stop_run(now) {
                 let name = format!("{self}");
-                debug!("{} finished running at {:.3}.", name, now);
 
-                self.report_output()
-                    .send(Report {
-                        name,
-                        finished: true,
-                    })
-                    .await;
+                if ReportLogger::get_report_interval() < f64::MAX {
+                    match self {
+                        PacketSource::DistPacketSource(source) => {
+                            source.log_report(now);
+                        }
+                        PacketSource::TCPPacketSource(source) => {
+                            source.log_report(now);
+                        }
+                    };
+                }
+
+                // notifies the Progress coroutine that the packet source
+                // finished running
+                self.finish_msg_output().send(FinishMsg {}).await;
+
+                debug!("{} finished running at {:.3}.", name, now);
             }
         }
     }
@@ -298,6 +361,17 @@ impl Model for PacketSource {
                     .unwrap();
             } else {
                 self.run((), scheduler).await;
+            }
+
+            let report_interval = ReportLogger::get_report_interval();
+            if report_interval < f64::MAX {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(initial_delay + report_interval),
+                        Self::log_report,
+                        (),
+                    )
+                    .unwrap();
             }
 
             self.into()

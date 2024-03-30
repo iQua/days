@@ -59,8 +59,10 @@ impl PacketSwitch {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         if packet.ack.is_none() {
             self.packets_received += 1;
@@ -72,7 +74,7 @@ impl PacketSwitch {
                 packet.packet_id,
                 packet.size,
                 packet.flow_id,
-                arrival_time,
+                now,
                 self.packets_received
             );
 
@@ -86,7 +88,7 @@ impl PacketSwitch {
         } else {
             debug!(
                 "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.switch_id, packet.packet_id, packet.size, packet.flow_id, arrival_time,
+                self.switch_id, packet.packet_id, packet.size, packet.flow_id, now,
             );
 
             // forwards acknowledgment packets to their corresponding upstream

@@ -1,17 +1,21 @@
 //! Implements a Deficit Round Robin (DRR) scheduler.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
+use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::{ReportStatistics, SchedulerReport};
+use crate::utils::logger::{Report, ReportLogger};
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -33,10 +37,12 @@ pub struct DRRServer {
     /// quantum of classes, which are consecutive and start from 0
     quantum: Vec<usize>,
 
-    /// the number of packets received, dropped, and in the queues waiting to be sent
+    /// the number of packets received, dropped, in the queues waiting to be
+    /// sent, and forwarded
     packets_received: usize,
     packets_dropped: usize,
     packets_waiting: usize,
+    packets_forwarded: usize,
 
     /// the number of bytes of classes, which are consecutive and start from 0
     byte_sizes: Vec<usize>,
@@ -51,6 +57,14 @@ pub struct DRRServer {
     busy_until: f64,
 
     pub output: Output<Packet>,
+
+    /// the statistics of a preiodic report
+    report_start_time: f64,
+    queue_length: usize,
+    received_sizes: usize,
+    forwarded_sizes: usize,
+    throughput_mean: f64,
+    queueing_delay_mean: f64,
 }
 
 impl DRRServer {
@@ -102,11 +116,18 @@ impl DRRServer {
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
+            packets_forwarded: 0,
             byte_sizes,
             queues,
             current_queue: 0,
             busy_until: 0.0,
             output: Output::default(),
+            report_start_time: 0.0,
+            queue_length: 0,
+            received_sizes: 0,
+            forwarded_sizes: 0,
+            throughput_mean: 0.0,
+            queueing_delay_mean: 0.0,
         }
     }
 
@@ -139,8 +160,8 @@ impl DRRServer {
         }
 
         // the case that this packet will not be dropped
+        self.on_packet_received(&packet);
         self.packets_waiting += 1;
-        self.packets_received += 1;
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -151,14 +172,13 @@ impl DRRServer {
 
         debug!(
             "DRRServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
-            {} packets received, {} packet(s) in flow class {}.",
+            {} packet(s) in flow class {}.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             class_id,
             arrival_time,
-            self.packets_received,
             self.queues[class_id].len(),
             class_id
         );
@@ -169,6 +189,7 @@ impl DRRServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        self.on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
 
@@ -253,6 +274,102 @@ impl DRRServer {
             }
         }
     }
+
+    fn log_report<'a>(
+        &'a mut self,
+        _: (),
+        scheduler: &'a Scheduler<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+
+            let report = self.generate_report(now);
+
+            ReportLogger::log_report(Report::SchedulerReport(report));
+            debug!(
+                "DRRServer {} logged a periodic report at time {:.3}.",
+                self.scheduler_id, now
+            );
+
+            self.reset_stats(now);
+
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                    Self::log_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
-impl Model for DRRServer {}
+impl ReportStatistics for DRRServer {
+    fn on_packet_received(&mut self, packet: &Packet) {
+        self.packets_received += 1;
+        self.received_sizes += packet.size;
+        self.queue_length += packet.size;
+    }
+
+    fn on_packet_forwarded(&mut self, packet: &Packet) {
+        let num_packets = self.packets_forwarded as f64;
+        self.queueing_delay_mean =
+            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
+        self.packets_forwarded += 1;
+        self.forwarded_sizes += packet.size;
+        self.queue_length -= packet.size;
+        self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
+    }
+
+    fn generate_report(&self, now: f64) -> SchedulerReport {
+        SchedulerReport {
+            id: self.scheduler_id,
+            start_time: self.report_start_time,
+            end_time: now,
+            received_packets: self.packets_received,
+            dropped_packets: self.packets_dropped,
+            forwarded_packets: self.packets_forwarded,
+            queue_length: self.queue_length,
+            received_sizes: self.received_sizes,
+            forwarded_sizes: self.forwarded_sizes,
+            throughput_mean: self.throughput_mean,
+            queueing_delay_mean: self.queueing_delay_mean,
+        }
+    }
+
+    fn reset_stats(&mut self, now: f64) {
+        self.report_start_time = now;
+        self.packets_received = 0;
+        self.packets_dropped = 0;
+        self.packets_forwarded = 0;
+        self.received_sizes = 0;
+        self.forwarded_sizes = 0;
+        self.throughput_mean = 0.0;
+        self.queueing_delay_mean = 0.0;
+    }
+}
+
+impl Model for DRRServer {
+    fn init(
+        self,
+        scheduler: &Scheduler<Self>,
+    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
+        Box::pin(async move {
+            let report_interval = ReportLogger::get_report_interval();
+            if report_interval < f64::MAX {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(report_interval),
+                        Self::log_report,
+                        (),
+                    )
+                    .unwrap();
+            }
+
+            self.into()
+        })
+    }
+}

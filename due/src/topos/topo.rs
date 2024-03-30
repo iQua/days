@@ -19,7 +19,6 @@ use asynchronix::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::Flow;
-use crate::flows::progress::Progress;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -30,12 +29,20 @@ use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
+use crate::utils::logger::ReportLogger;
+use crate::utils::progress::Progress;
 use crate::{next_flow_id, num_switches, set_num_switches};
 
 #[derive(Deserialize)]
 struct ProgressConfig {
     progress: Option<f64>,
     duration: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct LogConfig {
+    log_path: Option<String>,
+    log_interval: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -160,13 +167,18 @@ impl Topology {
             .unwrap_or(16)
             .min(usize::MAX / 2 + 1);
 
-        set_num_switches(graph.node_count());
-        let switches = Topology::init_switches();
-
         let pb_config: ProgressConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let duration = pb_config.duration.unwrap_or(1.);
-        let progress = pb_config.progress.unwrap_or(duration / 100.);
+        let (progress, duration) = Progress::setup(pb_config.progress, pb_config.duration);
+
+        let log_config: LogConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of logging outputs");
+        let report_interval = log_config.log_interval.unwrap_or(progress);
+        // initializes the singleton of the logger of reports
+        ReportLogger::init(log_config.log_path, report_interval);
+
+        set_num_switches(graph.node_count());
+        let switches = Topology::init_switches();
 
         Topology {
             sim_init: SimInit::new(),
@@ -307,6 +319,7 @@ impl Topology {
                     self.switch_config.drop,
                     weights.clone(),
                 );
+
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(DRRServer::packet_received, &drr_mbox);
@@ -327,6 +340,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     self.switch_config.drop,
                 );
+
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(Port::packet_received, &port_mbox);
@@ -462,8 +476,8 @@ impl Topology {
                 .connect(PacketSwitch::packet_received, host_mbox);
 
             source
-                .report_output()
-                .connect(Progress::report_received, &report_mbox);
+                .finish_msg_output()
+                .connect(Progress::finish_msg_received, &report_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, &source_mbox);
@@ -491,6 +505,7 @@ impl Topology {
 
             sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);
+
             let mut output = Output::default();
             output.connect(PacketSink::packet_received, &sink_mbox);
             sink_host.outputs.insert(sink.id(), output);
@@ -514,7 +529,6 @@ impl Topology {
         for flow in self.flows.iter_mut() {
             let path = flow.compute_path(self.graph.clone());
 
-            debug!("The path for flow {} is: {:?}", flow.id, path);
             for window in path.windows(2) {
                 let node_id = window.get(0).unwrap().index();
                 let next_id = window.get(1).unwrap().index();
@@ -539,7 +553,7 @@ impl Topology {
         );
     }
 
-    /// Creates and activates a progress coroutine to generate a progress bar and
+    /// Creates and activates a Progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
     fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
         let progress = Progress::new(self.progress, self.duration, self.flows.len());
@@ -582,7 +596,7 @@ impl Topology {
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
 
-        // creates and activates a progress coroutine
+        // creates and activates a Progress coroutine
         self = self.activate_progress(report_mbox);
 
         let duration = self.duration;
@@ -600,5 +614,8 @@ impl Topology {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64()
         );
+
+        // generates three CSV files containing statistics of this simulation run
+        ReportLogger::generate_output_files();
     }
 }
