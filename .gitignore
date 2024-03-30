@@ -2,3 +2,6 @@
 **/.vscode/
 **/target/
 **/Cargo.lock
+
+# These are files related to logged outputs
+*.csv

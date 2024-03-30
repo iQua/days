@@ -5,7 +5,6 @@ pub mod collective;
 pub mod dist_source;
 pub mod flow;
 pub mod packet;
-pub mod progress;
 pub mod route;
 pub mod sink;
 pub mod source;

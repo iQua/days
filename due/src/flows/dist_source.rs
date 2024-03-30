@@ -11,9 +11,11 @@ use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
-use crate::flows::progress::Report;
+use crate::flows::source::PacketSourceReport;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
+use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::progress::FinishMsg;
 
 #[derive(Debug)]
 pub struct DistPacketSource {
@@ -25,7 +27,9 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
-    pub report_output: Output<Report>,
+    pub finish_msg_output: Output<FinishMsg>,
+
+    pub report_start_time: f64,
 }
 
 impl DistPacketSource {
@@ -38,7 +42,8 @@ impl DistPacketSource {
             sent_size: 0,
             rng,
             output: Output::default(),
-            report_output: Output::default(),
+            finish_msg_output: Output::default(),
+            report_start_time: 0.0,
         }
     }
 
@@ -100,6 +105,28 @@ impl DistPacketSource {
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
         self.traffic.size.exceeded(self.sent_size, now)
+    }
+
+    pub fn log_report(&mut self, now: f64) {
+        let report = PacketSourceReport {
+            id: self.endpoint_id,
+            start_time: self.report_start_time,
+            end_time: now,
+            sent_packets: self.packets_sent,
+            packet_sizes: self.sent_size,
+            ack_bytes: 0,
+        };
+
+        ReportLogger::log_report(Report::PacketSourceReport(report));
+        debug!(
+            "DistPacketSource {} logged a periodic report at time {:.3}.",
+            self.endpoint_id, now
+        );
+
+        // resets the statistics of report
+        self.report_start_time = now;
+        self.packets_sent = 0;
+        self.sent_size = 0;
     }
 }
 

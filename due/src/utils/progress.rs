@@ -1,7 +1,5 @@
 //! Implements a Progress struct that generates a progress bar to illustrate the
-//! progress of the simulation run, and logs received statistics from all the
-//! network elements (switches, packet sources, and packet sinks) into a SQLite
-//! database.
+//! progress of the simulation run.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -14,6 +12,9 @@ use log::debug;
 use asynchronix::model::{InitializedModel, Model};
 use asynchronix::time::{MonotonicTime, Scheduler};
 
+#[derive(Clone, Debug)]
+pub struct FinishMsg {}
+
 pub struct Progress {
     progress_bar: ProgressBar,
     progress_interval: f64,
@@ -21,12 +22,6 @@ pub struct Progress {
     num_sources: usize,
     finished_sources: usize,
     finished: bool,
-}
-
-#[derive(Clone)]
-pub struct Report {
-    pub name: String,
-    pub finished: bool,
 }
 
 impl Progress {
@@ -56,30 +51,34 @@ impl Progress {
         }
     }
 
-    pub fn report_received(&mut self, report: Report, scheduler: &Scheduler<Self>) {
-        debug!("Progress received report from {}", report.name);
-        if report.finished {
-            self.finished_sources += 1;
-            debug!(
-                "{} / {} sources are finished",
-                self.finished_sources, self.num_sources
+    /// Sets up progress interval and duration from a configuration file.
+    pub fn setup(progress: Option<f64>, duration: Option<f64>) -> (f64, f64) {
+        let duration = duration.unwrap_or(1500.);
+        let progress_interval = progress.unwrap_or(duration / 100.);
+        (progress_interval, duration)
+    }
+
+    pub fn finish_msg_received(&mut self, _finish_msg: FinishMsg, scheduler: &Scheduler<Self>) {
+        self.finished_sources += 1;
+        debug!(
+            "{} / {} sources are finished.",
+            self.finished_sources, self.num_sources
+        );
+        if self.finished_sources == self.num_sources {
+            self.finished = true;
+
+            self.progress_bar.inc(
+                (self.duration / self.progress_interval) as u64 - self.progress_bar.position(),
             );
-            if self.finished_sources == self.num_sources {
-                self.finished = true;
 
-                self.progress_bar.inc(
-                    (self.duration / self.progress_interval) as u64 - self.progress_bar.position(),
-                );
+            let now = scheduler
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
 
-                let now = scheduler
-                    .time()
-                    .duration_since(MonotonicTime::EPOCH)
-                    .as_secs_f64();
-
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
-                    .unwrap();
-            }
+            scheduler
+                .schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
+                .unwrap();
         }
     }
 
