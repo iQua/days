@@ -309,14 +309,16 @@ impl PacketSource {
             if self.stop_run(now) {
                 let name = format!("{self}");
 
-                match self {
-                    PacketSource::DistPacketSource(source) => {
-                        source.log_report(now);
-                    }
-                    PacketSource::TCPPacketSource(source) => {
-                        source.log_report(now);
-                    }
-                };
+                if ReportLogger::get_report_interval() < f64::MAX {
+                    match self {
+                        PacketSource::DistPacketSource(source) => {
+                            source.log_report(now);
+                        }
+                        PacketSource::TCPPacketSource(source) => {
+                            source.log_report(now);
+                        }
+                    };
+                }
 
                 // notifies the Progress coroutine that the packet source
                 // finished running
@@ -361,13 +363,16 @@ impl Model for PacketSource {
                 self.run((), scheduler).await;
             }
 
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
+            let report_interval = ReportLogger::get_report_interval();
+            if report_interval < f64::MAX {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(report_interval),
+                        Self::log_report,
+                        (),
+                    )
+                    .unwrap();
+            }
 
             self.into()
         })

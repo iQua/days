@@ -320,13 +320,16 @@ impl Model for PacketSink {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
+            let report_interval = ReportLogger::get_report_interval();
+            if report_interval < f64::MAX {
+                scheduler
+                    .schedule_event(
+                        Duration::from_secs_f64(report_interval),
+                        Self::log_report,
+                        (),
+                    )
+                    .unwrap();
+            }
 
             self.into()
         })
