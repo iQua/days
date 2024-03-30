@@ -105,8 +105,6 @@ impl fmt::Debug for TCPPacketSource {
 
 impl TCPPacketSource {
     pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
-        let endpoint_id = next_endpoint_id();
-
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
@@ -115,7 +113,7 @@ impl TCPPacketSource {
         };
 
         TCPPacketSource {
-            endpoint_id,
+            endpoint_id: next_endpoint_id(),
             flow_id,
             traffic,
             traffic_exceeded: false,

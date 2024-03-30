@@ -34,10 +34,8 @@ pub struct DistPacketSource {
 
 impl DistPacketSource {
     pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> DistPacketSource {
-        let endpoint_id = next_endpoint_id();
-
         DistPacketSource {
-            endpoint_id,
+            endpoint_id: next_endpoint_id(),
             flow_id,
             traffic,
             packets_sent: 0,

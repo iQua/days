@@ -263,11 +263,11 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => {
                 sink.packet_statistics.update(&packet, now);
-                sink.update_report_statistics(&packet, now);
+                sink.update_report_stats(&packet, now);
             }
             PacketSink::TCPPacketSink(sink) => {
                 sink.packet_statistics.update(&packet, now);
-                sink.update_report_statistics(&packet, now);
+                sink.update_report_stats(&packet, now);
             }
         };
 

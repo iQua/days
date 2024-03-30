@@ -58,7 +58,7 @@ pub struct DRRServer {
 
     pub output: Output<Packet>,
 
-    /// the statictics of a preiodic report
+    /// the statistics of a preiodic report
     report_start_time: f64,
     queue_length: usize,
     received_sizes: usize,

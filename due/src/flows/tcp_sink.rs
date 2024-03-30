@@ -25,7 +25,7 @@ pub struct TCPPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
-    /// the statictics of a preiodic report
+    /// the statistics of a preiodic report
     report_start_time: f64,
     received_packets: usize,
     received_sizes: usize,
@@ -52,7 +52,7 @@ impl TCPPacketSink {
         }
     }
 
-    pub fn update_report_statistics(&mut self, packet: &Packet, now: f64) {
+    pub fn update_report_stats(&mut self, packet: &Packet, now: f64) {
         let num_packets = self.received_packets as f64;
         self.queueing_delay_mean =
             (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
