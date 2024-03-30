@@ -367,7 +367,7 @@ impl Model for PacketSource {
             if report_interval < f64::MAX {
                 scheduler
                     .schedule_event(
-                        Duration::from_secs_f64(report_interval),
+                        Duration::from_secs_f64(initial_delay + report_interval),
                         Self::log_report,
                         (),
                     )
