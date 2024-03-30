@@ -14,7 +14,7 @@ use asynchronix::time::{MonotonicTime, Scheduler};
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
-use crate::schedulers::SchedulerReport;
+use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{Report, ReportLogger};
 
 pub struct DRRServer {
@@ -160,10 +160,8 @@ impl DRRServer {
         }
 
         // the case that this packet will not be dropped
+        self.update_report_statistics_after_receive(&packet);
         self.packets_waiting += 1;
-        self.packets_received += 1;
-        self.received_sizes += packet.size;
-        self.queue_length += packet.size;
 
         let class_id = (self.flow_classes)(packet.flow_id);
 
@@ -174,14 +172,13 @@ impl DRRServer {
 
         debug!(
             "DRRServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
-            {} packets received, {} packet(s) in flow class {}.",
+            {} packet(s) in flow class {}.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             class_id,
             arrival_time,
-            self.packets_received,
             self.queues[class_id].len(),
             class_id
         );
@@ -192,14 +189,7 @@ impl DRRServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        let num_packets = self.packets_forwarded as f64;
-        self.queueing_delay_mean =
-            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
-        self.packets_forwarded += 1;
-        self.forwarded_sizes += packet.size;
-        self.queue_length -= packet.size;
-        self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
-
+        self.update_report_statistics_after_forward(&packet);
         self.output.send(packet).await;
     }
 
@@ -296,19 +286,7 @@ impl DRRServer {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            let report = SchedulerReport {
-                id: self.scheduler_id,
-                start_time: self.report_start_time,
-                end_time: now,
-                received_packets: self.packets_received,
-                dropped_packets: self.packets_dropped,
-                forwarded_packets: self.packets_forwarded,
-                queue_length: self.queue_length,
-                received_sizes: self.received_sizes,
-                forwarded_sizes: self.forwarded_sizes,
-                throughput_mean: self.throughput_mean,
-                queueing_delay_mean: self.queueing_delay_mean,
-            };
+            let report = self.generate_report(now);
 
             ReportLogger::log_report(Report::SchedulerReport(report));
             debug!(
@@ -316,15 +294,7 @@ impl DRRServer {
                 self.scheduler_id, now
             );
 
-            // resets the statistics of report
-            self.report_start_time = now;
-            self.packets_received = 0;
-            self.packets_dropped = 0;
-            self.packets_forwarded = 0;
-            self.received_sizes = 0;
-            self.forwarded_sizes = 0;
-            self.throughput_mean = 0.0;
-            self.queueing_delay_mean = 0.0;
+            self.reset_report_statistics(now);
 
             scheduler
                 .schedule_event(
@@ -334,6 +304,51 @@ impl DRRServer {
                 )
                 .unwrap();
         }
+    }
+}
+
+impl ReportStatistics for DRRServer {
+    fn update_report_statistics_after_receive(&mut self, packet: &Packet) {
+        self.packets_received += 1;
+        self.received_sizes += packet.size;
+        self.queue_length += packet.size;
+    }
+
+    fn update_report_statistics_after_forward(&mut self, packet: &Packet) {
+        let num_packets = self.packets_forwarded as f64;
+        self.queueing_delay_mean =
+            (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
+        self.packets_forwarded += 1;
+        self.forwarded_sizes += packet.size;
+        self.queue_length -= packet.size;
+        self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
+    }
+
+    fn generate_report(&self, now: f64) -> SchedulerReport {
+        SchedulerReport {
+            id: self.scheduler_id,
+            start_time: self.report_start_time,
+            end_time: now,
+            received_packets: self.packets_received,
+            dropped_packets: self.packets_dropped,
+            forwarded_packets: self.packets_forwarded,
+            queue_length: self.queue_length,
+            received_sizes: self.received_sizes,
+            forwarded_sizes: self.forwarded_sizes,
+            throughput_mean: self.throughput_mean,
+            queueing_delay_mean: self.queueing_delay_mean,
+        }
+    }
+
+    fn reset_report_statistics(&mut self, now: f64) {
+        self.report_start_time = now;
+        self.packets_received = 0;
+        self.packets_dropped = 0;
+        self.packets_forwarded = 0;
+        self.received_sizes = 0;
+        self.forwarded_sizes = 0;
+        self.throughput_mean = 0.0;
+        self.queueing_delay_mean = 0.0;
     }
 }
 
