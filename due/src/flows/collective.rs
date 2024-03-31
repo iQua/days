@@ -130,6 +130,58 @@ impl Collective {
                 let mut sources = collective.sources.unwrap_or_default();
                 let mut sinks = collective.sinks.unwrap_or_default();
 
+                if !sources.is_empty() && !sinks.is_empty() {
+                    match collective.collective_type {
+                        CollectiveType::Broadcast => {
+                            assert_eq!(
+                                sources.len(),
+                                1,
+                                "Please only specify 1 PacketSource for flows of a Broadcast operation in the configuration file."
+                            );
+                            assert_eq!(
+                                sinks.len(),
+                                collective.flow_count,
+                                "Please specify {} PacketSinks for flows of a Broadcast operation in the configuration file.",
+                                collective.flow_count
+                            );
+                            for _ in 1..collective.flow_count {
+                                sources.push(sources[0]);
+                            }
+                        }
+
+                        CollectiveType::Gather => {
+                            assert_eq!(
+                                sinks.len(),
+                                1,
+                                "Please only specify 1 PacketSink for flows of a Gather operation in the configuration file."
+                            );
+                            assert_eq!(
+                                sources.len(),
+                                collective.flow_count,
+                                "Please specify {} PacketSources for flows of a Gather operation in the configuration file.",
+                                collective.flow_count
+                            );
+                            for _ in 1..collective.flow_count {
+                                sinks.push(sinks[0]);
+                            }
+                        }
+                        CollectiveType::AllReduce => {
+                            assert_eq!(
+                                sources.len(),
+                                collective.flow_count,
+                                "Please specify {} PacketSources for flows of a AllReduce operation in the configuration file.",
+                                collective.flow_count
+                            );
+                            assert_eq!(
+                                sinks.len(),
+                                collective.flow_count,
+                                "Please specify {} PacketSinks for flows of a AllReduce operation in the configuration file.",
+                                collective.flow_count
+                            );
+                        }
+                    }
+                }
+
                 if sources.is_empty() && sinks.is_empty() {
                     let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
                     match collective.collective_type {
