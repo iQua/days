@@ -63,7 +63,7 @@ fn main() {
 
     // 2. initializes flows using a configuration file.
     //    Example:
-    let collectives = Collective::collectives_from_config(file_path);
+    let collectives = Collective::collectives_from_config(file_path, &hosts);
     info!(
         "A total of {} collective communication operations has been initialized.",
         collectives.len()

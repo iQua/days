@@ -240,64 +240,63 @@ impl Topology {
 
         // constructs, attaches, and routes flows in each collective
         for collective in self.collectives.iter_mut() {
-            for &source in collective.sources.iter() {
-                for &sink in collective.sinks.iter() {
-                    let flow_id = next_flow_id();
-                    match collective.collective_type {
-                        CollectiveType::Broadcast => {
-                            self.flows.push(Flow::new(
-                                flow_id,
-                                collective.flow_type,
-                                source,
-                                sink,
-                                collective.traffic,
-                                // uses collective_id as the random seed for the
-                                // flow, which ensures that all flows in the
-                                // broadcast have the same arrival and size
-                                // distribution
-                                collective.id,
-                            ));
-                            debug!(
-                                "Produced Flow {} of Broadcast collective communication operation {}.",
-                                flow_id, collective.id
-                            );
-                        }
-                        CollectiveType::Gather => {
-                            self.flows.push(Flow::new(
-                                flow_id,
-                                collective.flow_type,
-                                source,
-                                sink,
-                                collective.traffic,
-                                // uses flow_id as the random seed for the flow,
-                                // which ensures that different flows have
-                                // different arrival and size distributions
-                                flow_id,
-                            ));
-                            debug!(
-                                "Produced Flow {} of Gather collective communication operation {}.",
-                                flow_id, collective.id
-                            );
-                        }
-                        CollectiveType::AllReduce => {
-                            self.flows.push(Flow::new(
-                                flow_id,
-                                collective.flow_type,
-                                source,
-                                sink,
-                                collective.traffic,
-                                // uses the source host's id as the random seed
-                                // for the flow, which ensures that different
-                                // hosts have different arrival and size
-                                // distributions, but packet sources attached to
-                                // the same host have the same distribution
-                                source,
-                            ));
-                            debug!(
-                                "Produced Flow {} of AllReduce collective communication operation {}.",
-                                flow_id, collective.id
-                            );
-                        }
+            for (index, &source) in collective.sources.iter().enumerate() {
+                let sink = collective.sinks[index];
+                let flow_id = next_flow_id();
+                match collective.collective_type {
+                    CollectiveType::Broadcast => {
+                        self.flows.push(Flow::new(
+                            flow_id,
+                            collective.flow_type,
+                            source,
+                            sink,
+                            collective.traffic,
+                            // uses collective_id as the random seed for the
+                            // flow, which ensures that all flows in the
+                            // broadcast have the same arrival and size
+                            // distribution
+                            collective.id,
+                        ));
+                        debug!(
+                            "Produced Flow {} of Broadcast collective communication operation {}.",
+                            flow_id, collective.id
+                        );
+                    }
+                    CollectiveType::Gather => {
+                        self.flows.push(Flow::new(
+                            flow_id,
+                            collective.flow_type,
+                            source,
+                            sink,
+                            collective.traffic,
+                            // uses flow_id as the random seed for the flow,
+                            // which ensures that different flows have different
+                            // arrival and size distributions
+                            flow_id,
+                        ));
+                        debug!(
+                            "Produced Flow {} of Gather collective communication operation {}.",
+                            flow_id, collective.id
+                        );
+                    }
+                    CollectiveType::AllReduce => {
+                        self.flows.push(Flow::new(
+                            flow_id,
+                            collective.flow_type,
+                            source,
+                            sink,
+                            collective.traffic,
+                            // uses the source host's id as the random seed for
+                            // the flow, which ensures that different hosts have
+                            // different arrival and size distributions, but
+                            // packet sources attached to the same host have the
+                            // same distribution
+                            source,
+                        ));
+                        debug!(
+                            "Produced Flow {} of AllReduce collective communication operation {}.",
+                            flow_id, collective.id
+                        );
                     }
                 }
             }
