@@ -28,6 +28,23 @@ struct TomlCollective {
     traffic: TomlTrafficCharacteristics,
 }
 
+#[derive(Deserialize, Debug)]
+struct TomlCollectiveSet {
+    collective_type: CollectiveType,
+    collective_count: usize,
+    flow_type: FlowType,
+    flow_count: usize,
+    sources: Option<Vec<Vec<usize>>>,
+    sinks: Option<Vec<Vec<usize>>>,
+    traffic: TomlTrafficCharacteristics,
+}
+
+#[derive(Deserialize, Debug)]
+struct CollectiveConfig {
+    collective: Option<Vec<TomlCollective>>,
+    collective_set: Option<Vec<TomlCollectiveSet>>,
+}
+
 #[derive(Debug)]
 pub struct Collective {
     pub id: usize,
@@ -41,11 +58,6 @@ pub struct Collective {
     pub sinks: Vec<usize>,
 
     pub traffic: TrafficCharacteristics,
-}
-
-#[derive(Deserialize, Debug)]
-struct CollectiveConfig {
-    collective: Option<Vec<TomlCollective>>,
 }
 
 impl Collective {
@@ -246,6 +258,56 @@ impl Collective {
                     sinks,
                     traffic,
                 ));
+            }
+        }
+
+        if let Some(collective_set_vec) = config.collective_set {
+            for collective_set in collective_set_vec {
+                let mut sources_list = collective_set.sources.unwrap_or_default();
+                let mut sinks_list = collective_set.sinks.unwrap_or_default();
+                if sources_list.is_empty() && sinks_list.is_empty() {
+                    for _ in 0..collective_set.collective_count {
+                        sources_list.push(Vec::default());
+                        sinks_list.push(Vec::default());
+                    }
+                } else {
+                    assert_eq!(
+                        sources_list.len(),
+                        collective_set.collective_count,
+                        "Please specify {} sets of PacketSources for the collective set in the configuration file.",
+                        collective_set.collective_count
+                    );
+                    assert_eq!(
+                        sinks_list.len(),
+                        collective_set.collective_count,
+                        "Please specify {} sets of PacketSinks for the collective set in the configuration file.",
+                        collective_set.collective_count
+                    );
+                }
+
+                for _ in 0..collective_set.collective_count {
+                    let (sources, sinks) = Self::generate_endpoints(
+                        collective_set.collective_type,
+                        collective_set.flow_count,
+                        sources_list.remove(0),
+                        sinks_list.remove(0),
+                        hosts,
+                        rng.clone(),
+                    );
+
+                    let traffic = TrafficCharacteristics::clone(&collective_set.traffic);
+
+                    collectives.push(Collective::new(
+                        next_collective_id(),
+                        collective_set.collective_type,
+                        collective_set.flow_type,
+                        collective_set.flow_count,
+                        None,
+                        sources,
+                        sinks,
+                        traffic,
+                    ));
+                }
             }
         }
 
