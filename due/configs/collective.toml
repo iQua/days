@@ -29,10 +29,34 @@ sinks = [2, 3]
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
 
 [[collective]]
-collective_type = "AllReduce"
+collective_type = "Broadcast"
 flow_type = "PacketDistribution"
 flow_count = 4
 [collective.traffic]
+    initial_delay = 1.0
+    duration = 10.0
+    arr_dist = {type = "Uniform", low = 3, high = 4}
+    pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
+
+[[collective_set]]
+collective_type = "Gather"
+collective_count = 2
+flow_type = "PacketDistribution"
+flow_count = 2
+sources = [[0, 1], [1, 2]]
+sinks = [[2], [3]]
+[collective_set.traffic]
+    initial_delay = 1.0
+    duration = 10.0
+    arr_dist = {type = "Uniform", low = 3, high = 4}
+    pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
+
+[[collective_set]]
+collective_type = "AllReduce"
+collective_count = 2
+flow_type = "PacketDistribution"
+flow_count = 2
+[collective_set.traffic]
     initial_delay = 1.0
     duration = 10.0
     arr_dist = {type = "Uniform", low = 3, high = 4}

@@ -28,6 +28,23 @@ struct TomlCollective {
     traffic: TomlTrafficCharacteristics,
 }
 
+#[derive(Deserialize, Debug)]
+struct TomlCollectiveSet {
+    collective_type: CollectiveType,
+    collective_count: usize,
+    flow_type: FlowType,
+    flow_count: usize,
+    sources: Option<Vec<Vec<usize>>>,
+    sinks: Option<Vec<Vec<usize>>>,
+    traffic: TomlTrafficCharacteristics,
+}
+
+#[derive(Deserialize, Debug)]
+struct CollectiveConfig {
+    collective: Option<Vec<TomlCollective>>,
+    collective_set: Option<Vec<TomlCollectiveSet>>,
+}
+
 #[derive(Debug)]
 pub struct Collective {
     pub id: usize,
@@ -41,11 +58,6 @@ pub struct Collective {
     pub sinks: Vec<usize>,
 
     pub traffic: TrafficCharacteristics,
-}
-
-#[derive(Deserialize, Debug)]
-struct CollectiveConfig {
-    collective: Option<Vec<TomlCollective>>,
 }
 
 impl Collective {
@@ -111,12 +123,110 @@ impl Collective {
         collectives
     }
 
+    /// Generates sources and sinks of flows of a collective.
+    fn generate_endpoints(
+        collective_type: CollectiveType,
+        flow_count: usize,
+        mut sources: Vec<usize>,
+        mut sinks: Vec<usize>,
+        hosts: &Vec<usize>,
+        mut rng: SmallRng,
+    ) -> (Vec<usize>, Vec<usize>) {
+        if !sources.is_empty() && !sinks.is_empty() {
+            match collective_type {
+                CollectiveType::Broadcast => {
+                    assert_eq!(
+                                sources.len(),
+                                1,
+                                "Please only specify 1 PacketSource for flows of a Broadcast operation in the configuration file."
+                            );
+                    assert_eq!(
+                                sinks.len(),
+                                flow_count,
+                                "Please specify {} PacketSinks for flows of a Broadcast operation in the configuration file.",
+                                flow_count
+                            );
+                    for _ in 1..flow_count {
+                        sources.push(sources[0]);
+                    }
+                }
+
+                CollectiveType::Gather => {
+                    assert_eq!(
+                                sinks.len(),
+                                1,
+                                "Please only specify 1 PacketSink for flows of a Gather operation in the configuration file."
+                            );
+                    assert_eq!(
+                                sources.len(),
+                                flow_count,
+                                "Please specify {} PacketSources for flows of a Gather operation in the configuration file.",
+                                flow_count
+                            );
+                    for _ in 1..flow_count {
+                        sinks.push(sinks[0]);
+                    }
+                }
+                CollectiveType::AllReduce => {
+                    assert_eq!(
+                                sources.len(),
+                                flow_count,
+                                "Please specify {} PacketSources for flows of a AllReduce operation in the configuration file.",
+                                flow_count
+                            );
+                    assert_eq!(
+                                sinks.len(),
+                                flow_count,
+                                "Please specify {} PacketSinks for flows of a AllReduce operation in the configuration file.",
+                                flow_count
+                            );
+                }
+            }
+        }
+
+        if sources.is_empty() && sinks.is_empty() {
+            match collective_type {
+                CollectiveType::Broadcast => {
+                    let source = hosts.choose(&mut rng).unwrap().clone();
+                    let mut sink_hosts = hosts.clone();
+                    sink_hosts.retain(|&x| x != source);
+                    for _ in 0..flow_count {
+                        sources.push(source);
+                        sinks.push(sink_hosts.choose(&mut rng).unwrap().clone());
+                    }
+                }
+                CollectiveType::Gather => {
+                    let sink = hosts.choose(&mut rng).unwrap().clone();
+                    let mut source_hosts = hosts.clone();
+                    source_hosts.retain(|&x| x != sink);
+                    for _ in 0..flow_count {
+                        sources.push(source_hosts.choose(&mut rng).unwrap().clone());
+                        sinks.push(sink);
+                    }
+                }
+                CollectiveType::AllReduce => {
+                    let sink = hosts.choose(&mut rng).unwrap().clone();
+                    let mut source_hosts = hosts.clone();
+                    source_hosts.retain(|&x| x != sink);
+                    for _ in 0..flow_count {
+                        sources.push(source_hosts.choose(&mut rng).unwrap().clone());
+                        sinks.push(sink);
+                    }
+                }
+            }
+        }
+
+        (sources, sinks)
+    }
+
     /// Initializes collectives from a configuration file.
     pub fn collectives_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Collective> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let config: CollectiveConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
+
+        let rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
 
         let mut collectives = Vec::new();
 
@@ -127,95 +237,17 @@ impl Collective {
                     graph = Some(DiGraph::<usize, ()>::from_edges(config_graph));
                 }
 
-                let mut sources = collective.sources.unwrap_or_default();
-                let mut sinks = collective.sinks.unwrap_or_default();
-
-                if !sources.is_empty() && !sinks.is_empty() {
-                    match collective.collective_type {
-                        CollectiveType::Broadcast => {
-                            assert_eq!(
-                                sources.len(),
-                                1,
-                                "Please only specify 1 PacketSource for flows of a Broadcast operation in the configuration file."
-                            );
-                            assert_eq!(
-                                sinks.len(),
-                                collective.flow_count,
-                                "Please specify {} PacketSinks for flows of a Broadcast operation in the configuration file.",
-                                collective.flow_count
-                            );
-                            for _ in 1..collective.flow_count {
-                                sources.push(sources[0]);
-                            }
-                        }
-
-                        CollectiveType::Gather => {
-                            assert_eq!(
-                                sinks.len(),
-                                1,
-                                "Please only specify 1 PacketSink for flows of a Gather operation in the configuration file."
-                            );
-                            assert_eq!(
-                                sources.len(),
-                                collective.flow_count,
-                                "Please specify {} PacketSources for flows of a Gather operation in the configuration file.",
-                                collective.flow_count
-                            );
-                            for _ in 1..collective.flow_count {
-                                sinks.push(sinks[0]);
-                            }
-                        }
-                        CollectiveType::AllReduce => {
-                            assert_eq!(
-                                sources.len(),
-                                collective.flow_count,
-                                "Please specify {} PacketSources for flows of a AllReduce operation in the configuration file.",
-                                collective.flow_count
-                            );
-                            assert_eq!(
-                                sinks.len(),
-                                collective.flow_count,
-                                "Please specify {} PacketSinks for flows of a AllReduce operation in the configuration file.",
-                                collective.flow_count
-                            );
-                        }
-                    }
-                }
-
-                if sources.is_empty() && sinks.is_empty() {
-                    let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
-                    match collective.collective_type {
-                        CollectiveType::Broadcast => {
-                            let source = hosts.choose(&mut rng).unwrap().clone();
-                            let mut sink_hosts = hosts.clone();
-                            sink_hosts.retain(|&x| x != source);
-                            for _ in 0..collective.flow_count {
-                                sources.push(source);
-                                sinks.push(sink_hosts.choose(&mut rng).unwrap().clone());
-                            }
-                        }
-                        CollectiveType::Gather => {
-                            let sink = hosts.choose(&mut rng).unwrap().clone();
-                            let mut source_hosts = hosts.clone();
-                            source_hosts.retain(|&x| x != sink);
-                            for _ in 0..collective.flow_count {
-                                sources.push(source_hosts.choose(&mut rng).unwrap().clone());
-                                sinks.push(sink);
-                            }
-                        }
-                        CollectiveType::AllReduce => {
-                            let sink = hosts.choose(&mut rng).unwrap().clone();
-                            let mut source_hosts = hosts.clone();
-                            source_hosts.retain(|&x| x != sink);
-                            for _ in 0..collective.flow_count {
-                                sources.push(source_hosts.choose(&mut rng).unwrap().clone());
-                                sinks.push(sink);
-                            }
-                        }
-                    }
-                }
+                let (sources, sinks) = Self::generate_endpoints(
+                    collective.collective_type,
+                    collective.flow_count,
+                    collective.sources.unwrap_or_default(),
+                    collective.sinks.unwrap_or_default(),
+                    hosts,
+                    rng.clone(),
+                );
 
                 let traffic = TrafficCharacteristics::clone(&collective.traffic);
+
                 collectives.push(Collective::new(
                     next_collective_id(),
                     collective.collective_type,
@@ -226,6 +258,56 @@ impl Collective {
                     sinks,
                     traffic,
                 ));
+            }
+        }
+
+        if let Some(collective_set_vec) = config.collective_set {
+            for collective_set in collective_set_vec {
+                let mut sources_list = collective_set.sources.unwrap_or_default();
+                let mut sinks_list = collective_set.sinks.unwrap_or_default();
+                if sources_list.is_empty() && sinks_list.is_empty() {
+                    for _ in 0..collective_set.collective_count {
+                        sources_list.push(Vec::default());
+                        sinks_list.push(Vec::default());
+                    }
+                } else {
+                    assert_eq!(
+                        sources_list.len(),
+                        collective_set.collective_count,
+                        "Please specify {} sets of PacketSources for the collective set in the configuration file.",
+                        collective_set.collective_count
+                    );
+                    assert_eq!(
+                        sinks_list.len(),
+                        collective_set.collective_count,
+                        "Please specify {} sets of PacketSinks for the collective set in the configuration file.",
+                        collective_set.collective_count
+                    );
+                }
+
+                for _ in 0..collective_set.collective_count {
+                    let (sources, sinks) = Self::generate_endpoints(
+                        collective_set.collective_type,
+                        collective_set.flow_count,
+                        sources_list.remove(0),
+                        sinks_list.remove(0),
+                        hosts,
+                        rng.clone(),
+                    );
+
+                    let traffic = TrafficCharacteristics::clone(&collective_set.traffic);
+
+                    collectives.push(Collective::new(
+                        next_collective_id(),
+                        collective_set.collective_type,
+                        collective_set.flow_type,
+                        collective_set.flow_count,
+                        None,
+                        sources,
+                        sinks,
+                        traffic,
+                    ));
+                }
             }
         }
 
