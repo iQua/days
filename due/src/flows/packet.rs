@@ -7,7 +7,7 @@ pub struct TCPAck {
 
 #[derive(Debug, Clone)]
 pub struct Packet {
-    /// Packets in Due are typically created by packet sources, and run through
+    /// Packets in Day are typically created by packet sources, and run through
     /// a sequence of packet-forwarding switches. It may be entered into a queue
     /// at an output port on each of these switches.
 
