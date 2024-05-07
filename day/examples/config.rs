@@ -1,20 +1,21 @@
-//! This example shows a network simulation session involving a Torus topology.
+//! This example shows how a network simulation session can be established by
+//! using a configuration file.
 
 use log::info;
 
-use due::flows::collective::Collective;
-use due::flows::flow::Flow;
-use due::topos::build::build_graph;
-use due::topos::topo::Topology;
+use day::flows::collective::Collective;
+use day::flows::flow::Flow;
+use day::topos::build::build_graph;
+use day::topos::topo::Topology;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
-    let file_path = "configs/torus.toml";
+    let file_path = "configs/simple.toml";
 
     let (graph, hosts) = build_graph(file_path);
-    info!("The Torus graph has been initialized.");
+    info!("The network graph has been initialized.");
 
     let flows = Flow::flows_from_config(file_path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());

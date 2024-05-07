@@ -7,10 +7,10 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::flows::flow::FlowType;
-use due::flows::sink::PacketSink;
-use due::flows::source::PacketSource;
-use due::flows::{DistributionInfo, TrafficCharacteristics};
+use day::flows::flow::FlowType;
+use day::flows::sink::PacketSink;
+use day::flows::source::PacketSource;
+use day::flows::{DistributionInfo, TrafficCharacteristics};
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");

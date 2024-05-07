@@ -18,7 +18,7 @@ pub struct Packet {
 
     /// # Example
     /// ```
-    /// use due::flows::packet::Packet;
+    /// use day::flows::packet::Packet;
     ///
     /// let mut packet = Packet::new(
     ///     1024, // packet size

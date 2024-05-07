@@ -2,10 +2,10 @@
 
 use log::info;
 
-use due::flows::collective::Collective;
-use due::seed_from_config;
-use due::topos::build::build_graph;
-use due::topos::topo::Topology;
+use day::flows::collective::Collective;
+use day::seed_from_config;
+use day::topos::build::build_graph;
+use day::topos::topo::Topology;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");

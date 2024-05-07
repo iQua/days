@@ -8,7 +8,7 @@ To run a network simulation session using a configuration file:
 RUST_LOG=debug cargo run -- configs/simple.toml
 ```
 
-where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`. Five examples have also been provided in `due/examples/`. One can run each of these examples using:
+where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`. Five examples have also been provided in `day/examples/`. One can run each of these examples using:
 
 ```
 RUST_LOG=debug cargo run --example fattree
