@@ -8,12 +8,12 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::flows::flow::FlowType;
-use due::flows::sink::PacketSink;
-use due::flows::source::PacketSource;
-use due::flows::{DistributionInfo, TrafficCharacteristics};
-use due::schedulers::drop::{CapacityUnit, DropStrategy};
-use due::schedulers::drr::DRRServer;
+use day::flows::flow::FlowType;
+use day::flows::sink::PacketSink;
+use day::flows::source::PacketSource;
+use day::flows::{DistributionInfo, TrafficCharacteristics};
+use day::schedulers::drop::{CapacityUnit, DropStrategy};
+use day::schedulers::drr::DRRServer;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");

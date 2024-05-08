@@ -7,12 +7,12 @@ use log::info;
 use asynchronix::simulation::{Mailbox, SimInit};
 use asynchronix::time::MonotonicTime;
 
-use due::flows::cc::CCAlgorithm::TCPReno;
-use due::flows::flow::FlowType;
-use due::flows::sink::PacketSink;
-use due::flows::source::PacketSource;
-use due::flows::wire::Wire;
-use due::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
+use day::flows::cc::CCAlgorithm::TCPReno;
+use day::flows::flow::FlowType;
+use day::flows::sink::PacketSink;
+use day::flows::source::PacketSource;
+use day::flows::wire::Wire;
+use day::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
