@@ -247,6 +247,7 @@ impl Topology {
                     CollectiveType::Broadcast => {
                         self.flows.push(Flow::new(
                             flow_id,
+                            Vec::new(),
                             collective.flow_type,
                             source,
                             sink,
@@ -265,6 +266,7 @@ impl Topology {
                     CollectiveType::Gather => {
                         self.flows.push(Flow::new(
                             flow_id,
+                            Vec::new(),
                             collective.flow_type,
                             source,
                             sink,
@@ -282,6 +284,7 @@ impl Topology {
                     CollectiveType::AllReduce => {
                         self.flows.push(Flow::new(
                             flow_id,
+                            Vec::new(),
                             collective.flow_type,
                             source,
                             sink,

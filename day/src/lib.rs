@@ -63,6 +63,10 @@ pub fn next_flow_id() -> usize {
     FLOW_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+pub fn update_next_flow_id(next_flow_id: usize) {
+    FLOW_ID.store(next_flow_id, Ordering::Relaxed)
+}
+
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
 }
