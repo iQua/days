@@ -1,0 +1,48 @@
+# An example configuration file that has dependencies across flows.
+
+seed = 1000
+edges = [[0, 1], [0, 2]]
+hosts = [0, 1, 2]
+progress = 2.0
+duration = 20.0
+log_path = "./simple"
+log_interval = 10.0
+
+[switch]
+port_rate = 8000
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
+
+[[flow]]
+flow_id = 1
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+    initial_delay = 1.0
+    duration = 5.0
+    arr_dist = {type = "Uniform", low = 1, high = 1}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+
+[[flow]]
+flow_id = 2
+starts_after = [1]
+flow_type = "PacketDistribution"
+graph = [[1, 0]]
+[flow.traffic]
+    initial_delay = 2.0
+    duration = 3.0
+    arr_dist = {type = "Uniform", low = 1, high = 1}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+
+[[flow]]
+flow_id = 3
+starts_after = [1, 2]
+flow_type = "PacketDistribution"
+graph = [[1, 0]]
+[flow.traffic]
+    initial_delay = 2.0
+    duration = 4.0
+    arr_dist = {type = "Uniform", low = 1, high = 1}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
