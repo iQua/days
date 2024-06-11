@@ -19,6 +19,8 @@ pub enum FlowType {
 
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
+    flow_id: Option<usize>,
+    starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
     traffic: TomlTrafficCharacteristics,
@@ -26,6 +28,8 @@ struct TomlFlow {
 
 #[derive(Deserialize, Debug)]
 struct TomlFlowSet {
+    first_flow_id: Option<usize>,
+    starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     flow_count: u32,
     traffic: TomlTrafficCharacteristics,
@@ -41,6 +45,8 @@ struct FlowConfig {
 #[derive(Debug)]
 pub struct Flow {
     pub id: usize,
+    /// the dependencies across flows
+    pub starts_after: Vec<usize>,
     pub flow_type: FlowType,
     /// the id of the host switch that the source attaches to
     pub source_host: usize,
@@ -61,6 +67,7 @@ pub struct Flow {
 impl Flow {
     pub fn new(
         id: usize,
+        starts_after: Vec<usize>,
         flow_type: FlowType,
         source_host: usize,
         sink_host: usize,
@@ -71,6 +78,7 @@ impl Flow {
 
         Flow {
             id,
+            starts_after,
             flow_type,
             source_host,
             sink_host,
@@ -94,6 +102,7 @@ impl Flow {
             for (_, edge) in flow_graph.edge_references().enumerate() {
                 flows.push(Flow::new(
                     next_flow_id(),
+                    Vec::new(),
                     FlowType::PacketDistribution,
                     edge.source().index(),
                     edge.target().index(),
@@ -132,10 +141,12 @@ impl Flow {
 
                 for (_, edge) in graph.edge_references().enumerate() {
                     let flow_id = next_flow_id();
+                    let starts_after = flow.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
 
                     flows.push(Flow::new(
                         flow_id,
+                        starts_after,
                         flow.flow_type,
                         edge.source().index(),
                         edge.target().index(),
@@ -156,10 +167,12 @@ impl Flow {
                         hosts.choose_multiple(&mut rng, 2).cloned().collect();
 
                     let flow_id = next_flow_id();
+                    let starts_after = flow_set.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow_set.traffic);
 
                     flows.push(Flow::new(
                         flow_id,
+                        starts_after,
                         flow_set.flow_type,
                         host_pair[0],
                         host_pair[1],
