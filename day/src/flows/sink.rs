@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
-use crate::flows::source::PacketSource;
+use crate::flows::source::{FlowFinishMsg, PacketSource};
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::utils::logger::ReportLogger;
 
@@ -234,6 +234,13 @@ impl PacketSink {
         }
     }
 
+    pub fn flow_finish_outputs(&mut self) -> &mut Vec<Output<FlowFinishMsg>> {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
+            PacketSink::TCPPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
+        }
+    }
+
     pub async fn report(&mut self, endpoint_id: usize) {
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", format!("{self}"));
@@ -281,6 +288,53 @@ impl PacketSink {
         );
 
         self.wrap_up(packet, now).await;
+    }
+
+    pub async fn flow_finish_msg_received(
+        &mut self,
+        flow_finish_msg: FlowFinishMsg,
+        scheduler: &Scheduler<Self>,
+    ) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+
+        debug!(
+            "{} received the last packet from flow {} at time {:.3}.",
+            format!("{self}"),
+            flow_finish_msg.flow_id,
+            now,
+        );
+
+        let flows_after = match self {
+            PacketSink::BasicPacketSink(sink) => {
+                if !sink.flow_finish_outputs.is_empty() {
+                    for output in sink.flow_finish_outputs.iter_mut() {
+                        output.send(flow_finish_msg.clone()).await;
+                    }
+                }
+                sink.flow_finish_outputs.len()
+            }
+            PacketSink::TCPPacketSink(sink) => {
+                if !sink.flow_finish_outputs.is_empty() {
+                    for output in sink.flow_finish_outputs.iter_mut() {
+                        output.send(flow_finish_msg.clone()).await;
+                    }
+                }
+                sink.flow_finish_outputs.len()
+            }
+        };
+
+        if flows_after > 0 {
+            debug!(
+                "{} of flow {} notified {} flow(s) to start at time {:.3}.",
+                format!("{self}"),
+                flow_finish_msg.flow_id,
+                flows_after,
+                now,
+            );
+        }
     }
 
     fn log_report<'a>(

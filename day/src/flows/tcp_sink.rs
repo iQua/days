@@ -8,6 +8,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
+use crate::flows::source::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 
@@ -25,6 +26,9 @@ pub struct TCPPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    /// outputs: outbounds to packet sources of flows wait for this flow to
+    /// finish
+    pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
     /// the statistics of a preiodic report
     report_start_time: f64,
     received_packets: usize,
@@ -44,6 +48,7 @@ impl TCPPacketSink {
             next_seq_expected: 0,
             statistics: Output::default(),
             output: Output::default(),
+            flow_finish_outputs: Vec::new(),
             report_start_time: 0.0,
             received_packets: 0,
             received_sizes: 0,
