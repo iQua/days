@@ -41,7 +41,7 @@ impl FlowSize {
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct TomlTrafficCharacteristics {
-    pub initial_delay: f64,
+    pub initial_delay: Option<f64>,
     pub duration: Option<f64>,
     pub size: Option<usize>,
     pub arr_dist: DistributionInfo,
@@ -85,7 +85,7 @@ impl TrafficCharacteristics {
 
     pub fn clone(traffic: &TomlTrafficCharacteristics) -> Self {
         Self {
-            initial_delay: traffic.initial_delay,
+            initial_delay: traffic.initial_delay.unwrap_or_default(),
             size: match traffic.size {
                 Some(size) => FlowSize::Bytes(size),
                 None => match traffic.duration {
