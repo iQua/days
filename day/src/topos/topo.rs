@@ -248,6 +248,7 @@ impl Topology {
                         self.flows.push(Flow::new(
                             flow_id,
                             Vec::new(),
+                            Vec::new(),
                             collective.flow_type,
                             source,
                             sink,
@@ -267,6 +268,7 @@ impl Topology {
                         self.flows.push(Flow::new(
                             flow_id,
                             Vec::new(),
+                            Vec::new(),
                             collective.flow_type,
                             source,
                             sink,
@@ -284,6 +286,7 @@ impl Topology {
                     CollectiveType::AllReduce => {
                         self.flows.push(Flow::new(
                             flow_id,
+                            Vec::new(),
                             Vec::new(),
                             collective.flow_type,
                             source,
@@ -456,7 +459,13 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let mut source = PacketSource::new(flow.id, flow.flow_type, flow.traffic, flow.seed);
+            let mut source = PacketSource::new(
+                flow.id,
+                flow.starts_after.clone(),
+                flow.flow_type,
+                flow.traffic,
+                flow.seed,
+            );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
             // Flow::compute_path()

@@ -5,7 +5,7 @@ edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
 progress = 2.0
 duration = 20.0
-log_path = "./simple"
+log_path = "./dependency"
 log_interval = 10.0
 
 [switch]
@@ -17,6 +17,7 @@ drop = "RED"
 
 [[flow]]
 flow_id = 1
+starts_before = [2, 3]
 flow_type = "PacketDistribution"
 graph = [[0, 1]]
 [flow.traffic]
@@ -31,7 +32,6 @@ starts_after = [1]
 flow_type = "PacketDistribution"
 graph = [[1, 0]]
 [flow.traffic]
-    initial_delay = 2.0
     duration = 3.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
@@ -42,7 +42,6 @@ starts_after = [1, 2]
 flow_type = "PacketDistribution"
 graph = [[1, 0]]
 [flow.traffic]
-    initial_delay = 2.0
     duration = 4.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
