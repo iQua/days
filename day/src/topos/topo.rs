@@ -451,6 +451,13 @@ impl Topology {
 
         let report_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
 
+        let mut sources = HashMap::new();
+        let mut source_mboxes = HashMap::new();
+        for flow in self.flows.iter() {
+            let source_mbox: Mailbox<PacketSource> = Mailbox::with_capacity(self.mailbox_capacity);
+            source_mboxes.insert(flow.id, source_mbox);
+        }
+
         for flow in self.flows.iter_mut() {
             // creates and attaches a packet source and sink for each flow
 
@@ -481,8 +488,9 @@ impl Topology {
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
             let host_mbox = self.switch_mailboxes.get(&flow.source_host).unwrap();
 
-            // establishes a bi-directional connection between the packet source and the host
-            let source_mbox: Mailbox<PacketSource> = Mailbox::with_capacity(self.mailbox_capacity);
+            // establishes a bi-directional connection between the packet source
+            // and the host
+            let source_mbox = &source_mboxes[&flow.id];
             source
                 .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
@@ -492,11 +500,8 @@ impl Topology {
                 .connect(Progress::finish_msg_received, &report_mbox);
 
             let mut output = Output::default();
-            output.connect(PacketSource::packet_received, &source_mbox);
+            output.connect(PacketSource::packet_received, source_mbox);
             source_host.outputs.insert(source.id(), output);
-
-            // activates the packet source
-            self.sim_init = self.sim_init.add_model(source, source_mbox);
 
             // obtains the host switch and its mailbox for the packet sink
             let sink_host = self.switches.get_mut(&flow.sink_host).unwrap();
@@ -522,8 +527,34 @@ impl Topology {
             output.connect(PacketSink::packet_received, &sink_mbox);
             sink_host.outputs.insert(sink.id(), output);
 
+            // establishes a connection between the packet source and the packet
+            // sink for the source to notify the sink after it sends the last
+            // packet
+            source
+                .sink_output()
+                .connect(PacketSink::flow_finish_msg_received, &sink_mbox);
+
+            // establishes connections between the packet sink and the packet
+            // sources that will not start until this sink receives its last packet
+            for flow_id in flow.starts_before.iter() {
+                let mut flow_finish_output = Output::default();
+                flow_finish_output.connect(
+                    PacketSource::flow_finish_msg_received,
+                    &source_mboxes[&flow_id],
+                );
+                sink.flow_finish_outputs().push(flow_finish_output);
+            }
+
+            sources.insert(flow.id, source);
+
             // activates the packet sink
             self.sim_init = self.sim_init.add_model(sink, sink_mbox);
+        }
+
+        // activates all packet sources
+        for (flow_id, source) in sources.into_iter() {
+            let source_mbox = source_mboxes.remove(&flow_id).unwrap_or_default();
+            self.sim_init = self.sim_init.add_model(source, source_mbox);
         }
 
         (self, report_mbox)
