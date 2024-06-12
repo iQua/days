@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
+use crate::flows::sink::FlowFinishMsg;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
@@ -336,6 +337,31 @@ impl PacketSource {
         }
     }
 
+    pub async fn flow_finish_msg_received(
+        &mut self,
+        flow_finish_msg: FlowFinishMsg,
+        scheduler: &Scheduler<Self>,
+    ) {
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                source.flow_start_after.remove(&flow_finish_msg.flow_id);
+
+                if source.flow_start_after.is_empty() {
+                    self.run((), scheduler).await;
+                    self.start_report_logger(0.0, scheduler);
+                }
+            }
+            PacketSource::TCPPacketSource(source) => {
+                source.flow_start_after.remove(&flow_finish_msg.flow_id);
+
+                if source.flow_start_after.is_empty() {
+                    self.run((), scheduler).await;
+                    self.start_report_logger(0.0, scheduler);
+                }
+            }
+        }
+    }
+
     fn advance_initial_delay(&self) -> f64 {
         let initial_delay = match &self {
             PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
@@ -369,6 +395,19 @@ impl PacketSource {
             }
         }
     }
+
+    fn start_report_logger(&self, initial_delay: f64, scheduler: &Scheduler<Self>) {
+        let report_interval = ReportLogger::get_report_interval();
+        if report_interval < f64::MAX {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(initial_delay + report_interval),
+                    Self::log_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
 impl Model for PacketSource {
@@ -389,20 +428,7 @@ impl Model for PacketSource {
                     self.run((), scheduler).await;
                 }
 
-                let report_interval = ReportLogger::get_report_interval();
-                if report_interval < f64::MAX {
-                    scheduler
-                        .schedule_event(
-                            Duration::from_secs_f64(initial_delay + report_interval),
-                            Self::log_report,
-                            (),
-                        )
-                        .unwrap();
-                }
-            } else {
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(1.0), Self::run, ())
-                    .unwrap();
+                self.start_report_logger(initial_delay, scheduler);
             }
 
             self.into()

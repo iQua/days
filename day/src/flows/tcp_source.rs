@@ -4,7 +4,7 @@
 use core::fmt;
 use std::cmp::min;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use log::debug;
 use rand::rngs::SmallRng;
@@ -53,7 +53,7 @@ impl Eq for PacketTimeout {}
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
-    pub flow_start_after: Vec<usize>,
+    pub flow_start_after: HashSet<usize>,
     pub traffic: TrafficCharacteristics,
     pub traffic_exceeded: bool,
     /// the congestion controller
@@ -121,7 +121,7 @@ impl TCPPacketSource {
         TCPPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
-            flow_start_after,
+            flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
             traffic,
             traffic_exceeded: false,
             congestion_control,

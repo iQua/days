@@ -1,6 +1,7 @@
 //! Implements a packet source that simulates the sending of packets with
 //! specific distributions of inter-arrival times and packet sizes.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use log::debug;
@@ -21,7 +22,7 @@ use crate::utils::progress::FinishMsg;
 pub struct DistPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
-    pub flow_start_after: Vec<usize>,
+    pub flow_start_after: HashSet<usize>,
     pub traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
@@ -43,7 +44,7 @@ impl DistPacketSource {
         DistPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
-            flow_start_after,
+            flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
             traffic,
             packets_sent: 0,
             sent_size: 0,
