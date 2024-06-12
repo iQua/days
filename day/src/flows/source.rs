@@ -18,7 +18,6 @@ use serde::Serialize;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
-use crate::flows::sink::FlowFinishMsg;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
@@ -38,6 +37,11 @@ pub struct PacketSourceReport {
     pub packet_sizes: usize,
     /// the number of acknowledged bytes in this report interval
     pub ack_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowFinishMsg {
+    pub flow_id: usize,
 }
 
 #[derive(Debug)]
@@ -96,6 +100,13 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
+        }
+    }
+
+    pub fn sink_output(&mut self) -> &mut Output<FlowFinishMsg> {
+        match self {
+            PacketSource::DistPacketSource(source) => source.sink_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.sink_output.borrow_mut(),
         }
     }
 
@@ -327,6 +338,10 @@ impl PacketSource {
                         }
                     };
                 }
+
+                // notifies the sink that the last packet has been sent
+                let flow_id = self.flow_id();
+                self.sink_output().send(FlowFinishMsg { flow_id }).await;
 
                 // notifies the Progress coroutine that the packet source
                 // finished running
