@@ -53,6 +53,7 @@ impl Eq for PacketTimeout {}
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
+    pub flow_start_after: Vec<usize>,
     pub traffic: TrafficCharacteristics,
     pub traffic_exceeded: bool,
     /// the congestion controller
@@ -104,7 +105,12 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
+    pub fn new(
+        flow_id: usize,
+        flow_start_after: Vec<usize>,
+        traffic: TrafficCharacteristics,
+        rng: SmallRng,
+    ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
@@ -115,6 +121,7 @@ impl TCPPacketSource {
         TCPPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
+            flow_start_after,
             traffic,
             traffic_exceeded: false,
             congestion_control,

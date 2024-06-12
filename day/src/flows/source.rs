@@ -57,6 +57,7 @@ impl std::fmt::Display for PacketSource {
 impl PacketSource {
     pub fn new(
         flow_id: usize,
+        flow_start_after: Vec<usize>,
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
@@ -68,12 +69,18 @@ impl PacketSource {
         };
 
         match flow_type {
-            FlowType::PacketDistribution => {
-                PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
-            }
-            FlowType::TCP => {
-                PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
-            }
+            FlowType::PacketDistribution => PacketSource::DistPacketSource(DistPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                rng,
+            )),
+            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                rng,
+            )),
         }
     }
 
@@ -343,6 +350,25 @@ impl PacketSource {
 
         initial_delay
     }
+
+    /// Returns whether PacketSource should start now or wait for other flows to
+    /// end due to dependencies.
+    fn start_now(&mut self) -> bool {
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                if source.flow_start_after.is_empty() {
+                    return true;
+                }
+                false
+            }
+            PacketSource::TCPPacketSource(source) => {
+                if source.flow_start_after.is_empty() {
+                    return true;
+                }
+                false
+            }
+        }
+    }
 }
 
 impl Model for PacketSource {
@@ -351,26 +377,31 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            let initial_delay = self.advance_initial_delay();
+            if self.start_now() {
+                let initial_delay = self.advance_initial_delay();
+                self.prepare_run(initial_delay, scheduler);
 
-            self.prepare_run(initial_delay, scheduler);
+                if initial_delay > 0.0 {
+                    scheduler
+                        .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
+                        .unwrap();
+                } else {
+                    self.run((), scheduler).await;
+                }
 
-            if initial_delay > 0.0 {
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
-                    .unwrap();
+                let report_interval = ReportLogger::get_report_interval();
+                if report_interval < f64::MAX {
+                    scheduler
+                        .schedule_event(
+                            Duration::from_secs_f64(initial_delay + report_interval),
+                            Self::log_report,
+                            (),
+                        )
+                        .unwrap();
+                }
             } else {
-                self.run((), scheduler).await;
-            }
-
-            let report_interval = ReportLogger::get_report_interval();
-            if report_interval < f64::MAX {
                 scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(initial_delay + report_interval),
-                        Self::log_report,
-                        (),
-                    )
+                    .schedule_event(Duration::from_secs_f64(1.0), Self::run, ())
                     .unwrap();
             }
 

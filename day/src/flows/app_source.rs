@@ -23,9 +23,12 @@ impl AppDataSource {
         let app_type = AppDataType::DistData;
 
         match app_type {
-            AppDataType::DistData => {
-                AppDataSource::DistDataSource(DistPacketSource::new(flow_id, traffic, rng))
-            }
+            AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
+                flow_id,
+                Vec::new(),
+                traffic,
+                rng,
+            )),
         }
     }
 

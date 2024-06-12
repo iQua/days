@@ -21,6 +21,7 @@ use crate::utils::progress::FinishMsg;
 pub struct DistPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
+    pub flow_start_after: Vec<usize>,
     pub traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
@@ -33,10 +34,16 @@ pub struct DistPacketSource {
 }
 
 impl DistPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> DistPacketSource {
+    pub fn new(
+        flow_id: usize,
+        flow_start_after: Vec<usize>,
+        traffic: TrafficCharacteristics,
+        rng: SmallRng,
+    ) -> DistPacketSource {
         DistPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
+            flow_start_after,
             traffic,
             packets_sent: 0,
             sent_size: 0,
