@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -327,7 +327,7 @@ impl PacketSink {
         };
 
         if flows_after > 0 {
-            debug!(
+            info!(
                 "{} of flow {} notified {} flow(s) to start at time {:.3}.",
                 format!("{self}"),
                 flow_finish_msg.flow_id,
