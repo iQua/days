@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::debug;
 
 use asynchronix::model::{InitializedModel, Model, Output};
 use asynchronix::time::{MonotonicTime, Scheduler};
@@ -300,7 +300,7 @@ impl PacketSink {
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
-        info!(
+        debug!(
             "{} received the last packet from flow {} at time {:.3}.",
             format!("{self}"),
             flow_finish_msg.flow_id,
@@ -327,12 +327,9 @@ impl PacketSink {
         };
 
         if flows_after > 0 {
-            info!(
-                "{} of flow {} notified {} flow(s) to start at time {:.3}.",
-                format!("{self}"),
-                flow_finish_msg.flow_id,
-                flows_after,
-                now,
+            debug!(
+                "Flow {} notified {} flow(s) to start at time {:.3}.",
+                flow_finish_msg.flow_id, flows_after, now,
             );
         }
     }

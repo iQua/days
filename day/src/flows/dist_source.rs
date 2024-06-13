@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
@@ -63,7 +63,7 @@ impl DistPacketSource {
         self.packets_sent += 1;
         self.sent_size += packet.size;
 
-        info!(
+        debug!(
             "DistPacketSource {} of flow {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, self.flow_id, packet.packet_id, packet.size, now, self.packets_sent,
         );

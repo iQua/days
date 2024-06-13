@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
@@ -364,7 +364,7 @@ impl PacketSource {
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
-        info!(
+        debug!(
             "{} of flow {} received notification that flow {} ended at time {:.3}.",
             format!("{self}"),
             self.flow_id(),
@@ -375,7 +375,7 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => {
                 source.flow_start_after.remove(&flow_finish_msg.flow_id);
-                info!(
+                debug!(
                     "Flow {} still waits for {} flow(s) before it can start.",
                     source.flow_id,
                     source.flow_start_after.len()
@@ -386,7 +386,7 @@ impl PacketSource {
                     self.run((), scheduler).await;
                     self.start_report_logger(0.0, scheduler);
 
-                    info!(
+                    debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
                         format!("{self}"),
                         self.flow_id(),
@@ -396,7 +396,7 @@ impl PacketSource {
             }
             PacketSource::TCPPacketSource(source) => {
                 source.flow_start_after.remove(&flow_finish_msg.flow_id);
-                info!(
+                debug!(
                     "Flow {} still waits for {} flow(s) before it can start.",
                     source.flow_id,
                     source.flow_start_after.len()
@@ -407,7 +407,7 @@ impl PacketSource {
                     self.run((), scheduler).await;
                     self.start_report_logger(0.0, scheduler);
 
-                    info!(
+                    debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
                         format!("{self}"),
                         self.flow_id(),
