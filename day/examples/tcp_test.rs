@@ -21,6 +21,7 @@ fn main() {
     // instantiates models
     let mut source = PacketSource::new(
         0,
+        Vec::new(),
         FlowType::TCP,
         TrafficCharacteristics::new(
             0.0,
