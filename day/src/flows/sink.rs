@@ -300,7 +300,7 @@ impl PacketSink {
             .duration_since(MonotonicTime::EPOCH)
             .as_secs_f64();
 
-        debug!(
+        info!(
             "{} received the last packet from flow {} at time {:.3}.",
             format!("{self}"),
             flow_finish_msg.flow_id,
