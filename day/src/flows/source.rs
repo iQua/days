@@ -27,6 +27,7 @@ use crate::utils::progress::FinishMsg;
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
     pub id: usize,
+    pub flow_id: usize,
     /// the start time of this report interval
     pub start_time: f64,
     /// the end time of this report interval

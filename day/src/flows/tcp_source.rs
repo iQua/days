@@ -376,6 +376,7 @@ impl TCPPacketSource {
     pub fn log_report(&mut self, now: f64) {
         let report = PacketSourceReport {
             id: self.endpoint_id,
+            flow_id: self.flow_id,
             start_time: self.report_start_time,
             end_time: now,
             sent_packets: self.packets_sent,

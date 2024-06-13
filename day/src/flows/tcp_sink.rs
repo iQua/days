@@ -15,6 +15,7 @@ use crate::utils::logger::{Report, ReportLogger};
 #[derive(Debug)]
 pub struct TCPPacketSink {
     pub endpoint_id: usize,
+    flow_id: usize,
     /// the statistics of received packets
     pub packet_statistics: PacketStatistics,
     /// the receive buffer, which is a priority queue that is sorted based on
@@ -38,11 +39,12 @@ pub struct TCPPacketSink {
 }
 
 impl TCPPacketSink {
-    pub fn new() -> TCPPacketSink {
+    pub fn new(flow_id: usize) -> TCPPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("TCPPacketSink {endpoint_id}");
         TCPPacketSink {
             endpoint_id,
+            flow_id,
             packet_statistics: PacketStatistics::new(sink_name),
             recv_buffer: Vec::new(),
             next_seq_expected: 0,
@@ -71,6 +73,7 @@ impl TCPPacketSink {
     pub fn log_report(&mut self, now: f64) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
+            flow_id: self.flow_id,
             start_time: self.report_start_time,
             end_time: now,
             received_packets: self.received_packets,

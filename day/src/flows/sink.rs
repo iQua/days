@@ -27,6 +27,7 @@ use crate::utils::logger::ReportLogger;
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
     pub id: usize,
+    pub flow_id: usize,
     /// the start time of this report interval
     pub start_time: f64,
     /// the end time of this report interval
@@ -207,9 +208,11 @@ impl PacketSink {
     pub fn new(source: &PacketSource) -> Self {
         match source {
             PacketSource::DistPacketSource(_) => {
-                PacketSink::BasicPacketSink(BasicPacketSink::new())
+                PacketSink::BasicPacketSink(BasicPacketSink::new(source.flow_id()))
             }
-            PacketSource::TCPPacketSource(_) => PacketSink::TCPPacketSink(TCPPacketSink::new()),
+            PacketSource::TCPPacketSource(_) => {
+                PacketSink::TCPPacketSink(TCPPacketSink::new(source.flow_id()))
+            }
         }
     }
 
