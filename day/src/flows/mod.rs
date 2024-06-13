@@ -31,9 +31,9 @@ pub enum FlowSize {
 }
 
 impl FlowSize {
-    pub fn exceeded(&self, sent_size: usize, now: f64) -> bool {
+    pub fn exceeded(&self, sent_size: usize, flow_start_time: f64, now: f64) -> bool {
         match self {
-            FlowSize::Duration(duration) => now >= *duration,
+            FlowSize::Duration(duration) => (now - flow_start_time) >= *duration,
             FlowSize::Bytes(size) => sent_size >= *size,
         }
     }

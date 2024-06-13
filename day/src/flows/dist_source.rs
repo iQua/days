@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info};
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
@@ -23,6 +23,7 @@ pub struct DistPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub flow_start_after: HashSet<usize>,
+    pub flow_start_time: f64,
     pub traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
@@ -46,6 +47,7 @@ impl DistPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
             flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
+            flow_start_time: 0.0,
             traffic,
             packets_sent: 0,
             sent_size: 0,
@@ -61,9 +63,9 @@ impl DistPacketSource {
         self.packets_sent += 1;
         self.sent_size += packet.size;
 
-        debug!(
-            "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
+        info!(
+            "DistPacketSource {} of flow {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            self.endpoint_id, self.flow_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
     }
 
@@ -114,7 +116,9 @@ impl DistPacketSource {
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
-        self.traffic.size.exceeded(self.sent_size, now)
+        self.traffic
+            .size
+            .exceeded(self.sent_size, self.flow_start_time, now)
     }
 
     pub fn log_report(&mut self, now: f64) {

@@ -139,18 +139,15 @@ impl PacketSource {
         }
     }
 
-    fn prepare_run(
-        &mut self,
-        report_start_time: f64,
-        initial_delay: f64,
-        scheduler: &Scheduler<Self>,
-    ) {
+    fn prepare_run(&mut self, now: f64, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => {
-                source.report_start_time = report_start_time;
+                source.report_start_time = now + initial_delay;
+                source.flow_start_time = now + initial_delay;
             }
             PacketSource::TCPPacketSource(source) => {
-                source.report_start_time = report_start_time;
+                source.report_start_time = now + initial_delay;
+                source.datasource.flow_start_time(now + initial_delay);
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
@@ -166,11 +163,11 @@ impl PacketSource {
                     .unwrap();
 
                 // lets AppDataSource to send data to TCPPacketSource
-                let (data, interval) = source.datasource.produce_data(initial_delay);
+                let (data, interval) = source.datasource.produce_data(now + initial_delay);
 
                 // TCPPacketSource now owns the data from the application
                 source.send_buffer += data.size;
-                source.busy_until = initial_delay;
+                source.busy_until = now + initial_delay;
 
                 // schedules AppDataSource to send next data
                 scheduler
@@ -477,7 +474,7 @@ impl Model for PacketSource {
         Box::pin(async move {
             if self.start_now() {
                 let initial_delay = self.advance_initial_delay();
-                self.prepare_run(initial_delay, initial_delay, scheduler);
+                self.prepare_run(0.0, initial_delay, scheduler);
 
                 if initial_delay > 0.0 {
                     scheduler

@@ -32,6 +32,12 @@ impl AppDataSource {
         }
     }
 
+    pub fn flow_start_time(&mut self, start_time: f64) {
+        match self {
+            AppDataSource::DistDataSource(source) => source.flow_start_time = start_time,
+        }
+    }
+
     pub fn produce_data(&mut self, now: f64) -> (Packet, Duration) {
         let (packet, duration) = match self {
             AppDataSource::DistDataSource(source) => source.produce_packet(now),
