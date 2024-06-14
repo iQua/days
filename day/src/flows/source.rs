@@ -436,7 +436,7 @@ impl PacketSource {
 
     /// Returns whether PacketSource should start now or wait for other flows to
     /// end due to dependencies.
-    fn start_now(&mut self) -> bool {
+    fn start_now(&self) -> bool {
         match self {
             PacketSource::DistPacketSource(source) => {
                 if source.flow_start_after.is_empty() {
