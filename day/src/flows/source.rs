@@ -148,7 +148,7 @@ impl PacketSource {
             }
             PacketSource::TCPPacketSource(source) => {
                 source.report_start_time = now + initial_delay;
-                source.datasource.flow_start_time(now + initial_delay);
+                source.datasource.set_flow_start_time(now + initial_delay);
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout

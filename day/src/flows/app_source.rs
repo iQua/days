@@ -32,9 +32,9 @@ impl AppDataSource {
         }
     }
 
-    pub fn flow_start_time(&mut self, start_time: f64) {
+    pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
         match self {
-            AppDataSource::DistDataSource(source) => source.flow_start_time = start_time,
+            AppDataSource::DistDataSource(source) => source.flow_start_time = flow_start_time,
         }
     }
 
