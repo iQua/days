@@ -19,7 +19,7 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
-use crate::flows::TrafficCharacteristics;
+use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::utils::logger::ReportLogger;
 use crate::utils::progress::FinishMsg;
@@ -38,11 +38,6 @@ pub struct PacketSourceReport {
     pub packet_sizes: usize,
     /// the number of acknowledged bytes in this report interval
     pub ack_bytes: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct FlowFinishMsg {
-    pub flow_id: usize,
 }
 
 #[derive(Debug)]
@@ -376,11 +371,6 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => {
                 source.flow_start_after.remove(&flow_finish_msg.flow_id);
-                debug!(
-                    "Flow {} still waits for {} flow(s) before it can start.",
-                    source.flow_id,
-                    source.flow_start_after.len()
-                );
 
                 if source.flow_start_after.is_empty() {
                     self.prepare_run(now, 0.0, scheduler);
@@ -392,6 +382,12 @@ impl PacketSource {
                         format!("{self}"),
                         self.flow_id(),
                         now
+                    );
+                } else {
+                    debug!(
+                        "Flow {} still waits for {} flow(s) before it can start.",
+                        source.flow_id,
+                        source.flow_start_after.len()
                     );
                 }
             }

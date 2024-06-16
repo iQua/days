@@ -20,8 +20,9 @@ use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
-use crate::flows::source::{FlowFinishMsg, PacketSource};
+use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
+use crate::flows::FlowFinishMsg;
 use crate::utils::logger::ReportLogger;
 
 #[derive(Clone, Debug, Serialize)]

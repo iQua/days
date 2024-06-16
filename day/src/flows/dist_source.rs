@@ -12,8 +12,8 @@ use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
-use crate::flows::source::{FlowFinishMsg, PacketSourceReport};
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::flows::source::PacketSourceReport;
+use crate::flows::{DistributionInfo, FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 use crate::utils::progress::FinishMsg;

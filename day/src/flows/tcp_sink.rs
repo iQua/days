@@ -8,7 +8,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
-use crate::flows::source::FlowFinishMsg;
+use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 

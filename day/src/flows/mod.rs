@@ -100,6 +100,11 @@ impl TrafficCharacteristics {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct FlowFinishMsg {
+    pub flow_id: usize,
+}
+
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
