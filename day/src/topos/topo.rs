@@ -31,7 +31,7 @@ use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::utils::logger::ReportLogger;
 use crate::utils::progress::Progress;
-use crate::{next_flow_id, num_switches, set_num_switches};
+use crate::{num_switches, set_num_switches};
 
 #[derive(Deserialize)]
 struct ProgressConfig {
@@ -242,7 +242,7 @@ impl Topology {
         for collective in self.collectives.iter_mut() {
             for (index, &source) in collective.sources.iter().enumerate() {
                 let sink = collective.sinks[index];
-                let flow_id = next_flow_id();
+                let flow_id = collective.first_flow_id + index;
                 match collective.collective_type {
                     CollectiveType::Broadcast => {
                         self.flows.push(Flow::new(
