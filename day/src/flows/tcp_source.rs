@@ -88,6 +88,7 @@ pub struct TCPPacketSource {
 
     packets_sent: usize,
     sent_size: usize,
+    sent_size_in_period: usize,
 
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
@@ -140,6 +141,7 @@ impl TCPPacketSource {
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
+            sent_size_in_period: 0,
             output: Output::default(),
             finish_msg_output: Output::default(),
             sink_output: Output::default(),
@@ -279,6 +281,7 @@ impl TCPPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
+        self.sent_size_in_period += packet.size;
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -380,7 +383,7 @@ impl TCPPacketSource {
             start_time: self.report_start_time,
             end_time: now,
             sent_packets: self.packets_sent,
-            packet_sizes: self.sent_size,
+            packet_sizes: self.sent_size_in_period,
             ack_bytes: self.last_ack,
         };
 
@@ -393,7 +396,7 @@ impl TCPPacketSource {
         // resets the statistics of report
         self.report_start_time = now;
         self.packets_sent = 0;
-        self.sent_size = 0;
+        self.sent_size_in_period = 0;
     }
 }
 

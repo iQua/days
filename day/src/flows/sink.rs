@@ -305,7 +305,7 @@ impl PacketSink {
             .as_secs_f64();
 
         debug!(
-            "{} received the last packet from flow {} at time {:.3}.",
+            "{} received the last packet of flow {} at time {:.3}.",
             format!("{self}"),
             flow_finish_msg.flow_id,
             now,

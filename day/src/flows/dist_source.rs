@@ -27,6 +27,7 @@ pub struct DistPacketSource {
     pub traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
+    sent_size_in_period: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,
@@ -51,6 +52,7 @@ impl DistPacketSource {
             traffic,
             packets_sent: 0,
             sent_size: 0,
+            sent_size_in_period: 0,
             rng,
             output: Output::default(),
             finish_msg_output: Output::default(),
@@ -62,6 +64,7 @@ impl DistPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
+        self.sent_size_in_period += packet.size;
 
         debug!(
             "DistPacketSource {} of flow {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -128,7 +131,7 @@ impl DistPacketSource {
             start_time: self.report_start_time,
             end_time: now,
             sent_packets: self.packets_sent,
-            packet_sizes: self.sent_size,
+            packet_sizes: self.sent_size_in_period,
             ack_bytes: 0,
         };
 
@@ -141,7 +144,7 @@ impl DistPacketSource {
         // resets the statistics of report
         self.report_start_time = now;
         self.packets_sent = 0;
-        self.sent_size = 0;
+        self.sent_size_in_period = 0;
     }
 }
 
