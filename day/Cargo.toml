@@ -1,6 +1,6 @@
 [package]
 name = "day"
-version = "0.1.0"
+version = "0.1.5"
 description = "A Performant Discrete-Event Simulator for Network Simulations"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]
 repository = "https://github.com/iqua/day.rs"
@@ -15,13 +15,13 @@ edition = "2021"
 [dependencies]
 asynchronix = "0.2"
 csv = "1.3"
-env_logger = "0.10"
+env_logger = "0.11"
 indicatif = "0.17"
 indicatif-log-bridge = "0.2"
-lazy_static = "1.4"
+lazy_static = "1.5"
 log = "0.4"
 petgraph = "0.6"
 rand = {version = "0.8", features = ["small_rng"]}
 serde = { version = "1.0", features = ["derive"] }
-statrs = "0.16"
+statrs = "0.17"
 toml = "0.8"
