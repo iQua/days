@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
 use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
-use crate::{next_collective_id, seed_from_config};
+use crate::{next_collective_id, next_flow_id, seed_from_config, update_next_flow_id};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum CollectiveType {
@@ -20,6 +20,7 @@ pub enum CollectiveType {
 #[derive(Deserialize, Debug)]
 struct TomlCollective {
     collective_type: CollectiveType,
+    first_flow_id: Option<usize>,
     flow_type: FlowType,
     flow_count: usize,
     graph: Option<Vec<(u32, u32)>>,
@@ -32,6 +33,7 @@ struct TomlCollective {
 struct TomlCollectiveSet {
     collective_type: CollectiveType,
     collective_count: usize,
+    first_flow_id: Option<usize>,
     flow_type: FlowType,
     flow_count: usize,
     sources: Option<Vec<Vec<usize>>>,
@@ -49,6 +51,7 @@ struct CollectiveConfig {
 pub struct Collective {
     pub id: usize,
     pub collective_type: CollectiveType,
+    pub first_flow_id: usize,
     pub flow_type: FlowType,
     pub flow_count: usize,
     pub graph: Option<DiGraph<usize, ()>>,
@@ -64,6 +67,7 @@ impl Collective {
     pub fn new(
         id: usize,
         collective_type: CollectiveType,
+        first_flow_id: usize,
         flow_type: FlowType,
         flow_count: usize,
         graph: Option<DiGraph<usize, ()>>,
@@ -74,6 +78,7 @@ impl Collective {
         Collective {
             id,
             collective_type,
+            first_flow_id,
             flow_type,
             flow_count,
             graph,
@@ -98,9 +103,13 @@ impl Collective {
             let collective_sources = sources[index].clone();
             let collective_sinks = sinks[index].clone();
 
+            let first_flow_id = next_flow_id();
+            update_next_flow_id(first_flow_id + flow_count);
+
             collectives.push(Collective::new(
                 next_collective_id(),
                 CollectiveType::AllReduce,
+                first_flow_id,
                 FlowType::PacketDistribution,
                 flow_count,
                 collective_graph,
@@ -248,9 +257,23 @@ impl Collective {
 
                 let traffic = TrafficCharacteristics::clone(&collective.traffic);
 
+                let mut first_flow_id = next_flow_id();
+                if collective.first_flow_id.is_some() {
+                    let new_first_flow_id = collective.first_flow_id.unwrap();
+                    if new_first_flow_id < first_flow_id {
+                        panic!(
+                            "The specified first flow id {} of the collective should be at least {}",
+                            new_first_flow_id, first_flow_id
+                        );
+                    }
+                    first_flow_id = new_first_flow_id;
+                }
+                update_next_flow_id(first_flow_id + collective.flow_count);
+
                 collectives.push(Collective::new(
                     next_collective_id(),
                     collective.collective_type,
+                    first_flow_id,
                     collective.flow_type,
                     collective.flow_count,
                     graph,
@@ -285,7 +308,22 @@ impl Collective {
                     );
                 }
 
-                for _ in 0..collective_set.collective_count {
+                let mut first_flow_id = next_flow_id();
+                if collective_set.first_flow_id.is_some() {
+                    let new_first_flow_id = collective_set.first_flow_id.unwrap();
+                    if new_first_flow_id < first_flow_id {
+                        panic!(
+                            "The specified first flow id {} of the collective set should be at least {}",
+                            new_first_flow_id, first_flow_id
+                        );
+                    }
+                    first_flow_id = new_first_flow_id;
+                }
+                update_next_flow_id(
+                    first_flow_id + collective_set.collective_count * collective_set.flow_count,
+                );
+
+                for index in 0..collective_set.collective_count {
                     let (sources, sinks) = Self::generate_endpoints(
                         collective_set.collective_type,
                         collective_set.flow_count,
@@ -300,6 +338,7 @@ impl Collective {
                     collectives.push(Collective::new(
                         next_collective_id(),
                         collective_set.collective_type,
+                        first_flow_id + index * collective_set.flow_count,
                         collective_set.flow_type,
                         collective_set.flow_count,
                         None,

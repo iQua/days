@@ -8,12 +8,14 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
+use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 
 #[derive(Debug)]
 pub struct TCPPacketSink {
     pub endpoint_id: usize,
+    flow_id: usize,
     /// the statistics of received packets
     pub packet_statistics: PacketStatistics,
     /// the receive buffer, which is a priority queue that is sorted based on
@@ -25,6 +27,9 @@ pub struct TCPPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    /// outputs: outbounds to packet sources of flows wait for this flow to
+    /// finish
+    pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
     /// the statistics of a preiodic report
     report_start_time: f64,
     received_packets: usize,
@@ -34,16 +39,18 @@ pub struct TCPPacketSink {
 }
 
 impl TCPPacketSink {
-    pub fn new() -> TCPPacketSink {
+    pub fn new(flow_id: usize) -> TCPPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("TCPPacketSink {endpoint_id}");
         TCPPacketSink {
             endpoint_id,
+            flow_id,
             packet_statistics: PacketStatistics::new(sink_name),
             recv_buffer: Vec::new(),
             next_seq_expected: 0,
             statistics: Output::default(),
             output: Output::default(),
+            flow_finish_outputs: Vec::new(),
             report_start_time: 0.0,
             received_packets: 0,
             received_sizes: 0,
@@ -66,6 +73,7 @@ impl TCPPacketSink {
     pub fn log_report(&mut self, now: f64) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
+            flow_id: self.flow_id,
             start_time: self.report_start_time,
             end_time: now,
             received_packets: self.received_packets,

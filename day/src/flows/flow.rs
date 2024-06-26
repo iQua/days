@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::flows::route::{RoutingProtocol, ShortestPath};
 use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
-use crate::{next_flow_id, seed_from_config};
+use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum FlowType {
@@ -19,6 +19,9 @@ pub enum FlowType {
 
 #[derive(Deserialize, Debug)]
 struct TomlFlow {
+    flow_id: Option<usize>,
+    starts_before: Option<Vec<usize>>,
+    starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
     traffic: TomlTrafficCharacteristics,
@@ -26,6 +29,9 @@ struct TomlFlow {
 
 #[derive(Deserialize, Debug)]
 struct TomlFlowSet {
+    first_flow_id: Option<usize>,
+    starts_before: Option<Vec<usize>>,
+    starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     flow_count: u32,
     traffic: TomlTrafficCharacteristics,
@@ -41,6 +47,11 @@ struct FlowConfig {
 #[derive(Debug)]
 pub struct Flow {
     pub id: usize,
+    /// the ids of flows that can only start after this flow ends
+    pub starts_before: Vec<usize>,
+    /// the ids of flows that this flow must wait for them to finish before it
+    /// starts
+    pub starts_after: Vec<usize>,
     pub flow_type: FlowType,
     /// the id of the host switch that the source attaches to
     pub source_host: usize,
@@ -61,6 +72,8 @@ pub struct Flow {
 impl Flow {
     pub fn new(
         id: usize,
+        starts_before: Vec<usize>,
+        starts_after: Vec<usize>,
         flow_type: FlowType,
         source_host: usize,
         sink_host: usize,
@@ -71,6 +84,8 @@ impl Flow {
 
         Flow {
             id,
+            starts_before,
+            starts_after,
             flow_type,
             source_host,
             sink_host,
@@ -94,6 +109,8 @@ impl Flow {
             for (_, edge) in flow_graph.edge_references().enumerate() {
                 flows.push(Flow::new(
                     next_flow_id(),
+                    Vec::new(),
+                    Vec::new(),
                     FlowType::PacketDistribution,
                     edge.source().index(),
                     edge.target().index(),
@@ -131,11 +148,26 @@ impl Flow {
                 assert!(graph.edge_references().len() == 1);
 
                 for (_, edge) in graph.edge_references().enumerate() {
-                    let flow_id = next_flow_id();
+                    let mut flow_id = next_flow_id();
+                    if flow.flow_id.is_some() {
+                        let new_id = flow.flow_id.unwrap();
+                        if new_id < flow_id {
+                            panic!(
+                                "The specified flow id {} should be at least {}",
+                                new_id, flow_id
+                            );
+                        }
+                        update_next_flow_id(new_id + 1);
+                        flow_id = new_id;
+                    }
+                    let starts_before = flow.starts_before.clone().unwrap_or_default();
+                    let starts_after = flow.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
 
                     flows.push(Flow::new(
                         flow_id,
+                        starts_before,
+                        starts_after,
                         flow.flow_type,
                         edge.source().index(),
                         edge.target().index(),
@@ -151,15 +183,31 @@ impl Flow {
             let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
 
             for flow_set in flow_set_vec {
-                for _ in 0..flow_set.flow_count {
+                let mut first_flow_id = next_flow_id();
+                if flow_set.first_flow_id.is_some() {
+                    let new_first_flow_id = flow_set.first_flow_id.unwrap();
+                    if new_first_flow_id < first_flow_id {
+                        panic!(
+                            "The specified first flow id {} of the flow set should be at least {}",
+                            new_first_flow_id, first_flow_id
+                        );
+                    }
+                    first_flow_id = new_first_flow_id;
+                }
+
+                for id_counter in 0..flow_set.flow_count {
                     let host_pair: Vec<usize> =
                         hosts.choose_multiple(&mut rng, 2).cloned().collect();
 
-                    let flow_id = next_flow_id();
+                    let flow_id = first_flow_id + id_counter as usize;
+                    let starts_before = flow_set.starts_before.clone().unwrap_or_default();
+                    let starts_after = flow_set.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow_set.traffic);
 
                     flows.push(Flow::new(
                         flow_id,
+                        starts_before,
+                        starts_after,
                         flow_set.flow_type,
                         host_pair[0],
                         host_pair[1],
@@ -168,6 +216,7 @@ impl Flow {
                         flow_id,
                     ));
                 }
+                update_next_flow_id(first_flow_id + flow_set.flow_count as usize);
             }
         }
 

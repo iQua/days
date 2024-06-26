@@ -19,7 +19,7 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
-use crate::flows::TrafficCharacteristics;
+use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::utils::logger::ReportLogger;
 use crate::utils::progress::FinishMsg;
@@ -27,6 +27,7 @@ use crate::utils::progress::FinishMsg;
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
     pub id: usize,
+    pub flow_id: usize,
     /// the start time of this report interval
     pub start_time: f64,
     /// the end time of this report interval
@@ -57,6 +58,7 @@ impl std::fmt::Display for PacketSource {
 impl PacketSource {
     pub fn new(
         flow_id: usize,
+        flow_start_after: Vec<usize>,
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
@@ -68,12 +70,18 @@ impl PacketSource {
         };
 
         match flow_type {
-            FlowType::PacketDistribution => {
-                PacketSource::DistPacketSource(DistPacketSource::new(flow_id, traffic, rng))
-            }
-            FlowType::TCP => {
-                PacketSource::TCPPacketSource(TCPPacketSource::new(flow_id, traffic, rng))
-            }
+            FlowType::PacketDistribution => PacketSource::DistPacketSource(DistPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                rng,
+            )),
+            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                rng,
+            )),
         }
     }
 
@@ -88,6 +96,13 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
+        }
+    }
+
+    pub fn sink_output(&mut self) -> &mut Output<FlowFinishMsg> {
+        match self {
+            PacketSource::DistPacketSource(source) => source.sink_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.sink_output.borrow_mut(),
         }
     }
 
@@ -120,13 +135,15 @@ impl PacketSource {
         }
     }
 
-    fn prepare_run(&mut self, initial_delay: f64, scheduler: &Scheduler<Self>) {
+    fn prepare_run(&mut self, now: f64, initial_delay: f64, scheduler: &Scheduler<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => {
-                source.report_start_time = initial_delay;
+                source.report_start_time = now + initial_delay;
+                source.flow_start_time = now + initial_delay;
             }
             PacketSource::TCPPacketSource(source) => {
-                source.report_start_time = initial_delay;
+                source.report_start_time = now + initial_delay;
+                source.datasource.set_flow_start_time(now + initial_delay);
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
@@ -142,11 +159,11 @@ impl PacketSource {
                     .unwrap();
 
                 // lets AppDataSource to send data to TCPPacketSource
-                let (data, interval) = source.datasource.produce_data(initial_delay);
+                let (data, interval) = source.datasource.produce_data(now + initial_delay);
 
                 // TCPPacketSource now owns the data from the application
                 source.send_buffer += data.size;
-                source.busy_until = initial_delay;
+                source.busy_until = now + initial_delay;
 
                 // schedules AppDataSource to send next data
                 scheduler
@@ -320,11 +337,80 @@ impl PacketSource {
                     };
                 }
 
+                // notifies the sink that the last packet has been sent
+                let flow_id = self.flow_id();
+                self.sink_output().send(FlowFinishMsg { flow_id }).await;
+
                 // notifies the Progress coroutine that the packet source
                 // finished running
                 self.finish_msg_output().send(FinishMsg {}).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
+            }
+        }
+    }
+
+    pub async fn flow_finish_msg_received(
+        &mut self,
+        flow_finish_msg: FlowFinishMsg,
+        scheduler: &Scheduler<Self>,
+    ) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+
+        debug!(
+            "{} of flow {} received notification that flow {} ended at time {:.3}.",
+            format!("{self}"),
+            self.flow_id(),
+            flow_finish_msg.flow_id,
+            now
+        );
+
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                source.flow_start_after.remove(&flow_finish_msg.flow_id);
+
+                if source.flow_start_after.is_empty() {
+                    self.prepare_run(now, 0.0, scheduler);
+                    self.run((), scheduler).await;
+                    self.start_report_logger(0.0, scheduler);
+
+                    debug!(
+                        "{} of flow {} started sending packets at time {:.3}.",
+                        format!("{self}"),
+                        self.flow_id(),
+                        now
+                    );
+                } else {
+                    debug!(
+                        "Flow {} still waits for {} flow(s) before it can start.",
+                        source.flow_id,
+                        source.flow_start_after.len()
+                    );
+                }
+            }
+            PacketSource::TCPPacketSource(source) => {
+                source.flow_start_after.remove(&flow_finish_msg.flow_id);
+                debug!(
+                    "Flow {} still waits for {} flow(s) before it can start.",
+                    source.flow_id,
+                    source.flow_start_after.len()
+                );
+
+                if source.flow_start_after.is_empty() {
+                    self.prepare_run(now, 0.0, scheduler);
+                    self.run((), scheduler).await;
+                    self.start_report_logger(0.0, scheduler);
+
+                    debug!(
+                        "{} of flow {} started sending packets at time {:.3}.",
+                        format!("{self}"),
+                        self.flow_id(),
+                        now
+                    );
+                }
             }
         }
     }
@@ -343,6 +429,38 @@ impl PacketSource {
 
         initial_delay
     }
+
+    /// Returns whether PacketSource should start now or wait for other flows to
+    /// end due to dependencies.
+    fn start_now(&self) -> bool {
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                if source.flow_start_after.is_empty() {
+                    return true;
+                }
+                false
+            }
+            PacketSource::TCPPacketSource(source) => {
+                if source.flow_start_after.is_empty() {
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    fn start_report_logger(&self, initial_delay: f64, scheduler: &Scheduler<Self>) {
+        let report_interval = ReportLogger::get_report_interval();
+        if report_interval < f64::MAX {
+            scheduler
+                .schedule_event(
+                    Duration::from_secs_f64(initial_delay + report_interval),
+                    Self::log_report,
+                    (),
+                )
+                .unwrap();
+        }
+    }
 }
 
 impl Model for PacketSource {
@@ -351,27 +469,19 @@ impl Model for PacketSource {
         scheduler: &Scheduler<Self>,
     ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
         Box::pin(async move {
-            let initial_delay = self.advance_initial_delay();
+            if self.start_now() {
+                let initial_delay = self.advance_initial_delay();
+                self.prepare_run(0.0, initial_delay, scheduler);
 
-            self.prepare_run(initial_delay, scheduler);
+                if initial_delay > 0.0 {
+                    scheduler
+                        .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
+                        .unwrap();
+                } else {
+                    self.run((), scheduler).await;
+                }
 
-            if initial_delay > 0.0 {
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
-                    .unwrap();
-            } else {
-                self.run((), scheduler).await;
-            }
-
-            let report_interval = ReportLogger::get_report_interval();
-            if report_interval < f64::MAX {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(initial_delay + report_interval),
-                        Self::log_report,
-                        (),
-                    )
-                    .unwrap();
+                self.start_report_logger(initial_delay, scheduler);
             }
 
             self.into()

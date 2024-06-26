@@ -21,6 +21,7 @@ fn main() {
     // instantiates models and their mailboxes
     let mut source = PacketSource::new(
         0,
+        Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
             0.0,

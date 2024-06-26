@@ -22,11 +22,13 @@ use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
+use crate::flows::FlowFinishMsg;
 use crate::utils::logger::ReportLogger;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
     pub id: usize,
+    pub flow_id: usize,
     /// the start time of this report interval
     pub start_time: f64,
     /// the end time of this report interval
@@ -207,9 +209,11 @@ impl PacketSink {
     pub fn new(source: &PacketSource) -> Self {
         match source {
             PacketSource::DistPacketSource(_) => {
-                PacketSink::BasicPacketSink(BasicPacketSink::new())
+                PacketSink::BasicPacketSink(BasicPacketSink::new(source.flow_id()))
             }
-            PacketSource::TCPPacketSource(_) => PacketSink::TCPPacketSink(TCPPacketSink::new()),
+            PacketSource::TCPPacketSource(_) => {
+                PacketSink::TCPPacketSink(TCPPacketSink::new(source.flow_id()))
+            }
         }
     }
 
@@ -231,6 +235,13 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.output.borrow_mut(),
+        }
+    }
+
+    pub fn flow_finish_outputs(&mut self) -> &mut Vec<Output<FlowFinishMsg>> {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
+            PacketSink::TCPPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
         }
     }
 
@@ -281,6 +292,50 @@ impl PacketSink {
         );
 
         self.wrap_up(packet, now).await;
+    }
+
+    pub async fn flow_finish_msg_received(
+        &mut self,
+        flow_finish_msg: FlowFinishMsg,
+        scheduler: &Scheduler<Self>,
+    ) {
+        let now = scheduler
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
+
+        debug!(
+            "{} received the last packet of flow {} at time {:.3}.",
+            format!("{self}"),
+            flow_finish_msg.flow_id,
+            now,
+        );
+
+        let flows_after = match self {
+            PacketSink::BasicPacketSink(sink) => {
+                if !sink.flow_finish_outputs.is_empty() {
+                    for output in sink.flow_finish_outputs.iter_mut() {
+                        output.send(flow_finish_msg.clone()).await;
+                    }
+                }
+                sink.flow_finish_outputs.len()
+            }
+            PacketSink::TCPPacketSink(sink) => {
+                if !sink.flow_finish_outputs.is_empty() {
+                    for output in sink.flow_finish_outputs.iter_mut() {
+                        output.send(flow_finish_msg.clone()).await;
+                    }
+                }
+                sink.flow_finish_outputs.len()
+            }
+        };
+
+        if flows_after > 0 {
+            debug!(
+                "Flow {} notified {} flow(s) to start at time {:.3}.",
+                flow_finish_msg.flow_id, flows_after, now,
+            );
+        }
     }
 
     fn log_report<'a>(

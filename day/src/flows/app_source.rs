@@ -23,9 +23,18 @@ impl AppDataSource {
         let app_type = AppDataType::DistData;
 
         match app_type {
-            AppDataType::DistData => {
-                AppDataSource::DistDataSource(DistPacketSource::new(flow_id, traffic, rng))
-            }
+            AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
+                flow_id,
+                Vec::new(),
+                traffic,
+                rng,
+            )),
+        }
+    }
+
+    pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
+        match self {
+            AppDataSource::DistDataSource(source) => source.flow_start_time = flow_start_time,
         }
     }
 

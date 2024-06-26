@@ -1,6 +1,7 @@
 //! Implements a packet source that simulates the sending of packets with
 //! specific distributions of inter-arrival times and packet sizes.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use log::debug;
@@ -12,7 +13,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::{DistributionInfo, TrafficCharacteristics};
+use crate::flows::{DistributionInfo, FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 use crate::utils::progress::FinishMsg;
@@ -21,28 +22,41 @@ use crate::utils::progress::FinishMsg;
 pub struct DistPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
+    pub flow_start_after: HashSet<usize>,
+    pub flow_start_time: f64,
     pub traffic: TrafficCharacteristics,
     packets_sent: usize,
     sent_size: usize,
+    sent_size_in_period: usize,
     rng: SmallRng,
 
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
+    pub sink_output: Output<FlowFinishMsg>,
 
     pub report_start_time: f64,
 }
 
 impl DistPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> DistPacketSource {
+    pub fn new(
+        flow_id: usize,
+        flow_start_after: Vec<usize>,
+        traffic: TrafficCharacteristics,
+        rng: SmallRng,
+    ) -> DistPacketSource {
         DistPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
+            flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
+            flow_start_time: 0.0,
             traffic,
             packets_sent: 0,
             sent_size: 0,
+            sent_size_in_period: 0,
             rng,
             output: Output::default(),
             finish_msg_output: Output::default(),
+            sink_output: Output::default(),
             report_start_time: 0.0,
         }
     }
@@ -50,10 +64,11 @@ impl DistPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
+        self.sent_size_in_period += packet.size;
 
         debug!(
-            "DistPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
-            self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
+            "DistPacketSource {} of flow {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
+            self.endpoint_id, self.flow_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
     }
 
@@ -104,16 +119,19 @@ impl DistPacketSource {
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
-        self.traffic.size.exceeded(self.sent_size, now)
+        self.traffic
+            .size
+            .exceeded(self.sent_size, self.flow_start_time, now)
     }
 
     pub fn log_report(&mut self, now: f64) {
         let report = PacketSourceReport {
             id: self.endpoint_id,
+            flow_id: self.flow_id,
             start_time: self.report_start_time,
             end_time: now,
             sent_packets: self.packets_sent,
-            packet_sizes: self.sent_size,
+            packet_sizes: self.sent_size_in_period,
             ack_bytes: 0,
         };
 
@@ -126,7 +144,7 @@ impl DistPacketSource {
         // resets the statistics of report
         self.report_start_time = now;
         self.packets_sent = 0;
-        self.sent_size = 0;
+        self.sent_size_in_period = 0;
     }
 }
 

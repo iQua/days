@@ -4,7 +4,7 @@
 use core::fmt;
 use std::cmp::min;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use log::debug;
 use rand::rngs::SmallRng;
@@ -15,7 +15,7 @@ use crate::flows::app_source::AppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::TrafficCharacteristics;
+use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 use crate::utils::progress::FinishMsg;
@@ -53,6 +53,7 @@ impl Eq for PacketTimeout {}
 pub struct TCPPacketSource {
     pub endpoint_id: usize,
     pub flow_id: usize,
+    pub flow_start_after: HashSet<usize>,
     pub traffic: TrafficCharacteristics,
     pub traffic_exceeded: bool,
     /// the congestion controller
@@ -87,9 +88,11 @@ pub struct TCPPacketSource {
 
     packets_sent: usize,
     sent_size: usize,
+    sent_size_in_period: usize,
 
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
+    pub sink_output: Output<FlowFinishMsg>,
 
     pub report_start_time: f64,
 }
@@ -104,7 +107,12 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> TCPPacketSource {
+    pub fn new(
+        flow_id: usize,
+        flow_start_after: Vec<usize>,
+        traffic: TrafficCharacteristics,
+        rng: SmallRng,
+    ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
@@ -115,6 +123,7 @@ impl TCPPacketSource {
         TCPPacketSource {
             endpoint_id: next_endpoint_id(),
             flow_id,
+            flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
             traffic,
             traffic_exceeded: false,
             congestion_control,
@@ -132,8 +141,10 @@ impl TCPPacketSource {
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
+            sent_size_in_period: 0,
             output: Output::default(),
             finish_msg_output: Output::default(),
+            sink_output: Output::default(),
             report_start_time: 0.0,
         }
     }
@@ -270,6 +281,7 @@ impl TCPPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
+        self.sent_size_in_period += packet.size;
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
@@ -367,10 +379,11 @@ impl TCPPacketSource {
     pub fn log_report(&mut self, now: f64) {
         let report = PacketSourceReport {
             id: self.endpoint_id,
+            flow_id: self.flow_id,
             start_time: self.report_start_time,
             end_time: now,
             sent_packets: self.packets_sent,
-            packet_sizes: self.sent_size,
+            packet_sizes: self.sent_size_in_period,
             ack_bytes: self.last_ack,
         };
 
@@ -383,7 +396,7 @@ impl TCPPacketSource {
         // resets the statistics of report
         self.report_start_time = now;
         self.packets_sent = 0;
-        self.sent_size = 0;
+        self.sent_size_in_period = 0;
     }
 }
 
