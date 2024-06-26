@@ -61,7 +61,7 @@ impl Progress {
     pub fn finish_msg_received(&mut self, _finish_msg: FinishMsg, scheduler: &Scheduler<Self>) {
         self.finished_sources += 1;
         debug!(
-            "{} / {} sources are finished.",
+            "{} / {} sources have finished.",
             self.finished_sources, self.num_sources
         );
         if self.finished_sources == self.num_sources {
