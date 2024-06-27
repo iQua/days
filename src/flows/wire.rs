@@ -56,7 +56,11 @@ impl Wire {
                 .sample(&mut self.rng),
             DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
             DistributionInfo::Uniform { low, high } => {
-                Uniform::new(low, high).unwrap().sample(&mut self.rng)
+                if low == high {
+                    low
+                } else {
+                    Uniform::new(low, high).unwrap().sample(&mut self.rng)
+                }
             }
         };
 
