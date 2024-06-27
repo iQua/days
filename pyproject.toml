@@ -1,5 +1,5 @@
 [project]
-name = 'dayone'
+name = "dayone"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

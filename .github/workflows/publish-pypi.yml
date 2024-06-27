@@ -2,13 +2,8 @@ name: publish-pypi
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
-      - "*"
-  pull_request:
-  workflow_dispatch:
+      - "v*"
 
 jobs:
   linux:
@@ -64,6 +59,7 @@ jobs:
         with:
           name: wheels-windows-${{ matrix.platform.target }}
           path: dist
+
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -92,6 +88,7 @@ jobs:
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
+
   macos:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
