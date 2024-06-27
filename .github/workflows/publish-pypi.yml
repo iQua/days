@@ -23,12 +23,12 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --interpreter python3.9 python3.10 python3.11
       - name: Build wheels - universal2
         uses: PyO3/maturin-action@v1
         with:
           target: universal2-apple-darwin
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --interpreter python3.9 python3.10 python3.11
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -46,3 +46,8 @@ jobs:
           name: wheels
       - name: Publish to PyPI
         uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: --non-interactive --skip-existing wheels-*/*
