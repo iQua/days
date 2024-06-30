@@ -279,7 +279,7 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            if !self.stop_run(now) {
+            if !self.stop_run(now).await {
                 match self {
                     PacketSource::DistPacketSource(source) => {
                         source.log_report(now);
@@ -301,13 +301,18 @@ impl PacketSource {
     }
 
     /// Returns whether PacketSource should stop running.
-    fn stop_run(&self, now: f64) -> bool {
+    async fn stop_run(&mut self, now: f64) -> bool {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
-                source.traffic_exceeded
+                if source.traffic_exceeded
                     && source.next_seq + source.mss > source.send_buffer
                     && source.next_seq == source.last_ack
+                {
+                    source.wrap_up(now).await;
+                    return true;
+                }
+                false
             }
         }
     }
@@ -325,7 +330,7 @@ impl PacketSource {
 
             self.send_packet(scheduler).await;
 
-            if self.stop_run(now) {
+            if self.stop_run(now).await {
                 let name = format!("{self}");
 
                 if ReportLogger::get_report_interval() < f64::MAX {

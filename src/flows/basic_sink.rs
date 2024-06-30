@@ -88,7 +88,7 @@ impl BasicPacketSink {
     }
 
     /// Notifies sources that wait for this flow to end when receiving the last
-    /// packet
+    /// packet.
     pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
         if packet.last_packet {
             if !self.flow_finish_outputs.is_empty() {
@@ -100,7 +100,8 @@ impl BasicPacketSink {
                         .await;
                 }
                 debug!(
-                    "Flow {} notified {} flow(s) to start at time {:.3}.",
+                    "PacketSink {} of flow {} notified {} flow(s) to start at time {:.3}.",
+                    self.endpoint_id,
                     self.flow_id,
                     self.flow_finish_outputs.len(),
                     now,
