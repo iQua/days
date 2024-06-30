@@ -260,7 +260,7 @@ impl PacketSink {
 
     async fn wrap_up(&mut self, packet: Packet, now: f64) {
         match self {
-            PacketSink::BasicPacketSink(_) => (),
+            PacketSink::BasicPacketSink(sink) => sink.wrap_up(packet, now).await,
             PacketSink::TCPPacketSink(sink) => sink.wrap_up(packet, now).await,
         }
     }
@@ -311,31 +311,22 @@ impl PacketSink {
             now,
         );
 
-        let flows_after = match self {
-            PacketSink::BasicPacketSink(sink) => {
-                if !sink.flow_finish_outputs.is_empty() {
-                    for output in sink.flow_finish_outputs.iter_mut() {
-                        output.send(flow_finish_msg.clone()).await;
-                    }
-                }
-                sink.flow_finish_outputs.len()
-            }
+        match self {
+            PacketSink::BasicPacketSink(_) => {}
             PacketSink::TCPPacketSink(sink) => {
                 if !sink.flow_finish_outputs.is_empty() {
                     for output in sink.flow_finish_outputs.iter_mut() {
                         output.send(flow_finish_msg.clone()).await;
                     }
+                    debug!(
+                        "Flow {} notified {} flow(s) to start at time {:.3}.",
+                        flow_finish_msg.flow_id,
+                        sink.flow_finish_outputs.len(),
+                        now,
+                    );
                 }
-                sink.flow_finish_outputs.len()
             }
         };
-
-        if flows_after > 0 {
-            debug!(
-                "Flow {} notified {} flow(s) to start at time {:.3}.",
-                flow_finish_msg.flow_id, flows_after, now,
-            );
-        }
     }
 
     fn log_report<'a>(

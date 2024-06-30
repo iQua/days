@@ -15,7 +15,7 @@ use crate::utils::logger::{Report, ReportLogger};
 #[derive(Debug)]
 pub struct BasicPacketSink {
     pub endpoint_id: usize,
-    flow_id: usize,
+    pub flow_id: usize,
     /// the statistics of received packets
     pub packet_statistics: PacketStatistics,
     /// output: packet statistics
@@ -85,6 +85,28 @@ impl BasicPacketSink {
         self.report_start_time = now;
         self.received_packets = 0;
         self.received_sizes = 0;
+    }
+
+    /// Notifies sources that wait for this flow to end when receiving the last
+    /// packet
+    pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
+        if packet.last_packet {
+            if !self.flow_finish_outputs.is_empty() {
+                for output in self.flow_finish_outputs.iter_mut() {
+                    output
+                        .send(FlowFinishMsg {
+                            flow_id: self.flow_id,
+                        })
+                        .await;
+                }
+                debug!(
+                    "Flow {} notified {} flow(s) to start at time {:.3}.",
+                    self.flow_id,
+                    self.flow_finish_outputs.len(),
+                    now,
+                );
+            }
+        }
     }
 }
 
