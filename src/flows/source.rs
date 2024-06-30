@@ -282,16 +282,16 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            if !self.stop_run(now).await {
-                match self {
-                    PacketSource::DistPacketSource(source) => {
-                        source.log_report(now);
-                    }
-                    PacketSource::TCPPacketSource(source) => {
-                        source.log_report(now);
-                    }
-                };
+            match self {
+                PacketSource::DistPacketSource(source) => {
+                    source.log_report(now);
+                }
+                PacketSource::TCPPacketSource(source) => {
+                    source.log_report(now);
+                }
+            };
 
+            if !self.stop_run(now).await {
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(ReportLogger::get_report_interval()),

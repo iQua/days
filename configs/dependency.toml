@@ -6,7 +6,7 @@ hosts = [0, 1, 2]
 progress = 2.0
 duration = 20.0
 log_path = "./dependency"
-log_interval = 10.0
+log_interval = 1.0
 
 [switch]
 port_rate = 8000
