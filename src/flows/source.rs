@@ -198,7 +198,10 @@ impl PacketSource {
                     // TCPPacketSource now owns the data from the application
                     source.send_buffer += data.size;
 
-                    if !source.datasource.traffic_exceeded(now) {
+                    if !source
+                        .datasource
+                        .traffic_exceeded(now + interval.as_secs_f64())
+                    {
                         // schedules AppDataSource to send next data
                         scheduler
                             .schedule_event(interval, Self::fetch_app_data, ())
@@ -260,7 +263,7 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => {
                 let interval = source.send_packet(now).await;
-                if !source.traffic_exceeded(now) {
+                if !source.traffic_exceeded(now + interval.as_secs_f64()) {
                     scheduler.schedule_event(interval, Self::run, ()).unwrap();
                 }
             }

@@ -111,11 +111,11 @@ impl DistPacketSource {
 
         let mut packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
 
-        if self
-            .traffic
-            .size
-            .exceeded(self.sent_size + packet_size, self.flow_start_time, now)
-        {
+        if self.traffic.size.exceeded(
+            self.sent_size + packet_size,
+            self.flow_start_time,
+            now + interval,
+        ) {
             packet.last_packet = true;
         }
 
