@@ -238,10 +238,12 @@ impl PacketSink {
         }
     }
 
-    pub fn flow_finish_outputs(&mut self) -> &mut Vec<Output<FlowFinishMsg>> {
+    pub fn connect_flow_finish_output(&mut self, flow_finish_output: Output<FlowFinishMsg>) {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
-            PacketSink::TCPPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
+            PacketSink::BasicPacketSink(sink) => {
+                sink.flow_finish_outputs.push(flow_finish_output);
+            }
+            PacketSink::TCPPacketSink(_) => {}
         }
     }
 

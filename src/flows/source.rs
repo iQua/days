@@ -92,17 +92,19 @@ impl PacketSource {
         }
     }
 
+    pub fn connect_flow_finish_output(&mut self, flow_finish_output: Output<FlowFinishMsg>) {
+        match self {
+            PacketSource::DistPacketSource(_) => {}
+            PacketSource::TCPPacketSource(source) => {
+                source.flow_finish_outputs.push(flow_finish_output);
+            }
+        }
+    }
+
     pub fn finish_msg_output(&mut self) -> &mut Output<FinishMsg> {
         match self {
             PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
-        }
-    }
-
-    pub fn sink_output(&mut self) -> &mut Output<FlowFinishMsg> {
-        match self {
-            PacketSource::DistPacketSource(source) => source.sink_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.sink_output.borrow_mut(),
         }
     }
 
@@ -336,10 +338,6 @@ impl PacketSource {
                         }
                     };
                 }
-
-                // notifies the sink that the last packet has been sent
-                let flow_id = self.flow_id();
-                self.sink_output().send(FlowFinishMsg { flow_id }).await;
 
                 // notifies the Progress coroutine that the packet source
                 // finished running

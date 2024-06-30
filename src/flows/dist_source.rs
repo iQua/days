@@ -13,7 +13,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::{DistributionInfo, FlowFinishMsg, TrafficCharacteristics};
+use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 use crate::utils::progress::FinishMsg;
@@ -32,7 +32,6 @@ pub struct DistPacketSource {
 
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
-    pub sink_output: Output<FlowFinishMsg>,
 
     pub report_start_time: f64,
 }
@@ -56,7 +55,6 @@ impl DistPacketSource {
             rng,
             output: Output::default(),
             finish_msg_output: Output::default(),
-            sink_output: Output::default(),
             report_start_time: 0.0,
         }
     }

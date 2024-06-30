@@ -18,7 +18,7 @@ use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
 use asynchronix::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
-use crate::flows::flow::Flow;
+use crate::flows::flow::{Flow, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -527,22 +527,23 @@ impl Topology {
             output.connect(PacketSink::packet_received, &sink_mbox);
             sink_host.outputs.insert(sink.id(), output);
 
-            // establishes a connection between the packet source and the packet
-            // sink for the source to notify the sink after it sends the last
-            // packet
-            source
-                .sink_output()
-                .connect(PacketSink::flow_finish_msg_received, &sink_mbox);
-
-            // establishes connections between the packet sink and the packet
-            // sources that will not start until this sink receives its last packet
+            // establishes connections between the packet sink (or source for
+            // TCP) and the packet sources that will not start until this sink
+            // receives (or source for TCP) its last packet
             for flow_id in flow.starts_before.iter() {
                 let mut flow_finish_output = Output::default();
                 flow_finish_output.connect(
                     PacketSource::flow_finish_msg_received,
                     &source_mboxes[&flow_id],
                 );
-                sink.flow_finish_outputs().push(flow_finish_output);
+                match flow.flow_type {
+                    FlowType::PacketDistribution => {
+                        sink.connect_flow_finish_output(flow_finish_output);
+                    }
+                    FlowType::TCP => {
+                        source.connect_flow_finish_output(flow_finish_output);
+                    }
+                }
             }
 
             sources.insert(flow.id, source);

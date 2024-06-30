@@ -92,7 +92,9 @@ pub struct TCPPacketSource {
 
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
-    pub sink_output: Output<FlowFinishMsg>,
+    /// outputs: outbounds to packet sources of flows wait for this flow to
+    /// finish
+    pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
 
     pub report_start_time: f64,
 }
@@ -144,7 +146,7 @@ impl TCPPacketSource {
             sent_size_in_period: 0,
             output: Output::default(),
             finish_msg_output: Output::default(),
-            sink_output: Output::default(),
+            flow_finish_outputs: Vec::new(),
             report_start_time: 0.0,
         }
     }
