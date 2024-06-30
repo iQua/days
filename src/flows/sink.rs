@@ -296,41 +296,6 @@ impl PacketSink {
         self.wrap_up(packet, now).await;
     }
 
-    pub async fn flow_finish_msg_received(
-        &mut self,
-        flow_finish_msg: FlowFinishMsg,
-        scheduler: &Scheduler<Self>,
-    ) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
-
-        debug!(
-            "{} received the last packet of flow {} at time {:.3}.",
-            format!("{self}"),
-            flow_finish_msg.flow_id,
-            now,
-        );
-
-        match self {
-            PacketSink::BasicPacketSink(_) => {}
-            PacketSink::TCPPacketSink(sink) => {
-                if !sink.flow_finish_outputs.is_empty() {
-                    for output in sink.flow_finish_outputs.iter_mut() {
-                        output.send(flow_finish_msg.clone()).await;
-                    }
-                    debug!(
-                        "Flow {} notified {} flow(s) to start at time {:.3}.",
-                        flow_finish_msg.flow_id,
-                        sink.flow_finish_outputs.len(),
-                        now,
-                    );
-                }
-            }
-        };
-    }
-
     fn log_report<'a>(
         &'a mut self,
         _: (),
