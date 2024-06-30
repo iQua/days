@@ -41,6 +41,8 @@ pub struct Packet {
     pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
     pub queueing_delay: f64,
+    /// whether this is the last packet of the flow
+    pub last_packet: bool,
     /// used by TCPPacketSource and TCPPacketSink
     pub ack: Option<TCPAck>,
 }
@@ -55,6 +57,7 @@ impl Packet {
             flow_id,
             creation_time,
             queueing_delay: 0.0,
+            last_packet: false,
             ack: None,
         }
     }
