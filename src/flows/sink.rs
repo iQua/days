@@ -238,10 +238,12 @@ impl PacketSink {
         }
     }
 
-    pub fn flow_finish_outputs(&mut self) -> &mut Vec<Output<FlowFinishMsg>> {
+    pub fn connect_flow_finish_output(&mut self, flow_finish_output: Output<FlowFinishMsg>) {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
-            PacketSink::TCPPacketSink(sink) => sink.flow_finish_outputs.borrow_mut(),
+            PacketSink::BasicPacketSink(sink) => {
+                sink.flow_finish_outputs.push(flow_finish_output);
+            }
+            PacketSink::TCPPacketSink(_) => {}
         }
     }
 
@@ -260,7 +262,7 @@ impl PacketSink {
 
     async fn wrap_up(&mut self, packet: Packet, now: f64) {
         match self {
-            PacketSink::BasicPacketSink(_) => (),
+            PacketSink::BasicPacketSink(sink) => sink.wrap_up(packet, now).await,
             PacketSink::TCPPacketSink(sink) => sink.wrap_up(packet, now).await,
         }
     }
@@ -292,50 +294,6 @@ impl PacketSink {
         );
 
         self.wrap_up(packet, now).await;
-    }
-
-    pub async fn flow_finish_msg_received(
-        &mut self,
-        flow_finish_msg: FlowFinishMsg,
-        scheduler: &Scheduler<Self>,
-    ) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
-
-        debug!(
-            "{} received the last packet of flow {} at time {:.3}.",
-            format!("{self}"),
-            flow_finish_msg.flow_id,
-            now,
-        );
-
-        let flows_after = match self {
-            PacketSink::BasicPacketSink(sink) => {
-                if !sink.flow_finish_outputs.is_empty() {
-                    for output in sink.flow_finish_outputs.iter_mut() {
-                        output.send(flow_finish_msg.clone()).await;
-                    }
-                }
-                sink.flow_finish_outputs.len()
-            }
-            PacketSink::TCPPacketSink(sink) => {
-                if !sink.flow_finish_outputs.is_empty() {
-                    for output in sink.flow_finish_outputs.iter_mut() {
-                        output.send(flow_finish_msg.clone()).await;
-                    }
-                }
-                sink.flow_finish_outputs.len()
-            }
-        };
-
-        if flows_after > 0 {
-            debug!(
-                "Flow {} notified {} flow(s) to start at time {:.3}.",
-                flow_finish_msg.flow_id, flows_after, now,
-            );
-        }
     }
 
     fn log_report<'a>(

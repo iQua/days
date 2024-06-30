@@ -22,7 +22,7 @@ flow_type = "PacketDistribution"
 graph = [[0, 1]]
 [flow.traffic]
     initial_delay = 1.0
-    duration = 4.0
+    duration = 2.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
 
@@ -30,12 +30,14 @@ graph = [[0, 1]]
 flow_id = 2
 starts_before = [3]
 starts_after = [1]
-flow_type = "PacketDistribution"
+flow_type = "TCP"
 graph = [[1, 0]]
 [flow.traffic]
     duration = 2.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
-    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+    pkt_size_dist = {type = "Uniform", low = 512, high = 512}
+[flow.traffic.tcp]
+    cc_algorithm = "TCPReno"
 
 [[flow]]
 flow_id = 3
@@ -43,6 +45,6 @@ starts_after = [1, 2]
 flow_type = "PacketDistribution"
 graph = [[1, 0]]
 [flow.traffic]
-    duration = 3.0
+    duration = 2.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}

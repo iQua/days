@@ -92,17 +92,19 @@ impl PacketSource {
         }
     }
 
+    pub fn connect_flow_finish_output(&mut self, flow_finish_output: Output<FlowFinishMsg>) {
+        match self {
+            PacketSource::DistPacketSource(_) => {}
+            PacketSource::TCPPacketSource(source) => {
+                source.flow_finish_outputs.push(flow_finish_output);
+            }
+        }
+    }
+
     pub fn finish_msg_output(&mut self) -> &mut Output<FinishMsg> {
         match self {
             PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
-        }
-    }
-
-    pub fn sink_output(&mut self) -> &mut Output<FlowFinishMsg> {
-        match self {
-            PacketSource::DistPacketSource(source) => source.sink_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.sink_output.borrow_mut(),
         }
     }
 
@@ -196,7 +198,10 @@ impl PacketSource {
                     // TCPPacketSource now owns the data from the application
                     source.send_buffer += data.size;
 
-                    if !source.datasource.traffic_exceeded(now) {
+                    if !source
+                        .datasource
+                        .traffic_exceeded(now + interval.as_secs_f64())
+                    {
                         // schedules AppDataSource to send next data
                         scheduler
                             .schedule_event(interval, Self::fetch_app_data, ())
@@ -258,7 +263,7 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => {
                 let interval = source.send_packet(now).await;
-                if !source.traffic_exceeded(now) {
+                if !source.traffic_exceeded(now + interval.as_secs_f64()) {
                     scheduler.schedule_event(interval, Self::run, ()).unwrap();
                 }
             }
@@ -277,16 +282,16 @@ impl PacketSource {
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64();
 
-            if !self.stop_run(now) {
-                match self {
-                    PacketSource::DistPacketSource(source) => {
-                        source.log_report(now);
-                    }
-                    PacketSource::TCPPacketSource(source) => {
-                        source.log_report(now);
-                    }
-                };
+            match self {
+                PacketSource::DistPacketSource(source) => {
+                    source.log_report(now);
+                }
+                PacketSource::TCPPacketSource(source) => {
+                    source.log_report(now);
+                }
+            };
 
+            if !self.stop_run(now).await {
                 scheduler
                     .schedule_event(
                         Duration::from_secs_f64(ReportLogger::get_report_interval()),
@@ -299,13 +304,18 @@ impl PacketSource {
     }
 
     /// Returns whether PacketSource should stop running.
-    fn stop_run(&self, now: f64) -> bool {
+    async fn stop_run(&mut self, now: f64) -> bool {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
-                source.traffic_exceeded
+                if source.traffic_exceeded
                     && source.next_seq + source.mss > source.send_buffer
                     && source.next_seq == source.last_ack
+                {
+                    source.wrap_up(now).await;
+                    return true;
+                }
+                false
             }
         }
     }
@@ -323,7 +333,7 @@ impl PacketSource {
 
             self.send_packet(scheduler).await;
 
-            if self.stop_run(now) {
+            if self.stop_run(now).await {
                 let name = format!("{self}");
 
                 if ReportLogger::get_report_interval() < f64::MAX {
@@ -336,10 +346,6 @@ impl PacketSource {
                         }
                     };
                 }
-
-                // notifies the sink that the last packet has been sent
-                let flow_id = self.flow_id();
-                self.sink_output().send(FlowFinishMsg { flow_id }).await;
 
                 // notifies the Progress coroutine that the packet source
                 // finished running

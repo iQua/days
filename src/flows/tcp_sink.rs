@@ -125,6 +125,7 @@ impl TCPPacketSink {
             packet_id: packet.packet_id,
             flow_id: packet.flow_id,
             queueing_delay: packet.queueing_delay,
+            last_packet: false,
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
             }),

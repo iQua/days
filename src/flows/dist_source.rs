@@ -13,7 +13,7 @@ use asynchronix::model::{Model, Output};
 
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::{DistributionInfo, FlowFinishMsg, TrafficCharacteristics};
+use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger};
 use crate::utils::progress::FinishMsg;
@@ -32,7 +32,6 @@ pub struct DistPacketSource {
 
     pub output: Output<Packet>,
     pub finish_msg_output: Output<FinishMsg>,
-    pub sink_output: Output<FlowFinishMsg>,
 
     pub report_start_time: f64,
 }
@@ -56,7 +55,6 @@ impl DistPacketSource {
             rng,
             output: Output::default(),
             finish_msg_output: Output::default(),
-            sink_output: Output::default(),
             report_start_time: 0.0,
         }
     }
@@ -111,7 +109,15 @@ impl DistPacketSource {
             }
         };
 
-        let packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
+        let mut packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
+
+        if self.traffic.size.exceeded(
+            self.sent_size + packet_size,
+            self.flow_start_time,
+            now + interval,
+        ) {
+            packet.last_packet = true;
+        }
 
         (packet, Duration::from_secs_f64(interval))
     }
