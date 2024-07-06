@@ -24,6 +24,7 @@ struct TomlCollective {
     flow_type: FlowType,
     flow_count: usize,
     graph: Option<Vec<(u32, u32)>>,
+    paths: Option<Vec<Vec<usize>>>,
     sources: Option<Vec<usize>>,
     sinks: Option<Vec<usize>>,
     traffic: TomlTrafficCharacteristics,
@@ -55,6 +56,7 @@ pub struct Collective {
     pub flow_type: FlowType,
     pub flow_count: usize,
     pub graph: Option<DiGraph<usize, ()>>,
+    pub paths: Option<Vec<Vec<usize>>>,
 
     /// host ids that sources and sinks attach to
     pub sources: Vec<usize>,
@@ -71,6 +73,7 @@ impl Collective {
         flow_type: FlowType,
         flow_count: usize,
         graph: Option<DiGraph<usize, ()>>,
+        paths: Option<Vec<Vec<usize>>>,
         sources: Vec<usize>,
         sinks: Vec<usize>,
         traffic: TrafficCharacteristics,
@@ -82,6 +85,7 @@ impl Collective {
             flow_type,
             flow_count,
             graph,
+            paths,
             sources,
             sinks,
             traffic,
@@ -93,6 +97,7 @@ impl Collective {
     pub fn collectives_from_graph(
         flow_count: usize,
         graphs: Vec<Vec<(u32, u32)>>,
+        paths: Option<Vec<Vec<usize>>>,
         sources: Vec<Vec<usize>>,
         sinks: Vec<Vec<usize>>,
     ) -> Vec<Collective> {
@@ -113,6 +118,7 @@ impl Collective {
                 FlowType::PacketDistribution,
                 flow_count,
                 collective_graph,
+                paths.clone(),
                 collective_sources,
                 collective_sinks,
                 TrafficCharacteristics::new(
@@ -136,12 +142,29 @@ impl Collective {
     fn generate_endpoints(
         collective_type: CollectiveType,
         flow_count: usize,
+        paths: &Option<Vec<Vec<usize>>>,
         mut sources: Vec<usize>,
         mut sinks: Vec<usize>,
         hosts: &Vec<usize>,
         mut rng: SmallRng,
     ) -> (Vec<usize>, Vec<usize>) {
-        if !sources.is_empty() && !sinks.is_empty() {
+        if let Some(flow_paths) = paths {
+            assert_eq!(
+                flow_paths.len(),
+                flow_count,
+                "The number of specified paths ({}) should be the same as flow count {}",
+                flow_paths.len(),
+                flow_count
+            );
+
+            let mut sources = Vec::new();
+            let mut sinks = Vec::new();
+
+            for path in flow_paths {
+                sources.push(path[0]);
+                sinks.push(path[path.len() - 1]);
+            }
+        } else if !sources.is_empty() && !sinks.is_empty() {
             match collective_type {
                 CollectiveType::Broadcast => {
                     assert_eq!(
@@ -191,9 +214,7 @@ impl Collective {
                             );
                 }
             }
-        }
-
-        if sources.is_empty() && sinks.is_empty() {
+        } else {
             match collective_type {
                 CollectiveType::Broadcast => {
                     let source = hosts.choose(&mut rng).unwrap().clone();
@@ -249,6 +270,7 @@ impl Collective {
                 let (sources, sinks) = Self::generate_endpoints(
                     collective.collective_type,
                     collective.flow_count,
+                    &collective.paths,
                     collective.sources.unwrap_or_default(),
                     collective.sinks.unwrap_or_default(),
                     hosts,
@@ -277,6 +299,7 @@ impl Collective {
                     collective.flow_type,
                     collective.flow_count,
                     graph,
+                    collective.paths,
                     sources,
                     sinks,
                     traffic,
@@ -327,6 +350,7 @@ impl Collective {
                     let (sources, sinks) = Self::generate_endpoints(
                         collective_set.collective_type,
                         collective_set.flow_count,
+                        &None,
                         sources_list.remove(0),
                         sinks_list.remove(0),
                         hosts,
@@ -341,6 +365,7 @@ impl Collective {
                         first_flow_id + index * collective_set.flow_count,
                         collective_set.flow_type,
                         collective_set.flow_count,
+                        None,
                         None,
                         sources,
                         sinks,

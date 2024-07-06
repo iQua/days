@@ -1,10 +1,10 @@
 # An example configuration file that uses custom routing.
 
 seed = 1000
-edges = [[0, 1], [1, 2]]
+edges = [[0, 1], [1, 2], [0, 2]]
 hosts = [0, 1, 2]
-log_path = "./simple"
-log_interval = 0.01
+log_path = "./custom_routing"
+log_interval = 1.0
 
 [switch]
 port_rate = 8000
@@ -39,5 +39,16 @@ path = [1, 0]
 [flow.traffic]
     initial_delay = 2.0
     duration = 4.0
+    arr_dist = {type = "Uniform", low = 1, high = 1}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+
+[[collective]]
+collective_type = "Broadcast"
+flow_type = "PacketDistribution"
+flow_count = 2
+paths = [[0, 1], [0, 2]]
+[collective.traffic]
+    initial_delay = 1.0
+    duration = 10.0
     arr_dist = {type = "Uniform", low = 1, high = 1}
     pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
