@@ -263,12 +263,12 @@ impl Collective {
                 let mut first_flow_id = next_flow_id();
                 if collective.first_flow_id.is_some() {
                     let new_first_flow_id = collective.first_flow_id.unwrap();
-                    if new_first_flow_id < first_flow_id {
-                        panic!(
-                            "The specified first flow id {} of the collective should be at least {}",
-                            new_first_flow_id, first_flow_id
-                        );
-                    }
+                    assert!(
+                        new_first_flow_id >= first_flow_id,
+                        "The specified first flow id {} of the collective should be at least {}",
+                        new_first_flow_id,
+                        first_flow_id
+                    );
                     first_flow_id = new_first_flow_id;
                 }
                 update_next_flow_id(first_flow_id + collective.flow_count);
@@ -315,12 +315,12 @@ impl Collective {
                 let mut first_flow_id = next_flow_id();
                 if collective_set.first_flow_id.is_some() {
                     let new_first_flow_id = collective_set.first_flow_id.unwrap();
-                    if new_first_flow_id < first_flow_id {
-                        panic!(
-                            "The specified first flow id {} of the collective set should be at least {}",
-                            new_first_flow_id, first_flow_id
-                        );
-                    }
+                    assert!(
+                        new_first_flow_id >= first_flow_id,
+                        "The specified first flow id {} of the collective set should be at least {}",
+                        new_first_flow_id,
+                        first_flow_id
+                    );
                     first_flow_id = new_first_flow_id;
                 }
                 update_next_flow_id(

@@ -159,30 +159,32 @@ impl Flow {
                     let mut flow_id = next_flow_id();
                     if flow.flow_id.is_some() {
                         let new_id = flow.flow_id.unwrap();
-                        if new_id < flow_id {
-                            panic!(
-                                "The specified flow id {} should be at least {}",
-                                new_id, flow_id
-                            );
-                        }
+                        assert!(
+                            new_id >= flow_id,
+                            "The specified flow id {} should be at least {}",
+                            new_id,
+                            flow_id
+                        );
                         update_next_flow_id(new_id + 1);
                         flow_id = new_id;
                     }
 
                     if let Some(ref path) = flow.path {
                         let (source_host, sink_host) = &flow.graph[0];
-                        if path[0] != *source_host as usize {
-                            panic!(
-                                "Flow {}'s specified source in path {} should be the same as it in graph {}",
-                                flow_id, path[0], source_host
-                            );
-                        }
-                        if path[path.len() - 1] != *sink_host as usize {
-                            panic!(
-                                "Flow {}'s specified sink in path {} should be the same as it in graph {}",
-                                flow_id, path[path.len() - 1], sink_host
-                            );
-                        }
+                        assert!(
+                            path[0] == *source_host as usize,
+                            "Flow {}'s source specified in path ({}) should be the same as it in graph ({})",
+                            flow_id,
+                            path[0],
+                            source_host
+                        );
+                        assert!(
+                            path[path.len() - 1] == *sink_host as usize,
+                            "Flow {}'s sink specified in path ({}) should be the same as it in graph ({})",
+                            flow_id,
+                            path[path.len() - 1],
+                            sink_host
+                        );
                     }
 
                     let starts_before = flow.starts_before.clone().unwrap_or_default();
