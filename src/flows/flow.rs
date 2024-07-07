@@ -214,12 +214,12 @@ impl Flow {
                 let mut first_flow_id = next_flow_id();
                 if flow_set.first_flow_id.is_some() {
                     let new_first_flow_id = flow_set.first_flow_id.unwrap();
-                    if new_first_flow_id < first_flow_id {
-                        panic!(
-                            "The specified first flow id {} of the flow set should be at least {}",
-                            new_first_flow_id, first_flow_id
-                        );
-                    }
+                    assert!(
+                        new_first_flow_id >= first_flow_id,
+                        "The specified first flow id {} of the flow set should be at least {}",
+                        new_first_flow_id,
+                        first_flow_id
+                    );
                     first_flow_id = new_first_flow_id;
                 }
 
