@@ -56,8 +56,10 @@ fn main() {
     // 1. initializes collectives directly using collectives_from_graph().
     //    Example:
     // let collectives = Collective::collectives_from_graph(
+    //     day::flows::collective::CollectiveType::Broadcast,
     //     vec![vec![(0, 1), (0, 2)]],
-    //     vec![vec![0]],
+    //     None,
+    //     vec![vec![0, 0]],
     //     vec![vec![1, 2]],
     // );
 
