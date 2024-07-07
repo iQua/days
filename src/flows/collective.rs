@@ -95,7 +95,7 @@ impl Collective {
     /// Initializes collectives from a vector of directed graphs, each graph
     /// corresponding to one collective.
     pub fn collectives_from_graph(
-        flow_count: usize,
+        collective_type: CollectiveType,
         graphs: Vec<Vec<(u32, u32)>>,
         paths: Option<Vec<Vec<usize>>>,
         sources: Vec<Vec<usize>>,
@@ -104,7 +104,8 @@ impl Collective {
         let mut collectives = Vec::new();
 
         for (index, graph) in graphs.iter().enumerate() {
-            let collective_graph = Some(DiGraph::<usize, ()>::from_edges(graph));
+            let collective_graph = DiGraph::<usize, ()>::from_edges(graph);
+            let flow_count = collective_graph.edge_count();
             let collective_sources = sources[index].clone();
             let collective_sinks = sinks[index].clone();
 
@@ -113,11 +114,11 @@ impl Collective {
 
             collectives.push(Collective::new(
                 next_collective_id(),
-                CollectiveType::AllReduce,
+                collective_type,
                 first_flow_id,
                 FlowType::PacketDistribution,
                 flow_count,
-                collective_graph,
+                Some(collective_graph),
                 paths.clone(),
                 collective_sources,
                 collective_sinks,
@@ -164,55 +165,38 @@ impl Collective {
                 sources.push(path[0]);
                 sinks.push(path[path.len() - 1]);
             }
+
+            return (sources, sinks);
         } else if !sources.is_empty() && !sinks.is_empty() {
+            assert_eq!(
+                sources.len(),
+                flow_count,
+                "A collective whose specified flow_count is {} was specified {} sources",
+                flow_count,
+                sources.len()
+            );
+            assert_eq!(
+                sinks.len(),
+                flow_count,
+                "A collective whose specified flow_count is {} was specified {} sinks",
+                flow_count,
+                sinks.len()
+            );
+
             match collective_type {
                 CollectiveType::Broadcast => {
-                    assert_eq!(
-                                sources.len(),
-                                1,
-                                "Please only specify 1 PacketSource for flows of a Broadcast operation in the configuration file."
-                            );
-                    assert_eq!(
-                                sinks.len(),
-                                flow_count,
-                                "Please specify {} PacketSinks for flows of a Broadcast operation in the configuration file.",
-                                flow_count
-                            );
-                    for _ in 1..flow_count {
-                        sources.push(sources[0]);
-                    }
+                    assert!(
+                        sources.iter().all(|&x| x == sources[0]),
+                        "Please make specified sources of a Broadcast operation the same"
+                    );
                 }
-
                 CollectiveType::Gather => {
-                    assert_eq!(
-                                sinks.len(),
-                                1,
-                                "Please only specify 1 PacketSink for flows of a Gather operation in the configuration file."
-                            );
-                    assert_eq!(
-                                sources.len(),
-                                flow_count,
-                                "Please specify {} PacketSources for flows of a Gather operation in the configuration file.",
-                                flow_count
-                            );
-                    for _ in 1..flow_count {
-                        sinks.push(sinks[0]);
-                    }
+                    assert!(
+                        sinks.iter().all(|&x| x == sinks[0]),
+                        "Please make specified sinks of a Gather operation the same"
+                    );
                 }
-                CollectiveType::AllReduce => {
-                    assert_eq!(
-                                sources.len(),
-                                flow_count,
-                                "Please specify {} PacketSources for flows of a AllReduce operation in the configuration file.",
-                                flow_count
-                            );
-                    assert_eq!(
-                                sinks.len(),
-                                flow_count,
-                                "Please specify {} PacketSinks for flows of a AllReduce operation in the configuration file.",
-                                flow_count
-                            );
-                }
+                CollectiveType::AllReduce => {}
             }
         } else {
             match collective_type {
@@ -262,10 +246,7 @@ impl Collective {
 
         if let Some(collectives_vec) = config.collective {
             for collective in collectives_vec {
-                let mut graph = None;
-                if let Some(config_graph) = collective.graph {
-                    graph = Some(DiGraph::<usize, ()>::from_edges(config_graph));
-                }
+                let graph = collective.graph.map(DiGraph::<usize, ()>::from_edges);
 
                 let (sources, sinks) = Self::generate_endpoints(
                     collective.collective_type,

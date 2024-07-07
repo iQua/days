@@ -243,10 +243,8 @@ impl Topology {
             for (index, &source) in collective.sources.iter().enumerate() {
                 let sink = collective.sinks[index];
                 let flow_id = collective.first_flow_id + index;
-                let mut path = None;
-                if let Some(paths) = &collective.paths {
-                    path = Some(paths[index].clone());
-                }
+                let path = collective.paths.as_ref().map(|paths| paths[index].clone());
+
                 match collective.collective_type {
                     CollectiveType::Broadcast => {
                         self.flows.push(Flow::new(
