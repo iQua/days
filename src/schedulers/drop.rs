@@ -1,5 +1,4 @@
-//! Packet drop strategies for the scheduler. Currently, only tail drop
-//! (dropping packets at the tail of the queue) has been implemented.
+//! Packet drop strategies for the scheduler.
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -50,7 +49,7 @@ impl PacketDrop for TailDrop {
     }
 }
 
-/// Random Early Detection, as defined in RFC 2309
+/// Random Early Detection, as defined in RFC 2309.
 pub struct RED {
     capacity: usize, // 0 for unlimited
     capacity_unit: CapacityUnit,
