@@ -123,19 +123,94 @@ In the three CSV files, each row contains statistics in a time interval. `log_in
 	```
 
 
-
-
 ### Switch
+In **Day**, all switches use the same setting which can be specified with the following attributes.
 
 #### port_rate
+The bit rate of each outbound port.
+
+- **Valid value**: Floating point number
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  port_rate = 8000
+  ```
 
 #### capacity
+The capacity (buffer size) of each outbound port.
 
-#### weights
+- **Valid value**: Integer
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  capacity = 100
+  ```
+
+#### drop
+The packet drop strategy that drops packets when the buffer is full.
+
+- **Valid value**: 
+	
+	|   Value  |  Meaning |
+	|----------|----------|
+	|`TailDrop`| Dropping packets at the tail of the queue |
+	|   `RED`  | Random Early Detection |
+	 
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  capacity = 100
+  ```
 
 #### discipline
+The scheduling discipline.
 
-#### drop 
+- **Valid value**: 
+
+	|   Value  |  Meaning |   Notes  |
+	|----------|----------|----------|
+	|  `FIFO`  | Dropping packets at the tail of the queue |
+	|  `DRR`   | Deficit Round Robin | Required to specify `weights` |
+	|  `WFQ`   | Weighted Fair Queueing | Required to specify `weights` |
+	|  `SP`    | Static Priority | Required to specify `priorities` |
+	|  `VC`    | Virtual Clock | Required to specify `vticks` |
+	
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  discipline = "FIFO"
+  ```
+
+#### weights
+- **Valid value**: Vector of integers
+- **Required**: Yes if `dispcipline = "DRR"` or `dispcipline = "WFQ"`
+- **Example**:
+
+  ```toml
+  weights = [1, 2, 3]
+  ```
+
+#### priorities
+- **Valid value**: Vector of (integers, integer)
+- **Required**: Yes if `dispcipline = "SP"`
+- **Example**:
+
+  ```toml
+  priorities = [(0, 2), (1, 1)]
+  ```
+
+#### vticks
+- **Valid value**: Vector of (integers, integer)
+- **Required**: Yes if `dispcipline = "VC"`
+- **Example**:
+
+  ```toml
+  vticks = [(0, 2), (1, 1)]
+  ```
 
 
 ### Flow
