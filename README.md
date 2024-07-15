@@ -399,8 +399,8 @@ The following table lists attributes of traffic.
   ```
 
 #### traffic.tcp
-For a flow, it must specify its traffic under `[flow.traffic]`.  
-For a flow set, it must specify the traffic of its flows under `[flow_set.traffic]`.
+For a flow, it must specify its tcp characteristics under `[flow.traffic.tcp]`.  
+For a flow set, it must specify the tcp characteristics of its flows under `[flow_set.traffic.tcp]`.
 
 - **Attributes**: 
 	
@@ -471,14 +471,169 @@ The following table lists required, optional, or not supported attributes of a c
 
 #### collective_type
 
+The type of the collective or collective set.
+
+- **Valid value**: `Brordcast` or `Gather`
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  collective_type = "Broadcast"
+  ```
+
+#### first\_flow\_id
+The smallest flow id of the collective / collective set.
+
+- **Valid value**: Integer
+- **Required**: No
+- **Example**:
+
+  ```toml
+  flow_first_id = 1
+  ```
+
+#### collective_count
+The number of collectives in the collective set.
+
+- **Valid value**: Integer
+- **Required**: Yes for a collective set
+- **Example**:
+
+  ```toml
+  collective_count = 10
+  ```
+
+#### flow_count
+The number of flows in the collective or in each collective of the collective set.
+
+- **Valid value**: Integer
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  flow_count = 4
+  ```
+
 #### graph
+The pairs of the source hosts and the sink hosts of the collective's flows.
 
-#### initial_delay
+- **Valid value**: Vector of [integer, integer]
+- **Required**: No
+- **Example**:
 
-#### size
+  ```toml
+  graph = [[0, 1], [0, 2]]
+  ```
 
-#### duration
+#### paths
+The paths of the collective's flows.
 
-#### arr_dist
+- **Valid value**: Vector of vectors of integers where each integer is a node in the path
+- **Required**: No
+- **Example**:
 
-#### pkt\_size\_dist
+  ```toml
+  paths = [[0, 1], [0, 1, 2]]
+  ```
+
+#### sources
+For a collective, `sources` is the set of the source hosts of this collective's flows.
+
+- **Valid value**: Vector of integers where each integer is a source host
+- **Required**: No
+- **Example**:
+
+  ```toml
+  sources = [0, 1]
+  ```
+
+For a collective set, `sources` is set of the source hosts of this collective set's collectives' flows.
+
+- **Valid value**: Vector of vectors of integers where each vector is a collective's flows' source hosts
+- **Required**: No
+- **Example**:
+
+  ```toml
+  sources = [[0, 0], [1, 1]]
+  ```
+ 
+#### sinks
+For a collective, `sinks` is the set of the sink hosts of this collective's flows.
+
+- **Valid value**: Vector of integers where each integer is a sink host
+- **Required**: No
+- **Example**:
+
+  ```toml
+  sinks = [0, 1]
+  ```
+
+For a collective set, `sinks` is set of the sink hosts of this collective set's collectives' flows.
+
+- **Valid value**: Vector of vectors of integers where each vector is a collective's flows' sink hosts
+- **Required**: No
+- **Example**:
+
+  ```toml
+  sinks = [[0, 0], [1, 1]]
+  ```
+
+#### traffic 
+For a collective, it must specify the traffic of its flows under `[collective.traffic]`.  
+For a collective set, it must specify the traffic of its flows under `[collective_set.traffic]`.
+
+The following table lists attributes of traffic.
+  
+> Note:
+> 
+> - `initial_delay`, `arr_dist`, and `pkt_size_dist` are required.
+> - Either `size` or `duration` is required.
+> - If `flow_type = "TCP"`, `[flow.traffic.tcp]` or `[flow_set.traffic.tcp]` must be specified for the flow or flow set. 
+
+- **Attributes**: 
+	
+	|   Attribute   |  Meaning | Valid Value |
+	|:-------------:|----------|-------------|
+	|`initial_delay`| The seconds the collective / collective set waits before producing its first packet | Floating point number |
+	|     `size`    | The total size of packets of each flow of the collective / collective set in bytes | Integer |
+	|   `duration`  | The duration of each flow  of the collective / collective set in seconds | Floating point number |
+	|   `arr_dist`  | The arrival distribution of packets in seconds | Valid distribution info |
+	|`pkt_size_dist`| The distribution of packet sizes in bytes | Valid distribution info |
+	
+> Valid distribution info includes uniform distribution and exponential distribution: 
+> 
+> - {type = "Uniform", low = 0.0008, high = 0.0008}
+> - {type = "Exp", lambda = 1.0}
+	 
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+	[[collective]]
+	collective_type = "Broadcast"
+	flow_type = "PacketDistribution"
+	flow_count = 4
+	[collective.traffic]
+	    initial_delay = 1.0
+	    duration = 10.0
+	    arr_dist = {type = "Uniform", low = 3, high = 4}
+	    pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
+  ```
+
+#### traffic.tcp
+For a collective, it must specify the tcp characteristicsc of its flows under `[collective.traffic.tcp]`.  
+For a collective set, it must specify the tcp characteristics of its collectives' flows under `[collective_set.traffic.tcp]`.
+
+- **Attributes**: 
+	
+	|   Attribute   |  Meaning | Valid Value |
+	|:-------------:|----------|-------------|
+	| `cc_algorithm`| The congestion control algorithm | `TCPReno`, `TCPCubic` |
+	 
+- **Required**: Yes
+- **Example**:
+
+	```toml
+  [collective.traffic.tcp]
+		cc_algorithm = "TCPReno"
+  ```
