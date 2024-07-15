@@ -154,7 +154,7 @@ The packet drop strategy that drops packets when the buffer is full.
 - **Valid value**: 
 	
 	|   Value  |  Meaning |
-	|----------|----------|
+	|:--------:|----------|
 	|`TailDrop`| Dropping packets at the tail of the queue |
 	|   `RED`  | Random Early Detection |
 	 
@@ -171,7 +171,7 @@ The scheduling discipline.
 - **Valid value**: 
 
 	|   Value  |  Meaning |   Notes  |
-	|----------|----------|----------|
+	|:--------:|----------|----------|
 	|  `FIFO`  | First In First Out |
 	|  `DRR`   | Deficit Round Robin | Required to specify `weights` |
 	|  `WFQ`   | Weighted Fair Queueing | Required to specify `weights` |
@@ -249,23 +249,69 @@ flow_count = 10
 The following table lists required, optional, or not supported attributes of a flow or a flow set.
 
 |     Attribute   |      Meaning    |   flow   | flow_set |
-|-----------------|-----------------|:--------:|:--------:|
-|    `flow_id`    | The id of the flow| optional |    no    |
+|:---------------:|-----------------|:--------:|:--------:|
+|    `flow_id`    | The id of the flow | optional |    no    |
 | `first_flow_id` | The smallest flow id of the flow set |    no    | optional |
-| `starts_before` | The ids of flows that cannot start until this flow / flow set ends| optional | optional |
+| `starts_before` | The ids of flows that cannot start until this flow / flow set ends | optional | optional |
 | `starts_after`  | The ids of flows that this flow / flow set must wait for them to end before it starts | optional | optional |
 |   `flow_type`   | The type of the flow or flows of the flow_set | required | required |
 |   `flow_count`  | The number of flows in the flow set |    no    | required |
-|     `graph`     | The pair of source host and sink host | required | required |
+|     `graph`     | The pair of the source host and the sink host of the flow | required |    no    |
 |     `path`      | The path of the flow | optional |    no    |
 |    `traffic`    | The traffic of the flow / flow set| required | required |
 
+#### flow_id
+The id of the flow.   
+If not specified, the id of the first flow specified in the configuration file will be 0, and the subsequent ids of flows increase by 1.
+
+- **Valid value**: Integer
+- **Required**: No
+- **Example**:
+
+  ```toml
+  flow_id = 1
+  ```
+
+#### first\_flow\_id
+The smallest flow id of the flow set.
+
+- **Valid value**: Integer
+- **Required**: No
+- **Example**:
+
+  ```toml
+  flow_first_id = 1
+  ```
+
+#### starts_before
+The ids of flows that cannot start until this flow / flow set ends.
+
+- **Valid value**: Vector of integers
+- **Required**: No
+- **Example**:
+
+  ```toml
+  starts_before = [3, 4]
+  ```
+
+#### starts_after
+The ids of flows that this flow / flow set must wait for them to end before it starts.
+
+- **Valid value**: Vector of integers
+- **Required**: No
+- **Example**:
+
+  ```toml
+  starts_after = [0, 1]
+  ```
+
 #### flow_type
+The type of the flow or flows of the flow set.
 
 - **Valid value**: 
 	
 	|   Value  |  Meaning |
-	|----------|----------|
+	|:--------:|----------|
 	|`PacketDistribution`| A flow whose packet source sends packets with specific distributions of inter-arrival times and packet sizes |
 	|   `TCP`  | A flow whose packet source simulate the TCP protocol |
 	 
@@ -275,18 +321,101 @@ The following table lists required, optional, or not supported attributes of a f
   ```toml
   flow_type = "PacketDistribution"
   ```
-  
+
+#### flow_count
+The number of flows in the flow set.
+
+- **Valid value**: Integer
+- **Required**: Yes for a flow set
+- **Example**:
+
+  ```toml
+  flow_count = 10
+  ```
+
 #### graph
+The pair of the source host and the sink host of the flow.
 
-#### initial_delay
+- **Valid value**: [[integer, integer]]
+- **Required**: Yes for a single flow
+- **Example**:
 
-#### size
+  ```toml
+  graph = [[0, 2]]
+  ```
 
-#### duration
+#### path
+The path of the flow.
 
-#### arr_dist
+- **Valid value**: Vector of integers where each integer is a node in the path
+- **Required**: No
+- **Example**:
 
-#### pkt\_size\_dist
+  ```toml
+  path = [0, 1, 2]
+  ```
+
+#### traffic 
+For a flow, it must specify its traffic under `[flow.traffic]`.  
+For a flow set, it must specify the traffic of its flows under `[flow_set.traffic]`.
+
+The following table lists attributes of traffic.
+  
+> Note:
+> 
+> - `initial_delay`, `arr_dist`, and `pkt_size_dist` are required.
+> - Either `size` or `duration` is required.
+> - If `flow_type = "TCP"`, `[flow.traffic.tcp]` or `[flow_set.traffic.tcp]` must be specified for the flow or flow set. 
+
+- **Attributes**: 
+	
+	|   Attribute   |  Meaning | Valid Value |
+	|:-------------:|----------|-------------|
+	|`initial_delay`| The seconds the flow / flow set waits before producing its first packet | Floating point number |
+	|     `size`    | The total size of packets of the flow / each flow of the flow set in bytes | Integer |
+	|   `duration`  | The duration of the flow / each flow of the flow set in seconds | Floating point number |
+	|   `arr_dist`  | The arrival distribution of packets in seconds | Valid distribution info |
+	|`pkt_size_dist`| The distribution of packet sizes in bytes | Valid distribution info |
+	
+> Valid distribution info includes uniform distribution and exponential distribution: 
+> 
+> - {type = "Uniform", low = 0.0008, high = 0.0008}
+> - {type = "Exp", lambda = 1.0}
+	 
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  [[flow_set]]
+	flow_type = "TCP"
+	flow_count = 100
+  [flow_set.traffic]
+		initial_delay = 0.0
+		duration = 0.1
+		arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
+		pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
+  [flow_set.traffic.tcp]
+		cc_algorithm = "TCPReno"
+  ```
+
+#### traffic.tcp
+For a flow, it must specify its traffic under `[flow.traffic]`.  
+For a flow set, it must specify the traffic of its flows under `[flow_set.traffic]`.
+
+- **Attributes**: 
+	
+	|   Attribute   |  Meaning | Valid Value |
+	|:-------------:|----------|-------------|
+	| `cc_algorithm`| The congestion control algorithm | `TCPReno`, `TCPCubic` |
+	 
+- **Required**: Yes
+- **Example**:
+
+	```toml
+  [flow.traffic.tcp]
+		cc_algorithm = "TCPReno"
+  ```
+
 
 
 ### Collective
