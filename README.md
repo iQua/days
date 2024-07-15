@@ -172,7 +172,7 @@ The scheduling discipline.
 
 	|   Value  |  Meaning |   Notes  |
 	|----------|----------|----------|
-	|  `FIFO`  | Dropping packets at the tail of the queue |
+	|  `FIFO`  | First In First Out |
 	|  `DRR`   | Deficit Round Robin | Required to specify `weights` |
 	|  `WFQ`   | Weighted Fair Queueing | Required to specify `weights` |
 	|  `SP`    | Static Priority | Required to specify `priorities` |
@@ -186,6 +186,7 @@ The scheduling discipline.
   ```
 
 #### weights
+
 - **Valid value**: Vector of integers
 - **Required**: Yes if `dispcipline = "DRR"` or `dispcipline = "WFQ"`
 - **Example**:
@@ -195,7 +196,7 @@ The scheduling discipline.
   ```
 
 #### priorities
-- **Valid value**: Vector of (integers, integer)
+- **Valid value**: Vector of (integer, integer), where the first integer is the flow class and the second integer is the priority of this flow class
 - **Required**: Yes if `dispcipline = "SP"`
 - **Example**:
 
@@ -204,7 +205,7 @@ The scheduling discipline.
   ```
 
 #### vticks
-- **Valid value**: Vector of (integers, integer)
+- **Valid value**: Vector of (integer, integer), where the first integer is the flow class and the second integer is the inverse of the desired rates for the corresponding flows, in bits per second
 - **Required**: Yes if `dispcipline = "VC"`
 - **Example**:
 
@@ -215,8 +216,66 @@ The scheduling discipline.
 
 ### Flow
 
+In **Day**, flows can be specified one by one:
+
+```toml
+[[flow]]
+flow_id = 2
+starts_before = [3]
+starts_after = [1]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+    initial_delay = 1.0
+    duration = 2.0
+    arr_dist = {type = "Uniform", low = 1, high = 1}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+```
+
+or by sets:
+
+```toml
+[[flow_set]]
+first_flow_id = 10
+flow_type = "PacketDistribution"
+flow_count = 10
+[flow_set.traffic]
+    initial_delay = 0.0
+    duration = 10.0
+    arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}  # 10Mbps
+    pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
+``` 
+
+The following table lists required, optional, or not supported attributes of a flow or a flow set.
+
+|     Attribute   |      Meaning    |   flow   | flow_set |
+|-----------------|-----------------|:--------:|:--------:|
+|    `flow_id`    | The id of the flow| optional |    no    |
+| `first_flow_id` | The smallest flow id of the flow set |    no    | optional |
+| `starts_before` | The ids of flows that cannot start until this flow / flow set ends| optional | optional |
+| `starts_after`  | The ids of flows that this flow / flow set must wait for them to end before it starts | optional | optional |
+|   `flow_type`   | The type of the flow or flows of the flow_set | required | required |
+|   `flow_count`  | The number of flows in the flow set |    no    | required |
+|     `graph`     | The pair of source host and sink host | required | required |
+|     `path`      | The path of the flow | optional |    no    |
+|    `traffic`    | The traffic of the flow / flow set| required | required |
+
 #### flow_type
 
+- **Valid value**: 
+	
+	|   Value  |  Meaning |
+	|----------|----------|
+	|`PacketDistribution`| A flow whose packet source sends packets with specific distributions of inter-arrival times and packet sizes |
+	|   `TCP`  | A flow whose packet source simulate the TCP protocol |
+	 
+- **Required**: Yes
+- **Example**:
+
+  ```toml
+  flow_type = "PacketDistribution"
+  ```
+  
 #### graph
 
 #### initial_delay
