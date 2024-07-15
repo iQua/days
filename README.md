@@ -254,7 +254,7 @@ The following table lists required, optional, or not supported attributes of a f
 | `first_flow_id` | The smallest flow id of the flow set |    no    | optional |
 | `starts_before` | The ids of flows that cannot start until this flow / flow set ends | optional | optional |
 | `starts_after`  | The ids of flows that this flow / flow set must wait for them to end before it starts | optional | optional |
-|   `flow_type`   | The type of the flow or flows of the flow_set | required | required |
+|   `flow_type`   | The type of the flow or flows of the flow set | required | required |
 |   `flow_count`  | The number of flows in the flow set |    no    | required |
 |     `graph`     | The pair of the source host and the sink host of the flow | required |    no    |
 |     `path`      | The path of the flow | optional |    no    |
@@ -417,8 +417,57 @@ For a flow set, it must specify the traffic of its flows under `[flow_set.traffi
   ```
 
 
-
 ### Collective
+
+In **Day**, collectives can be specified one by one:
+
+```toml
+[[collective]]
+collective_type = "Broadcast"
+flow_type = "PacketDistribution"
+flow_count = 2
+graph = [[0, 2], [0, 3], [1, 2], [1, 3]]
+sources = [0, 1]
+sinks = [2, 3]
+[collective.traffic]
+    initial_delay = 1.0
+    duration = 10.0
+    arr_dist = {type = "Uniform", low = 1, high = 2}
+    pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+```
+
+or by sets:
+
+```toml
+[[collective_set]]
+collective_type = "Gather"
+collective_count = 2
+flow_type = "PacketDistribution"
+flow_count = 2
+sources = [[0, 1], [1, 2]]
+sinks = [[2, 2], [3, 3]]
+[collective_set.traffic]
+    initial_delay = 1.0
+    duration = 10.0
+    arr_dist = {type = "Uniform", low = 3, high = 4}
+    pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
+``` 
+
+The following table lists required, optional, or not supported attributes of a collective or a collective set.
+
+|     Attribute   |      Meaning    | collective | collective_set |
+|:---------------:|-----------------|:----------:|:--------------:|
+|`collective_type`| The type of the collective or collective set | required | required |
+| `first_flow_id` | The smallest flow id of the collective or collective set | optional | optional |
+|`collective_count`| The number of collectives in the collective set |    no    | required |
+|   `flow_type`   | The type of the flows of the collective or collective set | required | required |
+|   `flow_count`  | The number of flows in the collective or in each collective of the collective set | required | required |
+|     `graph`     | The pairs of the source host and the sink host of the collective's flows | optional |    no    |
+|     `paths`     | The paths of the collective's flows | optional |    no    |
+|    `sources`    | The sources of flows | optional | optional |
+|     `sinks`     | The sinks of flows | optional | optional |
+|    `traffic`    | The traffic of the collective / collective set| required | required |
+
 
 #### collective_type
 
