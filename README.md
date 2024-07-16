@@ -111,7 +111,7 @@ The total duration of the simulation in seconds.
 
 #### log_path
 
-**Day** generates three CSV files, `sources.csv`, `sinks.csv`, and `switches.csv`, containing statistics of a simulation session. `log_path` specifies th directory of the three CSV files.
+**Day** generates three CSV files, `sources.csv`, `sinks.csv`, and `switches.csv`, containing statistics of a simulation session. `log_path` specifies the directory of the three CSV files.
 
 - **Valid value**: String
 - **Required**: No
