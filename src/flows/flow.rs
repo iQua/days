@@ -7,7 +7,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Deserialize;
 
-use crate::flows::route::{RoutingProtocol, ShortestPath};
+use crate::flows::route::{PathFromConfig, Routing, RoutingProtocol, ShortestPath};
 use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
@@ -24,6 +24,7 @@ struct TomlFlow {
     starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
+    path: Option<Vec<usize>>,
     traffic: TomlTrafficCharacteristics,
 }
 
@@ -66,12 +67,13 @@ pub struct Flow {
     /// random seed for the packet source
     pub seed: usize,
     /// routing protocol
-    pub routing: ShortestPath,
+    pub routing: Routing,
 }
 
 impl Flow {
     pub fn new(
         id: usize,
+        path: Option<Vec<usize>>,
         starts_before: Vec<usize>,
         starts_after: Vec<usize>,
         flow_type: FlowType,
@@ -80,7 +82,12 @@ impl Flow {
         traffic: TrafficCharacteristics,
         seed: usize,
     ) -> Flow {
-        let routing = ShortestPath::new(UnGraph::<usize, ()>::new_undirected().clone());
+        let mut routing = Routing::ShortestPath(ShortestPath::new(
+            UnGraph::<usize, ()>::new_undirected().clone(),
+        ));
+        if let Some(path_from_config) = path {
+            routing = Routing::PathFromConfig(PathFromConfig::new(path_from_config));
+        }
 
         Flow {
             id,
@@ -109,6 +116,7 @@ impl Flow {
             for (_, edge) in flow_graph.edge_references().enumerate() {
                 flows.push(Flow::new(
                     next_flow_id(),
+                    None,
                     Vec::new(),
                     Vec::new(),
                     FlowType::PacketDistribution,
@@ -144,28 +152,48 @@ impl Flow {
 
         if let Some(flows_vec) = flow_config.flow {
             for flow in flows_vec {
-                let graph = DiGraph::<usize, ()>::from_edges(flow.graph);
+                let graph = DiGraph::<usize, ()>::from_edges(&flow.graph);
                 assert!(graph.edge_references().len() == 1);
 
                 for (_, edge) in graph.edge_references().enumerate() {
                     let mut flow_id = next_flow_id();
                     if flow.flow_id.is_some() {
                         let new_id = flow.flow_id.unwrap();
-                        if new_id < flow_id {
-                            panic!(
-                                "The specified flow id {} should be at least {}",
-                                new_id, flow_id
-                            );
-                        }
+                        assert!(
+                            new_id >= flow_id,
+                            "The specified flow id {} should be at least {}",
+                            new_id,
+                            flow_id
+                        );
                         update_next_flow_id(new_id + 1);
                         flow_id = new_id;
                     }
+
+                    if let Some(ref path) = flow.path {
+                        let (source_host, sink_host) = &flow.graph[0];
+                        assert!(
+                            path[0] == *source_host as usize,
+                            "Flow {}'s source specified in path ({}) should be the same as it in graph ({})",
+                            flow_id,
+                            path[0],
+                            source_host
+                        );
+                        assert!(
+                            path[path.len() - 1] == *sink_host as usize,
+                            "Flow {}'s sink specified in path ({}) should be the same as it in graph ({})",
+                            flow_id,
+                            path[path.len() - 1],
+                            sink_host
+                        );
+                    }
+
                     let starts_before = flow.starts_before.clone().unwrap_or_default();
                     let starts_after = flow.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
 
                     flows.push(Flow::new(
                         flow_id,
+                        flow.path.clone(),
                         starts_before,
                         starts_after,
                         flow.flow_type,
@@ -186,12 +214,12 @@ impl Flow {
                 let mut first_flow_id = next_flow_id();
                 if flow_set.first_flow_id.is_some() {
                     let new_first_flow_id = flow_set.first_flow_id.unwrap();
-                    if new_first_flow_id < first_flow_id {
-                        panic!(
-                            "The specified first flow id {} of the flow set should be at least {}",
-                            new_first_flow_id, first_flow_id
-                        );
-                    }
+                    assert!(
+                        new_first_flow_id >= first_flow_id,
+                        "The specified first flow id {} of the flow set should be at least {}",
+                        new_first_flow_id,
+                        first_flow_id
+                    );
                     first_flow_id = new_first_flow_id;
                 }
 
@@ -206,6 +234,7 @@ impl Flow {
 
                     flows.push(Flow::new(
                         flow_id,
+                        None,
                         starts_before,
                         starts_after,
                         flow_set.flow_type,
@@ -226,16 +255,27 @@ impl Flow {
     /// Given the network graph, computes the path from the PacketSource to the
     /// PacketSink in the flow.
     pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
-        self.routing = ShortestPath::new(graph);
+        match &self.routing {
+            Routing::ShortestPath(_) => {
+                let mut routing = ShortestPath::new(graph);
+                let mut path = vec![NodeIndex::new(self.source_id)];
 
-        let mut path = vec![NodeIndex::new(self.source_id)];
+                path.append(&mut routing.compute_route(
+                    NodeIndex::new(self.source_host),
+                    NodeIndex::new(self.sink_host),
+                ));
 
-        path.append(&mut self.routing.compute_route(
-            NodeIndex::new(self.source_host),
-            NodeIndex::new(self.sink_host),
-        ));
-        path.push(NodeIndex::new(self.sink_id));
+                path.push(NodeIndex::new(self.sink_id));
 
-        path
+                path
+            }
+            Routing::PathFromConfig(routing) => {
+                let mut path = vec![NodeIndex::new(self.source_id)];
+                path.append(&mut routing.path.clone());
+                path.push(NodeIndex::new(self.sink_id));
+
+                path
+            }
+        }
     }
 }

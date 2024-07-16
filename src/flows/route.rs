@@ -5,6 +5,12 @@
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 
+#[derive(Debug)]
+pub enum Routing {
+    ShortestPath(ShortestPath),
+    PathFromConfig(PathFromConfig),
+}
+
 /// Defines the interface for all routing protocols.
 pub trait RoutingProtocol {
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex>;
@@ -30,5 +36,20 @@ impl RoutingProtocol for ShortestPath {
             Some((_, path)) => path,
             None => panic!("No path can be found."),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct PathFromConfig {
+    pub path: Vec<NodeIndex>,
+}
+
+impl PathFromConfig {
+    pub fn new(path_from_config: Vec<usize>) -> PathFromConfig {
+        let path = path_from_config
+            .into_iter()
+            .map(|node| NodeIndex::new(node))
+            .collect();
+        PathFromConfig { path }
     }
 }

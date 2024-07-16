@@ -44,7 +44,7 @@ collective_count = 2
 flow_type = "PacketDistribution"
 flow_count = 2
 sources = [[0, 1], [1, 2]]
-sinks = [[2], [3]]
+sinks = [[2, 2], [3, 3]]
 [collective_set.traffic]
     initial_delay = 1.0
     duration = 10.0
