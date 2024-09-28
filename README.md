@@ -1,3 +1,4 @@
+# Day: A Performant Discrete-Event Simulator for Network Simulations
 
 Developed with the Rust programming language, **Day** has been designed as a performant discrete-event simulator for network simulations using a multi-threaded design.
 
