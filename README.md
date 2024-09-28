@@ -1,8 +1,9 @@
-# Day: a Multi-Threaded Performant Discrete-Event Simulator for Network Simulations
 
-Developed with the Rust programming language, **Day** is designed as a highly performant discrete-event simulator for network simulations, using a **multi-threaded** executor that oversees stackless coroutines. It is designed based on the actor model, where each actor can only interact with its counterparts using message passing.
+Developed with the Rust programming language, **Day** has been designed as a performant discrete-event simulator for network simulations using a multi-threaded design.
 
-To run a network simulation session using a configuration file:
+In **Day**, a **multi-threaded** executor has been incorprated to oversee stackless coroutines. **Day** is designed based on the actor model, where each actor can only interact with its counterparts using message passing. It excels at large-scale network simulations due to its ability to use multiple CPU cores concurrently in the same simulation run.
+
+To run a network simulation session using a configuration file, run:
 
 ```
 RUST_LOG=debug day configs/simple.toml
