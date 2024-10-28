@@ -188,7 +188,7 @@ impl WFQServer {
         }
 
         // the case that this packet will not be dropped
-        self.on_packet_forwarded(&packet);
+        self.on_packet_received(&packet);
 
         // computes a finish time and adds it as a tag to the packet
         let tagged_packet = self.tag(packet.clone(), arrival_time);
