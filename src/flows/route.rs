@@ -46,10 +46,7 @@ pub struct PathFromConfig {
 
 impl PathFromConfig {
     pub fn new(path_from_config: Vec<usize>) -> PathFromConfig {
-        let path = path_from_config
-            .into_iter()
-            .map(|node| NodeIndex::new(node))
-            .collect();
+        let path = path_from_config.into_iter().map(NodeIndex::new).collect();
         PathFromConfig { path }
     }
 }
