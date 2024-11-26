@@ -1,16 +1,14 @@
 //! Implements a Progress struct that generates a progress bar to illustrate the
 //! progress of the simulation run.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
 
-use asynchronix::model::{InitializedModel, Model};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::time::MonotonicTime;
 
 #[derive(Clone, Debug)]
 pub struct FinishMsg {}
@@ -58,7 +56,7 @@ impl Progress {
         (progress_interval, duration)
     }
 
-    pub fn finish_msg_received(&mut self, _finish_msg: FinishMsg, scheduler: &Scheduler<Self>) {
+    pub fn finish_msg_received(&mut self, _finish_msg: FinishMsg, cx: &mut Context<Self>) {
         self.finished_sources += 1;
         debug!(
             "{} / {} sources have finished.",
@@ -71,22 +69,15 @@ impl Progress {
                 (self.duration / self.progress_interval) as u64 - self.progress_bar.position(),
             );
 
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            scheduler
-                .schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
                 .unwrap();
         }
     }
 
-    fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    fn run(&mut self, _: (), cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         if self.finished {
             if now == self.duration {
@@ -98,26 +89,20 @@ impl Progress {
                 self.progress_bar.finish_and_clear();
                 self.finished = true;
             } else {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(self.progress_interval),
-                        Self::run,
-                        (),
-                    )
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(self.progress_interval),
+                    Self::run,
+                    (),
+                )
+                .unwrap();
             }
         }
     }
 }
 
 impl Model for Progress {
-    fn init(
-        mut self,
-        scheduler: &Scheduler<Self>,
-    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
-        Box::pin(async move {
-            self.run((), scheduler);
-            self.into()
-        })
+    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        self.run((), cx);
+        self.into()
     }
 }

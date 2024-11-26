@@ -4,15 +4,15 @@
 use std::borrow::BorrowMut;
 use std::fmt::Debug;
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
-use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 use serde::Serialize;
 
 use crate::flows::dist_source::DistPacketSource;
@@ -122,22 +122,19 @@ impl PacketSource {
         }
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         match self {
             PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
             PacketSource::TCPPacketSource(source) => {
                 if source.ack_packet_received(packet, now).await {
-                    self.run((), scheduler).await;
+                    self.run((), cx).await;
                 }
             }
         }
     }
 
-    fn prepare_run(&mut self, now: f64, initial_delay: f64, scheduler: &Scheduler<Self>) {
+    fn prepare_run(&mut self, now: f64, initial_delay: f64, cx: &Context<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => {
                 source.report_start_time = now + initial_delay;
@@ -152,13 +149,12 @@ impl PacketSource {
 
                 // as suggested by RFC 6298, the clock granuarity, i.e., the
                 // interval of this periodic timer, is always 100 msec
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(initial_delay + 0.1),
-                        Self::periodic_timer_event,
-                        (),
-                    )
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(initial_delay + 0.1),
+                    Self::periodic_timer_event,
+                    (),
+                )
+                .unwrap();
 
                 // lets AppDataSource to send data to TCPPacketSource
                 let (data, interval) = source.datasource.produce_data(now + initial_delay);
@@ -168,13 +164,12 @@ impl PacketSource {
                 source.busy_until = now + initial_delay;
 
                 // schedules AppDataSource to send next data
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(initial_delay) + interval,
-                        Self::fetch_app_data,
-                        (),
-                    )
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(initial_delay) + interval,
+                    Self::fetch_app_data,
+                    (),
+                )
+                .unwrap();
             }
         }
     }
@@ -182,16 +177,13 @@ impl PacketSource {
     fn fetch_app_data<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             match self {
                 PacketSource::DistPacketSource(_) => (),
                 PacketSource::TCPPacketSource(source) => {
-                    let now = scheduler
-                        .time()
-                        .duration_since(MonotonicTime::EPOCH)
-                        .as_secs_f64();
+                    let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
                     let (data, interval) = source.datasource.produce_data(now);
 
@@ -203,8 +195,7 @@ impl PacketSource {
                         .traffic_exceeded(now + interval.as_secs_f64())
                     {
                         // schedules AppDataSource to send next data
-                        scheduler
-                            .schedule_event(interval, Self::fetch_app_data, ())
+                        cx.schedule_event(interval, Self::fetch_app_data, ())
                             .unwrap();
                     } else {
                         source.traffic_exceeded = true;
@@ -214,7 +205,7 @@ impl PacketSource {
                         // the TCPPacketSource could send a new packet at this
                         // point, if the size of the congestion window
                         // allows
-                        self.run((), scheduler).await;
+                        self.run((), cx).await;
                     } else {
                         // the TCPPacketSource is considered busy retrieving
                         // the next packet from the (application-layer) flow
@@ -228,43 +219,36 @@ impl PacketSource {
     fn periodic_timer_event<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             match self {
                 PacketSource::DistPacketSource(_) => (),
                 PacketSource::TCPPacketSource(source) => {
-                    let now = scheduler
-                        .time()
-                        .duration_since(MonotonicTime::EPOCH)
-                        .as_secs_f64();
+                    let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
                     source.timer_tick(now).await;
 
                     // schedules the next periodic timer event
-                    scheduler
-                        .schedule_event(
-                            Duration::from_secs_f64(0.05),
-                            Self::periodic_timer_event,
-                            (),
-                        )
-                        .unwrap();
+                    cx.schedule_event(
+                        Duration::from_secs_f64(0.05),
+                        Self::periodic_timer_event,
+                        (),
+                    )
+                    .unwrap();
                 }
             }
         }
     }
 
-    async fn send_packet(&mut self, scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    async fn send_packet(&mut self, cx: &Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         match self {
             PacketSource::DistPacketSource(source) => {
                 let interval = source.send_packet(now).await;
                 if !source.traffic_exceeded(now + interval.as_secs_f64()) {
-                    scheduler.schedule_event(interval, Self::run, ()).unwrap();
+                    cx.schedule_event(interval, Self::run, ()).unwrap();
                 }
             }
             PacketSource::TCPPacketSource(source) => source.send_packet(now).await,
@@ -274,13 +258,10 @@ impl PacketSource {
     fn log_report<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             match self {
                 PacketSource::DistPacketSource(source) => {
@@ -292,13 +273,12 @@ impl PacketSource {
             };
 
             if !self.stop_run(now).await {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                        Self::log_report,
-                        (),
-                    )
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                    Self::log_report,
+                    (),
+                )
+                .unwrap();
             }
         }
     }
@@ -323,15 +303,12 @@ impl PacketSource {
     pub fn run<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            self.send_packet(scheduler).await;
+            self.send_packet(cx).await;
 
             if self.stop_run(now).await {
                 let name = format!("{self}");
@@ -359,12 +336,9 @@ impl PacketSource {
     pub async fn flow_finish_msg_received(
         &mut self,
         flow_finish_msg: FlowFinishMsg,
-        scheduler: &Scheduler<Self>,
+        cx: &mut Context<Self>,
     ) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(
             "{} of flow {} received notification that flow {} ended at time {:.3}.",
@@ -379,9 +353,9 @@ impl PacketSource {
                 source.flow_start_after.remove(&flow_finish_msg.flow_id);
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, scheduler);
-                    self.run((), scheduler).await;
-                    self.start_report_logger(0.0, scheduler);
+                    self.prepare_run(now, 0.0, cx);
+                    self.run((), cx).await;
+                    self.start_report_logger(0.0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
@@ -406,9 +380,9 @@ impl PacketSource {
                 );
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, scheduler);
-                    self.run((), scheduler).await;
-                    self.start_report_logger(0.0, scheduler);
+                    self.prepare_run(now, 0.0, cx);
+                    self.run((), cx).await;
+                    self.start_report_logger(0.0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
@@ -455,42 +429,36 @@ impl PacketSource {
         }
     }
 
-    fn start_report_logger(&self, initial_delay: f64, scheduler: &Scheduler<Self>) {
+    fn start_report_logger(&self, initial_delay: f64, cx: &mut Context<Self>) {
         let report_interval = ReportLogger::get_report_interval();
         if report_interval < f64::MAX {
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(initial_delay + report_interval),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
+            cx.schedule_periodic_event(
+                Duration::from_secs_f64(initial_delay),
+                Duration::from_secs_f64(report_interval),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
         }
     }
 }
 
 impl Model for PacketSource {
-    fn init(
-        mut self,
-        scheduler: &Scheduler<Self>,
-    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
-        Box::pin(async move {
-            if self.start_now() {
-                let initial_delay = self.advance_initial_delay();
-                self.prepare_run(0.0, initial_delay, scheduler);
+    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        if self.start_now() {
+            let initial_delay = self.advance_initial_delay();
+            self.prepare_run(0.0, initial_delay, cx);
 
-                if initial_delay > 0.0 {
-                    scheduler
-                        .schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
-                        .unwrap();
-                } else {
-                    self.run((), scheduler).await;
-                }
-
-                self.start_report_logger(initial_delay, scheduler);
+            if initial_delay > 0.0 {
+                cx.schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
+                    .unwrap();
+            } else {
+                self.run((), cx).await;
             }
 
-            self.into()
-        })
+            self.start_report_logger(initial_delay, cx);
+        }
+
+        self.into()
     }
 }

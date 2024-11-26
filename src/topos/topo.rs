@@ -13,9 +13,9 @@ use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
-use asynchronix::model::Output;
-use asynchronix::simulation::{Address, EventSlot, Mailbox, SimInit, Simulation};
-use asynchronix::time::MonotonicTime;
+use nexosim::ports::{EventSlot, Output};
+use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
+use nexosim::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowType};
@@ -107,7 +107,7 @@ impl SinkStatistics {
     pub fn collect_statistics(&mut self, mut sim: Simulation) -> Simulation {
         for sink_id in self.sink_ids.iter() {
             let sink_addr = self.sink_addresses.get(sink_id).unwrap();
-            sim.send_event(PacketSink::report, *sink_id, sink_addr);
+            sim.process_event(PacketSink::report, *sink_id, sink_addr);
 
             let mut sink_statistics = self.sink_statistics.remove(sink_id).unwrap();
             if let Some(statistics) = sink_statistics.take() {
@@ -161,7 +161,7 @@ impl Topology {
         let mailbox_config: MailboxConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of mailbox capacity");
         // uses 16 as the default value and limits the maximial capacity to
-        // usize::MAX/2 + 1 as it is designed in asynchronix
+        // usize::MAX/2 + 1 as it is designed in nexosim
         let mailbox_capacity = mailbox_config
             .mailbox_capacity
             .unwrap_or(16)
@@ -341,7 +341,7 @@ impl Topology {
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
-                self.sim_init = self.sim_init.add_model(drr_server, drr_mbox);
+                self.sim_init = self.sim_init.add_model(drr_server, drr_mbox, "DRR");
             }
 
             SchedulingDiscipline::FIFO => {
@@ -361,7 +361,7 @@ impl Topology {
                 port.output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
-                self.sim_init = self.sim_init.add_model(port, port_mbox);
+                self.sim_init = self.sim_init.add_model(port, port_mbox, "Port");
             }
 
             SchedulingDiscipline::SP => {
@@ -386,7 +386,7 @@ impl Topology {
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
-                self.sim_init = self.sim_init.add_model(sp_server, sp_mbox);
+                self.sim_init = self.sim_init.add_model(sp_server, sp_mbox, "SP");
             }
 
             SchedulingDiscipline::VirtualClock => {
@@ -412,9 +412,11 @@ impl Topology {
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
-                self.sim_init = self
-                    .sim_init
-                    .add_model(virtual_clock_server, virtual_clock_mbox);
+                self.sim_init = self.sim_init.add_model(
+                    virtual_clock_server,
+                    virtual_clock_mbox,
+                    "VirtualClock",
+                );
             }
 
             SchedulingDiscipline::WFQ => {
@@ -439,7 +441,7 @@ impl Topology {
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
-                self.sim_init = self.sim_init.add_model(wfq_server, wfq_mbox);
+                self.sim_init = self.sim_init.add_model(wfq_server, wfq_mbox, "WFQ");
             }
         }
 
@@ -554,13 +556,13 @@ impl Topology {
             sources.insert(flow.id, source);
 
             // activates the packet sink
-            self.sim_init = self.sim_init.add_model(sink, sink_mbox);
+            self.sim_init = self.sim_init.add_model(sink, sink_mbox, "Sink");
         }
 
         // activates all packet sources
         for (flow_id, source) in sources.into_iter() {
             let source_mbox = source_mboxes.remove(&flow_id).unwrap_or_default();
-            self.sim_init = self.sim_init.add_model(source, source_mbox);
+            self.sim_init = self.sim_init.add_model(source, source_mbox, "Source");
         }
 
         (self, report_mbox)
@@ -606,7 +608,7 @@ impl Topology {
     /// collect reports from all the network elements.
     fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
         let progress = Progress::new(self.progress, self.duration, self.flows.len());
-        self.sim_init = self.sim_init.add_model(progress, report_mbox);
+        self.sim_init = self.sim_init.add_model(progress, report_mbox, "Progress");
 
         self
     }
@@ -620,10 +622,12 @@ impl Topology {
 
         for (_, switch) in self.switches {
             let switch_mbox = self.switch_mailboxes.remove(&switch.id()).unwrap();
-            self.sim_init = self.sim_init.add_model(switch, switch_mbox);
+            self.sim_init = self.sim_init.add_model(switch, switch_mbox, "Switch");
         }
-
-        self.sim_init.init(MonotonicTime::EPOCH)
+        match self.sim_init.init(MonotonicTime::EPOCH) {
+            Ok((simulation, _)) => simulation,
+            Err(error) => panic!("Problem when initializing the simulation: {error:?}"),
+        }
     }
 
     pub fn run(mut self, graph: UnGraph<usize, ()>) {
@@ -654,7 +658,7 @@ impl Topology {
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_by(Duration::from_secs_f64(duration));
+        sim.step_until(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
         info!(

@@ -9,14 +9,14 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
@@ -161,8 +161,8 @@ impl VirtualClockServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         // drops the packet if the buffer is full
@@ -218,7 +218,7 @@ impl VirtualClockServer {
         );
 
         if arrival_time >= self.busy_until {
-            self.run((), scheduler);
+            self.run((), cx);
         }
     }
 
@@ -250,11 +250,8 @@ impl VirtualClockServer {
         self.output.send(packet).await;
     }
 
-    pub fn run(&mut self, _: (), scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         // schedules one packet with the smallest virtual clock finish time
         if !self.scheduler_queue.is_empty() {
             let mut outbound = self.scheduler_queue.pop().unwrap().packet;
@@ -271,17 +268,15 @@ impl VirtualClockServer {
 
             outbound.departure_update(now + timeout);
 
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(timeout),
-                    Self::send,
-                    outbound.clone(),
-                )
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(timeout),
+                Self::send,
+                outbound.clone(),
+            )
+            .unwrap();
 
             // schedules the next run
-            scheduler
-                .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
 
             self.busy_until = now + timeout;
@@ -302,13 +297,10 @@ impl VirtualClockServer {
     fn log_report<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             let report = self.generate_report(now);
 
@@ -320,13 +312,12 @@ impl VirtualClockServer {
 
             self.reset_stats(now);
 
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
         }
     }
 }
@@ -377,23 +368,17 @@ impl ReportStatistics for VirtualClockServer {
 }
 
 impl Model for VirtualClockServer {
-    fn init(
-        self,
-        scheduler: &Scheduler<Self>,
-    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
-        Box::pin(async move {
-            let report_interval = ReportLogger::get_report_interval();
-            if report_interval < f64::MAX {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(report_interval),
-                        Self::log_report,
-                        (),
-                    )
-                    .unwrap();
-            }
+    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        let report_interval = ReportLogger::get_report_interval();
+        if report_interval < f64::MAX {
+            cx.schedule_event(
+                Duration::from_secs_f64(report_interval),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
+        }
 
-            self.into()
-        })
+        self.into()
     }
 }

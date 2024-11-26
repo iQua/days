@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use log::info;
 
-use asynchronix::simulation::{Mailbox, SimInit};
-use asynchronix::time::MonotonicTime;
+use nexosim::simulation::{Mailbox, SimInit};
+use nexosim::time::MonotonicTime;
 
 use day::flows::cc::CCAlgorithm::TCPReno;
 use day::flows::flow::FlowType;
