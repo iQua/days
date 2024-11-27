@@ -9,13 +9,13 @@ use std::borrow::BorrowMut;
 use std::cell::Cell;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 use serde::Serialize;
 
 use crate::flows::basic_sink::BasicPacketSink;
@@ -267,11 +267,8 @@ impl PacketSink {
         }
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
@@ -299,13 +296,10 @@ impl PacketSink {
     fn log_report<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             match self {
                 PacketSink::BasicPacketSink(sink) => {
@@ -316,35 +310,29 @@ impl PacketSink {
                 }
             }
 
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
         }
     }
 }
 
 impl Model for PacketSink {
-    fn init(
-        self,
-        scheduler: &Scheduler<Self>,
-    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
-        Box::pin(async move {
-            let report_interval = ReportLogger::get_report_interval();
-            if report_interval < f64::MAX {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(report_interval),
-                        Self::log_report,
-                        (),
-                    )
-                    .unwrap();
-            }
+    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        let report_interval = ReportLogger::get_report_interval();
+        if report_interval < f64::MAX {
+            cx.schedule_periodic_event(
+                Duration::from_secs_f64(report_interval),
+                Duration::from_secs_f64(report_interval),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
+        }
 
-            self.into()
-        })
+        self.into()
     }
 }

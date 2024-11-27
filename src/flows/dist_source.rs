@@ -9,7 +9,8 @@ use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 
-use asynchronix::model::{Model, Output};
+use nexosim::model::Model;
+use nexosim::ports::Output;
 
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;

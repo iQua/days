@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use log::info;
 
-use asynchronix::simulation::{Mailbox, SimInit};
-use asynchronix::time::MonotonicTime;
+use nexosim::ports::EventSlot;
+use nexosim::simulation::{Mailbox, SimInit};
+use nexosim::time::MonotonicTime;
 
 use day::flows::flow::FlowType;
 use day::flows::sink::PacketSink;
@@ -89,29 +90,36 @@ fn main() {
         .connect(SPServer::packet_received, &sp_mbox);
     sp.output.connect(PacketSink::packet_received, &sink_mbox);
 
-    let mut sink_statistics = sink.statistics().connect_slot().0;
+    let mut sink_statistics = EventSlot::new();
+    sink.statistics().connect_sink(&sink_statistics);
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
-    let mut sim = SimInit::new()
-        .add_model(source_1, source_1_mbox)
-        .add_model(source_2, source_2_mbox)
-        .add_model(sp, sp_mbox)
-        .add_model(sink, sink_mbox)
-        .init(t0);
+    match SimInit::new()
+        .add_model(source_1, source_1_mbox, "Source1")
+        .add_model(source_2, source_2_mbox, "Source2")
+        .add_model(sp, sp_mbox, "SP")
+        .add_model(sink, sink_mbox, "Sink")
+        .init(t0)
+    {
+        Ok((mut sim, _)) => {
+            // starts the simulation
+            let _ = sim.step_until(Duration::from_secs(100));
 
-    // starts the simulation
-    sim.step_by(Duration::from_secs(100));
+            // requests the packet sink to report statistics
+            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
 
-    // requests the packet sink to report statistics
-    sim.send_event(PacketSink::report, 2, &sink_addr);
+            if let Some(statistics) = sink_statistics.next() {
+                info!("{:#.3}", statistics);
+            }
 
-    if let Some(statistics) = sink_statistics.take() {
-        info!("{:#.3}", statistics);
+            info!(
+                "Simulation completed at time {:.3}.",
+                sim.time().duration_since(t0).as_secs_f64()
+            );
+        }
+        Err(e) => {
+            info!("Simulation failed: {e}");
+        }
     }
-
-    info!(
-        "Simulation completed at time {:.3}.",
-        sim.time().duration_since(t0).as_secs_f64()
-    );
 }

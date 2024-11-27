@@ -2,13 +2,13 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use log::debug;
 
-use asynchronix::model::{InitializedModel, Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
@@ -89,8 +89,8 @@ impl Port {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler.time();
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time();
         let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         // drops the packet if the buffer is full
@@ -124,7 +124,7 @@ impl Port {
         );
 
         if arrival_time >= self.busy_until {
-            self.run((), scheduler).await;
+            self.run((), cx).await;
         }
     }
 
@@ -151,25 +151,20 @@ impl Port {
     pub fn run<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             if let Some(mut packet) = self.queue.pop_front() {
                 packet.queueing_delay_update(now);
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 packet.departure_update(now + timeout);
 
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
                     .unwrap();
 
-                scheduler
-                    .schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                     .unwrap();
 
                 self.packet_sent(now + timeout, packet);
@@ -180,13 +175,10 @@ impl Port {
     fn log_report<'a>(
         &'a mut self,
         _: (),
-        scheduler: &'a Scheduler<Self>,
+        cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = scheduler
-                .time()
-                .duration_since(MonotonicTime::EPOCH)
-                .as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             let report = self.generate_report(now);
 
@@ -198,13 +190,12 @@ impl Port {
 
             self.reset_stats(now);
 
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
         }
     }
 }
@@ -255,23 +246,17 @@ impl ReportStatistics for Port {
 }
 
 impl Model for Port {
-    fn init(
-        self,
-        scheduler: &Scheduler<Self>,
-    ) -> Pin<Box<dyn Future<Output = InitializedModel<Self>> + Send + '_>> {
-        Box::pin(async move {
-            let report_interval = ReportLogger::get_report_interval();
-            if report_interval < f64::MAX {
-                scheduler
-                    .schedule_event(
-                        Duration::from_secs_f64(report_interval),
-                        Self::log_report,
-                        (),
-                    )
-                    .unwrap();
-            }
+    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        let report_interval = ReportLogger::get_report_interval();
+        if report_interval < f64::MAX {
+            cx.schedule_event(
+                Duration::from_secs_f64(report_interval),
+                Self::log_report,
+                (),
+            )
+            .unwrap();
+        }
 
-            self.into()
-        })
+        self.into()
     }
 }

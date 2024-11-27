@@ -4,7 +4,8 @@
 use log::debug;
 use std::fmt::Debug;
 
-use asynchronix::model::{Model, Output};
+use nexosim::model::Model;
+use nexosim::ports::Output;
 
 use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};

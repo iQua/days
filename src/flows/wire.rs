@@ -7,8 +7,9 @@ use rand::SeedableRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
 use std::time::Duration;
 
-use asynchronix::model::{Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, Model};
+use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::flows::DistributionInfo;
@@ -39,11 +40,8 @@ impl Wire {
         }
     }
 
-    pub async fn packet_received(&mut self, mut packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -69,13 +67,12 @@ impl Wire {
         packet.time += delay;
 
         if packet.time > now {
-            scheduler
-                .schedule_event(
-                    Duration::from_secs_f64(packet.time - now),
-                    Self::forward_packet,
-                    packet.clone(),
-                )
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(packet.time - now),
+                Self::forward_packet,
+                packet.clone(),
+            )
+            .unwrap();
         } else {
             self.forward_packet(packet).await;
         }

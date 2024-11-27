@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use log::debug;
 
-use asynchronix::model::{Model, Output};
-use asynchronix::time::{MonotonicTime, Scheduler};
+use nexosim::model::{Context, Model};
+use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_switch_id;
@@ -58,11 +59,8 @@ impl PacketSwitch {
         self.r_fib.insert(flow_id, next_id);
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, scheduler: &Scheduler<Self>) {
-        let now = scheduler
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         if packet.ack.is_none() {
             self.packets_received += 1;
