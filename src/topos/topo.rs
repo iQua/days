@@ -40,6 +40,11 @@ struct ProgressConfig {
 }
 
 #[derive(Deserialize)]
+struct ConcurrencyConfig {
+    num_threads: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
     log_interval: Option<f64>,
@@ -171,9 +176,20 @@ impl Topology {
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
         let (progress, duration) = Progress::setup(pb_config.progress, pb_config.duration);
 
+        let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of concurrency");
+
+        let mut sim_init = SimInit::new();
+
+        if let Some(num_threads) = concurrency_config.num_threads {
+            sim_init = SimInit::with_num_threads(num_threads);
+            info!("Starting simulation with {num_threads} thread(s).",);
+        }
+
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
         let report_interval = log_config.log_interval.unwrap_or(progress);
+
         // initializes the singleton of the logger of reports
         ReportLogger::init(log_config.log_path, report_interval);
 
@@ -181,7 +197,7 @@ impl Topology {
         let switches = Topology::init_switches();
 
         Topology {
-            sim_init: SimInit::new(),
+            sim_init,
             graph: graph.clone(),
             hosts,
             switches,
@@ -624,6 +640,7 @@ impl Topology {
             let switch_mbox = self.switch_mailboxes.remove(&switch.id()).unwrap();
             self.sim_init = self.sim_init.add_model(switch, switch_mbox, "Switch");
         }
+
         match self.sim_init.init(MonotonicTime::EPOCH) {
             Ok((simulation, _)) => simulation,
             Err(error) => panic!("Problem when initializing the simulation: {error:?}"),

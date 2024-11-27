@@ -2,8 +2,9 @@
 
 seed = 100
 mailbox_capacity = 100
-duration = 0.1
+duration = 0.2
 progress = 0.01
+num_threads = 4
 log_path = "./tcp_fattree"
 log_interval =  0.01
 
@@ -11,7 +12,7 @@ log_interval =  0.01
 category = "FatTree"
 
 [topology.fat_tree]
-    k = 32
+    k = 96
 
 [switch]
 port_rate = 10000000000 # 10Gbps
@@ -25,7 +26,7 @@ flow_type = "TCP"
 flow_count = 200
 [flow_set.traffic]
     initial_delay = 0.0
-    duration = 0.1
+    duration = 0.2
     arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
     pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
 [flow_set.traffic.tcp]
