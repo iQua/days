@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use log::info;
 
+use nexosim::ports::EventSlot;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
@@ -46,24 +47,31 @@ fn main() {
         .output()
         .connect(PacketSink::packet_received, &sink_mbox);
 
-    let mut sink_statistics = sink.statistics().connect_slot().0;
+    let mut sink_statistics = EventSlot::new();
+    sink.statistics().connect_sink(&sink_statistics);
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
-    let mut sim = SimInit::new()
-        .add_model(source, source_mbox)
-        .add_model(sink, sink_mbox)
-        .init(t0);
+    match SimInit::new()
+        .add_model(source, source_mbox, "Source")
+        .add_model(sink, sink_mbox, "Sink")
+        .init(t0)
+    {
+        Ok((mut sim, _)) => {
+            let _ = sim.step_until(Duration::from_secs(20));
 
-    sim.step_by(Duration::from_secs(20));
+            let _ = sim.process_event(PacketSink::report, 1, &sink_addr);
+            if let Some(statistics) = sink_statistics.next() {
+                info!("{:#.3}", statistics);
+            }
 
-    sim.send_event(PacketSink::report, 1, &sink_addr);
-    if let Some(statistics) = sink_statistics.take() {
-        info!("{:#.3}", statistics);
+            info!(
+                "Simulation completed at time {:.3}.",
+                sim.time().duration_since(t0).as_secs_f64()
+            );
+        }
+        Err(e) => {
+            info!("Simulation failed: {e}");
+        }
     }
-
-    info!(
-        "Simulation completed at time {:.3}.",
-        sim.time().duration_since(t0).as_secs_f64()
-    );
 }
