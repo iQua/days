@@ -40,7 +40,7 @@ impl Wire {
         }
     }
 
-    pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
+    pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(

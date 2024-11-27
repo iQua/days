@@ -68,18 +68,24 @@ fn main() {
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
-    let mut sim = SimInit::new()
-        .add_model(source, source_mbox)
-        .add_model(wire, wire_mbox)
-        .add_model(sink, sink_mbox)
-        .init(t0);
+    match SimInit::new()
+        .add_model(source, source_mbox, "Source")
+        .add_model(wire, wire_mbox, "Wire")
+        .add_model(sink, sink_mbox, "Sink")
+        .init(t0)
+    {
+        Ok((mut sim, _)) => {
+            let _ = sim.step_until(Duration::from_secs(10));
 
-    sim.step_by(Duration::from_secs(10));
+            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
 
-    sim.send_event(PacketSink::report, 2, &sink_addr);
-
-    info!(
-        "Simulation completed at time {:.3}.",
-        sim.time().duration_since(t0).as_secs_f64()
-    );
+            info!(
+                "Simulation completed at time {:.3}.",
+                sim.time().duration_since(t0).as_secs_f64()
+            );
+        }
+        Err(e) => {
+            info!("Simulation failed: {e}");
+        }
+    }
 }
