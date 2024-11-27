@@ -87,10 +87,10 @@ fn main() {
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
     let mut sim = SimInit::new()
-        .add_model(source, source_mbox)
-        .add_model(server, server_mbox)
-        .add_model(wire, wire_mbox)
-        .add_model(sink, sink_mbox)
+        .add_model(source, source_mbox, "Source")
+        .add_model(server, server_mbox, "DRRServer")
+        .add_model(wire, wire_mbox, "Wire")
+        .add_model(sink, sink_mbox, "Sink")
         .init(t0);
 
     // starts the simulation

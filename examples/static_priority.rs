@@ -94,10 +94,10 @@ fn main() {
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
     let mut sim = SimInit::new()
-        .add_model(source_1, source_1_mbox)
-        .add_model(source_2, source_2_mbox)
-        .add_model(sp, sp_mbox)
-        .add_model(sink, sink_mbox)
+        .add_model(source_1, source_1_mbox, "Source1")
+        .add_model(source_2, source_2_mbox, "Source2")
+        .add_model(sp, sp_mbox, "SP")
+        .add_model(sink, sink_mbox, "Sink")
         .init(t0);
 
     // starts the simulation
