@@ -107,10 +107,10 @@ impl SinkStatistics {
     pub fn collect_statistics(&mut self, mut sim: Simulation) -> Simulation {
         for sink_id in self.sink_ids.iter() {
             let sink_addr = self.sink_addresses.get(sink_id).unwrap();
-            sim.process_event(PacketSink::report, *sink_id, sink_addr);
+            let _ = sim.process_event(PacketSink::report, *sink_id, sink_addr);
 
             let mut sink_statistics = self.sink_statistics.remove(sink_id).unwrap();
-            if let Some(statistics) = sink_statistics.take() {
+            if let Some(statistics) = sink_statistics.next() {
                 debug!("{:#.3}", statistics);
             }
         }
@@ -523,9 +523,9 @@ impl Topology {
             // simulation finishes
             stats.sink_ids.push(sink.id());
             stats.sink_addresses.insert(sink.id(), sink_mbox.address());
-            stats
-                .sink_statistics
-                .insert(sink.id(), sink.statistics().connect_slot().0);
+            let sink_stats = EventSlot::new();
+            sink.statistics().connect_sink(&sink_stats);
+            stats.sink_statistics.insert(sink.id(), sink_stats);
 
             sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);
@@ -658,7 +658,7 @@ impl Topology {
         let mut sim = self.init_sim();
 
         // starts the simulation
-        sim.step_until(Duration::from_secs_f64(duration));
+        let _ = sim.step_until(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
         info!(
