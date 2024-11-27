@@ -433,7 +433,7 @@ impl PacketSource {
         let report_interval = ReportLogger::get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
-                Duration::from_secs_f64(initial_delay),
+                Duration::from_secs_f64(initial_delay + report_interval),
                 Duration::from_secs_f64(report_interval),
                 Self::log_report,
                 (),

@@ -23,4 +23,4 @@ flow_count = 200
     initial_delay = 0.0
     duration = 10.0
     arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}  # 10Mbps
-    pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}  
+    pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
