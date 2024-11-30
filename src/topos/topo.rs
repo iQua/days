@@ -179,11 +179,14 @@ impl Topology {
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
 
-        let mut sim_init = SimInit::new();
+        let sim_init;
 
         if let Some(num_threads) = concurrency_config.num_threads {
             sim_init = SimInit::with_num_threads(num_threads);
             info!("Starting simulation with {num_threads} thread(s).",);
+        } else {
+            sim_init = SimInit::new();
+            info!("Starting simulation with the default number of thread(s).",);
         }
 
         let log_config: LogConfig = toml::from_str(&content)

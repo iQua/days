@@ -4,7 +4,7 @@ seed = 100
 mailbox_capacity = 100
 duration = 0.2
 progress = 0.01
-num_threads = 4
+num_threads = 1
 log_path = "./tcp_fattree"
 log_interval =  0.01
 
