@@ -32,6 +32,8 @@ lazy_static! {
     pub static ref SOURCE_REPORTS: RwLock<Vec<PacketSourceReport>> = RwLock::new(Vec::new());
     pub static ref SCHEDULER_REPORTS: RwLock<Vec<SchedulerReport>> = RwLock::new(Vec::new());
     pub static ref SINK_REPORTS: RwLock<Vec<PacketSinkReport>> = RwLock::new(Vec::new());
+    pub static ref TOTAL_PACKETS: RwLock<usize> = RwLock::new(0);
+    pub static ref TOTAL_DELAY: RwLock<f64> = RwLock::new(0.0);
 }
 
 pub struct ReportLogger {
@@ -135,6 +137,9 @@ impl CsvLogger {
                 let mut reports = SINK_REPORTS.write().unwrap();
                 reports.push(report);
                 if reports.len() >= max_log_num {
+                    // Compute packet stats before writing reports
+                    self.compute_packet_stats(&reports);
+
                     self.write_to_csv(ElementType::Sink, &reports);
                     reports.clear();
                 }
@@ -164,11 +169,9 @@ impl CsvLogger {
             .append(true)
             .open(&csv_file_name)
             .unwrap();
-        let write_header = if csv_file.metadata().unwrap().len() == 0 {
-            true
-        } else {
-            false
-        };
+
+        let write_header = csv_file.metadata().unwrap().len() == 0;
+
         let mut csv_writer = WriterBuilder::new()
             .has_headers(write_header)
             .from_writer(csv_file);
@@ -180,6 +183,17 @@ impl CsvLogger {
                     e, &csv_file_name
                 );
             }
+        }
+    }
+
+    fn compute_packet_stats(&self, reports: &Vec<PacketSinkReport>) {
+        let mut total_packets = TOTAL_PACKETS.write().unwrap();
+        let mut total_delay = TOTAL_DELAY.write().unwrap();
+
+        // Compute stats in one pass
+        for report in reports {
+            *total_packets += report.received_packets;
+            *total_delay += report.one_way_delay_mean * report.received_packets as f64;
         }
     }
 
@@ -198,5 +212,12 @@ impl CsvLogger {
             "Wrote outputs of this simulation run to three csv files under directory {}.",
             &log_dir
         );
+
+        let total_packets = TOTAL_PACKETS.read().unwrap();
+        let total_delay = TOTAL_DELAY.read().unwrap();
+        let avg_delay = *total_delay / *total_packets as f64;
+
+        info!("Total packets processed: {}", total_packets);
+        info!("Average one-way delay: {:.6} seconds", avg_delay);
     }
 }
