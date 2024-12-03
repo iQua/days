@@ -11,7 +11,7 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::logger::{Report, ReportLogger, ReportTiming};
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
@@ -26,7 +26,11 @@ pub struct BasicPacketSink {
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
-    /// the statistics of a preiodic report
+
+    /// the time to generate the next periodic report
+    report_time: f64,
+
+    /// the statistics of a periodic report
     report_start_time: f64,
     received_packets: usize,
     received_sizes: usize,
@@ -45,6 +49,7 @@ impl BasicPacketSink {
             statistics: Output::default(),
             output: Output::default(),
             flow_finish_outputs: Vec::new(),
+            report_time: ReportLogger::get_report_interval(),
             report_start_time: 0.0,
             received_packets: 0,
             received_sizes: 0,
@@ -64,34 +69,45 @@ impl BasicPacketSink {
         self.received_sizes += packet.size;
     }
 
-    pub fn log_report(&mut self, now: f64) {
-        let report = PacketSinkReport {
-            id: self.endpoint_id,
-            flow_id: self.flow_id,
-            start_time: self.report_start_time,
-            end_time: now,
-            received_packets: self.received_packets,
-            received_sizes: self.received_sizes,
-            queueing_delay_mean: self.queueing_delay_mean,
-            one_way_delay_mean: self.one_way_delay_mean,
-        };
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
+        if now >= self.report_time || timing == ReportTiming::Final {
+            let report = PacketSinkReport {
+                id: self.endpoint_id,
+                flow_id: self.flow_id,
+                start_time: self.report_start_time,
+                end_time: now,
+                received_packets: self.received_packets,
+                received_sizes: self.received_sizes,
+                queueing_delay_mean: self.queueing_delay_mean,
+                one_way_delay_mean: self.one_way_delay_mean,
+            };
 
-        ReportLogger::log_report(Report::PacketSinkReport(report));
-        debug!(
-            "PacketSink {} logged a periodic report at time {:.3}.",
-            self.endpoint_id, now
-        );
+            ReportLogger::log_report(Report::PacketSinkReport(report), timing);
+            debug!(
+                "PacketSink {} logged a periodic report at time {:.3}.",
+                self.endpoint_id, now
+            );
 
-        // resets the statistics of report
-        self.report_start_time = now;
-        self.received_packets = 0;
-        self.received_sizes = 0;
+            // resets the statistics of report
+            self.report_start_time = now;
+            self.received_packets = 0;
+            self.received_sizes = 0;
+
+            while now >= self.report_time {
+                self.report_time += ReportLogger::get_report_interval();
+            }
+        }
     }
 
     /// Notifies sources that wait for this flow to end when receiving the last
     /// packet.
     pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
         if packet.last_packet {
+            debug!(
+                "PacketSink {} received the last packet of flow {} at time {:.3}.",
+                self.endpoint_id, packet.flow_id, now,
+            );
+
             if !self.flow_finish_outputs.is_empty() {
                 for output in self.flow_finish_outputs.iter_mut() {
                     output
@@ -108,6 +124,11 @@ impl BasicPacketSink {
                     now,
                 );
             }
+
+            // logs a final report
+            self.log_report(now, ReportTiming::Final);
+        } else {
+            self.log_report(now, ReportTiming::InProgress);
         }
     }
 }

@@ -20,6 +20,12 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
 }
 
+#[derive(Debug, PartialEq)]
+pub enum ReportTiming {
+    InProgress,
+    Final,
+}
+
 enum ElementType {
     Source,
     Scheduler,
@@ -94,9 +100,9 @@ impl ReportLogger {
         Arc::clone(instance.as_ref().unwrap())
     }
 
-    pub fn log_report(report: Report) {
+    pub fn log_report(report: Report, timing: ReportTiming) {
         let report_logger = &ReportLogger::get_instance().report_logger;
-        report_logger.log_report(report);
+        report_logger.log_report(report, timing);
     }
 
     pub fn get_report_interval() -> f64 {
@@ -113,14 +119,21 @@ impl ReportLogger {
 pub struct CsvLogger {}
 
 impl CsvLogger {
-    pub fn log_report(&self, report: Report) {
-        let max_log_num = 10000;
+    fn logging_due(&self, log_len: usize, timing: ReportTiming) -> bool {
+        let max_log_len = 10000;
 
+        match timing {
+            ReportTiming::InProgress => log_len >= max_log_len,
+            ReportTiming::Final => true,
+        }
+    }
+
+    pub fn log_report(&self, report: Report, timing: ReportTiming) {
         match report {
             Report::PacketSourceReport(report) => {
                 let mut reports = SOURCE_REPORTS.write().unwrap();
                 reports.push(report);
-                if reports.len() >= max_log_num {
+                if self.logging_due(reports.len(), timing) {
                     self.write_to_csv(ElementType::Source, &reports);
                     reports.clear();
                 }
@@ -128,7 +141,7 @@ impl CsvLogger {
             Report::SchedulerReport(report) => {
                 let mut reports = SCHEDULER_REPORTS.write().unwrap();
                 reports.push(report);
-                if reports.len() >= max_log_num {
+                if self.logging_due(reports.len(), timing) {
                     self.write_to_csv(ElementType::Scheduler, &reports);
                     reports.clear();
                 }
@@ -136,7 +149,7 @@ impl CsvLogger {
             Report::PacketSinkReport(report) => {
                 let mut reports = SINK_REPORTS.write().unwrap();
                 reports.push(report);
-                if reports.len() >= max_log_num {
+                if self.logging_due(reports.len(), timing) {
                     // Compute packet stats before writing reports
                     self.compute_packet_stats(&reports);
 

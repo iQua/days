@@ -23,7 +23,7 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
-use crate::utils::logger::ReportLogger;
+use crate::utils::logger::{ReportLogger, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
@@ -303,10 +303,10 @@ impl PacketSink {
 
             match self {
                 PacketSink::BasicPacketSink(sink) => {
-                    sink.log_report(now);
+                    sink.log_report(now, ReportTiming::InProgress);
                 }
                 PacketSink::TCPPacketSink(sink) => {
-                    sink.log_report(now);
+                    sink.log_report(now, ReportTiming::InProgress);
                 }
             }
 

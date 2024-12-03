@@ -15,7 +15,7 @@ use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::logger::{Report, ReportLogger, ReportTiming};
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -280,7 +280,7 @@ impl DRRServer {
 
             let report = self.generate_report(now);
 
-            ReportLogger::log_report(Report::SchedulerReport(report));
+            ReportLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
             debug!(
                 "DRRServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
