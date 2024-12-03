@@ -89,37 +89,33 @@ impl BasicPacketSink {
         self.received_sizes = 0;
     }
 
+    pub async fn process(&mut self, packet: Packet, now: f64) {
+        self.packet_statistics.update(&packet, now);
+        self.update_report_stats(&packet, now);
+    }
+
     /// Notifies sources that wait for this flow to end when receiving the last
     /// packet.
-    pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
-        if packet.last_packet {
-            debug!(
-                "PacketSink {} received the last packet of flow {} at time {:.3}.",
-                self.endpoint_id, packet.flow_id, now,
-            );
-
-            if !self.flow_finish_outputs.is_empty() {
-                for output in self.flow_finish_outputs.iter_mut() {
-                    output
-                        .send(FlowFinishMsg {
-                            flow_id: self.flow_id,
-                        })
-                        .await;
-                }
-                debug!(
-                    "PacketSink {} of flow {} notified {} flow(s) to start at time {:.3}.",
-                    self.endpoint_id,
-                    self.flow_id,
-                    self.flow_finish_outputs.len(),
-                    now,
-                );
+    pub async fn wrap_up(&mut self, now: f64) {
+        if !self.flow_finish_outputs.is_empty() {
+            for output in self.flow_finish_outputs.iter_mut() {
+                output
+                    .send(FlowFinishMsg {
+                        flow_id: self.flow_id,
+                    })
+                    .await;
             }
-
-            // logs a final report
-            self.log_report(now, ReportTiming::Final);
-        } else {
-            self.log_report(now, ReportTiming::InProgress);
+            debug!(
+                "PacketSink {} of flow {} notified {} flow(s) to start at time {:.3}.",
+                self.endpoint_id,
+                self.flow_id,
+                self.flow_finish_outputs.len(),
+                now,
+            );
         }
+
+        // logs a final report
+        self.log_report(now, ReportTiming::Final);
     }
 }
 

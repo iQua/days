@@ -260,26 +260,22 @@ impl PacketSink {
         }
     }
 
-    async fn wrap_up(&mut self, packet: Packet, now: f64) {
+    async fn wrap_up(&mut self, now: f64) {
         match self {
-            PacketSink::BasicPacketSink(sink) => sink.wrap_up(packet, now).await,
-            PacketSink::TCPPacketSink(sink) => sink.wrap_up(packet, now).await,
+            PacketSink::BasicPacketSink(sink) => sink.wrap_up(now).await,
+            PacketSink::TCPPacketSink(sink) => sink.wrap_up(now).await,
+        }
+    }
+
+    async fn process(&mut self, packet: Packet, now: f64) {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
+            PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
         }
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        match self {
-            PacketSink::BasicPacketSink(sink) => {
-                sink.packet_statistics.update(&packet, now);
-                sink.update_report_stats(&packet, now);
-            }
-            PacketSink::TCPPacketSink(sink) => {
-                sink.packet_statistics.update(&packet, now);
-                sink.update_report_stats(&packet, now);
-            }
-        };
 
         debug!(
             "{} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -290,7 +286,18 @@ impl PacketSink {
             now,
         );
 
-        self.wrap_up(packet, now).await;
+        if packet.last_packet {
+            debug!(
+                "{} received the last packet of flow {} at time {:.3}.",
+                format!("{self}"),
+                packet.flow_id,
+                now,
+            );
+
+            self.wrap_up(now).await;
+        } else {
+            self.process(packet, now).await;
+        }
     }
 
     fn log_report<'a>(

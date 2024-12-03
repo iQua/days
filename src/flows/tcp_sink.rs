@@ -95,7 +95,7 @@ impl TCPPacketSink {
         self.received_sizes = 0;
     }
 
-    pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
+    pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
 
         // inserts the packet into the receive buffer and sorts based on the
@@ -139,6 +139,17 @@ impl TCPPacketSink {
             "TCPPacketSink {} sent ack packet {} ({} bytes) at time {:.3}.",
             self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
         );
+    }
+
+    pub async fn process(&mut self, packet: Packet, now: f64) {
+        self.packet_statistics.update(&packet, now);
+        self.update_report_stats(&packet, now);
+        self.produce_ack(packet, now).await;
+    }
+
+    pub async fn wrap_up(&mut self, now: f64) {
+        // logs a final report
+        self.log_report(now, ReportTiming::Final);
     }
 }
 
