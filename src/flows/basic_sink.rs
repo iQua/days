@@ -27,9 +27,6 @@ pub struct BasicPacketSink {
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
 
-    /// the time to generate the next periodic report
-    report_time: f64,
-
     /// the statistics of a periodic report
     report_start_time: f64,
     received_packets: usize,
@@ -49,7 +46,6 @@ impl BasicPacketSink {
             statistics: Output::default(),
             output: Output::default(),
             flow_finish_outputs: Vec::new(),
-            report_time: ReportLogger::get_report_interval(),
             report_start_time: 0.0,
             received_packets: 0,
             received_sizes: 0,
@@ -70,7 +66,6 @@ impl BasicPacketSink {
     }
 
     pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
-        if now >= self.report_time || timing == ReportTiming::Final {
             let report = PacketSinkReport {
                 id: self.endpoint_id,
                 flow_id: self.flow_id,
