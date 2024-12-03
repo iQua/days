@@ -316,10 +316,10 @@ impl PacketSource {
                 if ReportLogger::get_report_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {
-                            source.log_report(now, ReportTiming::InProgress);
+                            source.log_report(now, ReportTiming::Final);
                         }
                         PacketSource::TCPPacketSource(source) => {
-                            source.log_report(now, ReportTiming::InProgress);
+                            source.log_report(now, ReportTiming::Final);
                         }
                     };
                 }

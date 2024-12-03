@@ -66,32 +66,27 @@ impl BasicPacketSink {
     }
 
     pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
-            let report = PacketSinkReport {
-                id: self.endpoint_id,
-                flow_id: self.flow_id,
-                start_time: self.report_start_time,
-                end_time: now,
-                received_packets: self.received_packets,
-                received_sizes: self.received_sizes,
-                queueing_delay_mean: self.queueing_delay_mean,
-                one_way_delay_mean: self.one_way_delay_mean,
-            };
+        let report = PacketSinkReport {
+            id: self.endpoint_id,
+            flow_id: self.flow_id,
+            start_time: self.report_start_time,
+            end_time: now,
+            received_packets: self.received_packets,
+            received_sizes: self.received_sizes,
+            queueing_delay_mean: self.queueing_delay_mean,
+            one_way_delay_mean: self.one_way_delay_mean,
+        };
 
-            ReportLogger::log_report(Report::PacketSinkReport(report), timing);
-            debug!(
-                "PacketSink {} logged a periodic report at time {:.3}.",
-                self.endpoint_id, now
-            );
+        ReportLogger::log_report(Report::PacketSinkReport(report), timing);
+        debug!(
+            "PacketSink {} logged a periodic report at time {:.3}.",
+            self.endpoint_id, now
+        );
 
-            // resets the statistics of report
-            self.report_start_time = now;
-            self.received_packets = 0;
-            self.received_sizes = 0;
-
-            while now >= self.report_time {
-                self.report_time += ReportLogger::get_report_interval();
-            }
-        }
+        // resets the statistics of report
+        self.report_start_time = now;
+        self.received_packets = 0;
+        self.received_sizes = 0;
     }
 
     /// Notifies sources that wait for this flow to end when receiving the last
