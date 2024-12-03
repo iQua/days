@@ -316,13 +316,6 @@ impl PacketSink {
                     sink.log_report(now, ReportTiming::InProgress);
                 }
             }
-
-            cx.schedule_event(
-                Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                Self::log_report,
-                (),
-            )
-            .unwrap();
         }
     }
 }
