@@ -94,7 +94,7 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-latest-large
+          - runner: macos-13
             target: x86_64
           - runner: macos-latest
             target: aarch64
