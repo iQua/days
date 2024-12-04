@@ -255,26 +255,13 @@ impl PacketSink {
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
+                sink.log_report(now, ReportTiming::Final);
                 sink.statistics.send(sink.packet_statistics.clone()).await
             }
             PacketSink::TCPPacketSink(sink) => {
-                sink.wrap_up(now).await;
+                sink.log_report(now, ReportTiming::Final);
                 sink.statistics.send(sink.packet_statistics.clone()).await;
             }
-        }
-    }
-
-    async fn wrap_up(&mut self, now: f64) {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.wrap_up(now).await,
-            PacketSink::TCPPacketSink(sink) => sink.wrap_up(now).await,
-        }
-    }
-
-    async fn process(&mut self, packet: Packet, now: f64) {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
-            PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
         }
     }
 
@@ -290,17 +277,9 @@ impl PacketSink {
             now,
         );
 
-        if packet.last_packet {
-            debug!(
-                "{} received the last packet of flow {} at time {:.3}.",
-                format!("{self}"),
-                packet.flow_id,
-                now,
-            );
-
-            self.wrap_up(now).await;
-        } else {
-            self.process(packet, now).await;
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
+            PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
         }
     }
 

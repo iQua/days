@@ -92,11 +92,14 @@ impl BasicPacketSink {
     pub async fn process(&mut self, packet: Packet, now: f64) {
         self.packet_statistics.update(&packet, now);
         self.update_report_stats(&packet, now);
+
+        if packet.last_packet {
+            self.notify_pending_sources(now).await;
+        }
     }
 
-    /// Notifies sources that wait for this flow to end when receiving the last
-    /// packet.
-    pub async fn wrap_up(&mut self, now: f64) {
+    /// Notifies pending sources that are waiting for this flow to end
+    pub async fn notify_pending_sources(&mut self, now: f64) {
         if !self.flow_finish_outputs.is_empty() {
             for output in self.flow_finish_outputs.iter_mut() {
                 output
@@ -113,9 +116,6 @@ impl BasicPacketSink {
                 now,
             );
         }
-
-        // logs a final report
-        self.log_report(now, ReportTiming::Final);
     }
 }
 

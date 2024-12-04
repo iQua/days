@@ -146,11 +146,6 @@ impl TCPPacketSink {
         self.update_report_stats(&packet, now);
         self.produce_ack(packet, now).await;
     }
-
-    pub async fn wrap_up(&mut self, now: f64) {
-        // logs a final report
-        self.log_report(now, ReportTiming::Final);
-    }
 }
 
 impl Model for TCPPacketSink {}
