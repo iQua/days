@@ -247,9 +247,14 @@ impl PacketSink {
         }
     }
 
-    pub async fn report(&mut self, endpoint_id: usize) {
+    pub async fn report(&mut self, endpoint_id: usize, cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", format!("{self}"));
+
+        self.wrap_up(now).await;
+
         match self {
             PacketSink::BasicPacketSink(sink) => {
                 sink.statistics.send(sink.packet_statistics.clone()).await
