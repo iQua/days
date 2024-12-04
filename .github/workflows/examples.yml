@@ -1,4 +1,4 @@
-name: Run Examples as Tests
+name: Run Examples and Test Cases
 
 on:
   push:
@@ -37,5 +37,7 @@ jobs:
             if [ -f "$example" ]; then
               echo "Running example: $example"
               cargo run --release --example $(basename "$example" .rs)
+              echo "Running tests"
+              cargo test
             fi
           done
