@@ -253,14 +253,13 @@ impl PacketSink {
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", format!("{self}"));
 
-        self.wrap_up(now).await;
-
         match self {
             PacketSink::BasicPacketSink(sink) => {
                 sink.statistics.send(sink.packet_statistics.clone()).await
             }
             PacketSink::TCPPacketSink(sink) => {
-                sink.statistics.send(sink.packet_statistics.clone()).await
+                sink.wrap_up(now).await;
+                sink.statistics.send(sink.packet_statistics.clone()).await;
             }
         }
     }
