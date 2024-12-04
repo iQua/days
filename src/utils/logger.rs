@@ -2,11 +2,9 @@
 //! and sinks to three CSV files.
 
 use std::fs::{create_dir_all, File, OpenOptions};
-use std::sync::RwLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use csv::WriterBuilder;
-use lazy_static::lazy_static;
 use log::info;
 
 use crate::flows::sink::PacketSinkReport;
@@ -20,21 +18,29 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
 }
 
+#[derive(Debug, PartialEq)]
+pub enum ReportTiming {
+    InProgress,
+    Final,
+}
+
 enum ElementType {
     Source,
     Scheduler,
     Sink,
 }
 
-lazy_static! {
-    pub static ref LOG_FILES_DIR: RwLock<String> = RwLock::new(String::default());
-    pub static ref REPORT_INTERVAL: RwLock<f64> = RwLock::new(f64::MAX);
-    pub static ref SOURCE_REPORTS: RwLock<Vec<PacketSourceReport>> = RwLock::new(Vec::new());
-    pub static ref SCHEDULER_REPORTS: RwLock<Vec<SchedulerReport>> = RwLock::new(Vec::new());
-    pub static ref SINK_REPORTS: RwLock<Vec<PacketSinkReport>> = RwLock::new(Vec::new());
-    pub static ref TOTAL_PACKETS: RwLock<usize> = RwLock::new(0);
-    pub static ref TOTAL_DELAY: RwLock<f64> = RwLock::new(0.0);
-}
+pub static LOG_FILES_DIR: LazyLock<RwLock<String>> =
+    LazyLock::new(|| RwLock::new("./output/".to_string()));
+pub static REPORT_INTERVAL: LazyLock<RwLock<f64>> = LazyLock::new(|| RwLock::new(f64::MAX));
+pub static SOURCE_REPORTS: LazyLock<RwLock<Vec<PacketSourceReport>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+pub static SCHEDULER_REPORTS: LazyLock<RwLock<Vec<SchedulerReport>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+pub static SINK_REPORTS: LazyLock<RwLock<Vec<PacketSinkReport>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+pub static TOTAL_PACKETS: LazyLock<RwLock<usize>> = LazyLock::new(|| RwLock::new(0));
+pub static TOTAL_DELAY: LazyLock<RwLock<f64>> = LazyLock::new(|| RwLock::new(0.0));
 
 pub struct ReportLogger {
     report_logger: CsvLogger,
@@ -57,35 +63,35 @@ impl ReportLogger {
 
         if let Err(e) = create_dir_all(&log_dir) {
             panic!(
-                "Error '{}' occurred when creating a directory {} for log files",
+                "Error '{}' occurred when creating directory {} for log files",
                 e, &log_dir
             );
         };
-        for element in vec!["sources", "switches", "sinks"] {
+
+        // Create output files
+        for element in ["sources", "switches", "sinks"] {
             let file_name = format!("{log_dir}{element}.csv");
             if let Err(e) = File::create(&file_name) {
                 panic!(
-                    "Error '{}' occurred when creating a log file {}",
+                    "Error '{}' occurred when creating log file {}",
                     e, &file_name
                 );
-            };
+            }
         }
+
         info!(
             "Outputs of this simulation run will be logged to three CSV files under directory {}.",
             &log_dir
         );
 
-        let mut log_path_static = LOG_FILES_DIR.write().unwrap();
-        *log_path_static = log_dir;
-
-        let mut report_interval_static = REPORT_INTERVAL.write().unwrap();
-        *report_interval_static = report_interval;
+        // Store configs using RwLock only
+        *LOG_FILES_DIR.write().unwrap() = log_dir;
+        *REPORT_INTERVAL.write().unwrap() = report_interval;
     }
 
     pub fn get_instance() -> Arc<ReportLogger> {
-        lazy_static! {
-            static ref INSTANCE: Mutex<Option<Arc<ReportLogger>>> = Mutex::new(None);
-        }
+        static INSTANCE: LazyLock<Mutex<Option<Arc<ReportLogger>>>> =
+            LazyLock::new(|| Mutex::new(None));
 
         let mut instance = INSTANCE.lock().unwrap();
         if instance.is_none() {
@@ -94,9 +100,9 @@ impl ReportLogger {
         Arc::clone(instance.as_ref().unwrap())
     }
 
-    pub fn log_report(report: Report) {
+    pub fn log_report(report: Report, timing: ReportTiming) {
         let report_logger = &ReportLogger::get_instance().report_logger;
-        report_logger.log_report(report);
+        report_logger.log_report(report, timing);
     }
 
     pub fn get_report_interval() -> f64 {
@@ -113,14 +119,21 @@ impl ReportLogger {
 pub struct CsvLogger {}
 
 impl CsvLogger {
-    pub fn log_report(&self, report: Report) {
-        let max_log_num = 10000;
+    fn logging_due(&self, log_len: usize, timing: ReportTiming) -> bool {
+        let max_log_len = 10000;
 
+        match timing {
+            ReportTiming::InProgress => log_len >= max_log_len,
+            ReportTiming::Final => true,
+        }
+    }
+
+    pub fn log_report(&self, report: Report, timing: ReportTiming) {
         match report {
             Report::PacketSourceReport(report) => {
                 let mut reports = SOURCE_REPORTS.write().unwrap();
                 reports.push(report);
-                if reports.len() >= max_log_num {
+                if self.logging_due(reports.len(), timing) {
                     self.write_to_csv(ElementType::Source, &reports);
                     reports.clear();
                 }
@@ -128,7 +141,7 @@ impl CsvLogger {
             Report::SchedulerReport(report) => {
                 let mut reports = SCHEDULER_REPORTS.write().unwrap();
                 reports.push(report);
-                if reports.len() >= max_log_num {
+                if self.logging_due(reports.len(), timing) {
                     self.write_to_csv(ElementType::Scheduler, &reports);
                     reports.clear();
                 }
@@ -136,7 +149,7 @@ impl CsvLogger {
             Report::PacketSinkReport(report) => {
                 let mut reports = SINK_REPORTS.write().unwrap();
                 reports.push(report);
-                if reports.len() >= max_log_num {
+                if self.logging_due(reports.len(), timing) {
                     // Compute packet stats before writing reports
                     self.compute_packet_stats(&reports);
 
@@ -155,13 +168,13 @@ impl CsvLogger {
 
         let csv_file_name = match element {
             ElementType::Source => {
-                format!("{log_dir}sources.csv")
+                format!("{}sources.csv", log_dir)
             }
             ElementType::Scheduler => {
-                format!("{log_dir}switches.csv")
+                format!("{}switches.csv", log_dir)
             }
             ElementType::Sink => {
-                format!("{log_dir}sinks.csv")
+                format!("{}sinks.csv", log_dir)
             }
         };
 
@@ -186,11 +199,10 @@ impl CsvLogger {
         }
     }
 
-    fn compute_packet_stats(&self, reports: &Vec<PacketSinkReport>) {
+    fn compute_packet_stats(&self, reports: &[PacketSinkReport]) {
         let mut total_packets = TOTAL_PACKETS.write().unwrap();
         let mut total_delay = TOTAL_DELAY.write().unwrap();
 
-        // Compute stats in one pass
         for report in reports {
             *total_packets += report.received_packets;
             *total_delay += report.one_way_delay_mean * report.received_packets as f64;
@@ -198,6 +210,7 @@ impl CsvLogger {
     }
 
     pub fn generate_output_files(&self) {
+        // Update access patterns for thread safety
         let reports = SOURCE_REPORTS.read().unwrap();
         self.write_to_csv(ElementType::Source, &reports);
 
@@ -207,15 +220,13 @@ impl CsvLogger {
         let reports = SINK_REPORTS.read().unwrap();
         self.write_to_csv(ElementType::Sink, &reports);
 
-        let log_dir = LOG_FILES_DIR.read().unwrap();
-        info!(
-            "Wrote outputs of this simulation run to three csv files under directory {}.",
-            &log_dir
-        );
-
-        let total_packets = TOTAL_PACKETS.read().unwrap();
-        let total_delay = TOTAL_DELAY.read().unwrap();
-        let avg_delay = *total_delay / *total_packets as f64;
+        let total_packets = *TOTAL_PACKETS.read().unwrap();
+        let total_delay = *TOTAL_DELAY.read().unwrap();
+        let avg_delay = if total_packets > 0 {
+            total_delay / total_packets as f64
+        } else {
+            0.0
+        };
 
         info!("Total packets processed: {}", total_packets);
         info!("Average one-way delay: {:.6} seconds", avg_delay);

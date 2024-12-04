@@ -11,7 +11,7 @@ use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::logger::{Report, ReportLogger, ReportTiming};
 
 #[derive(Debug)]
 pub struct TCPPacketSink {
@@ -71,7 +71,7 @@ impl TCPPacketSink {
         self.received_sizes += packet.size;
     }
 
-    pub fn log_report(&mut self, now: f64) {
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -83,7 +83,7 @@ impl TCPPacketSink {
             one_way_delay_mean: self.one_way_delay_mean,
         };
 
-        ReportLogger::log_report(Report::PacketSinkReport(report));
+        ReportLogger::log_report(Report::PacketSinkReport(report), timing);
         debug!(
             "TCPPacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now
@@ -95,7 +95,7 @@ impl TCPPacketSink {
         self.received_sizes = 0;
     }
 
-    pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
+    pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
 
         // inserts the packet into the receive buffer and sorts based on the
@@ -139,6 +139,12 @@ impl TCPPacketSink {
             "TCPPacketSink {} sent ack packet {} ({} bytes) at time {:.3}.",
             self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
         );
+    }
+
+    pub async fn process(&mut self, packet: Packet, now: f64) {
+        self.packet_statistics.update(&packet, now);
+        self.update_report_stats(&packet, now);
+        self.produce_ack(packet, now).await;
     }
 }
 

@@ -11,7 +11,7 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger};
+use crate::utils::logger::{Report, ReportLogger, ReportTiming};
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
@@ -26,7 +26,8 @@ pub struct BasicPacketSink {
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
-    /// the statistics of a preiodic report
+
+    /// the statistics of a periodic report
     report_start_time: f64,
     received_packets: usize,
     received_sizes: usize,
@@ -64,7 +65,7 @@ impl BasicPacketSink {
         self.received_sizes += packet.size;
     }
 
-    pub fn log_report(&mut self, now: f64) {
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -76,7 +77,7 @@ impl BasicPacketSink {
             one_way_delay_mean: self.one_way_delay_mean,
         };
 
-        ReportLogger::log_report(Report::PacketSinkReport(report));
+        ReportLogger::log_report(Report::PacketSinkReport(report), timing);
         debug!(
             "PacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now
@@ -88,26 +89,32 @@ impl BasicPacketSink {
         self.received_sizes = 0;
     }
 
-    /// Notifies sources that wait for this flow to end when receiving the last
-    /// packet.
-    pub async fn wrap_up(&mut self, packet: Packet, now: f64) {
+    pub async fn process(&mut self, packet: Packet, now: f64) {
+        self.packet_statistics.update(&packet, now);
+        self.update_report_stats(&packet, now);
+
         if packet.last_packet {
-            if !self.flow_finish_outputs.is_empty() {
-                for output in self.flow_finish_outputs.iter_mut() {
-                    output
-                        .send(FlowFinishMsg {
-                            flow_id: self.flow_id,
-                        })
-                        .await;
-                }
-                debug!(
-                    "PacketSink {} of flow {} notified {} flow(s) to start at time {:.3}.",
-                    self.endpoint_id,
-                    self.flow_id,
-                    self.flow_finish_outputs.len(),
-                    now,
-                );
+            self.notify_pending_sources(now).await;
+        }
+    }
+
+    /// Notifies pending sources that are waiting for this flow to end
+    pub async fn notify_pending_sources(&mut self, now: f64) {
+        if !self.flow_finish_outputs.is_empty() {
+            for output in self.flow_finish_outputs.iter_mut() {
+                output
+                    .send(FlowFinishMsg {
+                        flow_id: self.flow_id,
+                    })
+                    .await;
             }
+            debug!(
+                "PacketSink {} of flow {} notified {} flow(s) to start at time {:.3}.",
+                self.endpoint_id,
+                self.flow_id,
+                self.flow_finish_outputs.len(),
+                now,
+            );
         }
     }
 }

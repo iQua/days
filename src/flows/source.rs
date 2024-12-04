@@ -21,7 +21,7 @@ use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
-use crate::utils::logger::ReportLogger;
+use crate::utils::logger::{ReportLogger, ReportTiming};
 use crate::utils::progress::FinishMsg;
 
 #[derive(Clone, Debug, Serialize)]
@@ -265,21 +265,12 @@ impl PacketSource {
 
             match self {
                 PacketSource::DistPacketSource(source) => {
-                    source.log_report(now);
+                    source.log_report(now, ReportTiming::InProgress);
                 }
                 PacketSource::TCPPacketSource(source) => {
-                    source.log_report(now);
+                    source.log_report(now, ReportTiming::InProgress);
                 }
             };
-
-            if !self.stop_run(now).await {
-                cx.schedule_event(
-                    Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                    Self::log_report,
-                    (),
-                )
-                .unwrap();
-            }
         }
     }
 
@@ -316,10 +307,10 @@ impl PacketSource {
                 if ReportLogger::get_report_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {
-                            source.log_report(now);
+                            source.log_report(now, ReportTiming::Final);
                         }
                         PacketSource::TCPPacketSource(source) => {
-                            source.log_report(now);
+                            source.log_report(now, ReportTiming::Final);
                         }
                     };
                 }

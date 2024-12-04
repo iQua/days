@@ -23,7 +23,7 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
-use crate::utils::logger::ReportLogger;
+use crate::utils::logger::{ReportLogger, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
@@ -247,39 +247,26 @@ impl PacketSink {
         }
     }
 
-    pub async fn report(&mut self, endpoint_id: usize) {
+    pub async fn report(&mut self, endpoint_id: usize, cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", format!("{self}"));
+
         match self {
             PacketSink::BasicPacketSink(sink) => {
+                sink.log_report(now, ReportTiming::Final);
                 sink.statistics.send(sink.packet_statistics.clone()).await
             }
             PacketSink::TCPPacketSink(sink) => {
-                sink.statistics.send(sink.packet_statistics.clone()).await
+                sink.log_report(now, ReportTiming::Final);
+                sink.statistics.send(sink.packet_statistics.clone()).await;
             }
-        }
-    }
-
-    async fn wrap_up(&mut self, packet: Packet, now: f64) {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.wrap_up(packet, now).await,
-            PacketSink::TCPPacketSink(sink) => sink.wrap_up(packet, now).await,
         }
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        match self {
-            PacketSink::BasicPacketSink(sink) => {
-                sink.packet_statistics.update(&packet, now);
-                sink.update_report_stats(&packet, now);
-            }
-            PacketSink::TCPPacketSink(sink) => {
-                sink.packet_statistics.update(&packet, now);
-                sink.update_report_stats(&packet, now);
-            }
-        };
 
         debug!(
             "{} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -290,7 +277,10 @@ impl PacketSink {
             now,
         );
 
-        self.wrap_up(packet, now).await;
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
+            PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
+        }
     }
 
     fn log_report<'a>(
@@ -303,19 +293,12 @@ impl PacketSink {
 
             match self {
                 PacketSink::BasicPacketSink(sink) => {
-                    sink.log_report(now);
+                    sink.log_report(now, ReportTiming::InProgress);
                 }
                 PacketSink::TCPPacketSink(sink) => {
-                    sink.log_report(now);
+                    sink.log_report(now, ReportTiming::InProgress);
                 }
             }
-
-            cx.schedule_event(
-                Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                Self::log_report,
-                (),
-            )
-            .unwrap();
         }
     }
 }
