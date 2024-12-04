@@ -80,10 +80,14 @@ impl DistPacketSource {
 
     pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
         let interval = match self.traffic.arr_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng),
-            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
+            DistributionInfo::DiscreteUniform { low, high } => {
+                let dist = DiscreteUniform::new(low, high).unwrap();
+                dist.sample(&mut self.rng)
+            }
+            DistributionInfo::Exp { lambda } => {
+                let dist = Exp::new(lambda).unwrap();
+                dist.sample(&mut self.rng)
+            }
             DistributionInfo::Uniform { low, high } => {
                 if low == high {
                     low
@@ -94,26 +98,29 @@ impl DistPacketSource {
         };
 
         let packet_size = match self.traffic.pkt_size_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng)
-                as usize,
+            DistributionInfo::DiscreteUniform { low, high } => {
+                let dist = DiscreteUniform::new(low, high).unwrap();
+                dist.sample(&mut self.rng)
+            }
             DistributionInfo::Exp { lambda } => {
-                Exp::new(lambda).unwrap().sample(&mut self.rng) as usize
+                let dist = Exp::new(lambda).unwrap();
+                dist.sample(&mut self.rng)
             }
             DistributionInfo::Uniform { low, high } => {
                 if low == high {
-                    low as usize
+                    low
                 } else {
-                    Uniform::new(low, high).unwrap().sample(&mut self.rng) as usize
+                    Uniform::new(low, high).unwrap().sample(&mut self.rng)
                 }
             }
         };
 
-        let mut packet = Packet::new(packet_size, self.packets_sent, self.flow_id, now);
+        // Ensure that the packet size is non-negative and at least 1 byte
+        let rounded_packet_size = packet_size.round().max(1.0) as usize;
+        let mut packet = Packet::new(rounded_packet_size, self.packets_sent, self.flow_id, now);
 
         if self.traffic.size.exceeded(
-            self.sent_size + packet_size,
+            self.sent_size + rounded_packet_size,
             self.flow_start_time,
             now + interval,
         ) {
