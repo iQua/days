@@ -15,7 +15,7 @@ category = "FatTree"
     k = 96
 
 [switch]
-port_rate = 10000000 # 10Gbps
+port_rate = 100000000 # 100 Mbps
 capacity = 1000
 weights = [1]
 discipline = "FIFO"
@@ -23,7 +23,7 @@ drop = "RED"
 
 [[flow_set]]
 flow_type = "TCP"
-flow_count = 200
+flow_count = 2000
 [flow_set.traffic]
     initial_delay = 0.0
     duration = 0.2
