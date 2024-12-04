@@ -4,9 +4,9 @@ seed = 100
 mailbox_capacity = 100
 duration = 0.2
 progress = 0.01
-num_threads = 10
+num_threads = 1
 log_path = "./tcp_fattree"
-log_interval =  0.1
+log_interval =  0.2
 
 [topology]
 category = "FatTree"
@@ -15,7 +15,7 @@ category = "FatTree"
     k = 96
 
 [switch]
-port_rate = 10000000000 # 10Gbps
+port_rate = 10000000 # 10Gbps
 capacity = 1000
 weights = [1]
 discipline = "FIFO"
