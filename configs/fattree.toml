@@ -1,6 +1,7 @@
 # An example configuration file for the FatTree topology.
 
 seed = 1000
+log_path = "logs/fattree"
 
 [topology]
 category = "FatTree"

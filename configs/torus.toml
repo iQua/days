@@ -1,6 +1,7 @@
 # An example configuration file for the Torus topology.
 
 seed = 1000
+log_path = "logs/torus"
 
 [topology]
 category = "Torus"

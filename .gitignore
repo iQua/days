@@ -4,4 +4,5 @@
 **/Cargo.lock
 
 # These are files related to logged outputs
-*.csv
+**/*.csv
+logs/**

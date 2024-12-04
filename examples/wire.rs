@@ -21,7 +21,7 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    ReportLogger::init(Some("wire/".to_string()), 1.0);
+    ReportLogger::init(Some("logs/wire".to_string()), 1.0);
 
     // instantiates models and their mailboxes
     let mut source = PacketSource::new(

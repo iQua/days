@@ -3,7 +3,7 @@
 seed = 1000
 edges = [[0, 1], [1, 2], [0, 2]]
 hosts = [0, 1, 2]
-log_path = "./custom_routing"
+log_path = "logs/custom_routing"
 log_interval = 1.0
 
 [switch]
