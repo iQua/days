@@ -1,8 +1,6 @@
 # Day: A Performant Discrete-Event Simulator for Network Simulations
 
-Developed with the Rust programming language, **Day** has been designed as a performant discrete-event simulator for network simulations using a multi-threaded design.
-
-In **Day**, a **multi-threaded** executor has been incorprated to oversee stackless coroutines. **Day** is designed based on the actor model, where each actor can only interact with its counterparts using message passing. It excels at large-scale network simulations due to its ability to use multiple CPU cores concurrently in the same simulation run.
+Developed with the Rust programming language, **Day** has been designed as a performant discrete-event simulator for network simulations. It uses stackless coroutines in asynchronous Rust to implement the [actor model](https://en.wikipedia.org/wiki/Actor_model), where each actor can only interact with its counterparts using message passing. It excels at both small-scale and large-scale network simulations due to its ability to use either a single-threaded or a multi-threaded runtime; the single-threaded runtime minimizes overhead, while the multi-threaded runtime utilizes multiple CPU cores concurrently in the same simulation run.
 
 To run a network simulation session using a configuration file, run:
 
@@ -26,6 +24,7 @@ edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
 progress = 2.0
 duration = 20.0
+num_threads = 1
 log_path = "./simple"
 log_interval = 1.0
 
@@ -110,6 +109,10 @@ The total duration of the simulation in seconds.
   ```toml
   progress = 1.0
   ```
+
+#### num_threads
+
+The number of threads to be used in the simulation run. By setting this value to 1, the single-threaded runtime will be used instead of the default multi-threaded runtime.
 
 #### log_path
 
@@ -330,7 +333,7 @@ The following table lists required, optional, or not supported attributes of a f
 
 #### flow_id
 
-The id of the flow.  
+The id of the flow.
 If not specified, the id of the first flow specified in the configuration file will be 0, and the subsequent ids of flows increase by 1.
 
 - **Valid value**: Integer
@@ -433,7 +436,7 @@ The path of the flow.
 
 #### traffic
 
-For a flow, it must specify its traffic under `[flow.traffic]`.  
+For a flow, it must specify its traffic under `[flow.traffic]`.
 For a flow set, it must specify the traffic of its flows under `[flow_set.traffic]`.
 
 The following table lists attributes of traffic.
@@ -477,7 +480,7 @@ The following table lists attributes of traffic.
 
 #### traffic.tcp
 
-For a flow, it must specify its tcp characteristics under `[flow.traffic.tcp]`.  
+For a flow, it must specify its tcp characteristics under `[flow.traffic.tcp]`.
 For a flow set, it must specify the tcp characteristics of its flows under `[flow_set.traffic.tcp]`.
 
 - **Attributes**:
@@ -663,7 +666,7 @@ For a collective set, `sinks` is set of the sink hosts of this collective set's 
 
 #### traffic
 
-For a collective, it must specify the traffic of its flows under `[collective.traffic]`.  
+For a collective, it must specify the traffic of its flows under `[collective.traffic]`.
 For a collective set, it must specify the traffic of its flows under `[collective_set.traffic]`.
 
 The following table lists attributes of traffic.
@@ -706,7 +709,7 @@ The following table lists attributes of traffic.
 
 #### traffic.tcp
 
-For a collective, it must specify the tcp characteristicsc of its flows under `[collective.traffic.tcp]`.  
+For a collective, it must specify the tcp characteristicsc of its flows under `[collective.traffic.tcp]`.
 For a collective set, it must specify the tcp characteristics of its collectives' flows under `[collective_set.traffic.tcp]`.
 
 - **Attributes**:
