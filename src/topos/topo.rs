@@ -677,15 +677,23 @@ impl Topology {
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 
+        // starts the performance measurement clock
+        let timer = std::time::Instant::now();
+
         // starts the simulation
         let _ = sim.step_until(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
+        let elapsed = timer.elapsed();
         info!(
-            "Simulation completed at time {:.3}.",
+            "Simulation completed at time {:.3} seconds in simulation time.",
             sim.time()
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64()
+        );
+        info!(
+            "Elapsed wall-clock time: {:.3} seconds.",
+            elapsed.as_secs_f64()
         );
 
         // generates three CSV files containing statistics of this simulation run
