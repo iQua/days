@@ -522,8 +522,8 @@ impl Topology {
                 .connect(PacketSwitch::packet_received, host_mbox);
 
             source
-                .finish_msg_output()
-                .connect(UserInterface::finish_msg_received, &report_mbox);
+                .report_output()
+                .connect(UserInterface::report_arrived, &report_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, source_mbox);
@@ -558,10 +558,7 @@ impl Topology {
             // receives (or source for TCP) its last packet
             for flow_id in flow.starts_before.iter() {
                 let mut flow_finish_output = Output::default();
-                flow_finish_output.connect(
-                    PacketSource::flow_finish_msg_received,
-                    &source_mboxes[&flow_id],
-                );
+                flow_finish_output.connect(PacketSource::flow_finished, &source_mboxes[&flow_id]);
                 match flow.flow_type {
                     FlowType::PacketDistribution => {
                         sink.connect_flow_finish_output(flow_finish_output);

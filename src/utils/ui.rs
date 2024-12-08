@@ -11,8 +11,7 @@ use log::debug;
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
-#[derive(Clone, Debug)]
-pub struct FinishMsg {}
+use crate::utils::reporter::Report;
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
@@ -57,7 +56,7 @@ impl UserInterface {
         (progress_interval, duration)
     }
 
-    pub fn finish_msg_received(&mut self, _finish_msg: FinishMsg, cx: &mut Context<Self>) {
+    pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {
         self.finished_sources += 1;
         debug!(
             "{} / {} sources have finished.",

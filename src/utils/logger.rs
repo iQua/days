@@ -10,13 +10,7 @@ use log::info;
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
-
-#[derive(Clone, Debug)]
-pub enum Report {
-    PacketSourceReport(PacketSourceReport),
-    SchedulerReport(SchedulerReport),
-    PacketSinkReport(PacketSinkReport),
-}
+use crate::utils::reporter::Report;
 
 #[derive(Debug, PartialEq)]
 pub enum ReportTiming {

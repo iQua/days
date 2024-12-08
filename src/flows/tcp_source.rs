@@ -18,8 +18,8 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
-use crate::utils::ui::FinishMsg;
+use crate::utils::logger::{ReportLogger, ReportTiming};
+use crate::utils::reporter::Report;
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
@@ -92,7 +92,7 @@ pub struct TCPPacketSource {
     sent_size_in_period: usize,
 
     pub output: Output<Packet>,
-    pub finish_msg_output: Output<FinishMsg>,
+    pub report_output: Output<Report>,
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
@@ -147,7 +147,7 @@ impl TCPPacketSource {
             sent_size: 0,
             sent_size_in_period: 0,
             output: Output::default(),
-            finish_msg_output: Output::default(),
+            report_output: Output::default(),
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,

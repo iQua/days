@@ -16,8 +16,8 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
-use crate::utils::ui::FinishMsg;
+use crate::utils::logger::{ReportLogger, ReportTiming};
+use crate::utils::reporter::Report;
 
 #[derive(Debug)]
 pub struct DistPacketSource {
@@ -32,7 +32,7 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
-    pub finish_msg_output: Output<FinishMsg>,
+    pub report_output: Output<Report>,
 
     pub report_start_time: f64,
 }
@@ -55,7 +55,7 @@ impl DistPacketSource {
             sent_size_in_period: 0,
             rng,
             output: Output::default(),
-            finish_msg_output: Output::default(),
+            report_output: Output::default(),
             report_start_time: 0.0,
         }
     }

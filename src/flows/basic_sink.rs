@@ -11,7 +11,8 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
+use crate::utils::logger::{ReportLogger, ReportTiming};
+use crate::utils::reporter::Report;
 
 #[derive(Debug)]
 pub struct BasicPacketSink {

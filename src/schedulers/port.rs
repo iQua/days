@@ -14,7 +14,8 @@ use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
+use crate::utils::logger::{ReportLogger, ReportTiming};
+use crate::utils::reporter::Report;
 
 pub struct Port {
     scheduler_id: usize,

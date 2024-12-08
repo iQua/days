@@ -22,7 +22,7 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::ui::FinishMsg;
+use crate::utils::reporter::Report;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
@@ -101,10 +101,10 @@ impl PacketSource {
         }
     }
 
-    pub fn finish_msg_output(&mut self) -> &mut Output<FinishMsg> {
+    pub fn report_output(&mut self) -> &mut Output<Report> {
         match self {
-            PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
+            PacketSource::DistPacketSource(source) => source.report_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.report_output.borrow_mut(),
         }
     }
 
@@ -317,18 +317,14 @@ impl PacketSource {
 
                 // notifies the UserInterface coroutine that the packet source
                 // finished running
-                self.finish_msg_output().send(FinishMsg {}).await;
+                self.report_output().send(Report {}).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
             }
         }
     }
 
-    pub async fn flow_finish_msg_received(
-        &mut self,
-        flow_finish_msg: FlowFinishMsg,
-        cx: &mut Context<Self>,
-    ) {
+    pub async fn flow_finished(&mut self, flow_finish_msg: FlowFinishMsg, cx: &mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(
