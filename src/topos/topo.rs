@@ -34,8 +34,8 @@ use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
 #[derive(Deserialize)]
-struct ProgressConfig {
-    progress: Option<f64>,
+struct UIConfig {
+    update_interval: Option<f64>,
     duration: Option<f64>,
 }
 
@@ -143,8 +143,8 @@ pub struct Topology {
     switch_config: SwitchConfig,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
-    /// the interval of updating the progress bar
-    progress: f64,
+    /// the interval of updating the user interface
+    update_interval: f64,
     /// the duration of the simulation run
     duration: f64,
 }
@@ -172,9 +172,10 @@ impl Topology {
             .unwrap_or(16)
             .min(usize::MAX / 2 + 1);
 
-        let pb_config: ProgressConfig =
-            toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let (progress, duration) = UserInterface::setup(pb_config.progress, pb_config.duration);
+        let ui_config: UIConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of the user interface");
+        let (update_interval, duration) =
+            UserInterface::setup(ui_config.update_interval, ui_config.duration);
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -191,7 +192,7 @@ impl Topology {
 
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
-        let report_interval = log_config.log_interval.unwrap_or(progress);
+        let report_interval = log_config.log_interval.unwrap_or(update_interval);
 
         // initializes the singleton of the logger of reports
         ReportLogger::init(log_config.log_path, report_interval);
@@ -209,7 +210,7 @@ impl Topology {
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
             mailbox_capacity,
-            progress,
+            update_interval,
             duration,
         }
     }
@@ -620,13 +621,11 @@ impl Topology {
         );
     }
 
-    /// Creates and activates a Progress coroutine to generate a progress bar and
+    /// Creates and activates a UserInterface coroutine, which contains a progress bar and
     /// collect reports from all the network elements.
-    fn activate_progress(mut self, update_ui: Mailbox<UserInterface>) -> Self {
-        let progress = UserInterface::new(self.progress, self.duration, self.flows.len());
-        self.sim_init = self
-            .sim_init
-            .add_model(progress, update_ui, "UserInterface");
+    fn activate_ui(mut self, update_ui: Mailbox<UserInterface>) -> Self {
+        let ui = UserInterface::new(self.update_interval, self.duration, self.flows.len());
+        self.sim_init = self.sim_init.add_model(ui, update_ui, "UserInterface");
 
         self
     }
@@ -669,7 +668,7 @@ impl Topology {
         self.route_flows();
 
         // creates and activates a Progress coroutine
-        self = self.activate_progress(update_ui);
+        self = self.activate_ui(update_ui);
 
         let duration = self.duration;
 

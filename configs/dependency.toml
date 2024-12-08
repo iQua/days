@@ -3,7 +3,7 @@
 seed = 1000
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
-progress = 2.0
+update_interval = 2.0
 duration = 20.0
 log_path = "logs/dependency"
 log_interval = 1.0

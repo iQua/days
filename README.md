@@ -22,7 +22,7 @@ Here is an example configuration file `simple.toml`:
 seed = 1000
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
-progress = 2.0
+update_interval = 2.0
 duration = 20.0
 num_threads = 1
 log_path = "./simple"
@@ -97,9 +97,9 @@ The total duration of the simulation in seconds.
   duration = 20.0
   ```
 
-#### progress
+#### update_interval
 
-**Day** provides a progress bar to visualize the progression of a simulation session. This `progress` element specifies the progress interval, which is the time interval to advance the position of the progress bar.
+**Day** provides a user interface, which includes a progress bar to visualize the progression of a simulation session. This `update_interval` element specifies the time interval to advance the position of the progress bar.
 
 - **Valid value**: Floating point number
 - **Required**: No
@@ -107,7 +107,7 @@ The total duration of the simulation in seconds.
 - **Example**:
 
   ```toml
-  progress = 1.0
+  update_interval = 1.0
   ```
 
 #### num_threads

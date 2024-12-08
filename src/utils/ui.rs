@@ -15,7 +15,7 @@ use crate::utils::reporter::Report;
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
-    progress_interval: f64,
+    update_interval: f64,
     duration: f64,
     num_sources: usize,
     finished_sources: usize,
@@ -23,13 +23,13 @@ pub struct UserInterface {
 }
 
 impl UserInterface {
-    pub fn new(progress_interval: f64, duration: f64, num_sources: usize) -> UserInterface {
+    pub fn new(update_interval: f64, duration: f64, num_sources: usize) -> UserInterface {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
         LogWrapper::new(multi.clone(), logger);
 
-        let progress_bar = ProgressBar::new((duration / progress_interval) as u64);
+        let progress_bar = ProgressBar::new((duration / update_interval) as u64);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
@@ -41,7 +41,7 @@ impl UserInterface {
 
         UserInterface {
             progress_bar: pg,
-            progress_interval,
+            update_interval,
             duration,
             num_sources,
             finished_sources: 0,
@@ -50,10 +50,10 @@ impl UserInterface {
     }
 
     /// Sets up progress interval and duration from a configuration file.
-    pub fn setup(progress: Option<f64>, duration: Option<f64>) -> (f64, f64) {
+    pub fn setup(update_interval: Option<f64>, duration: Option<f64>) -> (f64, f64) {
         let duration = duration.unwrap_or(1500.);
-        let progress_interval = progress.unwrap_or(duration / 100.);
-        (progress_interval, duration)
+        let update_interval = update_interval.unwrap_or(duration / 100.);
+        (update_interval, duration)
     }
 
     pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {
@@ -65,9 +65,8 @@ impl UserInterface {
         if self.finished_sources == self.num_sources {
             self.finished = true;
 
-            self.progress_bar.inc(
-                (self.duration / self.progress_interval) as u64 - self.progress_bar.position(),
-            );
+            self.progress_bar
+                .inc((self.duration / self.update_interval) as u64 - self.progress_bar.position());
 
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -85,16 +84,12 @@ impl UserInterface {
             }
         } else {
             self.progress_bar.inc(1);
-            if self.progress_bar.position() >= (self.duration / self.progress_interval) as u64 {
+            if self.progress_bar.position() >= (self.duration / self.update_interval) as u64 {
                 self.progress_bar.finish_and_clear();
                 self.finished = true;
             } else {
-                cx.schedule_event(
-                    Duration::from_secs_f64(self.progress_interval),
-                    Self::run,
-                    (),
-                )
-                .unwrap();
+                cx.schedule_event(Duration::from_secs_f64(self.update_interval), Self::run, ())
+                    .unwrap();
             }
         }
     }
