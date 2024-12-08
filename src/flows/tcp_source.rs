@@ -19,7 +19,7 @@ use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger, ReportTiming};
-use crate::utils::progress::FinishMsg;
+use crate::utils::ui::FinishMsg;
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {

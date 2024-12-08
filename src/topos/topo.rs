@@ -30,7 +30,7 @@ use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::utils::logger::ReportLogger;
-use crate::utils::progress::Progress;
+use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
 #[derive(Deserialize)]
@@ -174,7 +174,7 @@ impl Topology {
 
         let pb_config: ProgressConfig =
             toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let (progress, duration) = Progress::setup(pb_config.progress, pb_config.duration);
+        let (progress, duration) = UserInterface::setup(pb_config.progress, pb_config.duration);
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -469,13 +469,13 @@ impl Topology {
 
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
-    fn attach_flows(mut self, stats: &mut SinkStatistics) -> (Self, Mailbox<Progress>) {
+    fn attach_flows(mut self, stats: &mut SinkStatistics) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
 
-        let report_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
+        let report_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -523,7 +523,7 @@ impl Topology {
 
             source
                 .finish_msg_output()
-                .connect(Progress::finish_msg_received, &report_mbox);
+                .connect(UserInterface::finish_msg_received, &report_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, source_mbox);
@@ -625,9 +625,11 @@ impl Topology {
 
     /// Creates and activates a Progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
-    fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
-        let progress = Progress::new(self.progress, self.duration, self.flows.len());
-        self.sim_init = self.sim_init.add_model(progress, report_mbox, "Progress");
+    fn activate_progress(mut self, report_mbox: Mailbox<UserInterface>) -> Self {
+        let progress = UserInterface::new(self.progress, self.duration, self.flows.len());
+        self.sim_init = self
+            .sim_init
+            .add_model(progress, report_mbox, "UserInterface");
 
         self
     }
@@ -662,7 +664,7 @@ impl Topology {
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
 
-        let report_mbox: Mailbox<Progress>;
+        let report_mbox: Mailbox<UserInterface>;
         // attaches packet sources and sinks from flows to hosts in the network graph
         (self, report_mbox) = self.attach_flows(&mut statistics);
 

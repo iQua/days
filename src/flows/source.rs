@@ -22,7 +22,7 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::progress::FinishMsg;
+use crate::utils::ui::FinishMsg;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
@@ -315,7 +315,7 @@ impl PacketSource {
                     };
                 }
 
-                // notifies the Progress coroutine that the packet source
+                // notifies the UserInterface coroutine that the packet source
                 // finished running
                 self.finish_msg_output().send(FinishMsg {}).await;
 

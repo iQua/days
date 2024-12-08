@@ -17,7 +17,7 @@ use crate::flows::source::PacketSourceReport;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::{Report, ReportLogger, ReportTiming};
-use crate::utils::progress::FinishMsg;
+use crate::utils::ui::FinishMsg;
 
 #[derive(Debug)]
 pub struct DistPacketSource {

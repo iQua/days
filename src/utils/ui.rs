@@ -1,5 +1,6 @@
-//! Implements a Progress struct that generates a progress bar to illustrate the
-//! progress of the simulation run.
+//! Implements a UserInterface struct that includes a progress bar to illustrate the
+//! progress of the simulation run, as well as a report logger that logs reports
+//! to a .csv file.
 
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use nexosim::time::MonotonicTime;
 #[derive(Clone, Debug)]
 pub struct FinishMsg {}
 
-pub struct Progress {
+pub struct UserInterface {
     progress_bar: ProgressBar,
     progress_interval: f64,
     duration: f64,
@@ -22,8 +23,8 @@ pub struct Progress {
     finished: bool,
 }
 
-impl Progress {
-    pub fn new(progress_interval: f64, duration: f64, num_sources: usize) -> Progress {
+impl UserInterface {
+    pub fn new(progress_interval: f64, duration: f64, num_sources: usize) -> UserInterface {
         let multi = MultiProgress::new();
         let logger = env_logger::Builder::from_default_env().build();
 
@@ -39,7 +40,7 @@ impl Progress {
 
         let pg = multi.add(progress_bar);
 
-        Progress {
+        UserInterface {
             progress_bar: pg,
             progress_interval,
             duration,
@@ -100,7 +101,7 @@ impl Progress {
     }
 }
 
-impl Model for Progress {
+impl Model for UserInterface {
     async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         self.run((), cx);
         self.into()
