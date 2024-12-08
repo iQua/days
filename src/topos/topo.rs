@@ -475,7 +475,7 @@ impl Topology {
             self.flows.len()
         );
 
-        let report_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
+        let update_ui: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -523,7 +523,7 @@ impl Topology {
 
             source
                 .report_output()
-                .connect(UserInterface::report_arrived, &report_mbox);
+                .connect(UserInterface::report_arrived, &update_ui);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, source_mbox);
@@ -581,7 +581,7 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(source, source_mbox, "Source");
         }
 
-        (self, report_mbox)
+        (self, update_ui)
     }
 
     /// Computes routing decisions for all the flows, and installs Flow
@@ -622,11 +622,11 @@ impl Topology {
 
     /// Creates and activates a Progress coroutine to generate a progress bar and
     /// collect reports from all the network elements.
-    fn activate_progress(mut self, report_mbox: Mailbox<UserInterface>) -> Self {
+    fn activate_progress(mut self, update_ui: Mailbox<UserInterface>) -> Self {
         let progress = UserInterface::new(self.progress, self.duration, self.flows.len());
         self.sim_init = self
             .sim_init
-            .add_model(progress, report_mbox, "UserInterface");
+            .add_model(progress, update_ui, "UserInterface");
 
         self
     }
@@ -661,15 +661,15 @@ impl Topology {
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
 
-        let report_mbox: Mailbox<UserInterface>;
+        let update_ui: Mailbox<UserInterface>;
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, report_mbox) = self.attach_flows(&mut statistics);
+        (self, update_ui) = self.attach_flows(&mut statistics);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
 
         // creates and activates a Progress coroutine
-        self = self.activate_progress(report_mbox);
+        self = self.activate_progress(update_ui);
 
         let duration = self.duration;
 
