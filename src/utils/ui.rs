@@ -12,6 +12,7 @@ use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
 use crate::utils::reporter::Report;
+use crate::{get_update_interval, set_update_interval};
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
@@ -41,7 +42,7 @@ impl UserInterface {
 
         UserInterface {
             progress_bar: pg,
-            update_interval,
+            update_interval: get_update_interval(),
             duration,
             num_sources,
             finished_sources: 0,
@@ -50,10 +51,9 @@ impl UserInterface {
     }
 
     /// Sets up progress interval and duration from a configuration file.
-    pub fn setup(update_interval: Option<f64>, duration: Option<f64>) -> (f64, f64) {
+    pub fn setup(update_interval: Option<f64>, duration: Option<f64>) {
         let duration = duration.unwrap_or(1500.);
-        let update_interval = update_interval.unwrap_or(duration / 100.);
-        (update_interval, duration)
+        set_update_interval(update_interval.unwrap_or(duration / 100.));
     }
 
     pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {

@@ -1,5 +1,6 @@
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -21,6 +22,9 @@ static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
 static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
+
+// The update interval of the user interface
+static UPDATE_INTERVAL: OnceLock<f64> = OnceLock::new();
 
 pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
@@ -69,4 +73,12 @@ pub fn update_next_flow_id(next_flow_id: usize) {
 
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn get_update_interval() -> f64 {
+    *UPDATE_INTERVAL.get().unwrap()
+}
+
+pub fn set_update_interval(interval: f64) {
+    UPDATE_INTERVAL.set(interval).unwrap();
 }

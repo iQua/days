@@ -4,6 +4,7 @@ use log::debug;
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
+use crate::get_update_interval;
 use crate::schedulers::SchedulerReport;
 
 #[derive(Clone, Debug)]
@@ -30,8 +31,10 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    pub fn new(report_interval: f64) -> Reporter {
-        Reporter { report_interval }
+    pub fn new() -> Reporter {
+        Reporter {
+            report_interval: get_update_interval(),
+        }
     }
 
     pub fn report(report: Report, timing: ReportTiming) {
