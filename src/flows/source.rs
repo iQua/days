@@ -22,7 +22,6 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::get_update_interval;
-use crate::utils::logger::ReportLogger;
 use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
@@ -258,7 +257,7 @@ impl PacketSource {
         }
     }
 
-    fn log_report<'a>(
+    fn update_ui<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
@@ -416,12 +415,12 @@ impl PacketSource {
     }
 
     fn start_report_logger(&self, initial_delay: f64, cx: &mut Context<Self>) {
-        let report_interval = ReportLogger::get_report_interval();
-        if report_interval < f64::MAX {
+        let update_interval = get_update_interval();
+        if update_interval < f64::MAX {
             cx.schedule_periodic_event(
-                Duration::from_secs_f64(initial_delay + report_interval),
-                Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                Duration::from_secs_f64(initial_delay + update_interval),
+                Duration::from_secs_f64(update_interval),
+                Self::update_ui,
                 (),
             )
             .unwrap();

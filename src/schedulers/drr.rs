@@ -12,11 +12,10 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
-use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::ReportLogger;
 use crate::utils::ui::{Report, ReportTiming};
+use crate::{get_update_interval, next_scheduler_id};
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -273,7 +272,7 @@ impl DRRServer {
         }
     }
 
-    fn log_report<'a>(
+    fn update_ui<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
@@ -294,8 +293,8 @@ impl DRRServer {
             self.reset_stats(now);
 
             cx.schedule_event(
-                Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                Self::log_report,
+                Duration::from_secs_f64(get_update_interval()),
+                Self::update_ui,
                 (),
             )
             .unwrap();
@@ -351,11 +350,11 @@ impl ReportStatistics for DRRServer {
 
 impl Model for DRRServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        let report_interval = ReportLogger::get_report_interval();
-        if report_interval < f64::MAX {
+        let update_interval = get_update_interval();
+        if update_interval < f64::MAX {
             cx.schedule_event(
-                Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                Duration::from_secs_f64(update_interval),
+                Self::update_ui,
                 (),
             )
             .unwrap();

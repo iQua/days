@@ -32,14 +32,12 @@ pub static TOTAL_DELAY: LazyLock<RwLock<f64>> = LazyLock::new(|| RwLock::new(0.0
 
 pub struct ReportLogger {
     report_logger: CsvLogger,
-    report_interval: f64,
 }
 
 impl ReportLogger {
     pub fn new() -> ReportLogger {
         ReportLogger {
             report_logger: CsvLogger {},
-            report_interval: *REPORT_INTERVAL.read().unwrap(),
         }
     }
 
@@ -86,15 +84,6 @@ impl ReportLogger {
             *instance = Some(Arc::new(ReportLogger::new()));
         }
         Arc::clone(instance.as_ref().unwrap())
-    }
-
-    pub fn update_ui(report: Report, timing: ReportTiming) {
-        let report_logger = &ReportLogger::get_instance().report_logger;
-        report_logger.update_ui(report, timing);
-    }
-
-    pub fn get_report_interval() -> f64 {
-        ReportLogger::get_instance().report_interval
     }
 
     pub fn generate_output_files() {
