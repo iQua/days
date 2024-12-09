@@ -8,29 +8,13 @@ use std::time::Duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
-use serde::Serialize;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
-use crate::flows::sink::PacketSinkReport;
-use crate::flows::source::PacketSourceReport;
-use crate::schedulers::SchedulerReport;
+use crate::flows::FlowFinishMsg;
 use crate::topos::topo::UIConfig;
 use crate::{get_config_path, get_report_interval};
-
-#[derive(Clone, Debug)]
-pub enum Report {
-    PacketSourceReport(PacketSourceReport),
-    SchedulerReport(SchedulerReport),
-    PacketSinkReport(PacketSinkReport),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub enum ReportTiming {
-    InProgress,
-    Final,
-}
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
@@ -77,7 +61,7 @@ impl UserInterface {
             finished_sources: 0,
         }
     }
-    pub fn flow_finished(&mut self, _report: Report, cx: &mut Context<Self>) {
+    pub fn flow_finished(&mut self, _finished: FlowFinishMsg, cx: &mut Context<Self>) {
         self.finished_sources += 1;
         debug!(
             "{} / {} sources have finished.",

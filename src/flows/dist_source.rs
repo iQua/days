@@ -14,10 +14,11 @@ use nexosim::ports::Output;
 
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
+use crate::flows::FlowFinishMsg;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
-use crate::utils::ui::{Report, ReportTiming};
+use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct DistPacketSource {
@@ -32,7 +33,7 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
-    pub ui_output: Output<Report>,
+    pub ui_output: Output<FlowFinishMsg>,
 
     pub report_start_time: f64,
 }

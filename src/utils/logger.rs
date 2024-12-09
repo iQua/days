@@ -14,11 +14,23 @@ use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::get_config_path;
 use crate::schedulers::SchedulerReport;
-use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Report {
+    PacketSourceReport(PacketSourceReport),
+    SchedulerReport(SchedulerReport),
+    PacketSinkReport(PacketSinkReport),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub enum ReportTiming {
+    InProgress,
+    Final,
 }
 
 // Shared state structure

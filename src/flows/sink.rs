@@ -24,7 +24,7 @@ use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
 use crate::get_report_interval;
-use crate::utils::ui::ReportTiming;
+use crate::utils::logger::ReportTiming;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {

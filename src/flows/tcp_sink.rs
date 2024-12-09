@@ -12,7 +12,7 @@ use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
-use crate::utils::ui::{Report, ReportTiming};
+use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct TCPPacketSink {

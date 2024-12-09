@@ -22,7 +22,7 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_report_interval;
 use crate::get_seed;
-use crate::utils::ui::{Report, ReportTiming};
+use crate::utils::logger::ReportTiming;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
@@ -101,7 +101,7 @@ impl PacketSource {
         }
     }
 
-    pub fn ui_output(&mut self) -> &mut Output<Report> {
+    pub fn ui_output(&mut self) -> &mut Output<FlowFinishMsg> {
         match self {
             PacketSource::DistPacketSource(source) => source.ui_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.ui_output.borrow_mut(),
@@ -317,7 +317,7 @@ impl PacketSource {
 
                 // notifies the Progress coroutine that the packet source
                 // finished running
-                self.ui_output().send(FinishMsg {}).await;
+                self.ui_output().send(FlowFinishMsg { flow_id: 0 }).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
             }
