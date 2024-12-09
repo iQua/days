@@ -1,6 +1,5 @@
 //! Implements a UserInterface struct that includes a progress bar to illustrate the
-//! progress of the simulation run, as well as a report logger that logs reports
-//! to a .csv file.
+//! progress of the simulation run.
 
 use std::fs;
 use std::time::Duration;
@@ -30,8 +29,8 @@ impl UserInterface {
         // Obtain the user interface progress interval from the configuration file
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-        let ui_interval = ui_config.ui_interval.unwrap_or(1.0);
         let duration = ui_config.duration.unwrap_or(1500.);
+        let ui_interval = ui_config.ui_interval.unwrap_or(duration / 100.);
 
         let multi = MultiProgress::new();
         let env_logger = env_logger::Builder::from_default_env().build();

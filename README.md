@@ -98,7 +98,20 @@ The total duration of the simulation in seconds.
 
 #### report_interval
 
-**Day** provides a user interface, which includes a progress bar to visualize the progression of a simulation session. This `report_interval` element specifies the time interval to advance the position of the progress bar.
+The `report_interval` parameter specifies the time interval to log reports from all elements in the simulation.
+
+- **Valid value**: Floating point number
+- **Required**: No
+- **Default**: f64::MAX (No reports when the simulation is in progress, all reports are logged at the end.)
+- **Example**:
+
+  ```toml
+  report_interval = 1.0
+  ```
+
+#### ui_interval
+
+**Day** provides a user interface, which for now includes a progress bar to visualize the progression of a simulation session. This `ui_interval` element specifies the time interval to advance the position of the progress bar.
 
 - **Valid value**: Floating point number
 - **Required**: No
@@ -106,7 +119,7 @@ The total duration of the simulation in seconds.
 - **Example**:
 
   ```toml
-  report_interval = 1.0
+  ui_interval = 1.0
   ```
 
 #### num_threads
