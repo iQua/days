@@ -43,7 +43,6 @@ pub struct CsvLogger {
     // Shared state protected by locks
     shared_state: Arc<RwLock<SharedState>>,
     total_packets: Arc<AtomicUsize>,
-    file_lock: Arc<Mutex<()>>, // Lock for file operations
 }
 
 impl CsvLogger {
@@ -81,7 +80,6 @@ impl CsvLogger {
             max_log_len: 10000,
             shared_state: Arc::new(RwLock::new(SharedState::default())),
             total_packets: Arc::new(AtomicUsize::new(0)),
-            file_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -124,8 +122,6 @@ impl CsvLogger {
     where
         T: Serialize,
     {
-        let _guard = self.file_lock.lock().expect("Failed to acquire file lock");
-
         let csv_file_name = match element {
             ElementType::Source => format!("{}sources.csv", self.log_dir),
             ElementType::Scheduler => format!("{}switches.csv", self.log_dir),
@@ -194,31 +190,33 @@ impl CsvLogger {
         }
     }
 
-    pub fn generate_output_files(&self) {
-        let mut state = self.shared_state.write();
+    pub fn flush_reports() {
+        let logger = &CsvLogger::get_instance();
+        let mut state = logger.shared_state.write();
 
         // Write remaining reports
         if !state.source_reports.is_empty() {
             let reports = std::mem::take(&mut state.source_reports);
-            self.write_to_csv(ElementType::Source, &reports);
+            logger.write_to_csv(ElementType::Source, &reports);
         }
 
         if !state.scheduler_reports.is_empty() {
             let reports = std::mem::take(&mut state.scheduler_reports);
-            self.write_to_csv(ElementType::Scheduler, &reports);
+            logger.write_to_csv(ElementType::Scheduler, &reports);
         }
 
         if !state.sink_reports.is_empty() {
             let reports = std::mem::take(&mut state.sink_reports);
-            self.write_to_csv(ElementType::Sink, &reports);
+            logger.write_to_csv(ElementType::Sink, &reports);
 
             let (final_packets, final_delay) = Self::compute_sink_statistics(&reports);
-            self.total_packets
+            logger
+                .total_packets
                 .fetch_add(final_packets, Ordering::SeqCst);
             state.total_delay += final_delay;
         }
 
-        let total_packets = self.total_packets.load(Ordering::SeqCst);
+        let total_packets = logger.total_packets.load(Ordering::SeqCst);
         let avg_delay = if total_packets > 0 {
             state.total_delay / total_packets as f64
         } else {

@@ -29,6 +29,7 @@ use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
+use crate::utils::logger::CsvLogger;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_config_path, set_num_switches, set_report_interval};
 
@@ -675,6 +676,9 @@ impl Topology {
         // starts the simulation
         let _ = sim.step_until(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
+
+        // logs the remaining reports
+        CsvLogger::flush_reports();
 
         let elapsed = timer.elapsed();
         info!(
