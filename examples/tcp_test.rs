@@ -13,14 +13,10 @@ use day::flows::sink::PacketSink;
 use day::flows::source::PacketSource;
 use day::flows::wire::Wire;
 use day::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
-use day::utils::logger::ReportLogger;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
-
-    // initializes the singleton of the logger of reports
-    ReportLogger::init(Some("logs/tcp_test".to_string()), 1.0);
 
     // instantiates models
     let mut source = PacketSource::new(
@@ -87,9 +83,6 @@ fn main() {
                 "Simulation completed at time {:.3}.",
                 sim.time().duration_since(t0).as_secs_f64()
             );
-
-            // generates three CSV files containing statistics of this simulation run
-            ReportLogger::generate_output_files();
         }
         Err(e) => {
             info!("Simulation failed: {e}");

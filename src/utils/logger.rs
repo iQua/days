@@ -30,6 +30,8 @@ pub struct CsvLogger {
     scheduler_reports: Vec<SchedulerReport>,
     source_reports: Vec<PacketSourceReport>,
     sink_reports: Vec<PacketSinkReport>,
+    total_packets: usize,
+    total_delay: f64,
 }
 
 impl CsvLogger {
@@ -72,6 +74,8 @@ impl CsvLogger {
             scheduler_reports: Vec::new(),
             source_reports: Vec::new(),
             sink_reports: Vec::new(),
+            total_packets: 0,
+            total_delay: 0.0,
         }
     }
 
@@ -102,6 +106,9 @@ impl CsvLogger {
                 self.sink_reports.push(report);
                 if self.logging_due(self.sink_reports.len(), timing) {
                     self.write_to_csv(ElementType::Sink, &self.sink_reports);
+                    let (new_packets, new_delay) = self.compute_sink_statistics();
+                    self.total_packets += new_packets;
+                    self.total_delay += new_delay;
                     self.sink_reports.clear();
                 }
             }
@@ -145,13 +152,7 @@ impl CsvLogger {
         }
     }
 
-    pub fn generate_output_files(&self) {
-        // Write remaining reports to files
-        self.write_to_csv(ElementType::Source, &self.source_reports);
-        self.write_to_csv(ElementType::Scheduler, &self.scheduler_reports);
-        self.write_to_csv(ElementType::Sink, &self.sink_reports);
-
-        // Compute statistics using functional operations
+    fn compute_sink_statistics(&self) -> (usize, f64) {
         let total_packets = self
             .sink_reports
             .iter()
@@ -164,13 +165,26 @@ impl CsvLogger {
             .map(|report| report.one_way_delay_mean * report.received_packets as f64)
             .sum::<f64>();
 
-        let avg_delay = if total_packets > 0 {
-            total_delay / total_packets as f64
+        (total_packets, total_delay)
+    }
+
+    pub fn generate_output_files(&mut self) {
+        // Write remaining reports to files
+        self.write_to_csv(ElementType::Source, &self.source_reports);
+        self.write_to_csv(ElementType::Scheduler, &self.scheduler_reports);
+        self.write_to_csv(ElementType::Sink, &self.sink_reports);
+
+        let (final_packets, final_delay) = self.compute_sink_statistics();
+        self.total_packets += final_packets;
+        self.total_delay += final_delay;
+
+        let avg_delay = if self.total_packets > 0 {
+            self.total_delay / self.total_packets as f64
         } else {
             0.0
         };
 
-        info!("Total packets processed: {}", total_packets);
+        info!("Total packets processed: {}", self.total_packets);
         info!("Average one-way delay: {:.6} seconds", avg_delay);
     }
 }

@@ -77,6 +77,8 @@ impl UserInterface {
                     );
 
                     if self.finished_sources == self.num_sources {
+                        self.logger.generate_output_files();
+
                         self.progress_bar.inc(
                             (self.duration / self.update_interval) as u64
                                 - self.progress_bar.position(),
@@ -107,7 +109,6 @@ impl UserInterface {
     fn run(&mut self, _: (), cx: &mut Context<Self>) {
         if self.finished_sources == self.num_sources {
             self.progress_bar.finish_and_clear();
-            self.logger.generate_output_files();
         } else {
             if self.progress_bar.position() < (self.duration / self.update_interval) as u64 {
                 self.progress_bar.inc(1);
