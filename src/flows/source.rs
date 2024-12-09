@@ -315,6 +315,10 @@ impl PacketSource {
                     };
                 }
 
+                // notifies the Progress coroutine that the packet source
+                // finished running
+                self.ui_output().send(FinishMsg {}).await;
+
                 debug!("{} finished running at {:.3}.", name, now);
             }
         }
