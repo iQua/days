@@ -1,6 +1,7 @@
 //! Implements a report logger to log periodic reports of sources, schedulers,
 //! and sinks to three CSV files.
 
+use parking_lot::RwLock;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,9 +21,12 @@ struct LogConfig {
     log_path: Option<String>,
 }
 
-// Stats structure to hold shared counters
+// Shared state structure
 #[derive(Default, Debug)]
-struct Stats {
+struct SharedState {
+    source_reports: Vec<PacketSourceReport>,
+    scheduler_reports: Vec<SchedulerReport>,
+    sink_reports: Vec<PacketSinkReport>,
     total_delay: f64,
 }
 
@@ -32,102 +36,13 @@ enum ElementType {
     Sink,
 }
 
-#[derive(Serialize)]
-struct SourceReportForCsv {
-    pub id: usize,
-    pub flow_id: usize,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub sent_packets: usize,
-    pub packet_sizes: usize,
-    pub ack_bytes: usize,
-}
-
-#[derive(Serialize)]
-struct SchedulerReportForCsv {
-    pub id: usize,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub received_packets: usize,
-    pub dropped_packets: usize,
-    pub forwarded_packets: usize,
-    pub queue_length: usize,
-    pub received_sizes: usize,
-    pub forwarded_sizes: usize,
-    pub throughput_mean: f64,
-    pub queueing_delay_mean: f64,
-}
-
-#[derive(Serialize)]
-struct SinkReportForCsv {
-    pub id: usize,
-    pub flow_id: usize,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub received_packets: usize,
-    pub received_sizes: usize,
-    pub queueing_delay_mean: f64,
-    pub one_way_delay_mean: f64,
-}
-
-impl From<PacketSourceReport> for SourceReportForCsv {
-    fn from(report: PacketSourceReport) -> Self {
-        Self {
-            id: report.id,
-            flow_id: report.flow_id,
-            start_time: report.start_time,
-            end_time: report.end_time,
-            sent_packets: report.sent_packets,
-            packet_sizes: report.packet_sizes,
-            ack_bytes: report.ack_bytes,
-        }
-    }
-}
-
-impl From<PacketSinkReport> for SinkReportForCsv {
-    fn from(report: PacketSinkReport) -> Self {
-        Self {
-            id: report.id,
-            flow_id: report.flow_id,
-            start_time: report.start_time,
-            end_time: report.end_time,
-            received_packets: report.received_packets,
-            received_sizes: report.received_sizes,
-            queueing_delay_mean: report.queueing_delay_mean,
-            one_way_delay_mean: report.one_way_delay_mean,
-        }
-    }
-}
-
-impl From<SchedulerReport> for SchedulerReportForCsv {
-    fn from(report: SchedulerReport) -> Self {
-        Self {
-            id: report.id,
-            start_time: report.start_time,
-            end_time: report.end_time,
-            received_packets: report.received_packets,
-            dropped_packets: report.dropped_packets,
-            forwarded_packets: report.forwarded_packets,
-            queue_length: report.queue_length,
-            received_sizes: report.received_sizes,
-            forwarded_sizes: report.forwarded_sizes,
-            throughput_mean: report.throughput_mean,
-            queueing_delay_mean: report.queueing_delay_mean,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CsvLogger {
     log_dir: Arc<String>,
     max_log_len: usize,
-    scheduler_reports: Vec<SchedulerReport>,
-    source_reports: Vec<PacketSourceReport>,
-    sink_reports: Vec<PacketSinkReport>,
-
     // Shared state protected by locks
+    shared_state: Arc<RwLock<SharedState>>,
     total_packets: Arc<AtomicUsize>,
-    stats: Arc<Mutex<Stats>>,
     file_lock: Arc<Mutex<()>>, // Lock for file operations
 }
 
@@ -161,81 +76,42 @@ impl CsvLogger {
             }
         }
 
-        info!(
-            "Outputs of this simulation run will be logged to three CSV files under directory {}.",
-            &log_dir
-        );
-
         CsvLogger {
             log_dir: Arc::new(log_dir),
             max_log_len: 10000,
-            scheduler_reports: Vec::new(),
-            source_reports: Vec::new(),
-            sink_reports: Vec::new(),
+            shared_state: Arc::new(RwLock::new(SharedState::default())),
             total_packets: Arc::new(AtomicUsize::new(0)),
-            stats: Arc::new(Mutex::new(Stats::default())),
             file_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    fn logging_due(&self, log_len: usize, timing: ReportTiming) -> bool {
-        match timing {
-            ReportTiming::InProgress => log_len >= self.max_log_len,
-            ReportTiming::Final => true,
+    pub fn log_report(&self, report: Report, timing: ReportTiming) {
+        let mut state = self.shared_state.write();
+
+        match report {
+            Report::PacketSourceReport(report) => {
+                state.source_reports.push(report);
+            }
+            Report::SchedulerReport(report) => {
+                state.scheduler_reports.push(report);
+            }
+            Report::PacketSinkReport(report) => {
+                state.sink_reports.push(report);
+            }
+        }
+
+        // Release write lock before checking/flushing
+        drop(state);
+
+        if timing == ReportTiming::InProgress {
+            self.check_and_flush_reports();
         }
     }
 
-    pub fn log_report(&mut self, report: Report, timing: ReportTiming) {
-        match report {
-            Report::PacketSourceReport(report) => {
-                self.source_reports.push(report);
-                if self.logging_due(self.source_reports.len(), timing) {
-                    self.write_to_csv::<PacketSourceReport, SourceReportForCsv>(
-                        ElementType::Source,
-                        &self.source_reports,
-                    );
-                    self.source_reports.clear();
-                }
-            }
-            Report::SchedulerReport(report) => {
-                self.scheduler_reports.push(report);
-                if self.logging_due(self.scheduler_reports.len(), timing) {
-                    self.write_to_csv::<SchedulerReport, SchedulerReportForCsv>(
-                        ElementType::Scheduler,
-                        &self.scheduler_reports,
-                    );
-                    self.scheduler_reports.clear();
-                }
-            }
-            Report::PacketSinkReport(report) => {
-                self.sink_reports.push(report);
-                if self.logging_due(self.sink_reports.len(), timing) {
-                    self.write_to_csv::<PacketSinkReport, SinkReportForCsv>(
-                        ElementType::Sink,
-                        &self.sink_reports,
-                    );
-
-                    let (new_packets, new_delay) = self.compute_sink_statistics();
-
-                    // Update atomic counter
-                    self.total_packets.fetch_add(new_packets, Ordering::SeqCst);
-
-                    // Update shared stats under lock
-                    let mut stats = self.stats.lock().expect("Failed to lock stats");
-                    stats.total_delay += new_delay;
-
-                    self.sink_reports.clear();
-                }
-            }
-        };
-    }
-
-    fn write_to_csv<T, U>(&self, element: ElementType, reports: &Vec<T>)
+    fn write_to_csv<T>(&self, element: ElementType, reports: &[T])
     where
-        T: Clone,
-        U: Serialize + From<T>,
+        T: Serialize,
     {
-        // Acquire lock before file operations
         let _guard = self.file_lock.lock().expect("Failed to acquire file lock");
 
         let csv_file_name = match element {
@@ -256,8 +132,7 @@ impl CsvLogger {
             .from_writer(csv_file);
 
         for report in reports {
-            let csv_report = U::from(report.clone());
-            if let Err(e) = csv_writer.serialize(csv_report) {
+            if let Err(e) = csv_writer.serialize(report) {
                 panic!(
                     "Error '{}' occurred when writing a report to csv file {}",
                     e, &csv_file_name
@@ -266,15 +141,13 @@ impl CsvLogger {
         }
     }
 
-    fn compute_sink_statistics(&self) -> (usize, f64) {
-        let total_packets = self
-            .sink_reports
+    fn compute_sink_statistics(reports: &[PacketSinkReport]) -> (usize, f64) {
+        let total_packets = reports
             .iter()
             .map(|report| report.received_packets)
             .sum::<usize>();
 
-        let total_delay = self
-            .sink_reports
+        let total_delay = reports
             .iter()
             .map(|report| report.one_way_delay_mean * report.received_packets as f64)
             .sum::<f64>();
@@ -282,33 +155,59 @@ impl CsvLogger {
         (total_packets, total_delay)
     }
 
-    pub fn generate_output_files(&mut self) {
-        // Write remaining reports to files
-        self.write_to_csv::<PacketSourceReport, SourceReportForCsv>(
-            ElementType::Source,
-            &self.source_reports,
-        );
-        self.write_to_csv::<SchedulerReport, SchedulerReportForCsv>(
-            ElementType::Scheduler,
-            &self.scheduler_reports,
-        );
-        self.write_to_csv::<PacketSinkReport, SinkReportForCsv>(
-            ElementType::Sink,
-            &self.sink_reports,
-        );
+    fn check_and_flush_reports(&self) {
+        // Get write lock to check and potentially flush reports
+        let mut state = self.shared_state.write();
 
-        let (final_packets, final_delay) = self.compute_sink_statistics();
+        // Check source reports
+        if state.source_reports.len() >= self.max_log_len {
+            let reports = std::mem::take(&mut state.source_reports);
+            self.write_to_csv(ElementType::Source, &reports);
+        }
 
-        // Update final statistics atomically
-        self.total_packets
-            .fetch_add(final_packets, Ordering::SeqCst);
+        // Check scheduler reports
+        if state.scheduler_reports.len() >= self.max_log_len {
+            let reports = std::mem::take(&mut state.scheduler_reports);
+            self.write_to_csv(ElementType::Scheduler, &reports);
+        }
 
-        let mut stats = self.stats.lock().expect("Failed to lock stats");
-        stats.total_delay += final_delay;
+        // Check sink reports
+        if state.sink_reports.len() >= self.max_log_len {
+            let reports = std::mem::take(&mut state.sink_reports);
+            self.write_to_csv(ElementType::Sink, &reports);
+
+            let (new_packets, new_delay) = Self::compute_sink_statistics(&reports);
+            self.total_packets.fetch_add(new_packets, Ordering::SeqCst);
+            state.total_delay += new_delay;
+        }
+    }
+    pub fn generate_output_files(&self) {
+        let mut state = self.shared_state.write();
+
+        // Write remaining reports
+        if !state.source_reports.is_empty() {
+            let reports = std::mem::take(&mut state.source_reports);
+            self.write_to_csv(ElementType::Source, &reports);
+        }
+
+        if !state.scheduler_reports.is_empty() {
+            let reports = std::mem::take(&mut state.scheduler_reports);
+            self.write_to_csv(ElementType::Scheduler, &reports);
+        }
+
+        if !state.sink_reports.is_empty() {
+            let reports = std::mem::take(&mut state.sink_reports);
+            self.write_to_csv(ElementType::Sink, &reports);
+
+            let (final_packets, final_delay) = Self::compute_sink_statistics(&reports);
+            self.total_packets
+                .fetch_add(final_packets, Ordering::SeqCst);
+            state.total_delay += final_delay;
+        }
 
         let total_packets = self.total_packets.load(Ordering::SeqCst);
         let avg_delay = if total_packets > 0 {
-            stats.total_delay / total_packets as f64
+            state.total_delay / total_packets as f64
         } else {
             0.0
         };
