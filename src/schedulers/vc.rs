@@ -100,7 +100,6 @@ pub struct VirtualClockServer {
     busy_until: f64,
 
     pub output: Output<Packet>,
-    pub report_output: Output<Report>,
 
     /// the statistics of a preiodic report
     report_start_time: f64,
@@ -150,7 +149,6 @@ impl VirtualClockServer {
             aux_vc: HashMap::new(),
             busy_until: 0.0,
             output: Output::default(),
-            report_output: Output::default(),
             report_start_time: 0.0,
             queue_length: 0,
             received_sizes: 0,

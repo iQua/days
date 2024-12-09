@@ -519,8 +519,8 @@ impl Topology {
                 .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
             source
-                .report_output()
-                .connect(UserInterface::report_arrived, &ui_mbox);
+                .ui_output()
+                .connect(UserInterface::flow_finished, &ui_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, source_mbox);

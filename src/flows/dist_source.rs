@@ -32,7 +32,7 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
-    pub report_output: Output<Report>,
+    pub ui_output: Output<Report>,
 
     pub report_start_time: f64,
 }
@@ -55,7 +55,7 @@ impl DistPacketSource {
             sent_size_in_period: 0,
             rng,
             output: Output::default(),
-            report_output: Output::default(),
+            ui_output: Output::default(),
             report_start_time: 0.0,
         }
     }

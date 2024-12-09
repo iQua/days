@@ -77,7 +77,7 @@ impl UserInterface {
             finished_sources: 0,
         }
     }
-    pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {
+    pub fn flow_finished(&mut self, _report: Report, cx: &mut Context<Self>) {
         self.finished_sources += 1;
         debug!(
             "{} / {} sources have finished.",

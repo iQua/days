@@ -101,10 +101,10 @@ impl PacketSource {
         }
     }
 
-    pub fn report_output(&mut self) -> &mut Output<Report> {
+    pub fn ui_output(&mut self) -> &mut Output<Report> {
         match self {
-            PacketSource::DistPacketSource(source) => source.report_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.report_output.borrow_mut(),
+            PacketSource::DistPacketSource(source) => source.ui_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.ui_output.borrow_mut(),
         }
     }
 
