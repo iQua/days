@@ -52,7 +52,7 @@ enum ElementType {
 #[derive(Clone, Debug)]
 pub struct CsvLogger {
     max_log_len: usize,
-    log_dir: OnceLock<String>,
+    log_path: OnceLock<String>,
     report_interval: OnceLock<f64>,
     // Shared state protected by locks
     shared_state: Arc<RwLock<SharedState>>,
@@ -63,38 +63,62 @@ impl CsvLogger {
     pub fn new() -> Self {
         CsvLogger {
             max_log_len: 10000,
-            log_dir: OnceLock::new(),
+            log_path: OnceLock::new(),
             report_interval: OnceLock::new(),
             shared_state: Arc::new(RwLock::new(SharedState::default())),
             total_packets: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub fn init(&self, config_path: &str) {
+    pub fn init(&self, config_path: Option<&str>, log_path: Option<&str>) {
+        if let Some(config_path) = config_path {
+            self.init_from_config(config_path);
+        } else {
+            self.init_default(log_path);
+        }
+    }
+
+    pub fn init_default(&self, log_path: Option<&str>) {
+        let mut log_path = log_path.unwrap_or("./output/").to_string();
+        if log_path.chars().last().unwrap() != '/' {
+            log_path.push('/');
+        }
+
+        self.log_path.set(log_path.to_string()).unwrap();
+        self.report_interval.set(f64::MAX).unwrap();
+
+        self.init_output_files(log_path);
+    }
+
+    pub fn init_from_config(&self, config_path: &str) {
         let content = fs::read_to_string(config_path).expect("The configuration is not valid");
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
 
-        let mut log_dir = log_config.log_path.unwrap_or("./output/".to_string());
-        if log_dir.chars().last().unwrap() != '/' {
-            log_dir.push('/');
+        let mut log_path = log_config.log_path.unwrap_or("./output/".to_string());
+        if log_path.chars().last().unwrap() != '/' {
+            log_path.push('/');
         }
 
-        self.log_dir.set(log_dir.clone()).unwrap();
+        self.log_path.set(log_path.clone()).unwrap();
         self.report_interval
             .set(log_config.report_interval.unwrap_or(f64::MAX))
             .unwrap();
 
-        if let Err(e) = fs::create_dir_all(&log_dir) {
+        self.init_output_files(log_path);
+    }
+
+    pub fn init_output_files(&self, log_path: String) {
+        if let Err(e) = fs::create_dir_all(&log_path) {
             panic!(
                 "Error '{}' occurred when creating directory {} for log files",
-                e, &log_dir
+                e, &log_path
             );
         };
 
         // Create output files
         for element in ["sources", "switches", "sinks"] {
-            let file_name = format!("{}{}.csv", log_dir, element);
+            let file_name = format!("{}{}.csv", log_path, element);
             if let Err(e) = fs::File::create(&file_name) {
                 panic!(
                     "Error '{}' occurred when creating log file {}",
@@ -148,11 +172,11 @@ impl CsvLogger {
         T: Serialize,
     {
         let csv_file_name = match element {
-            ElementType::Source => format!("{}sources.csv", self.log_dir.get().unwrap().clone()),
+            ElementType::Source => format!("{}sources.csv", self.log_path.get().unwrap().clone()),
             ElementType::Scheduler => {
-                format!("{}switches.csv", self.log_dir.get().unwrap().clone())
+                format!("{}switches.csv", self.log_path.get().unwrap().clone())
             }
-            ElementType::Sink => format!("{}sinks.csv", self.log_dir.get().unwrap().clone()),
+            ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap().clone()),
         };
 
         let csv_file = fs::OpenOptions::new()

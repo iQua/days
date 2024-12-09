@@ -21,7 +21,7 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    CsvLogger::get_instance().init("logs/port");
+    CsvLogger::get_instance().init(None, Some("logs/port"));
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(

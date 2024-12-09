@@ -151,7 +151,7 @@ impl Topology {
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
-        CsvLogger::get_instance().init(config_path);
+        CsvLogger::get_instance().init(Some(config_path), None);
 
         // reads the configuration
         let content = fs::read_to_string(config_path).expect("The configuration is not valid");

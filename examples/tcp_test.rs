@@ -20,7 +20,7 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    CsvLogger::get_instance().init("logs/tcp_test");
+    CsvLogger::get_instance().init(None, Some("logs/tcp_test"));
 
     // instantiates models
     let mut source = PacketSource::new(
