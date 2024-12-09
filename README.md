@@ -126,10 +126,6 @@ The number of threads to be used in the simulation run. By setting this value to
   log_path = "./test"
   ```
 
-- **Required**: No
-- **Default**: Value of `progress`
-- **Example**:
-
 #### topology
 
 **Day** supports arbitrary topologies. Besides widely-used topologies `FatTree` and `Torus`, any topology that can be specified as an undirected graph can be supported as well.
