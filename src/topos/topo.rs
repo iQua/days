@@ -138,14 +138,14 @@ pub struct Topology {
     /// the capacity of every mailbox
     mailbox_capacity: usize,
     /// the path to the configuration file
-    config_path: &'static str,
+    config_path: String,
     /// the duration of the simulation
     duration: f64,
 }
 
 impl Topology {
     pub fn new(
-        config_path: &'static str,
+        config_path: &str,
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         flows: Vec<Flow>,
@@ -198,7 +198,7 @@ impl Topology {
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
             mailbox_capacity,
-            config_path,
+            config_path: config_path.to_string(),
             duration,
         }
     }
@@ -612,7 +612,7 @@ impl Topology {
 
     /// Creates and activates a UserInterface coroutine, which contains a progress bar.
     fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>) -> Self {
-        let ui = UserInterface::new(self.flows.len(), self.config_path);
+        let ui = UserInterface::new(self.flows.len(), self.config_path.as_str());
         self.sim_init = self.sim_init.add_model(ui, ui_mbox, "UserInterface");
 
         self

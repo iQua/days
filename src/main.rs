@@ -22,7 +22,6 @@ fn main() {
 
     let path = args[1].clone();
     let _ = seed_from_config(&path);
-    let file_path = path.as_str();
 
     // There are two ways of building a network graph:
 
@@ -35,7 +34,7 @@ fn main() {
     //    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
     //    let hosts = vec![0, 1];
 
-    let (graph, hosts) = build_graph(file_path);
+    let (graph, hosts) = build_graph(&path);
     info!("The network graph has been initialized.");
 
     // There are two ways of initializing the flows:
@@ -48,7 +47,7 @@ fn main() {
 
     // 2. initializes flows using a configuration file.
     //    Example:
-    let flows = Flow::flows_from_config(file_path, &hosts);
+    let flows = Flow::flows_from_config(&path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());
 
     // There are two ways of initializing the collectives:
@@ -65,14 +64,14 @@ fn main() {
 
     // 2. initializes flows using a configuration file.
     //    Example:
-    let collectives = Collective::collectives_from_config(file_path, &hosts);
+    let collectives = Collective::collectives_from_config(&path, &hosts);
     info!(
         "A total of {} collective communication operations has been initialized.",
         collectives.len()
     );
 
     // initializes the topology
-    let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
+    let topology = Topology::new(&path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
     topology.run(graph);
