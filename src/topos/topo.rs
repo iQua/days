@@ -231,19 +231,23 @@ impl Topology {
 
     /// Connects a hash map of packet switches according to edges in a network
     /// topology.
-    fn connect(mut self, graph: UnGraph<usize, ()>) -> Self {
+    fn connect(
+        mut self,
+        graph: UnGraph<usize, ()>,
+        ui_mbox: Mailbox<UserInterface>,
+    ) -> (Self, Mailbox<UserInterface>) {
         for node_id in graph.node_indices() {
             for neighbor in graph.neighbors(node_id) {
                 // if an edge exists between an upstream element and this
                 // downstream element in the provided network graph, then
                 // connect them and activate all schedulers in between
                 if neighbor.index() != node_id.index() {
-                    self = self.connect_neighbours(neighbor.index(), node_id.index());
+                    self = self.connect_neighbours(neighbor.index(), node_id.index(), &ui_mbox);
                 }
             }
         }
 
-        self
+        (self, ui_mbox)
     }
 
     /// Produces flows within all collectives in the network graph.
@@ -330,7 +334,12 @@ impl Topology {
     }
 
     /// Connects two adjacent switches in the network graph.
-    fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
+    fn connect_neighbours(
+        mut self,
+        upstream_id: usize,
+        downstream_id: usize,
+        ui_mbox: &Mailbox<UserInterface>,
+    ) -> Self {
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
 
         match self.switch_config.discipline {
@@ -355,6 +364,9 @@ impl Topology {
                 drr_server
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
+                drr_server
+                    .report_output
+                    .connect(UserInterface::report_arrived, ui_mbox);
 
                 self.sim_init = self.sim_init.add_model(drr_server, drr_mbox, "DRR");
             }
@@ -375,6 +387,8 @@ impl Topology {
                 let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
                 port.output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
+                port.report_output
+                    .connect(UserInterface::report_arrived, ui_mbox);
 
                 self.sim_init = self.sim_init.add_model(port, port_mbox, "Port");
             }
@@ -400,6 +414,9 @@ impl Topology {
                 sp_server
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
+                sp_server
+                    .report_output
+                    .connect(UserInterface::report_arrived, ui_mbox);
 
                 self.sim_init = self.sim_init.add_model(sp_server, sp_mbox, "SP");
             }
@@ -426,6 +443,9 @@ impl Topology {
                 virtual_clock_server
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
+                virtual_clock_server
+                    .report_output
+                    .connect(UserInterface::report_arrived, ui_mbox);
 
                 self.sim_init = self.sim_init.add_model(
                     virtual_clock_server,
@@ -455,6 +475,9 @@ impl Topology {
                 wfq_server
                     .output
                     .connect(PacketSwitch::packet_received, downstream_mbox);
+                wfq_server
+                    .report_output
+                    .connect(UserInterface::report_arrived, ui_mbox);
 
                 self.sim_init = self.sim_init.add_model(wfq_server, wfq_mbox, "WFQ");
             }
@@ -465,13 +488,15 @@ impl Topology {
 
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
-    fn attach_flows(mut self, stats: &mut SinkStatistics) -> (Self, Mailbox<UserInterface>) {
+    fn attach_flows(
+        mut self,
+        stats: &mut SinkStatistics,
+        ui_mbox: Mailbox<UserInterface>,
+    ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
-
-        let ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -516,7 +541,6 @@ impl Topology {
             source
                 .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
-
             source
                 .report_output()
                 .connect(UserInterface::report_arrived, &ui_mbox);
@@ -654,12 +678,13 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        // constructs the network graph by connecting the packet switches
-        self = self.connect(graph);
+        let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
-        let ui_mbox: Mailbox<UserInterface>;
+        // constructs the network graph by connecting the packet switches
+        (self, ui_mbox) = self.connect(graph, ui_mbox);
+
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(&mut statistics);
+        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
