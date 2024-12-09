@@ -15,7 +15,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, 
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::CsvLogger;
 use crate::utils::ui::{Report, ReportTiming};
-use crate::{get_update_interval, next_scheduler_id};
+use crate::{get_report_interval, next_scheduler_id};
 
 pub struct Port {
     scheduler_id: usize,
@@ -192,7 +192,7 @@ impl Port {
             self.reset_stats(now);
 
             cx.schedule_event(
-                Duration::from_secs_f64(get_update_interval()),
+                Duration::from_secs_f64(get_report_interval()),
                 Self::log_report,
                 (),
             )
@@ -248,10 +248,10 @@ impl ReportStatistics for Port {
 
 impl Model for Port {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        let update_interval = get_update_interval();
-        if update_interval < f64::MAX {
+        let report_interval = get_report_interval();
+        if report_interval < f64::MAX {
             cx.schedule_event(
-                Duration::from_secs_f64(update_interval),
+                Duration::from_secs_f64(report_interval),
                 Self::log_report,
                 (),
             )

@@ -17,7 +17,7 @@ use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
 use crate::topos::topo::UIConfig;
-use crate::{get_config_path, get_update_interval};
+use crate::{get_config_path, get_report_interval};
 
 #[derive(Clone, Debug)]
 pub enum Report {
@@ -34,7 +34,7 @@ pub enum ReportTiming {
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
-    update_interval: f64,
+    report_interval: f64,
     ui_interval: f64,
     duration: f64,
     num_sources: usize,
@@ -70,7 +70,7 @@ impl UserInterface {
 
         UserInterface {
             progress_bar: pg,
-            update_interval: get_update_interval(),
+            report_interval: get_report_interval(),
             ui_interval,
             duration,
             num_sources,
@@ -86,7 +86,7 @@ impl UserInterface {
 
         if self.finished_sources == self.num_sources {
             self.progress_bar
-                .inc((self.duration / self.update_interval) as u64 - self.progress_bar.position());
+                .inc((self.duration / self.report_interval) as u64 - self.progress_bar.position());
 
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
