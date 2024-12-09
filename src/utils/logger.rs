@@ -181,6 +181,7 @@ impl CsvLogger {
             state.total_delay += new_delay;
         }
     }
+
     pub fn generate_output_files(&self) {
         let mut state = self.shared_state.write();
 
