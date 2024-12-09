@@ -51,9 +51,11 @@ impl UserInterface {
     }
 
     /// Sets up progress interval and duration from a configuration file.
-    pub fn setup(update_interval: Option<f64>, duration: Option<f64>) {
+    pub fn setup(update_interval: Option<f64>, duration: Option<f64>) -> f64 {
         let duration = duration.unwrap_or(1500.);
         set_update_interval(update_interval.unwrap_or(duration / 100.));
+
+        duration
     }
 
     pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {

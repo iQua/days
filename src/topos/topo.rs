@@ -143,7 +143,7 @@ pub struct Topology {
     switch_config: SwitchConfig,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
-    /// the duration of the simulation run
+    /// the duration of the simulation
     duration: f64,
 }
 
@@ -173,7 +173,7 @@ impl Topology {
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
 
-        UserInterface::setup(ui_config.update_interval, ui_config.duration);
+        let duration = UserInterface::setup(ui_config.update_interval, ui_config.duration);
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -665,7 +665,6 @@ impl Topology {
 
         // creates and activates a UserInterface coroutine
         self = self.activate_ui(update_ui);
-
         let duration = self.duration;
 
         // activates all the switches and initializes the simulation
