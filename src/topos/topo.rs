@@ -47,7 +47,6 @@ struct ConcurrencyConfig {
 #[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
-    log_interval: Option<f64>,
 }
 
 #[derive(Deserialize)]

@@ -11,8 +11,7 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
-use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::reporter::Report;
+use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
@@ -24,6 +23,7 @@ pub struct BasicPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
@@ -46,6 +46,7 @@ impl BasicPacketSink {
             packet_statistics: PacketStatistics::new(sink_name),
             statistics: Output::default(),
             output: Output::default(),
+            report_output: Output::default(),
             flow_finish_outputs: Vec::new(),
             report_start_time: 0.0,
             received_packets: 0,
@@ -66,7 +67,7 @@ impl BasicPacketSink {
         self.received_sizes += packet.size;
     }
 
-    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
+    pub async fn update_ui(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -76,9 +77,13 @@ impl BasicPacketSink {
             received_sizes: self.received_sizes,
             queueing_delay_mean: self.queueing_delay_mean,
             one_way_delay_mean: self.one_way_delay_mean,
+            timing,
         };
 
-        ReportLogger::log_report(Report::PacketSinkReport(report), timing);
+        self.report_output
+            .send(Report::PacketSinkReport(report))
+            .await;
+
         debug!(
             "PacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

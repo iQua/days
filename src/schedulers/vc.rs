@@ -19,11 +19,10 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
-use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::reporter::Report;
+use crate::utils::ui::{Report, ReportTiming};
+use crate::{get_update_interval, next_scheduler_id};
 
 pub struct TaggedPacket {
     pub packet: Packet,
@@ -100,6 +99,7 @@ pub struct VirtualClockServer {
     busy_until: f64,
 
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
 
     /// the statistics of a preiodic report
     report_start_time: f64,
@@ -149,6 +149,7 @@ impl VirtualClockServer {
             aux_vc: HashMap::new(),
             busy_until: 0.0,
             output: Output::default(),
+            report_output: Output::default(),
             report_start_time: 0.0,
             queue_length: 0,
             received_sizes: 0,
@@ -295,7 +296,7 @@ impl VirtualClockServer {
         }
     }
 
-    fn log_report<'a>(
+    fn update_ui<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
@@ -303,9 +304,11 @@ impl VirtualClockServer {
         async move {
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            let report = self.generate_report(now);
+            let report = self.prepare_report(now, ReportTiming::InProgress);
+            self.report_output
+                .send(Report::SchedulerReport(report))
+                .await;
 
-            ReportLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
             debug!(
                 "VirtualClockServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
@@ -314,8 +317,8 @@ impl VirtualClockServer {
             self.reset_stats(now);
 
             cx.schedule_event(
-                Duration::from_secs_f64(ReportLogger::get_report_interval()),
-                Self::log_report,
+                Duration::from_secs_f64(get_update_interval()),
+                Self::update_ui,
                 (),
             )
             .unwrap();
@@ -340,7 +343,7 @@ impl ReportStatistics for VirtualClockServer {
         self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
     }
 
-    fn generate_report(&self, now: f64) -> SchedulerReport {
+    fn prepare_report(&self, now: f64, timing: ReportTiming) -> SchedulerReport {
         SchedulerReport {
             id: self.scheduler_id,
             start_time: self.report_start_time,
@@ -353,6 +356,7 @@ impl ReportStatistics for VirtualClockServer {
             forwarded_sizes: self.forwarded_sizes,
             throughput_mean: self.throughput_mean,
             queueing_delay_mean: self.queueing_delay_mean,
+            timing,
         }
     }
 
@@ -370,11 +374,11 @@ impl ReportStatistics for VirtualClockServer {
 
 impl Model for VirtualClockServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        let report_interval = ReportLogger::get_report_interval();
-        if report_interval < f64::MAX {
+        let update_interval = get_update_interval();
+        if update_interval < f64::MAX {
             cx.schedule_event(
-                Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                Duration::from_secs_f64(update_interval),
+                Self::update_ui,
                 (),
             )
             .unwrap();

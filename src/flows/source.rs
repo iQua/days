@@ -21,8 +21,9 @@ use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
-use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::reporter::Report;
+use crate::get_update_interval;
+use crate::utils::logger::ReportLogger;
+use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
@@ -38,6 +39,8 @@ pub struct PacketSourceReport {
     pub packet_sizes: usize,
     /// the number of acknowledged bytes in this report interval
     pub ack_bytes: usize,
+    /// the timing of this report
+    pub timing: ReportTiming,
 }
 
 #[derive(Debug)]
@@ -265,10 +268,10 @@ impl PacketSource {
 
             match self {
                 PacketSource::DistPacketSource(source) => {
-                    source.log_report(now, ReportTiming::InProgress);
+                    source.update_ui(now, ReportTiming::InProgress).await;
                 }
                 PacketSource::TCPPacketSource(source) => {
-                    source.log_report(now, ReportTiming::InProgress);
+                    source.update_ui(now, ReportTiming::InProgress).await;
                 }
             };
         }
@@ -304,20 +307,16 @@ impl PacketSource {
             if self.stop_run(now).await {
                 let name = format!("{self}");
 
-                if ReportLogger::get_report_interval() < f64::MAX {
+                if get_update_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {
-                            source.log_report(now, ReportTiming::Final);
+                            source.update_ui(now, ReportTiming::Final).await;
                         }
                         PacketSource::TCPPacketSource(source) => {
-                            source.log_report(now, ReportTiming::Final);
+                            source.update_ui(now, ReportTiming::Final).await;
                         }
                     };
                 }
-
-                // notifies the UserInterface coroutine that the packet source
-                // finished running
-                self.report_output().send(Report {}).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
             }

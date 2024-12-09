@@ -26,7 +26,6 @@ update_interval = 2.0
 duration = 20.0
 num_threads = 1
 log_path = "./simple"
-log_interval = 1.0
 
 [switch]
 port_rate = 8000
@@ -127,18 +126,9 @@ The number of threads to be used in the simulation run. By setting this value to
   log_path = "./test"
   ```
 
-#### log_interval
-
-In the three CSV files, each row contains statistics in a time interval. `log_interval` specifies the length of a time interval in seconds.
-
-- **Valid value**: Floating point number
 - **Required**: No
 - **Default**: Value of `progress`
 - **Example**:
-
-  ```toml
-  log_interval = "1.0"
-  ```
 
 #### topology
 

@@ -6,7 +6,6 @@ hosts = [0, 1, 2]
 update_interval = 2.0
 duration = 20.0
 log_path = "logs/simple"
-log_interval = 1.0
 
 [switch]
 port_rate = 8000

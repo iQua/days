@@ -7,12 +7,28 @@ use std::time::Duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
+use serde::Serialize;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
-use crate::utils::reporter::Report;
+use crate::flows::sink::PacketSinkReport;
+use crate::flows::source::PacketSourceReport;
+use crate::schedulers::SchedulerReport;
 use crate::{get_update_interval, set_update_interval};
+
+#[derive(Clone, Debug)]
+pub enum Report {
+    PacketSourceReport(PacketSourceReport),
+    SchedulerReport(SchedulerReport),
+    PacketSinkReport(PacketSinkReport),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum ReportTiming {
+    InProgress,
+    Final,
+}
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
@@ -53,7 +69,7 @@ impl UserInterface {
     /// Sets up progress interval and duration from a configuration file.
     pub fn setup(update_interval: Option<f64>, duration: Option<f64>) -> f64 {
         let duration = duration.unwrap_or(1500.);
-        set_update_interval(update_interval.unwrap_or(duration / 100.));
+        set_update_interval(update_interval.unwrap_or(f64::MAX));
 
         duration
     }

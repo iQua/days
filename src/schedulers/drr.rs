@@ -15,8 +15,8 @@ use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::reporter::Report;
+use crate::utils::logger::ReportLogger;
+use crate::utils::ui::{Report, ReportTiming};
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -58,6 +58,7 @@ pub struct DRRServer {
     busy_until: f64,
 
     pub output: Output<Packet>,
+    pub report_output: Output<Report>,
 
     /// the statistics of a preiodic report
     report_start_time: f64,
@@ -123,6 +124,7 @@ impl DRRServer {
             current_queue: 0,
             busy_until: 0.0,
             output: Output::default(),
+            report_output: Output::default(),
             report_start_time: 0.0,
             queue_length: 0,
             received_sizes: 0,
@@ -279,9 +281,11 @@ impl DRRServer {
         async move {
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            let report = self.generate_report(now);
+            let report = self.prepare_report(now, ReportTiming::InProgress);
+            self.report_output
+                .send(Report::SchedulerReport(report))
+                .await;
 
-            ReportLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
             debug!(
                 "DRRServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
@@ -316,7 +320,7 @@ impl ReportStatistics for DRRServer {
         self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
     }
 
-    fn generate_report(&self, now: f64) -> SchedulerReport {
+    fn prepare_report(&self, now: f64, timing: ReportTiming) -> SchedulerReport {
         SchedulerReport {
             id: self.scheduler_id,
             start_time: self.report_start_time,
@@ -329,6 +333,7 @@ impl ReportStatistics for DRRServer {
             forwarded_sizes: self.forwarded_sizes,
             throughput_mean: self.throughput_mean,
             queueing_delay_mean: self.queueing_delay_mean,
+            timing,
         }
     }
 

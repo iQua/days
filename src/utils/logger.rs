@@ -10,13 +10,7 @@ use log::info;
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
-use crate::utils::reporter::Report;
-
-#[derive(Debug, PartialEq)]
-pub enum ReportTiming {
-    InProgress,
-    Final,
-}
+use crate::utils::ui::{Report, ReportTiming};
 
 enum ElementType {
     Source,
@@ -94,9 +88,9 @@ impl ReportLogger {
         Arc::clone(instance.as_ref().unwrap())
     }
 
-    pub fn log_report(report: Report, timing: ReportTiming) {
+    pub fn update_ui(report: Report, timing: ReportTiming) {
         let report_logger = &ReportLogger::get_instance().report_logger;
-        report_logger.log_report(report, timing);
+        report_logger.update_ui(report, timing);
     }
 
     pub fn get_report_interval() -> f64 {
@@ -122,7 +116,7 @@ impl CsvLogger {
         }
     }
 
-    pub fn log_report(&self, report: Report, timing: ReportTiming) {
+    pub fn update_ui(&self, report: Report, timing: ReportTiming) {
         match report {
             Report::PacketSourceReport(report) => {
                 let mut reports = SOURCE_REPORTS.write().unwrap();
