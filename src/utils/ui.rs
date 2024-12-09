@@ -13,7 +13,6 @@ use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
 use crate::flows::FlowFinishMsg;
-use crate::get_config_path;
 use crate::topos::topo::UIConfig;
 
 pub struct UserInterface {
@@ -25,10 +24,8 @@ pub struct UserInterface {
 }
 
 impl UserInterface {
-    pub fn new(num_sources: usize) -> UserInterface {
-        let file_path = get_config_path();
-        let content =
-            fs::read_to_string(file_path.clone()).expect("The configuration is not valid");
+    pub fn new(num_sources: usize, config_path: &str) -> UserInterface {
+        let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
         // Obtain the user interface progress interval from the configuration file
         let ui_config: UIConfig = toml::from_str(&content)

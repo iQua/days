@@ -1,6 +1,5 @@
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -22,9 +21,6 @@ static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
 static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
-
-// The path of the configuration file
-static CONFIG_PATH: OnceLock<String> = OnceLock::new();
 
 pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
@@ -73,12 +69,4 @@ pub fn update_next_flow_id(next_flow_id: usize) {
 
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-pub fn get_config_path() -> String {
-    CONFIG_PATH.get().unwrap().clone()
-}
-
-pub fn set_config_path(path: String) {
-    CONFIG_PATH.set(path).unwrap();
 }

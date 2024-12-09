@@ -13,7 +13,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
-use crate::get_config_path;
 use crate::schedulers::SchedulerReport;
 
 #[derive(Deserialize)]
@@ -52,9 +51,8 @@ enum ElementType {
 
 #[derive(Clone, Debug)]
 pub struct CsvLogger {
-    interval: f64,
     max_log_len: usize,
-    log_dir: Arc<String>,
+    log_dir: OnceLock<String>,
     report_interval: OnceLock<f64>,
     // Shared state protected by locks
     shared_state: Arc<RwLock<SharedState>>,
@@ -63,16 +61,29 @@ pub struct CsvLogger {
 
 impl CsvLogger {
     pub fn new() -> Self {
-        let file_path = get_config_path();
-        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+        CsvLogger {
+            max_log_len: 10000,
+            log_dir: OnceLock::new(),
+            report_interval: OnceLock::new(),
+            shared_state: Arc::new(RwLock::new(SharedState::default())),
+            total_packets: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn init(&self, config_path: &str) {
+        let content = fs::read_to_string(config_path).expect("The configuration is not valid");
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
-        let interval = log_config.report_interval.unwrap_or(f64::MAX);
 
         let mut log_dir = log_config.log_path.unwrap_or("./output/".to_string());
         if log_dir.chars().last().unwrap() != '/' {
             log_dir.push('/');
         }
+
+        self.log_dir.set(log_dir.clone()).unwrap();
+        self.report_interval
+            .set(log_config.report_interval.unwrap_or(f64::MAX))
+            .unwrap();
 
         if let Err(e) = fs::create_dir_all(&log_dir) {
             panic!(
@@ -91,15 +102,6 @@ impl CsvLogger {
                 );
             }
         }
-
-        CsvLogger {
-            interval,
-            max_log_len: 10000,
-            log_dir: Arc::new(log_dir),
-            report_interval: OnceLock::new(),
-            shared_state: Arc::new(RwLock::new(SharedState::default())),
-            total_packets: Arc::new(AtomicUsize::new(0)),
-        }
     }
 
     pub fn get_instance() -> Arc<CsvLogger> {
@@ -114,7 +116,7 @@ impl CsvLogger {
     }
 
     pub fn get_report_interval(&self) -> f64 {
-        *self.report_interval.get_or_init(|| self.interval)
+        *self.report_interval.get().unwrap()
     }
 
     pub fn log_report(report: Report, timing: ReportTiming) {
@@ -146,9 +148,11 @@ impl CsvLogger {
         T: Serialize,
     {
         let csv_file_name = match element {
-            ElementType::Source => format!("{}sources.csv", self.log_dir),
-            ElementType::Scheduler => format!("{}switches.csv", self.log_dir),
-            ElementType::Sink => format!("{}sinks.csv", self.log_dir),
+            ElementType::Source => format!("{}sources.csv", self.log_dir.get().unwrap().clone()),
+            ElementType::Scheduler => {
+                format!("{}switches.csv", self.log_dir.get().unwrap().clone())
+            }
+            ElementType::Sink => format!("{}sinks.csv", self.log_dir.get().unwrap().clone()),
         };
 
         let csv_file = fs::OpenOptions::new()

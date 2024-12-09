@@ -31,7 +31,7 @@ use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::utils::logger::CsvLogger;
 use crate::utils::ui::UserInterface;
-use crate::{num_switches, set_config_path, set_num_switches};
+use crate::{num_switches, set_num_switches};
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -137,23 +137,24 @@ pub struct Topology {
     switch_config: SwitchConfig,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
+    /// the path to the configuration file
+    config_path: &'static str,
     /// the duration of the simulation
     duration: f64,
 }
 
 impl Topology {
     pub fn new(
-        file_path: &str,
+        config_path: &'static str,
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
-        // Setting the global configuration file path
-        set_config_path(file_path.to_string());
+        CsvLogger::get_instance().init(config_path);
 
         // reads the configuration
-        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+        let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
@@ -197,6 +198,7 @@ impl Topology {
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
             mailbox_capacity,
+            config_path,
             duration,
         }
     }
@@ -610,7 +612,7 @@ impl Topology {
 
     /// Creates and activates a UserInterface coroutine, which contains a progress bar.
     fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>) -> Self {
-        let ui = UserInterface::new(self.flows.len());
+        let ui = UserInterface::new(self.flows.len(), self.config_path);
         self.sim_init = self.sim_init.add_model(ui, ui_mbox, "UserInterface");
 
         self
