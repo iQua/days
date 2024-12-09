@@ -18,8 +18,8 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
-use crate::utils::progress::FinishMsg;
+use crate::utils::logger::CsvLogger;
+use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
@@ -92,7 +92,8 @@ pub struct TCPPacketSource {
     sent_size_in_period: usize,
 
     pub output: Output<Packet>,
-    pub finish_msg_output: Output<FinishMsg>,
+    /// output: outbound to the user interface
+    pub ui_output: Output<FlowFinishMsg>,
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
@@ -147,7 +148,7 @@ impl TCPPacketSource {
             sent_size: 0,
             sent_size_in_period: 0,
             output: Output::default(),
-            finish_msg_output: Output::default(),
+            ui_output: Output::default(),
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,
@@ -392,7 +393,8 @@ impl TCPPacketSource {
             ack_bytes: self.last_ack,
         };
 
-        ReportLogger::log_report(Report::PacketSourceReport(report), timing);
+        CsvLogger::log_report(Report::PacketSourceReport(report), timing);
+
         debug!(
             "TCPPacketSource {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

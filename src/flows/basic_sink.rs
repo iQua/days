@@ -11,7 +11,8 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
+use crate::utils::logger::CsvLogger;
+use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
@@ -76,8 +77,8 @@ impl BasicPacketSink {
             queueing_delay_mean: self.queueing_delay_mean,
             one_way_delay_mean: self.one_way_delay_mean,
         };
+        CsvLogger::log_report(Report::PacketSinkReport(report), timing);
 
-        ReportLogger::log_report(Report::PacketSinkReport(report), timing);
         debug!(
             "PacketSink {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

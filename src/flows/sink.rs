@@ -23,7 +23,7 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
-use crate::utils::logger::{ReportLogger, ReportTiming};
+use crate::utils::logger::{CsvLogger, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
@@ -305,7 +305,7 @@ impl PacketSink {
 
 impl Model for PacketSink {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        let report_interval = ReportLogger::get_report_interval();
+        let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),

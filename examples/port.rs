@@ -14,14 +14,14 @@ use day::flows::source::PacketSource;
 use day::flows::{DistributionInfo, TrafficCharacteristics};
 use day::schedulers::drop::{CapacityUnit, DropStrategy};
 use day::schedulers::port::Port;
-use day::utils::logger::ReportLogger;
+use day::utils::logger::CsvLogger;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    ReportLogger::init(Some("logs/port".to_string()), 1.0);
+    CsvLogger::get_instance().init(None, Some("logs/port"));
 
     // instantiates models and their mailboxes
     let mut source_1 = PacketSource::new(
@@ -103,7 +103,7 @@ fn main() {
             );
 
             // generates three CSV files containing statistics of this simulation run
-            ReportLogger::generate_output_files();
+            CsvLogger::flush_reports();
         }
         Err(e) => {
             info!("Simulation failed: {e}");

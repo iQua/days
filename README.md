@@ -22,11 +22,10 @@ Here is an example configuration file `simple.toml`:
 seed = 1000
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
-progress = 2.0
+report_interval = 2.0
 duration = 20.0
 num_threads = 1
 log_path = "./simple"
-log_interval = 1.0
 
 [switch]
 port_rate = 8000
@@ -97,9 +96,22 @@ The total duration of the simulation in seconds.
   duration = 20.0
   ```
 
-#### progress
+#### report_interval
 
-**Day** provides a progress bar to visualize the progression of a simulation session. This `progress` element specifies the progress interval, which is the time interval to advance the position of the progress bar.
+The `report_interval` parameter specifies the time interval to log reports from all elements in the simulation.
+
+- **Valid value**: Floating point number
+- **Required**: No
+- **Default**: f64::MAX (No reports when the simulation is in progress, all reports are logged at the end.)
+- **Example**:
+
+  ```toml
+  report_interval = 1.0
+  ```
+
+#### ui_interval
+
+**Day** provides a user interface, which for now includes a progress bar to visualize the progression of a simulation session. This `ui_interval` element specifies the time interval to advance the position of the progress bar.
 
 - **Valid value**: Floating point number
 - **Required**: No
@@ -107,7 +119,7 @@ The total duration of the simulation in seconds.
 - **Example**:
 
   ```toml
-  progress = 1.0
+  ui_interval = 1.0
   ```
 
 #### num_threads
@@ -125,19 +137,6 @@ The number of threads to be used in the simulation run. By setting this value to
 
   ```toml
   log_path = "./test"
-  ```
-
-#### log_interval
-
-In the three CSV files, each row contains statistics in a time interval. `log_interval` specifies the length of a time interval in seconds.
-
-- **Valid value**: Floating point number
-- **Required**: No
-- **Default**: Value of `progress`
-- **Example**:
-
-  ```toml
-  log_interval = "1.0"
   ```
 
 #### topology

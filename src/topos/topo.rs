@@ -29,25 +29,19 @@ use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::utils::logger::ReportLogger;
-use crate::utils::progress::Progress;
+use crate::utils::logger::CsvLogger;
+use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
 #[derive(Deserialize)]
-struct ProgressConfig {
-    progress: Option<f64>,
-    duration: Option<f64>,
+pub struct UIConfig {
+    pub ui_interval: Option<f64>,
+    pub duration: Option<f64>,
 }
 
 #[derive(Deserialize)]
 struct ConcurrencyConfig {
     num_threads: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct LogConfig {
-    log_path: Option<String>,
-    log_interval: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -143,22 +137,24 @@ pub struct Topology {
     switch_config: SwitchConfig,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
-    /// the interval of updating the progress bar
-    progress: f64,
-    /// the duration of the simulation run
+    /// the path to the configuration file
+    config_path: String,
+    /// the duration of the simulation
     duration: f64,
 }
 
 impl Topology {
     pub fn new(
-        file_path: &str,
+        config_path: &str,
         graph: UnGraph<usize, ()>,
         hosts: Vec<usize>,
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
+        CsvLogger::get_instance().init(Some(config_path), None);
+
         // reads the configuration
-        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+        let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
@@ -172,9 +168,9 @@ impl Topology {
             .unwrap_or(16)
             .min(usize::MAX / 2 + 1);
 
-        let pb_config: ProgressConfig =
-            toml::from_str(&content).expect("Failed to deserialize the configuration of progress");
-        let (progress, duration) = Progress::setup(pb_config.progress, pb_config.duration);
+        let ui_config: UIConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of the user interface");
+        let duration = ui_config.duration.unwrap_or(1500.);
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -189,13 +185,6 @@ impl Topology {
             info!("Starting simulation with the default number of thread(s).",);
         }
 
-        let log_config: LogConfig = toml::from_str(&content)
-            .expect("Failed to deserialize the configuration of logging outputs");
-        let report_interval = log_config.log_interval.unwrap_or(progress);
-
-        // initializes the singleton of the logger of reports
-        ReportLogger::init(log_config.log_path, report_interval);
-
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
@@ -209,7 +198,7 @@ impl Topology {
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
             mailbox_capacity,
-            progress,
+            config_path: config_path.to_string(),
             duration,
         }
     }
@@ -469,13 +458,15 @@ impl Topology {
 
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
-    fn attach_flows(mut self, stats: &mut SinkStatistics) -> (Self, Mailbox<Progress>) {
+    fn attach_flows(
+        mut self,
+        stats: &mut SinkStatistics,
+        ui_mbox: Mailbox<UserInterface>,
+    ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
-
-        let report_mbox: Mailbox<Progress> = Mailbox::with_capacity(self.mailbox_capacity);
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -520,10 +511,9 @@ impl Topology {
             source
                 .output()
                 .connect(PacketSwitch::packet_received, host_mbox);
-
             source
-                .finish_msg_output()
-                .connect(Progress::finish_msg_received, &report_mbox);
+                .ui_output()
+                .connect(UserInterface::flow_finished, &ui_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, source_mbox);
@@ -558,10 +548,7 @@ impl Topology {
             // receives (or source for TCP) its last packet
             for flow_id in flow.starts_before.iter() {
                 let mut flow_finish_output = Output::default();
-                flow_finish_output.connect(
-                    PacketSource::flow_finish_msg_received,
-                    &source_mboxes[&flow_id],
-                );
+                flow_finish_output.connect(PacketSource::flow_finished, &source_mboxes[&flow_id]);
                 match flow.flow_type {
                     FlowType::PacketDistribution => {
                         sink.connect_flow_finish_output(flow_finish_output);
@@ -584,7 +571,7 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(source, source_mbox, "Source");
         }
 
-        (self, report_mbox)
+        (self, ui_mbox)
     }
 
     /// Computes routing decisions for all the flows, and installs Flow
@@ -623,11 +610,10 @@ impl Topology {
         );
     }
 
-    /// Creates and activates a Progress coroutine to generate a progress bar and
-    /// collect reports from all the network elements.
-    fn activate_progress(mut self, report_mbox: Mailbox<Progress>) -> Self {
-        let progress = Progress::new(self.progress, self.duration, self.flows.len());
-        self.sim_init = self.sim_init.add_model(progress, report_mbox, "Progress");
+    /// Creates and activates a UserInterface coroutine, which contains a progress bar.
+    fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>) -> Self {
+        let ui = UserInterface::new(self.flows.len(), self.config_path.as_str());
+        self.sim_init = self.sim_init.add_model(ui, ui_mbox, "UserInterface");
 
         self
     }
@@ -659,19 +645,19 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
+        let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
+
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
 
-        let report_mbox: Mailbox<Progress>;
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, report_mbox) = self.attach_flows(&mut statistics);
+        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
 
-        // creates and activates a Progress coroutine
-        self = self.activate_progress(report_mbox);
-
+        // creates and activates a UserInterface coroutine
+        self = self.activate_ui(ui_mbox);
         let duration = self.duration;
 
         // activates all the switches and initializes the simulation
@@ -684,6 +670,9 @@ impl Topology {
         let _ = sim.step_until(Duration::from_secs_f64(duration));
         sim = statistics.collect_statistics(sim);
 
+        // logs the remaining reports
+        CsvLogger::flush_reports();
+
         let elapsed = timer.elapsed();
         info!(
             "Simulation completed at time {:.3} seconds in simulation time.",
@@ -695,8 +684,5 @@ impl Topology {
             "Elapsed wall-clock time: {:.3} seconds.",
             elapsed.as_secs_f64()
         );
-
-        // generates three CSV files containing statistics of this simulation run
-        ReportLogger::generate_output_files();
     }
 }

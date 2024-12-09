@@ -21,8 +21,7 @@ use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
-use crate::utils::logger::{ReportLogger, ReportTiming};
-use crate::utils::progress::FinishMsg;
+use crate::utils::logger::{CsvLogger, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
@@ -101,10 +100,10 @@ impl PacketSource {
         }
     }
 
-    pub fn finish_msg_output(&mut self) -> &mut Output<FinishMsg> {
+    pub fn ui_output(&mut self) -> &mut Output<FlowFinishMsg> {
         match self {
-            PacketSource::DistPacketSource(source) => source.finish_msg_output.borrow_mut(),
-            PacketSource::TCPPacketSource(source) => source.finish_msg_output.borrow_mut(),
+            PacketSource::DistPacketSource(source) => source.ui_output.borrow_mut(),
+            PacketSource::TCPPacketSource(source) => source.ui_output.borrow_mut(),
         }
     }
 
@@ -304,7 +303,7 @@ impl PacketSource {
             if self.stop_run(now).await {
                 let name = format!("{self}");
 
-                if ReportLogger::get_report_interval() < f64::MAX {
+                if CsvLogger::get_instance().get_report_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {
                             source.log_report(now, ReportTiming::Final);
@@ -317,18 +316,14 @@ impl PacketSource {
 
                 // notifies the Progress coroutine that the packet source
                 // finished running
-                self.finish_msg_output().send(FinishMsg {}).await;
+                self.ui_output().send(FlowFinishMsg { flow_id: 0 }).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
             }
         }
     }
 
-    pub async fn flow_finish_msg_received(
-        &mut self,
-        flow_finish_msg: FlowFinishMsg,
-        cx: &mut Context<Self>,
-    ) {
+    pub async fn flow_finished(&mut self, flow_finish_msg: FlowFinishMsg, cx: &mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(
@@ -421,7 +416,7 @@ impl PacketSource {
     }
 
     fn start_report_logger(&self, initial_delay: f64, cx: &mut Context<Self>) {
-        let report_interval = ReportLogger::get_report_interval();
+        let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(initial_delay + report_interval),

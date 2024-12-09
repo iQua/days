@@ -14,10 +14,11 @@ use nexosim::ports::Output;
 
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
+use crate::flows::FlowFinishMsg;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
-use crate::utils::progress::FinishMsg;
+use crate::utils::logger::CsvLogger;
+use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct DistPacketSource {
@@ -32,7 +33,7 @@ pub struct DistPacketSource {
     rng: SmallRng,
 
     pub output: Output<Packet>,
-    pub finish_msg_output: Output<FinishMsg>,
+    pub ui_output: Output<FlowFinishMsg>,
 
     pub report_start_time: f64,
 }
@@ -55,7 +56,7 @@ impl DistPacketSource {
             sent_size_in_period: 0,
             rng,
             output: Output::default(),
-            finish_msg_output: Output::default(),
+            ui_output: Output::default(),
             report_start_time: 0.0,
         }
     }
@@ -156,8 +157,8 @@ impl DistPacketSource {
             packet_sizes: self.sent_size_in_period,
             ack_bytes: 0,
         };
+        CsvLogger::log_report(Report::PacketSourceReport(report), timing);
 
-        ReportLogger::log_report(Report::PacketSourceReport(report), timing);
         debug!(
             "DistPacketSource {} logged a periodic report at time {:.3}.",
             self.endpoint_id, now

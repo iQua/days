@@ -34,6 +34,6 @@ pub struct SchedulerReport {
 pub trait ReportStatistics {
     fn on_packet_received(&mut self, packet: &Packet);
     fn on_packet_forwarded(&mut self, packet: &Packet);
-    fn generate_report(&self, now: f64) -> SchedulerReport;
+    fn prepare_report(&self, now: f64) -> SchedulerReport;
     fn reset_stats(&mut self, now: f64);
 }

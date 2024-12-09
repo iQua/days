@@ -16,7 +16,7 @@ use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::{Report, ReportLogger, ReportTiming};
+use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 pub struct SPServer {
     scheduler_id: usize,
@@ -232,9 +232,9 @@ impl SPServer {
         async move {
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            let report = self.generate_report(now);
+            let report = self.prepare_report(now);
+            CsvLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
 
-            ReportLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
             debug!(
                 "SPServer {} logged a periodic report at time {:.3}.",
                 self.scheduler_id, now
@@ -243,7 +243,7 @@ impl SPServer {
             self.reset_stats(now);
 
             cx.schedule_event(
-                Duration::from_secs_f64(ReportLogger::get_report_interval()),
+                Duration::from_secs_f64(CsvLogger::get_instance().get_report_interval()),
                 Self::log_report,
                 (),
             )
@@ -269,7 +269,7 @@ impl ReportStatistics for SPServer {
         self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
     }
 
-    fn generate_report(&self, now: f64) -> SchedulerReport {
+    fn prepare_report(&self, now: f64) -> SchedulerReport {
         SchedulerReport {
             id: self.scheduler_id,
             start_time: self.report_start_time,
@@ -299,7 +299,7 @@ impl ReportStatistics for SPServer {
 
 impl Model for SPServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        let report_interval = ReportLogger::get_report_interval();
+        let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_event(
                 Duration::from_secs_f64(report_interval),
