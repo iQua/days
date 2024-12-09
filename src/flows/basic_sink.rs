@@ -11,6 +11,7 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
+use crate::utils::logger::CsvLogger;
 use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Debug)]
@@ -23,7 +24,6 @@ pub struct BasicPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
-    pub report_output: Output<Report>,
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
@@ -34,6 +34,9 @@ pub struct BasicPacketSink {
     received_sizes: usize,
     queueing_delay_mean: f64,
     one_way_delay_mean: f64,
+
+    /// The CSV logger
+    logger: CsvLogger,
 }
 
 impl BasicPacketSink {
@@ -46,13 +49,13 @@ impl BasicPacketSink {
             packet_statistics: PacketStatistics::new(sink_name),
             statistics: Output::default(),
             output: Output::default(),
-            report_output: Output::default(),
             flow_finish_outputs: Vec::new(),
             report_start_time: 0.0,
             received_packets: 0,
             received_sizes: 0,
             queueing_delay_mean: 0.0,
             one_way_delay_mean: 0.0,
+            logger: CsvLogger::new(),
         }
     }
 
@@ -67,7 +70,7 @@ impl BasicPacketSink {
         self.received_sizes += packet.size;
     }
 
-    pub async fn update_ui(&mut self, now: f64, timing: ReportTiming) {
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -77,12 +80,9 @@ impl BasicPacketSink {
             received_sizes: self.received_sizes,
             queueing_delay_mean: self.queueing_delay_mean,
             one_way_delay_mean: self.one_way_delay_mean,
-            timing,
         };
-
-        self.report_output
-            .send(Report::PacketSinkReport(report))
-            .await;
+        self.logger
+            .log_report(Report::PacketSinkReport(report), timing);
 
         debug!(
             "PacketSink {} logged a periodic report at time {:.3}.",

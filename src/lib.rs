@@ -26,6 +26,9 @@ static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
 // The update interval of the user interface
 static UPDATE_INTERVAL: OnceLock<f64> = OnceLock::new();
 
+// The path of the configuration file
+static CONFIG_PATH: OnceLock<String> = OnceLock::new();
+
 pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
@@ -81,4 +84,12 @@ pub fn get_update_interval() -> f64 {
 
 pub fn set_update_interval(interval: f64) {
     UPDATE_INTERVAL.set(interval).unwrap();
+}
+
+pub fn get_config_path() -> String {
+    CONFIG_PATH.get().unwrap().clone()
+}
+
+pub fn set_config_path(path: String) {
+    CONFIG_PATH.set(path).unwrap();
 }

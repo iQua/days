@@ -18,6 +18,7 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
+use crate::utils::logger::CsvLogger;
 use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,9 @@ pub struct TCPPacketSource {
     sent_flow_finish_msg: bool,
 
     pub report_start_time: f64,
+
+    /// the CSV logger
+    logger: CsvLogger,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -151,6 +155,7 @@ impl TCPPacketSource {
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,
+            logger: CsvLogger::new(),
         }
     }
 
@@ -381,7 +386,7 @@ impl TCPPacketSource {
         }
     }
 
-    pub async fn update_ui(&mut self, now: f64, timing: ReportTiming) {
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSourceReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -390,12 +395,10 @@ impl TCPPacketSource {
             sent_packets: self.packets_sent,
             packet_sizes: self.sent_size_in_period,
             ack_bytes: self.last_ack,
-            timing,
         };
 
-        self.report_output
-            .send(Report::PacketSourceReport(report))
-            .await;
+        self.logger
+            .log_report(Report::PacketSourceReport(report), timing);
 
         debug!(
             "TCPPacketSource {} logged a periodic report at time {:.3}.",

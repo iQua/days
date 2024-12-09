@@ -11,6 +11,7 @@ use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
+use crate::utils::logger::CsvLogger;
 use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Debug)]
@@ -28,8 +29,6 @@ pub struct TCPPacketSink {
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
     pub output: Output<Packet>,
-    /// output: outbound to the user interface
-    pub report_output: Output<Report>,
     /// outputs: outbounds to packet sources of flows wait for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
@@ -39,12 +38,16 @@ pub struct TCPPacketSink {
     received_sizes: usize,
     queueing_delay_mean: f64,
     one_way_delay_mean: f64,
+
+    /// The CSV logger
+    logger: CsvLogger,
 }
 
 impl TCPPacketSink {
     pub fn new(flow_id: usize) -> TCPPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("TCPPacketSink {endpoint_id}");
+
         TCPPacketSink {
             endpoint_id,
             flow_id,
@@ -53,13 +56,13 @@ impl TCPPacketSink {
             next_seq_expected: 0,
             statistics: Output::default(),
             output: Output::default(),
-            report_output: Output::default(),
             flow_finish_outputs: Vec::new(),
             report_start_time: 0.0,
             received_packets: 0,
             received_sizes: 0,
             queueing_delay_mean: 0.0,
             one_way_delay_mean: 0.0,
+            logger: CsvLogger::new(),
         }
     }
 
@@ -74,7 +77,7 @@ impl TCPPacketSink {
         self.received_sizes += packet.size;
     }
 
-    pub async fn update_ui(&mut self, now: f64, timing: ReportTiming) {
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSinkReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -84,12 +87,9 @@ impl TCPPacketSink {
             received_sizes: self.received_sizes,
             queueing_delay_mean: self.queueing_delay_mean,
             one_way_delay_mean: self.one_way_delay_mean,
-            timing,
         };
-
-        self.report_output
-            .send(Report::PacketSinkReport(report))
-            .await;
+        self.logger
+            .log_report(Report::PacketSinkReport(report), timing);
 
         debug!(
             "TCPPacketSink {} logged a periodic report at time {:.3}.",

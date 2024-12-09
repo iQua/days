@@ -8,7 +8,6 @@ pub mod wfq;
 use serde::Serialize;
 
 use crate::flows::packet::Packet;
-use crate::utils::ui::ReportTiming;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SchedulerReport {
@@ -28,8 +27,6 @@ pub struct SchedulerReport {
     pub throughput_mean: f64,
     /// the mean of queueing delays of the packets
     pub queueing_delay_mean: f64,
-    /// the timing of this report
-    pub timing: ReportTiming,
 }
 
 /// Defines the interface for all schedulers to update statistics in their periodic
@@ -37,6 +34,6 @@ pub struct SchedulerReport {
 pub trait ReportStatistics {
     fn on_packet_received(&mut self, packet: &Packet);
     fn on_packet_forwarded(&mut self, packet: &Packet);
-    fn prepare_report(&self, now: f64, timing: ReportTiming) -> SchedulerReport;
+    fn prepare_report(&self, now: f64) -> SchedulerReport;
     fn reset_stats(&mut self, now: f64);
 }

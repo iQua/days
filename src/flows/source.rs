@@ -38,8 +38,6 @@ pub struct PacketSourceReport {
     pub packet_sizes: usize,
     /// the number of acknowledged bytes in this report interval
     pub ack_bytes: usize,
-    /// the timing of this report
-    pub timing: ReportTiming,
 }
 
 #[derive(Debug)]
@@ -257,7 +255,7 @@ impl PacketSource {
         }
     }
 
-    fn update_ui<'a>(
+    fn log_report<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
@@ -267,10 +265,10 @@ impl PacketSource {
 
             match self {
                 PacketSource::DistPacketSource(source) => {
-                    source.update_ui(now, ReportTiming::InProgress).await;
+                    source.log_report(now, ReportTiming::InProgress);
                 }
                 PacketSource::TCPPacketSource(source) => {
-                    source.update_ui(now, ReportTiming::InProgress).await;
+                    source.log_report(now, ReportTiming::InProgress);
                 }
             };
         }
@@ -309,10 +307,10 @@ impl PacketSource {
                 if get_update_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {
-                            source.update_ui(now, ReportTiming::Final).await;
+                            source.log_report(now, ReportTiming::Final);
                         }
                         PacketSource::TCPPacketSource(source) => {
-                            source.update_ui(now, ReportTiming::Final).await;
+                            source.log_report(now, ReportTiming::Final);
                         }
                     };
                 }
@@ -420,7 +418,7 @@ impl PacketSource {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(initial_delay + update_interval),
                 Duration::from_secs_f64(update_interval),
-                Self::update_ui,
+                Self::log_report,
                 (),
             )
             .unwrap();

@@ -24,7 +24,7 @@ use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
 use crate::get_update_interval;
-use crate::utils::ui::{Report, ReportTiming};
+use crate::utils::ui::ReportTiming;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
@@ -42,8 +42,6 @@ pub struct PacketSinkReport {
     pub queueing_delay_mean: f64,
     /// the mean of one-way end-to-end delays of received packets in this report interval
     pub one_way_delay_mean: f64,
-    /// the timing of this report
-    pub timing: ReportTiming,
 }
 
 /// A simple collector for statistical data.
@@ -241,13 +239,6 @@ impl PacketSink {
         }
     }
 
-    pub fn report_output(&mut self) -> &mut Output<Report> {
-        match self {
-            PacketSink::BasicPacketSink(sink) => sink.report_output.borrow_mut(),
-            PacketSink::TCPPacketSink(sink) => sink.report_output.borrow_mut(),
-        }
-    }
-
     pub fn connect_flow_finish_output(&mut self, flow_finish_output: Output<FlowFinishMsg>) {
         match self {
             PacketSink::BasicPacketSink(sink) => {
@@ -265,11 +256,11 @@ impl PacketSink {
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
-                sink.update_ui(now, ReportTiming::Final).await;
+                sink.log_report(now, ReportTiming::Final);
                 sink.statistics.send(sink.packet_statistics.clone()).await
             }
             PacketSink::TCPPacketSink(sink) => {
-                sink.update_ui(now, ReportTiming::Final).await;
+                sink.log_report(now, ReportTiming::Final);
                 sink.statistics.send(sink.packet_statistics.clone()).await;
             }
         }
@@ -293,7 +284,7 @@ impl PacketSink {
         }
     }
 
-    fn update_ui<'a>(
+    fn log_report<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
@@ -303,10 +294,10 @@ impl PacketSink {
 
             match self {
                 PacketSink::BasicPacketSink(sink) => {
-                    sink.update_ui(now, ReportTiming::InProgress).await;
+                    sink.log_report(now, ReportTiming::InProgress);
                 }
                 PacketSink::TCPPacketSink(sink) => {
-                    sink.update_ui(now, ReportTiming::InProgress).await;
+                    sink.log_report(now, ReportTiming::InProgress);
                 }
             }
         }
@@ -320,7 +311,7 @@ impl Model for PacketSink {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(update_interval),
                 Duration::from_secs_f64(update_interval),
-                Self::update_ui,
+                Self::log_report,
                 (),
             )
             .unwrap();

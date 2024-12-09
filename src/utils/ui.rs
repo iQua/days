@@ -15,10 +15,9 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
-use crate::get_update_interval;
 use crate::schedulers::SchedulerReport;
 use crate::topos::topo::UIConfig;
-use crate::utils::logger::CsvLogger;
+use crate::{get_config_path, get_update_interval};
 
 #[derive(Clone, Debug)]
 pub enum Report {
@@ -34,7 +33,6 @@ pub enum ReportTiming {
 }
 
 pub struct UserInterface {
-    logger: CsvLogger,
     progress_bar: ProgressBar,
     update_interval: f64,
     ui_interval: f64,
@@ -44,7 +42,8 @@ pub struct UserInterface {
 }
 
 impl UserInterface {
-    pub fn new(num_sources: usize, file_path: String) -> UserInterface {
+    pub fn new(num_sources: usize) -> UserInterface {
+        let file_path = get_config_path();
         let content =
             fs::read_to_string(file_path.clone()).expect("The configuration is not valid");
 
@@ -70,7 +69,6 @@ impl UserInterface {
         let pg = multi.add(progress_bar);
 
         UserInterface {
-            logger: CsvLogger::new(file_path),
             progress_bar: pg,
             update_interval: get_update_interval(),
             ui_interval,
@@ -79,41 +77,21 @@ impl UserInterface {
             finished_sources: 0,
         }
     }
-    pub fn report_arrived(&mut self, report: Report, cx: &mut Context<Self>) {
-        match report {
-            Report::PacketSourceReport(PacketSourceReport { timing, .. }) => {
-                if timing == ReportTiming::Final {
-                    self.finished_sources += 1;
-                    debug!(
-                        "{} / {} sources have finished.",
-                        self.finished_sources, self.num_sources
-                    );
+    pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {
+        self.finished_sources += 1;
+        debug!(
+            "{} / {} sources have finished.",
+            self.finished_sources, self.num_sources
+        );
 
-                    if self.finished_sources == self.num_sources {
-                        self.progress_bar.inc(
-                            (self.duration / self.update_interval) as u64
-                                - self.progress_bar.position(),
-                        );
+        if self.finished_sources == self.num_sources {
+            self.progress_bar
+                .inc((self.duration / self.update_interval) as u64 - self.progress_bar.position());
 
-                        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-                        cx.schedule_event(
-                            Duration::from_secs_f64(self.duration - now),
-                            Self::run,
-                            (),
-                        )
-                        .unwrap();
-                    }
-                }
-
-                self.logger.log_report(report, timing);
-            }
-            Report::PacketSinkReport(PacketSinkReport { timing, .. }) => {
-                self.logger.log_report(report, timing);
-            }
-            Report::SchedulerReport(SchedulerReport { timing, .. }) => {
-                self.logger.log_report(report, timing);
-            }
+            cx.schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
+                .unwrap();
         }
     }
 
@@ -122,7 +100,6 @@ impl UserInterface {
 
         if now >= self.duration {
             self.progress_bar.finish_and_clear();
-            self.logger.generate_output_files();
         } else {
             if self.progress_bar.position() < (self.duration / self.ui_interval) as u64 {
                 self.progress_bar.inc(1);

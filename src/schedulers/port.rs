@@ -13,6 +13,7 @@ use nexosim::time::MonotonicTime;
 use crate::flows::packet::Packet;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
+use crate::utils::logger::CsvLogger;
 use crate::utils::ui::{Report, ReportTiming};
 use crate::{get_update_interval, next_scheduler_id};
 
@@ -35,7 +36,6 @@ pub struct Port {
     busy_until: f64,
 
     pub output: Output<Packet>,
-    pub report_output: Output<Report>,
 
     /// the statistics of a preiodic report
     report_start_time: f64,
@@ -44,6 +44,9 @@ pub struct Port {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+
+    /// The CSV logger
+    logger: CsvLogger,
 }
 
 impl Port {
@@ -77,13 +80,13 @@ impl Port {
             queue: VecDeque::new(),
             busy_until: 0.0,
             output: Output::default(),
-            report_output: Output::default(),
             report_start_time: 0.0,
             queue_length: 0,
             received_sizes: 0,
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            logger: CsvLogger::new(),
         }
     }
 
@@ -174,7 +177,7 @@ impl Port {
         }
     }
 
-    fn update_ui<'a>(
+    fn log_report<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
@@ -182,10 +185,9 @@ impl Port {
         async move {
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            let report = self.prepare_report(now, ReportTiming::InProgress);
-            self.report_output
-                .send(Report::SchedulerReport(report))
-                .await;
+            let report = self.prepare_report(now);
+            self.logger
+                .log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
 
             debug!(
                 "Port {} logged a periodic report at time {:.3}.",
@@ -196,7 +198,7 @@ impl Port {
 
             cx.schedule_event(
                 Duration::from_secs_f64(get_update_interval()),
-                Self::update_ui,
+                Self::log_report,
                 (),
             )
             .unwrap();
@@ -221,7 +223,7 @@ impl ReportStatistics for Port {
         self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
     }
 
-    fn prepare_report(&self, now: f64, timing: ReportTiming) -> SchedulerReport {
+    fn prepare_report(&self, now: f64) -> SchedulerReport {
         SchedulerReport {
             id: self.scheduler_id,
             start_time: self.report_start_time,
@@ -234,7 +236,6 @@ impl ReportStatistics for Port {
             forwarded_sizes: self.forwarded_sizes,
             throughput_mean: self.throughput_mean,
             queueing_delay_mean: self.queueing_delay_mean,
-            timing,
         }
     }
 
@@ -256,7 +257,7 @@ impl Model for Port {
         if update_interval < f64::MAX {
             cx.schedule_event(
                 Duration::from_secs_f64(update_interval),
-                Self::update_ui,
+                Self::log_report,
                 (),
             )
             .unwrap();

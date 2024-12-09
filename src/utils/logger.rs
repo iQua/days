@@ -2,6 +2,8 @@
 //! and sinks to three CSV files.
 
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use csv::WriterBuilder;
 use log::info;
@@ -9,12 +11,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
+use crate::get_config_path;
 use crate::schedulers::SchedulerReport;
 use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
+}
+
+// Stats structure to hold shared counters
+#[derive(Default, Debug)]
+struct Stats {
+    total_delay: f64,
 }
 
 enum ElementType {
@@ -110,17 +119,21 @@ impl From<SchedulerReport> for SchedulerReportForCsv {
 
 #[derive(Clone, Debug)]
 pub struct CsvLogger {
-    log_dir: String,
+    log_dir: Arc<String>,
     max_log_len: usize,
     scheduler_reports: Vec<SchedulerReport>,
     source_reports: Vec<PacketSourceReport>,
     sink_reports: Vec<PacketSinkReport>,
-    total_packets: usize,
-    total_delay: f64,
+
+    // Shared state protected by locks
+    total_packets: Arc<AtomicUsize>,
+    stats: Arc<Mutex<Stats>>,
+    file_lock: Arc<Mutex<()>>, // Lock for file operations
 }
 
 impl CsvLogger {
-    pub fn new(file_path: String) -> Self {
+    pub fn new() -> Self {
+        let file_path = get_config_path();
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
@@ -154,13 +167,14 @@ impl CsvLogger {
         );
 
         CsvLogger {
-            log_dir,
+            log_dir: Arc::new(log_dir),
             max_log_len: 10000,
             scheduler_reports: Vec::new(),
             source_reports: Vec::new(),
             sink_reports: Vec::new(),
-            total_packets: 0,
-            total_delay: 0.0,
+            total_packets: Arc::new(AtomicUsize::new(0)),
+            stats: Arc::new(Mutex::new(Stats::default())),
+            file_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -200,9 +214,16 @@ impl CsvLogger {
                         ElementType::Sink,
                         &self.sink_reports,
                     );
+
                     let (new_packets, new_delay) = self.compute_sink_statistics();
-                    self.total_packets += new_packets;
-                    self.total_delay += new_delay;
+
+                    // Update atomic counter
+                    self.total_packets.fetch_add(new_packets, Ordering::SeqCst);
+
+                    // Update shared stats under lock
+                    let mut stats = self.stats.lock().expect("Failed to lock stats");
+                    stats.total_delay += new_delay;
+
                     self.sink_reports.clear();
                 }
             }
@@ -214,16 +235,13 @@ impl CsvLogger {
         T: Clone,
         U: Serialize + From<T>,
     {
+        // Acquire lock before file operations
+        let _guard = self.file_lock.lock().expect("Failed to acquire file lock");
+
         let csv_file_name = match element {
-            ElementType::Source => {
-                format!("{}sources.csv", self.log_dir)
-            }
-            ElementType::Scheduler => {
-                format!("{}switches.csv", self.log_dir)
-            }
-            ElementType::Sink => {
-                format!("{}sinks.csv", self.log_dir)
-            }
+            ElementType::Source => format!("{}sources.csv", self.log_dir),
+            ElementType::Scheduler => format!("{}switches.csv", self.log_dir),
+            ElementType::Sink => format!("{}sinks.csv", self.log_dir),
         };
 
         let csv_file = fs::OpenOptions::new()
@@ -280,16 +298,22 @@ impl CsvLogger {
         );
 
         let (final_packets, final_delay) = self.compute_sink_statistics();
-        self.total_packets += final_packets;
-        self.total_delay += final_delay;
 
-        let avg_delay = if self.total_packets > 0 {
-            self.total_delay / self.total_packets as f64
+        // Update final statistics atomically
+        self.total_packets
+            .fetch_add(final_packets, Ordering::SeqCst);
+
+        let mut stats = self.stats.lock().expect("Failed to lock stats");
+        stats.total_delay += final_delay;
+
+        let total_packets = self.total_packets.load(Ordering::SeqCst);
+        let avg_delay = if total_packets > 0 {
+            stats.total_delay / total_packets as f64
         } else {
             0.0
         };
 
-        info!("Total packets processed: {}", self.total_packets);
+        info!("Total packets processed: {}", total_packets);
         info!("Average one-way delay: {:.6} seconds", avg_delay);
     }
 }

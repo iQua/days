@@ -16,6 +16,7 @@ use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
+use crate::utils::logger::CsvLogger;
 use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Debug)]
@@ -34,6 +35,9 @@ pub struct DistPacketSource {
     pub report_output: Output<Report>,
 
     pub report_start_time: f64,
+
+    /// The CSV logger
+    logger: CsvLogger,
 }
 
 impl DistPacketSource {
@@ -56,6 +60,7 @@ impl DistPacketSource {
             output: Output::default(),
             report_output: Output::default(),
             report_start_time: 0.0,
+            logger: CsvLogger::new(),
         }
     }
 
@@ -145,7 +150,7 @@ impl DistPacketSource {
             .exceeded(self.sent_size, self.flow_start_time, now)
     }
 
-    pub async fn update_ui(&mut self, now: f64, timing: ReportTiming) {
+    pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
         let report = PacketSourceReport {
             id: self.endpoint_id,
             flow_id: self.flow_id,
@@ -154,12 +159,9 @@ impl DistPacketSource {
             sent_packets: self.packets_sent,
             packet_sizes: self.sent_size_in_period,
             ack_bytes: 0,
-            timing,
         };
-
-        self.report_output
-            .send(Report::PacketSourceReport(report))
-            .await;
+        self.logger
+            .log_report(Report::PacketSourceReport(report), timing);
 
         debug!(
             "DistPacketSource {} logged a periodic report at time {:.3}.",
