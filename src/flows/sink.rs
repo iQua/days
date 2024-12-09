@@ -24,7 +24,7 @@ use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
 use crate::utils::logger::ReportLogger;
-use crate::utils::ui::ReportTiming;
+use crate::utils::ui::{Report, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSinkReport {
@@ -238,6 +238,13 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.output.borrow_mut(),
+        }
+    }
+
+    pub fn report_output(&mut self) -> &mut Output<Report> {
+        match self {
+            PacketSink::BasicPacketSink(sink) => sink.report_output.borrow_mut(),
+            PacketSink::TCPPacketSink(sink) => sink.report_output.borrow_mut(),
         }
     }
 

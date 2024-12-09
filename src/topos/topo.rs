@@ -471,7 +471,7 @@ impl Topology {
             self.flows.len()
         );
 
-        let update_ui: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
+        let ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -519,7 +519,7 @@ impl Topology {
 
             source
                 .report_output()
-                .connect(UserInterface::report_arrived, &update_ui);
+                .connect(UserInterface::report_arrived, &ui_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSource::packet_received, source_mbox);
@@ -544,6 +544,8 @@ impl Topology {
 
             sink.output()
                 .connect(PacketSwitch::packet_received, host_mbox);
+            sink.report_output()
+                .connect(UserInterface::report_arrived, &ui_mbox);
 
             let mut output = Output::default();
             output.connect(PacketSink::packet_received, &sink_mbox);
@@ -577,7 +579,7 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(source, source_mbox, "Source");
         }
 
-        (self, update_ui)
+        (self, ui_mbox)
     }
 
     /// Computes routing decisions for all the flows, and installs Flow
@@ -618,9 +620,9 @@ impl Topology {
 
     /// Creates and activates a UserInterface coroutine, which contains a progress bar and
     /// collect reports from all the network elements.
-    fn activate_ui(mut self, update_ui: Mailbox<UserInterface>) -> Self {
+    fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>) -> Self {
         let ui = UserInterface::new(get_update_interval(), self.duration, self.flows.len());
-        self.sim_init = self.sim_init.add_model(ui, update_ui, "UserInterface");
+        self.sim_init = self.sim_init.add_model(ui, ui_mbox, "UserInterface");
 
         self
     }
@@ -655,15 +657,15 @@ impl Topology {
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
 
-        let update_ui: Mailbox<UserInterface>;
+        let ui_mbox: Mailbox<UserInterface>;
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, update_ui) = self.attach_flows(&mut statistics);
+        (self, ui_mbox) = self.attach_flows(&mut statistics);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
 
         // creates and activates a UserInterface coroutine
-        self = self.activate_ui(update_ui);
+        self = self.activate_ui(ui_mbox);
         let duration = self.duration;
 
         // activates all the switches and initializes the simulation
