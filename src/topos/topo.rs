@@ -29,9 +29,8 @@ use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
-use crate::utils::logger::ReportLogger;
 use crate::utils::ui::UserInterface;
-use crate::{get_update_interval, num_switches, set_num_switches};
+use crate::{num_switches, set_num_switches, set_update_interval};
 
 #[derive(Deserialize)]
 struct UIConfig {
@@ -42,11 +41,6 @@ struct UIConfig {
 #[derive(Deserialize)]
 struct ConcurrencyConfig {
     num_threads: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct LogConfig {
-    log_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +138,8 @@ pub struct Topology {
     mailbox_capacity: usize,
     /// the duration of the simulation
     duration: f64,
+    /// the path to the configuration file
+    file_path: String,
 }
 
 impl Topology {
@@ -171,8 +167,8 @@ impl Topology {
 
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-
-        let duration = UserInterface::setup(ui_config.update_interval, ui_config.duration);
+        let duration = ui_config.duration.unwrap_or(1500.);
+        set_update_interval(ui_config.update_interval.unwrap_or(f64::MAX));
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -186,12 +182,6 @@ impl Topology {
             sim_init = SimInit::new();
             info!("Starting simulation with the default number of thread(s).",);
         }
-
-        let log_config: LogConfig = toml::from_str(&content)
-            .expect("Failed to deserialize the configuration of logging outputs");
-
-        // initializes the singleton of the logger of reports
-        ReportLogger::init(log_config.log_path, get_update_interval());
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
@@ -207,6 +197,7 @@ impl Topology {
             switch_config: config.switch,
             mailbox_capacity,
             duration,
+            file_path: file_path.to_string(),
         }
     }
 
@@ -644,8 +635,8 @@ impl Topology {
 
     /// Creates and activates a UserInterface coroutine, which contains a progress bar and
     /// collect reports from all the network elements.
-    fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>) -> Self {
-        let ui = UserInterface::new(get_update_interval(), self.duration, self.flows.len());
+    fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>, file_path: String) -> Self {
+        let ui = UserInterface::new(self.duration, self.flows.len(), file_path);
         self.sim_init = self.sim_init.add_model(ui, ui_mbox, "UserInterface");
 
         self
@@ -690,7 +681,8 @@ impl Topology {
         self.route_flows();
 
         // creates and activates a UserInterface coroutine
-        self = self.activate_ui(ui_mbox);
+        let config_path = self.file_path.clone();
+        self = self.activate_ui(ui_mbox, config_path);
         let duration = self.duration;
 
         // activates all the switches and initializes the simulation
@@ -714,8 +706,5 @@ impl Topology {
             "Elapsed wall-clock time: {:.3} seconds.",
             elapsed.as_secs_f64()
         );
-
-        // generates three CSV files containing statistics of this simulation run
-        ReportLogger::generate_output_files();
     }
 }

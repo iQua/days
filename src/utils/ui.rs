@@ -14,8 +14,9 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
+use crate::get_update_interval;
 use crate::schedulers::SchedulerReport;
-use crate::{get_update_interval, set_update_interval};
+use crate::utils::logger::CsvLogger;
 
 #[derive(Clone, Debug)]
 pub enum Report {
@@ -31,6 +32,7 @@ pub enum ReportTiming {
 }
 
 pub struct UserInterface {
+    logger: CsvLogger,
     progress_bar: ProgressBar,
     update_interval: f64,
     duration: f64,
@@ -40,13 +42,13 @@ pub struct UserInterface {
 }
 
 impl UserInterface {
-    pub fn new(update_interval: f64, duration: f64, num_sources: usize) -> UserInterface {
+    pub fn new(duration: f64, num_sources: usize, file_path: String) -> UserInterface {
         let multi = MultiProgress::new();
-        let logger = env_logger::Builder::from_default_env().build();
+        let env_logger = env_logger::Builder::from_default_env().build();
 
-        LogWrapper::new(multi.clone(), logger);
+        LogWrapper::new(multi.clone(), env_logger);
 
-        let progress_bar = ProgressBar::new((duration / update_interval) as u64);
+        let progress_bar = ProgressBar::new((duration / get_update_interval()) as u64);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
@@ -57,6 +59,7 @@ impl UserInterface {
         let pg = multi.add(progress_bar);
 
         UserInterface {
+            logger: CsvLogger::new(file_path),
             progress_bar: pg,
             update_interval: get_update_interval(),
             duration,
@@ -64,14 +67,6 @@ impl UserInterface {
             finished_sources: 0,
             finished: false,
         }
-    }
-
-    /// Sets up progress interval and duration from a configuration file.
-    pub fn setup(update_interval: Option<f64>, duration: Option<f64>) -> f64 {
-        let duration = duration.unwrap_or(1500.);
-        set_update_interval(update_interval.unwrap_or(f64::MAX));
-
-        duration
     }
 
     pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {

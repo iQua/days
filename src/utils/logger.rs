@@ -1,16 +1,21 @@
 //! Implements a report logger to log periodic reports of sources, schedulers,
 //! and sinks to three CSV files.
 
-use std::fs::{create_dir_all, File, OpenOptions};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::fs;
 
 use csv::WriterBuilder;
 use log::info;
+use serde::Deserialize;
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
 use crate::utils::ui::{Report, ReportTiming};
+
+#[derive(Deserialize)]
+struct LogConfig {
+    log_path: Option<String>,
+}
 
 enum ElementType {
     Source,
@@ -20,25 +25,25 @@ enum ElementType {
 
 #[derive(Clone, Debug)]
 pub struct CsvLogger {
-    // The directory to save the log files
     log_dir: String,
-    // The maximum number of reports to be saved in the memory before writing to CSV
     max_log_len: usize,
     scheduler_reports: Vec<SchedulerReport>,
     source_reports: Vec<PacketSourceReport>,
     sink_reports: Vec<PacketSinkReport>,
-    total_packets: usize,
-    total_delay: f64,
 }
 
 impl CsvLogger {
-    pub fn new(log_path: Option<String>) -> Self {
-        let mut log_dir = log_path.unwrap_or("./output/".to_string());
+    pub fn new(file_path: String) -> Self {
+        let content = fs::read_to_string(file_path).expect("The configuration is not valid");
+        let log_config: LogConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of logging outputs");
+
+        let mut log_dir = log_config.log_path.unwrap_or("./output/".to_string());
         if log_dir.chars().last().unwrap() != '/' {
             log_dir.push('/');
         }
 
-        if let Err(e) = create_dir_all(&log_dir) {
+        if let Err(e) = fs::create_dir_all(&log_dir) {
             panic!(
                 "Error '{}' occurred when creating directory {} for log files",
                 e, &log_dir
@@ -47,8 +52,8 @@ impl CsvLogger {
 
         // Create output files
         for element in ["sources", "switches", "sinks"] {
-            let file_name = format!("{log_dir}{element}.csv");
-            if let Err(e) = File::create(&file_name) {
+            let file_name = format!("{}{}.csv", log_dir, element);
+            if let Err(e) = fs::File::create(&file_name) {
                 panic!(
                     "Error '{}' occurred when creating log file {}",
                     e, &file_name
@@ -62,13 +67,11 @@ impl CsvLogger {
         );
 
         CsvLogger {
-            log_dir,
+            log_dir: "./output/".to_string(),
             max_log_len: 10000,
             scheduler_reports: Vec::new(),
             source_reports: Vec::new(),
             sink_reports: Vec::new(),
-            total_packets: 0,
-            total_delay: 0.0,
         }
     }
 
@@ -98,9 +101,6 @@ impl CsvLogger {
             Report::PacketSinkReport(report) => {
                 self.sink_reports.push(report);
                 if self.logging_due(self.sink_reports.len(), timing) {
-                    // Compute packet stats before writing reports
-                    self.compute_packet_stats(&self.sink_reports);
-
                     self.write_to_csv(ElementType::Sink, &self.sink_reports);
                     self.sink_reports.clear();
                 }
@@ -124,7 +124,7 @@ impl CsvLogger {
             }
         };
 
-        let csv_file = OpenOptions::new()
+        let csv_file = fs::OpenOptions::new()
             .append(true)
             .open(&csv_file_name)
             .unwrap();
@@ -145,26 +145,32 @@ impl CsvLogger {
         }
     }
 
-    fn compute_packet_stats(&mut self, reports: &[PacketSinkReport]) {
-        for report in reports {
-            self.total_packets += report.received_packets;
-            self.total_delay += report.one_way_delay_mean * report.received_packets as f64;
-        }
-    }
-
     pub fn generate_output_files(&self) {
-        // Update access patterns for thread safety
+        // Write remaining reports to files
         self.write_to_csv(ElementType::Source, &self.source_reports);
         self.write_to_csv(ElementType::Scheduler, &self.scheduler_reports);
         self.write_to_csv(ElementType::Sink, &self.sink_reports);
 
-        let avg_delay = if self.total_packets > 0 {
-            self.total_delay / self.total_packets as f64
+        // Compute statistics using functional operations
+        let total_packets = self
+            .sink_reports
+            .iter()
+            .map(|report| report.received_packets)
+            .sum::<usize>();
+
+        let total_delay = self
+            .sink_reports
+            .iter()
+            .map(|report| report.one_way_delay_mean * report.received_packets as f64)
+            .sum::<f64>();
+
+        let avg_delay = if total_packets > 0 {
+            total_delay / total_packets as f64
         } else {
             0.0
         };
 
-        info!("Total packets processed: {}", self.total_packets);
+        info!("Total packets processed: {}", total_packets);
         info!("Average one-way delay: {:.6} seconds", avg_delay);
     }
 }
