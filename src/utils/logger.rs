@@ -1,14 +1,15 @@
 //! Implements a report logger to log periodic reports of sources, schedulers,
 //! and sinks to three CSV files.
 
-use parking_lot::RwLock;
-use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-
 use csv::WriterBuilder;
 use log::info;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
@@ -18,6 +19,7 @@ use crate::schedulers::SchedulerReport;
 #[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
+    report_interval: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,8 +52,10 @@ enum ElementType {
 
 #[derive(Clone, Debug)]
 pub struct CsvLogger {
-    log_dir: Arc<String>,
+    interval: f64,
     max_log_len: usize,
+    log_dir: Arc<String>,
+    report_interval: OnceLock<f64>,
     // Shared state protected by locks
     shared_state: Arc<RwLock<SharedState>>,
     total_packets: Arc<AtomicUsize>,
@@ -63,6 +67,7 @@ impl CsvLogger {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
+        let interval = log_config.report_interval.unwrap_or(f64::MAX);
 
         let mut log_dir = log_config.log_path.unwrap_or("./output/".to_string());
         if log_dir.chars().last().unwrap() != '/' {
@@ -88,8 +93,10 @@ impl CsvLogger {
         }
 
         CsvLogger {
-            log_dir: Arc::new(log_dir),
+            interval,
             max_log_len: 10000,
+            log_dir: Arc::new(log_dir),
+            report_interval: OnceLock::new(),
             shared_state: Arc::new(RwLock::new(SharedState::default())),
             total_packets: Arc::new(AtomicUsize::new(0)),
         }
@@ -104,6 +111,10 @@ impl CsvLogger {
             *instance = Some(Arc::new(CsvLogger::new()));
         }
         Arc::clone(instance.as_ref().unwrap())
+    }
+
+    pub fn get_report_interval(&self) -> f64 {
+        *self.report_interval.get_or_init(|| self.interval)
     }
 
     pub fn log_report(report: Report, timing: ReportTiming) {

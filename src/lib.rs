@@ -23,9 +23,6 @@ static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
 static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
 
-// The report interval of the CSV logger
-static REPORT_INTERVAL: OnceLock<f64> = OnceLock::new();
-
 // The path of the configuration file
 static CONFIG_PATH: OnceLock<String> = OnceLock::new();
 
@@ -76,14 +73,6 @@ pub fn update_next_flow_id(next_flow_id: usize) {
 
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-pub fn get_report_interval() -> f64 {
-    *REPORT_INTERVAL.get().unwrap()
-}
-
-pub fn set_report_interval(interval: f64) {
-    REPORT_INTERVAL.set(interval).unwrap();
 }
 
 pub fn get_config_path() -> String {

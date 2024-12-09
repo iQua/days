@@ -13,12 +13,11 @@ use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
 use crate::flows::FlowFinishMsg;
+use crate::get_config_path;
 use crate::topos::topo::UIConfig;
-use crate::{get_config_path, get_report_interval};
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
-    report_interval: f64,
     ui_interval: f64,
     duration: f64,
     num_sources: usize,
@@ -54,7 +53,6 @@ impl UserInterface {
 
         UserInterface {
             progress_bar: pg,
-            report_interval: get_report_interval(),
             ui_interval,
             duration,
             num_sources,
@@ -70,7 +68,7 @@ impl UserInterface {
 
         if self.finished_sources == self.num_sources {
             self.progress_bar
-                .inc((self.duration / self.report_interval) as u64 - self.progress_bar.position());
+                .inc((self.duration / self.ui_interval) as u64 - self.progress_bar.position());
 
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 

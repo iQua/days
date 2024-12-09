@@ -20,9 +20,8 @@ use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
-use crate::get_report_interval;
 use crate::get_seed;
-use crate::utils::logger::ReportTiming;
+use crate::utils::logger::{CsvLogger, ReportTiming};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PacketSourceReport {
@@ -304,7 +303,7 @@ impl PacketSource {
             if self.stop_run(now).await {
                 let name = format!("{self}");
 
-                if get_report_interval() < f64::MAX {
+                if CsvLogger::get_instance().get_report_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {
                             source.log_report(now, ReportTiming::Final);
@@ -417,7 +416,7 @@ impl PacketSource {
     }
 
     fn start_report_logger(&self, initial_delay: f64, cx: &mut Context<Self>) {
-        let report_interval = get_report_interval();
+        let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(initial_delay + report_interval),

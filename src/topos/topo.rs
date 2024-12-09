@@ -31,17 +31,12 @@ use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::utils::logger::CsvLogger;
 use crate::utils::ui::UserInterface;
-use crate::{num_switches, set_config_path, set_num_switches, set_report_interval};
+use crate::{num_switches, set_config_path, set_num_switches};
 
 #[derive(Deserialize)]
 pub struct UIConfig {
     pub ui_interval: Option<f64>,
     pub duration: Option<f64>,
-}
-
-#[derive(Deserialize)]
-struct UpdateConfig {
-    report_interval: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -175,10 +170,6 @@ impl Topology {
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
         let duration = ui_config.duration.unwrap_or(1500.);
-
-        let update_config: UpdateConfig = toml::from_str(&content)
-            .expect("Failed to deserialize the configuration of update interval");
-        set_report_interval(update_config.report_interval.unwrap_or(f64::MAX));
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");

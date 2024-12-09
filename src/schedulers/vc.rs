@@ -19,11 +19,10 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
+use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::logger::CsvLogger;
-use crate::utils::logger::{Report, ReportTiming};
-use crate::{get_report_interval, next_scheduler_id};
+use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 pub struct TaggedPacket {
     pub packet: Packet,
@@ -314,7 +313,7 @@ impl VirtualClockServer {
             self.reset_stats(now);
 
             cx.schedule_event(
-                Duration::from_secs_f64(get_report_interval()),
+                Duration::from_secs_f64(CsvLogger::get_instance().get_report_interval()),
                 Self::log_report,
                 (),
             )
@@ -370,7 +369,7 @@ impl ReportStatistics for VirtualClockServer {
 
 impl Model for VirtualClockServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        let report_interval = get_report_interval();
+        let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_event(
                 Duration::from_secs_f64(report_interval),
