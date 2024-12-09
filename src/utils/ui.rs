@@ -25,7 +25,7 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub enum ReportTiming {
     InProgress,
     Final,
@@ -38,7 +38,6 @@ pub struct UserInterface {
     duration: f64,
     num_sources: usize,
     finished_sources: usize,
-    finished: bool,
 }
 
 impl UserInterface {
@@ -65,45 +64,57 @@ impl UserInterface {
             duration,
             num_sources,
             finished_sources: 0,
-            finished: false,
         }
     }
+    pub fn report_arrived(&mut self, report: Report, cx: &mut Context<Self>) {
+        match report {
+            Report::PacketSourceReport(PacketSourceReport { timing, .. }) => {
+                if timing == ReportTiming::Final {
+                    self.finished_sources += 1;
+                    debug!(
+                        "{} / {} sources have finished.",
+                        self.finished_sources, self.num_sources
+                    );
 
-    pub fn report_arrived(&mut self, _report: Report, cx: &mut Context<Self>) {
-        self.finished_sources += 1;
-        debug!(
-            "{} / {} sources have finished.",
-            self.finished_sources, self.num_sources
-        );
-        if self.finished_sources == self.num_sources {
-            self.finished = true;
+                    if self.finished_sources == self.num_sources {
+                        self.progress_bar.inc(
+                            (self.duration / self.update_interval) as u64
+                                - self.progress_bar.position(),
+                        );
 
-            self.progress_bar
-                .inc((self.duration / self.update_interval) as u64 - self.progress_bar.position());
+                        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                        cx.schedule_event(
+                            Duration::from_secs_f64(self.duration - now),
+                            Self::run,
+                            (),
+                        )
+                        .unwrap();
+                    }
+                }
 
-            cx.schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
-                .unwrap();
+                self.logger.log_report(report, timing);
+            }
+            Report::PacketSinkReport(PacketSinkReport { timing, .. }) => {
+                self.logger.log_report(report, timing);
+            }
+            Report::SchedulerReport(SchedulerReport { timing, .. }) => {
+                self.logger.log_report(report, timing);
+            }
         }
     }
 
     fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        if self.finished {
-            if now == self.duration {
-                self.progress_bar.finish_and_clear();
-            }
+        if self.finished_sources == self.num_sources {
+            self.progress_bar.finish_and_clear();
+            self.logger.generate_output_files();
         } else {
-            self.progress_bar.inc(1);
-            if self.progress_bar.position() >= (self.duration / self.update_interval) as u64 {
-                self.progress_bar.finish_and_clear();
-                self.finished = true;
-            } else {
-                cx.schedule_event(Duration::from_secs_f64(self.update_interval), Self::run, ())
-                    .unwrap();
+            if self.progress_bar.position() < (self.duration / self.update_interval) as u64 {
+                self.progress_bar.inc(1);
             }
+
+            cx.schedule_event(Duration::from_secs_f64(self.update_interval), Self::run, ())
+                .unwrap();
         }
     }
 }

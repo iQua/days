@@ -67,7 +67,7 @@ impl CsvLogger {
         );
 
         CsvLogger {
-            log_dir: "./output/".to_string(),
+            log_dir,
             max_log_len: 10000,
             scheduler_reports: Vec::new(),
             source_reports: Vec::new(),
