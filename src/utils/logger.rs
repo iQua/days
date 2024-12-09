@@ -4,7 +4,7 @@
 use parking_lot::RwLock;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use csv::WriterBuilder;
 use log::info;
@@ -85,8 +85,20 @@ impl CsvLogger {
         }
     }
 
-    pub fn log_report(&self, report: Report, timing: ReportTiming) {
-        let mut state = self.shared_state.write();
+    pub fn get_instance() -> Arc<CsvLogger> {
+        static INSTANCE: LazyLock<Mutex<Option<Arc<CsvLogger>>>> =
+            LazyLock::new(|| Mutex::new(None));
+
+        let mut instance = INSTANCE.lock().unwrap();
+        if instance.is_none() {
+            *instance = Some(Arc::new(CsvLogger::new()));
+        }
+        Arc::clone(instance.as_ref().unwrap())
+    }
+
+    pub fn log_report(report: Report, timing: ReportTiming) {
+        let logger = &CsvLogger::get_instance();
+        let mut state = logger.shared_state.write();
 
         match report {
             Report::PacketSourceReport(report) => {
@@ -104,7 +116,7 @@ impl CsvLogger {
         drop(state);
 
         if timing == ReportTiming::InProgress {
-            self.check_and_flush_reports();
+            logger.check_and_flush_reports();
         }
     }
 

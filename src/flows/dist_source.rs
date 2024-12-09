@@ -35,9 +35,6 @@ pub struct DistPacketSource {
     pub report_output: Output<Report>,
 
     pub report_start_time: f64,
-
-    /// The CSV logger
-    logger: CsvLogger,
 }
 
 impl DistPacketSource {
@@ -60,7 +57,6 @@ impl DistPacketSource {
             output: Output::default(),
             report_output: Output::default(),
             report_start_time: 0.0,
-            logger: CsvLogger::new(),
         }
     }
 
@@ -160,8 +156,7 @@ impl DistPacketSource {
             packet_sizes: self.sent_size_in_period,
             ack_bytes: 0,
         };
-        self.logger
-            .log_report(Report::PacketSourceReport(report), timing);
+        CsvLogger::log_report(Report::PacketSourceReport(report), timing);
 
         debug!(
             "DistPacketSource {} logged a periodic report at time {:.3}.",

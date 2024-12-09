@@ -66,9 +66,6 @@ pub struct DRRServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
-
-    /// The CSV logger
-    logger: CsvLogger,
 }
 
 impl DRRServer {
@@ -132,7 +129,6 @@ impl DRRServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
-            logger: CsvLogger::new(),
         }
     }
 
@@ -284,8 +280,7 @@ impl DRRServer {
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             let report = self.prepare_report(now);
-            self.logger
-                .log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
+            CsvLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
 
             debug!(
                 "DRRServer {} logged a periodic report at time {:.3}.",

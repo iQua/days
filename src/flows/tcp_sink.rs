@@ -38,9 +38,6 @@ pub struct TCPPacketSink {
     received_sizes: usize,
     queueing_delay_mean: f64,
     one_way_delay_mean: f64,
-
-    /// The CSV logger
-    logger: CsvLogger,
 }
 
 impl TCPPacketSink {
@@ -62,7 +59,6 @@ impl TCPPacketSink {
             received_sizes: 0,
             queueing_delay_mean: 0.0,
             one_way_delay_mean: 0.0,
-            logger: CsvLogger::new(),
         }
     }
 
@@ -88,8 +84,7 @@ impl TCPPacketSink {
             queueing_delay_mean: self.queueing_delay_mean,
             one_way_delay_mean: self.one_way_delay_mean,
         };
-        self.logger
-            .log_report(Report::PacketSinkReport(report), timing);
+        CsvLogger::log_report(Report::PacketSinkReport(report), timing);
 
         debug!(
             "TCPPacketSink {} logged a periodic report at time {:.3}.",

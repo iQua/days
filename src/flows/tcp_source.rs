@@ -100,9 +100,6 @@ pub struct TCPPacketSource {
     sent_flow_finish_msg: bool,
 
     pub report_start_time: f64,
-
-    /// the CSV logger
-    logger: CsvLogger,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -155,7 +152,6 @@ impl TCPPacketSource {
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,
-            logger: CsvLogger::new(),
         }
     }
 
@@ -397,8 +393,7 @@ impl TCPPacketSource {
             ack_bytes: self.last_ack,
         };
 
-        self.logger
-            .log_report(Report::PacketSourceReport(report), timing);
+        CsvLogger::log_report(Report::PacketSourceReport(report), timing);
 
         debug!(
             "TCPPacketSource {} logged a periodic report at time {:.3}.",
