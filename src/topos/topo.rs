@@ -33,9 +33,14 @@ use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches, set_update_interval};
 
 #[derive(Deserialize)]
-struct UIConfig {
+pub struct UIConfig {
+    pub ui_interval: Option<f64>,
+    pub duration: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct UpdateConfig {
     update_interval: Option<f64>,
-    duration: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -168,7 +173,10 @@ impl Topology {
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
         let duration = ui_config.duration.unwrap_or(1500.);
-        set_update_interval(ui_config.update_interval.unwrap_or(f64::MAX));
+
+        let update_config: UpdateConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of update interval");
+        set_update_interval(update_config.update_interval.unwrap_or(f64::MAX));
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -636,7 +644,7 @@ impl Topology {
     /// Creates and activates a UserInterface coroutine, which contains a progress bar and
     /// collect reports from all the network elements.
     fn activate_ui(mut self, ui_mbox: Mailbox<UserInterface>, file_path: String) -> Self {
-        let ui = UserInterface::new(self.duration, self.flows.len(), file_path);
+        let ui = UserInterface::new(self.flows.len(), file_path);
         self.sim_init = self.sim_init.add_model(ui, ui_mbox, "UserInterface");
 
         self

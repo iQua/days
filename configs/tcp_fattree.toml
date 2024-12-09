@@ -3,7 +3,8 @@
 seed = 100
 mailbox_capacity = 100
 duration = 0.2
-update_interval = 0.01
+ui_interval = 0.01
+update_interval = 0.1
 num_threads = 1
 log_path = "logs/tcp_fattree"
 
@@ -11,7 +12,7 @@ log_path = "logs/tcp_fattree"
 category = "FatTree"
 
 [topology.fat_tree]
-    k = 96
+k = 96
 
 [switch]
 port_rate = 100000000 # 100 Mbps

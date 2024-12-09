@@ -5,7 +5,7 @@ use std::fs;
 
 use csv::WriterBuilder;
 use log::info;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
@@ -21,6 +21,91 @@ enum ElementType {
     Source,
     Scheduler,
     Sink,
+}
+
+#[derive(Serialize)]
+struct SourceReportForCsv {
+    pub id: usize,
+    pub flow_id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub sent_packets: usize,
+    pub packet_sizes: usize,
+    pub ack_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct SchedulerReportForCsv {
+    pub id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub received_packets: usize,
+    pub dropped_packets: usize,
+    pub forwarded_packets: usize,
+    pub queue_length: usize,
+    pub received_sizes: usize,
+    pub forwarded_sizes: usize,
+    pub throughput_mean: f64,
+    pub queueing_delay_mean: f64,
+}
+
+#[derive(Serialize)]
+struct SinkReportForCsv {
+    pub id: usize,
+    pub flow_id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub received_packets: usize,
+    pub received_sizes: usize,
+    pub queueing_delay_mean: f64,
+    pub one_way_delay_mean: f64,
+}
+
+impl From<PacketSourceReport> for SourceReportForCsv {
+    fn from(report: PacketSourceReport) -> Self {
+        Self {
+            id: report.id,
+            flow_id: report.flow_id,
+            start_time: report.start_time,
+            end_time: report.end_time,
+            sent_packets: report.sent_packets,
+            packet_sizes: report.packet_sizes,
+            ack_bytes: report.ack_bytes,
+        }
+    }
+}
+
+impl From<PacketSinkReport> for SinkReportForCsv {
+    fn from(report: PacketSinkReport) -> Self {
+        Self {
+            id: report.id,
+            flow_id: report.flow_id,
+            start_time: report.start_time,
+            end_time: report.end_time,
+            received_packets: report.received_packets,
+            received_sizes: report.received_sizes,
+            queueing_delay_mean: report.queueing_delay_mean,
+            one_way_delay_mean: report.one_way_delay_mean,
+        }
+    }
+}
+
+impl From<SchedulerReport> for SchedulerReportForCsv {
+    fn from(report: SchedulerReport) -> Self {
+        Self {
+            id: report.id,
+            start_time: report.start_time,
+            end_time: report.end_time,
+            received_packets: report.received_packets,
+            dropped_packets: report.dropped_packets,
+            forwarded_packets: report.forwarded_packets,
+            queue_length: report.queue_length,
+            received_sizes: report.received_sizes,
+            forwarded_sizes: report.forwarded_sizes,
+            throughput_mean: report.throughput_mean,
+            queueing_delay_mean: report.queueing_delay_mean,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -91,21 +176,30 @@ impl CsvLogger {
             Report::PacketSourceReport(report) => {
                 self.source_reports.push(report);
                 if self.logging_due(self.source_reports.len(), timing) {
-                    self.write_to_csv(ElementType::Source, &self.source_reports);
+                    self.write_to_csv::<PacketSourceReport, SourceReportForCsv>(
+                        ElementType::Source,
+                        &self.source_reports,
+                    );
                     self.source_reports.clear();
                 }
             }
             Report::SchedulerReport(report) => {
                 self.scheduler_reports.push(report);
                 if self.logging_due(self.scheduler_reports.len(), timing) {
-                    self.write_to_csv(ElementType::Scheduler, &self.scheduler_reports);
+                    self.write_to_csv::<SchedulerReport, SchedulerReportForCsv>(
+                        ElementType::Scheduler,
+                        &self.scheduler_reports,
+                    );
                     self.scheduler_reports.clear();
                 }
             }
             Report::PacketSinkReport(report) => {
                 self.sink_reports.push(report);
                 if self.logging_due(self.sink_reports.len(), timing) {
-                    self.write_to_csv(ElementType::Sink, &self.sink_reports);
+                    self.write_to_csv::<PacketSinkReport, SinkReportForCsv>(
+                        ElementType::Sink,
+                        &self.sink_reports,
+                    );
                     let (new_packets, new_delay) = self.compute_sink_statistics();
                     self.total_packets += new_packets;
                     self.total_delay += new_delay;
@@ -115,9 +209,10 @@ impl CsvLogger {
         };
     }
 
-    fn write_to_csv<T>(&self, element: ElementType, reports: &Vec<T>)
+    fn write_to_csv<T, U>(&self, element: ElementType, reports: &Vec<T>)
     where
-        T: serde::Serialize,
+        T: Clone,
+        U: Serialize + From<T>,
     {
         let csv_file_name = match element {
             ElementType::Source => {
@@ -143,7 +238,8 @@ impl CsvLogger {
             .from_writer(csv_file);
 
         for report in reports {
-            if let Err(e) = csv_writer.serialize(report) {
+            let csv_report = U::from(report.clone());
+            if let Err(e) = csv_writer.serialize(csv_report) {
                 panic!(
                     "Error '{}' occurred when writing a report to csv file {}",
                     e, &csv_file_name
@@ -170,9 +266,18 @@ impl CsvLogger {
 
     pub fn generate_output_files(&mut self) {
         // Write remaining reports to files
-        self.write_to_csv(ElementType::Source, &self.source_reports);
-        self.write_to_csv(ElementType::Scheduler, &self.scheduler_reports);
-        self.write_to_csv(ElementType::Sink, &self.sink_reports);
+        self.write_to_csv::<PacketSourceReport, SourceReportForCsv>(
+            ElementType::Source,
+            &self.source_reports,
+        );
+        self.write_to_csv::<SchedulerReport, SchedulerReportForCsv>(
+            ElementType::Scheduler,
+            &self.scheduler_reports,
+        );
+        self.write_to_csv::<PacketSinkReport, SinkReportForCsv>(
+            ElementType::Sink,
+            &self.sink_reports,
+        );
 
         let (final_packets, final_delay) = self.compute_sink_statistics();
         self.total_packets += final_packets;

@@ -2,6 +2,7 @@
 //! progress of the simulation run, as well as a report logger that logs reports
 //! to a .csv file.
 
+use std::fs;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -16,6 +17,7 @@ use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::get_update_interval;
 use crate::schedulers::SchedulerReport;
+use crate::topos::topo::UIConfig;
 use crate::utils::logger::CsvLogger;
 
 #[derive(Clone, Debug)]
@@ -35,19 +37,29 @@ pub struct UserInterface {
     logger: CsvLogger,
     progress_bar: ProgressBar,
     update_interval: f64,
+    ui_interval: f64,
     duration: f64,
     num_sources: usize,
     finished_sources: usize,
 }
 
 impl UserInterface {
-    pub fn new(duration: f64, num_sources: usize, file_path: String) -> UserInterface {
+    pub fn new(num_sources: usize, file_path: String) -> UserInterface {
+        let content =
+            fs::read_to_string(file_path.clone()).expect("The configuration is not valid");
+
+        // Obtain the user interface progress interval from the configuration file
+        let ui_config: UIConfig = toml::from_str(&content)
+            .expect("Failed to deserialize the configuration of the user interface");
+        let ui_interval = ui_config.ui_interval.unwrap_or(1.0);
+        let duration = ui_config.duration.unwrap_or(1500.);
+
         let multi = MultiProgress::new();
         let env_logger = env_logger::Builder::from_default_env().build();
 
         LogWrapper::new(multi.clone(), env_logger);
 
-        let progress_bar = ProgressBar::new((duration / get_update_interval()) as u64);
+        let progress_bar = ProgressBar::new((duration / ui_interval) as u64);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
@@ -61,6 +73,7 @@ impl UserInterface {
             logger: CsvLogger::new(file_path),
             progress_bar: pg,
             update_interval: get_update_interval(),
+            ui_interval,
             duration,
             num_sources,
             finished_sources: 0,
@@ -77,8 +90,6 @@ impl UserInterface {
                     );
 
                     if self.finished_sources == self.num_sources {
-                        self.logger.generate_output_files();
-
                         self.progress_bar.inc(
                             (self.duration / self.update_interval) as u64
                                 - self.progress_bar.position(),
@@ -107,14 +118,17 @@ impl UserInterface {
     }
 
     fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        if self.finished_sources == self.num_sources {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        if now >= self.duration {
             self.progress_bar.finish_and_clear();
+            self.logger.generate_output_files();
         } else {
-            if self.progress_bar.position() < (self.duration / self.update_interval) as u64 {
+            if self.progress_bar.position() < (self.duration / self.ui_interval) as u64 {
                 self.progress_bar.inc(1);
             }
 
-            cx.schedule_event(Duration::from_secs_f64(self.update_interval), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(self.ui_interval), Self::run, ())
                 .unwrap();
         }
     }
