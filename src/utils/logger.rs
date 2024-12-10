@@ -78,16 +78,21 @@ impl CsvLogger {
         }
     }
 
-    pub fn init_default(&self, log_path: Option<&str>) {
-        let mut log_path = log_path.unwrap_or("./output/").to_string();
-        if log_path.chars().last().unwrap() != '/' {
-            log_path.push('/');
+    fn ensure_trailing_slash(path: &str) -> String {
+        if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
         }
+    }
 
-        self.log_path.set(log_path.to_string()).unwrap();
+    pub fn init_default(&self, log_path: Option<&str>) {
+        let log_path = Self::ensure_trailing_slash(log_path.unwrap_or("./output"));
+
+        self.log_path.set(log_path.clone()).unwrap();
         self.report_interval.set(f64::MAX).unwrap();
 
-        self.init_output_files(log_path);
+        self.init_output_files(&log_path);
     }
 
     pub fn init_from_config(&self, config_path: &str) {
@@ -95,24 +100,22 @@ impl CsvLogger {
         let log_config: LogConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of logging outputs");
 
-        let mut log_path = log_config.log_path.unwrap_or("./output/".to_string());
-        if log_path.chars().last().unwrap() != '/' {
-            log_path.push('/');
-        }
+        let log_path =
+            Self::ensure_trailing_slash(&log_config.log_path.unwrap_or("./output".to_string()));
 
         self.log_path.set(log_path.clone()).unwrap();
         self.report_interval
             .set(log_config.report_interval.unwrap_or(f64::MAX))
             .unwrap();
 
-        self.init_output_files(log_path);
+        self.init_output_files(&log_path);
     }
 
-    pub fn init_output_files(&self, log_path: String) {
-        if let Err(e) = fs::create_dir_all(&log_path) {
+    pub fn init_output_files(&self, log_path: &str) {
+        if let Err(e) = fs::create_dir_all(log_path) {
             panic!(
                 "Error '{}' occurred when creating directory {} for log files",
-                e, &log_path
+                e, log_path
             );
         };
 
