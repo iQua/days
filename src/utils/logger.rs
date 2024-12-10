@@ -70,14 +70,6 @@ impl CsvLogger {
         }
     }
 
-    pub fn init(&self, config_path: Option<&str>, log_path: Option<&str>) {
-        if let Some(config_path) = config_path {
-            self.init_from_config(config_path);
-        } else {
-            self.init_default(log_path);
-        }
-    }
-
     fn ensure_trailing_slash(path: &str) -> String {
         if path.ends_with('/') {
             path.to_string()
@@ -86,8 +78,8 @@ impl CsvLogger {
         }
     }
 
-    pub fn init_default(&self, log_path: Option<&str>) {
-        let log_path = Self::ensure_trailing_slash(log_path.unwrap_or("./output"));
+    pub fn init(&self, log_path: &str) {
+        let log_path = Self::ensure_trailing_slash(log_path);
 
         self.log_path.set(log_path.clone()).unwrap();
         self.report_interval.set(f64::MAX).unwrap();

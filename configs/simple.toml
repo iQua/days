@@ -3,8 +3,6 @@
 seed = 1000
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
-report_interval = 2.0
-duration = 20.0
 log_path = "logs/simple"
 
 [switch]

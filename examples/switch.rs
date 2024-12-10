@@ -24,7 +24,7 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    CsvLogger::get_instance().init(None, Some("logs/switch"));
+    CsvLogger::get_instance().init("logs/switch");
 
     // instantiates models
     let mut source_1 = PacketSource::new(
