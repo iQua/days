@@ -34,7 +34,10 @@ fn main() {
     //    let graph = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
     //    let hosts = vec![0, 1];
 
-    let (graph, hosts) = build_graph(&path);
+    let Ok((graph, hosts)) = build_graph(&path) else {
+        panic!("Failed to build the network graph.");
+    };
+
     info!("The network graph has been initialized.");
 
     // There are two ways of initializing the flows:
