@@ -14,7 +14,7 @@ fn main() {
 
     let config_path = "configs/simple.toml";
 
-    let Ok((graph, hosts)) = build_graph(&path) else {
+    let Ok((graph, hosts)) = build_graph(&config_path) else {
         panic!("Failed to build the network graph.");
     };
 
