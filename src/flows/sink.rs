@@ -8,7 +8,6 @@
 use std::borrow::BorrowMut;
 use std::cell::Cell;
 use std::fmt::{Debug, Display, Formatter};
-use std::future::Future;
 use std::time::Duration;
 
 use log::debug;
@@ -283,21 +282,15 @@ impl PacketSink {
         }
     }
 
-    fn log_report<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            match self {
-                PacketSink::BasicPacketSink(sink) => {
-                    sink.log_report(now, ReportTiming::InProgress);
-                }
-                PacketSink::TCPPacketSink(sink) => {
-                    sink.log_report(now, ReportTiming::InProgress);
-                }
+        match self {
+            PacketSink::BasicPacketSink(sink) => {
+                sink.log_report(now, ReportTiming::InProgress);
+            }
+            PacketSink::TCPPacketSink(sink) => {
+                sink.log_report(now, ReportTiming::InProgress);
             }
         }
     }

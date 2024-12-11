@@ -98,6 +98,20 @@ impl TrafficCharacteristics {
             tcp: traffic.tcp,
         }
     }
+
+    fn default() -> Self {
+        Self::new(
+            1.,
+            Some(10.),
+            None,
+            DistributionInfo::Exp { lambda: 1. },
+            DistributionInfo::DiscreteUniform {
+                low: 1000,
+                high: 1000,
+            },
+            None,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]

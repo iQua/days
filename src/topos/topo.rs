@@ -18,7 +18,7 @@ use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
-use crate::flows::flow::{Flow, FlowType};
+use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -255,63 +255,66 @@ impl Topology {
 
                 match collective.collective_type {
                     CollectiveType::Broadcast => {
-                        self.flows.push(Flow::new(
-                            flow_id,
+                        self.flows.push(Flow::new(FlowParams {
+                            id: flow_id,
                             path,
-                            Vec::new(),
-                            Vec::new(),
-                            collective.flow_type,
-                            source,
-                            sink,
-                            collective.traffic,
+                            starts_before: Vec::new(),
+                            starts_after: Vec::new(),
+                            flow_type: collective.flow_type,
+                            source_host: source,
+                            sink_host: sink,
+                            traffic: collective.traffic,
                             // uses collective_id as the random seed for the
                             // flow, which ensures that all flows in the
                             // broadcast have the same arrival and size
                             // distribution
-                            collective.id,
-                        ));
+                            seed: collective.id,
+                        }));
+
                         debug!(
                             "Produced Flow {} of Broadcast collective communication operation {}.",
                             flow_id, collective.id
                         );
                     }
                     CollectiveType::Gather => {
-                        self.flows.push(Flow::new(
-                            flow_id,
+                        self.flows.push(Flow::new(FlowParams {
+                            id: flow_id,
                             path,
-                            Vec::new(),
-                            Vec::new(),
-                            collective.flow_type,
-                            source,
-                            sink,
-                            collective.traffic,
+                            starts_before: Vec::new(),
+                            starts_after: Vec::new(),
+                            flow_type: collective.flow_type,
+                            source_host: source,
+                            sink_host: sink,
+                            traffic: collective.traffic,
                             // uses flow_id as the random seed for the flow,
                             // which ensures that different flows have different
                             // arrival and size distributions
-                            flow_id,
-                        ));
+                            seed: flow_id,
+                        }));
+
                         debug!(
                             "Produced Flow {} of Gather collective communication operation {}.",
                             flow_id, collective.id
                         );
                     }
                     CollectiveType::AllReduce => {
-                        self.flows.push(Flow::new(
-                            flow_id,
+                        self.flows.push(Flow::new(FlowParams {
+                            id: flow_id,
                             path,
-                            Vec::new(),
-                            Vec::new(),
-                            collective.flow_type,
-                            source,
-                            sink,
-                            collective.traffic,
+                            starts_before: Vec::new(),
+                            starts_after: Vec::new(),
+                            flow_type: collective.flow_type,
+                            source_host: source,
+                            sink_host: sink,
+                            traffic: collective.traffic,
                             // uses the source host's id as the random seed for
                             // the flow, which ensures that different hosts have
                             // different arrival and size distributions, but
                             // packet sources attached to the same host have the
                             // same distribution
-                            source,
-                        ));
+                            seed: source,
+                        }));
+
                         debug!(
                             "Produced Flow {} of AllReduce collective communication operation {}.",
                             flow_id, collective.id
@@ -548,7 +551,7 @@ impl Topology {
             // receives (or source for TCP) its last packet
             for flow_id in flow.starts_before.iter() {
                 let mut flow_finish_output = Output::default();
-                flow_finish_output.connect(PacketSource::flow_finished, &source_mboxes[&flow_id]);
+                flow_finish_output.connect(PacketSource::flow_finished, &source_mboxes[flow_id]);
                 match flow.flow_type {
                     FlowType::PacketDistribution => {
                         sink.connect_flow_finish_output(flow_finish_output);
@@ -587,7 +590,7 @@ impl Topology {
             let path = flow.compute_path(self.graph.clone());
 
             for window in path.windows(2) {
-                let node_id = window.get(0).unwrap().index();
+                let node_id = window.first().unwrap().index();
                 let next_id = window.get(1).unwrap().index();
 
                 // FIBs do not include PacketSource

@@ -148,8 +148,9 @@ impl PacketSource {
 
                 // as suggested by RFC 6298, the clock granuarity, i.e., the
                 // interval of this periodic timer, is always 100 msec
-                cx.schedule_event(
+                cx.schedule_periodic_event(
                     Duration::from_secs_f64(initial_delay + 0.1),
+                    Duration::from_secs_f64(0.1),
                     Self::periodic_timer_event,
                     (),
                 )
@@ -214,28 +215,12 @@ impl PacketSource {
             }
         }
     }
-
-    fn periodic_timer_event<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            match self {
-                PacketSource::DistPacketSource(_) => (),
-                PacketSource::TCPPacketSource(source) => {
-                    let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-                    source.timer_tick(now).await;
-
-                    // schedules the next periodic timer event
-                    cx.schedule_event(
-                        Duration::from_secs_f64(0.05),
-                        Self::periodic_timer_event,
-                        (),
-                    )
-                    .unwrap();
-                }
+    async fn periodic_timer_event<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+        match self {
+            PacketSource::DistPacketSource(_) => (),
+            PacketSource::TCPPacketSource(source) => {
+                let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                source.timer_tick(now).await;
             }
         }
     }
@@ -254,23 +239,17 @@ impl PacketSource {
         }
     }
 
-    fn log_report<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            match self {
-                PacketSource::DistPacketSource(source) => {
-                    source.log_report(now, ReportTiming::InProgress);
-                }
-                PacketSource::TCPPacketSource(source) => {
-                    source.log_report(now, ReportTiming::InProgress);
-                }
-            };
-        }
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                source.log_report(now, ReportTiming::InProgress);
+            }
+            PacketSource::TCPPacketSource(source) => {
+                source.log_report(now, ReportTiming::InProgress);
+            }
+        };
     }
 
     /// Returns whether PacketSource should stop running.
