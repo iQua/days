@@ -254,23 +254,17 @@ impl PacketSource {
         }
     }
 
-    fn log_report<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            match self {
-                PacketSource::DistPacketSource(source) => {
-                    source.log_report(now, ReportTiming::InProgress);
-                }
-                PacketSource::TCPPacketSource(source) => {
-                    source.log_report(now, ReportTiming::InProgress);
-                }
-            };
-        }
+        match self {
+            PacketSource::DistPacketSource(source) => {
+                source.log_report(now, ReportTiming::InProgress);
+            }
+            PacketSource::TCPPacketSource(source) => {
+                source.log_report(now, ReportTiming::InProgress);
+            }
+        };
     }
 
     /// Returns whether PacketSource should stop running.

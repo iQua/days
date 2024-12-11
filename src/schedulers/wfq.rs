@@ -10,7 +10,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -337,31 +336,18 @@ impl WFQServer {
         }
     }
 
-    fn log_report<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            let report = self.prepare_report(now);
-            CsvLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
+        let report = self.prepare_report(now);
+        CsvLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
 
-            debug!(
-                "WFQServer {} logged a periodic report at time {:.3}.",
-                self.scheduler_id, now
-            );
+        debug!(
+            "WFQServer {} logged a periodic report at time {:.3}.",
+            self.scheduler_id, now
+        );
 
-            self.reset_stats(now);
-
-            cx.schedule_event(
-                Duration::from_secs_f64(CsvLogger::get_instance().get_report_interval()),
-                Self::log_report,
-                (),
-            )
-            .unwrap();
-        }
+        self.reset_stats(now);
     }
 }
 
@@ -414,7 +400,8 @@ impl Model for WFQServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
-            cx.schedule_event(
+            cx.schedule_periodic_event(
+                Duration::from_secs_f64(report_interval),
                 Duration::from_secs_f64(report_interval),
                 Self::log_report,
                 (),
