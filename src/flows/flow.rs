@@ -44,6 +44,19 @@ struct FlowConfig {
     flow_set: Option<Vec<TomlFlowSet>>,
 }
 
+#[derive(Debug)]
+pub struct FlowParams {
+    pub id: usize,
+    pub path: Option<Vec<usize>>,
+    pub starts_before: Vec<usize>,
+    pub starts_after: Vec<usize>,
+    pub flow_type: FlowType,
+    pub source_host: usize,
+    pub sink_host: usize,
+    pub traffic: TrafficCharacteristics,
+    pub seed: usize,
+}
+
 /// A flow represents a directed edge with one packet source and one packet sink.
 #[derive(Debug)]
 pub struct Flow {
@@ -71,35 +84,25 @@ pub struct Flow {
 }
 
 impl Flow {
-    pub fn new(
-        id: usize,
-        path: Option<Vec<usize>>,
-        starts_before: Vec<usize>,
-        starts_after: Vec<usize>,
-        flow_type: FlowType,
-        source_host: usize,
-        sink_host: usize,
-        traffic: TrafficCharacteristics,
-        seed: usize,
-    ) -> Flow {
+    pub fn new(params: FlowParams) -> Flow {
         let mut routing = Routing::ShortestPath(ShortestPath::new(
             UnGraph::<usize, ()>::new_undirected().clone(),
         ));
-        if let Some(path_from_config) = path {
+        if let Some(path_from_config) = params.path {
             routing = Routing::PathFromConfig(PathFromConfig::new(path_from_config));
         }
 
         Flow {
-            id,
-            starts_before,
-            starts_after,
-            flow_type,
-            source_host,
-            sink_host,
+            id: params.id,
+            starts_before: params.starts_before,
+            starts_after: params.starts_after,
+            flow_type: params.flow_type,
+            source_host: params.source_host,
+            sink_host: params.sink_host,
             source_id: 0,
             sink_id: 0,
-            traffic,
-            seed,
+            traffic: params.traffic,
+            seed: params.seed,
             routing,
         }
     }
@@ -114,15 +117,15 @@ impl Flow {
             assert!(flow_graph.edge_references().len() == 1);
 
             for (_, edge) in flow_graph.edge_references().enumerate() {
-                flows.push(Flow::new(
-                    next_flow_id(),
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    FlowType::PacketDistribution,
-                    edge.source().index(),
-                    edge.target().index(),
-                    TrafficCharacteristics::new(
+                let params = FlowParams {
+                    id: next_flow_id(),
+                    path: None,
+                    starts_before: Vec::new(),
+                    starts_after: Vec::new(),
+                    flow_type: FlowType::PacketDistribution,
+                    source_host: edge.source().index(),
+                    sink_host: edge.target().index(),
+                    traffic: TrafficCharacteristics::new(
                         1.,
                         Some(10.),
                         None,
@@ -133,8 +136,9 @@ impl Flow {
                         },
                         None,
                     ),
-                    0,
-                ));
+                    seed: 0,
+                };
+                flows.push(Flow::new(params));
             }
         }
 
@@ -191,18 +195,17 @@ impl Flow {
                     let starts_after = flow.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
 
-                    flows.push(Flow::new(
-                        flow_id,
-                        flow.path.clone(),
+                    flows.push(Flow::new(FlowParams {
+                        id: flow_id,
+                        path: flow.path.clone(),
                         starts_before,
                         starts_after,
-                        flow.flow_type,
-                        edge.source().index(),
-                        edge.target().index(),
+                        flow_type: flow.flow_type,
+                        source_host: edge.source().index(),
+                        sink_host: edge.target().index(),
                         traffic,
-                        // uses flow_id as the random seed (added to the global seed)
-                        flow_id,
-                    ));
+                        seed: flow_id,
+                    }));
                 }
             }
         }
@@ -232,18 +235,17 @@ impl Flow {
                     let starts_after = flow_set.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow_set.traffic);
 
-                    flows.push(Flow::new(
-                        flow_id,
-                        None,
+                    flows.push(Flow::new(FlowParams {
+                        id: flow_id,
+                        path: None,
                         starts_before,
                         starts_after,
-                        flow_set.flow_type,
-                        host_pair[0],
-                        host_pair[1],
+                        flow_type: flow_set.flow_type,
+                        source_host: host_pair[0],
+                        sink_host: host_pair[1],
                         traffic,
-                        // uses flow_id as the random seed (added to the global seed)
-                        flow_id,
-                    ));
+                        seed: flow_id,
+                    }));
                 }
                 update_next_flow_id(first_flow_id + flow_set.flow_count as usize);
             }
