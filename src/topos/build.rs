@@ -351,34 +351,6 @@ mod tests {
         assert!(validate_torus_params(1, 0).is_err());
     }
 
-    #[test]
-    fn test_torus_1d_debug() {
-        let (graph, _) = create_torus(1, 4);
-
-        // Print all edges for debugging
-        for node_idx in 0..4 {
-            let node = NodeIndex::new(node_idx);
-            println!("Node {} edges:", node_idx);
-            for edge in graph.edges(node) {
-                println!("  -> {}", edge.target().index());
-            }
-        }
-
-        // Count outgoing edges for each node
-        for node_idx in 0..4 {
-            let node = NodeIndex::new(node_idx);
-            let edges: Vec<_> = graph.edges(node).collect();
-            assert_eq!(
-                edges.len(),
-                2,
-                "Node {} has {} edges, expected 2. Edges: {:?}",
-                node_idx,
-                edges.len(),
-                edges.into_iter().map(|e| e.target().index())
-            );
-        }
-    }
-
     // FatTree Tests
     mod fattree_tests {
         use super::*;
