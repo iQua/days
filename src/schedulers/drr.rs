@@ -66,6 +66,12 @@ pub struct DRRServer {
     queueing_delay_mean: f64,
 }
 
+/// A Deficit Round Robin (DRR) packet scheduler
+///
+/// # Invariants
+/// - The number of queues matches the number of weights
+/// - All queue IDs are consecutive starting from 0
+/// - The rate must be positive
 impl DRRServer {
     pub fn new(
         rate: f64,
