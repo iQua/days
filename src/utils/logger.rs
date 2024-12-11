@@ -59,6 +59,12 @@ pub struct CsvLogger {
     total_packets: Arc<AtomicUsize>,
 }
 
+impl Default for CsvLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CsvLogger {
     pub fn new() -> Self {
         CsvLogger {

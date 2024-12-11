@@ -551,7 +551,7 @@ impl Topology {
             // receives (or source for TCP) its last packet
             for flow_id in flow.starts_before.iter() {
                 let mut flow_finish_output = Output::default();
-                flow_finish_output.connect(PacketSource::flow_finished, &source_mboxes[&flow_id]);
+                flow_finish_output.connect(PacketSource::flow_finished, &source_mboxes[flow_id]);
                 match flow.flow_type {
                     FlowType::PacketDistribution => {
                         sink.connect_flow_finish_output(flow_finish_output);
@@ -590,7 +590,7 @@ impl Topology {
             let path = flow.compute_path(self.graph.clone());
 
             for window in path.windows(2) {
-                let node_id = window.get(0).unwrap().index();
+                let node_id = window.first().unwrap().index();
                 let next_id = window.get(1).unwrap().index();
 
                 // FIBs do not include PacketSource
