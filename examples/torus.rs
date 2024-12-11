@@ -11,22 +11,25 @@ fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
-    let file_path = "configs/torus.toml";
+    let config_path = "configs/torus.toml";
 
-    let (graph, hosts) = build_graph(file_path);
+    let Ok((graph, hosts)) = build_graph(&config_path) else {
+        panic!("Failed to build the network graph.");
+    };
+
     info!("The Torus graph has been initialized.");
 
-    let flows = Flow::flows_from_config(file_path, &hosts);
+    let flows = Flow::flows_from_config(config_path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());
 
-    let collectives = Collective::collectives_from_config(file_path, &hosts);
+    let collectives = Collective::collectives_from_config(config_path, &hosts);
     info!(
         "A total of {} collective communication operations has been initialized.",
         collectives.len()
     );
 
     // initializes the topology
-    let topology = Topology::new(file_path, graph.clone(), hosts, flows, collectives);
+    let topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
     topology.run(graph);
