@@ -2,6 +2,7 @@
 //! takes. Currently, the only routing protocol implemented is to select a
 //! random candidate from a set of shortest paths, which are computed by the
 //! `petgraph` crate.
+
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 

@@ -1,7 +1,7 @@
 use petgraph::algo;
 use petgraph::graph::UnGraph;
 
-use day::topos::build::build_graph;
+use daytone::topos::build::build_graph;
 
 #[test]
 fn test_build_graph() {

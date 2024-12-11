@@ -1,5 +1,4 @@
-//! Implements a basic packet sink for receiving packets and recording
-//! statisctis.
+//! Implements a basic packet sink for receiving packets and recording statisctis.
 
 use log::debug;
 use std::fmt::Debug;

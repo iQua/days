@@ -1,4 +1,5 @@
-//! Packet drop strategies for the scheduler.
+//! Implements packet drop strategies for the scheduler.
+
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;

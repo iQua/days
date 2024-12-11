@@ -1,4 +1,4 @@
-//! Implements a simple FIFO scheduler with only one queue.
+//! Implements a First-In-First-Out (FIFO) scheduler with only one queue.
 
 use std::collections::VecDeque;
 use std::future::Future;

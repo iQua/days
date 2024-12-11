@@ -1,5 +1,13 @@
 //! Implements a Weighted Fair Queueing (WFQ) scheduler.
 
+//! Reference:
+
+//! A. K. Parekh, R. G. Gallager, "A Generalized Processor Sharing Approach to Flow Control
+//! in Integrated Services Networks: The Single-Node Case," IEEE/ACM Trans. Networking,
+//! vol. 1, no. 3, pp. 344-357, June 1993.
+
+//! https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=234856
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;

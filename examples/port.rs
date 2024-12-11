@@ -8,13 +8,13 @@ use nexosim::ports::EventSlot;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
-use day::flows::flow::FlowType;
-use day::flows::sink::PacketSink;
-use day::flows::source::PacketSource;
-use day::flows::{DistributionInfo, TrafficCharacteristics};
-use day::schedulers::drop::{CapacityUnit, DropStrategy};
-use day::schedulers::port::Port;
-use day::utils::logger::CsvLogger;
+use daytone::flows::flow::FlowType;
+use daytone::flows::sink::PacketSink;
+use daytone::flows::source::PacketSource;
+use daytone::flows::{DistributionInfo, TrafficCharacteristics};
+use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
+use daytone::schedulers::port::Port;
+use daytone::utils::logger::CsvLogger;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");

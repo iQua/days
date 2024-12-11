@@ -94,7 +94,7 @@ pub struct TCPPacketSource {
     pub output: Output<Packet>,
     /// output: outbound to the user interface
     pub ui_output: Output<FlowFinishMsg>,
-    /// outputs: outbounds to packet sources of flows wait for this flow to
+    /// outputs: outbounds to packet sources of flows waiting for this flow to
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
     sent_flow_finish_msg: bool,

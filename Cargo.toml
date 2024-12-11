@@ -1,5 +1,5 @@
 [package]
-name = "day"
+name = "daytone"
 version = "0.2.2"
 description = "A Performant Discrete-Event Simulator for Network Simulations"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]

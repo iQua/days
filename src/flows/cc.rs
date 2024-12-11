@@ -1,5 +1,5 @@
-//! Congestion control algorithms, designed to supply the TCPPacketSource class
-//! with congestion control decisions.
+//! Implements TCP Reno and TCP CUBIC congestion control algorithms, designed to supply
+//! the TCPPacketSource struct with congestion control decisions.
 
 use serde::Deserialize;
 
@@ -20,7 +20,7 @@ pub trait CongestionControl {
     fn get_cwnd(&self) -> usize;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TCPReno {
     /// the maximum segment size
     mss: usize,
@@ -85,7 +85,7 @@ impl CongestionControl for TCPReno {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TCPCubic {
     /// the maximum segment size
     mss: usize,

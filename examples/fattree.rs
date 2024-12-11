@@ -3,10 +3,10 @@
 
 use log::info;
 
-use day::flows::collective::Collective;
-use day::flows::flow::Flow;
-use day::topos::build::build_graph;
-use day::topos::topo::Topology;
+use daytone::flows::collective::Collective;
+use daytone::flows::flow::Flow;
+use daytone::topos::build::build_graph;
+use daytone::topos::topo::Topology;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");

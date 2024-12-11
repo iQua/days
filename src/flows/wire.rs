@@ -1,4 +1,4 @@
-//! The wire element adds a propagation delay to packets.
+//! Implements a wire element that adds a propagation delay to packets.
 
 use log::debug;
 use rand::distributions::Distribution;

@@ -1,3 +1,5 @@
+//! Implements collective communication operations in machine learning training workloads.
+
 use std::fs;
 
 use petgraph::graph::DiGraph;

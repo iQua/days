@@ -1,4 +1,4 @@
-//! Implements an application data source used by simulating the TCP protocol.
+//! Implements an application data source used by TCP.
 
 use rand::rngs::SmallRng;
 use std::time::Duration;
@@ -8,9 +8,8 @@ use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 
 pub enum AppDataSource {
-    // the data source from the application is implemented as a
-    // distribution-based packet source, but it can be trace-driven, etc., in
-    // the future
+    // The data source from the application generates packets based on probability distributions,
+    // but it can be trace-driven as well in the future.
     DistDataSource(DistPacketSource),
 }
 

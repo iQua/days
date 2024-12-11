@@ -1,5 +1,6 @@
 //! Implements a UserInterface struct that includes a progress bar to illustrate the
-//! progress of the simulation run.
+//! progress of the simulation run. This will eventually evolve to a Ratatui-based
+//! user interface that allows real-time interaction with the simulation.
 
 use std::fs;
 use std::time::Duration;

@@ -1,5 +1,5 @@
-//! Implements a packet source that simulates the sending of packets with
-//! specific distributions of inter-arrival times and packet sizes.
+//! Implements a packet source that sends packets with specific distributions of
+//! inter-arrival times and packet sizes.
 
 use std::collections::HashSet;
 use std::time::Duration;

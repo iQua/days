@@ -7,13 +7,13 @@ use log::info;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
-use day::flows::cc::CCAlgorithm::TCPReno;
-use day::flows::flow::FlowType;
-use day::flows::sink::PacketSink;
-use day::flows::source::PacketSource;
-use day::flows::wire::Wire;
-use day::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
-use day::utils::logger::CsvLogger;
+use daytone::flows::cc::CCAlgorithm::TCPReno;
+use daytone::flows::flow::FlowType;
+use daytone::flows::sink::PacketSink;
+use daytone::flows::source::PacketSource;
+use daytone::flows::wire::Wire;
+use daytone::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
+use daytone::utils::logger::CsvLogger;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
