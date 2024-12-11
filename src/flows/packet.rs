@@ -10,12 +10,12 @@ pub struct Packet {
     /// Packets in Day are typically created by packet sources, and run through
     /// a sequence of packet-forwarding switches. It may be entered into a queue
     /// at an output port on each of these switches.
-
+    ///
     /// Key fields include: creation time, size, packet id, flow_id, source, and
     /// destination. We do not model upper layer protocols, i.e., packets do not
     /// contain a payload. The size (in bytes) field is used to determine its
     /// transmission time.
-
+    ///
     /// # Example
     /// ```
     /// use daytone::flows::packet::Packet;

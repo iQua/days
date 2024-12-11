@@ -112,11 +112,11 @@ impl Flow {
     pub fn flows_from_graph(graphs: Vec<Vec<(u32, u32)>>) -> Vec<Flow> {
         let mut flows = Vec::new();
 
-        for (_, graph) in graphs.iter().enumerate() {
+        for graph in graphs.iter() {
             let flow_graph = DiGraph::<usize, ()>::from_edges(graph);
             assert!(flow_graph.edge_references().len() == 1);
 
-            for (_, edge) in flow_graph.edge_references().enumerate() {
+            for edge in flow_graph.edge_references() {
                 let params = FlowParams {
                     id: next_flow_id(),
                     path: None,
@@ -146,7 +146,7 @@ impl Flow {
     }
 
     /// Initializes flows from a configuration file.
-    pub fn flows_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Flow> {
+    pub fn flows_from_config(file_path: &str, hosts: &[usize]) -> Vec<Flow> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let flow_config: FlowConfig =
@@ -159,7 +159,7 @@ impl Flow {
                 let graph = DiGraph::<usize, ()>::from_edges(&flow.graph);
                 assert!(graph.edge_references().len() == 1);
 
-                for (_, edge) in graph.edge_references().enumerate() {
+                for edge in graph.edge_references() {
                     let mut flow_id = next_flow_id();
                     if flow.flow_id.is_some() {
                         let new_id = flow.flow_id.unwrap();
