@@ -1,13 +1,13 @@
 [project]
-name = "dayone"
+name = "daytone"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-name = "dayone"
-version = "0.1.6"
+name = "daytone"
+version = "0.3.0"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]
 description = "A Performant Discrete-Event Simulator for Network Simulations"
 classifiers = [
