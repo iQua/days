@@ -143,7 +143,7 @@ impl Collective {
         paths: &Option<Vec<Vec<usize>>>,
         sources: Vec<usize>,
         sinks: Vec<usize>,
-        hosts: &Vec<usize>,
+        hosts: &[usize],
         mut rng: SmallRng,
     ) -> (Vec<usize>, Vec<usize>) {
         if !sources.is_empty() && !sinks.is_empty() {
@@ -177,6 +177,7 @@ impl Collective {
                 }
                 CollectiveType::AllReduce => {}
             }
+
             return (sources, sinks);
         }
 
@@ -196,31 +197,30 @@ impl Collective {
 
         match collective_type {
             CollectiveType::Broadcast => {
-                let source = hosts.choose(&mut rng).unwrap().clone();
+                let source = *hosts.choose(&mut rng).unwrap();
                 let sink_hosts: Vec<_> = hosts.iter().filter(|&&x| x != source).copied().collect();
                 let sources = vec![source; flow_count];
                 let sinks = (0..flow_count)
                     .map(|_| *sink_hosts.choose(&mut rng).unwrap())
                     .collect();
 
-                return (sources, sinks);
+                (sources, sinks)
             }
             CollectiveType::Gather | CollectiveType::AllReduce => {
-                //Combined gather and allreduce
-                let sink = hosts.choose(&mut rng).unwrap().clone();
+                let sink = *hosts.choose(&mut rng).unwrap();
                 let source_hosts: Vec<_> = hosts.iter().filter(|&&x| x != sink).copied().collect();
                 let sinks = vec![sink; flow_count];
                 let sources = (0..flow_count)
                     .map(|_| *source_hosts.choose(&mut rng).unwrap())
                     .collect();
 
-                return (sources, sinks);
+                (sources, sinks)
             }
         }
     }
 
     /// Initializes collectives from a configuration file.
-    pub fn collectives_from_config(file_path: &str, hosts: &Vec<usize>) -> Vec<Collective> {
+    pub fn collectives_from_config(file_path: &str, hosts: &[usize]) -> Vec<Collective> {
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let config: CollectiveConfig =
