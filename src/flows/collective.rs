@@ -9,7 +9,7 @@ use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
-use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
+use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_collective_id, next_flow_id, seed_from_config, update_next_flow_id};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -67,30 +67,33 @@ pub struct Collective {
     pub traffic: TrafficCharacteristics,
 }
 
+// Struct to hold parameters for collectives
+pub struct CollectiveParams {
+    id: usize,
+    collective_type: CollectiveType,
+    first_flow_id: usize,
+    flow_type: FlowType,
+    flow_count: usize,
+    graph: Option<DiGraph<usize, ()>>,
+    paths: Option<Vec<Vec<usize>>>,
+    sources: Vec<usize>,
+    sinks: Vec<usize>,
+    traffic: TrafficCharacteristics,
+}
+
 impl Collective {
-    pub fn new(
-        id: usize,
-        collective_type: CollectiveType,
-        first_flow_id: usize,
-        flow_type: FlowType,
-        flow_count: usize,
-        graph: Option<DiGraph<usize, ()>>,
-        paths: Option<Vec<Vec<usize>>>,
-        sources: Vec<usize>,
-        sinks: Vec<usize>,
-        traffic: TrafficCharacteristics,
-    ) -> Collective {
-        Collective {
-            id,
-            collective_type,
-            first_flow_id,
-            flow_type,
-            flow_count,
-            graph,
-            paths,
-            sources,
-            sinks,
-            traffic,
+    pub fn new(params: CollectiveParams) -> Self {
+        Self {
+            id: params.id,
+            collective_type: params.collective_type,
+            first_flow_id: params.first_flow_id,
+            flow_type: params.flow_type,
+            flow_count: params.flow_count,
+            graph: params.graph,
+            paths: params.paths,
+            sources: params.sources,
+            sinks: params.sinks,
+            traffic: params.traffic,
         }
     }
 
@@ -110,32 +113,24 @@ impl Collective {
             let flow_count = collective_graph.edge_count();
             let collective_sources = sources[index].clone();
             let collective_sinks = sinks[index].clone();
+            let collective_paths = paths.clone();
 
             let first_flow_id = next_flow_id();
             update_next_flow_id(first_flow_id + flow_count);
 
-            collectives.push(Collective::new(
-                next_collective_id(),
+            let params = CollectiveParams {
+                id: next_collective_id(),
                 collective_type,
                 first_flow_id,
-                FlowType::PacketDistribution,
+                flow_type: FlowType::PacketDistribution,
                 flow_count,
-                Some(collective_graph),
-                paths.clone(),
-                collective_sources,
-                collective_sinks,
-                TrafficCharacteristics::new(
-                    1.,
-                    Some(10.),
-                    None,
-                    DistributionInfo::Exp { lambda: 1. },
-                    DistributionInfo::DiscreteUniform {
-                        low: 1000,
-                        high: 1000,
-                    },
-                    None,
-                ),
-            ));
+                graph: Some(collective_graph),
+                paths: collective_paths,
+                sources: collective_sources,
+                sinks: collective_sinks,
+                traffic: TrafficCharacteristics::default(),
+            };
+            collectives.push(Collective::new(params));
         }
 
         collectives
@@ -146,30 +141,12 @@ impl Collective {
         collective_type: CollectiveType,
         flow_count: usize,
         paths: &Option<Vec<Vec<usize>>>,
-        mut sources: Vec<usize>,
-        mut sinks: Vec<usize>,
+        sources: Vec<usize>,
+        sinks: Vec<usize>,
         hosts: &Vec<usize>,
         mut rng: SmallRng,
     ) -> (Vec<usize>, Vec<usize>) {
-        if let Some(flow_paths) = paths {
-            assert_eq!(
-                flow_paths.len(),
-                flow_count,
-                "The number of specified paths ({}) should be the same as flow count {}",
-                flow_paths.len(),
-                flow_count
-            );
-
-            let mut sources = Vec::new();
-            let mut sinks = Vec::new();
-
-            for path in flow_paths {
-                sources.push(path[0]);
-                sinks.push(path[path.len() - 1]);
-            }
-
-            return (sources, sinks);
-        } else if !sources.is_empty() && !sinks.is_empty() {
+        if !sources.is_empty() && !sinks.is_empty() {
             assert_eq!(
                 sources.len(),
                 flow_count,
@@ -200,39 +177,46 @@ impl Collective {
                 }
                 CollectiveType::AllReduce => {}
             }
-        } else {
-            match collective_type {
-                CollectiveType::Broadcast => {
-                    let source = hosts.choose(&mut rng).unwrap().clone();
-                    let mut sink_hosts = hosts.clone();
-                    sink_hosts.retain(|&x| x != source);
-                    for _ in 0..flow_count {
-                        sources.push(source);
-                        sinks.push(sink_hosts.choose(&mut rng).unwrap().clone());
-                    }
-                }
-                CollectiveType::Gather => {
-                    let sink = hosts.choose(&mut rng).unwrap().clone();
-                    let mut source_hosts = hosts.clone();
-                    source_hosts.retain(|&x| x != sink);
-                    for _ in 0..flow_count {
-                        sources.push(source_hosts.choose(&mut rng).unwrap().clone());
-                        sinks.push(sink);
-                    }
-                }
-                CollectiveType::AllReduce => {
-                    let sink = hosts.choose(&mut rng).unwrap().clone();
-                    let mut source_hosts = hosts.clone();
-                    source_hosts.retain(|&x| x != sink);
-                    for _ in 0..flow_count {
-                        sources.push(source_hosts.choose(&mut rng).unwrap().clone());
-                        sinks.push(sink);
-                    }
-                }
-            }
+            return (sources, sinks);
         }
 
-        (sources, sinks)
+        if let Some(flow_paths) = paths {
+            assert_eq!(
+                flow_paths.len(),
+                flow_count,
+                "The number of specified paths ({}) should be the same as flow count {}",
+                flow_paths.len(),
+                flow_count
+            );
+            let sources = flow_paths.iter().map(|path| path[0]).collect();
+            let sinks = flow_paths.iter().map(|path| path[path.len() - 1]).collect();
+
+            return (sources, sinks);
+        }
+
+        match collective_type {
+            CollectiveType::Broadcast => {
+                let source = hosts.choose(&mut rng).unwrap().clone();
+                let sink_hosts: Vec<_> = hosts.iter().filter(|&&x| x != source).copied().collect();
+                let sources = vec![source; flow_count];
+                let sinks = (0..flow_count)
+                    .map(|_| *sink_hosts.choose(&mut rng).unwrap())
+                    .collect();
+
+                return (sources, sinks);
+            }
+            CollectiveType::Gather | CollectiveType::AllReduce => {
+                //Combined gather and allreduce
+                let sink = hosts.choose(&mut rng).unwrap().clone();
+                let source_hosts: Vec<_> = hosts.iter().filter(|&&x| x != sink).copied().collect();
+                let sinks = vec![sink; flow_count];
+                let sources = (0..flow_count)
+                    .map(|_| *source_hosts.choose(&mut rng).unwrap())
+                    .collect();
+
+                return (sources, sinks);
+            }
+        }
     }
 
     /// Initializes collectives from a configuration file.
@@ -275,18 +259,20 @@ impl Collective {
                 }
                 update_next_flow_id(first_flow_id + collective.flow_count);
 
-                collectives.push(Collective::new(
-                    next_collective_id(),
-                    collective.collective_type,
+                let params = CollectiveParams {
+                    id: next_collective_id(),
+                    collective_type: collective.collective_type,
                     first_flow_id,
-                    collective.flow_type,
-                    collective.flow_count,
+                    flow_type: collective.flow_type,
+                    flow_count: collective.flow_count,
                     graph,
-                    collective.paths,
+                    paths: collective.paths,
                     sources,
                     sinks,
                     traffic,
-                ));
+                };
+
+                collectives.push(Collective::new(params));
             }
         }
 
@@ -342,18 +328,20 @@ impl Collective {
 
                     let traffic = TrafficCharacteristics::clone(&collective_set.traffic);
 
-                    collectives.push(Collective::new(
-                        next_collective_id(),
-                        collective_set.collective_type,
-                        first_flow_id + index * collective_set.flow_count,
-                        collective_set.flow_type,
-                        collective_set.flow_count,
-                        None,
-                        None,
+                    let params = CollectiveParams {
+                        id: next_collective_id(),
+                        collective_type: collective_set.collective_type,
+                        first_flow_id: first_flow_id + index * collective_set.flow_count,
+                        flow_type: collective_set.flow_type,
+                        flow_count: collective_set.flow_count,
+                        graph: None,
+                        paths: None,
                         sources,
                         sinks,
                         traffic,
-                    ));
+                    };
+
+                    collectives.push(Collective::new(params));
                 }
             }
         }
