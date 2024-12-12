@@ -13,8 +13,10 @@ use nexosim::model::Model;
 use nexosim::ports::Output;
 
 use crate::flows::app_source::AppDataSource;
-use crate::flows::cc::{CCAlgorithm, CongestionControl, TCPCubic, TCPReno};
+use crate::flows::cc::{CCAlgorithm, CongestionControl};
+use crate::flows::cubic::TCPCubic;
 use crate::flows::packet::Packet;
+use crate::flows::reno::TCPReno;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
@@ -278,7 +280,8 @@ impl TCPPacketSource {
             }
 
             self.last_ack = ack.sequence_num;
-            self.congestion_control.ack_received(sample_rtt, now);
+            self.congestion_control
+                .ack_received(sample_rtt, now, ack_packet.size);
 
             debug!(
                 "TCPPacketSource {} received ack till sequence number {} at time {:.3}.",
