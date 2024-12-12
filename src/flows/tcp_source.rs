@@ -100,6 +100,13 @@ pub struct TCPPacketSource {
     sent_flow_finish_msg: bool,
 
     pub report_start_time: f64,
+
+    /// Clock granularity in seconds for RTO calculation
+    clock_granularity: f64,
+    /// Minimum RTO value in seconds
+    min_rto: f64,
+    /// Maximum RTO value in seconds
+    max_rto: f64,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -152,6 +159,9 @@ impl TCPPacketSource {
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,
+            clock_granularity: 0.001, // 1ms granularity
+            min_rto: 1.0,             // 1 second minimum as per RFC 6298
+            max_rto: 60.0,            // 60 seconds maximum (commonly used value)
         }
     }
 
@@ -231,27 +241,41 @@ impl TCPPacketSource {
             // described in RFC 2988. The updated algorithm is commonly referred
             // to as the "Karn/Partridge Algorithm."
 
-            let alpha = 0.125;
-            let beta = 0.25;
-
             // calculates the deviation (RTTVAR) of the RTT to account for
             // variations in the network
             if self.rtt_var == 0.0 {
                 self.rtt_var = sample_rtt / 2.0;
-            } else {
-                let deviation = self.smoothed_rtt - sample_rtt;
-                self.rtt_var = (1.0 - beta) * self.rtt_var + beta * deviation.abs();
-            }
-
-            // computes a smoothed round-trip time (SRTT)
-            if self.smoothed_rtt == 0.0 {
                 self.smoothed_rtt = sample_rtt;
+                // Initial RTO as per RFC 6298
+                self.rto = f64::max(
+                    self.min_rto,
+                    self.smoothed_rtt + f64::max(self.clock_granularity, 4.0 * self.rtt_var),
+                );
             } else {
-                self.smoothed_rtt = (1.0 - alpha) * self.smoothed_rtt + alpha * sample_rtt;
-            }
+                let beta = 0.25;
+                let alpha = 0.125;
 
-            // the clock granularity, G in RFC 6298, is always set as 100 msec as suggested by RFC 6298
-            self.rto = f64::max(1.0, self.smoothed_rtt + f64::max(0.1, 4.0 * self.rtt_var));
+                // Update RTTVAR first using the old SRTT as per RFC 6298
+                self.rtt_var =
+                    (1.0 - beta) * self.rtt_var + beta * (self.smoothed_rtt - sample_rtt).abs();
+
+                // Then update the smoothed round-trip time (SRTT)
+                // computes a smoothed round-trip time (SRTT)
+                if self.smoothed_rtt == 0.0 {
+                    self.smoothed_rtt = sample_rtt;
+                } else {
+                    self.smoothed_rtt = (1.0 - alpha) * self.smoothed_rtt + alpha * sample_rtt;
+                }
+
+                // Calculate new RTO with bounds
+                self.rto = f64::min(
+                    self.max_rto,
+                    f64::max(
+                        self.min_rto,
+                        self.smoothed_rtt + f64::max(self.clock_granularity, 4.0 * self.rtt_var),
+                    ),
+                );
+            }
 
             self.last_ack = ack.sequence_num;
             self.congestion_control.ack_received(sample_rtt, now);
@@ -347,7 +371,10 @@ impl TCPPacketSource {
                     packet_timeout.timeout,
                 );
 
-                let revised_rto = packet_timeout.rto * 2.0;
+                let revised_rto = f64::min(
+                    self.max_rto,
+                    packet_timeout.rto * 2.0, // Exponential backoff
+                );
 
                 let revised_timeout = PacketTimeout {
                     packet_id: packet_timeout.packet_id,
