@@ -29,4 +29,4 @@ flow_count = 200
     arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
     pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
 [flow_set.traffic.tcp]
-    cc_algorithm = "TCPCubic"
+    cc_algorithm = "TCPReno"

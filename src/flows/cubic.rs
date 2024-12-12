@@ -271,13 +271,13 @@ impl CongestionControl for TCPCubic {
 
         if self.cwnd <= self.ssthresh && !self.hystart.exit_slow_start {
             // Slow start with HyStart++ detection
-            self.cwnd += self.mss;
+            self.cwnd += bytes_acked.min(self.mss); // Use bytes_acked instead of just mss
         } else {
             // Congestion avoidance
             self.cubic_update(current_time);
             if self.cwnd_cnt > self.cnt {
                 self.update_fast_convergence();
-                self.cwnd += self.mss;
+                self.cwnd += bytes_acked.min(self.mss); // Use bytes_acked
                 self.cwnd = self.cwnd.min(self.max_cwnd);
                 self.cwnd_cnt = 0;
             } else {
