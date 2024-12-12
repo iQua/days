@@ -1,4 +1,16 @@
 //! Implements the TCP Reno congestion control algorithm.
+//!
+//! This module implements TCP Reno congestion control as specified in:
+//! - RFC 5681: TCP Congestion Control
+//! - RFC 6582: The NewReno Modification to TCP's Fast Recovery Algorithm
+//! - RFC 6298: Computing TCP's Retransmission Timer
+//!
+//! Key features:
+//! - Slow Start and Congestion Avoidance phases
+//! - Fast Recovery with NewReno modifications
+//! - Optional SACK support
+//! - Configurable duplicate ACK threshold
+//! - RFC 6298 compliant RTO calculation
 
 use crate::flows::cc::CongestionControl;
 use std::collections::HashSet;
@@ -75,6 +87,8 @@ pub struct TCPReno {
     recovery_exit_threshold: usize,
     /// Optional sequence number for immediate retransmission
     immediate_retransmit: Option<usize>,
+    /// Highest ACK received
+    highest_ack: usize,
 }
 
 impl TCPReno {
@@ -111,10 +125,14 @@ impl TCPReno {
             lost_sequences: HashSet::new(),
             recovery_exit_threshold: 0,
             immediate_retransmit: None,
+            highest_ack: 0,
         }
     }
 
-    /// Updates RTT measurements and RTO calculation per RFC 6298
+    /// Updates RTT measurements and RTO calculation according to RFC 6298
+    ///
+    /// Uses standard EWMA with alpha=0.125 for SRTT and beta=0.25 for RTTVAR
+    /// RTO = SRTT + 4*RTTVAR with minimum of 1 second per RFC 6298
     fn update_rtt(&mut self, rtt: f64) {
         self.last_rtt = rtt;
 
@@ -148,17 +166,12 @@ impl TCPReno {
         self.retransmission_queue.push(seq);
     }
 
-    /// Updates sequence space tracking
-    fn update_sequence_space(&mut self, seq: usize, bytes: usize) {
-        self.snd_max = self.snd_max.max(seq + bytes);
-        if seq == self.rcv_next {
-            self.rcv_next = seq + bytes;
-            // Remove acknowledged sequences from lost set
-            self.lost_sequences.remove(&seq);
-        }
-    }
-
-    /// Updates recovery window management
+    /// Implements NewReno modifications from RFC 6582 Section 3.2
+    ///
+    /// Handles partial ACKs during recovery by:
+    /// - Deflating cwnd by amount of new data acknowledged
+    /// - Re-inflating by one MSS
+    /// - Retransmitting next unacknowledged segment
     fn update_recovery_window(&mut self) {
         if self.state == TCPRenoState::FastRecovery {
             self.recovery_window = self.pre_recovery_flight_size + self.mss;
@@ -190,7 +203,10 @@ impl TCPReno {
         self.lost_sequences.clear();
     }
 
-    /// Updates the congestion window based on current state
+    /// Updates congestion window based on RFC 5681:
+    /// - Slow Start: Increase by MSS per ACK
+    /// - Congestion Avoidance: Increase by MSS per RTT
+    /// - Fast Recovery: Follow NewReno rules
     fn update_cwnd(&mut self, bytes_acked: usize) {
         match self.state {
             TCPRenoState::SlowStart => {
@@ -243,6 +259,24 @@ impl TCPReno {
                 0
             }
     }
+
+    /// Updates sequence space tracking
+    fn update_sequence_space(&mut self, seq: usize, bytes: usize) {
+        self.snd_max = self.snd_max.max(seq + bytes);
+        if seq == self.rcv_next {
+            self.rcv_next = seq + bytes;
+            // Track highest cumulative ACK
+            self.highest_ack = self.highest_ack.max(seq + bytes);
+            self.lost_sequences.remove(&seq);
+        }
+    }
+
+    // Update recovery exit check
+    fn should_exit_recovery(&self) -> bool {
+        self.highest_ack >= self.recovery_high_seq
+            && !self.retransmit_required
+            && self.lost_sequences.is_empty()
+    }
 }
 
 impl CongestionControl for TCPReno {
@@ -253,12 +287,10 @@ impl CongestionControl for TCPReno {
         if self.state == TCPRenoState::FastRecovery {
             self.pipe = self.estimate_pipe();
 
-            if self.pipe <= self.ssthresh && bytes_acked >= self.recovery_high_seq {
-                if !self.retransmit_required && self.retransmission_queue.is_empty() {
-                    self.state = TCPRenoState::CongestionAvoidance;
-                    self.cwnd = self.ssthresh;
-                    self.reset_recovery_state();
-                }
+            if self.pipe <= self.ssthresh && self.should_exit_recovery() {
+                self.state = TCPRenoState::CongestionAvoidance;
+                self.cwnd = self.ssthresh;
+                self.reset_recovery_state();
             }
             self.last_reduction_time = current_time;
         } else {
