@@ -87,25 +87,24 @@ impl TCPReno {
                     // Ensure smooth transition
                     self.cwnd = self.ssthresh;
                 }
-
-                if self.cwnd >= self.ssthresh {
-                    let k = (self.cwnd / self.mss) / 2;
-                    self.cwnd = (self.cwnd + self.mss * self.mss / k)
-                        .max(self.min_cwnd)
-                        .min(self.max_cwnd);
-                }
             }
             TCPRenoState::CongestionAvoidance => {
                 // RFC 5681: At most one SMSS per RTT
-                let n = (bytes_acked * self.mss / self.cwnd).min(self.mss);
+                let mss_per_rtt =
+                    (self.mss as f64 * bytes_acked as f64 / self.cwnd as f64).ceil() as usize;
+                let n = mss_per_rtt.min(self.mss);
                 self.cwnd = (self.cwnd + n).max(self.min_cwnd).min(self.max_cwnd);
             }
             TCPRenoState::FastRecovery => {
-                // Track new data received during recovery
-                if self.pipe > bytes_acked {
-                    self.pipe -= bytes_acked;
+                // For partial ACKs during recovery
+                if bytes_acked < self.recovery_high_seq {
+                    // Partial ACK - retransmit next segment
+                    self.pipe = self.pipe.saturating_sub(bytes_acked);
+                    // Should trigger retransmission here
                 } else {
+                    // Full ACK - exit recovery
                     self.pipe = 0;
+                    self.state = TCPRenoState::CongestionAvoidance;
                 }
 
                 // Deflate window by amount of new data received
@@ -122,33 +121,39 @@ impl TCPReno {
 
     /// Estimates pipe (segments in flight) during recovery
     fn estimate_pipe(&self) -> usize {
+        // Consider both in-flight packets and outstanding retransmissions
         self.packets_in_flight
+            + if self.state == TCPRenoState::FastRecovery {
+                self.dupack_count
+            } else {
+                0
+            }
     }
 }
 
 impl CongestionControl for TCPReno {
-    fn ack_received(&mut self, rtt: f64, current_time: f64) {
+    fn ack_received(&mut self, rtt: f64, current_time: f64, bytes_acked: usize) {
         self.update_rtt(rtt);
 
         if self.state == TCPRenoState::FastRecovery {
             // Update pipe estimate
             self.pipe = self.estimate_pipe();
 
-            // Check if we can exit recovery
-            if self.pipe <= self.ssthresh {
-                // Exit recovery if we've processed enough data
+            if self.pipe <= self.ssthresh && bytes_acked >= self.recovery_high_seq {
+                // Full recovery - all data acknowledged
                 self.state = TCPRenoState::CongestionAvoidance;
                 self.cwnd = self.ssthresh;
                 self.dupack_count = 0;
                 self.recovery_window = 0;
                 self.pipe = 0;
+                self.recovery_high_seq = 0;
             } else {
-                // Still in recovery - maintain window
+                // Still in recovery
                 self.cwnd = self.ssthresh;
             }
             self.last_reduction_time = current_time;
         } else {
-            self.update_cwnd(self.mss);
+            self.update_cwnd(bytes_acked); // Pass bytes_acked here instead of self.mss
         }
 
         if self.packets_in_flight > 0 {
@@ -186,9 +191,13 @@ impl CongestionControl for TCPReno {
 
     fn timer_expired(&mut self) {
         self.ssthresh = (self.cwnd / 2).max(2 * self.mss);
-        // Reset to minimum window size after timeout
         self.cwnd = self.min_cwnd;
         self.state = TCPRenoState::SlowStart;
+        // Should also reset recovery state
+        self.pipe = 0;
+        self.recovery_high_seq = 0;
+        self.pre_recovery_flight_size = 0;
+        self.recovery_window = 0;
         self.dupack_count = 0;
         self.packets_in_flight = 0;
     }

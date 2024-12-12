@@ -258,7 +258,7 @@ impl TCPCubic {
 
 impl CongestionControl for TCPCubic {
     /// Actions to be taken when a new acknowledgment has been received.
-    fn ack_received(&mut self, rtt: f64, current_time: f64) {
+    fn ack_received(&mut self, rtt: f64, current_time: f64, bytes_acked: usize) {
         // Track minimum RTT
         if self.d_min > 0.0 {
             self.d_min = self.d_min.min(rtt);
