@@ -142,9 +142,9 @@ fn validate_fattree_params(k: u32) -> Result<()> {
 }
 
 fn calculate_fattree_params(k: u32) -> Result<(u32, u32, u32)> {
-    let num_layer_switches = (k.pow(2) / 2) as u32;
-    let layer_switches_per_pod = (k / 2) as u32;
-    let num_core_switches = (k.pow(2) / 4) as u32;
+    let num_layer_switches = k.pow(2) / 2;
+    let layer_switches_per_pod = k / 2;
+    let num_core_switches = k.pow(2) / 4;
     let core_switches_per_agg = num_core_switches / layer_switches_per_pod;
 
     Ok((

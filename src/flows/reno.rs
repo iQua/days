@@ -16,17 +16,12 @@ use crate::flows::cc::CongestionControl;
 use std::collections::HashSet;
 
 /// TCP Reno states
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 enum TCPRenoState {
+    #[default]
     SlowStart,
     CongestionAvoidance,
     FastRecovery,
-}
-
-impl Default for TCPRenoState {
-    fn default() -> Self {
-        TCPRenoState::SlowStart
-    }
 }
 
 #[derive(Debug, Default)]
