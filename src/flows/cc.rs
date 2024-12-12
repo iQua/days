@@ -1,4 +1,4 @@
-//! Implements TCP Reno and TCP CUBIC congestion control algorithms, designed to supply
+//! Implements the general struct for congestion control algorithms, designed to supply
 //! the TCPPacketSource struct with congestion control decisions.
 
 use serde::Deserialize;
