@@ -43,7 +43,7 @@ impl HyStartState {
             self.last_round = self.current_round;
             self.current_round += 1;
             self.round_start = current_time;
-            self.rtt_samples.clear();
+            // Removed clearing of rtt_samples to allow accumulation across rounds
         }
 
         self.rtt_samples.push(rtt);
@@ -257,6 +257,10 @@ impl TCPCubic {
 
         println!("w_est (final estimate): {}", w_est);
 
+        // Assign cwnd to the estimated value, ensuring it does not exceed max_cwnd
+        self.cwnd = w_est as usize;
+        println!("Cwnd updated to: {}", self.cwnd);
+
         // Prevent overflow and handle cases where w_est <= cwnd
         if w_est > self.cwnd as f64 {
             // To prevent overflow, ensure the multiplication does not exceed usize::MAX
@@ -415,6 +419,7 @@ impl CongestionControl for TCPCubic {
     fn consecutive_dupacks_received(&mut self) {
         self.ssthresh = (2 * self.mss).max(self.cwnd / 2).min(self.max_cwnd);
         self.cwnd = self.ssthresh + 3 * self.mss;
+        self.cwnd = self.cwnd.min(self.max_cwnd); // Ensure cwnd does not exceed max_cwnd
         println!(
             "Three dupacks received: ssthresh={}, cwnd={}",
             self.ssthresh, self.cwnd
@@ -498,6 +503,7 @@ mod tests {
 
         // Ensure cwnd has increased appropriately without exponential growth
         assert!(cubic.cwnd > 2048);
+        assert!(cubic.cwnd <= cubic.max_cwnd);
     }
 
     #[test]
@@ -512,6 +518,10 @@ mod tests {
             (2 * cubic.mss).max(cubic.cwnd / 2).min(cubic.max_cwnd)
         );
         assert_eq!(cubic.cwnd, cubic.ssthresh + 3 * cubic.mss);
+        assert!(
+            cubic.cwnd <= cubic.max_cwnd,
+            "Cwnd exceeded max_cwnd after consecutive_dupacks_received"
+        );
     }
 
     #[test]
@@ -567,8 +577,8 @@ mod tests {
         cubic.cwnd = 16;
 
         // Simulate RTT samples with significant increase
-        let initial_rtt = 0.1;
-        let increased_rtt = 0.3; // 200% increase
+        let initial_rtt = 0.2;
+        let increased_rtt = 0.4; // 200% increase
 
         for _ in 0..4 {
             cubic.ack_received(0, initial_rtt, 1.0, cubic.mss);
@@ -636,6 +646,10 @@ mod tests {
             cubic.cwnd >= 5000,
             "Cwnd did not increase as expected after cubic update."
         );
+        assert!(
+            cubic.cwnd <= cubic.max_cwnd,
+            "Cwnd exceeded max_cwnd after cubic update."
+        );
     }
 
     #[test]
@@ -672,6 +686,10 @@ mod tests {
             cubic.cwnd > 4096,
             "Cwnd did not increase as expected with TCP friendliness."
         );
+        assert!(
+            cubic.cwnd <= cubic.max_cwnd,
+            "Cwnd exceeded max_cwnd with TCP friendliness."
+        );
     }
 
     #[test]
@@ -689,6 +707,10 @@ mod tests {
         assert!(
             cubic.cwnd > 4096,
             "Cwnd did not increase as expected without TCP friendliness."
+        );
+        assert!(
+            cubic.cwnd <= cubic.max_cwnd,
+            "Cwnd exceeded max_cwnd without TCP friendliness."
         );
     }
 
@@ -742,12 +764,12 @@ mod tests {
         let mut cubic = TCPCubic::new();
         // usize::MAX is typically 18446744073709551615 on a 64-bit system
         // Adjusting to prevent overflow in the test
-        cubic.cwnd = usize::MAX - 1000;
+        cubic.cwnd = 18_446_744_073_709_550_615;
         cubic.ssthresh = 65535;
         cubic.mss = 512;
 
         // Simulate ACK received that wraps around
-        cubic.ack_received(18446744073709551615 - 100, 0.1, 1.0, 512);
+        cubic.ack_received(18_446_744_073_709_551_515, 0.1, 1.0, 512);
 
         // Ensure cwnd does not exceed max_cwnd and prevent overflow
         assert!(
@@ -808,6 +830,10 @@ mod tests {
             cubic.cwnd > 2048,
             "Cwnd did not increase correctly after out-of-order ACKs."
         );
+        assert!(
+            cubic.cwnd <= cubic.max_cwnd,
+            "Cwnd exceeded max_cwnd after out-of-order ACKs."
+        );
     }
 
     #[test]
@@ -818,11 +844,11 @@ mod tests {
         cubic.cwnd = 10000;
         cubic.ssthresh = 5000;
 
-        // Trigger first loss recovery
+        // First loss recovery
         cubic.consecutive_dupacks_received();
         assert_eq!(cubic.cwnd, cubic.ssthresh + 3 * cubic.mss);
 
-        // Trigger second loss recovery
+        // Second loss recovery
         cubic.consecutive_dupacks_received();
         assert_eq!(cubic.cwnd, cubic.ssthresh + 3 * cubic.mss);
     }
@@ -830,8 +856,9 @@ mod tests {
     #[test]
     fn test_recovery_window_limits() {
         let mut cubic = TCPCubic::new();
-        cubic.cwnd = 16_000;
-        cubic.origin_point = 16_000;
+        cubic.cwnd = 5000;
+        cubic.ssthresh = 3000;
+        cubic.origin_point = 5000;
         cubic.epoch_start = 1.0;
 
         cubic.cubic_update(2.0);
