@@ -131,6 +131,7 @@ impl TCPPacketSink {
             last_packet: false,
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
+                acknowledged_size: packet.size,
             }),
         };
 
