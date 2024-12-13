@@ -710,8 +710,8 @@ mod tests {
         reno.snd_max = usize::MAX - 1000;
         reno.update_sequence_space(usize::MAX - 1000, 500);
 
-        // Should handle wraparound correctly
-        assert_eq!(reno.snd_max, usize::MAX - 500);
+        // Should handle wraparound correctly by updating rcv_next
+        assert_eq!(reno.rcv_next, usize::MAX - 500);
     }
 
     #[test]
