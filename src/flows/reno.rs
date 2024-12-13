@@ -232,12 +232,6 @@ impl TCPReno {
                 if cwnd_increase > 0 {
                     self.cwnd = (self.cwnd + cwnd_increase).min(self.max_cwnd);
                     self.cwnd_increment -= cwnd_increase as f64;
-
-                    // Enhanced Logging for Debugging
-                    println!(
-                                    "Congestion Avoidance: ACKed {} bytes. Increment: {:.4}, Applied: {}, New cwnd: {}",
-                                    bytes_acked, increment, cwnd_increase, self.cwnd
-                                );
                 }
             }
             TCPRenoState::FastRecovery => {
@@ -489,9 +483,8 @@ mod tests {
         reno.snd_max = 20000;
         reno.consecutive_dupacks_received();
 
-        // Simulate full recovery ACK
-        reno.recovery_high_seq = 15000;
-        reno.ack_received(0.1, 0.1, 15000);
+        // Simulate full recovery ACK by acknowledging all outstanding packets
+        reno.ack_received(0.1, 0.1, 20000);
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
         assert_eq!(reno.cwnd, reno.ssthresh);
@@ -794,12 +787,6 @@ mod tests {
             } else {
                 expected_cwnd - actual_cwnd
             };
-
-            // Logging for Each RTT
-            println!("--- RTT {} ---", rtt);
-            println!("Expected cwnd: {}", expected_cwnd);
-            println!("Actual cwnd: {}", actual_cwnd);
-            println!("Deviation: {}\n", deviation);
 
             // Assert that deviation is within acceptable range
             assert!(
