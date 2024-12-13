@@ -5,6 +5,7 @@ mailbox_capacity = 100
 duration = 0.2
 ui_interval = 0.01
 report_interval = 0.1
+num_threads = 1
 log_path = "logs/tcp_fattree"
 
 [topology]
@@ -29,4 +30,4 @@ flow_count = 200
     arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
     pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
 [flow_set.traffic.tcp]
-    cc_algorithm = "TCPReno"
+    cc_algorithm = "TCPCubic"
