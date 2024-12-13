@@ -205,9 +205,9 @@ impl TCPPacketSource {
                 self.output.send(resent_pkt.clone()).await;
 
                 debug!(
-                    "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                    self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
-                );
+                        "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                        self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+                    );
             }
 
             if self.dupack > 3 {
@@ -218,9 +218,9 @@ impl TCPPacketSource {
                     && self.next_seq < self.send_buffer
                 {
                     debug!(
-                        "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
-                        self.endpoint_id, self.next_seq, self.mss, now,
-                    );
+                            "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
+                            self.endpoint_id, self.next_seq, self.mss, now,
+                        );
 
                     let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
                     self.output.send(packet.clone()).await;
@@ -280,8 +280,12 @@ impl TCPPacketSource {
             }
 
             self.last_ack = ack.sequence_num;
-            self.congestion_control
-                .ack_received(sample_rtt, now, ack_packet.size);
+            self.congestion_control.ack_received(
+                ack.sequence_num,
+                sample_rtt,
+                now,
+                ack_packet.size,
+            );
 
             debug!(
                 "TCPPacketSource {} received ack till sequence number {} at time {:.3}.",

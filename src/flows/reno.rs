@@ -271,12 +271,25 @@ impl TCPReno {
 
     /// Updates sequence space tracking
     fn update_sequence_space(&mut self, ack_seq: usize, bytes: usize) {
+        println!(
+            "Updating sequence space: ack_seq={}, bytes={}",
+            ack_seq, bytes
+        );
         // Update highest_ack if the new acknowledgment is higher
         if ack_seq > self.highest_ack {
             self.highest_ack = ack_seq;
+            println!("Updated highest_ack to {}", self.highest_ack);
 
             // Remove all lost sequences less than or equal to highest_ack
+            let before = self.lost_sequences.len();
             self.lost_sequences.retain(|&s| s > self.highest_ack);
+            let after = self.lost_sequences.len();
+            if before != after {
+                println!(
+                    "Lost sequences updated, count before: {}, after: {}",
+                    before, after
+                );
+            }
 
             // Clear retransmit_required if all losses are recovered
             if self.lost_sequences.is_empty() {
@@ -286,18 +299,28 @@ impl TCPReno {
 
         // Update rcv_next to reflect the next expected sequence number
         self.rcv_next = ack_seq + bytes;
+        println!("Updated rcv_next to {}", self.rcv_next);
     }
 
     // Update recovery exit check
     fn should_exit_recovery(&self) -> bool {
+        println!(
+            "Checking if should exit recovery: highest_ack={}, recovery_high_seq={}",
+            self.highest_ack, self.recovery_high_seq
+        );
         self.highest_ack >= self.recovery_high_seq
     }
 }
 
 impl CongestionControl for TCPReno {
-    fn ack_received(&mut self, rtt: f64, current_time: f64, bytes_acked: usize) {
+    fn ack_received(&mut self, ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize) {
         self.update_rtt(rtt);
-        self.update_sequence_space(self.rcv_next, bytes_acked);
+        self.update_sequence_space(ack_seq, bytes_acked);
+
+        println!(
+            "ACK received: ack_seq={}, bytes_acked={}, state={:?}, highest_ack={}, recovery_high_seq={}",
+            ack_seq, bytes_acked, self.state, self.highest_ack, self.recovery_high_seq
+        );
 
         if self.state == TCPRenoState::FastRecovery {
             self.pipe = self.estimate_pipe();
@@ -306,6 +329,7 @@ impl CongestionControl for TCPReno {
                 self.state = TCPRenoState::CongestionAvoidance;
                 self.cwnd = self.ssthresh;
                 self.reset_recovery_state();
+                println!("Exiting Fast Recovery, new state: {:?}", self.state);
             }
             self.last_reduction_time = current_time;
         } else {
@@ -389,12 +413,12 @@ mod tests {
         let initial_cwnd = reno.cwnd;
 
         // Simulate ACK for 1 MSS
-        reno.ack_received(0.1, 0.1, reno.mss);
+        reno.ack_received(reno.mss, 0.1, 0.1, reno.mss);
         assert_eq!(reno.cwnd, initial_cwnd + reno.mss);
         assert_eq!(reno.state, TCPRenoState::SlowStart);
 
         // Another ACK
-        reno.ack_received(0.1, 0.2, reno.mss);
+        reno.ack_received(reno.mss * 2, 0.1, 0.2, reno.mss);
         assert_eq!(reno.cwnd, initial_cwnd + 2 * reno.mss);
     }
 
@@ -405,7 +429,7 @@ mod tests {
 
         // Send enough ACKs to exceed ssthresh
         while reno.cwnd < reno.ssthresh {
-            reno.ack_received(0.1, 0.1, reno.mss);
+            reno.ack_received(reno.cwnd, 0.1, 0.1, reno.mss);
         }
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
@@ -460,15 +484,18 @@ mod tests {
     #[test]
     fn test_fast_recovery_partial_acks() {
         let mut reno = TCPReno::new();
-        reno.packets_in_flight = 10000;
-        reno.snd_max = 20000;
+        reno.packets_in_flight = 10000; // Set high flight size
+        reno.snd_max = 20000; // Highest sequence number sent
 
-        // Enter fast recovery
+        // Trigger fast recovery with 3 duplicate ACKs
         reno.consecutive_dupacks_received();
+
+        assert_eq!(reno.state, TCPRenoState::FastRecovery);
         let initial_recovery_window = reno.cwnd;
 
         // Simulate partial ACK
-        reno.ack_received(0.1, 0.1, 500);
+        let partial_ack_seq = reno.highest_ack + 500;
+        reno.ack_received(partial_ack_seq, 0.1, 0.1, 500);
 
         // Verify NewReno behavior on partial ACK
         assert_eq!(reno.state, TCPRenoState::FastRecovery);
@@ -481,10 +508,20 @@ mod tests {
         let mut reno = TCPReno::new();
         reno.packets_in_flight = 10000;
         reno.snd_max = 20000;
+        reno.highest_ack = 0; // Initialize highest_ack
+
+        // Enter fast recovery
         reno.consecutive_dupacks_received();
 
         // Simulate full recovery ACK by acknowledging all outstanding packets
-        reno.ack_received(0.1, 0.1, 20000);
+        let full_ack_seq = reno.snd_max;
+        let bytes_acked = reno.snd_max - reno.highest_ack;
+        reno.ack_received(
+            full_ack_seq, // ack_seq: usize
+            0.1,          // rtt: f64
+            0.1,          // current_time: f64
+            bytes_acked,  // bytes_acked: usize
+        );
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
         assert_eq!(reno.cwnd, reno.ssthresh);
@@ -498,7 +535,7 @@ mod tests {
         // First loss recovery
         reno.packets_in_flight = 10000;
         reno.consecutive_dupacks_received();
-        reno.ack_received(0.1, 0.1, 15000);
+        reno.ack_received(reno.snd_max, 0.1, 0.1, 15000);
 
         let first_ssthresh = reno.ssthresh;
 
@@ -537,7 +574,7 @@ mod tests {
 
         // Test maximum bound
         reno.cwnd = reno.max_cwnd + 1000;
-        reno.ack_received(0.1, 0.1, reno.mss);
+        reno.ack_received(reno.snd_max, 0.1, 0.1, reno.mss);
         assert_eq!(reno.cwnd, reno.max_cwnd);
     }
 
@@ -581,7 +618,7 @@ mod tests {
         reno.cwnd = 0; // Invalid state
 
         // ACK should restore to minimum
-        reno.ack_received(0.1, 0.1, reno.mss);
+        reno.ack_received(reno.snd_max, 0.1, 0.1, reno.mss);
         assert_eq!(reno.cwnd, reno.min_cwnd);
     }
 
@@ -691,7 +728,7 @@ mod tests {
         for _ in 0..5 {
             // Simulate ACKs acknowledging 500 bytes each time
             reno.update_sequence_space(reno.highest_ack + 500, 0);
-            reno.ack_received(0.1, 0.1, 500);
+            reno.ack_received(reno.highest_ack + 500, 0.1, 0.1, 500);
         }
 
         // New losses during recovery
@@ -704,7 +741,7 @@ mod tests {
 
         // Full ACK that covers all sent data
         reno.update_sequence_space(reno.snd_max, 0);
-        reno.ack_received(0.1, 0.1, reno.snd_max - reno.highest_ack);
+        reno.ack_received(reno.snd_max, 0.1, 0.1, reno.snd_max - reno.highest_ack);
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
         assert!(reno.lost_sequences.is_empty());
@@ -772,7 +809,13 @@ mod tests {
 
             // Simulate ACKs for the RTT
             for _ in 0..acks_per_rtt {
-                reno.ack_received(0.1, 0.1 * (rtt as f64), mss);
+                let ack_seq = reno.highest_ack + mss; // Increment the ack_seq appropriately
+                reno.ack_received(
+                    ack_seq,            // ack_seq: usize
+                    0.1 * (rtt as f64), // rtt: f64
+                    0.1 * (rtt as f64), // current_time: f64
+                    mss,                // bytes_acked: usize
+                );
             }
 
             // Calculate expected cwnd

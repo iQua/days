@@ -12,7 +12,7 @@ pub enum CCAlgorithm {
 
 /// Defines the interface for all congestion control algorithms.
 pub trait CongestionControl {
-    fn ack_received(&mut self, rtt: f64, current_time: f64, bytes_acked: usize);
+    fn ack_received(&mut self, ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize);
     fn timer_expired(&mut self);
     fn dupack_over(&mut self);
     fn consecutive_dupacks_received(&mut self);
