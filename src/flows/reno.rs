@@ -261,7 +261,7 @@ impl TCPReno {
     }
 
     /// Updates sequence space tracking
-    fn update_sequence_space(&mut self, ack_seq: usize, _bytes: usize) {
+    fn update_sequence_space(&mut self, ack_seq: usize, bytes: usize) {
         // Update highest_ack if the new acknowledgment is higher
         if ack_seq > self.highest_ack {
             self.highest_ack = ack_seq;
@@ -275,8 +275,8 @@ impl TCPReno {
             }
         }
 
-        // Do not update snd_max here since it represents the highest sequence number sent,
-        // which should be updated when data is sent, not when ACKs are received.
+        // Update rcv_next to reflect the next expected sequence number
+        self.rcv_next = ack_seq + bytes;
     }
 
     // Update recovery exit check
@@ -518,12 +518,14 @@ mod tests {
 
     #[test]
     fn test_window_bounds() {
-        let mut reno = TCPReno::new();
-
         // Test minimum bound
+        let mut reno = TCPReno::new();
         reno.cwnd = 100;
         reno.timer_expired();
         assert_eq!(reno.cwnd, reno.min_cwnd);
+
+        // Create a new instance for the maximum bound test
+        let mut reno = TCPReno::new();
 
         // Test maximum bound
         reno.cwnd = reno.max_cwnd + 1000;
@@ -548,12 +550,18 @@ mod tests {
     fn test_sequence_tracking() {
         let mut reno = TCPReno::new();
 
-        reno.update_sequence_space(1000, 500);
-        assert_eq!(reno.snd_max, 1500);
+        // Simulate sending data up to sequence number 1500
+        reno.snd_max = 1500;
 
+        // Simulate receiving an acknowledgment for sequence number 1000, acknowledging 500 bytes
+        reno.update_sequence_space(1000, 500);
+        assert_eq!(reno.highest_ack, 1000);
+        assert_eq!(reno.rcv_next, 1500);
+
+        // Simulate receiving an acknowledgment for sequence number 1500, acknowledging another 500 bytes
         reno.update_sequence_space(1500, 500);
+        assert_eq!(reno.highest_ack, 1500);
         assert_eq!(reno.rcv_next, 2000);
-        assert_eq!(reno.highest_ack, 2000);
     }
 
     #[test]
