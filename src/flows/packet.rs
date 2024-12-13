@@ -3,6 +3,7 @@
 #[derive(Debug, Clone)]
 pub struct TCPAck {
     pub sequence_num: usize,
+    pub acknowledged_size: usize,
 }
 
 #[derive(Debug, Clone)]
