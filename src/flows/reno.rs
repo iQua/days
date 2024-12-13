@@ -159,6 +159,11 @@ impl TCPReno {
         self.lost_sequences.insert(seq);
         self.retransmit_required = true;
         self.retransmission_queue.push(seq);
+
+        // Update recovery_high_seq if the lost sequence is higher
+        if seq > self.recovery_high_seq {
+            self.recovery_high_seq = seq;
+        }
     }
 
     /// Implements NewReno modifications from RFC 6582 Section 3.2
@@ -256,21 +261,27 @@ impl TCPReno {
     }
 
     /// Updates sequence space tracking
-    fn update_sequence_space(&mut self, seq: usize, bytes: usize) {
-        self.snd_max = self.snd_max.max(seq + bytes);
-        if seq == self.rcv_next {
-            self.rcv_next = seq + bytes;
-            // Track highest cumulative ACK
-            self.highest_ack = self.highest_ack.max(seq + bytes);
-            self.lost_sequences.remove(&seq);
+    fn update_sequence_space(&mut self, ack_seq: usize, _bytes: usize) {
+        // Update highest_ack if the new acknowledgment is higher
+        if ack_seq > self.highest_ack {
+            self.highest_ack = ack_seq;
+
+            // Remove all lost sequences less than or equal to highest_ack
+            self.lost_sequences.retain(|&s| s > self.highest_ack);
+
+            // Clear retransmit_required if all losses are recovered
+            if self.lost_sequences.is_empty() {
+                self.retransmit_required = false;
+            }
         }
+
+        // Do not update snd_max here since it represents the highest sequence number sent,
+        // which should be updated when data is sent, not when ACKs are received.
     }
 
     // Update recovery exit check
     fn should_exit_recovery(&self) -> bool {
         self.highest_ack >= self.recovery_high_seq
-            && !self.retransmit_required
-            && self.lost_sequences.is_empty()
     }
 }
 
@@ -282,7 +293,7 @@ impl CongestionControl for TCPReno {
         if self.state == TCPRenoState::FastRecovery {
             self.pipe = self.estimate_pipe();
 
-            if self.pipe <= self.ssthresh && self.should_exit_recovery() {
+            if self.should_exit_recovery() {
                 self.state = TCPRenoState::CongestionAvoidance;
                 self.cwnd = self.ssthresh;
                 self.reset_recovery_state();
@@ -652,6 +663,9 @@ mod tests {
     #[test]
     fn test_extended_loss_recovery() {
         let mut reno = TCPReno::new();
+
+        // Simulate sending data up to sequence number 20000
+        reno.snd_max = 20000;
         reno.packets_in_flight = 10000;
 
         // Enter recovery
@@ -659,6 +673,8 @@ mod tests {
 
         // Multiple partial ACKs
         for _ in 0..5 {
+            // Simulate ACKs acknowledging 500 bytes each time
+            reno.update_sequence_space(reno.highest_ack + 500, 0);
             reno.ack_received(0.1, 0.1, 500);
         }
 
@@ -670,8 +686,10 @@ mod tests {
         assert_eq!(reno.state, TCPRenoState::FastRecovery);
         assert!(!reno.lost_sequences.is_empty());
 
-        // Full ACK should clear everything
-        reno.ack_received(0.1, 0.1, reno.recovery_high_seq);
+        // Full ACK that covers all sent data
+        reno.update_sequence_space(reno.snd_max, 0);
+        reno.ack_received(0.1, 0.1, reno.snd_max - reno.highest_ack);
+
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
         assert!(reno.lost_sequences.is_empty());
     }
