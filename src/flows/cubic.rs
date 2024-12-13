@@ -130,7 +130,6 @@ impl TCPCubic {
 
     /// Resets the states in CUBIC.
     pub fn cubic_reset(&mut self) {
-        println!("Resetting CUBIC state.");
         self.w_last_max = 0;
         self.epoch_start = 0.0;
         self.origin_point = 0;
@@ -149,11 +148,6 @@ impl TCPCubic {
         self.hystart.add_rtt_sample(rtt, current_time);
         self.hystart.min_rtt = self.hystart.min_rtt.min(rtt);
 
-        println!(
-            "HyStart++ updated: cwnd={}, min_rtt={}, rtt_samples={:?}",
-            self.cwnd, self.hystart.min_rtt, self.hystart.rtt_samples
-        );
-
         // Exit conditions for slow start using improved sampling
         if self.hystart.rtt_samples.len() >= 8 {
             let sorted_samples: Vec<f64> = {
@@ -167,20 +161,10 @@ impl TCPCubic {
 
             // Use last_rtt to detect rapid RTT increases
             let rtt_increase = (max_rtt - min_rtt) / min_rtt;
-            println!(
-                "RTT increase calculation: min_rtt={}, max_rtt={}, increase={}",
-                min_rtt, max_rtt, rtt_increase
-            );
 
             if rtt_increase > 0.125 {
                 self.hystart.exit_slow_start = true;
                 self.ssthresh = self.cwnd.min(self.max_cwnd);
-                println!(
-                    "Exiting slow start due to RTT increase. New ssthresh={}",
-                    self.ssthresh
-                );
-            } else {
-                println!("No significant RTT increase detected. Continuing slow start.");
             }
         }
     }
@@ -189,11 +173,6 @@ impl TCPCubic {
     fn cubic_update(&mut self, current_time: f64) {
         self.ack_cnt += 1;
         self.round_count = self.hystart.current_round;
-
-        println!(
-            "CUBIC update called: cwnd={}, ssthresh={}, epoch_start={}, current_time={}",
-            self.cwnd, self.ssthresh, self.epoch_start, current_time
-        );
 
         // Reset epoch if needed
         if self.epoch_start <= 0.0 {
@@ -207,11 +186,6 @@ impl TCPCubic {
             }
             self.ack_cnt = 1;
             self.w_tcp = self.cwnd;
-
-            println!(
-                "Epoch reset: epoch_start={}, k={}, origin_point={}, w_tcp={}",
-                self.epoch_start, self.k, self.origin_point, self.w_tcp
-            );
         }
 
         let t = current_time + self.d_min - self.epoch_start;
@@ -223,9 +197,6 @@ impl TCPCubic {
         } else {
             self.min_cwnd as f64
         };
-
-        println!("Cubic window target: {}", target);
-        println!("w_cubic after bounds: {}", w_cubic);
 
         // Improved TCP friendliness calculation
         let w_tcp = if self.tcp_friendliness {
@@ -241,15 +212,12 @@ impl TCPCubic {
             let w_tcp_calc = self.w_tcp as f64
                 + (alpha * self.beta * (self.ack_cnt as f64)
                     / (self.cwnd as f64 * self.delayed_ack_factor as f64));
-            println!("w_tcp_calc: {}", w_tcp_calc);
             w_tcp_calc
                 .max(self.min_cwnd as f64)
                 .min(self.max_cwnd as f64)
         } else {
             0.0
         };
-
-        println!("w_tcp after calculation: {}", w_tcp);
 
         // Take maximum of cubic and TCP friendly windows
         let w_est = if self.tcp_friendliness {
@@ -258,13 +226,8 @@ impl TCPCubic {
             w_cubic
         };
 
-        println!("w_est (final estimate): {}", w_est);
-
-        println!("Cwnd updated to: {}", self.cwnd);
-
         // Assign cwnd to the estimated value, ensuring it does not exceed max_cwnd
         self.cwnd = w_est.min(self.max_cwnd as f64) as usize;
-        println!("Cwnd updated to: {}", self.cwnd);
 
         // Prevent overflow and handle cases where w_est <= cwnd
         if w_est > self.cwnd as f64 {
@@ -272,31 +235,19 @@ impl TCPCubic {
             // and handle large cwnd appropriately
             if self.cwnd > (usize::MAX / 100) {
                 self.cnt = usize::MAX; // Assign maximum usize to prevent overflow
-                println!(
-                    "cwnd is too large (cwnd={} > usize::MAX / 100). Setting cnt to usize::MAX",
-                    self.cwnd
-                );
             } else {
                 self.cnt = ((self.cwnd as f64 * (w_est - self.cwnd as f64))
                     / (w_est * self.mss as f64))
                     .max(2.0) as usize;
-                println!("cnt updated to: {}", self.cnt);
             }
         } else {
             // Prevent cwnd * 100 from overflowing
             if self.cwnd > usize::MAX / 100 {
                 self.cnt = usize::MAX;
-                println!(
-                    "cwnd is too large (cwnd={} > usize::MAX / 100). Setting cnt to usize::MAX",
-                    self.cwnd
-                );
             } else {
                 self.cnt = 100 * self.cwnd; // Arbitrary large count to prevent cwnd increment
-                println!("w_est <= cwnd, setting cnt to a large value: {}", self.cnt);
             }
         }
-
-        println!("cnt updated to: {}", self.cnt);
     }
 
     fn update_fast_convergence(&mut self) {
@@ -308,17 +259,9 @@ impl TCPCubic {
         if self.cwnd < self.last_max_cwnd {
             self.last_max_cwnd = (self.cwnd as f64 * (1.0 + self.beta)).floor() as usize;
             self.w_last_max = self.cwnd;
-            println!(
-                "Fast convergence: cwnd={}, last_max_cwnd={}, w_last_max={}",
-                self.cwnd, self.last_max_cwnd, self.w_last_max
-            );
         } else {
             self.last_max_cwnd = self.cwnd;
             self.w_last_max = self.cwnd;
-            println!(
-                "Fast convergence updated: cwnd={}, last_max_cwnd={}, w_last_max={}",
-                self.cwnd, self.last_max_cwnd, self.w_last_max
-            );
         }
     }
 
@@ -329,8 +272,6 @@ impl TCPCubic {
             .floor() as usize;
         self.ack_cnt = 0;
 
-        println!("CUBIC TCP Friendliness: w_tcp={}", self.w_tcp);
-
         if self.w_tcp > self.cwnd {
             let max_cnt = if (self.w_tcp - self.cwnd) != 0 {
                 self.cwnd / (self.w_tcp - self.cwnd)
@@ -339,7 +280,6 @@ impl TCPCubic {
             };
             if self.cnt > max_cnt {
                 self.cnt = max_cnt;
-                println!("cnt reduced to max_cnt: {}", self.cnt);
             }
         }
     }
@@ -347,18 +287,12 @@ impl TCPCubic {
 
 impl CongestionControl for TCPCubic {
     fn ack_received(&mut self, _ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize) {
-        println!(
-            "ACK received: ack_seq={}, rtt={}, current_time={}, bytes_acked={}",
-            _ack_seq, rtt, current_time, bytes_acked
-        );
-
         // Track minimum RTT
         if self.d_min > 0.0 {
             self.d_min = self.d_min.min(rtt);
         } else {
             self.d_min = rtt;
         }
-        println!("Updated d_min: {}", self.d_min);
 
         // Update HyStart state with improved RTT tracking
         self.update_hystart(rtt, current_time);
@@ -368,7 +302,6 @@ impl CongestionControl for TCPCubic {
                 // Full acknowledgment received, exit recovery
                 self.cwnd = self.ssthresh;
                 self.in_recovery = false;
-                println!("Recovery complete: cwnd set to ssthresh={}", self.ssthresh);
                 return;
             }
         }
@@ -381,10 +314,6 @@ impl CongestionControl for TCPCubic {
                 .checked_add(increment)
                 .unwrap_or(self.max_cwnd)
                 .min(self.max_cwnd);
-            println!(
-                "Slow start: Increment cwnd by {}, new cwnd={}",
-                increment, self.cwnd
-            );
         } else {
             // Congestion avoidance
             self.cubic_update(current_time);
@@ -396,24 +325,16 @@ impl CongestionControl for TCPCubic {
                     .checked_add(increment)
                     .unwrap_or(self.max_cwnd)
                     .min(self.max_cwnd);
-                println!(
-                    "Congestion avoidance: Increment cwnd by {}, new cwnd={}",
-                    increment, self.cwnd
-                );
+
                 self.cwnd_cnt = 0;
             } else {
                 self.cwnd_cnt += 1;
-                println!(
-                    "Congestion avoidance: cwnd_cnt={}, cnt={}",
-                    self.cwnd_cnt, self.cnt
-                );
             }
         }
     }
 
     /// Actions to be taken when a timer expired.
     fn timer_expired(&mut self) {
-        println!("Timer expired: resetting congestion window.");
         // sets the congestion window to 1 segment
         self.last_decrease = self.cwnd;
         self.last_reduction_time = self.epoch_start;
@@ -427,7 +348,6 @@ impl CongestionControl for TCPCubic {
     /// Actions to be taken when a new acknowledgment is received after previous
     /// dupacks.
     fn dupack_over(&mut self) {
-        println!("dupack_over: setting cwnd to ssthresh.");
         self.cwnd = self.ssthresh;
         self.in_recovery = false;
     }
@@ -438,17 +358,12 @@ impl CongestionControl for TCPCubic {
         self.cwnd = self.ssthresh + 3 * self.mss;
         self.cwnd = self.cwnd.min(self.max_cwnd); // Ensure cwnd does not exceed max_cwnd
         self.in_recovery = true;
-        println!(
-            "Three dupacks received: ssthresh={}, cwnd={}, entering recovery",
-            self.ssthresh, self.cwnd
-        );
     }
 
     /// Actions to be taken when more than three consecutive dupacks are
     /// received.
     fn more_dupacks_received(&mut self) {
         self.cwnd = self.cwnd.saturating_add(self.mss).min(self.max_cwnd);
-        println!("More dupacks received: cwnd increased to {}", self.cwnd);
     }
 
     fn get_cwnd(&self) -> usize {
