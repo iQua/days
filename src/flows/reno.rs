@@ -349,3 +349,416 @@ impl CongestionControl for TCPReno {
         self.cwnd
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_state() {
+        let reno = TCPReno::new();
+        assert_eq!(reno.state, TCPRenoState::SlowStart);
+        assert_eq!(reno.cwnd, 1024); // 2*MSS
+        assert_eq!(reno.ssthresh, 65535);
+        assert_eq!(reno.mss, 512);
+    }
+
+    #[test]
+    fn test_slow_start_growth() {
+        let mut reno = TCPReno::new();
+        let initial_cwnd = reno.cwnd;
+
+        // Simulate ACK for 1 MSS
+        reno.ack_received(0.1, 0.1, reno.mss);
+        assert_eq!(reno.cwnd, initial_cwnd + reno.mss);
+        assert_eq!(reno.state, TCPRenoState::SlowStart);
+
+        // Another ACK
+        reno.ack_received(0.1, 0.2, reno.mss);
+        assert_eq!(reno.cwnd, initial_cwnd + 2 * reno.mss);
+    }
+
+    #[test]
+    fn test_slow_start_to_congestion_avoidance() {
+        let mut reno = TCPReno::new();
+        reno.ssthresh = 2048; // Set low ssthresh to force transition
+
+        // Send enough ACKs to exceed ssthresh
+        while reno.cwnd < reno.ssthresh {
+            reno.ack_received(0.1, 0.1, reno.mss);
+        }
+
+        assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
+        assert_eq!(reno.cwnd, reno.ssthresh);
+    }
+
+    #[test]
+    fn test_fast_recovery_entry() {
+        let mut reno = TCPReno::new();
+        reno.packets_in_flight = 10000; // Set high flight size
+
+        // Trigger fast recovery with 3 duplicate ACKs
+        reno.consecutive_dupacks_received();
+
+        assert_eq!(reno.state, TCPRenoState::FastRecovery);
+        assert_eq!(reno.ssthresh, 5000); // FlightSize/2
+        assert_eq!(reno.cwnd, reno.ssthresh + 3 * reno.mss);
+        assert_eq!(reno.dupack_count, 3);
+    }
+
+    #[test]
+    fn test_rto_calculation() {
+        let mut reno = TCPReno::new();
+
+        // First RTT measurement
+        reno.update_rtt(0.1);
+        assert_eq!(reno.srtt, 0.1);
+        assert_eq!(reno.rtt_var, 0.05);
+
+        // Second measurement
+        reno.update_rtt(0.15);
+        assert!((reno.srtt - 0.10625).abs() < 0.0001); // 0.875*0.1 + 0.125*0.15
+
+        // Verify RTO bounds
+        assert!(reno.rto >= reno.min_rto);
+        assert!(reno.rto <= reno.max_rto);
+    }
+
+    #[test]
+    fn test_timer_expiry() {
+        let mut reno = TCPReno::new();
+        reno.cwnd = 10000;
+        reno.state = TCPRenoState::CongestionAvoidance;
+
+        reno.timer_expired();
+
+        assert_eq!(reno.state, TCPRenoState::SlowStart);
+        assert_eq!(reno.cwnd, reno.min_cwnd);
+        assert_eq!(reno.ssthresh, 5000); // cwnd/2
+    }
+
+    #[test]
+    fn test_fast_recovery_partial_acks() {
+        let mut reno = TCPReno::new();
+        reno.packets_in_flight = 10000;
+        reno.snd_max = 20000;
+
+        // Enter fast recovery
+        reno.consecutive_dupacks_received();
+        let initial_recovery_window = reno.cwnd;
+
+        // Simulate partial ACK
+        reno.ack_received(0.1, 0.1, 500);
+
+        // Verify NewReno behavior on partial ACK
+        assert_eq!(reno.state, TCPRenoState::FastRecovery);
+        assert!(reno.cwnd < initial_recovery_window); // Window should deflate
+        assert!(reno.retransmit_required); // Should trigger retransmission
+    }
+
+    #[test]
+    fn test_fast_recovery_full_ack() {
+        let mut reno = TCPReno::new();
+        reno.packets_in_flight = 10000;
+        reno.snd_max = 20000;
+        reno.consecutive_dupacks_received();
+
+        // Simulate full recovery ACK
+        reno.recovery_high_seq = 15000;
+        reno.ack_received(0.1, 0.1, 15000);
+
+        assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
+        assert_eq!(reno.cwnd, reno.ssthresh);
+        assert!(!reno.retransmit_required);
+    }
+
+    #[test]
+    fn test_multiple_loss_recoveries() {
+        let mut reno = TCPReno::new();
+
+        // First loss recovery
+        reno.packets_in_flight = 10000;
+        reno.consecutive_dupacks_received();
+        reno.ack_received(0.1, 0.1, 15000);
+
+        let first_ssthresh = reno.ssthresh;
+
+        // Second loss recovery
+        reno.packets_in_flight = 5000;
+        reno.consecutive_dupacks_received();
+
+        assert!(reno.ssthresh < first_ssthresh); // Should reduce further
+        assert_eq!(reno.state, TCPRenoState::FastRecovery);
+    }
+
+    #[test]
+    fn test_pipe_estimation() {
+        let mut reno = TCPReno::new();
+        reno.packets_in_flight = 1000;
+        reno.consecutive_dupacks_received();
+
+        // Add some lost sequences
+        reno.lost_sequences.insert(1000);
+        reno.lost_sequences.insert(2000);
+
+        let pipe = reno.estimate_pipe();
+        assert_eq!(pipe, 1000 + 3 + 2); // in_flight + dupacks + lost_seqs
+    }
+
+    #[test]
+    fn test_window_bounds() {
+        let mut reno = TCPReno::new();
+
+        // Test minimum bound
+        reno.cwnd = 100;
+        reno.timer_expired();
+        assert_eq!(reno.cwnd, reno.min_cwnd);
+
+        // Test maximum bound
+        reno.cwnd = reno.max_cwnd + 1000;
+        reno.ack_received(0.1, 0.1, reno.mss);
+        assert_eq!(reno.cwnd, reno.max_cwnd);
+    }
+
+    #[test]
+    fn test_rtt_update_during_recovery() {
+        let mut reno = TCPReno::new();
+        reno.consecutive_dupacks_received();
+
+        let initial_srtt = 0.1;
+        reno.srtt = initial_srtt;
+
+        // RTT updates should still work in recovery
+        reno.update_rtt(0.2);
+        assert!(reno.srtt > initial_srtt);
+    }
+
+    #[test]
+    fn test_sequence_tracking() {
+        let mut reno = TCPReno::new();
+
+        reno.update_sequence_space(1000, 500);
+        assert_eq!(reno.snd_max, 1500);
+
+        reno.update_sequence_space(1500, 500);
+        assert_eq!(reno.rcv_next, 2000);
+        assert_eq!(reno.highest_ack, 2000);
+    }
+
+    #[test]
+    fn test_zero_window_handling() {
+        let mut reno = TCPReno::new();
+
+        // Force window to minimum
+        reno.timer_expired();
+        reno.cwnd = 0; // Invalid state
+
+        // ACK should restore to minimum
+        reno.ack_received(0.1, 0.1, reno.mss);
+        assert_eq!(reno.cwnd, reno.min_cwnd);
+    }
+
+    #[test]
+    fn test_extreme_rtt_values() {
+        let mut reno = TCPReno::new();
+
+        // Very small RTT
+        reno.update_rtt(0.000001);
+        assert!(reno.rto >= reno.min_rto);
+
+        // Very large RTT
+        reno.update_rtt(100.0);
+        assert!(reno.rto <= reno.max_rto);
+    }
+
+    #[test]
+    fn test_multiple_dupacks() {
+        let mut reno = TCPReno::new();
+        reno.consecutive_dupacks_received();
+        let initial_cwnd = reno.cwnd;
+
+        // Additional dupacks should inflate window
+        reno.more_dupacks_received();
+        assert_eq!(reno.cwnd, initial_cwnd + reno.mss);
+
+        reno.more_dupacks_received();
+        assert_eq!(reno.cwnd, initial_cwnd + 2 * reno.mss);
+    }
+
+    #[test]
+    fn test_back_to_back_timer_expiry() {
+        let mut reno = TCPReno::new();
+        reno.cwnd = 10000;
+
+        // First timer expiry
+        reno.timer_expired();
+        let first_ssthresh = reno.ssthresh;
+
+        // Second timer expiry
+        reno.timer_expired();
+
+        // ssthresh should be reduced again
+        assert!(reno.ssthresh < first_ssthresh);
+        assert_eq!(reno.cwnd, reno.min_cwnd);
+    }
+
+    #[test]
+    fn test_recovery_window_calculation() {
+        let mut reno = TCPReno::new();
+        reno.packets_in_flight = 10000;
+        reno.consecutive_dupacks_received();
+
+        // Recovery window should be flight size + MSS
+        assert_eq!(reno.recovery_window, 10000 + reno.mss);
+        assert!(reno.recovery_window <= reno.max_cwnd);
+    }
+
+    #[test]
+    fn test_state_cleanup() {
+        let mut reno = TCPReno::new();
+
+        // Set various state
+        reno.consecutive_dupacks_received();
+        reno.lost_sequences.insert(1000);
+        reno.retransmission_queue.push(1000);
+        reno.immediate_retransmit = Some(1000);
+
+        // Reset state
+        reno.reset_recovery_state();
+
+        assert_eq!(reno.pipe, 0);
+        assert_eq!(reno.recovery_high_seq, 0);
+        assert_eq!(reno.dupack_count, 0);
+        assert!(!reno.retransmit_required);
+        assert!(reno.immediate_retransmit.is_none());
+        assert!(reno.retransmission_queue.is_empty());
+        assert!(reno.lost_sequences.is_empty());
+    }
+
+    #[test]
+    fn test_reordering_tolerance() {
+        let mut reno = TCPReno::new();
+        reno.state = TCPRenoState::CongestionAvoidance;
+        let initial_cwnd = reno.cwnd;
+
+        // Simulate reordered ACK
+        reno.update_sequence_space(2000, 1000); // Later sequence first
+        reno.update_sequence_space(1000, 1000); // Earlier sequence after
+
+        // Should maintain same window
+        assert_eq!(reno.cwnd, initial_cwnd);
+    }
+
+    #[test]
+    fn test_extended_loss_recovery() {
+        let mut reno = TCPReno::new();
+        reno.packets_in_flight = 10000;
+
+        // Enter recovery
+        reno.consecutive_dupacks_received();
+
+        // Multiple partial ACKs
+        for _ in 0..5 {
+            reno.ack_received(0.1, 0.1, 500);
+        }
+
+        // New losses during recovery
+        reno.mark_lost(5000);
+        reno.mark_lost(6000);
+
+        // Should stay in recovery
+        assert_eq!(reno.state, TCPRenoState::FastRecovery);
+        assert!(!reno.lost_sequences.is_empty());
+
+        // Full ACK should clear everything
+        reno.ack_received(0.1, 0.1, reno.recovery_high_seq);
+        assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
+        assert!(reno.lost_sequences.is_empty());
+    }
+
+    #[test]
+    fn test_sequence_number_wraparound() {
+        let mut reno = TCPReno::new();
+
+        // Set sequence near maximum value
+        reno.snd_max = usize::MAX - 1000;
+        reno.update_sequence_space(usize::MAX - 1000, 500);
+
+        // Should handle wraparound correctly
+        assert_eq!(reno.snd_max, usize::MAX - 500);
+    }
+
+    #[test]
+    fn test_rtt_measurement_edge_cases() {
+        let mut reno = TCPReno::new();
+
+        // RTT decreasing
+        reno.update_rtt(0.1);
+        reno.update_rtt(0.09);
+        reno.update_rtt(0.08);
+
+        // RTT increasing
+        reno.update_rtt(0.12);
+        reno.update_rtt(0.15);
+
+        // Verify SRTT and RTTVAR remain stable
+        assert!(reno.srtt > 0.0);
+        assert!(reno.rtt_var > 0.0);
+        assert!(reno.rto >= reno.min_rto);
+        assert!(reno.rto <= reno.max_rto);
+    }
+
+    #[test]
+    fn test_timer_expiry_during_recovery() {
+        let mut reno = TCPReno::new();
+        reno.consecutive_dupacks_received();
+
+        // Timer expires during recovery
+        reno.timer_expired();
+
+        // Should reset to slow start
+        assert_eq!(reno.state, TCPRenoState::SlowStart);
+        assert_eq!(reno.cwnd, reno.min_cwnd);
+        assert!(reno.lost_sequences.is_empty());
+    }
+
+    #[test]
+    fn test_long_term_congestion_avoidance() {
+        let mut reno = TCPReno::new();
+        reno.state = TCPRenoState::CongestionAvoidance;
+        reno.cwnd = 10000;
+
+        // Simulate multiple RTTs
+        let initial_cwnd = reno.cwnd;
+        let rtts = 10;
+        let acks_per_rtt = reno.cwnd / reno.mss;
+
+        for rtt in 0..rtts {
+            let start_cwnd = reno.cwnd;
+
+            for _ in 0..acks_per_rtt {
+                reno.ack_received(0.1, 0.1 * (rtt as f64), reno.mss);
+            }
+
+            // Verify growth is approximately MSS per RTT
+            let diff = if reno.cwnd > start_cwnd + reno.mss {
+                reno.cwnd - (start_cwnd + reno.mss)
+            } else {
+                (start_cwnd + reno.mss) - reno.cwnd
+            };
+            assert!(
+                diff <= 1,
+                "Window growth in RTT {} deviated by more than 1 byte from MSS",
+                rtt
+            );
+        }
+
+        // Verify overall growth
+        let expected_growth = rtts * reno.mss;
+        let actual_growth = reno.cwnd - initial_cwnd;
+        assert!(
+            (actual_growth as i64 - expected_growth as i64).abs() <= rtts as i64,
+            "Overall window growth deviated significantly from expected"
+        );
+    }
+}
