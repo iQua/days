@@ -284,7 +284,7 @@ impl TCPPacketSource {
                 ack.sequence_num,
                 sample_rtt,
                 now,
-                ack_packet.size,
+                ack.acknowledged_size,
             );
 
             debug!(
