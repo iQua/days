@@ -1,3 +1,5 @@
+//! Implements the TCP Reno congestion control mechanism, specified in RFCs 5681, 6582 and 6298.
+//!
 use crate::flows::cc::CongestionControl;
 use std::collections::HashSet;
 
@@ -12,69 +14,70 @@ enum TCPRenoState {
 
 #[derive(Debug, Default)]
 pub struct TCPReno {
-    /// The maximum segment size
+    /// Maximum segment size in bytes
     mss: usize,
-    /// The size of the congestion window
+    /// Current congestion window size
     cwnd: usize,
-    /// The slow start threshold
+    /// Slow start threshold
     ssthresh: usize,
-    /// Current state of TCP Reno
+    /// Current TCP Reno phase
     state: TCPRenoState,
-    /// Minimum window size
+    /// Minimum allowed window size
     min_cwnd: usize,
-    /// Maximum window size
+    /// Maximum allowed window size
     max_cwnd: usize,
-    /// Number of packets in flight
+    /// Count of unacknowledged packets
     packets_in_flight: usize,
-    /// Last measured RTT
+    /// Most recent RTT sample
     last_rtt: f64,
-    /// Previous RTT measurement for variance calculation
+    /// Previous RTT measurement
     prev_rtt: Option<f64>,
-    /// RTT variance for RTO calculation
+    /// RTT variation estimate
     rtt_var: f64,
-    /// Smoothed RTT
+    /// Smoothed RTT estimate
     srtt: f64,
-    /// RTO value
+    /// Retransmission timeout
     rto: f64,
-    /// Minimum RTO value
+    /// Minimum RTO per RFC 6298
     min_rto: f64,
-    /// Maximum RTO value
+    /// Maximum RTO limit
     max_rto: f64,
-    /// Minimum observed RTT
+    /// Lowest observed RTT
     min_rtt: f64,
-    /// Number of duplicate ACKs received
+    /// Count of duplicate ACKs received
     dupack_count: usize,
-    /// Recovery window - tracks window size during recovery
+    /// Window size during recovery
     recovery_window: usize,
-    /// Time of last window reduction
+    /// Timestamp of last window reduction
     last_reduction_time: f64,
-    /// Saves FlightSize before entering recovery
+    /// FlightSize before recovery
     pre_recovery_flight_size: usize,
-    /// Highest sequence transmitted when entering recovery
+    /// Sequence threshold for recovery exit
     recovery_high_seq: usize,
-    /// Tracks number of segments assumed outstanding ("pipe")
+    /// Outstanding segments estimate
     pipe: usize,
-    /// Highest sequence number sent
+    /// Highest transmitted sequence
     snd_max: usize,
-    /// Next sequence number expected
+    /// Next expected sequence
     rcv_next: usize,
-    /// Flag indicating if retransmission is required
+    /// Indicates pending retransmission
     retransmit_required: bool,
-    /// Segments that need retransmission
+    /// Segments queued for retransmission
     retransmission_queue: Vec<usize>,
-    /// Set of lost sequence numbers
+    /// Currently lost sequences
     lost_sequences: HashSet<usize>,
-    /// Recovery exit threshold
+    /// Recovery completion threshold
     recovery_exit_threshold: usize,
-    /// Optional sequence number for immediate retransmission
+    /// Next segment for immediate retransmit
     immediate_retransmit: Option<usize>,
-    /// Highest ACK received
+    /// Highest acknowledged sequence
     highest_ack: usize,
-    /// Accumulated fractional increments for cwnd
+    /// Partial window increment accumulator
     cwnd_increment: f64,
 }
 
 impl TCPReno {
+    /// Creates new TCP Reno instance with default parameters
     pub fn new() -> TCPReno {
         let mss = 512;
         let initial_window = 2 * mss;
@@ -143,7 +146,7 @@ impl TCPReno {
         self.prev_rtt = Some(rtt);
     }
 
-    /// Marks a sequence number as lost and updates retransmission state
+    /// Records sequence as lost and updates retransmission state
     fn mark_lost(&mut self, seq: usize) {
         self.lost_sequences.insert(seq);
         self.retransmit_required = true;

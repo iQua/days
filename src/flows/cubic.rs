@@ -1,23 +1,86 @@
-//! Implements the TCP CUBIC congestion control algorithm.
+//! Implements the TCP CUBIC congestion control.
+//!
+//! CUBIC is a TCP congestion control algorithm designed for high-speed, high-latency
+//! networks (a.k.a. "long fat networks"). It improves upon traditional TCP algorithms
+//! in several ways:
+//!
+//! - Uses a cubic function for window growth instead of a linear one
+//! - Supports RTT-fairness between flows
+//! - Provides fast convergence and TCP-friendly behavior
+//! - Includes HyStart++ for improved slow start
+//!
+//! # Algorithm Overview
+//!
+//! CUBIC operates in three main phases:
+//!
+//! 1. Slow Start - Exponential window growth using HyStart++ detection
+//! 2. Congestion Avoidance - Cubic growth function based on elapsed time
+//! 3. Fast Recovery - Responds to packet loss with multiplicative decrease
+//!
+//! The cubic window growth function is:
+//! ```text
+//! W(t) = C*(t-K)^3 + W_max
+//! ```
+//! where:
+//! - t is the elapsed time since last congestion event
+//! - K is the time to grow to W_max
+//! - C is the scaling factor
+//! - W_max is the window size before the last reduction
+//!
+//! # Key Parameters
+//!
+//! The main tunable parameters are:
+//!
+//! - `beta`: Window reduction factor (default 0.2)
+//! - `c`: CUBIC scaling factor (default 0.4)
+//! - `fast_convergence`: Enable fast convergence (default true)
+//! - `tcp_friendliness`: Enable TCP compatible mode (default true)
+//!
+//! See individual field documentation for more details.
 
 use crate::flows::cc::CongestionControl;
 
-/// HyStart++ parameters
+/// HyStart++ parameters for improved slow start exit detection.
+///
+/// HyStart++ improves upon the original HyStart algorithm by using more robust RTT
+/// sampling techniques to detect the beginning of congestion during slow start.
+/// It maintains a history of RTT samples and tracks round transitions to make
+/// more reliable exit decisions.
 #[derive(Debug, Default)]
 struct HyStartState {
+    /// Whether HyStart++ detection is enabled. When false, standard slow start is used.
     enabled: bool,
+    /// Minimum window size (in segments) to begin RTT sampling.
     low_cwnd: usize,
+    /// Most recently measured RTT sample in seconds.
     last_rtt: f64,
+    /// Minimum observed RTT in seconds across all samples.
     min_rtt: f64,
+    /// Count of RTT samples collected in current round.
     rtt_sample_cnt: usize,
+    /// Current round number, incremented when ACKs for all packets from previous round are received.
     current_round: usize,
+    /// Previous round number, used to detect round transitions and properly group RTT samples.
     last_round: usize,
+    /// Timestamp when current round started (in seconds).
     round_start: f64,
+    /// Vector of RTT samples collected across rounds.
     rtt_samples: Vec<f64>,
+    /// Flag indicating whether slow start should be exited.
+    /// Set to true when either:
+    /// - Significant RTT increase detected (>12.5% over baseline)
+    /// - Sustained RTT increase trend observed
+    /// - Maximum slow start threshold reached
+    /// Once true, triggers transition to congestion avoidance.
     exit_slow_start: bool,
 }
 
 impl HyStartState {
+    /// Creates a new HyStartState with default parameters:
+    /// - Enabled
+    /// - 16 segment minimum window
+    /// - No RTT history
+    /// - Starting in round 0
     fn new() -> Self {
         HyStartState {
             enabled: true,
@@ -33,31 +96,43 @@ impl HyStartState {
         }
     }
 
-    // Add method to track RTT samples
+    /// Adds a new RTT sample and updates round tracking.
+    ///
+    /// # Arguments
+    ///
+    /// * `rtt` - New RTT measurement in seconds
+    /// * `current_time` - Current timestamp in seconds
+    ///
     fn add_rtt_sample(&mut self, rtt: f64, current_time: f64) {
         self.last_rtt = rtt;
         self.rtt_sample_cnt += 1;
 
-        // Update round tracking
+        // Track round transitions based on time
         if current_time > self.round_start {
             self.last_round = self.current_round;
             self.current_round += 1;
             self.round_start = current_time;
-            // Removed clearing of rtt_samples to allow accumulation across rounds
         }
 
         self.rtt_samples.push(rtt);
     }
 }
 
+/// TCP CUBIC congestion control implementation.
+///
+/// CUBIC modifies the window growth function to use a cubic function instead of
+/// the standard linear increase. This provides better scalability in
+/// high-bandwidth, high-latency networks.
+///
 #[derive(Debug, Default)]
 pub struct TCPCubic {
-    /// the maximum segment size
+    /// Maximum segment size in bytes
     mss: usize,
-    /// the size of the congestion window
+    /// Current congestion window size in bytes
     cwnd: usize,
-    /// the slow start threshold
+    /// Slow start threshold in bytes
     ssthresh: usize,
+    /// Window size before last reduction, used as target during window growth
     w_last_max: usize,
     epoch_start: f64,
     origin_point: usize,
@@ -95,6 +170,7 @@ pub struct TCPCubic {
 }
 
 impl TCPCubic {
+    /// Creates a new TCP CUBIC instance with default parameters.
     pub fn new() -> TCPCubic {
         TCPCubic {
             mss: 512,
@@ -128,7 +204,9 @@ impl TCPCubic {
         }
     }
 
-    /// Resets the states in CUBIC.
+    /// Resets the CUBIC state after timeout or app-limited period.
+    ///
+    /// This resets internal state variables but preserves configuration parameters.
     pub fn cubic_reset(&mut self) {
         self.w_last_max = 0;
         self.epoch_start = 0.0;
@@ -286,6 +364,20 @@ impl TCPCubic {
 }
 
 impl CongestionControl for TCPCubic {
+    /// Processes a new acknowledgment.
+    ///
+    /// Updates the congestion window based on:
+    /// - Current phase (slow start vs congestion avoidance)
+    /// - HyStart++ exit conditions
+    /// - CUBIC window growth function
+    /// - TCP friendliness calculations
+    ///
+    /// # Arguments
+    /// * `ack_seq` - Sequence number being acknowledged
+    /// * `rtt` - Round trip time measurement for this ACK
+    /// * `current_time` - Current timestamp
+    /// * `bytes_acked` - Number of new bytes acknowledged
+    ///
     fn ack_received(&mut self, _ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize) {
         // Track minimum RTT
         if self.d_min > 0.0 {
