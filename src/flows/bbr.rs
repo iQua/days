@@ -39,6 +39,10 @@ pub struct BBRState {
     pub mss: usize,
     /// Maximum congestion window
     pub max_cwnd: usize,
+    /// Current gain based on mode and cycle
+    pub current_gain: f64,
+    /// Indicator for RTT probing completion
+    pub rtt_probe_done: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -59,18 +63,30 @@ impl BBRState {
     pub fn new(mss: usize) -> Self {
         BBRState {
             mss,
-            max_cwnd: 2_000_000 * mss, // 2M segments
-            startup_gain: [1.25, 1.25, 1.25, 1.25],
-            drain_gain: [0.75, 1.0],
-            probe_bw_gain: [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.25, 0.75],
-            probe_rtt_gain: [1.0, 1.0, 1.0, 1.0],
+            max_cwnd: 2_000_000 * mss,                  // 2M segments
+            startup_gain: [2.885, 3.157, 3.429, 3.700], // Typical startup gains
+            drain_gain: [0.875, 0.875],                 // Drain to drain the queue
+            probe_bw_gain: [0.875, 1.0, 1.15, 1.0, 1.0, 1.15, 1.0, 0.875], // ProbeBW cycle
+            probe_rtt_gain: [1.0, 1.0, 1.0, 1.0],       // Maintain current state during ProbeRTT
             // Initialize rtt_min to a large value
             rtt_min: f64::INFINITY, // Or a very large number
+            bandwidth_max: 0.0,
+            bandwidth_latest: 0.0,
+            rtt_latest: 0.0,
+            pacing_rate: 0.0,
+            cwnd: 10 * mss, // Initial cwnd
+            gain_cycle: 0,
+            loss_rate: 0.0,
+            round_count: 0,
+            cycle_start_time: 0.0,
+            current_gain: 1.0,
+            rtt_probe_done: false,
+            inflight: 0,
             ..Default::default()
         }
     }
 
-    fn update_bw_and_rtt(&mut self, bytes_acked: usize, rtt: f64, now: f64) {
+    pub fn update_bw_and_rtt(&mut self, bytes_acked: usize, rtt: f64, now: f64) {
         // Bandwidth calculation, filtered with EWMA
         self.bandwidth_latest = (bytes_acked as f64 / rtt).max(self.bandwidth_latest * 0.875);
         self.bandwidth_max = self.bandwidth_max.max(self.bandwidth_latest);
@@ -82,62 +98,93 @@ impl BBRState {
         // Update BBR cycle
         self.round_count += 1;
 
-        //  Use a separate cycle_start_time check:
+        // Use a separate cycle_start_time check:
         if self.cycle_start_time == 0.0 {
             self.cycle_start_time = now;
         }
 
-        if now - self.cycle_start_time > self.rtt_min {
+        if now - self.cycle_start_time >= self.rtt_min {
             self.cycle_start_time = now;
 
             match self.mode {
                 BBRMode::Startup => {
                     // Check for bandwidth increase, transition to Drain if no increase
-                    if self.round_count >= 4 || self.bandwidth_latest < self.bandwidth_max {
+                    if self.round_count >= self.startup_gain.len()
+                        || self.bandwidth_latest < self.bandwidth_max
+                    {
                         self.mode = BBRMode::Drain;
+                        self.round_count = 0;
+                        self.current_gain = self.drain_gain[0];
+                    } else {
+                        // Continue in Startup with increasing gain
+                        self.current_gain =
+                            self.startup_gain[self.round_count % self.startup_gain.len()];
                     }
                 }
                 BBRMode::Drain => {
-                    // Transition to ProbeBW
-                    self.mode = BBRMode::ProbeBW;
-                    self.round_count = 0;
-                    self.gain_cycle = 0;
+                    // Transition to ProbeBW after draining the queue
+                    // Fixed by casting mss to f64
+                    if self.inflight
+                        < (self.bandwidth_max * self.rtt_min / (self.mss as f64)) as usize
+                    {
+                        self.mode = BBRMode::ProbeBW;
+                        self.round_count = 0;
+                        self.gain_cycle = 0;
+                        self.current_gain = self.probe_bw_gain[self.gain_cycle];
+                    } else {
+                        // Continue draining
+                        self.current_gain =
+                            self.drain_gain[self.round_count % self.drain_gain.len()];
+                    }
                 }
                 BBRMode::ProbeBW => {
                     // Cycle through probe_bw_gain
+                    self.current_gain = self.probe_bw_gain[self.gain_cycle];
                     self.gain_cycle = (self.gain_cycle + 1) % self.probe_bw_gain.len();
+
+                    // After completing a full cycle, potentially enter ProbeRTT
+                    if self.gain_cycle == 0 && self.round_count >= self.probe_bw_gain.len() {
+                        self.mode = BBRMode::ProbeRTT;
+                        self.round_count = 0;
+                        self.rtt_probe_done = false;
+                        // Fixed by casting mss to f64
+                        self.inflight = ((self.bandwidth_max * self.rtt_min / (self.mss as f64)
+                            * 0.5) as usize)
+                            .max(10 * self.mss);
+                    }
                 }
                 BBRMode::ProbeRTT => {
-                    // Transition back to ProbeBW or Drain based on loss rate and bandwidth
-                    self.mode = BBRMode::ProbeBW; // Simplify, no ProbeRTT
+                    if !self.rtt_probe_done {
+                        // Temporarily reduce pacing and cwnd to measure RTT
+                        self.current_gain = self.probe_rtt_gain[0];
+                        self.rtt_probe_done = true;
+                    } else {
+                        // After RTT measurement, transition back to ProbeBW
+                        self.mode = BBRMode::ProbeBW;
+                        self.round_count = 0;
+                        self.gain_cycle = 0;
+                        self.current_gain = self.probe_bw_gain[self.gain_cycle];
+                    }
                 }
             }
         }
     }
 
-    fn calculate_cwnd(&mut self) {
+    pub fn calculate_cwnd(&mut self) {
         // Cwnd calculation based on bandwidth and RTT
         let bdp = self.bandwidth_max * self.rtt_min;
-        let gain = match self.mode {
-            BBRMode::Startup => self.startup_gain[self.round_count % self.startup_gain.len()],
-            BBRMode::Drain => self.drain_gain[self.round_count % self.drain_gain.len()],
-            BBRMode::ProbeBW => self.probe_bw_gain[self.gain_cycle],
-            BBRMode::ProbeRTT => self.probe_rtt_gain[self.round_count % self.probe_rtt_gain.len()],
-        };
+        self.cwnd = (bdp * self.current_gain).min(self.max_cwnd as f64) as usize;
 
-        self.cwnd = (bdp * gain).min(self.max_cwnd as f64) as usize;
+        // Enforce a minimum cwnd to prevent underutilization
+        let min_cwnd = 10 * self.mss;
+        if self.cwnd < min_cwnd {
+            self.cwnd = min_cwnd;
+        }
     }
 
-    fn calculate_pacing_rate(&mut self) {
+    pub fn calculate_pacing_rate(&mut self) {
         // Pacing rate calculation based on bandwidth and gain
-        let gain = match self.mode {
-            BBRMode::Startup => self.startup_gain[self.round_count % self.startup_gain.len()],
-            BBRMode::Drain => self.drain_gain[self.round_count % self.drain_gain.len()],
-            BBRMode::ProbeBW => self.probe_bw_gain[self.gain_cycle],
-            BBRMode::ProbeRTT => self.probe_rtt_gain[self.round_count % self.probe_rtt_gain.len()],
-        };
-
-        self.pacing_rate = self.bandwidth_max * gain;
+        self.pacing_rate = self.bandwidth_max * self.current_gain;
     }
 }
 
@@ -159,17 +206,23 @@ impl TCPBBR {
 impl CongestionControl for TCPBBR {
     fn ack_received(&mut self, _ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) {
         self.state.update_bw_and_rtt(bytes_acked, rtt, now);
+        // Updating inflight: assuming bytes_acked have been acknowledged
+        self.state.inflight = self.state.inflight.saturating_sub(bytes_acked);
         self.state.calculate_cwnd();
         self.state.calculate_pacing_rate();
     }
 
     fn timer_expired(&mut self) {
-        // Handle RTO event, halve bandwidth_max
+        // Handle RTO event, halve bandwidth_max to respond to congestion
         self.state.bandwidth_max /= 2.0;
         self.state.calculate_cwnd();
+        self.state.calculate_pacing_rate();
 
-        // Should enter startup after a timeout.
+        // Enter Startup mode after a timeout
         self.state.mode = BBRMode::Startup;
+        self.state.round_count = 0;
+        self.state.current_gain = self.state.startup_gain[0];
+        self.state.inflight = 0; // Reset inflight due to timeout
     }
 
     // These methods don't have a direct BBR equivalent, implement them as no-ops or simple reactions
@@ -180,9 +233,11 @@ impl CongestionControl for TCPBBR {
     fn get_cwnd(&self) -> usize {
         self.state.cwnd
     }
-}
 
-// Tests (add more as needed)
+    fn get_pacing_rate(&self) -> f64 {
+        self.state.pacing_rate
+    }
+}
 
 #[cfg(test)]
 mod tests {

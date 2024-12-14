@@ -4,7 +4,7 @@ import re
 
 def count_loc_rust(directory):
     """Counts non-empty, non-comment lines of code in Rust files recursively,
-       excluding test code (lines before #[cfg(test)]).
+       excluding test code (lines before #[cfg(test)]) and the tests/ directory.
 
     Args:
         directory (str): The path to the directory to analyze.
@@ -16,6 +16,10 @@ def count_loc_rust(directory):
     total_loc = 0
 
     for root, _, files in os.walk(directory):
+        # Skip the 'tests' directory and its subdirectories
+        if "tests" in root.split(os.sep):
+            continue
+
         for file in files:
             if file.endswith(".rs"):
                 file_path = os.path.join(root, file)
