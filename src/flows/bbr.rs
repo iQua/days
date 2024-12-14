@@ -133,22 +133,30 @@ impl BBRState {
                     }
                 }
                 BBRMode::ProbeBW => {
+                    // First update gain cycle
                     self.gain_cycle = (self.gain_cycle + 1) % self.probe_bw_gain.len();
                     self.current_gain = self.probe_bw_gain[self.gain_cycle];
-                    if self.round_count >= 10 {
+
+                    // Only switch after round_count > 10
+                    if self.round_count > 10 {
                         self.mode = BBRMode::ProbeRTT;
                         self.rtt_probe_done = false;
+                        self.current_gain = self.probe_rtt_gain[0];
                     }
                 }
                 BBRMode::ProbeRTT => {
                     if !self.rtt_probe_done {
+                        // Maintain probe_rtt_gain[0] throughout ProbeRTT
                         self.current_gain = self.probe_rtt_gain[0];
                         self.inflight = self.min_cwnd();
                         self.rtt_probe_done = true;
                     } else {
-                        self.mode = BBRMode::ProbeBW;
-                        self.gain_cycle = 0;
-                        self.current_gain = self.probe_bw_gain[self.gain_cycle];
+                        // Only change mode and gain when exiting ProbeRTT
+                        if self.inflight <= self.min_cwnd() {
+                            self.mode = BBRMode::ProbeBW;
+                            self.gain_cycle = 0;
+                            self.current_gain = self.probe_bw_gain[self.gain_cycle];
+                        }
                     }
                 }
             }
@@ -172,6 +180,10 @@ impl BBRState {
         // Pacing rate calculation
         self.pacing_rate = self.bandwidth_max * self.current_gain;
     }
+
+    pub fn probe_rtt_complete(&self) -> bool {
+        self.mode == BBRMode::ProbeRTT && self.rtt_probe_done
+    }
 }
 
 #[derive(Debug)]
@@ -192,7 +204,7 @@ impl TCPBBR {
 impl CongestionControl for TCPBBR {
     fn ack_received(&mut self, _ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) {
         self.state.update_bw_and_rtt(bytes_acked, rtt, now);
-        // Updating inflight
+        // Update inflight
         self.state.inflight = self.state.inflight.saturating_sub(bytes_acked);
         self.state.calculate_cwnd();
         self.state.calculate_pacing_rate();
@@ -334,7 +346,7 @@ mod tests {
     #[test]
     fn test_cwnd_max_boundary() {
         let mut bbr = TCPBBR::new();
-        bbr.state.bandwidth_max = 2_000_000_000.0; // Increased bandwidth to exceed max_cwnd
+        bbr.state.bandwidth_max = 2_500_000_000.0; // Increased bandwidth to exceed max_cwnd
         bbr.state.rtt_min = 0.1;
         bbr.state.current_gain = 10.0; // High gain
 
@@ -419,5 +431,109 @@ mod tests {
 
         // bandwidth_max should reflect the highest observed
         assert!(bbr.state.bandwidth_max >= bbr.state.bandwidth_latest);
+    }
+
+    // Additional tests to ensure compliance with RFC 8961
+
+    /// Test that ProbeBW cycles correctly and handles mode transition at round_count == 10
+    #[test]
+    fn test_probe_bw_cycles() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.mode = BBRMode::ProbeBW;
+        bbr.state.rtt_min = 0.1;
+        bbr.state.bandwidth_max = 1000.0;
+
+        for cycle in 0..16 {
+            simulate_ack(&mut bbr, cycle, 0.1, (cycle + 1) as f64, 1024);
+
+            if cycle < 9 {
+                // Before round_count reaches 10
+                let expected_cycle = (cycle + 1) % 8;
+                let expected_gain = bbr.state.probe_bw_gain[expected_cycle];
+                assert_eq!(
+                    bbr.state.gain_cycle, expected_cycle,
+                    "Cycle {}: Expected gain_cycle {}, got {}",
+                    cycle, expected_cycle, bbr.state.gain_cycle
+                );
+                assert_eq!(
+                    bbr.state.current_gain, expected_gain,
+                    "Cycle {}: Expected current_gain {}, got {}",
+                    cycle, expected_gain, bbr.state.current_gain
+                );
+            } else if cycle == 9 {
+                // At cycle 9, round_count becomes 10, mode should switch to ProbeRTT
+                let expected_cycle = (cycle + 1) % 8;
+                let expected_gain = bbr.state.probe_bw_gain[expected_cycle];
+                assert_eq!(
+                    bbr.state.gain_cycle, expected_cycle,
+                    "Cycle {}: Expected gain_cycle {}, got {}",
+                    cycle, expected_cycle, bbr.state.gain_cycle
+                );
+                assert_eq!(
+                    bbr.state.current_gain, expected_gain,
+                    "Cycle {}: Expected current_gain {}, got {}",
+                    cycle, expected_gain, bbr.state.current_gain
+                );
+                // Next ACK should trigger mode switch
+            } else if cycle == 10 {
+                // Mode should have switched to ProbeRTT
+                let expected_gain = bbr.state.probe_rtt_gain[0];
+                assert_eq!(
+                    bbr.state.mode,
+                    BBRMode::ProbeRTT,
+                    "Cycle {}: Expected mode ProbeRTT, got {:?}",
+                    cycle,
+                    bbr.state.mode
+                );
+                assert_eq!(
+                    bbr.state.current_gain, expected_gain,
+                    "Cycle {}: Expected current_gain {}, got {}",
+                    cycle, expected_gain, bbr.state.current_gain
+                );
+            } else {
+                // After mode has switched to ProbeRTT
+                if bbr.state.mode == BBRMode::ProbeRTT {
+                    let expected_gain = bbr.state.probe_rtt_gain[0];
+                    assert_eq!(
+                        bbr.state.current_gain, expected_gain,
+                        "Cycle {}: Expected current_gain {}, got {}",
+                        cycle, expected_gain, bbr.state.current_gain
+                    );
+                } else {
+                    // After ProbeRTT completes, it should switch back to ProbeBW
+                    let expected_cycle = 0;
+                    let expected_gain = bbr.state.probe_bw_gain[expected_cycle];
+                    assert_eq!(
+                        bbr.state.gain_cycle, expected_cycle,
+                        "Cycle {}: Expected gain_cycle {}, got {}",
+                        cycle, expected_cycle, bbr.state.gain_cycle
+                    );
+                    assert_eq!(
+                        bbr.state.current_gain, expected_gain,
+                        "Cycle {}: Expected current_gain {}, got {}",
+                        cycle, expected_gain, bbr.state.current_gain
+                    );
+                }
+            }
+        }
+    }
+
+    // Test that ProbeRTT does not repeatedly set inflight
+    #[test]
+    fn test_probe_rtt_single_inflight_set() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.mode = BBRMode::ProbeRTT;
+        bbr.state.rtt_min = 0.1;
+        bbr.state.mss = 512;
+        bbr.state.inflight = 2048;
+
+        // First ACK should set inflight to min_cwnd
+        simulate_ack(&mut bbr, 1, 0.1, 1.0, 512);
+        let min_cwnd = bbr.state.min_cwnd();
+        assert_eq!(bbr.state.inflight, min_cwnd);
+
+        // Subsequent ACKs should not alter inflight further
+        simulate_ack(&mut bbr, 2, 0.1, 2.0, 512);
+        assert_eq!(bbr.state.inflight, min_cwnd);
     }
 }
