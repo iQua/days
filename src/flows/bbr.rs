@@ -121,7 +121,6 @@ impl BBRState {
                     } else {
                         self.mode = BBRMode::Drain;
                         self.current_gain = self.drain_gain[0];
-                        println!("Transitioned to mode: {:?}", self.mode);
                     }
                 }
                 BBRMode::Drain => {
@@ -131,7 +130,6 @@ impl BBRState {
                         self.mode = BBRMode::ProbeBW;
                         self.gain_cycle = 0;
                         self.current_gain = self.probe_bw_gain[self.gain_cycle];
-                        println!("Transitioned to mode: {:?}", self.mode);
                     }
                 }
                 BBRMode::ProbeBW => {
@@ -140,7 +138,6 @@ impl BBRState {
                     if self.round_count >= 10 {
                         self.mode = BBRMode::ProbeRTT;
                         self.rtt_probe_done = false;
-                        println!("Transitioned to mode: {:?}", self.mode);
                     }
                 }
                 BBRMode::ProbeRTT => {
@@ -148,12 +145,10 @@ impl BBRState {
                         self.current_gain = self.probe_rtt_gain[0];
                         self.inflight = self.min_cwnd();
                         self.rtt_probe_done = true;
-                        println!("Performing RTT probe");
                     } else {
                         self.mode = BBRMode::ProbeBW;
                         self.gain_cycle = 0;
                         self.current_gain = self.probe_bw_gain[self.gain_cycle];
-                        println!("Transitioned to mode: {:?}", self.mode);
                     }
                 }
             }
@@ -214,7 +209,6 @@ impl CongestionControl for TCPBBR {
         self.state.prev_bandwidth_max = 0.0;
         self.state.current_gain = self.state.startup_gain[0];
         self.state.inflight = 0;
-        println!("Timer expired: Entered Startup mode");
     }
 
     fn dupack_over(&mut self) {} // BBR doesn't use dupacks explicitly
