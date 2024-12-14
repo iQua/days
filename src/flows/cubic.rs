@@ -1,4 +1,4 @@
-//! Implements the TCP CUBIC congestion control.
+//! Implements the TCP CUBIC congestion control (RFC 9438).
 //!
 //! CUBIC is a TCP congestion control algorithm designed for high-speed, high-latency
 //! networks (a.k.a. "long fat networks"). It improves upon traditional TCP algorithms

@@ -1,4 +1,5 @@
-//! Implements the TCP Reno congestion control mechanism, specified in RFCs 5681, 6582 and 6298.
+//! Implements the TCP Reno congestion control mechanism,
+//! specified in RFCs 5681, 6582 and 6298.
 //!
 use crate::flows::cc::CongestionControl;
 use std::collections::HashSet;
