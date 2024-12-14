@@ -13,6 +13,7 @@ use nexosim::model::Model;
 use nexosim::ports::Output;
 
 use crate::flows::app_source::AppDataSource;
+use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::packet::Packet;
@@ -132,6 +133,7 @@ impl TCPPacketSource {
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
+            CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
 
         TCPPacketSource {
