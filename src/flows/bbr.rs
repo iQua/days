@@ -1,4 +1,4 @@
-//! Implements the TCP BBR congestion control algorithm.
+//! Implements the TCP BBR congestion control algorithm (RFC 8961).
 
 use crate::flows::cc::CongestionControl;
 
@@ -277,5 +277,223 @@ mod tests {
         bbr.ack_received(0, 0.3, 3.0, 1024); // Higher RTT, shouldn't change rtt_min
         assert_eq!(bbr.state.rtt_min, 0.1);
         assert_eq!(bbr.state.rtt_latest, 0.3);
+    }
+
+    // Helper function to simulate the passage of time and receiving ACKs
+    fn simulate_ack(bbr: &mut TCPBBR, ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) {
+        bbr.ack_received(ack_seq, rtt, now, bytes_acked);
+    }
+
+    // Test transition from Startup to Drain
+    #[test]
+    fn test_startup_to_drain_transition() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.rtt_min = 0.1;
+
+        // Simulate enough ACKs without bandwidth increase to trigger transition
+        for i in 0..5 {
+            simulate_ack(&mut bbr, i, 0.1, i as f64, 1024);
+        }
+
+        assert_eq!(bbr.state.mode, BBRMode::Drain);
+    }
+
+    // Test transition from Drain to ProbeBW
+    #[test]
+    fn test_drain_to_probe_bw_transition() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.rtt_min = 0.1;
+        bbr.state.mode = BBRMode::Drain;
+        bbr.state.inflight = 500; // Set inflight below the threshold
+
+        // Simulate ACKs to trigger transition
+        simulate_ack(&mut bbr, 1, 0.1, 1.0, 1024);
+
+        assert_eq!(bbr.state.mode, BBRMode::ProbeBW);
+    }
+
+    // Test transition from ProbeBW to ProbeRTT
+    #[test]
+    fn test_probe_bw_to_probe_rtt_transition() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.rtt_min = 0.1;
+        bbr.state.mode = BBRMode::ProbeBW;
+        bbr.state.gain_cycle = bbr.state.probe_bw_gain.len() - 1;
+        bbr.state.round_count = bbr.state.probe_bw_gain.len();
+
+        // Simulate ACKs to complete a ProbeBW cycle
+        simulate_ack(&mut bbr, 1, 0.1, 1.0, 1024);
+
+        assert_eq!(bbr.state.mode, BBRMode::ProbeRTT);
+    }
+
+    // Test transition from ProbeRTT to ProbeBW
+    #[test]
+    fn test_probe_rtt_to_probe_bw_transition() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.rtt_min = 0.1;
+        bbr.state.mode = BBRMode::ProbeRTT;
+        bbr.state.rtt_probe_done = false;
+
+        // Simulate ACK to perform RTT probing
+        simulate_ack(&mut bbr, 1, 0.1, 1.0, 1024);
+
+        assert_eq!(bbr.state.mode, BBRMode::ProbeBW);
+        assert!(bbr.state.rtt_probe_done);
+    }
+
+    // Test that cwnd does not exceed max_cwnd
+    #[test]
+    fn test_cwnd_max_boundary() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.bandwidth_max = 1_000_000.0;
+        bbr.state.rtt_min = 0.1;
+        bbr.state.current_gain = 10.0; // Intentionally high gain to exceed max_cwnd
+
+        bbr.state.calculate_cwnd();
+
+        assert_eq!(bbr.state.cwnd, bbr.state.max_cwnd);
+    }
+
+    // Test that cwnd does not drop below minimum threshold
+    #[test]
+    fn test_cwnd_min_boundary() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.bandwidth_max = 100.0;
+        bbr.state.rtt_min = 0.1;
+        bbr.state.current_gain = 0.5; // Intentionally low gain
+
+        bbr.state.calculate_cwnd();
+
+        let min_cwnd = 10 * bbr.state.mss;
+        assert_eq!(bbr.state.cwnd, min_cwnd);
+    }
+
+    // Test inflight data reduction
+    #[test]
+    fn test_inflight_reduction() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.inflight = 2048;
+        bbr.ack_received(1, 0.1, 1.0, 1024);
+
+        assert_eq!(bbr.state.inflight, 1024);
+    }
+
+    // Test timer_expired handling (simulating packet loss)
+    #[test]
+    fn test_timer_expired_packet_loss() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.bandwidth_max = 1000.0;
+        bbr.state.mode = BBRMode::ProbeBW;
+        bbr.state.inflight = 5000;
+
+        bbr.timer_expired();
+
+        assert_eq!(bbr.state.bandwidth_max, 500.0); // Halved
+        assert_eq!(bbr.state.mode, BBRMode::Startup);
+        assert_eq!(bbr.state.current_gain, bbr.state.startup_gain[0]);
+        assert_eq!(bbr.state.inflight, 0);
+    }
+
+    // Simulate RTT spikes and observe BBR's response
+    #[test]
+    fn test_rtt_spike() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.rtt_min = 0.1;
+        bbr.state.bandwidth_max = 1000.0;
+        bbr.state.current_gain = 1.0;
+
+        // Simulate a spike in RTT
+        simulate_ack(&mut bbr, 1, 0.5, 1.0, 1024);
+
+        assert!(bbr.state.rtt_min < 0.5); // rtt_min should remain the minimum
+        assert_eq!(bbr.state.rtt_latest, 0.5);
+    }
+
+    // Simulate varying bandwidth and observe adaptive behavior
+    #[test]
+    fn test_varying_bandwidth() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.rtt_min = 0.1;
+
+        // Simulate increasing bandwidth
+        for i in 0..10 {
+            simulate_ack(&mut bbr, i, 0.1, i as f64, 2048);
+        }
+
+        assert!(bbr.state.bandwidth_max > 0.0);
+
+        // Simulate decreasing bandwidth
+        for i in 10..20 {
+            simulate_ack(&mut bbr, i, 0.2, i as f64, 1024);
+        }
+
+        // bandwidth_max should remain the maximum observed
+        assert_eq!(bbr.state.bandwidth_max, 2048.0 / 0.1);
+    }
+
+    // Simulate packet loss and ensure BBR enters appropriate state
+    #[test]
+    fn test_packet_loss_recovery() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.mode = BBRMode::ProbeBW;
+        bbr.state.bandwidth_max = 1000.0;
+        bbr.state.inflight = 1500;
+
+        // Simulate packet loss via timer_expired
+        bbr.timer_expired();
+
+        assert_eq!(bbr.state.mode, BBRMode::Startup);
+        assert_eq!(bbr.state.bandwidth_max, 500.0);
+    }
+
+    // Test handling of multiple consecutive timer expirations
+    #[test]
+    fn test_consecutive_timer_expired() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.bandwidth_max = 1000.0;
+
+        // First timer expiration
+        bbr.timer_expired();
+        assert_eq!(bbr.state.bandwidth_max, 500.0);
+        assert_eq!(bbr.state.mode, BBRMode::Startup);
+
+        // Second timer expiration
+        bbr.timer_expired();
+        assert_eq!(bbr.state.bandwidth_max, 250.0);
+        assert_eq!(bbr.state.mode, BBRMode::Startup);
+    }
+
+    // Test that BBR does not transition to ProbeRTT prematurely
+    #[test]
+    fn test_probe_rtt_not_premature() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.mode = BBRMode::ProbeBW;
+        bbr.state.gain_cycle = 4; // Not completing a full cycle
+        bbr.state.round_count = 4;
+
+        // Simulate ACKs without completing the probe_bw_gain cycle
+        simulate_ack(&mut bbr, 1, 0.1, 1.0, 1024);
+
+        assert_eq!(bbr.state.mode, BBRMode::ProbeBW);
+        assert!(!bbr.state.rtt_probe_done);
+    }
+
+    // Test that ProbeRTT sets inflight correctly
+    #[test]
+    fn test_probe_rtt_inflight_set() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.mode = BBRMode::ProbeRTT;
+        bbr.state.bandwidth_max = 1000.0;
+        bbr.state.rtt_min = 0.1;
+        bbr.state.mss = 512;
+        bbr.state.inflight = 1024;
+
+        simulate_ack(&mut bbr, 1, 0.1, 1.0, 512);
+
+        let expected_inflight = ((1000.0 * 0.1 / 512.0) * 0.5) as usize;
+        let min_inflight = 10 * 512;
+        let final_inflight = expected_inflight.max(min_inflight);
+        assert_eq!(bbr.state.inflight, final_inflight);
     }
 }
