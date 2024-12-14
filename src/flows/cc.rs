@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub enum CCAlgorithm {
     TCPReno,
     TCPCubic,
+    TCPBBR,
 }
 
 /// Defines the interface for all congestion control algorithms.
