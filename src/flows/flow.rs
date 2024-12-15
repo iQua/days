@@ -1,5 +1,6 @@
 use std::fs;
 
+use log::debug;
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use rand::rngs::SmallRng;
@@ -7,7 +8,9 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Deserialize;
 
-use crate::flows::route::{PathFromConfig, Routing, RoutingProtocol, ShortestPath};
+use crate::flows::route::{
+    PathFromConfig, Routing, RoutingConfig, RoutingProtocol, ShortestPath, ECMP,
+};
 use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
@@ -24,6 +27,7 @@ struct TomlFlow {
     starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     graph: Vec<(u32, u32)>,
+    routing: Option<RoutingConfig>,
     path: Option<Vec<usize>>,
     traffic: TomlTrafficCharacteristics,
 }
@@ -35,6 +39,7 @@ struct TomlFlowSet {
     starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     flow_count: u32,
+    routing: Option<RoutingConfig>,
     traffic: TomlTrafficCharacteristics,
 }
 
@@ -53,6 +58,7 @@ pub struct FlowParams {
     pub flow_type: FlowType,
     pub source_host: usize,
     pub sink_host: usize,
+    pub routing: Option<RoutingConfig>,
     pub traffic: TrafficCharacteristics,
     pub seed: usize,
 }
@@ -75,19 +81,39 @@ pub struct Flow {
     pub source_id: usize,
     /// the id of PacketSink
     pub sink_id: usize,
+    /// the routing protocol
+    pub routing: Routing,
     /// traffic characteristics of the flow
     pub traffic: TrafficCharacteristics,
     /// random seed for the packet source
     pub seed: usize,
-    /// routing protocol
-    pub routing: Routing,
 }
 
 impl Flow {
     pub fn new(params: FlowParams) -> Flow {
-        let mut routing = Routing::ShortestPath(ShortestPath::new(
-            UnGraph::<usize, ()>::new_undirected().clone(),
-        ));
+        let mut routing;
+
+        match params.routing {
+            Some(RoutingConfig::ShortestPath) => {
+                routing = Routing::ShortestPath(ShortestPath::new(
+                    UnGraph::<usize, ()>::new_undirected().clone(),
+                ));
+            }
+            Some(RoutingConfig::ECMP) => {
+                routing = Routing::ECMP(ECMP::new(
+                    UnGraph::<usize, ()>::new_undirected().clone(),
+                    params.id,
+                    params.source_host,
+                    params.sink_host,
+                ));
+            }
+            _ => {
+                routing = Routing::ShortestPath(ShortestPath::new(
+                    UnGraph::<usize, ()>::new_undirected().clone(),
+                ));
+            }
+        }
+
         if let Some(path_from_config) = params.path {
             routing = Routing::PathFromConfig(PathFromConfig::new(path_from_config));
         }
@@ -125,6 +151,7 @@ impl Flow {
                     flow_type: FlowType::PacketDistribution,
                     source_host: edge.source().index(),
                     sink_host: edge.target().index(),
+                    routing: Some(RoutingConfig::PathFromConfig),
                     traffic: TrafficCharacteristics::new(
                         1.,
                         Some(10.),
@@ -203,6 +230,7 @@ impl Flow {
                         flow_type: flow.flow_type,
                         source_host: edge.source().index(),
                         sink_host: edge.target().index(),
+                        routing: flow.routing,
                         traffic,
                         seed: flow_id,
                     }));
@@ -243,6 +271,7 @@ impl Flow {
                         flow_type: flow_set.flow_type,
                         source_host: host_pair[0],
                         sink_host: host_pair[1],
+                        routing: flow_set.routing,
                         traffic,
                         seed: flow_id,
                     }));
@@ -255,10 +284,17 @@ impl Flow {
     }
 
     /// Given the network graph, computes the path from the PacketSource to the
-    /// PacketSink in the flow.
+    /// PacketSink in the flow, using one of the available routing protocols.
+    ///
+    /// Available routing protocols are:
+    /// - Shortest path routing
+    /// - Custom routing by using the path from the configuration file
+    /// - Equal-Cost Multi-Path (ECMP) routing
+    ///
     pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
         match &self.routing {
             Routing::ShortestPath(_) => {
+                // Select a random candidate from all shortest paths
                 let mut routing = ShortestPath::new(graph);
                 let mut path = vec![NodeIndex::new(self.source_id)];
 
@@ -268,13 +304,35 @@ impl Flow {
                 ));
 
                 path.push(NodeIndex::new(self.sink_id));
+                debug!("Shortest path computed for flow {}.", self.id);
 
                 path
             }
             Routing::PathFromConfig(routing) => {
                 let mut path = vec![NodeIndex::new(self.source_id)];
+
                 path.append(&mut routing.path.clone());
+
                 path.push(NodeIndex::new(self.sink_id));
+                debug!(
+                    "Path from configuration file deployed for flow {}.",
+                    self.id
+                );
+
+                path
+            }
+            Routing::ECMP(_) => {
+                // Selects a path using Equal-Cost Multi-Path (ECMP) routing
+                let mut routing = ECMP::new(graph, self.id, self.source_id, self.sink_id);
+                let mut path = vec![NodeIndex::new(self.source_id)];
+
+                path.append(&mut routing.compute_route(
+                    NodeIndex::new(self.source_host),
+                    NodeIndex::new(self.sink_host),
+                ));
+
+                path.push(NodeIndex::new(self.sink_id));
+                debug!("ECMP path computed for flow {}.", self.id);
 
                 path
             }
