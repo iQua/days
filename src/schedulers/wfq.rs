@@ -471,6 +471,8 @@ impl Model for WFQServer {
 
 #[cfg(test)]
 mod tests {
+    use rand::Rng;
+
     use super::*;
     use crate::flows::packet::Packet;
     use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -829,46 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn test_weight_ratios() {
-        let mut wfq = WFQServer::new(
-            1000.0,
-            100,
-            CapacityUnit::Packets,
-            Arc::new(|flow_id| flow_id),
-            DropStrategy::TailDrop,
-            vec![1, 2], // 1:2 weight ratio
-        );
-
-        // Send many equal-sized packets to both flows
-        for i in 0..50 {
-            let packet1 = Packet::new(10, i * 2, 0, 0.0);
-            let packet2 = Packet::new(10, i * 2 + 1, 1, 0.0);
-            wfq.on_packet_received(packet1, 0.0);
-            wfq.on_packet_received(packet2, 0.0);
-        }
-
-        wfq.test_run(0.0);
-
-        // Calculate bytes sent for each flow
-        let flow0_bytes: usize = wfq
-            .sent_packets
-            .iter()
-            .filter(|p| p.packet.flow_id == 0)
-            .map(|p| p.packet.size)
-            .sum();
-        let flow1_bytes: usize = wfq
-            .sent_packets
-            .iter()
-            .filter(|p| p.packet.flow_id == 1)
-            .map(|p| p.packet.size)
-            .sum();
-
-        // With 1:2 weight ratio, flow1 should get ~2x the service
-        let ratio = flow1_bytes as f64 / flow0_bytes as f64;
-        assert!((ratio - 2.0).abs() < 0.2); // Allow 10% error margin
-    }
-
-    #[test]
     fn test_multiple_weight_ratios() {
         let mut wfq = WFQServer::new(
             1000.0,
@@ -880,13 +842,16 @@ mod tests {
         );
 
         // Send packets to all three flows
+        let mut rng = rand::thread_rng();
         for i in 0..3000 {
             let packet1 = Packet::new(10, i * 3, 0, 0.0);
+            wfq.on_packet_received(packet1, rng.gen_range(0.0..0.1));
+
             let packet2 = Packet::new(10, i * 3 + 1, 1, 0.0);
+            wfq.on_packet_received(packet2, rng.gen_range(0.0..0.1));
+
             let packet3 = Packet::new(10, i * 3 + 2, 2, 0.0);
-            wfq.on_packet_received(packet1, 0.0);
-            wfq.on_packet_received(packet2, 0.0);
-            wfq.on_packet_received(packet3, 0.0);
+            wfq.on_packet_received(packet3, rng.gen_range(0.0..0.1));
         }
 
         wfq.test_run(0.0);
