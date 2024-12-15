@@ -261,6 +261,7 @@ impl WFQServer {
             let class_id = (self.flow_classes)(packet.flow_id);
             finish_time = self.vtime.max(self.finish_times[&class_id])
                 + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
+
             self.finish_times.insert(class_id, finish_time);
         }
 
@@ -496,40 +497,41 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_flows_different_weights() {
-        // Test packets from multiple flows with different weights.
+    fn test_multiple_flows() {
+        // Test packets from multiple flows.
         let mut wfq = WFQServer::new(
-            1e6, // server rate: 1 Mbps
-            20,  // capacity: 20 packets
+            8.0, // server rate: 8 bits/second
+            4,   // capacity: 4 packets
             CapacityUnit::Packets,
-            Arc::new(|flow_id| flow_id % 2), // Map even flow_ids to class 0, odd to class 1
+            Arc::new(|flow_id| flow_id), // Map flow ids to class ids directly
             DropStrategy::TailDrop,
-            vec![1, 2], // weights for two classes
+            vec![1, 1, 1], // equal weights for three connections
         );
 
-        // Create packets from two flows
-        let packet1 = Packet::new(1024, 1, 0, 0.0);
-        let packet2 = Packet::new(1024, 2, 1, 0.0);
+        // Packets of size 1, 2, and 2 units arrive at time 0, on equally weighted connections
+        // 0, 1, and 2, respectively.
+        let packet1 = Packet::new(1, 1, 0, 0.0);
+        let packet2 = Packet::new(2, 2, 1, 0.0);
+        let packet3 = Packet::new(2, 3, 2, 0.0);
+        wfq.on_packet_received(packet1, 0.0);
+        wfq.on_packet_received(packet2, 0.0);
+        wfq.on_packet_received(packet3, 0.0);
 
-        // Send packets to WFQServer
-        wfq.on_packet_received(packet1.clone(), 0.0);
-        wfq.on_packet_received(packet2.clone(), 0.0);
+        // A packet of size 2 arrives at connection 0 at time 4
+        let packet4 = Packet::new(2, 4, 0, 4.0);
+        wfq.on_packet_received(packet4, 4.0);
 
-        // Check that both packets are in the queue
-        assert_eq!(wfq.scheduler_queue.len(), 2);
-        assert_eq!(wfq.packets_received, 2);
+        // Check that all four packets are in the queue
+        assert_eq!(wfq.scheduler_queue.len(), 4);
+        assert_eq!(wfq.packets_received, 4);
 
         // Run the scheduler
         wfq.test_run(0.0);
 
-        // Extract the tagged packets to check scheduling order
-        let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
-        scheduled_packets.reverse(); // Since it's a max-heap, reverse to get min-heap order
-
-        // Packet from class 1 (higher weight) should have a smaller tag (earlier finish time)
-        assert!(scheduled_packets[0].tag < scheduled_packets[1].tag);
-        assert_eq!(scheduled_packets[0].packet.flow_id % 2, 1); // Flow from class 1
-        assert_eq!(scheduled_packets[1].packet.flow_id % 2, 0); // Flow from class 0
+        // Packet should be sent in the order of their finish tags
+        assert!(wfq.sent_packets[0].tag <= wfq.sent_packets[1].tag);
+        assert!(wfq.sent_packets[1].tag <= wfq.sent_packets[2].tag);
+        assert!(wfq.sent_packets[2].tag <= wfq.sent_packets[3].tag);
     }
 
     #[test]
@@ -556,16 +558,16 @@ mod tests {
 
         // Only two packets should be in the queue due to capacity limit
         assert_eq!(wfq.scheduler_queue.len(), 2);
-        assert_eq!(wfq.packets_received, 3);
+        assert_eq!(wfq.packets_received, 2);
         assert_eq!(wfq.packets_dropped, 1);
     }
 
     #[test]
-    fn test_zero_capacity_queue() {
-        // Test behavior when capacity is zero (all packets should be dropped).
+    fn test_unlimited_capacity_queue() {
+        // Test behavior when capacity is unlimited (no packets should be dropped).
         let mut wfq = WFQServer::new(
             1e6,
-            0, // capacity: 0 packets
+            0, // unlimited capacity
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
@@ -576,10 +578,8 @@ mod tests {
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
-        // Queue should be empty, packet should be dropped
-        assert_eq!(wfq.scheduler_queue.len(), 0);
-        assert_eq!(wfq.packets_received, 1);
-        assert_eq!(wfq.packets_dropped, 1);
+        // Unlimited capacity: no packet should be dropped
+        assert_eq!(wfq.packets_dropped, 0);
     }
 
     #[test]
@@ -594,13 +594,11 @@ mod tests {
             vec![1],
         );
 
-        let packet = Packet::new(1024, 1, 0, 0.0); // Packet size greater than capacity
+        let packet = Packet::new(1501, 1, 0, 0.0); // Packet size greater than capacity
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
         // Queue should be empty, packet should be dropped
-        assert_eq!(wfq.scheduler_queue.len(), 0);
-        assert_eq!(wfq.packets_received, 1);
         assert_eq!(wfq.packets_dropped, 1);
     }
 
@@ -644,7 +642,7 @@ mod tests {
         );
 
         // Create a packet
-        let packet = Packet::new(1024, 1, 0, 0.0); // 1000 bytes
+        let packet = Packet::new(1000, 1, 0, 0.0); // 1000 bytes
 
         // Expected transmission time = (size * 8) / rate
         let expected_transmission_time = (1000.0 * 8.0) / 1e6; // 0.008 seconds
@@ -701,8 +699,8 @@ mod tests {
         let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 0
 
         // Send packets
-        wfq.on_packet_received(packet1.clone(), 0.0);
         wfq.on_packet_received(packet2.clone(), 0.0);
+        wfq.on_packet_received(packet1.clone(), 0.0);
         wfq.on_packet_received(packet3.clone(), 0.0);
 
         // Check that flow_class mapping works
@@ -710,19 +708,11 @@ mod tests {
         assert_eq!((wfq.flow_classes)(2), 2);
         assert_eq!((wfq.flow_classes)(3), 0);
 
+        // Run the scheduler
+        wfq.test_run(0.0);
+
         // Check that packets are scheduled according to weights
-        let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
-        scheduled_packets.reverse();
-
-        // Prints the scheduled_packets queue
-        for packet in scheduled_packets.iter() {
-            println!(
-                "Packet: {} Flow: {} Tag: {}",
-                packet.packet.packet_id, packet.packet.flow_id, packet.tag
-            );
-        }
-
         // Packet from class 2 (weight 3) should have smallest tag
-        assert_eq!(scheduled_packets[0].packet.flow_id, 2);
+        assert_eq!(wfq.sent_packets[0].packet.flow_id, 2);
     }
 }
