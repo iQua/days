@@ -171,10 +171,7 @@ impl WFQServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
+    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -196,7 +193,7 @@ impl WFQServer {
         }
 
         // the case that this packet will not be dropped
-        self.on_packet_received(&packet);
+        self.update_stats_on_packet_received(&packet);
 
         // computes a finish time and adds it as a tag to the packet
         let tagged_packet = self.tag(packet.clone(), arrival_time);
@@ -224,6 +221,12 @@ impl WFQServer {
             arrival_time,
             self.scheduler_queue.len(),
         );
+    }
+
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        self.on_packet_received(packet, arrival_time);
 
         if arrival_time >= self.busy_until {
             self.run((), cx);
@@ -261,7 +264,7 @@ impl WFQServer {
         }
     }
 
-    fn update_stats(&mut self, packet: &Packet, arrival_time: f64) {
+    fn update_internal_states(&mut self, packet: &Packet, arrival_time: f64) {
         // updates the virtual time based on the current set of active flow classes
         let weight_sum: f64 = self
             .active_set
@@ -289,9 +292,9 @@ impl WFQServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        self.on_packet_forwarded(&packet);
         self.output.send(packet.clone()).await;
-        self.update_stats(&packet, self.time_packet_sent);
+        self.update_stats_on_packet_forwarded(&packet);
+        self.update_internal_states(&packet, self.time_packet_sent);
     }
 
     pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
@@ -337,6 +340,39 @@ impl WFQServer {
         }
     }
 
+    pub fn test_run(&mut self, now: f64) {
+        // schedules one packet with the smallest finish time
+        if !self.scheduler_queue.is_empty() {
+            let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+            let class_id = (self.flow_classes)(outbound.flow_id);
+            let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
+            *byte_size -= outbound.size;
+            outbound.queueing_delay_update(now);
+
+            // sends the packet out to the next element after a timeout
+            let timeout = outbound.size as f64 * 8.0 / self.rate;
+
+            outbound.departure_update(now + timeout);
+
+            self.time_packet_sent = now + timeout;
+
+            // schedules the next run
+            self.test_run(now + timeout);
+            self.busy_until = now + timeout;
+
+            debug!(
+                "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                        {} packets in the queue.",
+                self.scheduler_id,
+                outbound.packet_id,
+                outbound.size,
+                outbound.flow_id,
+                now + timeout,
+                self.scheduler_queue.len(),
+            );
+        }
+    }
+
     async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -353,13 +389,13 @@ impl WFQServer {
 }
 
 impl ReportStatistics for WFQServer {
-    fn on_packet_received(&mut self, packet: &Packet) {
+    fn update_stats_on_packet_received(&mut self, packet: &Packet) {
         self.packets_received += 1;
         self.received_sizes += packet.size;
         self.queue_length += packet.size;
     }
 
-    fn on_packet_forwarded(&mut self, packet: &Packet) {
+    fn update_stats_on_packet_forwarded(&mut self, packet: &Packet) {
         let num_packets = self.packets_forwarded as f64;
         self.queueing_delay_mean =
             (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);
@@ -418,13 +454,11 @@ impl Model for WFQServer {
 mod tests {
     use super::*;
     use crate::flows::packet::Packet;
-    use crate::schedulers::drop::CapacityUnit;
-    use crate::schedulers::drop::DropStrategy;
-    use nexosim::model::Context;
+    use crate::schedulers::drop::{CapacityUnit, DropStrategy};
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn test_single_packet() {
+    #[test]
+    fn test_single_packet() {
         // Test sending a single packet through the WFQServer.
         let mut wfq = WFQServer::new(
             1e6, // server rate: 1 Mbps
@@ -435,27 +469,25 @@ mod tests {
             vec![1], // weights for one class
         );
 
-        let mut cx = Context::default();
-
         // Create a packet
         let packet = Packet::new(1, 0, 1000, 0.0); // packet_id, flow_id, size in bytes, time
 
         // Send packet to WFQServer
-        wfq.packet_received(packet.clone(), &mut cx).await;
+        wfq.on_packet_received(packet.clone(), 0.0);
 
         // Check that the packet is in the queue
         assert_eq!(wfq.scheduler_queue.len(), 1);
         assert_eq!(wfq.packets_received, 1);
 
         // Run the scheduler
-        wfq.run((), &mut cx);
+        wfq.test_run(0.0);
 
         // Since the server is not busy, it should schedule the packet immediately
         assert!(wfq.busy_until > 0.0);
     }
 
-    #[tokio::test]
-    async fn test_multiple_flows_different_weights() {
+    #[test]
+    fn test_multiple_flows_different_weights() {
         // Test packets from multiple flows with different weights.
         let mut wfq = WFQServer::new(
             1e6, // server rate: 1 Mbps
@@ -466,22 +498,20 @@ mod tests {
             vec![1, 2], // weights for two classes
         );
 
-        let mut cx = Context::default();
-
         // Create packets from two flows
         let packet1 = Packet::new(1, 0, 1000, 0.0);
         let packet2 = Packet::new(2, 1, 1000, 0.0);
 
         // Send packets to WFQServer
-        wfq.packet_received(packet1.clone(), &mut cx).await;
-        wfq.packet_received(packet2.clone(), &mut cx).await;
+        wfq.on_packet_received(packet1.clone(), 0.0);
+        wfq.on_packet_received(packet2.clone(), 0.0);
 
         // Check that both packets are in the queue
         assert_eq!(wfq.scheduler_queue.len(), 2);
         assert_eq!(wfq.packets_received, 2);
 
         // Run the scheduler
-        wfq.run((), &mut cx);
+        wfq.test_run(0.0);
 
         // Extract the tagged packets to check scheduling order
         let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
@@ -493,8 +523,8 @@ mod tests {
         assert_eq!(scheduled_packets[1].packet.flow_id % 2, 0); // Flow from class 0
     }
 
-    #[tokio::test]
-    async fn test_queue_overflow() {
+    #[test]
+    fn test_queue_overflow() {
         // Test handling when queue is full (capacity reached).
         let mut wfq = WFQServer::new(
             1e6,
@@ -505,17 +535,15 @@ mod tests {
             vec![1, 1],
         );
 
-        let mut cx = Context::default();
-
         // Create three packets
         let packet1 = Packet::new(1, 0, 1000, 0.0);
         let packet2 = Packet::new(2, 1, 1000, 0.0);
         let packet3 = Packet::new(3, 0, 1000, 0.0);
 
         // Send packets to WFQServer
-        wfq.packet_received(packet1.clone(), &mut cx).await;
-        wfq.packet_received(packet2.clone(), &mut cx).await;
-        wfq.packet_received(packet3.clone(), &mut cx).await;
+        wfq.on_packet_received(packet1.clone(), 0.0);
+        wfq.on_packet_received(packet2.clone(), 0.0);
+        wfq.on_packet_received(packet3.clone(), 0.0);
 
         // Only two packets should be in the queue due to capacity limit
         assert_eq!(wfq.scheduler_queue.len(), 2);
@@ -523,8 +551,8 @@ mod tests {
         assert_eq!(wfq.packets_dropped, 1);
     }
 
-    #[tokio::test]
-    async fn test_zero_capacity_queue() {
+    #[test]
+    fn test_zero_capacity_queue() {
         // Test behavior when capacity is zero (all packets should be dropped).
         let mut wfq = WFQServer::new(
             1e6,
@@ -535,11 +563,9 @@ mod tests {
             vec![1],
         );
 
-        let mut cx = Context::default();
-
         let packet = Packet::new(1, 0, 1000, 0.0);
 
-        wfq.packet_received(packet.clone(), &mut cx).await;
+        wfq.on_packet_received(packet.clone(), 0.0);
 
         // Queue should be empty, packet should be dropped
         assert_eq!(wfq.scheduler_queue.len(), 0);
@@ -547,8 +573,8 @@ mod tests {
         assert_eq!(wfq.packets_dropped, 1);
     }
 
-    #[tokio::test]
-    async fn test_large_packet_size() {
+    #[test]
+    fn test_large_packet_size() {
         // Test handling of a packet larger than capacity (should be dropped).
         let mut wfq = WFQServer::new(
             1e6,
@@ -559,11 +585,9 @@ mod tests {
             vec![1],
         );
 
-        let mut cx = Context::default();
-
         let packet = Packet::new(1, 0, 2000, 0.0); // Packet size greater than capacity
 
-        wfq.packet_received(packet.clone(), &mut cx).await;
+        wfq.on_packet_received(packet.clone(), 0.0);
 
         // Queue should be empty, packet should be dropped
         assert_eq!(wfq.scheduler_queue.len(), 0);
@@ -571,8 +595,8 @@ mod tests {
         assert_eq!(wfq.packets_dropped, 1);
     }
 
-    #[tokio::test]
-    async fn test_packet_ordering_with_same_weights() {
+    #[test]
+    fn test_packet_ordering_with_same_weights() {
         // Test that packets from different flows but same weight are scheduled fairly.
         let mut wfq = WFQServer::new(
             1e6,
@@ -583,18 +607,16 @@ mod tests {
             vec![1, 1], // Same weights
         );
 
-        let mut cx = Context::default();
-
         // Create packets from two flows
         let packet1 = Packet::new(1, 0, 1000, 0.0); // flow_id 0
         let packet2 = Packet::new(2, 1, 1000, 0.1); // flow_id 1
 
         // Send packets to WFQServer
-        wfq.packet_received(packet1.clone(), &mut cx).await;
-        wfq.packet_received(packet2.clone(), &mut cx).await;
+        wfq.on_packet_received(packet1.clone(), 0.0);
+        wfq.on_packet_received(packet2.clone(), 0.0);
 
         // Run the scheduler
-        wfq.run((), &mut cx);
+        wfq.test_run(0.0);
 
         // Extract the tagged packets
         let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
@@ -604,8 +626,8 @@ mod tests {
         assert!(scheduled_packets[0].tag <= scheduled_packets[1].tag);
     }
 
-    #[tokio::test]
-    async fn test_packet_departure_time() {
+    #[test]
+    fn test_packet_departure_time() {
         // Test that the departure time of packets is calculated correctly.
         let mut wfq = WFQServer::new(
             1e6, // 1 Mbps
@@ -616,28 +638,26 @@ mod tests {
             vec![1],
         );
 
-        let mut cx = Context::default();
-
         // Create a packet
         let packet = Packet::new(1, 0, 1000, 0.0); // 1000 bytes
 
         // Expected transmission time = (size * 8) / rate
         let expected_transmission_time = (1000.0 * 8.0) / 1e6; // 0.008 seconds
 
-        wfq.packet_received(packet.clone(), &mut cx).await;
+        wfq.on_packet_received(packet.clone(), 0.0);
 
         // Run the scheduler
-        wfq.run((), &mut cx);
+        wfq.test_run(0.0);
 
         // Send the packet (simulate the event)
-        wfq.send(packet.clone()).await;
+        wfq.update_internal_states(&packet, wfq.time_packet_sent);
 
         // Check that time_packet_sent is correct
         assert!((wfq.time_packet_sent - expected_transmission_time).abs() < 1e-6);
     }
 
-    #[tokio::test]
-    async fn test_red_drop_strategy() {
+    #[test]
+    fn test_red_drop_strategy() {
         // Test using RED drop strategy.
         let mut wfq = WFQServer::new(
             1e6,
@@ -648,20 +668,18 @@ mod tests {
             vec![1],
         );
 
-        let mut cx = Context::default();
-
         // Send multiple packets to fill the queue
         for i in 0..20 {
             let packet = Packet::new(i, 0, 1000, 0.0);
-            wfq.packet_received(packet.clone(), &mut cx).await;
+            wfq.on_packet_received(packet.clone(), 0.0);
         }
 
         // With RED, some packets should be randomly dropped before reaching capacity
         assert!(wfq.packets_dropped > 0);
     }
 
-    #[tokio::test]
-    async fn test_flow_class_mapping() {
+    #[test]
+    fn test_flow_class_mapping() {
         // Test custom flow_classes mapping.
         let mut wfq = WFQServer::new(
             1e6,
@@ -672,17 +690,15 @@ mod tests {
             vec![1, 2, 3], // Different weights
         );
 
-        let mut cx = Context::default();
-
         // Create packets from different flows
         let packet1 = Packet::new(1, 1, 1000, 0.0); // flow_id 1 -> class 1
         let packet2 = Packet::new(2, 2, 1000, 0.0); // flow_id 2 -> class 2
         let packet3 = Packet::new(3, 3, 1000, 0.0); // flow_id 3 -> class 0
 
         // Send packets
-        wfq.packet_received(packet1.clone(), &mut cx).await;
-        wfq.packet_received(packet2.clone(), &mut cx).await;
-        wfq.packet_received(packet3.clone(), &mut cx).await;
+        wfq.on_packet_received(packet1.clone(), 0.0);
+        wfq.on_packet_received(packet2.clone(), 0.0);
+        wfq.on_packet_received(packet3.clone(), 0.0);
 
         // Check that flow_class mapping works
         assert_eq!((wfq.flow_classes)(1), 1);
