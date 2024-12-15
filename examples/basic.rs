@@ -19,7 +19,9 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    CsvLogger::get_instance().init("logs/basic");
+    if let Err(e) = CsvLogger::get_instance().init("logs/basic") {
+        panic!("Failed to initialize CsvLogger: {}", e);
+    }
 
     // instantiates models and their mailboxes
     let mut source = PacketSource::new(
