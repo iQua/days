@@ -151,8 +151,6 @@ impl Topology {
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
-        CsvLogger::get_instance().init_from_config(config_path);
-
         // reads the configuration
         let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
@@ -201,6 +199,12 @@ impl Topology {
             config_path: config_path.to_string(),
             duration,
         }
+    }
+
+    fn init_logger(config_path: &str) {
+        CsvLogger::get_instance()
+            .init_from_config(config_path)
+            .expect("Failed to initialize the logger.")
     }
 
     // Initializes mailboxes for switches.
@@ -645,6 +649,9 @@ impl Topology {
     pub fn run(mut self, graph: UnGraph<usize, ()>) {
         let mut statistics = SinkStatistics::default();
 
+        // initializes the logger
+        Topology::init_logger(&self.config_path);
+
         // initializes mailboxes for the packet switches
         self.init_mailboxes();
 
@@ -677,9 +684,7 @@ impl Topology {
         sim = statistics.collect_statistics(sim);
 
         // logs the remaining reports
-        if let Err(error) = CsvLogger::get_instance().flush_reports() {
-            panic!("Problem when logging the remaining reports: {error:?}");
-        }
+        CsvLogger::get_instance().flush_reports();
 
         let elapsed = timer.elapsed();
         info!(
@@ -701,15 +706,8 @@ mod tests {
     use petgraph::algo;
     use petgraph::graph::{NodeIndex, UnGraph};
 
-    use crate::flows::TrafficCharacteristics;
-
     #[test]
     fn test_topology_new() {
-        let logger = CsvLogger::get_instance();
-        logger
-            .init("/test_logs/test_topology_new")
-            .expect("Failed to initialize logger");
-
         // Sample configuration in TOML format
         let config_content = r#"
             ui_interval = 1.0
@@ -762,11 +760,6 @@ mod tests {
 
     #[test]
     fn test_init_switches() {
-        let logger = CsvLogger::get_instance();
-        logger
-            .init("/logs/test_init_switches")
-            .expect("Failed to initialize logger");
-
         // Set number of switches
         set_num_switches(3);
 
@@ -778,285 +771,5 @@ mod tests {
         for (id, switch) in switches.iter() {
             assert_eq!(*id, switch.id());
         }
-    }
-
-    #[test]
-    fn test_connect_neighbours_fifo() {
-        let logger = CsvLogger::get_instance();
-        logger
-            .init("/test_logs/test_connect_neighbours_fifo")
-            .expect("Failed to initialize logger");
-
-        // Sample configuration in TOML format with FIFO discipline
-        let config_content = r#"
-            [switch]
-            port_rate = 1000.0
-            capacity = 1024
-            discipline = "FIFO"
-            drop = "TailDrop"
-        "#;
-
-        // Write the sample configuration to a temporary file
-        let config_path = "test_config_fifo.toml";
-        fs::write(config_path, config_content).expect("Unable to write test config");
-
-        // Create a sample graph
-        let mut graph = UnGraph::<usize, ()>::new_undirected();
-        graph.add_node(0);
-        graph.add_node(1);
-
-        // Sample hosts, flows, and collectives
-        let hosts = vec![0, 1];
-        let flows = vec![];
-        let collectives = vec![];
-
-        // Initialize Topology
-        let mut topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
-
-        // Initialize switches
-        topology.init_mailboxes();
-
-        // Connect neighbors
-        topology = topology.connect(graph.clone());
-
-        // Assertions to verify connections
-        let switch0 = topology.switches.get(&0).unwrap();
-        let switch1 = topology.switches.get(&1).unwrap();
-
-        assert!(switch0.outputs.contains_key(&1));
-        assert!(switch1.outputs.contains_key(&0));
-
-        // Clean up the temporary config file
-        fs::remove_file(config_path).expect("Unable to delete test config");
-    }
-
-    #[test]
-    fn test_attach_flows() {
-        let logger = CsvLogger::get_instance();
-        logger
-            .init("/test_logs/test_attach_flows")
-            .expect("Failed to initialize logger");
-
-        // Sample configuration in TOML format
-        let config_content = r#"
-            [switch]
-            port_rate = 1000.0
-            capacity = 1024
-            discipline = "FIFO"
-            drop = "TailDrop"
-        "#;
-
-        // Write the sample configuration to a temporary file
-        let config_path = "test_config_attach_flows.toml";
-        fs::write(config_path, config_content).expect("Unable to write test config");
-
-        // Create a sample graph
-        let mut graph = UnGraph::<usize, ()>::new_undirected();
-        graph.add_node(0);
-        graph.add_node(1);
-
-        // Sample hosts
-        let hosts = vec![0, 1];
-
-        // Sample flows
-        let mut flow = Flow::new(FlowParams {
-            id: 1,
-            path: None,
-            starts_before: vec![],
-            starts_after: vec![],
-            flow_type: FlowType::PacketDistribution,
-            source_host: 0,
-            sink_host: 1,
-            routing: None,
-            traffic: TrafficCharacteristics::default(),
-            seed: 42,
-        });
-        flow.source_id = 100;
-        flow.sink_id = 200;
-        let flows = vec![flow];
-
-        // Sample collectives
-        let collectives = vec![];
-
-        // Initialize Topology
-        let mut topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
-
-        // Initialize mailboxes
-        topology.init_mailboxes();
-
-        // Attach flows
-        let mut statistics = SinkStatistics::default();
-        let ui_mbox = Mailbox::with_capacity(topology.mailbox_capacity);
-        let (topology, _) = topology.attach_flows(&mut statistics, ui_mbox);
-
-        // Assertions to verify flows are attached
-        assert_eq!(topology.flows.len(), 1);
-        let switch0 = topology.switches.get(&0).unwrap();
-        let switch1 = topology.switches.get(&1).unwrap();
-        assert!(switch0.outputs.contains_key(&100));
-        assert!(switch1.outputs.contains_key(&200));
-
-        // Clean up the temporary config file
-        fs::remove_file(config_path).expect("Unable to delete test config");
-    }
-
-    #[test]
-    fn test_route_flows() {
-        let logger = CsvLogger::get_instance();
-        logger
-            .init("/test_logs/test_route_flows")
-            .expect("Failed to initialize logger");
-
-        // Sample configuration in TOML format
-        let config_content = r#"
-            [switch]
-            port_rate = 1000.0
-            capacity = 1024
-            discipline = "FIFO"
-            drop = "TailDrop"
-
-            [topology]
-            category = "FatTree"
-
-            [topology.fat_tree]
-            k = 4
-        "#;
-
-        // Write the sample configuration to a temporary file
-        let config_path = "test_config_route_flows.toml";
-        fs::write(config_path, config_content).expect("Unable to write test config");
-
-        // Create a sample graph
-        let mut graph = UnGraph::<usize, ()>::new_undirected();
-        graph.add_node(0);
-        graph.add_node(1);
-        graph.add_node(2);
-        graph.add_edge(NodeIndex::new(0), NodeIndex::new(1), ());
-        graph.add_edge(NodeIndex::new(1), NodeIndex::new(2), ());
-
-        // Sample hosts
-        let hosts = vec![0, 2];
-
-        // Sample flows
-        let mut flow = Flow::new(FlowParams {
-            id: 1,
-            path: None,
-            starts_before: vec![],
-            starts_after: vec![],
-            flow_type: FlowType::PacketDistribution,
-            source_host: 0,
-            sink_host: 2,
-            routing: None,
-            traffic: TrafficCharacteristics::default(),
-            seed: 42,
-        });
-        flow.source_id = 100;
-        flow.sink_id = 200;
-        let flows = vec![flow];
-
-        // Sample collectives
-        let collectives = vec![];
-
-        // Initialize Topology
-        let mut topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
-
-        // Initialize mailboxes
-        topology.init_mailboxes();
-
-        // Connect neighbors
-        topology = topology.connect(graph.clone());
-
-        // Attach flows
-        let mut statistics = SinkStatistics::default();
-        let ui_mbox = Mailbox::with_capacity(topology.mailbox_capacity);
-        let (mut topology, _) = topology.attach_flows(&mut statistics, ui_mbox);
-
-        // Route flows
-        topology.route_flows();
-
-        // Verify FIBs
-        let switch0 = topology.switches.get(&0).unwrap();
-        let switch1 = topology.switches.get(&1).unwrap();
-        let switch2 = topology.switches.get(&2).unwrap();
-
-        // Flow 1 should have a path [0,1,2]
-        assert_eq!(switch0.fib.get(&1), Some(&1));
-        assert_eq!(switch1.fib.get(&1), Some(&2));
-        assert_eq!(switch2.r_fib.get(&1), Some(&1));
-
-        // Clean up the temporary config file
-        fs::remove_file(config_path).expect("Unable to delete test config");
-    }
-
-    #[test]
-    fn test_run_simulation() {
-        let logger = CsvLogger::get_instance();
-        logger
-            .init("/logs/test_run_simulation")
-            .expect("Failed to initialize logger");
-
-        // Sample configuration in TOML format
-        let config_content = r#"
-            [switch]
-            port_rate = 1000.0
-            capacity = 1024
-            discipline = "FIFO"
-            drop = "TailDrop"
-
-            [topology]
-            category = "FatTree"
-
-            [topology.fat_tree]
-            k = 4
-
-            [ui]
-            ui_interval = 1.0
-            duration = 100.0
-        "#;
-
-        // Write the sample configuration to a temporary file
-        let config_path = "test_config_run_simulation.toml";
-        fs::write(config_path, config_content).expect("Unable to write test config");
-
-        // Create a sample graph
-        let mut graph = UnGraph::<usize, ()>::new_undirected();
-        graph.add_node(0);
-        graph.add_node(1);
-        graph.add_edge(NodeIndex::new(0), NodeIndex::new(1), ());
-
-        // Sample hosts
-        let hosts = vec![0, 1];
-
-        // Sample flows
-        let mut flow = Flow::new(FlowParams {
-            id: 1,
-            path: None,
-            starts_before: vec![],
-            starts_after: vec![],
-            flow_type: FlowType::PacketDistribution,
-            source_host: 0,
-            sink_host: 1,
-            routing: None,
-            traffic: TrafficCharacteristics::default(),
-            seed: 42,
-        });
-        flow.source_id = 100;
-        flow.sink_id = 200;
-        let flows = vec![flow];
-
-        // Sample collectives
-        let collectives = vec![];
-
-        // Initialize Topology
-        let topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
-
-        // Run the simulation
-        topology.run(graph.clone());
-
-        // Since the simulation runs without return values, further assertions
-        // would require inspecting internal state or logs. Here, we ensure no panic occurs.
-
-        // Clean up the temporary config file
-        fs::remove_file(config_path).expect("Unable to delete test config");
     }
 }

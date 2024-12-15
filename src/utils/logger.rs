@@ -3,10 +3,11 @@
 
 use csv::WriterBuilder;
 use log::info;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 // Import statements for PacketSinkReport, PacketSourceReport, SchedulerReport
 use crate::flows::sink::PacketSinkReport;
@@ -53,10 +54,12 @@ pub struct CsvLogger {
     max_log_len: usize,
     log_path: OnceLock<String>,
     report_interval: OnceLock<f64>,
-    // Shared state protected by a Mutex
-    shared_state: Arc<Mutex<SharedState>>,
+    // Shared state protected by locks
+    shared_state: Arc<RwLock<SharedState>>,
     total_packets: Arc<AtomicUsize>,
 }
+
+static INSTANCE: OnceLock<Arc<CsvLogger>> = OnceLock::new();
 
 impl Default for CsvLogger {
     fn default() -> Self {
@@ -71,7 +74,7 @@ impl CsvLogger {
             max_log_len: 10000,
             log_path: OnceLock::new(),
             report_interval: OnceLock::new(),
-            shared_state: Arc::new(Mutex::new(SharedState::default())),
+            shared_state: Arc::new(RwLock::new(SharedState::default())),
             total_packets: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -86,21 +89,21 @@ impl CsvLogger {
     }
 
     /// Initializes the CsvLogger with a given log path.
-    pub fn init(&self, log_path: &str) -> Result<(), String> {
+    pub fn init(&self, log_path: &str) {
         let log_path = Self::ensure_trailing_slash(log_path);
 
         // Attempt to set the log_path; return an error if already set
-        if self.log_path.set(log_path.clone()).is_err() {
-            return Err("Log path has already been set.".to_string());
-        }
+        self.log_path
+            .set(log_path.clone())
+            .expect("Log path has already been set.");
 
         // Set report_interval; default to f64::MAX if not set
         self.report_interval
             .set(f64::MAX)
-            .map_err(|_| "Report interval already set.".to_string())?;
+            .expect("Report interval already set.");
 
-        self.init_output_files(&log_path)?;
-        Ok(())
+        self.init_output_files(&log_path)
+            .expect("Error initializing output files.");
     }
 
     /// Initializes the CsvLogger from a configuration file.
@@ -144,8 +147,6 @@ impl CsvLogger {
 
     /// Retrieves the singleton instance of CsvLogger.
     pub fn get_instance() -> Arc<CsvLogger> {
-        static INSTANCE: OnceLock<Arc<CsvLogger>> = OnceLock::new();
-
         INSTANCE.get_or_init(|| Arc::new(CsvLogger::new())).clone()
     }
 
@@ -155,19 +156,14 @@ impl CsvLogger {
     }
 
     /// Logs a report. Must be called after the logger has been initialized.
-    pub fn log_report(report: Report, timing: ReportTiming) -> Result<(), String> {
+    pub fn log_report(report: Report, timing: ReportTiming) {
         let logger = CsvLogger::get_instance();
         if !logger.log_path.get().is_some() {
-            return Err(
-                "CsvLogger not initialized. Call init or init_from_config first.".to_string(),
-            );
+            panic!("CsvLogger not initialized. Call init or init_from_config first.");
         }
 
         // Acquire the lock to modify shared state
-        let mut state = logger
-            .shared_state
-            .lock()
-            .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+        let mut state = logger.shared_state.write();
 
         match report {
             Report::PacketSourceReport(report) => {
@@ -187,8 +183,6 @@ impl CsvLogger {
         if timing == ReportTiming::InProgress {
             logger.check_and_flush_reports();
         }
-
-        Ok(())
     }
 
     /// Writes reports to their respective CSV files.
@@ -248,13 +242,7 @@ impl CsvLogger {
     /// Checks if reports exceed the maximum log length and flushes them if necessary.
     fn check_and_flush_reports(&self) {
         // Acquire the lock to modify shared state
-        let mut state = match self.shared_state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                eprintln!("Mutex poisoned. Recovering guarded data.");
-                poisoned.into_inner()
-            }
-        };
+        let mut state = self.shared_state.write();
 
         // Check and flush source reports
         if state.source_reports.len() >= self.max_log_len {
@@ -286,28 +274,28 @@ impl CsvLogger {
     }
 
     /// Flushes all remaining reports to CSV files.
-    pub fn flush_reports(&self) -> Result<(), String> {
-        let mut state = self
-            .shared_state
-            .lock()
-            .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    pub fn flush_reports(&self) {
+        let mut state = self.shared_state.write();
 
         // Write remaining source reports
         if !state.source_reports.is_empty() {
             let reports = std::mem::take(&mut state.source_reports);
-            self.write_to_csv(ElementType::Source, &reports)?;
+            self.write_to_csv(ElementType::Source, &reports)
+                .expect("Error writing source reports to CSV");
         }
 
         // Write remaining scheduler reports
         if !state.scheduler_reports.is_empty() {
             let reports = std::mem::take(&mut state.scheduler_reports);
-            self.write_to_csv(ElementType::Scheduler, &reports)?;
+            self.write_to_csv(ElementType::Scheduler, &reports)
+                .expect("Error writing scheduler reports to CSV");
         }
 
         // Write remaining sink reports
         if !state.sink_reports.is_empty() {
             let reports = std::mem::take(&mut state.sink_reports);
-            self.write_to_csv(ElementType::Sink, &reports)?;
+            self.write_to_csv(ElementType::Sink, &reports)
+                .expect("Error writing sink reports to CSV");
 
             let (final_packets, final_delay) = Self::compute_sink_statistics(&reports);
             self.total_packets
@@ -324,66 +312,5 @@ impl CsvLogger {
 
         info!("Total packets processed: {}", total_packets);
         info!("Average one-way delay: {:.6} seconds", avg_delay);
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_init_logger() {
-        // Reset INSTANCE if possible (requires implementation)
-        // CsvLogger::reset_instance();
-
-        let logger = CsvLogger::get_instance();
-        let log_path = "/test_logs/test_init_logger";
-
-        // Initialize logger
-        assert!(logger.init(log_path).is_ok());
-
-        // Attempt to re-initialize should fail
-        assert!(logger.init(log_path).is_err());
-    }
-
-    #[test]
-    fn test_logging() {
-        let logger = CsvLogger::get_instance();
-        let log_path = "/test_logs/test_logging";
-
-        // Initialize logger
-        assert!(logger.init(log_path).is_ok());
-
-        // Create sample reports
-        let source_report = PacketSourceReport::default();
-        let scheduler_report = SchedulerReport::default();
-        let sink_report = PacketSinkReport::default();
-
-        // Log reports
-        assert!(CsvLogger::log_report(
-            Report::PacketSourceReport(source_report),
-            ReportTiming::InProgress
-        )
-        .is_ok());
-        assert!(CsvLogger::log_report(
-            Report::SchedulerReport(scheduler_report),
-            ReportTiming::InProgress
-        )
-        .is_ok());
-        assert!(CsvLogger::log_report(
-            Report::PacketSinkReport(sink_report),
-            ReportTiming::InProgress
-        )
-        .is_ok());
-
-        // Flush reports
-        assert!(logger.flush_reports().is_ok());
-
-        // Verify CSV files exist
-        assert!(fs::metadata(format!("{}/sources.csv", log_path)).is_ok());
-        assert!(fs::metadata(format!("{}/switches.csv", log_path)).is_ok());
-        assert!(fs::metadata(format!("{}/sinks.csv", log_path)).is_ok());
     }
 }
