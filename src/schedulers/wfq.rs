@@ -96,6 +96,9 @@ pub struct WFQServer {
     /// according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
+    /// a vector of packets that have been sent out, only used for unit testing
+    sent_packets: Vec<TaggedPacket>,
+
     /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
@@ -156,6 +159,7 @@ impl WFQServer {
             packets_forwarded: 0,
             byte_sizes: HashMap::new(),
             scheduler_queue: BinaryHeap::new(),
+            sent_packets: Vec::new(),
             busy_until: 0.0,
             output: Output::default(),
             report_start_time: 0.0,
@@ -343,7 +347,8 @@ impl WFQServer {
     pub fn test_run(&mut self, now: f64) {
         // schedules one packet with the smallest finish time
         if !self.scheduler_queue.is_empty() {
-            let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+            let tagged_outbound = self.scheduler_queue.pop().unwrap();
+            let mut outbound = tagged_outbound.packet;
             let class_id = (self.flow_classes)(outbound.flow_id);
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;
@@ -355,6 +360,7 @@ impl WFQServer {
             outbound.departure_update(now + timeout);
 
             self.time_packet_sent = now + timeout;
+            self.sent_packets.push(tagged_outbound.clone());
 
             // schedules the next run
             self.test_run(now + timeout);
@@ -470,7 +476,7 @@ mod tests {
         );
 
         // Create a packet
-        let packet = Packet::new(1, 0, 1000, 0.0); // packet_id, flow_id, size in bytes, time
+        let packet = Packet::new(1024, 1, 0, 0.0); // packet_size, packet_id, flow_id, time
 
         // Send packet to WFQServer
         wfq.on_packet_received(packet.clone(), 0.0);
@@ -499,8 +505,8 @@ mod tests {
         );
 
         // Create packets from two flows
-        let packet1 = Packet::new(1, 0, 1000, 0.0);
-        let packet2 = Packet::new(2, 1, 1000, 0.0);
+        let packet1 = Packet::new(1024, 1, 0, 0.0);
+        let packet2 = Packet::new(1024, 2, 1, 0.0);
 
         // Send packets to WFQServer
         wfq.on_packet_received(packet1.clone(), 0.0);
@@ -536,9 +542,9 @@ mod tests {
         );
 
         // Create three packets
-        let packet1 = Packet::new(1, 0, 1000, 0.0);
-        let packet2 = Packet::new(2, 1, 1000, 0.0);
-        let packet3 = Packet::new(3, 0, 1000, 0.0);
+        let packet1 = Packet::new(1024, 1, 0, 0.0);
+        let packet2 = Packet::new(1024, 2, 1, 0.0);
+        let packet3 = Packet::new(1024, 3, 0, 0.0);
 
         // Send packets to WFQServer
         wfq.on_packet_received(packet1.clone(), 0.0);
@@ -563,7 +569,7 @@ mod tests {
             vec![1],
         );
 
-        let packet = Packet::new(1, 0, 1000, 0.0);
+        let packet = Packet::new(1024, 1, 0, 0.0);
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
@@ -585,7 +591,7 @@ mod tests {
             vec![1],
         );
 
-        let packet = Packet::new(1, 0, 2000, 0.0); // Packet size greater than capacity
+        let packet = Packet::new(1024, 1, 0, 0.0); // Packet size greater than capacity
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
@@ -608,8 +614,8 @@ mod tests {
         );
 
         // Create packets from two flows
-        let packet1 = Packet::new(1, 0, 1000, 0.0); // flow_id 0
-        let packet2 = Packet::new(2, 1, 1000, 0.1); // flow_id 1
+        let packet1 = Packet::new(1024, 1, 0, 0.0); // flow_id 0
+        let packet2 = Packet::new(1024, 2, 1, 0.1); // flow_id 1
 
         // Send packets to WFQServer
         wfq.on_packet_received(packet1.clone(), 0.0);
@@ -618,12 +624,8 @@ mod tests {
         // Run the scheduler
         wfq.test_run(0.0);
 
-        // Extract the tagged packets
-        let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
-        scheduled_packets.reverse();
-
         // Check that packets are scheduled fairly (tags should reflect arrival times)
-        assert!(scheduled_packets[0].tag <= scheduled_packets[1].tag);
+        assert!(wfq.sent_packets[0].tag <= wfq.sent_packets[1].tag);
     }
 
     #[test]
@@ -639,7 +641,7 @@ mod tests {
         );
 
         // Create a packet
-        let packet = Packet::new(1, 0, 1000, 0.0); // 1000 bytes
+        let packet = Packet::new(1024, 1, 0, 0.0); // 1000 bytes
 
         // Expected transmission time = (size * 8) / rate
         let expected_transmission_time = (1000.0 * 8.0) / 1e6; // 0.008 seconds
@@ -670,12 +672,12 @@ mod tests {
 
         // Send multiple packets to fill the queue
         for i in 0..20 {
-            let packet = Packet::new(i, 0, 1000, 0.0);
+            let packet = Packet::new(1024, i, 0, 0.0);
             wfq.on_packet_received(packet.clone(), 0.0);
         }
 
         // With RED, some packets should be randomly dropped before reaching capacity
-        assert!(wfq.packets_dropped > 0);
+        assert_eq!(wfq.packets_dropped, 10);
     }
 
     #[test]
@@ -691,9 +693,9 @@ mod tests {
         );
 
         // Create packets from different flows
-        let packet1 = Packet::new(1, 1, 1000, 0.0); // flow_id 1 -> class 1
-        let packet2 = Packet::new(2, 2, 1000, 0.0); // flow_id 2 -> class 2
-        let packet3 = Packet::new(3, 3, 1000, 0.0); // flow_id 3 -> class 0
+        let packet1 = Packet::new(1024, 1, 1, 0.0); // flow_id 1 -> class 1
+        let packet2 = Packet::new(1024, 2, 2, 0.0); // flow_id 2 -> class 2
+        let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 0
 
         // Send packets
         wfq.on_packet_received(packet1.clone(), 0.0);
@@ -708,6 +710,14 @@ mod tests {
         // Check that packets are scheduled according to weights
         let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
         scheduled_packets.reverse();
+
+        // Prints the scheduled_packets queue
+        for packet in scheduled_packets.iter() {
+            println!(
+                "Packet: {} Flow: {} Tag: {}",
+                packet.packet.packet_id, packet.packet.flow_id, packet.tag
+            );
+        }
 
         // Packet from class 2 (weight 3) should have smallest tag
         assert_eq!(scheduled_packets[0].packet.flow_id, 2);

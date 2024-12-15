@@ -1,12 +1,12 @@
 //! A very simple struct that represents a packet.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct TCPAck {
     pub sequence_num: usize,
     pub acknowledged_size: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Packet {
     /// Packets in Day are typically created by packet sources, and run through
     /// a sequence of packet-forwarding switches. It may be entered into a queue
