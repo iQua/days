@@ -1,10 +1,10 @@
 //! The routing protocols that are used to compute the path that each flow
 //! takes. Currently, three routing protocols have been implemented:
 //!
-//! - Shortest path routing: select a random candidate from a set of shortest
+//! - Shortest path routing: Selects a random candidate from a set of shortest
 //! paths, which are computed by the `petgraph` crate.
-//! - Path from configuration: use the path that is specified in the configuration.
-//! - ECMP: select a random candidate from a set of equal-cost multi-path routes.
+//! - Path from configuration: Uses the path that is specified in the configuration.
+//! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992).
 //!
 use std::hash::{Hash, Hasher};
 
@@ -147,5 +147,130 @@ impl RoutingProtocol for ECMP {
         } else {
             panic!("No path can be found.");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use petgraph::graph::UnGraph;
+
+    #[test]
+    fn test_shortest_path_routing() {
+        // Build a simple undirected graph
+        // Graph structure:
+        // 0 - 1
+        //  \ /
+        //   2
+        //   |
+        //   3
+
+        let mut graph = UnGraph::<usize, ()>::new_undirected();
+        let node0 = graph.add_node(0);
+        let node1 = graph.add_node(1);
+        let node2 = graph.add_node(2);
+        let node3 = graph.add_node(3);
+
+        graph.add_edge(node0, node1, ()); // Edge 0-1
+        graph.add_edge(node0, node2, ()); // Edge 0-2
+        graph.add_edge(node1, node2, ()); // Edge 1-2
+        graph.add_edge(node2, node3, ()); // Edge 2-3
+
+        // Create a ShortestPath routing instance
+        let mut shortest_path = ShortestPath::new(graph);
+
+        // Compute the route from node 0 to node 3
+        let start = NodeIndex::new(0);
+        let end = NodeIndex::new(3);
+        let path = shortest_path.compute_route(start, end);
+
+        // The expected shortest path is [0, 2, 3]
+        let expected_path = vec![start, NodeIndex::new(2), end];
+
+        assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_ecmp_routing() {
+        // Build a graph with multiple equal-cost paths between nodes 0 and 3
+        // Graph structure:
+        //     1
+        //    / \
+        //   0   3
+        //    \ /
+        //     2
+
+        let mut graph = UnGraph::<usize, ()>::new_undirected();
+        let node0 = graph.add_node(0);
+        let node1 = graph.add_node(1);
+        let node2 = graph.add_node(2);
+        let node3 = graph.add_node(3);
+
+        graph.add_edge(node0, node1, ()); // Edge 0-1
+        graph.add_edge(node1, node3, ()); // Edge 1-3
+        graph.add_edge(node0, node2, ()); // Edge 0-2
+        graph.add_edge(node2, node3, ()); // Edge 2-3
+
+        // Create an ECMP routing instance
+        let flow_id = 1;
+        let source_host = 0;
+        let sink_host = 3;
+        let mut ecmp = ECMP::new(graph, flow_id, source_host, sink_host);
+
+        // Compute the route from node 0 to node 3
+        let start = NodeIndex::new(source_host);
+        let end = NodeIndex::new(sink_host);
+        let path = ecmp.compute_route(start, end);
+
+        // There are two equal-cost paths: [0, 1, 3] and [0, 2, 3]
+        let possible_paths = vec![
+            vec![start, NodeIndex::new(1), end],
+            vec![start, NodeIndex::new(2), end],
+        ];
+
+        // Check that the computed path is one of the possible equal-cost paths
+        assert!(
+            possible_paths.contains(&path),
+            "ECMP routing did not find an equal-cost path"
+        );
+    }
+
+    #[test]
+    fn test_no_path() {
+        // Build a disconnected graph where no path exists between nodes 0 and 3
+        let mut graph = UnGraph::<usize, ()>::new_undirected();
+        let node0 = graph.add_node(0);
+        let node1 = graph.add_node(1);
+        let node2 = graph.add_node(2);
+        let node3 = graph.add_node(3);
+
+        graph.add_edge(node0, node1, ());
+        graph.add_edge(node1, node2, ());
+        // Note: No edge connecting to node3
+
+        // Test ShortestPath routing for no path scenario
+        let mut shortest_path = ShortestPath::new(graph.clone());
+        let start = NodeIndex::new(0);
+        let end = NodeIndex::new(3);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shortest_path.compute_route(start, end);
+        }));
+
+        assert!(
+            result.is_err(),
+            "ShortestPath should panic when no path exists"
+        );
+
+        // Test ECMP routing for no path scenario
+        let flow_id = 1;
+        let source_host = 0;
+        let sink_host = 3;
+        let mut ecmp = ECMP::new(graph, flow_id, source_host, sink_host);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ecmp.compute_route(start, end);
+        }));
+
+        assert!(result.is_err(), "ECMP should panic when no path exists");
     }
 }
