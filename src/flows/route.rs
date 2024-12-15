@@ -6,8 +6,6 @@
 //! - Path from configuration: Uses the path that is specified in the configuration.
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
-//! This revision optimizes ECMP by leveraging the A* algorithm to efficiently find multiple equal-cost paths.
-
 use std::hash::{Hash, Hasher};
 
 use petgraph::algo::astar;
@@ -298,5 +296,72 @@ mod tests {
         }));
 
         assert!(result.is_err(), "ECMP should panic when no path exists");
+    }
+
+    #[test]
+    fn test_ecmp_hashing() {
+        // Build a graph with multiple equal-cost paths between nodes 0 and 3
+        let mut graph = UnGraph::<usize, ()>::new_undirected();
+        let node0 = graph.add_node(0);
+        let node1 = graph.add_node(1);
+        let node2 = graph.add_node(2);
+        let node3 = graph.add_node(3);
+
+        graph.add_edge(node0, node1, ()); // Edge 0-1
+        graph.add_edge(node1, node3, ()); // Edge 1-3
+        graph.add_edge(node0, node2, ()); // Edge 0-2
+        graph.add_edge(node2, node3, ()); // Edge 2-3
+
+        let source_host = 0;
+        let sink_host = 3;
+
+        // Create ECMP routing instances with different flow_ids
+        let mut ecmp1 = ECMP::new(graph.clone(), 1, source_host, sink_host);
+        let mut ecmp2 = ECMP::new(graph.clone(), 2, source_host, sink_host);
+        let mut ecmp3 = ECMP::new(graph.clone(), 3, source_host, sink_host);
+
+        let start = NodeIndex::new(source_host);
+        let end = NodeIndex::new(sink_host);
+
+        // Compute routes for different flow_ids
+        let path1 = ecmp1.compute_route(start, end);
+        let path2 = ecmp2.compute_route(start, end);
+        let path3 = ecmp3.compute_route(start, end);
+
+        // There are two equal-cost paths: [0, 1, 3] and [0, 2, 3]
+        let possible_paths = vec![
+            vec![start, NodeIndex::new(1), end],
+            vec![start, NodeIndex::new(2), end],
+        ];
+
+        // Verify that each path is one of the possible equal-cost paths
+        assert!(
+            possible_paths.contains(&path1),
+            "ECMP routing did not select a valid path for flow_id 1"
+        );
+        assert!(
+            possible_paths.contains(&path2),
+            "ECMP routing did not select a valid path for flow_id 2"
+        );
+        assert!(
+            possible_paths.contains(&path3),
+            "ECMP routing did not select a valid path for flow_id 3"
+        );
+
+        // It's highly likely that different flow_ids result in different paths
+        // depending on the hash, but due to the small number of paths and possible
+        // hash collisions, we check that not all paths are the same.
+
+        // Count how many unique paths are selected
+        let unique_paths = vec![path1, path2, path3]
+            .into_iter()
+            .map(|p| p.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        // There are 2 possible paths, so unique_paths.len() should be <= 2
+        assert!(
+            unique_paths.len() > 1,
+            "Different flow_ids should result in different paths when possible"
+        );
     }
 }
