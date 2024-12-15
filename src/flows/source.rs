@@ -23,7 +23,7 @@ use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::utils::logger::{CsvLogger, ReportTiming};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub struct PacketSourceReport {
     pub id: usize,
     pub flow_id: usize,

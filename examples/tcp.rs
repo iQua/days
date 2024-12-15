@@ -115,7 +115,7 @@ fn main() {
             );
 
             // generates three CSV files containing statistics of this simulation run
-            CsvLogger::flush_reports();
+            CsvLogger::get_instance().flush_reports();
         }
         Err(e) => {
             info!("Simulation failed: {e}");

@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::flows::packet::Packet;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub struct SchedulerReport {
     pub id: usize,
     /// the start time of this report interval

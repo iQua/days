@@ -677,7 +677,9 @@ impl Topology {
         sim = statistics.collect_statistics(sim);
 
         // logs the remaining reports
-        CsvLogger::flush_reports();
+        if let Err(error) = CsvLogger::get_instance().flush_reports() {
+            panic!("Problem when logging the remaining reports: {error:?}");
+        }
 
         let elapsed = timer.elapsed();
         info!(

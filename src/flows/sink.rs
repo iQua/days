@@ -24,7 +24,7 @@ use crate::flows::tcp_sink::TCPPacketSink;
 use crate::flows::FlowFinishMsg;
 use crate::utils::logger::{CsvLogger, ReportTiming};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub struct PacketSinkReport {
     pub id: usize,
     pub flow_id: usize,
