@@ -4,7 +4,7 @@
 use serde::Deserialize;
 
 /// The congestion control algorithms.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub enum CCAlgorithm {
     TCPReno,
     TCPCubic,

@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::flows::cc::CCAlgorithm;
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(tag = "type")]
 pub enum DistributionInfo {
     DiscreteUniform { low: i64, high: i64 },
@@ -27,7 +27,7 @@ pub enum DistributionInfo {
     Uniform { low: f64, high: f64 },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlowSize {
     Bytes(usize),
     Duration(f64),
@@ -52,7 +52,7 @@ pub struct TomlTrafficCharacteristics {
     pub tcp: Option<TCPCharacteristics>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrafficCharacteristics {
     pub initial_delay: f64,
     pub size: FlowSize,
@@ -122,7 +122,7 @@ pub struct FlowFinishMsg {
     pub flow_id: usize,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
 }
