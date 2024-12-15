@@ -2,13 +2,15 @@
 //! takes. Currently, three routing protocols have been implemented:
 //!
 //! - Shortest path routing: Selects a random candidate from a set of shortest
-//! paths, which are computed by the `petgraph` crate.
+//! paths, which are computed by the `petgraph` crate using the A* algorithm.
 //! - Path from configuration: Uses the path that is specified in the configuration.
-//! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992).
+//! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
+//! This revision optimizes ECMP by leveraging the A* algorithm to efficiently find multiple equal-cost paths.
+
 use std::hash::{Hash, Hasher};
 
-use petgraph::algo::{all_simple_paths, astar, dijkstra};
+use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 
@@ -43,9 +45,15 @@ impl ShortestPath {
 }
 
 impl RoutingProtocol for ShortestPath {
-    /// Returns a shortest path between two nodes in the graph.
+    /// Returns a shortest path between two nodes in the graph using A*.
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
-        let path = astar(&self.graph, start, |n| n == end, |_| 1, |_| 0);
+        let path = astar(
+            &self.graph,
+            start,
+            |n| n == end,
+            |_| 1, // Uniform cost
+            |_| 0, // Heuristic ignored for uniform cost
+        );
 
         match path {
             Some((_, path)) => path,
@@ -96,9 +104,7 @@ impl ECMP {
         self.flow_id.hash(&mut hasher);
         self.source_host.hash(&mut hasher);
         self.sink_host.hash(&mut hasher);
-        let hash_value = hasher.finish();
-
-        hash_value
+        hasher.finish()
     }
 
     /// Selects one of the equal-cost paths using a hash of flow attributes.
@@ -107,40 +113,65 @@ impl ECMP {
         let index = (self.compute_hash() as usize) % paths.len();
         paths[index].clone()
     }
+
+    /// Finds all equal-cost paths using an optimized A* approach.
+    fn find_equal_cost_paths(
+        &self,
+        start: NodeIndex,
+        end: NodeIndex,
+        shortest_distance: usize,
+    ) -> Vec<Vec<NodeIndex>> {
+        let mut paths = Vec::new();
+        let mut stack = vec![(start, vec![start], 0)];
+
+        while let Some((current, path, cost)) = stack.pop() {
+            if current == end {
+                if cost == shortest_distance {
+                    paths.push(path.clone());
+                }
+                continue;
+            }
+
+            for neighbor in self.graph.neighbors(current) {
+                if !path.contains(&neighbor) {
+                    let new_cost = cost + 1; // Uniform cost
+                    if new_cost <= shortest_distance {
+                        let mut new_path = path.clone();
+                        new_path.push(neighbor);
+                        stack.push((neighbor, new_path, new_cost));
+                    }
+                }
+            }
+        }
+
+        paths
+    }
 }
 
 impl RoutingProtocol for ECMP {
-    /// Returns a path based on the Equal-Cost Multi-Path (ECMP) routing protocol.
+    /// Returns a path based on the Equal-Cost Multi-Path (ECMP) routing protocol optimized with A*.
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
-        // Compute shortest path distances from source to all nodes
-        let distances = dijkstra(&self.graph, start, None, |_| 1);
+        // Use A* to find the shortest path distance
+        let shortest_path = astar(
+            &self.graph,
+            start,
+            |n| n == end,
+            |_| 1, // Uniform cost
+            |_| 0, // Heuristic ignored for uniform cost
+        );
 
-        // Get the shortest distance to the target
-        if let Some(&shortest_distance) = distances.get(&end) {
-            // Find all simple paths from source to target within the shortest distance
-            let all_paths_iter = all_simple_paths::<Vec<_>, _>(
-                &self.graph,
-                start,
-                end,
-                0,
-                Some(shortest_distance + 1),
-            );
+        let shortest_distance = match shortest_path {
+            Some((cost, _)) => cost,
+            None => panic!("No path can be found."),
+        };
 
-            // Collect all equal-cost paths
-            let equal_cost_paths: Vec<Vec<NodeIndex>> = all_paths_iter
-                .filter(|path| path.len() - 1 == shortest_distance)
-                .collect();
+        // Find all equal-cost paths using the optimized A* approach
+        let equal_cost_paths = self.find_equal_cost_paths(start, end, shortest_distance as usize);
 
-            if !equal_cost_paths.is_empty() {
-                // Use a hash of flow attributes to select a path
-                let selected_path = self.select_ecmp_path(&equal_cost_paths);
-
-                selected_path
-            } else {
-                panic!("No equal-cost path can be found.");
-            }
+        if !equal_cost_paths.is_empty() {
+            self.select_ecmp_path(&equal_cost_paths)
         } else {
-            panic!("No path can be found.");
+            panic!("No equal-cost path can be found.");
         }
     }
 }
