@@ -25,7 +25,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, 
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TaggedPacket {
     pub packet: Packet,
     /// tag is the finish time of the packet
@@ -240,6 +240,8 @@ impl WFQServer {
     }
 
     fn tag(&mut self, packet: Packet, arrival_time: f64) -> TaggedPacket {
+        let mut finish_time = 0.0;
+
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
             self.vtime = 0.0;
@@ -253,27 +255,25 @@ impl WFQServer {
                 .sum();
 
             self.vtime += (arrival_time - self.last_updated) / weight_sum;
+
+            let flow_id = packet.flow_id;
+            let class_id = (self.flow_classes)(flow_id);
+
+            // Get previous finish time for this flow class, defaulting to 0
+            let prev_finish = *self.finish_times.get(&class_id).unwrap_or(&0.0);
+
+            // Calculate virtual start time as max(vtime, prev_finish)
+            let virtual_start = self.vtime.max(prev_finish);
+
+            finish_time = virtual_start
+                + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
+
+            self.finish_times.insert(class_id, finish_time);
         }
-
-        let flow_id = packet.flow_id;
-        let class_id = (self.flow_classes)(flow_id);
-        let weight = self.weights[class_id] as f64;
-
-        // Get previous finish time for this flow class, defaulting to 0
-        let prev_finish = *self.finish_times.get(&class_id).unwrap_or(&0.0);
-
-        // Calculate virtual start time as max(vtime, prev_finish)
-        let virtual_start = self.vtime.max(prev_finish);
-
-        // Calculate virtual finish time
-        let virtual_finish = virtual_start + packet.size as f64 / weight;
-
-        // Store virtual finish time for this flow
-        self.finish_times.insert(class_id, virtual_finish);
 
         TaggedPacket {
             packet,
-            tag: virtual_finish,
+            tag: finish_time,
         }
     }
 
@@ -471,8 +471,6 @@ impl Model for WFQServer {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
-
     use super::*;
     use crate::flows::packet::Packet;
     use crate::schedulers::drop::{CapacityUnit, DropStrategy};
@@ -536,6 +534,7 @@ mod tests {
         assert_eq!(wfq.scheduler_queue.len(), 4);
         assert_eq!(wfq.packets_received, 4);
         // Prints the scheduled_packets queue
+
         // Check that packets are scheduled according to weights
         let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
         scheduled_packets.reverse();
@@ -786,11 +785,11 @@ mod tests {
         let mut packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
         packets.reverse();
 
-        // First packet: start = 0, finish = 10/1 = 10
-        assert!((packets[0].tag - 10.0).abs() < 1e-6);
+        // First packet: start = 0.0, finish = 0.0
+        assert!((packets[0].tag - 0.0).abs() < 1e-6);
 
-        // Second packet: start = 10, finish = 20
-        assert!((packets[1].tag - 20.0).abs() < 1e-6);
+        // Second packet: start = 0.0, finish = 0.8
+        assert!((packets[1].tag - 0.8).abs() < 1e-6);
     }
 
     #[test]
@@ -834,44 +833,52 @@ mod tests {
     fn test_multiple_weight_ratios() {
         let mut wfq = WFQServer::new(
             1000.0,
-            100,
+            120,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
             vec![1, 2, 4], // 1:2:4 weight ratio
         );
 
-        // Send packets to all three flows
-        let mut rng = rand::thread_rng();
-        for i in 0..3000 {
-            let packet1 = Packet::new(10, i * 3, 0, 0.0);
-            wfq.on_packet_received(packet1, rng.gen_range(0.0..0.1));
+        // Send packets to all three flows at fixed intervals
+        let arrival_interval = 0.001;
+        let mut arrival_time = 0.0;
 
-            let packet2 = Packet::new(10, i * 3 + 1, 1, 0.0);
-            wfq.on_packet_received(packet2, rng.gen_range(0.0..0.1));
+        for i in 0..40 {
+            // Send one packet to each flow in sequence
+            let packet1 = Packet::new(10, i * 3, 0, arrival_time);
+            wfq.on_packet_received(packet1, arrival_time);
 
-            let packet3 = Packet::new(10, i * 3 + 2, 2, 0.0);
-            wfq.on_packet_received(packet3, rng.gen_range(0.0..0.1));
+            let packet2 = Packet::new(10, i * 3 + 1, 1, arrival_time);
+            wfq.on_packet_received(packet2, arrival_time);
+
+            let packet3 = Packet::new(10, i * 3 + 2, 2, arrival_time);
+            wfq.on_packet_received(packet3, arrival_time);
+
+            arrival_time += arrival_interval;
         }
 
         wfq.test_run(0.0);
 
+        // Calculate bytes sent per flow
         let bytes: Vec<usize> = (0..3)
             .map(|flow_id| {
                 wfq.sent_packets
                     .iter()
+                    .take(40) // Only consider first 40 packets sent
                     .filter(|p| p.packet.flow_id == flow_id)
                     .map(|p| p.packet.size)
                     .sum()
             })
             .collect();
 
-        // Check ratios between flows match weights
-        println!(
-            "ratio = {}",
-            (bytes[1] as f64 / bytes[0] as f64 - 2.0).abs()
-        );
-        println!("{}, {}, {}", bytes[0], bytes[1], bytes[2]);
+        println!("Flow 0 (weight 1): {} bytes", bytes[0]);
+        println!("Flow 1 (weight 2): {} bytes", bytes[1]);
+        println!("Flow 2 (weight 4): {} bytes", bytes[2]);
+        println!("Ratio flow 1/flow 0: {}", bytes[1] as f64 / bytes[0] as f64);
+        println!("Ratio flow 2/flow 0: {}", bytes[2] as f64 / bytes[0] as f64);
+
+        // Check ratios between flows match weights (within 20% tolerance)
         assert!((bytes[1] as f64 / bytes[0] as f64 - 2.0).abs() < 0.2);
         assert!((bytes[2] as f64 / bytes[0] as f64 - 4.0).abs() < 0.2);
     }
