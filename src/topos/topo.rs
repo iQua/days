@@ -703,6 +703,11 @@ mod tests {
 
     #[test]
     fn test_topology_new() {
+        let logger = CsvLogger::get_instance();
+        logger
+            .init("/test_logs/test_topology_new")
+            .expect("Failed to initialize logger");
+
         // Sample configuration in TOML format
         let config_content = r#"
             ui_interval = 1.0
@@ -755,6 +760,11 @@ mod tests {
 
     #[test]
     fn test_init_switches() {
+        let logger = CsvLogger::get_instance();
+        logger
+            .init("/logs/test_init_switches")
+            .expect("Failed to initialize logger");
+
         // Set number of switches
         set_num_switches(3);
 
@@ -770,6 +780,11 @@ mod tests {
 
     #[test]
     fn test_connect_neighbours_fifo() {
+        let logger = CsvLogger::get_instance();
+        logger
+            .init("/test_logs/test_connect_neighbours_fifo")
+            .expect("Failed to initialize logger");
+
         // Sample configuration in TOML format with FIFO discipline
         let config_content = r#"
             [switch]
@@ -815,6 +830,11 @@ mod tests {
 
     #[test]
     fn test_attach_flows() {
+        let logger = CsvLogger::get_instance();
+        logger
+            .init("/test_logs/test_attach_flows")
+            .expect("Failed to initialize logger");
+
         // Sample configuration in TOML format
         let config_content = r#"
             [switch]
@@ -880,6 +900,11 @@ mod tests {
 
     #[test]
     fn test_route_flows() {
+        let logger = CsvLogger::get_instance();
+        logger
+            .init("/test_logs/test_route_flows")
+            .expect("Failed to initialize logger");
+
         // Sample configuration in TOML format
         let config_content = r#"
             [switch]
@@ -963,6 +988,11 @@ mod tests {
 
     #[test]
     fn test_run_simulation() {
+        let logger = CsvLogger::get_instance();
+        logger
+            .init("/logs/test_run_simulation")
+            .expect("Failed to initialize logger");
+
         // Sample configuration in TOML format
         let config_content = r#"
             [switch]
