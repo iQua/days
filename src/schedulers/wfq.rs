@@ -96,9 +96,6 @@ pub struct WFQServer {
     /// according to their finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
-    /// a vector of packets that have been sent out, only used for unit testing
-    sent_packets: Vec<TaggedPacket>,
-
     /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
@@ -111,6 +108,10 @@ pub struct WFQServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+
+    /// a vector of packets that have been sent out, only used for unit testing
+    #[cfg(test)]
+    sent_packets: Vec<TaggedPacket>,
 }
 
 impl WFQServer {
@@ -159,7 +160,6 @@ impl WFQServer {
             packets_forwarded: 0,
             byte_sizes: HashMap::new(),
             scheduler_queue: BinaryHeap::new(),
-            sent_packets: Vec::new(),
             busy_until: 0.0,
             output: Output::default(),
             report_start_time: 0.0,
@@ -168,6 +168,8 @@ impl WFQServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            #[cfg(test)]
+            sent_packets: Vec::new(),
         }
     }
 
@@ -344,6 +346,7 @@ impl WFQServer {
         }
     }
 
+    #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
         // schedules one packet with the smallest finish time
         if !self.scheduler_queue.is_empty() {
