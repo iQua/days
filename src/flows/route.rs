@@ -135,12 +135,7 @@ impl RoutingProtocol for ECMP {
                 // Use a hash of flow attributes to select a path
                 let selected_path = self.select_ecmp_path(&equal_cost_paths);
 
-                // Prepend source_id and append sink_id to the path
-                let mut full_path = vec![start];
-                full_path.extend(selected_path);
-                full_path.push(end);
-
-                full_path
+                selected_path
             } else {
                 panic!("No equal-cost path found from source to target");
             }
@@ -242,7 +237,7 @@ mod tests {
         let node0 = graph.add_node(0);
         let node1 = graph.add_node(1);
         let node2 = graph.add_node(2);
-        let node3 = graph.add_node(3);
+        let _node3 = graph.add_node(3);
 
         graph.add_edge(node0, node1, ());
         graph.add_edge(node1, node2, ());
