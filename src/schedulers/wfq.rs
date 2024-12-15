@@ -259,8 +259,8 @@ impl WFQServer {
         let class_id = (self.flow_classes)(flow_id);
         let weight = self.weights[class_id] as f64;
 
-        // Get previous finish time for this flow, defaulting to 0
-        let prev_finish = *self.finish_times.get(&flow_id).unwrap_or(&0.0);
+        // Get previous finish time for this flow class, defaulting to 0
+        let prev_finish = *self.finish_times.get(&class_id).unwrap_or(&0.0);
 
         // Calculate virtual start time as max(vtime, prev_finish)
         let virtual_start = self.vtime.max(prev_finish);
@@ -269,7 +269,7 @@ impl WFQServer {
         let virtual_finish = virtual_start + packet.size as f64 / weight;
 
         // Store virtual finish time for this flow
-        self.finish_times.insert(flow_id, virtual_finish);
+        self.finish_times.insert(class_id, virtual_finish);
 
         TaggedPacket {
             packet,
@@ -371,6 +371,9 @@ impl WFQServer {
 
             self.time_packet_sent = now + timeout;
             self.sent_packets.push(tagged_outbound.clone());
+
+            // Send the packet (simulate the event)
+            self.update_internal_states(&outbound, self.time_packet_sent);
 
             // schedules the next run
             self.test_run(now + timeout);
@@ -667,9 +670,6 @@ mod tests {
         // Run the scheduler
         wfq.test_run(0.0);
 
-        // Send the packet (simulate the event)
-        wfq.update_internal_states(&packet, wfq.time_packet_sent);
-
         // Check that time_packet_sent is correct
         assert!((wfq.time_packet_sent - expected_transmission_time).abs() < 1e-6);
     }
@@ -729,5 +729,232 @@ mod tests {
         // Check that packets are scheduled according to weights
         // Packet from class 2 (weight 3) should have smallest tag
         assert_eq!(wfq.sent_packets[0].packet.flow_id, 2);
+    }
+
+    #[test]
+    fn test_virtual_time_accuracy() {
+        let mut wfq = WFQServer::new(
+            100.0, // 100 bps for easy calculation
+            10,    // capacity
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1, 2], // weights 1:2
+        );
+
+        // Test initial state
+        assert_eq!(wfq.vtime, 0.0);
+
+        // Send packet to flow 0 (weight 1)
+        let packet1 = Packet::new(10, 1, 0, 0.0);
+        wfq.on_packet_received(packet1, 0.0);
+
+        // Send packet to flow 1 (weight 2)
+        let packet2 = Packet::new(10, 2, 1, 0.0);
+        wfq.on_packet_received(packet2, 0.0);
+
+        // After processing first packet (size 10, weight 1)
+        // Virtual time should advance by: 10/1 = 10 units
+        wfq.test_run(0.0);
+
+        // Process all packets and verify system goes idle
+        assert_eq!(wfq.scheduler_queue.len(), 0);
+        assert_eq!(wfq.vtime, 0.0); // Should reset when idle
+    }
+
+    #[test]
+    fn test_start_finish_times() {
+        let mut wfq = WFQServer::new(
+            100.0,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1, 1], // Equal weights
+        );
+
+        // Send two packets to same flow
+        let packet1 = Packet::new(10, 1, 0, 0.0);
+        let packet2 = Packet::new(10, 2, 0, 0.0);
+
+        wfq.on_packet_received(packet1, 0.0);
+        wfq.on_packet_received(packet2, 0.0);
+
+        // Get finish times from queue
+        let mut packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
+        packets.reverse();
+
+        // First packet: start = 0, finish = 10/1 = 10
+        assert!((packets[0].tag - 10.0).abs() < 1e-6);
+
+        // Second packet: start = 10, finish = 20
+        assert!((packets[1].tag - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_flow_isolation() {
+        let mut wfq = WFQServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1, 1], // Equal weights
+        );
+
+        // Send many packets to both flows
+        for i in 0..50 {
+            let packet1 = Packet::new(10, i * 2, 0, 0.0);
+            let packet2 = Packet::new(10, i * 2 + 1, 1, 0.0);
+            wfq.on_packet_received(packet1, 0.0);
+            wfq.on_packet_received(packet2, 0.0);
+        }
+
+        wfq.test_run(0.0);
+
+        // Count packets sent from each flow
+        let flow0_packets = wfq
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 0)
+            .count();
+        let flow1_packets = wfq
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 1)
+            .count();
+
+        // With equal weights, should be roughly equal
+        assert!((flow0_packets as i32 - flow1_packets as i32).abs() <= 1);
+    }
+
+    #[test]
+    fn test_weight_ratios() {
+        let mut wfq = WFQServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1, 2], // 1:2 weight ratio
+        );
+
+        // Send many equal-sized packets to both flows
+        for i in 0..50 {
+            let packet1 = Packet::new(10, i * 2, 0, 0.0);
+            let packet2 = Packet::new(10, i * 2 + 1, 1, 0.0);
+            wfq.on_packet_received(packet1, 0.0);
+            wfq.on_packet_received(packet2, 0.0);
+        }
+
+        wfq.test_run(0.0);
+
+        // Calculate bytes sent for each flow
+        let flow0_bytes: usize = wfq
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 0)
+            .map(|p| p.packet.size)
+            .sum();
+        let flow1_bytes: usize = wfq
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 1)
+            .map(|p| p.packet.size)
+            .sum();
+
+        // With 1:2 weight ratio, flow1 should get ~2x the service
+        let ratio = flow1_bytes as f64 / flow0_bytes as f64;
+        assert!((ratio - 2.0).abs() < 0.2); // Allow 10% error margin
+    }
+
+    #[test]
+    fn test_multiple_weight_ratios() {
+        let mut wfq = WFQServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1, 2, 4], // 1:2:4 weight ratio
+        );
+
+        // Send packets to all three flows
+        for i in 0..3000 {
+            let packet1 = Packet::new(10, i * 3, 0, 0.0);
+            let packet2 = Packet::new(10, i * 3 + 1, 1, 0.0);
+            let packet3 = Packet::new(10, i * 3 + 2, 2, 0.0);
+            wfq.on_packet_received(packet1, 0.0);
+            wfq.on_packet_received(packet2, 0.0);
+            wfq.on_packet_received(packet3, 0.0);
+        }
+
+        wfq.test_run(0.0);
+
+        let bytes: Vec<usize> = (0..3)
+            .map(|flow_id| {
+                wfq.sent_packets
+                    .iter()
+                    .filter(|p| p.packet.flow_id == flow_id)
+                    .map(|p| p.packet.size)
+                    .sum()
+            })
+            .collect();
+
+        // Check ratios between flows match weights
+        println!(
+            "ratio = {}",
+            (bytes[1] as f64 / bytes[0] as f64 - 2.0).abs()
+        );
+        println!("{}, {}, {}", bytes[0], bytes[1], bytes[2]);
+        assert!((bytes[1] as f64 / bytes[0] as f64 - 2.0).abs() < 0.2);
+        assert!((bytes[2] as f64 / bytes[0] as f64 - 4.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_dynamic_flows() {
+        let mut wfq = WFQServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1, 1], // Equal weights
+        );
+
+        // Initially send packets only to flow 0
+        for i in 0..10 {
+            let packet = Packet::new(10, i, 0, 0.0);
+            wfq.on_packet_received(packet, 0.0);
+        }
+
+        // Then send to both flows
+        for i in 10..20 {
+            let packet1 = Packet::new(10, i * 2, 0, 1.0);
+            let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
+            wfq.on_packet_received(packet1, 1.0);
+            wfq.on_packet_received(packet2, 1.0);
+        }
+
+        wfq.test_run(0.0);
+
+        // Verify fair sharing once both flows active
+        let late_packets: Vec<&TaggedPacket> = wfq
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.time >= 1.0)
+            .collect();
+
+        let flow0_late = late_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 0)
+            .count();
+        let flow1_late = late_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 1)
+            .count();
+
+        // Should be roughly equal after both flows active
+        assert!((flow0_late as i32 - flow1_late as i32).abs() <= 1);
     }
 }
