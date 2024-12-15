@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::flows::route::{
     PathFromConfig, Routing, RoutingConfig, RoutingProtocol, ShortestPath, ECMP,
 };
-use crate::flows::{DistributionInfo, TomlTrafficCharacteristics, TrafficCharacteristics};
+use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -152,17 +152,7 @@ impl Flow {
                     source_host: edge.source().index(),
                     sink_host: edge.target().index(),
                     routing: Some(RoutingConfig::PathFromConfig),
-                    traffic: TrafficCharacteristics::new(
-                        1.,
-                        Some(10.),
-                        None,
-                        DistributionInfo::Exp { lambda: 1. },
-                        DistributionInfo::DiscreteUniform {
-                            low: 1000,
-                            high: 1000,
-                        },
-                        None,
-                    ),
+                    traffic: TrafficCharacteristics::default(),
                     seed: 0,
                 };
                 flows.push(Flow::new(params));

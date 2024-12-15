@@ -102,7 +102,7 @@ impl TrafficCharacteristics {
         }
     }
 
-    fn default() -> Self {
+    pub fn default() -> Self {
         Self::new(
             1.,
             Some(10.),

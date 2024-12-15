@@ -17,10 +17,10 @@ pub struct PacketSwitch {
     packets_received: usize,
     /// the flow information base (FIB) of the switch
     /// flow_id -> switch_id
-    fib: HashMap<usize, usize>,
+    pub fib: HashMap<usize, usize>,
     /// the reverse flow information base (FIB) of the switch, used by TCP
     /// flow_id -> switch_id
-    r_fib: HashMap<usize, usize>,
+    pub r_fib: HashMap<usize, usize>,
 
     /// senders for sending inbound packets to outbound ports
     /// switch_id -> outputs to downstream schedulers or endpoints
