@@ -636,13 +636,8 @@ impl Topology {
             pg.inc(flow_count as u64 - pg.position());
         }
 
-        info!(
-            "Routing decisions for all {} flows have been finalized.",
-            self.flows.len()
-        );
-
         pg.inc(num_flows as u64 - pg.position());
-        pg.finish_and_clear();
+        pg.finish_with_message("Done.");
     }
 
     /// Creates and activates a UserInterface coroutine, which contains a progress bar.
