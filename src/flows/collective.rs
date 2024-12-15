@@ -9,6 +9,7 @@ use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
+use crate::flows::route::RoutingConfig;
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_collective_id, next_flow_id, seed_from_config, update_next_flow_id};
 
@@ -29,6 +30,7 @@ struct TomlCollective {
     paths: Option<Vec<Vec<usize>>>,
     sources: Option<Vec<usize>>,
     sinks: Option<Vec<usize>>,
+    routing: Option<RoutingConfig>,
     traffic: TomlTrafficCharacteristics,
 }
 
@@ -41,6 +43,7 @@ struct TomlCollectiveSet {
     flow_count: usize,
     sources: Option<Vec<Vec<usize>>>,
     sinks: Option<Vec<Vec<usize>>>,
+    routing: Option<RoutingConfig>,
     traffic: TomlTrafficCharacteristics,
 }
 
@@ -64,6 +67,7 @@ pub struct Collective {
     pub sources: Vec<usize>,
     pub sinks: Vec<usize>,
 
+    pub routing: Option<RoutingConfig>,
     pub traffic: TrafficCharacteristics,
 }
 
@@ -78,6 +82,7 @@ pub struct CollectiveParams {
     paths: Option<Vec<Vec<usize>>>,
     sources: Vec<usize>,
     sinks: Vec<usize>,
+    routing: Option<RoutingConfig>,
     traffic: TrafficCharacteristics,
 }
 
@@ -93,6 +98,7 @@ impl Collective {
             paths: params.paths,
             sources: params.sources,
             sinks: params.sinks,
+            routing: params.routing,
             traffic: params.traffic,
         }
     }
@@ -128,6 +134,7 @@ impl Collective {
                 paths: collective_paths,
                 sources: collective_sources,
                 sinks: collective_sinks,
+                routing: None,
                 traffic: TrafficCharacteristics::default(),
             };
             collectives.push(Collective::new(params));
@@ -269,6 +276,7 @@ impl Collective {
                     paths: collective.paths,
                     sources,
                     sinks,
+                    routing: collective.routing,
                     traffic,
                 };
 
@@ -338,6 +346,7 @@ impl Collective {
                         paths: None,
                         sources,
                         sinks,
+                        routing: collective_set.routing,
                         traffic,
                     };
 

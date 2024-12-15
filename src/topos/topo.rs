@@ -263,6 +263,7 @@ impl Topology {
                             flow_type: collective.flow_type,
                             source_host: source,
                             sink_host: sink,
+                            routing: collective.routing,
                             traffic: collective.traffic,
                             // uses collective_id as the random seed for the
                             // flow, which ensures that all flows in the
@@ -285,6 +286,7 @@ impl Topology {
                             flow_type: collective.flow_type,
                             source_host: source,
                             sink_host: sink,
+                            routing: collective.routing,
                             traffic: collective.traffic,
                             // uses flow_id as the random seed for the flow,
                             // which ensures that different flows have different
@@ -306,6 +308,7 @@ impl Topology {
                             flow_type: collective.flow_type,
                             source_host: source,
                             sink_host: sink,
+                            routing: collective.routing,
                             traffic: collective.traffic,
                             // uses the source host's id as the random seed for
                             // the flow, which ensures that different hosts have

@@ -18,6 +18,7 @@ drop = "RED"
 [[flow]]
 flow_type = "TCP"
 graph = [[0, 1]]
+routing = "ECMP"
 [flow.traffic]
     initial_delay = 0.0
     size = 3000
