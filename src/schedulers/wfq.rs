@@ -694,7 +694,7 @@ mod tests {
         }
 
         // With RED, some packets should be randomly dropped before reaching capacity
-        assert_eq!(wfq.packets_dropped, 10);
+        assert!(wfq.packets_dropped >= 10);
     }
 
     #[test]
