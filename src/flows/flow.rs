@@ -259,8 +259,8 @@ impl Flow {
                         );
                     }
 
-                    let starts_before = flow.starts_before.clone().unwrap();
-                    let starts_after = flow.starts_after.clone().unwrap();
+                    let starts_before = flow.starts_before.clone().unwrap_or_default();
+                    let starts_after = flow.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
 
                     flows.push(Flow::new(FlowParams {
