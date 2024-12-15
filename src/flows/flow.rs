@@ -3,7 +3,6 @@
 
 use std::fs;
 
-use log::info;
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use rand::rngs::SmallRng;
@@ -350,7 +349,6 @@ impl Flow {
                 ));
 
                 path.push(NodeIndex::new(self.sink_id));
-                info!("Shortest path computed for flow {}.", self.id);
 
                 path
             }
@@ -360,10 +358,6 @@ impl Flow {
                 path.append(&mut routing.path.clone());
 
                 path.push(NodeIndex::new(self.sink_id));
-                info!(
-                    "Path from configuration file deployed for flow {}.",
-                    self.id
-                );
 
                 path
             }
@@ -378,7 +372,6 @@ impl Flow {
                 ));
 
                 path.push(NodeIndex::new(self.sink_id));
-                info!("ECMP path computed for flow {}.", self.id);
 
                 path
             }
