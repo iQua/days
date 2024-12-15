@@ -137,7 +137,7 @@ impl RoutingProtocol for ECMP {
 
                 selected_path
             } else {
-                panic!("No equal-cost path found from source to target");
+                panic!("No equal-cost path can be found.");
             }
         } else {
             panic!("No path can be found.");

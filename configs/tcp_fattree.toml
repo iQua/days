@@ -12,7 +12,7 @@ log_path = "logs/tcp_fattree"
 category = "FatTree"
 
 [topology.fat_tree]
-k = 96
+k = 32
 
 [switch]
 port_rate = 100000000 # 100 Mbps
@@ -24,6 +24,7 @@ drop = "RED"
 [[flow_set]]
 flow_type = "TCP"
 flow_count = 200
+routing = "ECMP"
 [flow_set.traffic]
     initial_delay = 0.0
     duration = 0.2
