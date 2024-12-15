@@ -240,15 +240,10 @@ impl WFQServer {
     }
 
     fn tag(&mut self, packet: Packet, arrival_time: f64) -> TaggedPacket {
-        let mut finish_time = 0.0;
-
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
             self.vtime = 0.0;
-
-            for (class_id, _) in self.weights.iter().enumerate() {
-                self.finish_times.insert(class_id, 0.0);
-            }
+            self.finish_times.clear();
         } else {
             // computes the sum of weights for flow classes in the active set
             let weight_sum: f64 = self
@@ -258,16 +253,27 @@ impl WFQServer {
                 .sum();
 
             self.vtime += (arrival_time - self.last_updated) / weight_sum;
-            let class_id = (self.flow_classes)(packet.flow_id);
-            finish_time = self.vtime.max(self.finish_times[&class_id])
-                + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
-
-            self.finish_times.insert(class_id, finish_time);
         }
+
+        let flow_id = packet.flow_id;
+        let class_id = (self.flow_classes)(flow_id);
+        let weight = self.weights[class_id] as f64;
+
+        // Get previous finish time for this flow, defaulting to 0
+        let prev_finish = *self.finish_times.get(&flow_id).unwrap_or(&0.0);
+
+        // Calculate virtual start time as max(vtime, prev_finish)
+        let virtual_start = self.vtime.max(prev_finish);
+
+        // Calculate virtual finish time
+        let virtual_finish = virtual_start + packet.size as f64 / weight;
+
+        // Store virtual finish time for this flow
+        self.finish_times.insert(flow_id, virtual_finish);
 
         TaggedPacket {
             packet,
-            tag: finish_time,
+            tag: virtual_finish,
         }
     }
 
@@ -524,7 +530,16 @@ mod tests {
         // Check that all four packets are in the queue
         assert_eq!(wfq.scheduler_queue.len(), 4);
         assert_eq!(wfq.packets_received, 4);
-
+        // Prints the scheduled_packets queue
+        // Check that packets are scheduled according to weights
+        let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
+        scheduled_packets.reverse();
+        for packet in scheduled_packets.iter() {
+            println!(
+                "Packet: {} Flow: {} Tag: {}",
+                packet.packet.packet_id, packet.packet.flow_id, packet.tag
+            );
+        }
         // Run the scheduler
         wfq.test_run(0.0);
 
