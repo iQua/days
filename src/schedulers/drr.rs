@@ -165,7 +165,7 @@ impl DRRServer {
         }
 
         // the case that this packet will not be dropped
-        self.on_packet_received(&packet);
+        self.update_stats_on_packet_received(&packet);
         self.packets_waiting += 1;
 
         let class_id = (self.flow_classes)(packet.flow_id);
@@ -194,7 +194,7 @@ impl DRRServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        self.on_packet_forwarded(&packet);
+        self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
 
@@ -291,13 +291,13 @@ impl DRRServer {
 }
 
 impl ReportStatistics for DRRServer {
-    fn on_packet_received(&mut self, packet: &Packet) {
+    fn update_stats_on_packet_received(&mut self, packet: &Packet) {
         self.packets_received += 1;
         self.received_sizes += packet.size;
         self.queue_length += packet.size;
     }
 
-    fn on_packet_forwarded(&mut self, packet: &Packet) {
+    fn update_stats_on_packet_forwarded(&mut self, packet: &Packet) {
         let num_packets = self.packets_forwarded as f64;
         self.queueing_delay_mean =
             (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);

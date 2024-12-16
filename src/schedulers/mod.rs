@@ -32,8 +32,8 @@ pub struct SchedulerReport {
 /// Defines the interface for all schedulers to update statistics in their periodic
 /// reports.
 pub trait ReportStatistics {
-    fn on_packet_received(&mut self, packet: &Packet);
-    fn on_packet_forwarded(&mut self, packet: &Packet);
+    fn update_stats_on_packet_received(&mut self, packet: &Packet);
+    fn update_stats_on_packet_forwarded(&mut self, packet: &Packet);
     fn prepare_report(&self, now: f64) -> SchedulerReport;
     fn reset_stats(&mut self, now: f64);
 }

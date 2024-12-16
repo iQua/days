@@ -9,7 +9,6 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-// Import statements for PacketSinkReport, PacketSourceReport, SchedulerReport
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
@@ -59,14 +58,6 @@ pub struct CsvLogger {
     total_packets: Arc<AtomicUsize>,
 }
 
-static INSTANCE: OnceLock<Arc<CsvLogger>> = OnceLock::new();
-
-impl Default for CsvLogger {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CsvLogger {
     /// Creates a new CsvLogger instance with default settings.
     pub fn new() -> Self {
@@ -89,7 +80,7 @@ impl CsvLogger {
     }
 
     /// Initializes the CsvLogger with a given log path.
-    pub fn init(&self, log_path: &str) {
+    pub fn init(&self, log_path: &str) -> Result<(), String> {
         let log_path = Self::ensure_trailing_slash(log_path);
 
         // Attempt to set the log_path; return an error if already set
@@ -97,13 +88,15 @@ impl CsvLogger {
             .set(log_path.clone())
             .expect("Log path has already been set.");
 
-        // Set report_interval; default to f64::MAX if not set
+        // Setting the default report interval of f64::MAX
         self.report_interval
             .set(f64::MAX)
-            .expect("Report interval already set.");
+            .map_err(|_| "The report interval has already been set.".to_string())?;
 
         self.init_output_files(&log_path)
             .expect("Error initializing output files.");
+
+        Ok(())
     }
 
     /// Initializes the CsvLogger from a configuration file.
@@ -113,20 +106,21 @@ impl CsvLogger {
         let log_config: LogConfig = toml::from_str(&content)
             .map_err(|e| format!("Failed to deserialize log configuration: {}", e))?;
 
-        let log_path =
-            Self::ensure_trailing_slash(&log_config.log_path.unwrap_or("./output".to_string()));
+        let log_path = Self::ensure_trailing_slash(
+            &log_config
+                .log_path
+                .unwrap_or_else(|| "./output".to_string()),
+        );
 
-        // Attempt to set the log_path; return an error if already set
-        if self.log_path.set(log_path.clone()).is_err() {
-            return Err("Log path has already been set.".to_string());
-        }
-
-        // Set report_interval; default to f64::MAX if not set
+        self.log_path.set(log_path.clone())?;
+        // Setting the report interval; default to f64::MAX if not set
         self.report_interval
             .set(log_config.report_interval.unwrap_or(f64::MAX))
-            .map_err(|_| "Report interval already set.".to_string())?;
+            .map_err(|_| "The report interval has already been set.".to_string())?;
 
-        self.init_output_files(&log_path)
+        self.init_output_files(&log_path)?;
+
+        Ok(())
     }
 
     /// Initializes the output CSV files.
@@ -147,6 +141,7 @@ impl CsvLogger {
 
     /// Retrieves the singleton instance of CsvLogger.
     pub fn get_instance() -> Arc<CsvLogger> {
+        static INSTANCE: OnceLock<Arc<CsvLogger>> = OnceLock::new();
         INSTANCE.get_or_init(|| Arc::new(CsvLogger::new())).clone()
     }
 

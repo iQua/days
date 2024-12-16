@@ -109,7 +109,7 @@ impl Port {
         }
 
         // the case that this packet will not be dropped
-        self.on_packet_received(&packet);
+        self.update_stats_on_packet_received(&packet);
         self.queue.push_back(packet.clone());
 
         debug!(
@@ -129,7 +129,7 @@ impl Port {
     }
 
     pub async fn send(&mut self, packet: Packet) {
-        self.on_packet_forwarded(&packet);
+        self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
 
@@ -188,13 +188,13 @@ impl Port {
 }
 
 impl ReportStatistics for Port {
-    fn on_packet_received(&mut self, packet: &Packet) {
+    fn update_stats_on_packet_received(&mut self, packet: &Packet) {
         self.packets_received += 1;
         self.received_sizes += packet.size;
         self.queue_length += packet.size;
     }
 
-    fn on_packet_forwarded(&mut self, packet: &Packet) {
+    fn update_stats_on_packet_forwarded(&mut self, packet: &Packet) {
         let num_packets = self.packets_forwarded as f64;
         self.queueing_delay_mean =
             (self.queueing_delay_mean * num_packets + packet.queueing_delay) / (num_packets + 1.0);

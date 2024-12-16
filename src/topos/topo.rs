@@ -9,6 +9,8 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif_log_bridge::LogWrapper;
 use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
@@ -593,6 +595,22 @@ impl Topology {
             self.flows.len()
         );
 
+        let num_flows = self.flows.len();
+
+        // initializes a multi-progress bar for the routing process
+        let multi = MultiProgress::new();
+        let env_logger = env_logger::Builder::from_default_env().build();
+        LogWrapper::new(multi.clone(), env_logger);
+        let progress_bar = ProgressBar::new(num_flows as u64);
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
+            )
+            .unwrap(),
+        );
+        let pg = multi.add(progress_bar);
+        let mut flow_count = 0;
+
         for flow in self.flows.iter_mut() {
             let path = flow.compute_path(self.graph.clone());
 
@@ -612,12 +630,14 @@ impl Topology {
                     switch.set_r_fib(flow.id, node_id);
                 }
             }
+
+            // increment the progress bar
+            flow_count += 1;
+            pg.inc(flow_count as u64 - pg.position());
         }
 
-        info!(
-            "Routing decisions for all {} flows have been finalized.",
-            self.flows.len()
-        );
+        pg.inc(num_flows as u64 - pg.position());
+        pg.finish_with_message("Done.");
     }
 
     /// Creates and activates a UserInterface coroutine, which contains a progress bar.

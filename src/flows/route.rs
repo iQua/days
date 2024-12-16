@@ -8,18 +8,19 @@
 //!
 use std::hash::{Hash, Hasher};
 
+use petgraph::algo;
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Copy, Clone)]
+#[derive(Debug, Deserialize, Copy, Clone, PartialEq)]
 pub enum RoutingConfig {
     ShortestPath,
     PathFromConfig,
     ECMP,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Routing {
     ShortestPath(ShortestPath),
     PathFromConfig(PathFromConfig),
@@ -31,9 +32,15 @@ pub trait RoutingProtocol {
     fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShortestPath {
     graph: UnGraph<usize, ()>,
+}
+
+impl PartialEq for ShortestPath {
+    fn eq(&self, other: &Self) -> bool {
+        algo::is_isomorphic(&self.graph, &other.graph)
+    }
 }
 
 impl ShortestPath {
@@ -60,7 +67,7 @@ impl RoutingProtocol for ShortestPath {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PathFromConfig {
     pub path: Vec<NodeIndex>,
 }
@@ -72,12 +79,21 @@ impl PathFromConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ECMP {
     graph: UnGraph<usize, ()>,
     flow_id: usize,
     source_host: usize,
     sink_host: usize,
+}
+
+impl PartialEq for ECMP {
+    fn eq(&self, other: &Self) -> bool {
+        self.flow_id == other.flow_id
+            && self.source_host == other.source_host
+            && self.sink_host == other.sink_host
+            && algo::is_isomorphic(&self.graph, &other.graph)
+    }
 }
 
 impl ECMP {

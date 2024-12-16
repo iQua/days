@@ -20,7 +20,9 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    CsvLogger::get_instance().init("logs/tcp_test");
+    if let Err(e) = CsvLogger::get_instance().init("logs/tcp_test") {
+        panic!("Failed to initialize CsvLogger: {}", e);
+    }
 
     // instantiates models
     let mut source = PacketSource::new(

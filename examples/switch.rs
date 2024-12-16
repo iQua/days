@@ -24,7 +24,9 @@ fn main() {
     env_logger::init_from_env(env);
 
     // initializes the singleton of the logger of reports
-    CsvLogger::get_instance().init("logs/switch");
+    if let Err(e) = CsvLogger::get_instance().init("logs/switch") {
+        panic!("Failed to initialize CsvLogger: {}", e);
+    }
 
     // instantiates models
     let mut source_1 = PacketSource::new(
