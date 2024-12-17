@@ -230,10 +230,10 @@ impl DRRServer {
     where
         F: FnMut(f64, Packet),
     {
-        // Main scheduling logic
+        // main scheduling logic
         loop {
             if self.packets_waiting == 0 {
-                // No packets to process
+                // all packets in the queues have been processed
                 return;
             }
 
@@ -250,12 +250,11 @@ impl DRRServer {
                     self.packets_waiting -= 1;
                     self.deficit[self.current_queue] -= packet.size;
 
-                    // Calculate timeout
+                    // sends the packet out to the next element after a timeout
                     let timeout = packet.size as f64 * 8.0 / self.rate;
-
                     outbound.departure_update(now + timeout);
 
-                    // Schedule events using the provided function
+                    // schedules the future event sending the packet and the next run
                     schedule_events(timeout, outbound);
 
                     self.busy_until = now + timeout;
@@ -285,11 +284,11 @@ impl DRRServer {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         self.schedule_packets(now, |timeout, outbound| {
-            // Schedule the send event
+            // schedules the send event
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
                 .unwrap();
 
-            // Schedule the next run
+            // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
         });
@@ -297,30 +296,30 @@ impl DRRServer {
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // Create a vector to collect events inside the closure
+        // creates a vector to collect events inside the closure
         let mut events = Vec::new();
 
-        // Call schedule_packets without borrowing self inside the closure
+        // calls schedule_packets() without borrowing self inside the closure
         self.schedule_packets(now, |timeout, mut outbound| {
-            // Simulate sending the packet
+            // simulates sending the packet
             outbound.departure_update(now + timeout);
 
-            // Collect the outbound packet and timeout
+            // collects the outbound packet and timeout
             events.push((timeout, outbound));
         });
 
-        // Process collected events after schedule_packets returns
+        // processes collected events after schedule_packets returns
         for (timeout, outbound) in events {
-            // Update the sent_packets vector
+            // updates the sent_packets vector
             self.sent_packets.push(outbound.clone());
 
-            // Update statistics
+            // updates statistics
             self.update_stats_on_packet_forwarded(&outbound);
 
-            // Update busy_until
+            // pdates busy_until
             self.busy_until = now + timeout;
 
-            // Schedule the next run by calling test_run recursively
+            // schedules the next run by calling test_run recursively
             self.test_run(now + timeout);
         }
     }
