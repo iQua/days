@@ -101,7 +101,7 @@ pub struct WFQServer {
 
     pub output: Output<Packet>,
 
-    /// the statistics of a preiodic report
+    /// the statistics of a periodic report
     report_start_time: f64,
     queue_length: usize,
     received_sizes: usize,
@@ -259,10 +259,10 @@ impl WFQServer {
             let flow_id = packet.flow_id;
             let class_id = (self.flow_classes)(flow_id);
 
-            // Get previous finish time for this flow class, defaulting to 0
+            // gets previous finish time for this flow class, defaulting to 0
             let prev_finish = *self.finish_times.get(&class_id).unwrap_or(&0.0);
 
-            // Calculate virtual start time as max(vtime, prev_finish)
+            // calculates virtual start time as max(vtime, prev_finish)
             let virtual_start = self.vtime.max(prev_finish);
 
             finish_time = virtual_start
@@ -310,7 +310,7 @@ impl WFQServer {
         self.update_internal_states(&packet, self.time_packet_sent);
     }
 
-    /// Schedules packets by accepting a closure to handle packet sending based on context.
+    /// schedules packets by accepting a closure to handle packet sending based on context.
     fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
     where
         F: FnMut(f64, TaggedPacket),
@@ -351,7 +351,7 @@ impl WFQServer {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         self.schedule_packets(now, |timeout, outbound| {
-            // Schedule the send event
+            // schedules the send event
             cx.schedule_event(
                 Duration::from_secs_f64(timeout),
                 Self::send,
@@ -359,7 +359,7 @@ impl WFQServer {
             )
             .unwrap();
 
-            // Schedule the next run
+            // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
         });
@@ -367,31 +367,31 @@ impl WFQServer {
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // Create a vector to collect events inside the closure
+        // creates a vector to collect events inside the closure
         let mut events = Vec::new();
 
-        // Call schedule_packets without borrowing self inside the closure
+        // calls schedule_packets without borrowing self inside the closure
         self.schedule_packets(now, |timeout, mut outbound| {
-            // Simulate sending the packet
+            // simulates sending the packet
             outbound.packet.departure_update(now + timeout);
 
-            // Collect the outbound packet and timeout
+            // collects the outbound packet and timeout
             events.push((timeout, outbound));
         });
 
-        // Process collected events after schedule_packets returns
+        // processes collected events after schedule_packets returns
         for (timeout, outbound) in events {
-            // Update the sent_packets vector
+            // updates the sent_packets vector
             self.sent_packets.push(outbound.clone());
 
-            // Update statistics and internal states
+            // updates statistics and internal states
             self.update_stats_on_packet_forwarded(&outbound.packet);
             self.update_internal_states(&outbound.packet, self.time_packet_sent);
 
-            // Update busy_until
+            // updates busy_until
             self.busy_until = now + timeout;
 
-            // Schedule the next run by calling test_run recursively
+            // schedules the next run by calling test_run recursively
             self.test_run(now + timeout);
         }
     }
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_single_packet() {
-        // Test sending a single packet through the WFQServer.
+        // tests sending a single packet through the WFQServer.
         let mut wfq = WFQServer::new(
             1e6, // server rate: 1 Mbps
             10,  // capacity: 10 packets
@@ -493,36 +493,36 @@ mod tests {
             vec![1], // weights for one class
         );
 
-        // Create a packet
+        // creates a packet
         let packet = Packet::new(1024, 1, 0, 0.0); // packet_size, packet_id, flow_id, time
 
-        // Send packet to WFQServer
+        // sends packet to WFQServer
         wfq.on_packet_received(packet.clone(), 0.0);
 
-        // Check that the packet is in the queue
+        // checks that the packet is in the queue
         assert_eq!(wfq.scheduler_queue.len(), 1);
         assert_eq!(wfq.packets_received, 1);
 
-        // Run the scheduler
+        // runs the scheduler
         wfq.test_run(0.0);
 
-        // Since the server is not busy, it should schedule the packet immediately
+        // since the server is not busy, it should schedule the packet immediately
         assert!(wfq.busy_until > 0.0);
     }
 
     #[test]
     fn test_multiple_flows() {
-        // Test packets from multiple flows.
+        // tests packets from multiple flows.
         let mut wfq = WFQServer::new(
             8.0, // server rate: 8 bits/second
             4,   // capacity: 4 packets
             CapacityUnit::Packets,
-            Arc::new(|flow_id| flow_id), // Map flow ids to class ids directly
+            Arc::new(|flow_id| flow_id), // maps flow ids to class ids directly
             DropStrategy::TailDrop,
             vec![1, 1, 1], // equal weights for three connections
         );
 
-        // Packets of size 1, 2, and 2 units arrive at time 0, on equally weighted connections
+        // simulates packets of size 1, 2, and 2 units arrive at time 0, on equally weighted connections
         // 0, 1, and 2, respectively.
         let packet1 = Packet::new(1, 1, 0, 0.0);
         let packet2 = Packet::new(2, 2, 1, 0.0);
@@ -531,16 +531,15 @@ mod tests {
         wfq.on_packet_received(packet2, 0.0);
         wfq.on_packet_received(packet3, 0.0);
 
-        // A packet of size 2 arrives at connection 0 at time 4
+        // simulates a packet of size 2 arrives at connection 0 at time 4
         let packet4 = Packet::new(2, 4, 0, 4.0);
         wfq.on_packet_received(packet4, 4.0);
 
-        // Check that all four packets are in the queue
+        // checks that all four packets are in the queue
         assert_eq!(wfq.scheduler_queue.len(), 4);
         assert_eq!(wfq.packets_received, 4);
-        // Prints the scheduled_packets queue
 
-        // Check that packets are scheduled according to weights
+        // prints the scheduled_packets queue
         let mut scheduled_packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
         scheduled_packets.reverse();
         for packet in scheduled_packets.iter() {
@@ -549,10 +548,11 @@ mod tests {
                 packet.packet.packet_id, packet.packet.flow_id, packet.tag
             );
         }
-        // Run the scheduler
+
+        // runs the scheduler
         wfq.test_run(0.0);
 
-        // Packet should be sent in the order of their finish tags
+        // packets should be sent in the order of their finish tags
         assert!(wfq.sent_packets[0].tag <= wfq.sent_packets[1].tag);
         assert!(wfq.sent_packets[1].tag <= wfq.sent_packets[2].tag);
         assert!(wfq.sent_packets[2].tag <= wfq.sent_packets[3].tag);
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_queue_overflow() {
-        // Test handling when queue is full (capacity reached).
+        // tests handling when queue is full (capacity reached).
         let mut wfq = WFQServer::new(
             1e6,
             2, // capacity: 2 packets
@@ -570,17 +570,17 @@ mod tests {
             vec![1, 1],
         );
 
-        // Create three packets
+        // creates three packets
         let packet1 = Packet::new(1024, 1, 0, 0.0);
         let packet2 = Packet::new(1024, 2, 1, 0.0);
         let packet3 = Packet::new(1024, 3, 0, 0.0);
 
-        // Send packets to WFQServer
+        // sends packets to WFQServer
         wfq.on_packet_received(packet1.clone(), 0.0);
         wfq.on_packet_received(packet2.clone(), 0.0);
         wfq.on_packet_received(packet3.clone(), 0.0);
 
-        // Only two packets should be in the queue due to capacity limit
+        // checks that only two packets should be in the queue due to capacity limit
         assert_eq!(wfq.scheduler_queue.len(), 2);
         assert_eq!(wfq.packets_received, 2);
         assert_eq!(wfq.packets_dropped, 1);
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_unlimited_capacity_queue() {
-        // Test behavior when capacity is unlimited (no packets should be dropped).
+        // tests behavior when capacity is unlimited (no packets should be dropped).
         let mut wfq = WFQServer::new(
             1e6,
             0, // unlimited capacity
@@ -602,13 +602,13 @@ mod tests {
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
-        // Unlimited capacity: no packet should be dropped
+        // verifies unlimited capacity: no packet should be dropped
         assert_eq!(wfq.packets_dropped, 0);
     }
 
     #[test]
     fn test_large_packet_size() {
-        // Test handling of a packet larger than capacity (should be dropped).
+        // tests handling of a packet larger than capacity (should be dropped).
         let mut wfq = WFQServer::new(
             1e6,
             1500, // capacity in bytes
@@ -618,38 +618,38 @@ mod tests {
             vec![1],
         );
 
-        let packet = Packet::new(1501, 1, 0, 0.0); // Packet size greater than capacity
+        let packet = Packet::new(1501, 1, 0, 0.0); // packet size greater than capacity
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
-        // Queue should be empty, packet should be dropped
+        // verifies queue should be empty, packet should be dropped
         assert_eq!(wfq.packets_dropped, 1);
     }
 
     #[test]
     fn test_packet_ordering_with_same_weights() {
-        // Test that packets from different flows but same weight are scheduled fairly.
+        // tests that packets from different flows but same weight are scheduled fairly.
         let mut wfq = WFQServer::new(
             1e6,
             10,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
-            vec![1, 1], // Same weights
+            vec![1, 1], // same weights
         );
 
-        // Create packets from two flows
+        // creates packets from two flows
         let packet1 = Packet::new(1024, 1, 0, 0.0); // flow_id 0
         let packet2 = Packet::new(1024, 2, 1, 0.1); // flow_id 1
 
-        // Send packets to WFQServer
+        // sends packets to WFQServer
         wfq.on_packet_received(packet1.clone(), 0.0);
         wfq.on_packet_received(packet2.clone(), 0.0);
 
-        // Run the scheduler
+        // runs the scheduler
         wfq.test_run(0.0);
 
-        // Check that packets are scheduled fairly (tags should reflect arrival times)
+        // verifies that packets are scheduled fairly (tags should reflect arrival times)
         let sent_packet_ids: Vec<usize> = wfq
             .sent_packets
             .iter()
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_packet_departure_time() {
-        // Test that the departure time of packets is calculated correctly.
+        // tests that the departure time of packets is calculated correctly.
         let mut wfq = WFQServer::new(
             1e6, // 1 Mbps
             10,
@@ -670,85 +670,86 @@ mod tests {
             vec![1],
         );
 
-        // Create a packet
+        // creates a packet
         let packet = Packet::new(1000, 1, 0, 0.0); // 1000 bytes
 
-        // Expected transmission time = (size * 8) / rate
+        // calculates expected transmission time = (size * 8) / rate
         let expected_transmission_time = (1000.0 * 8.0) / 1e6; // 0.008 seconds
 
         wfq.on_packet_received(packet.clone(), 0.0);
 
-        // Run the scheduler
+        // runs the scheduler
         wfq.test_run(0.0);
 
-        // Check that time_packet_sent is correct
+        // verifies that time_packet_sent is correct
         assert!((wfq.time_packet_sent - expected_transmission_time).abs() < 1e-6);
     }
 
     #[test]
     fn test_red_drop_strategy() {
-        // Test using RED drop strategy.
+        // tests using the RED packet drop strategy.
         let mut wfq = WFQServer::new(
             1e6,
             10, // capacity
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
-            DropStrategy::RED, // Use RED
+            DropStrategy::RED, // uses RED
             vec![1],
         );
 
-        // Send multiple packets to fill the queue
+        // sends multiple packets to fill the queue
         for i in 0..20 {
             let packet = Packet::new(1024, i, 0, 0.0);
             wfq.on_packet_received(packet.clone(), 0.0);
         }
 
-        // With RED, some packets should be randomly dropped before reaching capacity
+        // verifies with RED, some packets should be randomly dropped before reaching capacity
         assert!(wfq.packets_dropped >= 10);
     }
 
     #[test]
     fn test_flow_class_mapping() {
-        // Test custom flow_classes mapping.
+        // tests custom flow_classes mapping
         let mut wfq = WFQServer::new(
             1e6,
             10,
             CapacityUnit::Packets,
-            Arc::new(|flow_id| (flow_id % 3) as usize), // Map flow_ids to 3 classes
+            Arc::new(|flow_id| (flow_id % 3) as usize), // maps flow_ids to 3 classes
             DropStrategy::TailDrop,
-            vec![1, 2, 3], // Different weights
+            vec![1, 2, 3], // different weights
         );
 
-        // Create packets from different flows
+        // creates packets from different flows
         let packet1 = Packet::new(1024, 1, 1, 0.0); // flow_id 1 -> class 1
         let packet2 = Packet::new(1024, 2, 2, 0.0); // flow_id 2 -> class 2
         let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 0
 
-        // Send packets
+        // sends packets
         wfq.on_packet_received(packet2.clone(), 0.0);
         wfq.on_packet_received(packet1.clone(), 0.0);
         wfq.on_packet_received(packet3.clone(), 0.0);
 
-        // Check that flow_class mapping works
+        // verifies that flow_class mapping works
         assert_eq!((wfq.flow_classes)(1), 1);
         assert_eq!((wfq.flow_classes)(2), 2);
         assert_eq!((wfq.flow_classes)(3), 0);
 
-        // Run the scheduler
+        // runs the scheduler
         wfq.test_run(0.0);
 
-        // Adjusted expected packet send order
+        // verifies expected packet send order based on weights
         let sent_packet_ids: Vec<usize> = wfq
             .sent_packets
             .iter()
             .map(|p| p.packet.packet_id)
             .collect();
-        // Due to the weights (1,2,3), the scheduling order should be [3,1,2]
+        // due to the weights (1,2,3), the scheduling order should be [2, 1, 3]
         assert_eq!(sent_packet_ids, vec![2, 1, 3]);
     }
 
     #[test]
     fn test_virtual_time_accuracy() {
+        // tests the accuracy of virtual time calculations
         let mut wfq = WFQServer::new(
             100.0, // 100 bps for easy calculation
             10,    // capacity
@@ -758,22 +759,22 @@ mod tests {
             vec![1, 2], // weights 1:2
         );
 
-        // Test initial state
+        // verifies initial state
         assert_eq!(wfq.vtime, 0.0);
 
-        // Send packet to flow 0 (weight 1)
+        // sends packet to flow 0 (weight 1)
         let packet1 = Packet::new(10, 1, 0, 0.0);
         wfq.on_packet_received(packet1, 0.0);
 
-        // Send packet to flow 1 (weight 2)
+        // sends packet to flow 1 (weight 2)
         let packet2 = Packet::new(10, 2, 1, 0.0);
         wfq.on_packet_received(packet2, 0.0);
 
-        // After processing first packet (size 10, weight 1)
-        // Virtual time should advance by: 10/1 = 10 units
+        // processes first packet (size 10, weight 1)
+        // the virtual time should advance by 10 / 1 = 10 units
         wfq.test_run(0.0);
 
-        // Process all packets and verify system goes idle
+        // processes all packets and verify system goes idle
         assert_eq!(wfq.scheduler_queue.len(), 0);
         assert_eq!(wfq.vtime, 0.0); // Should reset when idle
     }
@@ -789,21 +790,21 @@ mod tests {
             vec![1, 1], // Equal weights
         );
 
-        // Send two packets to same flow
+        // sends two packets to same flow
         let packet1 = Packet::new(10, 1, 0, 0.0);
         let packet2 = Packet::new(10, 2, 0, 0.0);
 
         wfq.on_packet_received(packet1, 0.0);
         wfq.on_packet_received(packet2, 0.0);
 
-        // Get finish times from queue
+        // retrieves finish times from queue
         let mut packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
         packets.reverse();
 
-        // First packet: start = 0.0, finish = 0.0
+        // first packet: start = 0.0, finish = 0.0
         assert!((packets[0].tag - 0.0).abs() < 1e-6);
 
-        // Second packet: start = 0.0, finish = 0.8
+        // second packet: start = 0.0, finish = 0.8
         assert!((packets[1].tag - 0.8).abs() < 1e-6);
     }
 
@@ -818,7 +819,7 @@ mod tests {
             vec![1, 1], // Equal weights
         );
 
-        // Send many packets to both flows
+        // sends many packets to both flows
         for i in 0..50 {
             let packet1 = Packet::new(10, i * 2, 0, 0.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 0.0);
@@ -828,7 +829,7 @@ mod tests {
 
         wfq.test_run(0.0);
 
-        // Count packets sent from each flow
+        // counts packets sent from each flow
         let flow0_packets = wfq
             .sent_packets
             .iter()
@@ -840,7 +841,7 @@ mod tests {
             .filter(|p| p.packet.flow_id == 1)
             .count();
 
-        // With equal weights, should be roughly equal
+        // with equal weights, should be roughly equal
         assert!((flow0_packets as i32 - flow1_packets as i32).abs() <= 1);
     }
 
@@ -855,12 +856,12 @@ mod tests {
             vec![1, 2, 4], // 1:2:4 weight ratio
         );
 
-        // Send packets to all three flows at fixed intervals
+        // sends packets to all three flows at fixed intervals
         let arrival_interval = 0.001;
         let mut arrival_time = 0.0;
 
         for i in 0..40 {
-            // Send one packet to each flow in sequence
+            // sends one packet to each flow in sequence
             let packet1 = Packet::new(10, i * 3, 0, arrival_time);
             wfq.on_packet_received(packet1, arrival_time);
 
@@ -875,7 +876,7 @@ mod tests {
 
         wfq.test_run(0.0);
 
-        // Calculate bytes sent per flow
+        // calculates bytes sent per flow
         let bytes: Vec<usize> = (0..3)
             .map(|flow_id| {
                 wfq.sent_packets
@@ -909,13 +910,13 @@ mod tests {
             vec![1, 1], // Equal weights
         );
 
-        // Initially send packets only to flow 0
+        // initially send packets only to flow 0
         for i in 0..10 {
             let packet = Packet::new(10, i, 0, 0.0);
             wfq.on_packet_received(packet, 0.0);
         }
 
-        // Then send to both flows
+        // then send to both flows
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
@@ -925,7 +926,7 @@ mod tests {
 
         wfq.test_run(0.0);
 
-        // Count packets sent from each flow
+        // count packets sent from each flow
         let flow0_packets = wfq
             .sent_packets
             .iter()
@@ -937,7 +938,7 @@ mod tests {
             .filter(|p| p.packet.flow_id == 1)
             .count();
 
-        // Should be roughly equal after both flows active
+        // should be roughly equal after both flows active
         assert!((flow0_packets as isize - flow1_packets as isize).abs() <= 10);
     }
 }

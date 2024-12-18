@@ -27,8 +27,7 @@ pub struct DRRServer {
     /// its class_id, which is equivalent to flow-based DRR.
     pub flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
 
-    /// a closure that determines whether an inbound packet should be dropped or
-    /// not
+    /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
 
     /// deficit of classes, which are consecutive and start from 0
@@ -73,9 +72,9 @@ pub struct DRRServer {
 /// A Deficit Round Robin (DRR) packet scheduler
 ///
 /// # Invariants
-/// - The number of queues matches the number of weights
-/// - All queue IDs are consecutive starting from 0
-/// - The rate must be positive
+/// - the number of queues matches the number of weights
+/// - all queue IDs are consecutive starting from 0
+/// - the rate must be positive
 impl DRRServer {
     pub fn new(
         rate: f64,
@@ -207,7 +206,7 @@ impl DRRServer {
         self.output.send(packet).await;
     }
 
-    /// Moves on to the next queue if the current queue is empty.
+    /// moves on to the next queue if the current queue is empty.
     fn next_queue(&mut self) {
         self.current_queue += 1;
 
@@ -230,10 +229,10 @@ impl DRRServer {
     where
         F: FnMut(f64, Packet),
     {
-        // Main scheduling logic
+        // main scheduling logic
         loop {
             if self.packets_waiting == 0 {
-                // No packets to process
+                // all packets in the queues have been processed
                 return;
             }
 
@@ -250,12 +249,11 @@ impl DRRServer {
                     self.packets_waiting -= 1;
                     self.deficit[self.current_queue] -= packet.size;
 
-                    // Calculate timeout
+                    // sends the packet out to the next element after a timeout
                     let timeout = packet.size as f64 * 8.0 / self.rate;
-
                     outbound.departure_update(now + timeout);
 
-                    // Schedule events using the provided function
+                    // schedules the future event sending the packet and the next run
                     schedule_events(timeout, outbound);
 
                     self.busy_until = now + timeout;
@@ -285,11 +283,11 @@ impl DRRServer {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         self.schedule_packets(now, |timeout, outbound| {
-            // Schedule the send event
+            // schedules the send event
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
                 .unwrap();
 
-            // Schedule the next run
+            // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
         });
@@ -297,30 +295,30 @@ impl DRRServer {
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // Create a vector to collect events inside the closure
+        // creates a vector to collect events inside the closure
         let mut events = Vec::new();
 
-        // Call schedule_packets without borrowing self inside the closure
+        // calls schedule_packets() without borrowing self inside the closure
         self.schedule_packets(now, |timeout, mut outbound| {
-            // Simulate sending the packet
+            // simulates sending the packet
             outbound.departure_update(now + timeout);
 
-            // Collect the outbound packet and timeout
+            // collects the outbound packet and timeout
             events.push((timeout, outbound));
         });
 
-        // Process collected events after schedule_packets returns
+        // processes collected events after schedule_packets returns
         for (timeout, outbound) in events {
-            // Update the sent_packets vector
+            // updates the sent_packets vector
             self.sent_packets.push(outbound.clone());
 
-            // Update statistics
+            // updates statistics
             self.update_stats_on_packet_forwarded(&outbound);
 
-            // Update busy_until
+            // updates busy_until
             self.busy_until = now + timeout;
 
-            // Schedule the next run by calling test_run recursively
+            // schedules the next run by calling test_run recursively
             self.test_run(now + timeout);
         }
     }
@@ -411,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_single_packet() {
-        // Test sending a single packet through the DRRServer.
+        // tests sending a single packet through the DRRServer.
         let mut drr = DRRServer::new(
             1e6, // server rate: 1 Mbps
             10,  // capacity: 10 packets
@@ -421,37 +419,37 @@ mod tests {
             vec![1], // weights for one class
         );
 
-        // Create a packet
+        // creates a packet
         let packet = Packet::new(1024, 1, 0, 0.0); // packet_size, packet_id, flow_id, time
 
-        // Send packet to DRRServer
+        // sends packet to DRRServer
         drr.on_packet_received(packet.clone(), 0.0);
 
-        // Check that the packet is in the queue
+        // checks that the packet is in the queue
         assert_eq!(drr.queues[0].len(), 1);
         assert_eq!(drr.packets_received, 1);
 
-        // Run the scheduler
+        // runs the scheduler
         drr.test_run(0.0);
 
-        // Since the server is not busy, it should schedule the packet immediately
+        // since the server is not busy, it should schedule the packet immediately
         assert!(drr.busy_until > 0.0);
         assert_eq!(drr.sent_packets.len(), 1);
     }
 
     #[test]
     fn test_multiple_flows() {
-        // Test packets from multiple flows.
+        // tests packets from multiple flows.
         let mut drr = DRRServer::new(
             8.0, // server rate: 8 bits/second
             4,   // capacity: 4 packets
             CapacityUnit::Packets,
-            Arc::new(|flow_id| flow_id), // Map flow ids to class ids directly
+            Arc::new(|flow_id| flow_id), // maps flow ids to class ids directly
             DropStrategy::TailDrop,
             vec![1, 1, 1], // equal weights for three connections
         );
 
-        // Packets of size 1, 2, and 2 units arrive at time 0, on equally weighted connections
+        // simulates packets of size 1, 2, and 2 units arrive at time 0, on equally weighted connections
         // 0, 1, and 2, respectively.
         let packet1 = Packet::new(1, 1, 0, 0.0);
         let packet2 = Packet::new(2, 2, 1, 0.0);
@@ -460,30 +458,30 @@ mod tests {
         drr.on_packet_received(packet2, 0.0);
         drr.on_packet_received(packet3, 0.0);
 
-        // A packet of size 2 arrives at connection 0 at time 4
+        // simulates a packet of size 2 arrives at connection 0 at time 4
         let packet4 = Packet::new(2, 4, 0, 4.0);
-        drr.on_packet_received(packet4, 4.0); // Updated arrival time
+        drr.on_packet_received(packet4, 4.0); // updated arrival time
 
-        // Check that all four packets are in the queue
+        // checks that all four packets are in the queue
         assert_eq!(drr.queues[0].len(), 2);
         assert_eq!(drr.queues[1].len(), 1);
         assert_eq!(drr.queues[2].len(), 1);
         assert_eq!(drr.packets_received, 4);
 
-        // Run the scheduler
+        // runs the scheduler
         drr.test_run(0.0);
 
-        // Packet should be sent in the actual order
+        // packets should be sent in the actual order
         assert_eq!(drr.sent_packets.len(), 4);
         let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
 
-        // Adjusted expected packet order to match actual behavior
+        // adjusts expected packet order to match actual behavior
         assert_eq!(sent_packet_ids, vec![1, 4, 2, 3]);
     }
 
     #[test]
     fn test_queue_overflow() {
-        // Test handling when queue is full (capacity reached).
+        // tests handling when queue is full (capacity reached).
         let mut drr = DRRServer::new(
             1e6,
             2, // capacity: 2 packets
@@ -493,17 +491,17 @@ mod tests {
             vec![1, 1],
         );
 
-        // Create three packets
+        // creates three packets
         let packet1 = Packet::new(1024, 1, 0, 0.0);
         let packet2 = Packet::new(1024, 2, 1, 0.0);
         let packet3 = Packet::new(1024, 3, 0, 0.0);
 
-        // Send packets to DRRServer
+        // sends packets to DRRServer
         drr.on_packet_received(packet1.clone(), 0.0);
         drr.on_packet_received(packet2.clone(), 0.0);
         drr.on_packet_received(packet3.clone(), 0.0);
 
-        // Only two packets should be in the queue due to capacity limit
+        // only two packets should be in the queue due to capacity limit
         assert_eq!(drr.queues[0].len() + drr.queues[1].len(), 2);
         assert_eq!(drr.packets_received, 2);
         assert_eq!(drr.packets_dropped, 1);
@@ -511,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_unlimited_capacity_queue() {
-        // Test behavior when capacity is unlimited (no packets should be dropped).
+        // tests behavior when capacity is unlimited (no packets should be dropped).
         let mut drr = DRRServer::new(
             1e6,
             0, // unlimited capacity
@@ -525,13 +523,13 @@ mod tests {
 
         drr.on_packet_received(packet.clone(), 0.0);
 
-        // Unlimited capacity: no packet should be dropped
+        // verifies unlimited capacity: no packet should be dropped
         assert_eq!(drr.packets_dropped, 0);
     }
 
     #[test]
     fn test_large_packet_size() {
-        // Test handling of a packet larger than capacity (should be dropped).
+        // tests handling of a packet larger than capacity (should be dropped).
         let mut drr = DRRServer::new(
             1e6,
             1500, // capacity in bytes
@@ -541,45 +539,45 @@ mod tests {
             vec![1],
         );
 
-        let packet = Packet::new(1501, 1, 0, 0.0); // Packet size greater than capacity
+        let packet = Packet::new(1501, 1, 0, 0.0); // packet size greater than capacity
 
         drr.on_packet_received(packet.clone(), 0.0);
 
-        // Queue should be empty, packet should be dropped
+        // verifies queue should be empty, packet should be dropped
         assert_eq!(drr.packets_dropped, 1);
     }
 
     #[test]
     fn test_packet_ordering_with_same_weights() {
-        // Test that packets from different flows but same weight are scheduled fairly.
+        // tests that packets from different flows but same weight are scheduled fairly.
         let mut drr = DRRServer::new(
             1e6,
             10,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
-            vec![1, 1], // Same weights
+            vec![1, 1], // same weights
         );
 
-        // Create packets from two flows
+        // creates packets from two flows
         let packet1 = Packet::new(1024, 1, 0, 0.0); // flow_id 0
         let packet2 = Packet::new(1024, 2, 1, 0.1); // flow_id 1
 
-        // Send packets to DRRServer
+        // sends packets to DRRServer
         drr.on_packet_received(packet1.clone(), 0.0);
         drr.on_packet_received(packet2.clone(), 0.0);
 
-        // Run the scheduler
+        // runs the scheduler
         drr.test_run(0.0);
 
-        // Check that packets are scheduled fairly (tags should reflect arrival times)
+        // checks that packets are scheduled fairly (tags should reflect arrival times)
         let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
         assert_eq!(sent_packet_ids, vec![1, 2]);
     }
 
     #[test]
     fn test_packet_departure_time() {
-        // Test that the departure time of packets is calculated correctly.
+        // tests that the departure time of packets is calculated correctly.
         let mut drr = DRRServer::new(
             1e6, // 1 Mbps
             10,
@@ -589,71 +587,71 @@ mod tests {
             vec![1],
         );
 
-        // Create a packet
+        // creates a packet
         let packet = Packet::new(1000, 1, 0, 0.0); // 1000 bytes
         drr.on_packet_received(packet.clone(), 0.0);
 
-        // Run the scheduler
+        // runs the scheduler
         drr.test_run(0.0);
-        // Check that time_packet_sent is correct
+        // checks that time_packet_sent is correct
         assert!(drr.busy_until > 0.0);
     }
 
     #[test]
     fn test_red_drop_strategy() {
-        // Test using RED drop strategy.
+        // tests using RED drop strategy.
         let mut drr = DRRServer::new(
             1e6,
             10, // capacity
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
-            DropStrategy::RED, // Use RED
+            DropStrategy::RED, // uses RED
             vec![1],
         );
 
-        // Send multiple packets to fill the queue
+        // sends multiple packets to fill the queue
         for i in 0..20 {
             let packet = Packet::new(1024, i, 0, 0.0);
             drr.on_packet_received(packet.clone(), 0.0);
         }
 
-        // With RED, some packets should be randomly dropped before reaching capacity
+        // verifies with RED, some packets should be randomly dropped before reaching capacity
         assert!(drr.packets_dropped >= 10);
     }
 
     #[test]
     fn test_flow_class_mapping() {
-        // Test custom flow_classes mapping.
+        // tests custom flow_classes mapping.
         let mut drr = DRRServer::new(
             1e6,
             10,
             CapacityUnit::Packets,
-            Arc::new(|flow_id| (flow_id % 3) as usize), // Map flow_ids to 3 classes
+            Arc::new(|flow_id| (flow_id % 3) as usize), // maps flow_ids to 3 classes
             DropStrategy::TailDrop,
-            vec![1, 2, 3], // Different weights
+            vec![1, 2, 3], // different weights
         );
 
-        // Create packets from different flows
+        // creates packets from different flows
         let packet1 = Packet::new(1024, 1, 1, 0.0); // flow_id 1 -> class 1
         let packet2 = Packet::new(1024, 2, 2, 0.0); // flow_id 2 -> class 2
         let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 0
 
-        // Send packets
+        // sends packets
         drr.on_packet_received(packet2.clone(), 0.0);
         drr.on_packet_received(packet1.clone(), 0.0);
         drr.on_packet_received(packet3.clone(), 0.0);
 
-        // Check that flow_class mapping works
+        // checks that flow_class mapping works
         assert_eq!((drr.flow_classes)(1), 1);
         assert_eq!((drr.flow_classes)(2), 2);
         assert_eq!((drr.flow_classes)(3), 0);
 
-        // Run the scheduler
+        // runs the scheduler
         drr.test_run(0.0);
 
-        // Adjusted expected packet send order
+        // adjusts expected packet send order
         let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
-        // Due to the weights (1,2,3), the scheduling order should be [3,1,2]
+        // due to the weights (1,2,3), the scheduling order should be [3,1,2]
         assert_eq!(sent_packet_ids, vec![3, 1, 2]);
     }
 
@@ -665,16 +663,16 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
-            vec![1, 1], // Equal weights
+            vec![1, 1], // equal weights
         );
 
-        // Initially send packets only to flow 0
+        // initially sends packets only to flow 0
         for i in 0..10 {
             let packet = Packet::new(10, i, 0, 0.0);
             drr.on_packet_received(packet, 0.0);
         }
 
-        // Then send to both flows
+        // then sends to both flows
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
@@ -684,11 +682,11 @@ mod tests {
 
         drr.test_run(0.0);
 
-        // Count packets sent from each flow
+        // counts packets sent from each flow
         let flow0_packets = drr.sent_packets.iter().filter(|p| p.flow_id == 0).count();
         let flow1_packets = drr.sent_packets.iter().filter(|p| p.flow_id == 1).count();
 
-        // Adjust the assertion to allow a larger difference
+        // adjusts the assertion to allow a larger difference
         assert!((flow0_packets as isize - flow1_packets as isize).abs() <= 10);
     }
 
@@ -703,15 +701,15 @@ mod tests {
             vec![1, 2, 4], // 1:2:4 weight ratio
         );
 
-        // Adjusted packet size to better reflect weights
-        let packet_size = 1500; // Matching the min_quantum used in DRRServer
+        // adjusts packet size to better reflect weights
+        let packet_size = 1500; // matches the min_quantum used in DRRServer
 
-        // Send packets to all three flows at fixed intervals
+        // sends packets to all three flows at fixed intervals
         let arrival_interval = 0.001;
         let mut arrival_time = 0.0;
 
         for i in 0..40 {
-            // Send one packet to each flow in sequence
+            // sends one packet to each flow in sequence
             let packet1 = Packet::new(packet_size, i * 3, 0, arrival_time);
             drr.on_packet_received(packet1, arrival_time);
 
@@ -726,12 +724,12 @@ mod tests {
 
         drr.test_run(0.0);
 
-        // Calculate bytes sent per flow
+        // calculates bytes sent per flow
         let bytes: Vec<usize> = (0..3)
             .map(|flow_id| {
                 drr.sent_packets
                     .iter()
-                    .take(40) // Only consider first 120 packets sent
+                    .take(40) // only considers first 120 packets sent
                     .filter(|p| p.flow_id == flow_id)
                     .map(|p| p.size)
                     .sum()
@@ -744,7 +742,7 @@ mod tests {
         println!("Ratio flow 1/flow 0: {}", bytes[1] as f64 / bytes[0] as f64);
         println!("Ratio flow 2/flow 0: {}", bytes[2] as f64 / bytes[0] as f64);
 
-        // Adjusted assertion to reflect the actual ratios, allowing some tolerance
+        // adjusts assertion to reflect the actual ratios, allowing some tolerance
         assert!((bytes[1] as f64 / bytes[0] as f64 - 2.0).abs() < 0.2);
         assert!((bytes[2] as f64 / bytes[0] as f64 - 4.0).abs() < 0.4);
     }

@@ -47,7 +47,7 @@ pub struct SPServer {
     /// flow_class -> priority
     priorities: HashMap<usize, usize>,
 
-    /// The server is considered busy sending the current packet until this time
+    /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
     pub output: Output<Packet>,
@@ -59,6 +59,10 @@ pub struct SPServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+
+    /// a vector of packets that have been sent out, only used for unit testing
+    #[cfg(test)]
+    sent_packets: Vec<Packet>,
 }
 
 impl SPServer {
@@ -103,6 +107,8 @@ impl SPServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            #[cfg(test)]
+            sent_packets: Vec::new(),
         }
     }
 
@@ -110,10 +116,7 @@ impl SPServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
+    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -141,25 +144,30 @@ impl SPServer {
 
         // pushes the packet to the back of its priority queue
         let priority = self.priorities[&class_id];
-
         let queue = self.queues.entry(priority).or_default();
         queue.push_back(packet.clone());
 
-        let byte_size = self.byte_sizes.entry(priority).or_insert(0);
+        let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
         *byte_size += packet.size;
 
         debug!(
             "SPServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
-            {} packet(s) in flow class {}.",
+             {} packet(s) in flow class {}.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
             class_id,
             arrival_time,
-            self.queues[&priority].len(),
+            queue.len(),
             class_id
         );
+    }
+
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        self.on_packet_received(packet, arrival_time);
 
         if arrival_time >= self.busy_until {
             self.run((), cx);
@@ -168,6 +176,10 @@ impl SPServer {
 
     pub async fn send(&mut self, packet: Packet) {
         self.update_stats_on_packet_forwarded(&packet);
+
+        #[cfg(test)]
+        self.sent_packets.push(packet.clone());
+
         self.output.send(packet).await;
     }
 
@@ -178,48 +190,77 @@ impl SPServer {
                 return Some(priority);
             }
         }
-
         None
     }
-
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        // schedules one packet with the highest priority
+    /// Schedule packets using provided event handler
+    fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
+    where
+        F: FnMut(f64, Packet),
+    {
         if let Some(current_priority) = self.next_priority() {
-            let queue = self.queues.entry(current_priority).or_default();
+            let queue = self.queues.get_mut(&current_priority).unwrap();
             let mut packet = queue.pop_front().unwrap();
-            let outbound = packet.clone();
+            let class_id = (self.flow_classes)(packet.flow_id);
 
-            let byte_size = self.byte_sizes.entry(current_priority).or_insert(0);
+            let byte_size = self.byte_sizes.get_mut(&class_id).unwrap();
             *byte_size -= packet.size;
 
             packet.queueing_delay_update(now);
 
-            // sends the packet out to the next element after a timeout
+            // calculate send timeout
             let timeout = packet.size as f64 * 8.0 / self.rate;
-
             packet.departure_update(now + timeout);
 
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)
-                .unwrap();
-
-            // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                .unwrap();
+            // call provided event handler
+            schedule_events(timeout, packet);
 
             self.busy_until = now + timeout;
 
             debug!(
                 "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.3}. {} packets in the priority queue.",
                 self.scheduler_id,
-                outbound.packet_id,
-                outbound.size,
+                packet.packet_id,
+                packet.size,
                 current_priority,
-                outbound.flow_id,
+                packet.flow_id,
                 now + timeout,
-                self.queues[&current_priority].len(),
+                queue.len(),
             );
+        }
+    }
+
+    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        self.schedule_packets(now, |timeout, outbound| {
+            // schedules the send event
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                .unwrap();
+
+            // schedules the next run
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
+        });
+    }
+
+    #[cfg(test)]
+    pub fn test_run(&mut self, now: f64) {
+        // creates vector to collect events
+        let mut events = Vec::new();
+
+        self.schedule_packets(now, |timeout, outbound| {
+            // collects the events
+            events.push((timeout, outbound));
+        });
+
+        // processes collected events
+        for (timeout, outbound) in events {
+            self.sent_packets.push(outbound.clone());
+            self.update_stats_on_packet_forwarded(&outbound);
+            self.busy_until = now + timeout;
+
+            // recursively schedules the next run
+            self.test_run(now + timeout);
         }
     }
 
@@ -297,5 +338,322 @@ impl Model for SPServer {
         }
 
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_single_packet() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1); // class 0 has priority 1
+
+        let mut sp = SPServer::new(
+            1e6, // server rate: 1 Mbps
+            10,  // capacity: 10 packets
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id), // flow_classes mapping
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // creates a packet
+        let packet = Packet::new(1024, 1, 0, 0.0);
+
+        // sends packet to SPServer
+        sp.on_packet_received(packet.clone(), 0.0);
+
+        // checks that the packet is in the queue
+        assert_eq!(sp.queues[&1].len(), 1);
+        assert_eq!(sp.packets_received, 1);
+
+        // runs the scheduler
+        sp.test_run(0.0);
+
+        // verifies packet was sent
+        assert!(sp.busy_until > 0.0);
+        assert_eq!(sp.sent_packets.len(), 1);
+    }
+
+    #[test]
+    fn test_priority_ordering() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1); // low priority
+        priorities.insert(1, 2); // high priority
+
+        let mut sp = SPServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // creates packets with different priorities
+        let low_prio_packet = Packet::new(1024, 1, 0, 0.0);
+        let high_prio_packet = Packet::new(1024, 2, 1, 0.0);
+
+        // sends low priority packet first
+        sp.on_packet_received(low_prio_packet.clone(), 0.0);
+        sp.on_packet_received(high_prio_packet.clone(), 0.0);
+
+        // runs the scheduler
+        sp.test_run(0.0);
+
+        // verifies high priority packet was sent first
+        assert_eq!(sp.sent_packets.len(), 2);
+        assert_eq!(sp.sent_packets[0].packet_id, 2); // high priority packet
+        assert_eq!(sp.sent_packets[1].packet_id, 1); // low priority packet
+    }
+
+    #[test]
+    fn test_queue_overflow() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1);
+
+        let mut sp = SPServer::new(
+            1e6,
+            2, // capacity: 2 packets
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // creates three packets
+        let packet1 = Packet::new(1024, 1, 0, 0.0);
+        let packet2 = Packet::new(1024, 2, 0, 0.0);
+        let packet3 = Packet::new(1024, 3, 0, 0.0);
+
+        // sends packets to SPServer
+        sp.on_packet_received(packet1, 0.0);
+        sp.on_packet_received(packet2, 0.0);
+        sp.on_packet_received(packet3, 0.0);
+
+        // verifies only two packets are in queue due to capacity limit
+        assert_eq!(sp.queues[&1].len(), 2);
+        assert_eq!(sp.packets_dropped, 1);
+    }
+
+    #[test]
+    fn test_unlimited_capacity() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1);
+
+        let mut sp = SPServer::new(
+            1e6,
+            0, // unlimited capacity
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // sends multiple packets
+        for i in 0..100 {
+            let packet = Packet::new(1024, i, 0, 0.0);
+            sp.on_packet_received(packet, 0.0);
+        }
+
+        // verifies no packets were dropped
+        assert_eq!(sp.packets_dropped, 0);
+    }
+
+    #[test]
+    fn test_red_drop_strategy() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1);
+
+        let mut sp = SPServer::new(
+            1e6,
+            10, // capacity
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::RED,
+            priorities,
+        );
+
+        // sends multiple packets to fill the queue
+        for i in 0..20 {
+            let packet = Packet::new(1024, i, 0, 0.0);
+            sp.on_packet_received(packet, 0.0);
+        }
+
+        // verifies RED dropped some packets before reaching capacity
+        assert!(sp.packets_dropped > 0);
+    }
+
+    #[test]
+    fn test_flow_class_mapping() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1); // class 0 -> priority 1
+        priorities.insert(1, 2); // class 1 -> priority 2
+
+        let mut sp = SPServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id % 2), // maps to 2 classes
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // creates packets from different flows
+        let packet1 = Packet::new(1024, 1, 1, 0.0); // flow 1 -> class 1 (high priority)
+        let packet2 = Packet::new(1024, 2, 0, 0.0); // flow 0 -> class 0 (low priority)
+        let packet3 = Packet::new(1024, 3, 2, 0.0); // flow 2 -> class 0 (low priority)
+
+        // sends packets
+        sp.on_packet_received(packet2, 0.0);
+        sp.on_packet_received(packet3, 0.0);
+        sp.on_packet_received(packet1, 0.0);
+
+        // runs scheduler
+        sp.test_run(0.0);
+
+        // verifies high priority packet (from class 1) sent first
+        assert_eq!(sp.sent_packets[0].flow_id, 1);
+    }
+
+    #[test]
+    fn test_fifo_within_priority() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1);
+
+        let mut sp = SPServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // sends multiple packets with same priority
+        for i in 0..3 {
+            let packet = Packet::new(1024, i, 0, 0.0);
+            sp.on_packet_received(packet, 0.0);
+        }
+
+        // runs scheduler
+        sp.test_run(0.0);
+
+        // verifies FIFO order within same priority
+        assert_eq!(sp.sent_packets[0].packet_id, 0);
+        assert_eq!(sp.sent_packets[1].packet_id, 1);
+        assert_eq!(sp.sent_packets[2].packet_id, 2);
+    }
+
+    #[test]
+    fn test_dynamic_flows() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1); // low priority
+        priorities.insert(1, 2); // high priority
+
+        let mut sp = SPServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // initially sends only low priority packets
+        for i in 0..5 {
+            let packet = Packet::new(10, i, 0, 0.0);
+            sp.on_packet_received(packet, 0.0);
+        }
+
+        sp.test_run(0.0);
+        let initial_sent = sp.sent_packets.len();
+
+        // then sends high priority packets
+        for i in 5..10 {
+            let packet = Packet::new(10, i, 1, 1.0); // high priority packets
+            sp.on_packet_received(packet, 1.0);
+        }
+
+        // runs scheduler again
+        sp.test_run(1.0);
+
+        // verifies:
+        // 1. Initial low priority packets were sent first (no competition)
+        // 2. Then high priority packets were sent before remaining low priority
+        assert_eq!(initial_sent, 5); // first 5 low priority packets sent
+
+        // all remaining packets should be high priority (flow_id 1)
+        for i in 5..sp.sent_packets.len() {
+            assert_eq!(sp.sent_packets[i].flow_id, 1);
+        }
+    }
+
+    #[test]
+    fn test_large_packet_handling() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1);
+
+        let mut sp = SPServer::new(
+            1e6,
+            1500, // capacity in bytes
+            CapacityUnit::Bytes,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // creates a packet larger than capacity
+        let large_packet = Packet::new(1501, 1, 0, 0.0);
+        sp.on_packet_received(large_packet, 0.0);
+
+        // verifies packet was dropped
+        assert_eq!(sp.packets_dropped, 1);
+        assert!(sp.queues.get(&1).map_or(true, |q| q.is_empty()));
+
+        // sends a packet within capacity limits
+        let normal_packet = Packet::new(1000, 2, 0, 0.0);
+        sp.on_packet_received(normal_packet, 0.0);
+
+        // verifies normal packet was accepted
+        assert_eq!(sp.queues[&1].len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_priority_levels() {
+        let mut priorities = HashMap::new();
+        priorities.insert(0, 1); // lowest priority
+        priorities.insert(1, 2);
+        priorities.insert(2, 3); // highest priority
+
+        let mut sp = SPServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            priorities,
+        );
+
+        // sends packets with different priorities in reverse order
+        let packet1 = Packet::new(1024, 1, 0, 0.0); // lowest priority
+        let packet2 = Packet::new(1024, 2, 1, 0.0); // medium priority
+        let packet3 = Packet::new(1024, 3, 2, 0.0); // highest priority
+
+        sp.on_packet_received(packet1, 0.0);
+        sp.on_packet_received(packet2, 0.0);
+        sp.on_packet_received(packet3, 0.0);
+
+        // runs scheduler
+        sp.test_run(0.0);
+
+        // verifies packets were sent in priority order (highest to lowest)
+        assert_eq!(sp.sent_packets.len(), 3);
+        assert_eq!(sp.sent_packets[0].flow_id, 2); // highest priority
+        assert_eq!(sp.sent_packets[1].flow_id, 1); // medium priority
+        assert_eq!(sp.sent_packets[2].flow_id, 0); // lowest priority
     }
 }
