@@ -192,11 +192,11 @@ impl SPServer {
         }
         None
     }
-
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        // schedules one packet with the highest priority
+    /// Schedule packets using provided event handler
+    fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
+    where
+        F: FnMut(f64, Packet),
+    {
         if let Some(current_priority) = self.next_priority() {
             let queue = self.queues.get_mut(&current_priority).unwrap();
             let mut packet = queue.pop_front().unwrap();
@@ -207,18 +207,12 @@ impl SPServer {
 
             packet.queueing_delay_update(now);
 
-            // sends the packet out to the next element after a timeout
+            // Calculate send timeout
             let timeout = packet.size as f64 * 8.0 / self.rate;
-
             packet.departure_update(now + timeout);
 
-            // schedules the send event
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)
-                .unwrap();
-
-            // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                .unwrap();
+            // Call provided event handler
+            schedule_events(timeout, packet);
 
             self.busy_until = now + timeout;
 
@@ -235,31 +229,43 @@ impl SPServer {
         }
     }
 
+    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        self.schedule_packets(now, |timeout, outbound| {
+            // Schedule send event
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                .unwrap();
+
+            // Schedule next run
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
+        });
+    }
+
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        if let Some(current_priority) = self.next_priority() {
-            let queue = self.queues.get_mut(&current_priority).unwrap();
-            let mut packet = queue.pop_front().unwrap();
-            let class_id = (self.flow_classes)(packet.flow_id);
+        // Create vector to collect events
+        let mut events = Vec::new();
 
-            let byte_size = self.byte_sizes.get_mut(&class_id).unwrap();
-            *byte_size -= packet.size;
+        self.schedule_packets(now, |timeout, outbound| {
+            // Collect the events
+            events.push((timeout, outbound));
+        });
 
-            packet.queueing_delay_update(now);
+        // Process collected events
+        for (timeout, outbound) in events {
+            // Update sent_packets
+            self.sent_packets.push(outbound.clone());
 
-            // Calculate timeout
-            let timeout = packet.size as f64 * 8.0 / self.rate;
-            packet.departure_update(now + timeout);
+            // Update statistics
+            self.update_stats_on_packet_forwarded(&outbound);
 
-            // Update statistics and test data
-            self.update_stats_on_packet_forwarded(&packet);
-            self.sent_packets.push(packet);
+            // Update busy_until
             self.busy_until = now + timeout;
 
-            // Recursively process next packet after timeout
-            if !self.queues.values().all(|q| q.is_empty()) {
-                self.test_run(now + timeout);
-            }
+            // Recursively schedule next run
+            self.test_run(now + timeout);
         }
     }
 
