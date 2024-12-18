@@ -37,8 +37,11 @@ pub struct SPServer {
     packets_forwarded: usize,
 
     /// the number of bytes of classes, which are consecutive and start from 0
-    /// flow_class -> byte_size
-    byte_sizes: HashMap<usize, usize>,
+    /// index is class ID, value is byte count
+    byte_sizes: Vec<usize>,
+
+    /// Total bytes currently queued across all classes
+    total_queued_bytes: usize,
 
     /// FIFO queues of classes
     /// priority -> queue
@@ -74,6 +77,9 @@ impl SPServer {
         drop_strategy: DropStrategy,
         priorities: HashMap<usize, usize>,
     ) -> SPServer {
+        // gets max class ID to size the vector
+        let max_class_id = priorities.keys().max().unwrap_or(&0) + 1;
+
         let scheduler_id = next_scheduler_id();
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
@@ -96,7 +102,8 @@ impl SPServer {
             packets_received: 0,
             packets_dropped: 0,
             packets_forwarded: 0,
-            byte_sizes: HashMap::new(),
+            byte_sizes: vec![0; max_class_id],
+            total_queued_bytes: 0,
             queues: BTreeMap::new(),
             priorities,
             busy_until: 0.0,
@@ -120,7 +127,7 @@ impl SPServer {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
-            self.byte_sizes.values().sum(),
+            self.total_queued_bytes,
             self.queues.values().map(|q| q.len()).sum(),
         );
 
@@ -140,15 +147,15 @@ impl SPServer {
         // the case that this packet will not be dropped
         self.update_stats_on_packet_received(&packet);
 
+        // Update bytes tracked
         let class_id = (self.flow_classes)(packet.flow_id);
+        self.byte_sizes[class_id] += packet.size;
+        self.total_queued_bytes += packet.size;
 
         // pushes the packet to the back of its priority queue
         let priority = self.priorities[&class_id];
         let queue = self.queues.entry(priority).or_default();
         queue.push_back(packet.clone());
-
-        let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
-        *byte_size += packet.size;
 
         debug!(
             "SPServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
@@ -200,10 +207,11 @@ impl SPServer {
         if let Some(current_priority) = self.next_priority() {
             let queue = self.queues.get_mut(&current_priority).unwrap();
             let mut packet = queue.pop_front().unwrap();
-            let class_id = (self.flow_classes)(packet.flow_id);
 
-            let byte_size = self.byte_sizes.get_mut(&class_id).unwrap();
-            *byte_size -= packet.size;
+            // Update byte tracking
+            let class_id = (self.flow_classes)(packet.flow_id);
+            self.byte_sizes[class_id] -= packet.size;
+            self.total_queued_bytes -= packet.size;
 
             packet.queueing_delay_update(now);
 
