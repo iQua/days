@@ -47,7 +47,7 @@ pub struct SPServer {
     /// flow_class -> priority
     priorities: HashMap<usize, usize>,
 
-    /// The server is considered busy sending the current packet until this time
+    /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
     pub output: Output<Packet>,
@@ -207,11 +207,11 @@ impl SPServer {
 
             packet.queueing_delay_update(now);
 
-            // Calculate send timeout
+            // calculate send timeout
             let timeout = packet.size as f64 * 8.0 / self.rate;
             packet.departure_update(now + timeout);
 
-            // Call provided event handler
+            // call provided event handler
             schedule_events(timeout, packet);
 
             self.busy_until = now + timeout;
@@ -233,11 +233,11 @@ impl SPServer {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         self.schedule_packets(now, |timeout, outbound| {
-            // Schedule send event
+            // schedules the send event
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
                 .unwrap();
 
-            // Schedule next run
+            // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
         });
@@ -245,26 +245,21 @@ impl SPServer {
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // Create vector to collect events
+        // creates vector to collect events
         let mut events = Vec::new();
 
         self.schedule_packets(now, |timeout, outbound| {
-            // Collect the events
+            // collects the events
             events.push((timeout, outbound));
         });
 
-        // Process collected events
+        // processes collected events
         for (timeout, outbound) in events {
-            // Update sent_packets
             self.sent_packets.push(outbound.clone());
-
-            // Update statistics
             self.update_stats_on_packet_forwarded(&outbound);
-
-            // Update busy_until
             self.busy_until = now + timeout;
 
-            // Recursively schedule next run
+            // recursively schedules the next run
             self.test_run(now + timeout);
         }
     }
