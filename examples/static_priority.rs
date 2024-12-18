@@ -1,6 +1,5 @@
 //! An example of connecting two packet sources into one Static Priority scheduler.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,7 +75,7 @@ fn main() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        HashMap::from([(0, 1), (1, 2)]),
+        vec![1, 2],
     );
 
     let mut sink = PacketSink::new(&source_1);

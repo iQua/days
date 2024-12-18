@@ -12,19 +12,19 @@ log_path = "logs/tcp_fattree"
 category = "FatTree"
 
 [topology.fat_tree]
-k = 32
+k = 64
 
 [switch]
 port_rate = 100000000 # 100 Mbps
 capacity = 1000
-weights = [1]
-discipline = "FIFO"
+priorities = [1]
+discipline = "SP"
 drop = "RED"
 
 [[flow_set]]
 flow_type = "TCP"
-flow_count = 200
-routing = "ECMP"
+flow_count = 500
+routing = "ShortestPath"
 [flow_set.traffic]
     initial_delay = 0.0
     duration = 0.2

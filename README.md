@@ -267,12 +267,12 @@ The scheduling discipline.
 
 #### priorities
 
-- **Valid value**: Vector of (integer, integer), where the first integer is the flow class and the second integer is the priority of this flow class
+- **Valid value**: Vector of integer values, where the index of the vector is the flow class, and the value is the priority of this flow class
 - **Required**: Yes if `dispcipline = "SP"`
 - **Example**:
 
   ```toml
-  priorities = [(0, 2), (1, 1)]
+  priorities = [1, 2]
   ```
 
 #### vticks

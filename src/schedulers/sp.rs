@@ -1,7 +1,6 @@
 //! Implements a Static Priority (SP) scheduler.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,8 +46,8 @@ pub struct SPServer {
     /// priority -> queue
     queues: BTreeMap<usize, VecDeque<Packet>>,
 
-    /// flow_class -> priority
-    priorities: HashMap<usize, usize>,
+    /// Vector where index is class_id and value is priority
+    priorities: Vec<usize>,
 
     /// the server is considered busy sending the current packet until this time
     busy_until: f64,
@@ -75,11 +74,8 @@ impl SPServer {
         capacity_unit: CapacityUnit,
         flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
-        priorities: HashMap<usize, usize>,
+        priorities: Vec<usize>,
     ) -> SPServer {
-        // gets max class ID to size the vector
-        let max_class_id = priorities.keys().max().unwrap_or(&0) + 1;
-
         let scheduler_id = next_scheduler_id();
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
@@ -94,6 +90,9 @@ impl SPServer {
             )),
         };
 
+        // Size of byte_sizes vector matches number of classes
+        let byte_sizes = vec![0; priorities.len()];
+
         SPServer {
             scheduler_id,
             rate,
@@ -102,7 +101,7 @@ impl SPServer {
             packets_received: 0,
             packets_dropped: 0,
             packets_forwarded: 0,
-            byte_sizes: vec![0; max_class_id],
+            byte_sizes,
             total_queued_bytes: 0,
             queues: BTreeMap::new(),
             priorities,
@@ -153,7 +152,7 @@ impl SPServer {
         self.total_queued_bytes += packet.size;
 
         // pushes the packet to the back of its priority queue
-        let priority = self.priorities[&class_id];
+        let priority = self.priorities[class_id];
         let queue = self.queues.entry(priority).or_default();
         queue.push_back(packet.clone());
 
@@ -352,12 +351,10 @@ impl Model for SPServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_single_packet() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1); // class 0 has priority 1
+        let priorities = vec![1]; // class 0 has priority 1
 
         let mut sp = SPServer::new(
             1e6, // server rate: 1 Mbps
@@ -388,9 +385,7 @@ mod tests {
 
     #[test]
     fn test_priority_ordering() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1); // low priority
-        priorities.insert(1, 2); // high priority
+        let priorities = vec![1, 2]; // class 0 has priority 1, class 1 has priority 2
 
         let mut sp = SPServer::new(
             1e6,
@@ -420,8 +415,7 @@ mod tests {
 
     #[test]
     fn test_queue_overflow() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1);
+        let priorities = vec![1];
 
         let mut sp = SPServer::new(
             1e6,
@@ -449,8 +443,7 @@ mod tests {
 
     #[test]
     fn test_unlimited_capacity() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1);
+        let priorities = vec![1];
 
         let mut sp = SPServer::new(
             1e6,
@@ -473,8 +466,7 @@ mod tests {
 
     #[test]
     fn test_red_drop_strategy() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1);
+        let priorities = vec![1];
 
         let mut sp = SPServer::new(
             1e6,
@@ -497,9 +489,7 @@ mod tests {
 
     #[test]
     fn test_flow_class_mapping() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1); // class 0 -> priority 1
-        priorities.insert(1, 2); // class 1 -> priority 2
+        let priorities = vec![1, 2]; // class 0 -> priority 1, class 1 -> priority 2
 
         let mut sp = SPServer::new(
             1e6,
@@ -529,8 +519,7 @@ mod tests {
 
     #[test]
     fn test_fifo_within_priority() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1);
+        let priorities = vec![1];
 
         let mut sp = SPServer::new(
             1e6,
@@ -558,9 +547,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_flows() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1); // low priority
-        priorities.insert(1, 2); // high priority
+        let priorities = vec![1, 2];
 
         let mut sp = SPServer::new(
             1000.0,
@@ -602,8 +589,7 @@ mod tests {
 
     #[test]
     fn test_large_packet_handling() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1);
+        let priorities = vec![1];
 
         let mut sp = SPServer::new(
             1e6,
@@ -632,10 +618,7 @@ mod tests {
 
     #[test]
     fn test_multiple_priority_levels() {
-        let mut priorities = HashMap::new();
-        priorities.insert(0, 1); // lowest priority
-        priorities.insert(1, 2);
-        priorities.insert(2, 3); // highest priority
+        let priorities = vec![1, 2, 3];
 
         let mut sp = SPServer::new(
             1e6,

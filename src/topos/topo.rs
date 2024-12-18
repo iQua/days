@@ -53,7 +53,7 @@ pub struct SwitchConfig {
     discipline: SchedulingDiscipline,
     drop: DropStrategy,
     weights: Option<Vec<usize>>,
-    priorities: Option<HashMap<usize, usize>>,
+    priorities: Option<Vec<usize>>,
     vticks: Option<HashMap<usize, usize>>,
 }
 
