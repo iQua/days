@@ -38,6 +38,6 @@ jobs:
               echo "Running example: $example"
               cargo run --release --example $(basename "$example" .rs)
               echo "Running tests"
-              cargo test
+              cargo test --features test
             fi
           done

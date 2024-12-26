@@ -32,13 +32,13 @@ fn test_virtual_clock_scheduler() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            0.0,        // initial delay
-            Some(50.0), // duration
-            None,       // size
+            0.0,         // initial delay
+            Some(100.0), // duration
+            None,        // size
             DistributionInfo::Uniform {
                 // arrival distribution
-                low: 0.1,
-                high: 0.2,
+                low: 0.05,
+                high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 // packet size distribution
@@ -56,11 +56,11 @@ fn test_virtual_clock_scheduler() {
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
             0.0,
-            Some(50.0),
+            Some(100.0),
             None,
             DistributionInfo::Uniform {
-                low: 0.1,
-                high: 0.2,
+                low: 0.05,
+                high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
@@ -122,19 +122,20 @@ fn test_virtual_clock_scheduler() {
                 // Ground truth based on Virtual Clock behavior:
                 // Flow 0 (vticks 1) and Flow 1 (vticks 2) should receive
                 // packets in a 1:2 ratio
-                let mut flow0_count = 0;
-                let mut flow1_count = 0;
+                let mut flow0_traffic = 0;
+                let mut flow1_traffic = 0;
 
                 for packet in statistics.packets {
                     match packet.flow_id {
-                        0 => flow0_count += 1,
-                        1 => flow1_count += 1,
+                        0 => flow0_traffic += packet.size,
+                        1 => flow1_traffic += packet.size,
                         _ => panic!("Unexpected flow ID"),
                     }
                 }
 
                 // Verify ratio is approximately 1:2 with a wider tolerance
-                let ratio = flow1_count as f64 / flow0_count as f64;
+                let ratio = flow1_traffic as f64 / flow0_traffic as f64;
+                println!("{ratio}");
 
                 assert!(
                     ratio >= 0.45 && ratio <= 0.55,
