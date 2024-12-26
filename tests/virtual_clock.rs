@@ -1,11 +1,10 @@
-//! An example of connecting two packet sources into one Virtual Clock scheduler.
+#![cfg(feature = "test")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::info;
-
 use nexosim::ports::EventSlot;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
@@ -18,33 +17,35 @@ use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
 use daytone::schedulers::vc::VirtualClockServer;
 use daytone::utils::logger::CsvLogger;
 
-fn main() {
-    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
-    env_logger::init_from_env(env);
+#[test]
+fn test_virtual_clock_scheduler() {
+    let _ = env_logger::builder().is_test(true).try_init();
 
-    // initializes the singleton of the logger of reports
-    if let Err(e) = CsvLogger::get_instance().init("logs/virtual_clock") {
+    // Initialize the logger
+    if let Err(e) = CsvLogger::get_instance().init("logs/vc_test") {
         panic!("Failed to initialize CsvLogger: {}", e);
     }
 
-    // instantiates models and their mailboxes
+    // Create packet sources with different rates and packet sizes
     let mut source_1 = PacketSource::new(
         0,
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.75,
-            Some(50.0),
-            None,
+            0.0,        // initial delay
+            Some(50.0), // duration
+            None,       // size
             DistributionInfo::Uniform {
-                low: 1.75,
-                high: 1.75,
+                // arrival distribution
+                low: 0.1,
+                high: 0.2,
             },
             DistributionInfo::DiscreteUniform {
-                low: 1000,
-                high: 1000,
+                // packet size distribution
+                low: 500,
+                high: 1500,
             },
-            None,
+            None, // TCP characteristics
         ),
         0,
     );
@@ -54,40 +55,40 @@ fn main() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            11.75,
+            0.0,
             Some(50.0),
             None,
             DistributionInfo::Uniform {
-                low: 1.75,
-                high: 1.75,
+                low: 0.1,
+                high: 0.2,
             },
             DistributionInfo::DiscreteUniform {
-                low: 1000,
-                high: 1000,
+                low: 500,
+                high: 1500,
             },
             None,
         ),
         0,
     );
 
+    // Create Virtual Clock scheduler with weights 1:2 for flow 0 and flow 1
     let mut vc = VirtualClockServer::new(
-        4600.0,
+        8000.0, // 8 Mbps
         100,
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        HashMap::from([(0, 2), (1, 1)]),
+        HashMap::from([(0, 1), (1, 2)]), // 1:2 in weights
     );
 
     let mut sink = PacketSink::new(&source_1);
-
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
     let vc_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
 
-    // connects the output of packet sources to the input of the Virtual Clock scheduler
+    // Connect sources to scheduler and scheduler to sink
     source_1
         .output()
         .connect(VirtualClockServer::packet_received, &vc_mbox);
@@ -99,7 +100,7 @@ fn main() {
     let mut sink_statistics = EventSlot::new();
     sink.statistics().connect_sink(&sink_statistics);
 
-    // instantiates the simulator
+    // Initialize simulation
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
         .add_model(source_1, source_1_mbox, "Source1")
@@ -109,14 +110,39 @@ fn main() {
         .init(t0)
     {
         Ok((mut sim, _)) => {
-            // starts the simulation
+            // Run simulation for 100 seconds to allow scheduler to stabilize
             let _ = sim.step_until(Duration::from_secs(100));
 
-            // requests the packet sink to report statistics
+            // Request statistics report
             let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
+
+                // Ground truth based on Virtual Clock behavior:
+                // Flow 0 (vticks 1) and Flow 1 (vticks 2) should receive
+                // packets in a 1:2 ratio
+                let mut flow0_count = 0;
+                let mut flow1_count = 0;
+
+                for packet in statistics.packets {
+                    match packet.flow_id {
+                        0 => flow0_count += 1,
+                        1 => flow1_count += 1,
+                        _ => panic!("Unexpected flow ID"),
+                    }
+                }
+
+                // Verify ratio is approximately 1:2 with a wider tolerance
+                let ratio = flow1_count as f64 / flow0_count as f64;
+
+                assert!(
+                    ratio >= 0.45 && ratio <= 0.55,
+                    "Expected ratio ~0.5:1, got {}:1",
+                    ratio
+                );
+            } else {
+                panic!("No statistics were reported by the sink.");
             }
 
             info!(
@@ -124,11 +150,9 @@ fn main() {
                 sim.time().duration_since(t0).as_secs_f64()
             );
 
-            // generates three CSV files containing statistics of this simulation run
+            // Generate CSV files
             CsvLogger::get_instance().flush_reports();
         }
-        Err(e) => {
-            info!("Simulation failed: {e}");
-        }
+        Err(_) => panic!("Failed to initialize the simulation."),
     }
 }

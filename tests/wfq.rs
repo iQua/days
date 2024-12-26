@@ -31,12 +31,12 @@ fn test_weighted_fair_queueing() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.0, // 1 packet per second
-            Some(50.0),
+            1.0,        // initial delay
+            Some(50.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.5,
-                high: 1.5,
+                low: 0.1,
+                high: 0.2,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
@@ -52,12 +52,12 @@ fn test_weighted_fair_queueing() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.0, // 1 packet per second
-            Some(50.0),
+            1.0,        // initial delay
+            Some(50.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.5,
-                high: 1.5,
+                low: 0.1,
+                high: 0.2,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
@@ -132,9 +132,9 @@ fn test_weighted_fair_queueing() {
 
                 // Verify ratio is approximately 1:2 with a wider tolerance
                 let ratio = flow2_count as f64 / flow1_count as f64;
-                println!("{ratio}");
+
                 assert!(
-                    ratio >= 1.5 && ratio <= 2.5,
+                    ratio >= 1.9 && ratio <= 2.1,
                     "Expected ratio ~2:1, got {}:1",
                     ratio
                 );
