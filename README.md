@@ -10,6 +10,14 @@ RUST_LOG=debug daytone configs/simple.toml
 
 where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`.
 
+## Running Unit and Integration Tests
+
+To run both unit and integration tests, use the command:
+
+```sh
+cargo test --features test
+```
+
 ## Configuration Settings
 
 In **Daytone**, all configuration settings are read from a configuration file when a simulation session starts, and the configuration file follows the `TOML` format for the sake of simplicity and readability.

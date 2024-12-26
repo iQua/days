@@ -17,7 +17,7 @@ use crate::utils::logger::{Report, ReportTiming};
 pub struct BasicPacketSink {
     pub endpoint_id: usize,
     pub flow_id: usize,
-    /// the statistics of received packets
+    /// the statistics of all received packets
     pub packet_statistics: PacketStatistics,
     /// output: packet statistics
     pub statistics: Output<PacketStatistics>,
@@ -27,7 +27,7 @@ pub struct BasicPacketSink {
     /// finish
     pub flow_finish_outputs: Vec<Output<FlowFinishMsg>>,
 
-    /// the statistics of a periodic report
+    /// the statistics needed for each periodic report
     report_start_time: f64,
     received_packets: usize,
     received_sizes: usize,
