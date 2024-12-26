@@ -143,6 +143,8 @@ pub struct PacketStatistics {
     queueing_delays: RandomVar,
     /// the size of the packets
     packet_sizes: RandomVar,
+    #[cfg(feature = "test")]
+    pub packets: Vec<Packet>,
 }
 
 impl Display for PacketStatistics {
@@ -175,6 +177,8 @@ impl PacketStatistics {
             one_way_delays: RandomVar::new(),
             queueing_delays: RandomVar::new(),
             packet_sizes: RandomVar::new(),
+            #[cfg(feature = "test")]
+            packets: Vec::new(),
         }
     }
 
@@ -186,6 +190,8 @@ impl PacketStatistics {
         self.one_way_delays.tabulate(now - packet.creation_time);
         self.queueing_delays.tabulate(packet.queueing_delay);
         self.packet_sizes.tabulate(packet.size as u32);
+        #[cfg(feature = "test")]
+        self.packets.push(packet.clone());
     }
 }
 

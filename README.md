@@ -10,6 +10,14 @@ RUST_LOG=debug daytone configs/simple.toml
 
 where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`.
 
+## Running Unit and Integration Tests
+
+To run both unit and integration tests, use the command:
+
+```sh
+cargo test --features test
+```
+
 ## Configuration Settings
 
 In **Daytone**, all configuration settings are read from a configuration file when a simulation session starts, and the configuration file follows the `TOML` format for the sake of simplicity and readability.
@@ -267,12 +275,12 @@ The scheduling discipline.
 
 #### priorities
 
-- **Valid value**: Vector of (integer, integer), where the first integer is the flow class and the second integer is the priority of this flow class
+- **Valid value**: Vector of integer values, where the index of the vector is the flow class, and the value is the priority of this flow class
 - **Required**: Yes if `dispcipline = "SP"`
 - **Example**:
 
   ```toml
-  priorities = [(0, 2), (1, 1)]
+  priorities = [1, 2]
   ```
 
 #### vticks
