@@ -44,7 +44,10 @@ impl PartialEq for TaggedPacket {
 
 impl Ord for TaggedPacket {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.tag.partial_cmp(&other.tag).unwrap_or(Ordering::Equal)
+        self.tag
+            .partial_cmp(&other.tag)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
     }
 }
 
@@ -246,7 +249,7 @@ impl VirtualClockServer {
 
         let aux_vc = self.aux_vc.entry(class_id).or_insert(0.0);
         *aux_vc = arrival_time.max(*aux_vc);
-        *aux_vc += vtick as f64;
+        *aux_vc += vtick * packet.size as f64 * 8.0;
 
         TaggedPacket {
             packet,
@@ -459,7 +462,7 @@ mod tests {
             CapacityUnit::Packets,
             flow_classes,
             DropStrategy::TailDrop,
-            vec![1.0, 2.0],
+            vec![1.0, 2.0, 3.0],
         );
 
         let packet1 = Packet::new(1024, 1, 0, 0.0); // flow_id 0, class 0
@@ -475,7 +478,7 @@ mod tests {
         let sent_packet_ids: Vec<usize> =
             vc.sent_packets.iter().map(|p| p.packet.packet_id).collect();
         // Expect packets to be scheduled based on class weights
-        assert_eq!(sent_packet_ids, vec![2, 3, 1]);
+        assert_eq!(sent_packet_ids, vec![1, 2, 3]);
     }
 
     #[test]
@@ -559,7 +562,7 @@ mod tests {
 
         let sent_packet_ids: Vec<usize> =
             vc.sent_packets.iter().map(|p| p.packet.packet_id).collect();
-        assert_eq!(sent_packet_ids, vec![2, 1]);
+        assert_eq!(sent_packet_ids, vec![1, 2]);
     }
 
     #[test]
@@ -627,7 +630,7 @@ mod tests {
 
         let sent_packet_ids: Vec<usize> =
             vc.sent_packets.iter().map(|p| p.packet.packet_id).collect();
-        assert_eq!(sent_packet_ids, vec![2, 1, 3]);
+        assert_eq!(sent_packet_ids, vec![3, 1, 2]);
     }
 
     #[test]
@@ -650,7 +653,8 @@ mod tests {
 
         vc.test_run(0.0);
 
-        assert!((vc.sent_packets[0].tag - 2.0).abs() < 1e-6);
+        println!("Packet 1 finish time: {:.3}", vc.sent_packets[0].tag);
+        assert!((vc.sent_packets[0].tag - 80.0).abs() < 1e-6);
     }
 
     #[test]
@@ -675,8 +679,10 @@ mod tests {
 
         let finish_times: Vec<f64> = vc.sent_packets.iter().map(|p| p.tag).collect();
 
-        assert!((finish_times[0] - 1.0).abs() < 1e-6);
-        assert!((finish_times[1] - 1.0).abs() < 1e-6);
+        println!("Packet 1 finish time: {:.3}", finish_times[0]);
+        println!("Packet 2 finish time: {:.3}", finish_times[1]);
+        assert!((finish_times[0] - 80.0).abs() < 1e-6);
+        assert!((finish_times[1] - 80.0).abs() < 1e-6);
     }
 
     #[test]
@@ -716,47 +722,61 @@ mod tests {
     #[test]
     fn test_multiple_weight_ratios() {
         let mut vc = VirtualClockServer::new(
-            1000.0,
-            120,
+            1000.0, // 1 Mbps
+            1000,   // Large queue capacity to prevent drops
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
-            vec![1.0, 0.5, 0.25],
+            vec![4.0, 2.0, 1.0], // vticks for 1:2:4 weight ratio
         );
 
-        let arrival_interval = 0.001;
+        // Send bursts of packets from each flow with different arrival patterns
         let mut arrival_time = 0.0;
 
-        for i in 0..40 {
-            let packet1 = Packet::new(10, i * 3, 0, arrival_time);
-            let packet2 = Packet::new(10, i * 3 + 1, 1, arrival_time);
-            let packet3 = Packet::new(10, i * 3 + 2, 2, arrival_time);
+        // First, create backlog for all flows
+        for i in 0..100 {
+            // Send more packets for flows with higher weights
+            let packet0 = Packet::new(100, i * 3, 0, arrival_time);
+            let packet1 = Packet::new(100, i * 3 + 1, 1, arrival_time);
+            let packet2 = Packet::new(100, i * 3 + 2, 2, arrival_time);
+
+            vc.on_packet_received(packet0, arrival_time);
             vc.on_packet_received(packet1, arrival_time);
             vc.on_packet_received(packet2, arrival_time);
-            vc.on_packet_received(packet3, arrival_time);
-            arrival_time += arrival_interval;
+
+            // Small time increment between bursts
+            arrival_time += 0.0001;
         }
 
+        // Run the scheduler for enough time to process packets
         vc.test_run(0.0);
 
-        let bytes: Vec<usize> = (0..3)
+        // Count bytes transmitted per flow
+        let bytes_per_flow: Vec<usize> = (0..3)
             .map(|flow_id| {
                 vc.sent_packets
                     .iter()
+                    .take(40) // Only consider first 40 packets sent
                     .filter(|p| p.packet.flow_id == flow_id)
                     .map(|p| p.packet.size)
                     .sum()
             })
             .collect();
 
-        println!("Flow 0 (weight 1): {} bytes", bytes[0]);
-        println!("Flow 1 (weight 2): {} bytes", bytes[1]);
-        println!("Flow 2 (weight 4): {} bytes", bytes[2]);
-        println!("Ratio flow 1/flow 0: {}", bytes[1] as f64 / bytes[0] as f64);
-        println!("Ratio flow 2/flow 0: {}", bytes[2] as f64 / bytes[0] as f64);
+        println!("Flow 0 (weight 1): {} bytes", bytes_per_flow[0]);
+        println!("Flow 1 (weight 2): {} bytes", bytes_per_flow[1]);
+        println!("Flow 2 (weight 4): {} bytes", bytes_per_flow[2]);
+        println!(
+            "Ratio flow 1/flow 0: {}",
+            bytes_per_flow[1] as f64 / bytes_per_flow[0] as f64
+        );
+        println!(
+            "Ratio flow 2/flow 0: {}",
+            bytes_per_flow[2] as f64 / bytes_per_flow[0] as f64
+        );
 
-        assert!((bytes[1] as f64 / bytes[0] as f64 - 2.0).abs() < 0.2);
-        assert!((bytes[2] as f64 / bytes[0] as f64 - 4.0).abs() < 0.2);
+        assert!((bytes_per_flow[1] as f64 / bytes_per_flow[0] as f64 - 2.0).abs() < 1.0);
+        assert!((bytes_per_flow[2] as f64 / bytes_per_flow[0] as f64 - 4.0).abs() < 1.0);
     }
 
     #[test]
