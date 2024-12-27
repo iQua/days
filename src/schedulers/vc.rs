@@ -23,6 +23,7 @@ use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, 
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
+#[derive(Clone, Debug)]
 pub struct TaggedPacket {
     pub packet: Packet,
     /// tag is the virtual clock finish time of the packet
@@ -106,6 +107,10 @@ pub struct VirtualClockServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+
+    /// a vector of packets that have been sent out, only used for unit testing
+    #[cfg(test)]
+    sent_packets: Vec<TaggedPacket>,
 }
 
 impl VirtualClockServer {
@@ -153,6 +158,8 @@ impl VirtualClockServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            #[cfg(test)]
+            sent_packets: Vec::new(),
         }
     }
 
@@ -160,10 +167,7 @@ impl VirtualClockServer {
         self.scheduler_id
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
+    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -215,6 +219,12 @@ impl VirtualClockServer {
             arrival_time,
             self.scheduler_queue.len(),
         );
+    }
+
+    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let now = cx.time();
+        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        self.on_packet_received(packet, arrival_time);
 
         if arrival_time >= self.busy_until {
             self.run((), cx);
@@ -249,11 +259,13 @@ impl VirtualClockServer {
         self.output.send(packet).await;
     }
 
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        // schedules one packet with the smallest virtual clock finish time
+    fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
+    where
+        F: FnMut(f64, TaggedPacket),
+    {
         if !self.scheduler_queue.is_empty() {
-            let mut outbound = self.scheduler_queue.pop().unwrap().packet;
+            let tagged_outbound = self.scheduler_queue.pop().unwrap();
+            let mut outbound = tagged_outbound.packet;
             let class_id = (self.flow_classes)(outbound.flow_id);
             let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
             *flow_queue_count -= 1;
@@ -266,17 +278,7 @@ impl VirtualClockServer {
             let timeout = outbound.size as f64 * 8.0 / self.rate;
 
             outbound.departure_update(now + timeout);
-
-            cx.schedule_event(
-                Duration::from_secs_f64(timeout),
-                Self::send,
-                outbound.clone(),
-            )
-            .unwrap();
-
-            // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
-                .unwrap();
+            schedule_events(timeout, tagged_outbound.clone());
 
             self.busy_until = now + timeout;
 
@@ -290,6 +292,54 @@ impl VirtualClockServer {
                 now + timeout,
                 self.scheduler_queue.len(),
             );
+        }
+    }
+
+    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        self.schedule_packets(now, |timeout, outbound| {
+            // schedules the send event
+            cx.schedule_event(
+                Duration::from_secs_f64(timeout),
+                Self::send,
+                outbound.packet.clone(),
+            )
+            .unwrap();
+
+            // schedules the next run
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
+        });
+    }
+
+    #[cfg(test)]
+    pub fn test_run(&mut self, now: f64) {
+        // creates a vector to collect events inside the closure
+        let mut events = Vec::new();
+
+        // calls schedule_packets() without borrowing self inside the closure
+        self.schedule_packets(now, |timeout, mut outbound| {
+            // simulates sending the packet
+            outbound.packet.departure_update(now + timeout);
+
+            // collects the outbound packet and timeout
+            events.push((timeout, outbound));
+        });
+
+        // processes collected events after schedule_packets returns
+        for (timeout, outbound) in events {
+            // updates the sent_packets vector
+            self.sent_packets.push(outbound.clone());
+
+            // updates statistics
+            self.update_stats_on_packet_forwarded(&outbound.packet);
+
+            // updates busy_until
+            self.busy_until = now + timeout;
+
+            // schedules the next run by calling test_run recursively
+            self.test_run(now + timeout);
         }
     }
 
@@ -367,5 +417,34 @@ impl Model for VirtualClockServer {
         }
 
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flows::packet::Packet;
+    use crate::schedulers::drop::{CapacityUnit, DropStrategy};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_single_packet() {
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            HashMap::from([(0, 1)]),
+        );
+
+        let packet = Packet::new(1024, 1, 0, 0.0);
+        vc.on_packet_received(packet.clone(), 0.0);
+
+        assert_eq!(vc.scheduler_queue.len(), 1);
+        assert_eq!(vc.packets_received, 1);
+
+        vc.test_run(0.0);
+        assert!(vc.busy_until > 0.0);
     }
 }
