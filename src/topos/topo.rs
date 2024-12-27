@@ -54,7 +54,7 @@ pub struct SwitchConfig {
     drop: DropStrategy,
     weights: Option<Vec<usize>>,
     priorities: Option<Vec<usize>>,
-    vticks: Option<HashMap<usize, usize>>,
+    vticks: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

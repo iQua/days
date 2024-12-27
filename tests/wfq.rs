@@ -31,12 +31,12 @@ fn test_weighted_fair_queueing() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.0, // 1 packet per second
-            Some(50.0),
+            1.0,         // initial delay
+            Some(100.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.5,
-                high: 1.5,
+                low: 0.05,
+                high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
@@ -52,12 +52,12 @@ fn test_weighted_fair_queueing() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.0, // 1 packet per second
-            Some(50.0),
+            1.0,         // initial delay
+            Some(100.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.5,
-                high: 1.5,
+                low: 0.05,
+                high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
@@ -117,24 +117,24 @@ fn test_weighted_fair_queueing() {
                 info!("{:#.3}", statistics);
 
                 // Ground truth based on WFQ behavior:
-                // Flow 1 (weight 1) and Flow 2 (weight 2) should receive
+                // Flow 0 (weight 1) and Flow 1 (weight 2) should receive
                 // packets in a 1:2 ratio
-                let mut flow1_count = 0;
-                let mut flow2_count = 0;
+                let mut flow0_traffic = 0;
+                let mut flow1_traffic = 0;
 
                 for packet in statistics.packets {
                     match packet.flow_id {
-                        0 => flow1_count += 1,
-                        1 => flow2_count += 1,
+                        0 => flow0_traffic += packet.size,
+                        1 => flow1_traffic += packet.size,
                         _ => panic!("Unexpected flow ID"),
                     }
                 }
 
                 // Verify ratio is approximately 1:2 with a wider tolerance
-                let ratio = flow2_count as f64 / flow1_count as f64;
-                println!("{ratio}");
+                let ratio = flow1_traffic as f64 / flow0_traffic as f64;
+
                 assert!(
-                    ratio >= 1.5 && ratio <= 2.5,
+                    ratio >= 1.7 && ratio <= 2.3,
                     "Expected ratio ~2:1, got {}:1",
                     ratio
                 );

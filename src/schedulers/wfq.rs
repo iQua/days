@@ -370,7 +370,7 @@ impl WFQServer {
         // creates a vector to collect events inside the closure
         let mut events = Vec::new();
 
-        // calls schedule_packets without borrowing self inside the closure
+        // calls schedule_packets() without borrowing self inside the closure
         self.schedule_packets(now, |timeout, mut outbound| {
             // simulates sending the packet
             outbound.packet.departure_update(now + timeout);
