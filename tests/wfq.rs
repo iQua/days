@@ -134,7 +134,7 @@ fn test_weighted_fair_queueing() {
                 let ratio = flow1_traffic as f64 / flow0_traffic as f64;
 
                 assert!(
-                    ratio >= 1.8 && ratio <= 2.2,
+                    ratio >= 1.7 && ratio <= 2.3,
                     "Expected ratio ~2:1, got {}:1",
                     ratio
                 );

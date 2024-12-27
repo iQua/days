@@ -44,10 +44,7 @@ impl PartialEq for TaggedPacket {
 
 impl Ord for TaggedPacket {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.tag
-            .partial_cmp(&other.tag)
-            .unwrap_or(Ordering::Equal)
-            .reverse()
+        self.tag.partial_cmp(&other.tag).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -81,9 +78,9 @@ pub struct VirtualClockServer {
     /// according to their virtual clock finish times
     scheduler_queue: BinaryHeap<TaggedPacket>,
 
-    /// flow_class -> vtick (inverse of the desired rates for the corresponding
-    /// flows, in bits per second)
-    vticks: HashMap<usize, usize>,
+    /// Vector of vtick values (inverse of the desired rates for the corresponding
+    /// flows, in bits per second) using the flow class as the index
+    vticks: Vec<f64>,
 
     /// number of queued packets of each flow class
     flow_queue_count: HashMap<usize, usize>,
@@ -108,6 +105,8 @@ pub struct VirtualClockServer {
     throughput_mean: f64,
     queueing_delay_mean: f64,
 
+    time_packet_sent: f64,
+
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
     sent_packets: Vec<TaggedPacket>,
@@ -120,7 +119,7 @@ impl VirtualClockServer {
         capacity_unit: CapacityUnit,
         flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
-        vticks: HashMap<usize, usize>,
+        vticks: Vec<f64>,
     ) -> VirtualClockServer {
         let scheduler_id = next_scheduler_id();
 
@@ -158,6 +157,7 @@ impl VirtualClockServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            time_packet_sent: 0.0,
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -241,12 +241,12 @@ impl VirtualClockServer {
         // updates the virtual clock for the corresponding flow_class by
         // multiplying vtick (the desired bit time, i.e., the inverse of the
         // desired bits per second data rate) by the size of the packet in bits
-        let vtick = self.vticks.get(&class_id).unwrap();
-        *v_clock += *vtick as f64 * packet.size as f64 * 8.0;
+        let vtick = self.vticks[class_id];
+        *v_clock += vtick * packet.size as f64 * 8.0;
 
         let aux_vc = self.aux_vc.entry(class_id).or_insert(0.0);
         *aux_vc = arrival_time.max(*aux_vc);
-        *aux_vc += *vtick as f64;
+        *aux_vc += vtick as f64;
 
         TaggedPacket {
             packet,
@@ -278,6 +278,8 @@ impl VirtualClockServer {
             let timeout = outbound.size as f64 * 8.0 / self.rate;
 
             outbound.departure_update(now + timeout);
+            self.time_packet_sent = now + timeout;
+
             schedule_events(timeout, tagged_outbound.clone());
 
             self.busy_until = now + timeout;
@@ -435,7 +437,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
-            HashMap::from([(0, 1)]),
+            vec![1.0],
         );
 
         let packet = Packet::new(1024, 1, 0, 0.0);
@@ -446,5 +448,352 @@ mod tests {
 
         vc.test_run(0.0);
         assert!(vc.busy_until > 0.0);
+    }
+
+    #[test]
+    fn test_multiple_flows_different_weights() {
+        let flow_classes = Arc::new(|flow_id| flow_id % 2);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0, 2.0],
+        );
+
+        let packet1 = Packet::new(1024, 1, 0, 0.0); // flow_id 0, class 0
+        let packet2 = Packet::new(1024, 2, 1, 0.0); // flow_id 1, class 1
+        let packet3 = Packet::new(1024, 3, 2, 0.0); // flow_id 2, class 0
+
+        vc.on_packet_received(packet1, 0.0);
+        vc.on_packet_received(packet2, 0.0);
+        vc.on_packet_received(packet3, 0.0);
+
+        vc.test_run(0.0);
+
+        let sent_packet_ids: Vec<usize> =
+            vc.sent_packets.iter().map(|p| p.packet.packet_id).collect();
+        // Expect packets to be scheduled based on class weights
+        assert_eq!(sent_packet_ids, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_queue_overflow() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            2,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0],
+        );
+
+        let packet1 = Packet::new(1024, 1, 0, 0.0);
+        let packet2 = Packet::new(1024, 2, 0, 0.0);
+        let packet3 = Packet::new(1024, 3, 0, 0.0);
+
+        vc.on_packet_received(packet1, 0.0);
+        vc.on_packet_received(packet2, 0.0);
+        vc.on_packet_received(packet3, 0.0);
+
+        assert_eq!(vc.packets_dropped, 1);
+    }
+
+    #[test]
+    fn test_unlimited_capacity_queue() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            0,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0],
+        );
+
+        let packet = Packet::new(1024, 1, 0, 0.0);
+        vc.on_packet_received(packet, 0.0);
+
+        assert_eq!(vc.packets_dropped, 0);
+    }
+
+    #[test]
+    fn test_large_packet_size() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            1500,
+            CapacityUnit::Bytes,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0],
+        );
+
+        let packet = Packet::new(1501, 1, 0, 0.0);
+        vc.on_packet_received(packet, 0.0);
+
+        assert_eq!(vc.packets_dropped, 1);
+    }
+
+    #[test]
+    fn test_packet_ordering_with_same_weights() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0, 1.0],
+        );
+
+        let packet1 = Packet::new(1024, 1, 0, 0.0);
+        let packet2 = Packet::new(1024, 2, 1, 0.1);
+
+        vc.on_packet_received(packet1, 0.0);
+        vc.on_packet_received(packet2, 0.1);
+
+        vc.test_run(0.0);
+
+        let sent_packet_ids: Vec<usize> =
+            vc.sent_packets.iter().map(|p| p.packet.packet_id).collect();
+        assert_eq!(sent_packet_ids, vec![2, 1]);
+    }
+
+    #[test]
+    fn test_packet_departure_time() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0],
+        );
+
+        let packet = Packet::new(1000, 1, 0, 0.0);
+        vc.on_packet_received(packet, 0.0);
+
+        vc.test_run(0.0);
+
+        let expected_transmission_time = (1000.0 * 8.0) / 1e6;
+        assert!((vc.time_packet_sent - expected_transmission_time).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_red_drop_strategy() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::RED,
+            vec![1.0],
+        );
+
+        for i in 0..20 {
+            let packet = Packet::new(1024, i, 0, 0.0);
+            vc.on_packet_received(packet, 0.0);
+        }
+
+        assert!(vc.packets_dropped >= 10);
+    }
+
+    #[test]
+    fn test_flow_class_mapping() {
+        let flow_classes = Arc::new(|flow_id| flow_id % 3);
+        let mut vc = VirtualClockServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0, 2.0, 3.0],
+        );
+
+        let packet1 = Packet::new(1024, 1, 1, 0.0); // flow_id 1 -> class 1
+        let packet2 = Packet::new(1024, 2, 2, 0.0); // flow_id 2 -> class 2
+        let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 3
+
+        vc.on_packet_received(packet2, 0.0);
+        vc.on_packet_received(packet1, 0.0);
+        vc.on_packet_received(packet3, 0.0);
+
+        vc.test_run(0.0);
+
+        let sent_packet_ids: Vec<usize> =
+            vc.sent_packets.iter().map(|p| p.packet.packet_id).collect();
+        assert_eq!(sent_packet_ids, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn test_virtual_time_accuracy() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            100.0,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0, 2.0],
+        );
+
+        let packet1 = Packet::new(10, 1, 0, 0.0);
+        let packet2 = Packet::new(10, 2, 1, 0.0);
+
+        vc.on_packet_received(packet1, 0.0);
+        vc.on_packet_received(packet2, 0.0);
+
+        vc.test_run(0.0);
+
+        assert!((vc.sent_packets[0].tag - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_start_finish_times() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            100.0,
+            10,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0, 1.0],
+        );
+
+        let packet1 = Packet::new(10, 1, 0, 0.0);
+        let packet2 = Packet::new(10, 2, 1, 0.0);
+
+        vc.on_packet_received(packet1, 0.0);
+        vc.on_packet_received(packet2, 0.0);
+
+        vc.test_run(0.0);
+
+        let finish_times: Vec<f64> = vc.sent_packets.iter().map(|p| p.tag).collect();
+
+        assert!((finish_times[0] - 1.0).abs() < 1e-6);
+        assert!((finish_times[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_flow_isolation() {
+        let flow_classes = Arc::new(|flow_id| flow_id);
+        let mut vc = VirtualClockServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            flow_classes,
+            DropStrategy::TailDrop,
+            vec![1.0, 1.0],
+        );
+
+        for i in 0..50 {
+            let packet1 = Packet::new(10, i * 2, 0, 0.0);
+            let packet2 = Packet::new(10, i * 2 + 1, 1, 0.0);
+            vc.on_packet_received(packet1, 0.0);
+            vc.on_packet_received(packet2, 0.0);
+        }
+
+        vc.test_run(0.0);
+
+        let flow0_packets = vc
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 0)
+            .count();
+        let flow1_packets = vc
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 1)
+            .count();
+        assert!((flow0_packets as i32 - flow1_packets as i32).abs() <= 1);
+    }
+
+    #[test]
+    fn test_multiple_weight_ratios() {
+        let mut vc = VirtualClockServer::new(
+            1000.0,
+            120,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1.0, 0.5, 0.25],
+        );
+
+        let arrival_interval = 0.001;
+        let mut arrival_time = 0.0;
+
+        for i in 0..40 {
+            let packet1 = Packet::new(10, i * 3, 0, arrival_time);
+            let packet2 = Packet::new(10, i * 3 + 1, 1, arrival_time);
+            let packet3 = Packet::new(10, i * 3 + 2, 2, arrival_time);
+            vc.on_packet_received(packet1, arrival_time);
+            vc.on_packet_received(packet2, arrival_time);
+            vc.on_packet_received(packet3, arrival_time);
+            arrival_time += arrival_interval;
+        }
+
+        vc.test_run(0.0);
+
+        let bytes: Vec<usize> = (0..3)
+            .map(|flow_id| {
+                vc.sent_packets
+                    .iter()
+                    .filter(|p| p.packet.flow_id == flow_id)
+                    .map(|p| p.packet.size)
+                    .sum()
+            })
+            .collect();
+
+        println!("Flow 0 (weight 1): {} bytes", bytes[0]);
+        println!("Flow 1 (weight 2): {} bytes", bytes[1]);
+        println!("Flow 2 (weight 4): {} bytes", bytes[2]);
+        println!("Ratio flow 1/flow 0: {}", bytes[1] as f64 / bytes[0] as f64);
+        println!("Ratio flow 2/flow 0: {}", bytes[2] as f64 / bytes[0] as f64);
+
+        assert!((bytes[1] as f64 / bytes[0] as f64 - 2.0).abs() < 0.2);
+        assert!((bytes[2] as f64 / bytes[0] as f64 - 4.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_dynamic_flows() {
+        let mut vc = VirtualClockServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            vec![1.0, 1.0],
+        );
+
+        for i in 0..10 {
+            let packet = Packet::new(10, i, 0, 0.0);
+            vc.on_packet_received(packet, 0.0);
+        }
+
+        for i in 10..20 {
+            let packet1 = Packet::new(10, i * 2, 0, 1.0);
+            let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
+            vc.on_packet_received(packet1, 1.0);
+            vc.on_packet_received(packet2, 1.0);
+        }
+
+        vc.test_run(0.0);
+
+        let flow0_packets = vc
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 0)
+            .count();
+        let flow1_packets = vc
+            .sent_packets
+            .iter()
+            .filter(|p| p.packet.flow_id == 1)
+            .count();
+        assert!((flow0_packets as isize - flow1_packets as isize).abs() <= 10);
     }
 }

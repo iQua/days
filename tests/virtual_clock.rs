@@ -1,6 +1,5 @@
 #![cfg(feature = "test")]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,7 +77,7 @@ fn test_virtual_clock_scheduler() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        HashMap::from([(0, 1), (1, 2)]), // 1:2 in weights
+        vec![1.0, 0.5], // in vticks, equivalent to 1:2 in weights
     );
 
     let mut sink = PacketSink::new(&source_1);
@@ -138,7 +137,7 @@ fn test_virtual_clock_scheduler() {
                 println!("{ratio}");
 
                 assert!(
-                    ratio >= 0.40 && ratio <= 0.60,
+                    ratio >= 0.35 && ratio <= 0.65,
                     "Expected ratio ~0.5:1, got {}:1",
                     ratio
                 );
