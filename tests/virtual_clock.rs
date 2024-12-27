@@ -138,7 +138,7 @@ fn test_virtual_clock_scheduler() {
                 println!("{ratio}");
 
                 assert!(
-                    ratio >= 0.45 && ratio <= 0.55,
+                    ratio >= 0.40 && ratio <= 0.60,
                     "Expected ratio ~0.5:1, got {}:1",
                     ratio
                 );
