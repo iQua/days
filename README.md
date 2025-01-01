@@ -18,6 +18,12 @@ To run both unit and integration tests, use the command:
 cargo test --features test
 ```
 
+Or if [cargo-nextest](https://nexte.st/) has been installed (by using the command `brew install cargo-nextest`), run the following command instead to take advantage of its speed and more streamlined user interface:
+
+```sh
+cargo nextest run --all-features
+```
+
 ## Configuration Settings
 
 In **Daytone**, all configuration settings are read from a configuration file when a simulation session starts, and the configuration file follows the `TOML` format for the sake of simplicity and readability.
