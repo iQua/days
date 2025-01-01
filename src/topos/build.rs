@@ -101,10 +101,7 @@ pub fn build_graph(file_path: &str) -> Result<(UnGraph<usize, ()>, Vec<usize>)> 
     let content = fs::read_to_string(file_path)?;
 
     let config: Config = match toml::from_str::<Config>(&content) {
-        Ok(config) => {
-            println!("Deserialized successfully.");
-            config
-        }
+        Ok(config) => config,
         Err(err) => {
             eprintln!("Failed to deserialize: {}", err);
             return Err(TopologyError::TomlParseError(err));
