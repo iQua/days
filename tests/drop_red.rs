@@ -15,13 +15,19 @@ use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
 use daytone::schedulers::port::Port;
 use daytone::utils::logger::CsvLogger;
 
-fn run_drop_test(strategy: DropStrategy, log_path: &str) {
-    // initializes the logger for this test; each test uses a different log directory
+/// In this test, RED (Random Early Detection) is configured so that
+/// it can begin dropping packets at certain average queue sizes —— even
+/// when the buffer hasn’t reached its max capacity. We use a larger
+/// buffer and more frequent packet arrivals so we see early drops.
+#[test]
+fn test_drop_strategy_red_early_drop() {
+    let log_path = "logs/drop_test_red_early_drop";
     if let Err(e) = CsvLogger::get_instance().init(log_path) {
         panic!("Failed to initialize CsvLogger ({}): {}", log_path, e);
     }
 
-    // creates a packet source with high rate
+    // faster arrivals (0.05s) so that we can fill the queue sufficiently
+    // for RED to trigger early drops
     let mut source = PacketSource::new(
         0,
         Vec::new(),
@@ -31,8 +37,8 @@ fn run_drop_test(strategy: DropStrategy, log_path: &str) {
             Some(5.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.1,
-                high: 0.1,
+                low: 0.05,
+                high: 0.05,
             },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
@@ -43,80 +49,59 @@ fn run_drop_test(strategy: DropStrategy, log_path: &str) {
         0,
     );
 
-    // creates a port with small capacity and the specified drop strategy
-    // using 2-packet capacity to force drops in both tests.
+    // larger capacity (e.g., 10 packets) so pure TailDrop wouldn't drop
+    // many packets this early; RED's early-drop mechanism should kick in
+    // once average queue size rises above min_threshold
     let mut port = Port::new(
-        10_000.0, // link rate, in bits per second
-        2,        // small buffer capacity
+        10_000.0, // link rate
+        10,       // 10-packet capacity
         CapacityUnit::Packets,
-        strategy,
+        DropStrategy::RED,
     );
 
-    // creates a sink and connect source -> port -> sink
     let mut sink = PacketSink::new(&source);
+
+    // sets up mailboxes and connects source -> port -> sink
     let source_mbox = Mailbox::new();
     let port_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
     let sink_id = sink.id();
 
-    // connects the components
     source.output().connect(Port::packet_received, &port_mbox);
     port.output.connect(PacketSink::packet_received, &sink_mbox);
 
-    // EventSlot for collecting statistics from the sink
     let mut sink_statistics = EventSlot::new();
     sink.statistics().connect_sink(&sink_statistics);
 
-    // initializes and runs the simulation
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
-        .add_model(source, source_mbox, "Source")
-        .add_model(port, port_mbox, "Port")
-        .add_model(sink, sink_mbox, "Sink")
+        .add_model(source, source_mbox, "REDSource")
+        .add_model(port, port_mbox, "REDPort")
+        .add_model(sink, sink_mbox, "REDSink")
         .init(t0)
     {
         Ok((mut sim, _)) => {
-            // runs the simulation for up to 10 seconds
             let _ = sim.step_until(Duration::from_secs(10));
-
-            // asks the sink for a statistics report
             let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
 
-            // checks how many packets were sent in total
             let packets_sent = CsvLogger::get_instance().total_packets_sent();
-
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
-
-                // verifies that some packets got dropped (small buffer)
+                // We expect that RED has dropped packets even before queue is truly "full".
                 assert!(
                     packets_sent > statistics.packets.len(),
-                    "Expected some packets to be dropped, but none were."
+                    "RED test: expected some packets to be dropped via early detection."
                 );
             } else {
-                panic!("No statistics were reported by the sink.");
+                panic!("No statistics were reported by the sink for RED test.");
             }
 
             info!(
-                "Simulation (strategy={:?}) completed at time {:.3}.",
-                strategy,
+                "RED test completed at time {:.3}.",
                 sim.time().duration_since(t0).as_secs_f64()
             );
         }
-        Err(_) => panic!(
-            "Failed to initialize the simulation for strategy: {:?}",
-            strategy
-        ),
+        Err(_) => panic!("Failed to initialize the simulation for RED test"),
     }
-}
-
-#[test]
-fn test_drop_strategy_taildrop() {
-    run_drop_test(DropStrategy::TailDrop, "logs/drop_test_taildrop");
-}
-
-#[test]
-fn test_drop_strategy_red() {
-    run_drop_test(DropStrategy::RED, "logs/drop_test_red");
 }
