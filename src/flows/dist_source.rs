@@ -142,7 +142,6 @@ impl DistPacketSource {
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
-        println!("{:?}", self.traffic.size);
         self.traffic
             .size
             .exceeded(self.sent_size, self.flow_start_time, now)

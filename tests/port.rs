@@ -34,12 +34,12 @@ fn test_fifo_scheduling() {
             Some(10.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.05,
+                low: 0.1,
                 high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
-                high: 1500,
+                high: 1000,
             },
             None,
         ),
@@ -55,12 +55,12 @@ fn test_fifo_scheduling() {
             Some(10.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.05,
+                low: 0.1,
                 high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 low: 500,
-                high: 1500,
+                high: 1000,
             },
             None,
         ),
@@ -69,8 +69,8 @@ fn test_fifo_scheduling() {
 
     // creates the FIFO port scheduler
     let mut port = Port::new(
-        8000.0, // 8 Mbps
-        100,    // capacity
+        20000.0, // 20 Mbps
+        100,     // capacity
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
