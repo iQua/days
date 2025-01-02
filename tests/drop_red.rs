@@ -88,7 +88,7 @@ fn test_drop_strategy_red_early_drop() {
             let packets_sent = CsvLogger::get_instance().total_packets_sent();
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
-                // We expect that RED has dropped packets even before queue is truly "full".
+                // we expect that RED has dropped packets even before queue is truly "full"
                 assert!(
                     packets_sent > statistics.packets.len(),
                     "RED test: expected some packets to be dropped via early detection."
