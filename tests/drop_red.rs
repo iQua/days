@@ -15,16 +15,19 @@ use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
 use daytone::schedulers::port::Port;
 use daytone::utils::logger::CsvLogger;
 
+/// In this test, RED (Random Early Detection) is configured so that
+/// it can begin dropping packets at certain average queue sizes —— even
+/// when the buffer hasn’t reached its max capacity. We use a larger
+/// buffer and more frequent packet arrivals so we see early drops.
 #[test]
-fn test_drop_strategy() {
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    // initializes the logger
-    if let Err(e) = CsvLogger::get_instance().init("logs/drop_test") {
-        panic!("Failed to initialize CsvLogger: {}", e);
+fn test_drop_strategy_red_early_drop() {
+    let log_path = "logs/drop_test_red_early_drop";
+    if let Err(e) = CsvLogger::get_instance().init(log_path) {
+        panic!("Failed to initialize CsvLogger ({}): {}", log_path, e);
     }
 
-    // creates packet source with high rate
+    // faster arrivals (0.05s) so that we can fill the queue sufficiently
+    // for RED to trigger early drops
     let mut source = PacketSource::new(
         0,
         Vec::new(),
@@ -34,8 +37,8 @@ fn test_drop_strategy() {
             Some(5.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.1,
-                high: 0.1,
+                low: 0.05,
+                high: 0.05,
             },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
@@ -46,63 +49,59 @@ fn test_drop_strategy() {
         0,
     );
 
-    // creates FIFO port with limited capacity
+    // larger capacity (e.g., 10 packets) so pure TailDrop wouldn't drop
+    // many packets this early; RED's early-drop mechanism should kick in
+    // once average queue size rises above min_threshold
     let mut port = Port::new(
-        10000.0, // source rate is 80,000 bits/second
-        2,       // small capacity
+        10_000.0, // link rate
+        10,       // 10-packet capacity
         CapacityUnit::Packets,
-        DropStrategy::TailDrop,
+        DropStrategy::RED,
     );
 
     let mut sink = PacketSink::new(&source);
+
+    // sets up mailboxes and connects source -> port -> sink
     let source_mbox = Mailbox::new();
     let port_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
     let sink_id = sink.id();
 
-    // connects source to port and port to sink
     source.output().connect(Port::packet_received, &port_mbox);
     port.output.connect(PacketSink::packet_received, &sink_mbox);
 
     let mut sink_statistics = EventSlot::new();
     sink.statistics().connect_sink(&sink_statistics);
 
-    // initializes simulation
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
-        .add_model(source, source_mbox, "Source")
-        .add_model(port, port_mbox, "FIFO")
-        .add_model(sink, sink_mbox, "Sink")
+        .add_model(source, source_mbox, "REDSource")
+        .add_model(port, port_mbox, "REDPort")
+        .add_model(sink, sink_mbox, "REDSink")
         .init(t0)
     {
         Ok((mut sim, _)) => {
-            // runs the simulation for 5 seconds
             let _ = sim.step_until(Duration::from_secs(10));
-
-            // requests statistics report
             let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
 
-            // obtains the total number of packets sent
             let packets_sent = CsvLogger::get_instance().total_packets_sent();
-
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
-
-                // Verify that some packets were dropped due to capacity limit
+                // we expect that RED has dropped packets even before queue is truly "full"
                 assert!(
                     packets_sent > statistics.packets.len(),
-                    "Expected packets to be dropped due to capacity limit."
+                    "RED test: expected some packets to be dropped via early detection."
                 );
             } else {
-                panic!("No statistics were reported by the sink.");
+                panic!("No statistics were reported by the sink for RED test.");
             }
 
             info!(
-                "Simulation completed at time {:.3}.",
+                "RED test completed at time {:.3}.",
                 sim.time().duration_since(t0).as_secs_f64()
             );
         }
-        Err(_) => panic!("Failed to initialize the simulation."),
+        Err(_) => panic!("Failed to initialize the simulation for RED test"),
     }
 }
