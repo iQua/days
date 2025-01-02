@@ -86,6 +86,7 @@ fn test_virtual_clock_scheduler() {
     let vc_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
+    let sink_id = sink.id();
 
     // Connect sources to scheduler and scheduler to sink
     source_1
@@ -102,8 +103,8 @@ fn test_virtual_clock_scheduler() {
     // Initialize simulation
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
-        .add_model(source_1, source_1_mbox, "Source1")
-        .add_model(source_2, source_2_mbox, "Source2")
+        .add_model(source_1, source_1_mbox, "Source_1")
+        .add_model(source_2, source_2_mbox, "Source_2")
         .add_model(vc, vc_mbox, "VC")
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
@@ -113,7 +114,7 @@ fn test_virtual_clock_scheduler() {
             let _ = sim.step_until(Duration::from_secs(100));
 
             // Request statistics report
-            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);

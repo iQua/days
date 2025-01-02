@@ -83,6 +83,7 @@ fn test_static_priority_scheduler() {
     let sp_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
+    let sink_id = sink.id();
 
     // connects the output of packet sources to the input of the Static Priority
     // scheduler
@@ -100,8 +101,8 @@ fn test_static_priority_scheduler() {
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
-        .add_model(source_1, source_1_mbox, "Source1")
-        .add_model(source_2, source_2_mbox, "Source2")
+        .add_model(source_1, source_1_mbox, "Source_1")
+        .add_model(source_2, source_2_mbox, "Source_2")
         .add_model(sp, sp_mbox, "SP")
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
@@ -111,7 +112,7 @@ fn test_static_priority_scheduler() {
             let _ = sim.step_until(Duration::from_secs(10));
 
             // requests the packet sink to report statistics
-            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);

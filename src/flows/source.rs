@@ -184,16 +184,12 @@ impl PacketSource {
                 PacketSource::DistPacketSource(_) => (),
                 PacketSource::TCPPacketSource(source) => {
                     let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
                     let (data, interval) = source.datasource.produce_data(now);
 
-                    // TCPPacketSource now owns the data from the application
-                    source.send_buffer += data.size;
+                    if !source.datasource.traffic_exceeded(now) {
+                        // TCPPacketSource now owns the data from the application
+                        source.send_buffer += data.size;
 
-                    if !source
-                        .datasource
-                        .traffic_exceeded(now + interval.as_secs_f64())
-                    {
                         // schedules AppDataSource to send next data
                         cx.schedule_event(interval, Self::fetch_app_data, ())
                             .unwrap();
@@ -230,8 +226,8 @@ impl PacketSource {
 
         match self {
             PacketSource::DistPacketSource(source) => {
-                let interval = source.send_packet(now).await;
-                if !source.traffic_exceeded(now + interval.as_secs_f64()) {
+                if !source.traffic_exceeded(now) {
+                    let interval = source.send_packet(now).await;
                     cx.schedule_event(interval, Self::run, ()).unwrap();
                 }
             }
@@ -282,16 +278,15 @@ impl PacketSource {
             if self.stop_run(now).await {
                 let name = format!("{self}");
 
-                if CsvLogger::get_instance().get_report_interval() < f64::MAX {
-                    match self {
-                        PacketSource::DistPacketSource(source) => {
-                            source.log_report(now, ReportTiming::Final);
-                        }
-                        PacketSource::TCPPacketSource(source) => {
-                            source.log_report(now, ReportTiming::Final);
-                        }
-                    };
-                }
+                // logs the final report
+                match self {
+                    PacketSource::DistPacketSource(source) => {
+                        source.log_report(now, ReportTiming::Final);
+                    }
+                    PacketSource::TCPPacketSource(source) => {
+                        source.log_report(now, ReportTiming::Final);
+                    }
+                };
 
                 // notifies the Progress coroutine that the packet source
                 // finished running

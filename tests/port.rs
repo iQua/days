@@ -1,6 +1,5 @@
 #![cfg(feature = "test")]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use log::info;
@@ -13,34 +12,34 @@ use daytone::flows::sink::PacketSink;
 use daytone::flows::source::PacketSource;
 use daytone::flows::{DistributionInfo, TrafficCharacteristics};
 use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
-use daytone::schedulers::drr::DRRServer;
+use daytone::schedulers::port::Port;
 use daytone::utils::logger::CsvLogger;
 
 #[test]
-fn test_deficit_round_robin() {
+fn test_fifo_scheduling() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    // Initialize the logger
-    if let Err(e) = CsvLogger::get_instance().init("logs/drr_test") {
+    // initializes the logger
+    if let Err(e) = CsvLogger::get_instance().init("logs/port_test") {
         panic!("Failed to initialize CsvLogger: {}", e);
     }
 
-    // Create packet sources with different rates and packet sizes
+    // creates packet sources with different rates
     let mut source_1 = PacketSource::new(
         0,
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.0,         // initial delay
-            Some(100.0), // duration
+            1.0,        // initial delay
+            Some(10.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.05,
+                low: 0.1,
                 high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
-                low: 500,
-                high: 1500,
+                low: 1000,
+                high: 1000,
             },
             None,
         ),
@@ -52,92 +51,87 @@ fn test_deficit_round_robin() {
         Vec::new(),
         FlowType::PacketDistribution,
         TrafficCharacteristics::new(
-            1.0,         // initial delay
-            Some(100.0), // duration
+            1.0,        // initial delay
+            Some(10.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.05,
+                low: 0.1,
                 high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
-                low: 500,
-                high: 1500,
+                low: 1000,
+                high: 1000,
             },
             None,
         ),
         0,
     );
 
-    // Create DRR scheduler with weights 1:2
-    let mut drr = DRRServer::new(
-        8000.0, // 8 Mbps
-        100,
+    // creates the FIFO port scheduler
+    let mut port = Port::new(
+        160000.0, // 160,000 bits/second
+        100,      // capacity
         CapacityUnit::Packets,
-        Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
-        vec![1, 2], // weights
     );
 
     let mut sink = PacketSink::new(&source_1);
     let source_1_mbox = Mailbox::new();
     let source_2_mbox = Mailbox::new();
-    let drr_mbox = Mailbox::new();
+    let port_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
     let sink_id = sink.id();
 
-    // Connect sources to scheduler and scheduler to sink
-    source_1
-        .output()
-        .connect(DRRServer::packet_received, &drr_mbox);
-    source_2
-        .output()
-        .connect(DRRServer::packet_received, &drr_mbox);
-    drr.output.connect(PacketSink::packet_received, &sink_mbox);
+    // connects sources to port and port to sink
+    source_1.output().connect(Port::packet_received, &port_mbox);
+    source_2.output().connect(Port::packet_received, &port_mbox);
+    port.output.connect(PacketSink::packet_received, &sink_mbox);
 
     let mut sink_statistics = EventSlot::new();
     sink.statistics().connect_sink(&sink_statistics);
 
-    // Initialize simulation
+    // initializes the simulation
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
         .add_model(source_1, source_1_mbox, "Source_1")
         .add_model(source_2, source_2_mbox, "Source_2")
-        .add_model(drr, drr_mbox, "DRR")
+        .add_model(port, port_mbox, "FIFO")
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
         Ok((mut sim, _)) => {
-            // Run simulation for 50 seconds to allow scheduler to stabilize
-            let _ = sim.step_until(Duration::from_secs(50));
+            // runs simulation for 20 seconds
+            let _ = sim.step_until(Duration::from_secs(20));
 
-            // Request statistics report
+            // requests statistics report
             let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+
+            // obtains the total number of packets sent
+            let packets_sent = CsvLogger::get_instance().total_packets_sent();
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
 
-                // Ground truth based on DRR behavior:
-                // Flow 0 (weight 1) and Flow 1 (weight 2) should receive
-                // packets in a 1:2 ratio
-                let mut flow0_traffic = 0;
-                let mut flow1_traffic = 0;
+                // verifies the FIFO behavior: packets should be processed in order of arrival
+                let mut prev_arrival = 0.0;
+                let packets_received = statistics.packets.len();
 
                 for packet in statistics.packets {
-                    match packet.flow_id {
-                        0 => flow0_traffic += packet.size,
-                        1 => flow1_traffic += packet.size,
-                        _ => panic!("Unexpected flow ID"),
-                    }
+                    assert!(
+                        packet.time >= prev_arrival,
+                        "Packets not processed in FIFO order."
+                    );
+                    prev_arrival = packet.time;
                 }
+                println!("packets sent: {}", packets_sent);
+                println!("packets received: {}", packets_received);
 
-                // Verify ratio is approximately 1:2 with a wider tolerance
-                let ratio = flow1_traffic as f64 / flow0_traffic as f64;
-
+                // verifies that all packets were processed
+                assert!(packets_received > 0, "No packets were processed.");
                 assert!(
-                    ratio >= 1.5 && ratio <= 2.5,
-                    "Expected ratio ~2:1, got {}:1",
-                    ratio
+                    packets_sent == packets_received,
+                    "Packets were dropped unexpectedly."
                 );
             } else {
                 panic!("No statistics were reported by the sink.");
@@ -147,9 +141,6 @@ fn test_deficit_round_robin() {
                 "Simulation completed at time {:.3}.",
                 sim.time().duration_since(t0).as_secs_f64()
             );
-
-            // Generate CSV files
-            CsvLogger::get_instance().flush_reports();
         }
         Err(_) => panic!("Failed to initialize the simulation."),
     }
