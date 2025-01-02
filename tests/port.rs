@@ -38,7 +38,7 @@ fn test_fifo_scheduling() {
                 high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
-                low: 500,
+                low: 1000,
                 high: 1000,
             },
             None,
@@ -59,7 +59,7 @@ fn test_fifo_scheduling() {
                 high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
-                low: 500,
+                low: 1000,
                 high: 1000,
             },
             None,
@@ -69,8 +69,8 @@ fn test_fifo_scheduling() {
 
     // creates the FIFO port scheduler
     let mut port = Port::new(
-        20000.0, // 20 Mbps
-        100,     // capacity
+        160000.0, // 160,000 bits/second
+        100,      // capacity
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
@@ -167,12 +167,12 @@ fn test_port_capacity() {
             Some(5.0), // duration
             None,
             DistributionInfo::Uniform {
-                low: 0.01,
-                high: 0.02,
+                low: 0.1,
+                high: 0.1,
             },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
-                high: 1500,
+                high: 1000,
             },
             None,
         ),
@@ -181,8 +181,8 @@ fn test_port_capacity() {
 
     // creates FIFO port with limited capacity
     let mut port = Port::new(
-        8000.0, // 8 Mbps
-        10,     // small capacity
+        10000.0, // source rate is 80,000 bits/second
+        2,       // small capacity
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
@@ -213,7 +213,7 @@ fn test_port_capacity() {
             let _ = sim.step_until(Duration::from_secs(10));
 
             // requests statistics report
-            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event(PacketSink::report, 1, &sink_addr);
 
             // obtains the total number of packets sent
             let packets_sent = CsvLogger::get_instance().total_packets_sent();
