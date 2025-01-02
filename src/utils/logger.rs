@@ -219,6 +219,24 @@ impl CsvLogger {
         Ok(())
     }
 
+    #[cfg(feature = "test")]
+    /// Computes the total number of packets sent from source reports.
+    pub fn total_packets_sent(&self) -> usize {
+        let state = self.shared_state.read();
+
+        println!("{:?}", state.source_reports);
+        let total_packets_sent = state
+            .source_reports
+            .iter()
+            .map(|report| {
+                println!("{}", report.sent_packets);
+                report.sent_packets
+            })
+            .sum::<usize>();
+
+        total_packets_sent
+    }
+
     /// Computes sink statistics from sink reports.
     fn compute_sink_statistics(reports: &[PacketSinkReport]) -> (usize, f64) {
         let total_packets = reports

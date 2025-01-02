@@ -278,10 +278,13 @@ impl PacketSource {
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             self.send_packet(cx).await;
+            println!("Packet sent: {}", now);
 
             if self.stop_run(now).await {
                 let name = format!("{self}");
+                println!("Traffic stopped: {}", name);
 
+                println!("{}", CsvLogger::get_instance().get_report_interval());
                 if CsvLogger::get_instance().get_report_interval() < f64::MAX {
                     match self {
                         PacketSource::DistPacketSource(source) => {

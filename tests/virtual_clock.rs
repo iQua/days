@@ -102,8 +102,8 @@ fn test_virtual_clock_scheduler() {
     // Initialize simulation
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
-        .add_model(source_1, source_1_mbox, "Source1")
-        .add_model(source_2, source_2_mbox, "Source2")
+        .add_model(source_1, source_1_mbox, "Source_1")
+        .add_model(source_2, source_2_mbox, "Source_2")
         .add_model(vc, vc_mbox, "VC")
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
