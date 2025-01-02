@@ -84,6 +84,7 @@ fn test_weighted_fair_queueing() {
     let wfq_mbox = Mailbox::new();
     let sink_mbox = Mailbox::new();
     let sink_addr = sink_mbox.address();
+    let sink_id = sink.id();
 
     // Connect sources to scheduler and scheduler to sink
     source_1
@@ -111,7 +112,7 @@ fn test_weighted_fair_queueing() {
             let _ = sim.step_until(Duration::from_secs(50));
 
             // Request statistics report
-            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);

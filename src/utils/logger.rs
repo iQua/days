@@ -224,14 +224,10 @@ impl CsvLogger {
     pub fn total_packets_sent(&self) -> usize {
         let state = self.shared_state.read();
 
-        println!("{:?}", state.source_reports);
         let total_packets_sent = state
             .source_reports
             .iter()
-            .map(|report| {
-                println!("{}", report.sent_packets);
-                report.sent_packets
-            })
+            .map(|report| report.sent_packets)
             .sum::<usize>();
 
         total_packets_sent
