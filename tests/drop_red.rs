@@ -102,6 +102,6 @@ fn test_drop_strategy_red_early_drop() {
                 sim.time().duration_since(t0).as_secs_f64()
             );
         }
-        Err(_) => panic!("Failed to initialize the simulation for RED test"),
+        Err(_) => panic!("Failed to initialize the simulation for RED test."),
     }
 }

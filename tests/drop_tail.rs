@@ -99,6 +99,6 @@ fn test_drop_strategy_taildrop_small_buffer() {
                 sim.time().duration_since(t0).as_secs_f64()
             );
         }
-        Err(_) => panic!("Failed to initialize the simulation for TailDrop test"),
+        Err(_) => panic!("Failed to initialize the simulation for TailDrop test."),
     }
 }
