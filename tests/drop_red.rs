@@ -49,12 +49,12 @@ fn test_drop_strategy_red_early_drop() {
         0,
     );
 
-    // larger capacity (e.g., 10 packets) so pure TailDrop wouldn't drop
-    // many packets this early; RED's early-drop mechanism should kick in
+    // opted for a larger capacity (e.g., 10 packets) so pure TailDrop wouldn't
+    // drop many packets this early; RED's early-drop mechanism should kick in
     // once average queue size rises above min_threshold
     let mut port = Port::new(
-        10_000.0, // link rate
-        10,       // 10-packet capacity
+        140_000.0, // link rate
+        10,        // 10-packet capacity
         CapacityUnit::Packets,
         DropStrategy::RED,
     );

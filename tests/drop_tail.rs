@@ -36,8 +36,8 @@ fn test_drop_strategy_taildrop_small_buffer() {
             Some(5.0), // run 5 seconds
             None,
             DistributionInfo::Uniform {
-                low: 0.1,
-                high: 0.1,
+                low: 0.05,
+                high: 0.05,
             },
             DistributionInfo::DiscreteUniform {
                 low: 1000,
@@ -50,8 +50,8 @@ fn test_drop_strategy_taildrop_small_buffer() {
 
     // a low-capacity (2 packets) TailDrop queue—will only drop when full
     let mut port = Port::new(
-        10_000.0, // link rate (bits per second)
-        2,        // 2-packet capacity
+        150_000.0, // link rate (bits per second)
+        2,         // 2-packet capacity
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
     );
