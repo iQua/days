@@ -221,13 +221,14 @@ impl PacketSource {
         }
     }
 
-    async fn send_packet(&mut self, cx: &Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
+    async fn send_packet(&mut self, cx: &Context<Self>, now: f64) {
         match self {
             PacketSource::DistPacketSource(source) => {
                 if !source.traffic_exceeded(now) {
                     let interval = source.send_packet(now).await;
+                    // updates the locally maintained simulation time
+                    source.time = now + interval.as_secs_f64();
+                    // schedules the next packet to be sent
                     cx.schedule_event(interval, Self::run, ()).unwrap();
                 }
             }
@@ -271,9 +272,33 @@ impl PacketSource {
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            // To be removed after more thorough testing
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-            self.send_packet(cx).await;
+            // retrieves the current simulation time from the locally stored simulation time
+            let mut now = match self {
+                PacketSource::DistPacketSource(source) => source.time,
+                PacketSource::TCPPacketSource(source) => source.time,
+            };
+
+            if now == 0.0 {
+                now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+                // updates the locally maintained simulation time
+                match self {
+                    PacketSource::DistPacketSource(source) => {
+                        source.time = now;
+                    }
+                    PacketSource::TCPPacketSource(source) => {
+                        source.time = now;
+                    }
+                }
+            }
+
+            // To be removed after more thorough testing
+            assert_eq!(now, global_time);
+
+            self.send_packet(cx, now).await;
 
             if self.stop_run(now).await {
                 let name = format!("{self}");
