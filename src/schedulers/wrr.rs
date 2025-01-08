@@ -196,54 +196,64 @@ impl WRRServer {
     /// moves on to the next queue if the current queue is empty or has sent its weight worth of packets
     fn next_queue(&mut self) {
         self.current_queue = (self.current_queue + 1) % self.queues.len();
-        // Reset counts only when we complete a full cycle
-        if self.current_queue == 0 {
-            for count in self.packets_sent_in_round.iter_mut() {
-                *count = 0;
-            }
-        }
     }
 
     fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
     where
         F: FnMut(f64, Packet),
     {
-        // Iterate through all queues based on their weights
-        for _ in 0..self.weights.len() {
-            if self.packets_waiting == 0 {
-                return;
+        // Return if no packets are waiting
+        if self.packets_waiting == 0 {
+            return;
+        }
+
+        // Keep track of whether we found a packet to send in this iteration
+        let mut packet_sent = false;
+
+        // Try to send a packet from the current queue if it hasn't exceeded its weight
+        if !self.queues[self.current_queue].is_empty()
+            && self.packets_sent_in_round[self.current_queue] < self.weights[self.current_queue]
+        {
+            if let Some(mut outbound) = self.queues[self.current_queue].pop_front() {
+                self.byte_sizes[self.current_queue] -= outbound.size;
+                outbound.queueing_delay_update(now);
+
+                self.packets_waiting -= 1;
+                self.packets_sent_in_round[self.current_queue] += 1;
+
+                let transmission_time = (outbound.size as f64 * 8.0) / self.rate;
+
+                schedule_events(transmission_time, outbound.clone());
+                self.busy_until = now + transmission_time;
+                packet_sent = true;
+
+                debug!(
+                    "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                    {} packets in the class queue.",
+                    self.scheduler_id,
+                    outbound.packet_id,
+                    outbound.size,
+                    outbound.flow_id,
+                    now + transmission_time,
+                    self.queues[self.current_queue].len(),
+                );
             }
+        }
 
-            // Check if current queue has packets and hasn't exceeded its weight
-            if !self.queues[self.current_queue].is_empty()
-                && self.packets_sent_in_round[self.current_queue] < self.weights[self.current_queue]
-            {
-                if let Some(mut outbound) = self.queues[self.current_queue].pop_front() {
-                    self.byte_sizes[self.current_queue] -= outbound.size;
-                    outbound.queueing_delay_update(now);
+        // Move to next queue if:
+        // 1. Current queue is empty, or
+        // 2. Current queue has sent its weight worth of packets
+        if !packet_sent
+            || self.packets_sent_in_round[self.current_queue] >= self.weights[self.current_queue]
+        {
+            self.next_queue();
 
-                    self.packets_waiting -= 1;
-                    self.packets_sent_in_round[self.current_queue] += 1;
-
-                    let transmission_time = (outbound.size as f64 * 8.0) / self.rate;
-
-                    schedule_events(transmission_time, outbound.clone());
-                    self.busy_until = now + transmission_time;
-
-                    debug!(
-                        "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
-                        {} packets in the class queue.",
-                        self.scheduler_id,
-                        outbound.packet_id,
-                        outbound.size,
-                        outbound.flow_id,
-                        now + transmission_time,
-                        self.queues[self.current_queue].len(),
-                    );
+            // If we've completed a round (back to queue 0), reset the counters
+            if self.current_queue == 0 {
+                for count in self.packets_sent_in_round.iter_mut() {
+                    *count = 0;
                 }
             }
-
-            self.next_queue();
         }
     }
 
