@@ -224,20 +224,21 @@ impl WRRServer {
                 outbound.queueing_delay_update(now);
 
                 self.packets_waiting -= 1;
-                self.packets_sent += 1;
+                self.packets_sent_in_round[self.current_queue] += 1;
 
-                schedule_events(timeout, outbound.clone());
+                let transmission_time = (outbound.size as f64 * 8.0) / self.rate;
 
-                self.busy_until = now + timeout;
+                schedule_events(transmission_time, outbound.clone());
+                self.busy_until = now + transmission_time;
 
                 debug!(
                     "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
-                       {} packets in the class queue.",
+                    {} packets in the class queue.",
                     self.scheduler_id,
                     outbound.packet_id,
                     outbound.size,
                     outbound.flow_id,
-                    now + timeout,
+                    now + transmission_time,
                     self.queues[self.current_queue].len(),
                 );
 
@@ -268,12 +269,12 @@ impl WRRServer {
         let mut events = Vec::new();
 
         // calls schedule_packets() without borrowing self inside the closure
-        self.schedule_packets(now, |timeout, outbound| {
+        self.schedule_packets(now, |transmission_time, mut outbound| {
             // simulates sending the packet
-            outbound.departure_update(now + timeout);
+            outbound.departure_update(now + transmission_time);
 
-            // collects the outbound packet and timeout
-            events.push((timeout, outbound));
+            // collects the outbound packet and transmission_time
+            events.push((transmission_time, outbound));
         });
 
         // processes collected events after schedule_packets returns
@@ -459,31 +460,36 @@ mod tests {
             1000.0,
             100,
             CapacityUnit::Packets,
-            Arc::new(|flow_id| flow_id),
+            Arc::new(|flow_id| flow_id % 3), // Map to three classes
             DropStrategy::TailDrop,
-            vec![4, 2, 1], // 4:2:1 ratio
+            vec![4, 2, 1], // Weights for classes 0, 1, 2
         );
 
-        // Send many packets to all flows
+        // Send packets to different flows mapped to classes 0, 1, and 2
         for i in 0..70 {
-            wrr.on_packet_received(Packet::new(10, i * 3, 0, 0.0), 0.0);     // Flow 0
-            wrr.on_packet_received(Packet::new(10, i * 3 + 1, 1, 0.0), 0.0); // Flow 1
-            wrr.on_packet_received(Packet::new(10, i * 3 + 2, 2, 0.0), 0.0); // Flow 2
+            wrr.on_packet_received(Packet::new(10, i * 3, 0, 0.0), 0.0);     // Flow 0 -> class 0
+            wrr.on_packet_received(Packet::new(10, i * 3 + 1, 1, 0.0), 0.0); // Flow 1 -> class 1
+            wrr.on_packet_received(Packet::new(10, i * 3 + 2, 2, 0.0), 0.0); // Flow 2 -> class 2
         }
 
         wrr.test_run(0.0);
 
-        // Count packets sent from each flow
-        let flow0_count = wrr.sent_packets.iter().filter(|p| p.flow_id == 0).count();
-        let flow1_count = wrr.sent_packets.iter().
-            let flow1_count = wrr.sent_packets.iter().filter(|p| p.flow_id == 1).count();
-             let flow2_count = wrr.sent_packets.iter().filter(|p| p.flow_id == 2).count();
+        // Count packets sent from each class
+        let flow0_count = wrr.sent_packets.iter()
+            .filter(|p| p.flow_id == 0)
+            .count();
+        let flow1_count = wrr.sent_packets.iter()
+            .filter(|p| p.flow_id == 1)
+            .count();
+        let flow2_count = wrr.sent_packets.iter()
+            .filter(|p| p.flow_id == 2)
+            .count();
 
-             // Check that packet counts roughly match weight ratios (4:2:1)
-             // Allow for some deviation due to rounding
-             assert!(((flow0_count as f64 / flow2_count as f64) - 4.0).abs() < 0.5);
-             assert!(((flow1_count as f64 / flow2_count as f64) - 2.0).abs() < 0.5);
-         }
+        // Check that packet counts roughly match weight ratios (4:2:1)
+        // Allow for some deviation due to rounding
+        assert!(((flow0_count as f64 / flow2_count as f64) - 4.0).abs() < 0.5);
+        assert!(((flow1_count as f64 / flow2_count as f64) - 2.0).abs() < 0.5);
+    }
 
          #[test]
          fn test_red_drop_strategy() {
@@ -503,86 +509,86 @@ mod tests {
              }
 
              assert!(wrr.packets_dropped > 0);
-             assert!(wrr.scheduler_queue.len() < 20);
+             assert!(wrr.queues.iter().map(|q| q.len()).sum::<usize>() < 20);
          }
 
-         #[test]
-         fn test_flow_class_mapping() {
-             let mut wrr = WRRServer::new(
-                 1e6,
-                 10,
-                 CapacityUnit::Packets,
-                 Arc::new(|flow_id| flow_id % 2), // Map flows to two classes
-                 DropStrategy::TailDrop,
-                 vec![2, 1], // 2:1 weight ratio
-             );
+    #[test]
+    fn test_flow_class_mapping() {
+        let mut wrr = WRRServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id % 2), // Ensure mapping within two classes
+            DropStrategy::TailDrop,
+            vec![2, 1], // Weights: class 0 has weight 2, class 1 has weight 1
+        );
 
-             // Send packets from multiple flows
-             let packet1 = Packet::new(1024, 1, 0, 0.0); // Maps to class 0
-             let packet2 = Packet::new(1024, 2, 1, 0.0); // Maps to class 1
-             let packet3 = Packet::new(1024, 3, 2, 0.0); // Maps to class 0
-             let packet4 = Packet::new(1024, 4, 3, 0.0); // Maps to class 1
+        // Send packets from multiple flows
+        let packet1 = Packet::new(1024, 1, 0, 0.0); // Maps to class 0
+        let packet2 = Packet::new(1024, 2, 1, 0.0); // Maps to class 1
+        let packet3 = Packet::new(1024, 3, 0, 0.0); // Maps to class 0
+        let packet4 = Packet::new(1024, 4, 1, 0.0); // Maps to class 1
 
-             wrr.on_packet_received(packet1, 0.0);
-             wrr.on_packet_received(packet2, 0.0);
-             wrr.on_packet_received(packet3, 0.0);
-             wrr.on_packet_received(packet4, 0.0);
+        wrr.on_packet_received(packet1, 0.0);
+        wrr.on_packet_received(packet2, 0.0);
+        wrr.on_packet_received(packet3, 0.0);
+        wrr.on_packet_received(packet4, 0.0);
 
-             wrr.test_run(0.0);
+        wrr.test_run(0.0);
 
-             let class0_packets = wrr.sent_packets.iter()
-                 .filter(|p| p.flow_id % 2 == 0)
-                 .count();
-             let class1_packets = wrr.sent_packets.iter()
-                 .filter(|p| p.flow_id % 2 == 1)
-                 .count();
+        let class0_packets = wrr.sent_packets.iter()
+            .filter(|p| p.flow_id % 2 == 0) // Flow IDs 0 and 2 map to class 0
+            .count();
+        let class1_packets = wrr.sent_packets.iter()
+            .filter(|p| p.flow_id % 2 == 1) // Flow IDs 1 and 3 map to class 1
+            .count();
 
-             // Class 0 should get twice as many packets as class 1
-             assert_eq!(class0_packets, 2 * class1_packets);
-         }
+        // Class 0 should get twice as many packets as class 1
+        assert_eq!(class0_packets, 2 * class1_packets);
+    }
 
-         #[test]
-         fn test_dynamic_flows() {
-             let mut wrr = WRRServer::new(
-                 1000.0,
-                 100,
-                 CapacityUnit::Packets,
-                 Arc::new(|flow_id| flow_id),
-                 DropStrategy::TailDrop,
-                 vec![1, 1], // Equal weights
-             );
+    #[test]
+    fn test_dynamic_flows() {
+        let mut wrr = WRRServer::new(
+            1000.0,
+            100,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id % 2), // Map to two classes
+            DropStrategy::TailDrop,
+            vec![1, 1], // Equal weights for two classes
+        );
 
-             // First phase: only send to flow 0
-             for i in 0..10 {
-                 let packet = Packet::new(10, i, 0, 0.0);
-                 wrr.on_packet_received(packet, 0.0);
-             }
+        // First phase: only send to flow 0 (class 0)
+        for i in 0..10 {
+            let packet = Packet::new(10, i, 0, 0.0);
+            wrr.on_packet_received(packet, 0.0);
+        }
 
-             // Second phase: send to both flows
-             for i in 10..20 {
-                 let packet1 = Packet::new(10, i * 2, 0, 1.0);
-                 let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
-                 wrr.on_packet_received(packet1, 1.0);
-                 wrr.on_packet_received(packet2, 1.0);
-             }
+        // Second phase: send to both flows
+        for i in 10..20 {
+            let packet1 = Packet::new(10, i * 2, 0, 1.0); // Flow 0 -> class 0
+            let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0); // Flow 1 -> class 1
+            wrr.on_packet_received(packet1, 1.0);
+            wrr.on_packet_received(packet2, 1.0);
+        }
 
-             wrr.test_run(0.0);
+        wrr.test_run(0.0);
 
-             // Count packets in second phase
-             let phase2_packets = wrr.sent_packets.iter()
-                 .filter(|p| p.time >= 1.0)
-                 .collect::<Vec<_>>();
+        // Count packets in second phase
+        let phase2_packets = wrr.sent_packets.iter()
+            .filter(|p| p.time >= 1.0)
+            .collect::<Vec<_>>();
 
-             let flow0_phase2 = phase2_packets.iter()
-                 .filter(|p| p.flow_id == 0)
-                 .count();
-             let flow1_phase2 = phase2_packets.iter()
-                 .filter(|p| p.flow_id == 1)
-                 .count();
+        let flow0_phase2 = phase2_packets.iter()
+            .filter(|p| p.flow_id == 0)
+            .count();
+        let flow1_phase2 = phase2_packets.iter()
+            .filter(|p| p.flow_id == 1)
+            .count();
 
-             // In second phase, flows should get equal treatment
-             assert!((flow0_phase2 as i32 - flow1_phase2 as i32).abs() <= 1);
-         }
+        // In second phase, flows should get equal treatment
+        assert!((flow0_phase2 as i32 - flow1_phase2 as i32).abs() <= 1);
+    }
 
          #[test]
          fn test_empty_queues() {
