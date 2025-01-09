@@ -197,19 +197,15 @@ impl WRRServer {
     where
         F: FnMut(f64, Packet),
     {
-        // Return if no packets are waiting
-        if self.packets_waiting == 0 {
-            return;
-        }
+        loop {
+            // Return if no packets are waiting
+            if self.packets_waiting == 0 {
+                return;
+            }
 
-        let start_queue = self.current_queue;
-        let mut checked_all_queues = false;
-
-        while !checked_all_queues {
-            // Try to send a packet from the current queue if it hasn't exceeded its weight
-            if !self.queues[self.current_queue].is_empty()
-                && self.packets_sent_in_round[self.current_queue] < self.weights[self.current_queue]
-            {
+            // sends packets from the current queue according to its weight,
+            // which is an integer indicating the number of packets to be sent in this round
+            for _ in 0..self.weights[self.current_queue] {
                 if let Some(mut outbound) = self.queues[self.current_queue].pop_front() {
                     self.byte_sizes[self.current_queue] -= outbound.size;
                     outbound.queueing_delay_update(now);
@@ -233,28 +229,13 @@ impl WRRServer {
                         self.queues[self.current_queue].len(),
                     );
                     return;
+                } else {
+                    break;
                 }
             }
 
-            // Move to next queue if current queue is done
-            if self.queues[self.current_queue].is_empty()
-                || self.packets_sent_in_round[self.current_queue]
-                    >= self.weights[self.current_queue]
-            {
-                self.current_queue = (self.current_queue + 1) % self.queues.len();
-
-                // Reset counters if we've completed a round
-                if self.current_queue == 0 {
-                    for count in self.packets_sent_in_round.iter_mut() {
-                        *count = 0;
-                    }
-                }
-
-                // Check if we've checked all queues
-                if self.current_queue == start_queue {
-                    checked_all_queues = true;
-                }
-            }
+            // moves to the next queue
+            self.current_queue = (self.current_queue + 1) % self.queues.len();
         }
     }
 
