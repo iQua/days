@@ -1,4 +1,5 @@
 //! Implements a Weighted Round Robin (WRR) scheduler.
+//! https://en.wikipedia.org/wiki/Weighted_fair_queueing
 
 use std::collections::VecDeque;
 use std::sync::Arc;
