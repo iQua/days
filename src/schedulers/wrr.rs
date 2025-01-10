@@ -517,52 +517,68 @@ mod tests {
 
     #[test]
     fn test_flow_class_mapping() {
+        // uses a capacity to 12 so none of the packets are dropped
         let mut wrr = WRRServer::new(
-            1e6, // Server rate: 1 Mbps
-            10,  // Capacity: 10 packets
+            1e6, // server rate (1 Mbps)
+            12,  // capacity: 12 packets
             CapacityUnit::Packets,
-            Arc::new(|flow_id| flow_id % 3), // Map flows to 3 classes
+            Arc::new(|flow_id| flow_id % 3), // maps flows to 3 classes
             DropStrategy::TailDrop,
-            vec![1, 2, 3], // Weights for classes 0, 1, 2 respectively
+            vec![1, 2, 3], // weights for classes 0, 1, 2
         );
 
-        // Send packets mapped to classes based on flow_id
+        // We want two "rounds" of WRR with ratio 1:2:3, so each class needs:
+        // Class 0: 2 packets
+        // Class 1: 4 packets
+        // Class 2: 6 packets
+        // That totals 12 packets. Each flow_id % 3 = class.
+        // flow_ids that go to class 0: 0, 3
+        // flow_ids that go to class 1: 1, 4, 7, 10
+        // flow_ids that go to class 2: 2, 5, 8, 11, 14, 17 (we only need 6 of these).
+
         let packets = vec![
-            Packet::new(1024, 1, 0, 0.0), // flow_id 0 -> class 0
-            Packet::new(1024, 2, 1, 0.0), // flow_id 1 -> class 1
-            Packet::new(1024, 3, 2, 0.0), // flow_id 2 -> class 2
-            Packet::new(1024, 4, 0, 0.0), // flow_id 0 -> class 0
-            Packet::new(1024, 5, 1, 0.0), // flow_id 1 -> class 1
-            Packet::new(1024, 6, 2, 0.0), // flow_id 2 -> class 2
+            // Class 0 (flow_id multiples of 3)
+            Packet::new(1024, 0, 0, 0.0),
+            Packet::new(1024, 3, 0, 0.0),
+            // Class 1 (flow_id ≡ 1 mod 3)
+            Packet::new(1024, 1, 1, 0.0),
+            Packet::new(1024, 4, 1, 0.0),
+            Packet::new(1024, 7, 1, 0.0),
+            Packet::new(1024, 10, 1, 0.0),
+            // Class 2 (flow_id ≡ 2 mod 3)
+            Packet::new(1024, 2, 2, 0.0),
+            Packet::new(1024, 5, 2, 0.0),
+            Packet::new(1024, 8, 2, 0.0),
+            Packet::new(1024, 11, 2, 0.0),
+            Packet::new(1024, 14, 2, 0.0),
+            Packet::new(1024, 17, 2, 0.0),
         ];
 
         for packet in &packets {
             wrr.on_packet_received(packet.clone(), 0.0);
         }
 
+        // runs the WRR at time = 0.0
         wrr.test_run(0.0);
 
-        // Counts sent packets per class
+        // counts how many packets each queue actually sent
         let class0_packets = wrr
             .sent_packets
             .iter()
-            .filter(|p| (p.flow_id % 3) == 0)
+            .filter(|p| p.flow_id % 3 == 0)
             .count();
         let class1_packets = wrr
             .sent_packets
             .iter()
-            .filter(|p| (p.flow_id % 3) == 1)
+            .filter(|p| p.flow_id % 3 == 1)
             .count();
         let class2_packets = wrr
             .sent_packets
             .iter()
-            .filter(|p| (p.flow_id % 3) == 2)
+            .filter(|p| p.flow_id % 3 == 2)
             .count();
 
-        // Expected distribution based on weights [1, 2, 3]:
-        // class0: 1 packet per round * 2 rounds = 2 packets
-        // class1: 2 packets per round * 2 rounds = 4 packets
-        // class2: 3 packets per round * 2 rounds = 6 packets
+        // Now the test can truly expect 2, 4, and 6.
         assert_eq!(class0_packets, 2, "Class 0 should have sent 2 packets");
         assert_eq!(class1_packets, 4, "Class 1 should have sent 4 packets");
         assert_eq!(class2_packets, 6, "Class 2 should have sent 6 packets");
