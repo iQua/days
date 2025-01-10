@@ -33,6 +33,9 @@ pub struct WRRServer {
     /// weights of classes, which are consecutive and start from 0
     weights: Vec<usize>,
 
+    /// number of packets sent in current round for each class
+    packets_sent_in_round: Vec<usize>,
+
     /// the number of packets received, dropped, in the queues waiting to be
     /// sent, and forwarded
     packets_received: usize,
@@ -78,10 +81,12 @@ impl WRRServer {
     ) -> WRRServer {
         let mut byte_sizes = Vec::new();
         let mut queues = Vec::new();
+        let mut packets_sent_in_round = Vec::new();
 
         for _ in weights.iter() {
             byte_sizes.push(0);
             queues.push(VecDeque::new());
+            packets_sent_in_round.push(0);
         }
 
         let scheduler_id = next_scheduler_id();
@@ -104,6 +109,7 @@ impl WRRServer {
             flow_classes,
             drop_strategy: packet_drop,
             weights,
+            packets_sent_in_round,
             packets_received: 0,
             packets_dropped: 0,
             packets_waiting: 0,
@@ -198,14 +204,17 @@ impl WRRServer {
                 return;
             }
 
-            // sends packets from the current queue according to its weight,
-            // which is an integer indicating the number of packets to be sent in this round
-            for _ in 0..self.weights[self.current_queue] {
+            // sends a single packet from the current queue according to its weight, which is an
+            // integer indicating the number of packets to be sent in this round
+            if !self.queues[self.current_queue].is_empty()
+                && self.packets_sent_in_round[self.current_queue] < self.weights[self.current_queue]
+            {
                 if let Some(mut outbound) = self.queues[self.current_queue].pop_front() {
                     self.byte_sizes[self.current_queue] -= outbound.size;
                     outbound.queueing_delay_update(now);
 
                     self.packets_waiting -= 1;
+                    self.packets_sent_in_round[self.current_queue] += 1;
 
                     let transmission_time = (outbound.size as f64 * 8.0) / self.rate;
 
@@ -223,12 +232,11 @@ impl WRRServer {
                         self.queues[self.current_queue].len(),
                     );
                     return;
-                } else {
-                    break;
                 }
             }
 
             // moves to the next queue
+            self.packets_sent_in_round[self.current_queue] = 0;
             self.current_queue = (self.current_queue + 1) % self.queues.len();
         }
     }
