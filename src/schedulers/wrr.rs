@@ -569,6 +569,21 @@ mod tests {
         // runs the WRR at time = 0.0
         wrr.test_run(0.0);
 
+        // Split sent packets into rounds (each round sends 6 packets)
+        let mut rounds: Vec<Vec<usize>> = vec![vec![], vec![]];
+        for (i, packet) in wrr.sent_packets.iter().enumerate() {
+            let round = i / 6;
+            rounds[round].push(packet.packet_id);
+        }
+
+        // Expected packet IDs for each round
+        let expected_round1 = vec![0, 1, 4, 2, 5, 8];
+        let expected_round2 = vec![3, 7, 10, 11, 14, 17];
+
+        // Assert that packets sent in each round match the expected IDs
+        assert_eq!(rounds[0], expected_round1, "Round 1 packet IDs mismatch");
+        assert_eq!(rounds[1], expected_round2, "Round 2 packet IDs mismatch");
+
         // counts how many packets each queue actually sent
         let class0_packets: Vec<usize> = wrr
             .sent_packets
