@@ -273,7 +273,7 @@ The scheduling discipline.
 #### weights
 
 - **Valid value**: Vector of integers
-- **Required**: Yes if `dispcipline = "DRR"` or `dispcipline = "WFQ"`
+- **Required**: Yes if `discipline = "DRR"` or `discipline = "WFQ"` or `discipline = "WRR"`
 - **Example**:
 
   ```toml
@@ -283,7 +283,7 @@ The scheduling discipline.
 #### priorities
 
 - **Valid value**: Vector of integer values, where the index of the vector is the flow class, and the value is the priority of this flow class
-- **Required**: Yes if `dispcipline = "SP"`
+- **Required**: Yes if `discipline = "SP"`
 - **Example**:
 
   ```toml
@@ -292,12 +292,12 @@ The scheduling discipline.
 
 #### vticks
 
-- **Valid value**: Vector of (integer, integer), where the first integer is the flow class and the second integer is the inverse of the desired rates for the corresponding flows, in bits per second
-- **Required**: Yes if `dispcipline = "VC"`
+- **Valid value**: Vector of double-precision floating point values, where the index of the vector is the flow class, and the value is the inverse of the desired rates for the corresponding flows, in bits per second, called `vticks`
+- **Required**: Yes if `discipline = "VC"`
 - **Example**:
 
   ```toml
-  vticks = [(0, 2), (1, 1)]
+  vticks = [2, 1]
   ```
 
 ### Flow

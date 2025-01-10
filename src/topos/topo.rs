@@ -29,6 +29,7 @@ use crate::schedulers::port::Port;
 use crate::schedulers::sp::SPServer;
 use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
+use crate::schedulers::wrr::WRRServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::utils::logger::CsvLogger;
@@ -340,8 +341,13 @@ impl Topology {
 
         match self.switch_config.discipline {
             SchedulingDiscipline::DRR => {
-                let weights = self.switch_config.weights.as_ref().unwrap();
+                let weights = self.switch_config.weights.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "`weights` must be provided for Deficit Round Robin scheduling discipline."
+                    )
+                });
                 let weights_len = weights.len();
+
                 let mut drr_server = DRRServer::new(
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
@@ -385,8 +391,13 @@ impl Topology {
             }
 
             SchedulingDiscipline::SP => {
-                let priorities = self.switch_config.priorities.as_ref().unwrap();
+                let priorities = self.switch_config.priorities.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "`priorities` must be provided for Static Priority scheduling discipline."
+                    )
+                });
                 let priorities_len = priorities.len();
+
                 let mut sp_server = SPServer::new(
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
@@ -410,8 +421,11 @@ impl Topology {
             }
 
             SchedulingDiscipline::VirtualClock => {
-                let vticks = self.switch_config.vticks.as_ref().unwrap();
+                let vticks = self.switch_config.vticks.as_ref().unwrap_or_else(|| {
+                    panic!("`vticks` must be provided for VirtualClock scheduling discipline.")
+                });
                 let vticks_len = vticks.len();
+
                 let mut virtual_clock_server = VirtualClockServer::new(
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
@@ -440,8 +454,11 @@ impl Topology {
             }
 
             SchedulingDiscipline::WFQ => {
-                let weights = self.switch_config.weights.as_ref().unwrap();
+                let weights = self.switch_config.weights.as_ref().unwrap_or_else(|| {
+                    panic!("`weights` must be provided for Weighted Fair Queuing scheduling discipline.")
+                });
                 let weights_len = weights.len();
+
                 let mut wfq_server = WFQServer::new(
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
@@ -462,6 +479,34 @@ impl Topology {
                     .connect(PacketSwitch::packet_received, downstream_mbox);
 
                 self.sim_init = self.sim_init.add_model(wfq_server, wfq_mbox, "WFQ");
+            }
+
+            SchedulingDiscipline::WRR => {
+                let weights = self.switch_config.weights.as_ref().unwrap_or_else(|| {
+                    panic!("`weights` must be provided for Weighted Round Robin scheduling discipline.")
+                });
+
+                let weights_len = weights.len();
+                let mut wrr_server = WRRServer::new(
+                    self.switch_config.port_rate,
+                    self.switch_config.capacity,
+                    CapacityUnit::Packets,
+                    Arc::new(move |flow_id| flow_id % weights_len),
+                    self.switch_config.drop,
+                    weights.clone(),
+                );
+
+                let mut output = Output::default();
+                let wrr_mbox: Mailbox<WRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
+                output.connect(WRRServer::packet_received, &wrr_mbox);
+                upstream_switch.outputs.insert(downstream_id, output);
+
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                wrr_server
+                    .output
+                    .connect(PacketSwitch::packet_received, downstream_mbox);
+
+                self.sim_init = self.sim_init.add_model(wrr_server, wrr_mbox, "WRR");
             }
         }
 
