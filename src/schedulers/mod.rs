@@ -4,6 +4,7 @@ pub mod port;
 pub mod sp;
 pub mod vc;
 pub mod wfq;
+pub mod wrr;
 
 use serde::Serialize;
 

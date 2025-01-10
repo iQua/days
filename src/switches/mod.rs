@@ -10,4 +10,5 @@ pub enum SchedulingDiscipline {
     SP,
     VirtualClock,
     WFQ,
+    WRR,
 }
