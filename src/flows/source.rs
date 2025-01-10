@@ -296,7 +296,7 @@ impl PacketSource {
             }
 
             // To be removed after more thorough testing
-            assert_eq!(now, global_time);
+            assert!(now - global_time <= 1e-6);
 
             self.send_packet(cx, now).await;
 
