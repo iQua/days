@@ -258,6 +258,7 @@ The scheduling discipline.
   | :----: | ---------------------- | -------------------------------- |
   | `FIFO` | First In First Out     |
   | `DRR`  | Deficit Round Robin    | Required to specify `weights`    |
+  | `WRR`  | Weighted Round Robin    | Required to specify `weights`    |
   | `WFQ`  | Weighted Fair Queueing | Required to specify `weights`    |
   |  `SP`  | Static Priority        | Required to specify `priorities` |
   |  `VC`  | Virtual Clock          | Required to specify `vticks`     |
