@@ -254,14 +254,14 @@ The scheduling discipline.
 
 - **Valid value**:
 
-  | Value  | Meaning                | Notes                            |
-  | :----: | ---------------------- | -------------------------------- |
-  | `FIFO` | First In First Out     |
-  | `DRR`  | Deficit Round Robin    | Required to specify `weights`    |
-  | `WRR`  | Weighted Round Robin   | Required to specify `weights`    |
-  | `WFQ`  | Weighted Fair Queueing | Required to specify `weights`    |
-  |  `SP`  | Static Priority        | Required to specify `priorities` |
-  |  `VC`  | Virtual Clock          | Required to specify `vticks`     |
+  |     Value      | Meaning                | Notes                            |
+  | :------------: | ---------------------- | -------------------------------- |
+  |     `FIFO`     | First In First Out     |
+  |     `DRR`      | Deficit Round Robin    | Required to specify `weights`    |
+  |     `WRR`      | Weighted Round Robin   | Required to specify `weights`    |
+  |     `WFQ`      | Weighted Fair Queueing | Required to specify `weights`    |
+  |      `SP`      | Static Priority        | Required to specify `priorities` |
+  | `VirtualClock` | Virtual Clock          | Required to specify `vticks`     |
 
 - **Required**: Yes
 - **Example**:
@@ -293,7 +293,7 @@ The scheduling discipline.
 #### vticks
 
 - **Valid value**: Vector of double-precision floating point values, where the index of the vector is the flow class, and the value is the inverse of the desired rates for the corresponding flows, in bits per second, called `vticks`
-- **Required**: Yes if `discipline = "VC"`
+- **Required**: Yes if `discipline = "VirtualClock"`
 - **Example**:
 
   ```toml
