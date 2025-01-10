@@ -17,8 +17,8 @@ k = 64
 [switch]
 port_rate = 100000000 # 100 Mbps
 capacity = 1000
-priorities = [1]
-discipline = "SP"
+weights = [1]
+discipline = "WRR"
 drop = "RED"
 
 [[flow_set]]
@@ -26,9 +26,9 @@ flow_type = "TCP"
 flow_count = 500
 routing = "ShortestPath"
 [flow_set.traffic]
-    initial_delay = 0.0
-    duration = 0.2
-    arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}
-    pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
+initial_delay = 0.0
+duration = 0.2
+arr_dist = { type = "Uniform", low = 0.0008, high = 0.0008 }
+pkt_size_dist = { type = "Uniform", low = 1024, high = 1024 }
 [flow_set.traffic.tcp]
-    cc_algorithm = "TCPBBR"
+cc_algorithm = "TCPBBR"

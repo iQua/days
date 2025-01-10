@@ -729,7 +729,7 @@ mod tests {
             .map(|flow_id| {
                 drr.sent_packets
                     .iter()
-                    .take(40) // only considers first 120 packets sent
+                    .take(40) // only considers first 40 packets sent
                     .filter(|p| p.flow_id == flow_id)
                     .map(|p| p.size)
                     .sum()
