@@ -599,7 +599,7 @@ mod tests {
         let phase2_packets = wrr
             .sent_packets
             .iter()
-            .filter(|p| p.time >= 1.0)
+            .filter(|p| p.creation_time >= 1.0)
             .collect::<Vec<_>>();
 
         let flow0_phase2 = phase2_packets
