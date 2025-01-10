@@ -570,26 +570,59 @@ mod tests {
         wrr.test_run(0.0);
 
         // counts how many packets each queue actually sent
-        let class0_packets = wrr
+        let class0_packets: Vec<usize> = wrr
             .sent_packets
             .iter()
             .filter(|p| p.flow_id % 3 == 0)
-            .count();
-        let class1_packets = wrr
+            .map(|p| p.packet_id)
+            .collect();
+        let class1_packets: Vec<usize> = wrr
             .sent_packets
             .iter()
             .filter(|p| p.flow_id % 3 == 1)
-            .count();
-        let class2_packets = wrr
+            .map(|p| p.packet_id)
+            .collect();
+        let class2_packets: Vec<usize> = wrr
             .sent_packets
             .iter()
             .filter(|p| p.flow_id % 3 == 2)
-            .count();
+            .map(|p| p.packet_id)
+            .collect();
 
+        // Expected packet IDs by class in the correct round-robin order
+        let expected_class0_ids = vec![0, 3];
+        let expected_class1_ids = vec![1, 4, 7, 10];
+        let expected_class2_ids = vec![2, 5, 8, 11, 14, 17];
+
+        // Assert packet IDs match the expected order for each class
+        assert_eq!(
+            class0_packets, expected_class0_ids,
+            "Class 0 packet IDs mismatch"
+        );
+        assert_eq!(
+            class1_packets, expected_class1_ids,
+            "Class 1 packet IDs mismatch"
+        );
+        assert_eq!(
+            class2_packets, expected_class2_ids,
+            "Class 2 packet IDs mismatch"
+        );
         // Now the test can truly expect 2, 4, and 6.
-        assert_eq!(class0_packets, 2, "Class 0 should have sent 2 packets");
-        assert_eq!(class1_packets, 4, "Class 1 should have sent 4 packets");
-        assert_eq!(class2_packets, 6, "Class 2 should have sent 6 packets");
+        assert_eq!(
+            class0_packets.len(),
+            2,
+            "Class 0 should have sent 2 packets"
+        );
+        assert_eq!(
+            class1_packets.len(),
+            4,
+            "Class 1 should have sent 4 packets"
+        );
+        assert_eq!(
+            class2_packets.len(),
+            6,
+            "Class 2 should have sent 6 packets"
+        );
     }
 
     #[test]
