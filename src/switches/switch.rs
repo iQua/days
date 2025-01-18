@@ -25,6 +25,9 @@ pub struct PacketSwitch {
     /// senders for sending inbound packets to outbound ports
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
+
+    /// Locally maintained simulation time
+    pub local_time: f64,
 }
 
 impl PacketSwitch {
@@ -44,6 +47,7 @@ impl PacketSwitch {
             r_fib,
             packets_received: 0,
             outputs,
+            local_time: 0.0, // Initialize local simulation time
         }
     }
 
@@ -61,18 +65,30 @@ impl PacketSwitch {
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
+        self.local_time = self.local_time.max(packet.time);
         if packet.ack.is_none() {
             self.packets_received += 1;
-
-            debug!(
-                "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-                {} packets received.",
+            println!(
+                "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3} (at local_time {:.3}). \
+                        {} packets received.",
                 self.switch_id,
                 packet.packet_id,
                 packet.size,
                 packet.flow_id,
                 now,
+                self.local_time,
+                self.packets_received
+            );
+
+            debug!(
+                "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3} (at local_time {:.3}). \
+                        {} packets received.",
+                self.switch_id,
+                packet.packet_id,
+                packet.size,
+                packet.flow_id,
+                now,
+                self.local_time,
                 self.packets_received
             );
 
@@ -81,12 +97,15 @@ impl PacketSwitch {
             let switch_id = self.fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
-                output.send(packet).await;
+                let mut updated_packet = packet;
+                updated_packet.time = self.local_time;
+                output.send(updated_packet).await;
+                // output.send(packet).await;
             }
         } else {
             debug!(
-                "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.switch_id, packet.packet_id, packet.size, packet.flow_id, now,
+                "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3} (at local_time {:.3}).",
+                self.switch_id, packet.packet_id, packet.size, packet.flow_id, now,self.local_time,
             );
 
             // forwards acknowledgment packets to their corresponding upstream
@@ -94,7 +113,10 @@ impl PacketSwitch {
             let switch_id = self.r_fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
-                output.send(packet).await;
+                let mut updated_packet = packet;
+                updated_packet.time = self.local_time;
+                output.send(updated_packet).await;
+                // output.send(packet).await;
             }
         }
     }
