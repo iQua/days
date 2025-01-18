@@ -55,6 +55,10 @@ impl Ord for PacketTimeout {
 impl Eq for PacketTimeout {}
 
 pub struct TCPPacketSource {
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub flow_start_after: HashSet<usize>,
@@ -137,6 +141,7 @@ impl TCPPacketSource {
         };
 
         TCPPacketSource {
+            time: 0.0,
             endpoint_id: next_endpoint_id(),
             flow_id,
             flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
