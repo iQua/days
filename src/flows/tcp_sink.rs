@@ -150,9 +150,17 @@ impl TCPPacketSink {
     }
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
-        self.packet_statistics.update(&packet, now);
-        self.update_report_stats(&packet, now);
-        self.produce_ack(packet, now).await;
+        // Update the locally maintained simulation time
+        self.local_time = self.local_time.max(now).max(packet.time);
+
+        // Update packet statistics
+        self.packet_statistics.update(&packet, self.local_time);
+
+        // Update report statistics
+        self.update_report_stats(&packet, self.local_time);
+
+        // Produce an acknowledgment using the updated local time
+        self.produce_ack(packet, self.local_time).await;
     }
 }
 
