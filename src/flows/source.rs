@@ -200,6 +200,8 @@ impl PacketSource {
                 PacketSource::DistPacketSource(_) => (),
                 PacketSource::TCPPacketSource(source) => {
                     let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                    source.time = now;
+
                     let (data, interval) = source.datasource.produce_data(now);
 
                     if !source.datasource.traffic_exceeded(now) {
@@ -232,6 +234,7 @@ impl PacketSource {
             PacketSource::DistPacketSource(_) => (),
             PacketSource::TCPPacketSource(source) => {
                 let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                source.time = now;
                 source.timer_tick(now).await;
             }
         }
@@ -288,7 +291,7 @@ impl PacketSource {
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            // To be removed after more thorough testing
+            // to be removed after more thorough testing
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             // retrieves the current simulation time from the locally stored simulation time
@@ -311,7 +314,7 @@ impl PacketSource {
                 }
             }
 
-            // To be removed after more thorough testing
+            // to be removed after more thorough testing
             assert!(now - global_time <= 1e-6);
 
             self.send_packet(cx, now).await;
@@ -329,8 +332,7 @@ impl PacketSource {
                     }
                 };
 
-                // notifies the Progress coroutine that the packet source
-                // finished running
+                // notifies the Progress coroutine that the packet source finished running
                 self.ui_output().send(FlowFinishMsg { flow_id: 0 }).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
