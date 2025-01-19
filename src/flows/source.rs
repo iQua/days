@@ -125,7 +125,7 @@ impl PacketSource {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        let now = match self {
+        let local_time = match self {
             PacketSource::DistPacketSource(source) => source.time,
             PacketSource::TCPPacketSource(source) => source.time,
         };
@@ -135,17 +135,9 @@ impl PacketSource {
         assert!(packet.time - global_time <= 1e-6);
 
         // makes sure that the simulation advances in time
-        assert!(packet.time >= now);
+        assert!(packet.time >= local_time);
 
-        // updates the locally maintained simulation time to the packet's time
-        match self {
-            PacketSource::DistPacketSource(source) => {
-                source.time = packet.time;
-            }
-            PacketSource::TCPPacketSource(source) => {
-                source.time = packet.time;
-            }
-        }
+        let now = packet.time;
 
         match self {
             PacketSource::DistPacketSource(source) => source.packet_received(packet, now),

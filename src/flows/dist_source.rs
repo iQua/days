@@ -78,6 +78,9 @@ impl DistPacketSource {
     }
 
     pub fn packet_received(&mut self, packet: Packet, now: f64) {
+        // updates the locally maintained simulation time
+        self.time = now;
+
         debug!(
             "DistPacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, now,

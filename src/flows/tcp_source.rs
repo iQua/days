@@ -177,6 +177,9 @@ impl TCPPacketSource {
     /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
+        // updates the locally maintained simulation time
+        self.time = now;
+
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
 
@@ -348,8 +351,7 @@ impl TCPPacketSource {
         );
     }
 
-    /// Checks if any sent packet reached timeout at regularly occurring
-    /// intervals.
+    /// Checks if any sent packet reached timeout at regularly occurring intervals.
     pub async fn timer_tick(&mut self, now: f64) {
         while !self.timeout_queue.is_empty() {
             let timeout_time = self.timeout_queue.peek().unwrap().timeout;
