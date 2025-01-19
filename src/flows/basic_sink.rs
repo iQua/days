@@ -44,7 +44,7 @@ impl BasicPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("PacketSink {endpoint_id}");
         BasicPacketSink {
-            time: 0.0, // Initialize local time
+            time: 0.0,
             endpoint_id,
             flow_id,
             packet_statistics: PacketStatistics::new(sink_name),

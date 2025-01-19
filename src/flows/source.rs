@@ -146,6 +146,15 @@ impl PacketSource {
                 source.time = packet.time;
             }
         }
+
+        match self {
+            PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
+            PacketSource::TCPPacketSource(source) => {
+                if source.ack_packet_received(packet, now).await {
+                    self.run((), cx).await;
+                }
+            }
+        }
     }
 
     fn prepare_run(&mut self, now: f64, initial_delay: f64, cx: &Context<Self>) {
