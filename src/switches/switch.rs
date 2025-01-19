@@ -71,10 +71,10 @@ impl PacketSwitch {
 
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
-        assert!(packet.time - global_time <= 1e-6);
+        assert!((packet.time - global_time).abs() <= 1e-8);
 
         // makes sure that the simulation advances in time
-        assert!(packet.time >= local_time);
+        assert!((packet.time - local_time).abs() <= 1e-8 || packet.time > local_time);
 
         let now = packet.time;
         self.time = now;

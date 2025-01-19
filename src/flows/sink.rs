@@ -273,17 +273,17 @@ impl PacketSink {
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        // makes sure that the current simulation time can be correctly retrieved from
-        // the packet itself
-        assert!(packet.time - global_time <= 1e-6);
-
-        // makes sure that the simulation advances in time
         let local_time = match self {
             PacketSink::BasicPacketSink(sink) => sink.time,
             PacketSink::TCPPacketSink(sink) => sink.time,
         };
-        assert!(packet.time >= local_time);
+
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!((packet.time - global_time).abs() <= 1e-8);
+
+        // makes sure that the simulation advances in time
+        assert!((packet.time - local_time).abs() <= 1e-8 || packet.time > local_time);
 
         let now = packet.time;
 
