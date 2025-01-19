@@ -56,6 +56,10 @@ impl Eq for TaggedPacket {}
 pub struct VirtualClockServer {
     scheduler_id: usize,
 
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     /// the bit rate of the server
     rate: f64,
 
@@ -140,6 +144,7 @@ impl VirtualClockServer {
 
         VirtualClockServer {
             scheduler_id,
+            time: 0.0,
             rate,
             flow_classes,
             drop_strategy: packet_drop,

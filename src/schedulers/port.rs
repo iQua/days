@@ -18,6 +18,11 @@ use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 pub struct Port {
     scheduler_id: usize,
+
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     /// the bit rate of the port (0 for unlimited)
     rate: f64,
     /// a closure that determines whether an inbound packet should be dropped or
@@ -68,6 +73,7 @@ impl Port {
 
         Port {
             scheduler_id,
+            time: 0.0,
             rate,
             drop_strategy: packet_drop,
             packets_received: 0,
