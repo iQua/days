@@ -18,7 +18,7 @@ k = 64
 port_rate = 100000000 # 100 Mbps
 capacity = 1000
 weights = [1]
-discipline = "WRR"
+discipline = "DRR"
 drop = "RED"
 
 [[flow_set]]

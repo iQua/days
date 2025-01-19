@@ -150,7 +150,10 @@ impl DRRServer {
         self.scheduler_id
     }
 
-    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
+    pub fn on_packet_received(&mut self, packet: Packet) {
+        // updates the locally maintained simulation time
+        self.time = packet.time;
+
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -166,7 +169,7 @@ impl DRRServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                arrival_time
+                self.time
             }
             return;
         }
@@ -190,18 +193,27 @@ impl DRRServer {
             packet.size,
             packet.flow_id,
             class_id,
-            arrival_time,
+            self.time,
             self.queues[class_id].len(),
             class_id
         );
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        self.on_packet_received(packet, arrival_time);
+        // to be removed after more thorough testing
+        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let local_time = self.time;
 
-        if arrival_time >= self.busy_until {
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(packet.time - global_time <= 1e-6);
+
+        // makes sure that the simulation advances in time
+        assert!(packet.time >= local_time);
+
+        self.on_packet_received(packet);
+
+        if self.time >= self.busy_until {
             self.run((), cx);
         }
     }
@@ -428,7 +440,7 @@ mod tests {
         let packet = Packet::new(1024, 1, 0, 0.0); // packet_size, packet_id, flow_id, time
 
         // sends packet to DRRServer
-        drr.on_packet_received(packet.clone(), 0.0);
+        drr.on_packet_received(packet.clone());
 
         // checks that the packet is in the queue
         assert_eq!(drr.queues[0].len(), 1);
@@ -459,13 +471,13 @@ mod tests {
         let packet1 = Packet::new(1, 1, 0, 0.0);
         let packet2 = Packet::new(2, 2, 1, 0.0);
         let packet3 = Packet::new(2, 3, 2, 0.0);
-        drr.on_packet_received(packet1, 0.0);
-        drr.on_packet_received(packet2, 0.0);
-        drr.on_packet_received(packet3, 0.0);
+        drr.on_packet_received(packet1);
+        drr.on_packet_received(packet2);
+        drr.on_packet_received(packet3);
 
         // simulates a packet of size 2 arrives at connection 0 at time 4
         let packet4 = Packet::new(2, 4, 0, 4.0);
-        drr.on_packet_received(packet4, 4.0); // updated arrival time
+        drr.on_packet_received(packet4); // updated arrival time
 
         // checks that all four packets are in the queue
         assert_eq!(drr.queues[0].len(), 2);
@@ -502,9 +514,9 @@ mod tests {
         let packet3 = Packet::new(1024, 3, 0, 0.0);
 
         // sends packets to DRRServer
-        drr.on_packet_received(packet1.clone(), 0.0);
-        drr.on_packet_received(packet2.clone(), 0.0);
-        drr.on_packet_received(packet3.clone(), 0.0);
+        drr.on_packet_received(packet1.clone());
+        drr.on_packet_received(packet2.clone());
+        drr.on_packet_received(packet3.clone());
 
         // only two packets should be in the queue due to capacity limit
         assert_eq!(drr.queues[0].len() + drr.queues[1].len(), 2);
@@ -526,7 +538,7 @@ mod tests {
 
         let packet = Packet::new(1024, 1, 0, 0.0);
 
-        drr.on_packet_received(packet.clone(), 0.0);
+        drr.on_packet_received(packet.clone());
 
         // verifies unlimited capacity: no packet should be dropped
         assert_eq!(drr.packets_dropped, 0);
@@ -546,7 +558,7 @@ mod tests {
 
         let packet = Packet::new(1501, 1, 0, 0.0); // packet size greater than capacity
 
-        drr.on_packet_received(packet.clone(), 0.0);
+        drr.on_packet_received(packet.clone());
 
         // verifies queue should be empty, packet should be dropped
         assert_eq!(drr.packets_dropped, 1);
@@ -569,8 +581,8 @@ mod tests {
         let packet2 = Packet::new(1024, 2, 1, 0.1); // flow_id 1
 
         // sends packets to DRRServer
-        drr.on_packet_received(packet1.clone(), 0.0);
-        drr.on_packet_received(packet2.clone(), 0.0);
+        drr.on_packet_received(packet1.clone());
+        drr.on_packet_received(packet2.clone());
 
         // runs the scheduler
         drr.test_run(0.0);
@@ -594,7 +606,7 @@ mod tests {
 
         // creates a packet
         let packet = Packet::new(1000, 1, 0, 0.0); // 1000 bytes
-        drr.on_packet_received(packet.clone(), 0.0);
+        drr.on_packet_received(packet.clone());
 
         // runs the scheduler
         drr.test_run(0.0);
@@ -617,7 +629,7 @@ mod tests {
         // sends multiple packets to fill the queue
         for i in 0..20 {
             let packet = Packet::new(1024, i, 0, 0.0);
-            drr.on_packet_received(packet.clone(), 0.0);
+            drr.on_packet_received(packet.clone());
         }
 
         // verifies with RED, some packets should be randomly dropped before reaching capacity
@@ -642,9 +654,9 @@ mod tests {
         let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 0
 
         // sends packets
-        drr.on_packet_received(packet2.clone(), 0.0);
-        drr.on_packet_received(packet1.clone(), 0.0);
-        drr.on_packet_received(packet3.clone(), 0.0);
+        drr.on_packet_received(packet2.clone());
+        drr.on_packet_received(packet1.clone());
+        drr.on_packet_received(packet3.clone());
 
         // checks that flow_class mapping works
         assert_eq!((drr.flow_classes)(1), 1);
@@ -674,15 +686,15 @@ mod tests {
         // initially sends packets only to flow 0
         for i in 0..10 {
             let packet = Packet::new(10, i, 0, 0.0);
-            drr.on_packet_received(packet, 0.0);
+            drr.on_packet_received(packet);
         }
 
         // then sends to both flows
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
-            drr.on_packet_received(packet1, 1.0);
-            drr.on_packet_received(packet2, 1.0);
+            drr.on_packet_received(packet1);
+            drr.on_packet_received(packet2);
         }
 
         drr.test_run(0.0);
@@ -716,13 +728,13 @@ mod tests {
         for i in 0..40 {
             // sends one packet to each flow in sequence
             let packet1 = Packet::new(packet_size, i * 3, 0, arrival_time);
-            drr.on_packet_received(packet1, arrival_time);
+            drr.on_packet_received(packet1);
 
             let packet2 = Packet::new(packet_size, i * 3 + 1, 1, arrival_time);
-            drr.on_packet_received(packet2, arrival_time);
+            drr.on_packet_received(packet2);
 
             let packet3 = Packet::new(packet_size, i * 3 + 2, 2, arrival_time);
-            drr.on_packet_received(packet3, arrival_time);
+            drr.on_packet_received(packet3);
 
             arrival_time += arrival_interval;
         }
