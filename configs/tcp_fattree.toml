@@ -15,7 +15,7 @@ category = "FatTree"
 k = 96
 
 [switch]
-port_rate = 100000000 # 100 Mbps
+port_rate = 10000000 # 100 Mbps
 capacity = 1000
 weights = [1]
 discipline = "DRR"

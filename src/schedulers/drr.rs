@@ -151,6 +151,9 @@ impl DRRServer {
     }
 
     pub fn on_packet_received(&mut self, packet: Packet) {
+        // updates the locally maintained simulation time
+        self.time = self.time.max(packet.time);
+
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -206,15 +209,17 @@ impl DRRServer {
 
         self.on_packet_received(packet);
 
-        if self.time >= self.busy_until {
-            // updates the locally maintained simulation time
-            self.time = packet.time;
-
+        if packet.time >= self.busy_until {
+            println!(
+                "Running myself: time = {:.8e}, busy_until = {:.8e}",
+                self.time, self.busy_until
+            );
             self.run((), cx);
         }
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        println!("Sending packet.");
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
@@ -269,7 +274,7 @@ impl DRRServer {
                     self.time = now + timeout;
 
                     // schedules the future event sending the packet and the next run
-                    schedule_event(timeout, outbound);
+                    schedule_event(now + timeout, outbound);
 
                     debug!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -302,6 +307,12 @@ impl DRRServer {
         }
 
         // to be removed after more thorough testing
+        println!(
+            "now = {:.7e}, global_time = {:.7e}, abs = {:.7e}",
+            now,
+            global_time,
+            (now - global_time).abs()
+        );
         assert!((now - global_time).abs() <= 1e-8);
 
         self.schedule_packet(now, |timeout, outbound| {
@@ -310,6 +321,7 @@ impl DRRServer {
                 .unwrap();
 
             // schedules the next run
+            println!("timeout = {:.8e}", timeout);
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
         });
