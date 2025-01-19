@@ -271,54 +271,34 @@ impl PacketSink {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        let local_time = packet.time;
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(packet.time - global_time <= 1e-6);
 
-        println!(
-            "{} received packet {} ({} bytes) from flow {} at time {:.3} (local_time {:.3}).",
+        // makes sure that the simulation advances in time
+        let local_time = match self {
+            PacketSink::BasicPacketSink(sink) => sink.time,
+            PacketSink::TCPPacketSink(sink) => sink.time,
+        };
+        assert!(packet.time >= local_time);
+
+        let now = packet.time;
+
+        debug!(
+            "{} received packet {} ({} bytes) from flow {} at time {:.3}.",
             format!("{self}"),
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            global_time,
-            local_time
+            now,
         );
 
-        // match self {
-        //     PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
-        //     PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
-        // }
-        // Update local simulation time
         match self {
-            PacketSink::BasicPacketSink(sink) => {
-                sink.local_time = sink.local_time.max(packet.time);
-                debug!(
-                    "BasicPacketSink {} received packet {} ({} bytes) from flow {} \
-                        at time {:.3} (local time {:.3}).",
-                    sink.endpoint_id,
-                    packet.packet_id,
-                    packet.size,
-                    packet.flow_id,
-                    global_time,
-                    sink.local_time,
-                );
-                sink.process(packet, sink.local_time).await;
-            }
-            PacketSink::TCPPacketSink(sink) => {
-                sink.local_time = sink.local_time.max(packet.time);
-                println!(
-                    "TCPPacketSink {} received packet {} ({} bytes) from flow {} \
-                        at time {:.3} (local time {:.3}).",
-                    sink.endpoint_id,
-                    packet.packet_id,
-                    packet.size,
-                    packet.flow_id,
-                    global_time,
-                    sink.local_time,
-                );
-                sink.process(packet, sink.local_time).await;
-            }
+            PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
+            PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
         }
     }
 

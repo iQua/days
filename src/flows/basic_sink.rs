@@ -15,7 +15,10 @@ use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
-    pub local_time: f64, // Maintain local simulation time
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     pub endpoint_id: usize,
     pub flow_id: usize,
     /// the statistics of all received packets
@@ -41,7 +44,7 @@ impl BasicPacketSink {
         let endpoint_id = next_endpoint_id();
         let sink_name = format!("PacketSink {endpoint_id}");
         BasicPacketSink {
-            local_time: 0.0, // Initialize local time
+            time: 0.0, // Initialize local time
             endpoint_id,
             flow_id,
             packet_statistics: PacketStatistics::new(sink_name),
@@ -92,19 +95,14 @@ impl BasicPacketSink {
     }
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
-        let global_time = now;
-        // Update the locally maintained simulation time
-        self.local_time = self.local_time.max(packet.time);
+        // updates the locally maintained simulation time
+        self.time = now;
 
-        // Update packet statistics
-        self.packet_statistics.update(&packet, self.local_time);
+        self.packet_statistics.update(&packet, now);
+        self.update_report_stats(&packet, now);
 
-        // Update report statistics
-        self.update_report_stats(&packet, self.local_time);
-
-        // Notify pending sources if this is the last packet
         if packet.last_packet {
-            self.notify_pending_sources(self.local_time).await;
+            self.notify_pending_sources(now).await;
         }
     }
 

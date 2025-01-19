@@ -122,18 +122,28 @@ impl PacketSource {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        let local_time = packet.time;
 
-        // To be removed after more thorough testing
-        assert!(local_time - global_time <= 1e-6);
+        let now = match self {
+            PacketSource::DistPacketSource(source) => source.time,
+            PacketSource::TCPPacketSource(source) => source.time,
+        };
 
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(packet.time - global_time <= 1e-6);
+
+        // makes sure that the simulation advances in time
+        assert!(packet.time >= now);
+
+        // updates the locally maintained simulation time to the packet's time
         match self {
-            PacketSource::DistPacketSource(source) => source.packet_received(packet, local_time),
+            PacketSource::DistPacketSource(source) => {
+                source.time = packet.time;
+            }
             PacketSource::TCPPacketSource(source) => {
-                if source.ack_packet_received(packet, local_time).await {
-                    self.run((), cx).await;
-                }
+                source.time = packet.time;
             }
         }
     }
@@ -281,21 +291,21 @@ impl PacketSource {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             // retrieves the current simulation time from the locally stored simulation time
-            let mut now = match self {
+            let now = match self {
                 PacketSource::DistPacketSource(source) => source.time,
                 PacketSource::TCPPacketSource(source) => source.time,
             };
 
             if now == 0.0 {
-                now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
                 // updates the locally maintained simulation time
                 match self {
                     PacketSource::DistPacketSource(source) => {
-                        source.time = now;
+                        source.time = global_time;
                     }
                     PacketSource::TCPPacketSource(source) => {
-                        source.time = now;
+                        source.time = global_time;
                     }
                 }
             }
