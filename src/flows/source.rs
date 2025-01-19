@@ -132,10 +132,10 @@ impl PacketSource {
 
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
-        assert!((packet.time - global_time).abs() <= 1e-6);
+        assert!((packet.time - global_time).abs() <= 1e-8);
 
         // makes sure that the simulation advances in time
-        assert!((packet.time - local_time).abs() <= 1e-6 || packet.time > local_time);
+        assert!((packet.time - local_time).abs() <= 1e-8 || packet.time > local_time);
 
         let now = packet.time;
 
@@ -315,7 +315,7 @@ impl PacketSource {
             }
 
             // to be removed after more thorough testing
-            assert!((now - global_time).abs() <= 1e-6);
+            assert!((now - global_time).abs() <= 1e-8);
 
             self.send_packet(cx, now).await;
 

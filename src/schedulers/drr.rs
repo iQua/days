@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use approx::assert_relative_eq;
 use log::debug;
 
 use nexosim::model::{Context, InitializedModel, Model};
@@ -152,9 +151,6 @@ impl DRRServer {
     }
 
     pub fn on_packet_received(&mut self, packet: Packet) {
-        // updates the locally maintained simulation time
-        self.time = packet.time;
-
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -203,26 +199,17 @@ impl DRRServer {
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        let local_time = self.time;
 
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
-        assert!((packet.time - global_time).abs() <= 1e-6);
-
-        // makes sure that the simulation advances in time
-        assert_relative_eq!(packet.time, local_time, epsilon = 1e-6);
-        //assert!((packet.time - local_time).abs() <= 1e-6);
-        //assert!(packet.time > local_time);
-        println!(
-            "packet.time = {:.8}, local_time = {:.8}, abs = {:.8}",
-            packet.time,
-            local_time,
-            (packet.time - local_time).abs()
-        );
+        assert!((packet.time - global_time).abs() <= 1e-8);
 
         self.on_packet_received(packet);
 
         if self.time >= self.busy_until {
+            // updates the locally maintained simulation time
+            self.time = packet.time;
+
             self.run((), cx);
         }
     }
@@ -251,15 +238,15 @@ impl DRRServer {
         }
     }
 
-    fn schedule_packets(&mut self, now: f64) -> Vec<(f64, Packet)> {
-        let mut events = Vec::new();
-        let mut scheduled_time = now;
-
+    fn schedule_packet<F>(&mut self, now: f64, mut schedule_event: F)
+    where
+        F: FnMut(f64, Packet),
+    {
         // main scheduling logic
         loop {
             if self.packets_waiting == 0 {
                 // all packets in the queues have been processed
-                return events;
+                return;
             }
 
             if !self.queues[self.current_queue].is_empty() {
@@ -277,13 +264,12 @@ impl DRRServer {
 
                     // sends the packet out to the next element after a timeout
                     let timeout = packet.size as f64 * 8.0 / self.rate;
-                    outbound.departure_update(scheduled_time + timeout);
-                    scheduled_time += timeout;
-
-                    // records the (timeout, Packet) so we can schedule it after returning
-                    events.push((scheduled_time, outbound));
-
+                    outbound.departure_update(now + timeout);
                     self.busy_until = now + timeout;
+                    self.time = now + timeout;
+
+                    // schedules the future event sending the packet and the next run
+                    schedule_event(timeout, outbound);
 
                     debug!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -292,11 +278,11 @@ impl DRRServer {
                         packet.packet_id,
                         packet.size,
                         packet.flow_id,
-                        scheduled_time + timeout,
+                        now + timeout,
                         self.queues[self.current_queue].len(),
                     );
 
-                    return events;
+                    return;
                 } else {
                     self.next_queue();
                 }
@@ -305,7 +291,6 @@ impl DRRServer {
             }
         }
     }
-
     pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -317,44 +302,35 @@ impl DRRServer {
         }
 
         // to be removed after more thorough testing
-        assert!((now - global_time).abs() <= 1e-6);
+        assert!((now - global_time).abs() <= 1e-8);
 
-        // collects the (timeout, Packet) “send” events from schedule_packets
-        let events = self.schedule_packets(now);
-        let mut last_departure_time = 0.0;
-
-        // schedules them
-        for (departure_time, outbound) in events {
+        self.schedule_packet(now, |timeout, outbound| {
             // schedules the send event
-            cx.schedule_event(
-                Duration::from_secs_f64(departure_time),
-                Self::send,
-                outbound,
-            )
-            .unwrap();
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                .unwrap();
 
-            last_departure_time = departure_time;
-        }
-
-        // schedules the next run
-        self.time += last_departure_time;
-        cx.schedule_event(Duration::from_secs_f64(last_departure_time), Self::run, ())
-            .unwrap();
+            // schedules the next run
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                .unwrap();
+        });
     }
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // collects the (timeout, Packet) “send” events from schedule_packets
-        let events = self.schedule_packets(now);
+        // creates a vector to collect events inside the closure
+        let mut events = Vec::new();
 
-        // processes collected events after schedule_packets returns
-        for (timeout, mut outbound) in events {
-            // advances the local simulation time
-            self.time += timeout;
-
+        // calls schedule_packets() without borrowing self inside the closure
+        self.schedule_packet(now, |timeout, mut outbound| {
             // simulates sending the packet
             outbound.departure_update(now + timeout);
 
+            // collects the outbound packet and timeout
+            events.push((timeout, outbound));
+        });
+
+        // processes collected events after schedule_packets returns
+        for (timeout, outbound) in events {
             // updates the sent_packets vector
             self.sent_packets.push(outbound.clone());
 
