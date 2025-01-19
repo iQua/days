@@ -92,8 +92,9 @@ impl BasicPacketSink {
     }
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
+        let global_time = now;
         // Update the locally maintained simulation time
-        self.local_time = self.local_time.max(now).max(packet.time);
+        self.local_time = self.local_time.max(packet.time);
 
         // Update packet statistics
         self.packet_statistics.update(&packet, self.local_time);

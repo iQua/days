@@ -122,11 +122,16 @@ impl PacketSource {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let local_time = packet.time;
+
+        // To be removed after more thorough testing
+        assert!(local_time - global_time <= 1e-6);
+
         match self {
-            PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
+            PacketSource::DistPacketSource(source) => source.packet_received(packet, local_time),
             PacketSource::TCPPacketSource(source) => {
-                if source.ack_packet_received(packet, now).await {
+                if source.ack_packet_received(packet, local_time).await {
                     self.run((), cx).await;
                 }
             }
