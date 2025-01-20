@@ -180,27 +180,34 @@ impl PacketSource {
                 source.busy_until = now + initial_delay;
 
                 // schedules AppDataSource to send next data
-                cx.schedule_event(Duration::from_secs_f64(interval), Self::fetch_app_data, ())
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(interval),
+                    Self::fetch_app_data,
+                    source.time + interval,
+                )
+                .unwrap();
             }
         }
     }
 
     fn fetch_app_data<'a>(
         &'a mut self,
-        _: (),
+        current_time: f64,
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             match self {
-                PacketSource::DistPacketSource(_) => (),
+                PacketSource::DistPacketSource(source) => source.time = current_time,
                 PacketSource::TCPPacketSource(source) => {
+                    source.time = current_time;
+
+                    // to be removed after further testing
                     let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-                    source.time = now;
+                    assert!((now - source.time).abs() <= 1e-8);
 
-                    let (data, interval) = source.datasource.produce_data(now);
+                    let (data, interval) = source.datasource.produce_data(source.time);
 
-                    if !source.datasource.traffic_exceeded(now) {
+                    if !source.datasource.traffic_exceeded(source.time) {
                         // TCPPacketSource now owns the data from the application
                         source.send_buffer += data.size;
 
@@ -208,7 +215,7 @@ impl PacketSource {
                         cx.schedule_event(
                             Duration::from_secs_f64(interval),
                             Self::fetch_app_data,
-                            (),
+                            source.time + interval,
                         )
                         .unwrap();
                     } else {
@@ -223,7 +230,7 @@ impl PacketSource {
                     } else {
                         // the TCPPacketSource is considered busy retrieving
                         // the next packet from the (application-layer) flow
-                        source.busy_until = now + interval;
+                        source.busy_until = source.time + interval;
                     }
                 }
             }
