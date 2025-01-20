@@ -151,9 +151,6 @@ impl DRRServer {
     }
 
     pub fn on_packet_received(&mut self, packet: Packet) {
-        // updates the locally maintained simulation time
-        self.time = self.time.max(packet.time);
-
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -211,22 +208,25 @@ impl DRRServer {
 
         if packet.time >= self.busy_until {
             println!(
-                "DRRServer {} running myself: time = {:.8e}, busy_until = {:.8e}",
-                self.scheduler_id, self.time, self.busy_until
+                "DRRServer {} running myself: time = {:.8e}, packet.time = {:.8e}",
+                self.scheduler_id, self.time, packet.time
             );
-            self.run((), cx);
+            self.run(packet.time, cx);
         }
     }
 
-    pub async fn send(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn send(&mut self, packet: (f64, Packet), cx: &mut Context<Self>) {
+        // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         println!(
             "DRRServer {} sending packet at global time {:.8e} and local time {:.8e}.",
             self.scheduler_id, global_time, self.time
         );
-        self.update_stats_on_packet_forwarded(&packet);
-        self.output.send(packet).await;
+
+        self.time = packet.0;
+        self.update_stats_on_packet_forwarded(&packet.1);
+        self.output.send(packet.1).await;
     }
 
     /// moves on to the next queue if the current queue is empty.
@@ -248,9 +248,9 @@ impl DRRServer {
         }
     }
 
-    fn schedule_packet<F>(&mut self, now: f64, mut schedule_event: F)
+    fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
-        F: FnMut(f64, Packet),
+        F: FnMut(f64, f64, Packet),
     {
         // main scheduling logic
         loop {
@@ -267,23 +267,22 @@ impl DRRServer {
                 {
                     self.byte_sizes[self.current_queue] -= packet.size;
                     let mut outbound = self.queues[self.current_queue].pop_front().unwrap();
-                    outbound.queueing_delay_update(now);
+                    outbound.queueing_delay_update(self.time);
 
                     self.packets_waiting -= 1;
                     self.deficit[self.current_queue] -= packet.size;
 
                     // sends the packet out to the next element after a timeout
                     let timeout = packet.size as f64 * 8.0 / self.rate;
-                    outbound.departure_update(now + timeout);
-                    self.busy_until = now + timeout;
+                    outbound.departure_update(self.time + timeout);
+                    self.busy_until = self.time + timeout;
                     println!(
                         "DRRServer {} busy_until updated to: {:.8e}",
                         self.scheduler_id, self.busy_until
                     );
-                    self.time += timeout;
 
                     // schedules two future events: sending the packet and the next run
-                    schedule_event(timeout, outbound);
+                    schedule_event(self.time, timeout, outbound);
 
                     println!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
@@ -292,7 +291,7 @@ impl DRRServer {
                         packet.packet_id,
                         packet.size,
                         packet.flow_id,
-                        now + timeout,
+                        self.time + timeout,
                         self.queues[self.current_queue].len(),
                     );
 
@@ -305,10 +304,11 @@ impl DRRServer {
             }
         }
     }
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
+
+    pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        let now = self.time;
+        self.time = now;
 
         if self.time == 0.0 {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -323,16 +323,21 @@ impl DRRServer {
             global_time,
             (now - global_time).abs()
         );
+
         assert!((now - global_time).abs() <= 1e-8);
 
-        self.schedule_packet(now, |timeout, outbound| {
+        self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(timeout),
+                Self::send,
+                (timeout, outbound),
+            )
+            .unwrap();
 
             // schedules the next run
             println!("DRRServer: timeout = {:.8e}", timeout);
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                 .unwrap();
         });
     }
