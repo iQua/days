@@ -5,7 +5,7 @@ mailbox_capacity = 100
 duration = 0.2
 ui_interval = 0.01
 report_interval = 0.1
-num_threads = 1
+num_threads = 10
 log_path = "logs/tcp_fattree"
 
 [topology]
