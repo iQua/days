@@ -555,7 +555,7 @@ mod tests {
 
         // simulates a packet of size 2 arrives at connection 0 at time 4
         let packet4 = Packet::new(2, 4, 0, 4.0);
-        wfq.on_packet_received(packet4, 4.0);
+        wfq.on_packet_received(packet4);
 
         // checks that all four packets are in the queue
         assert_eq!(wfq.scheduler_queue.len(), 4);
@@ -885,13 +885,13 @@ mod tests {
         for i in 0..40 {
             // sends one packet to each flow in sequence
             let packet1 = Packet::new(10, i * 3, 0, arrival_time);
-            wfq.on_packet_received(packet1, arrival_time);
+            wfq.on_packet_received(packet1);
 
             let packet2 = Packet::new(10, i * 3 + 1, 1, arrival_time);
-            wfq.on_packet_received(packet2, arrival_time);
+            wfq.on_packet_received(packet2);
 
             let packet3 = Packet::new(10, i * 3 + 2, 2, arrival_time);
-            wfq.on_packet_received(packet3, arrival_time);
+            wfq.on_packet_received(packet3);
 
             arrival_time += arrival_interval;
         }
@@ -942,8 +942,8 @@ mod tests {
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
-            wfq.on_packet_received(packet1, 1.0);
-            wfq.on_packet_received(packet2, 1.0);
+            wfq.on_packet_received(packet1);
+            wfq.on_packet_received(packet2);
         }
 
         wfq.test_run(0.0);
