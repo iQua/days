@@ -211,15 +211,20 @@ impl DRRServer {
 
         if packet.time >= self.busy_until {
             println!(
-                "Running myself: time = {:.8e}, busy_until = {:.8e}",
-                self.time, self.busy_until
+                "DRRServer {} running myself: time = {:.8e}, busy_until = {:.8e}",
+                self.scheduler_id, self.time, self.busy_until
             );
             self.run((), cx);
         }
     }
 
-    pub async fn send(&mut self, packet: Packet) {
-        println!("Sending packet.");
+    pub async fn send(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        println!(
+            "DRRServer {} sending packet at global time {:.8e} and local time {:.8e}.",
+            self.scheduler_id, global_time, self.time
+        );
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
@@ -271,13 +276,17 @@ impl DRRServer {
                     let timeout = packet.size as f64 * 8.0 / self.rate;
                     outbound.departure_update(now + timeout);
                     self.busy_until = now + timeout;
-                    self.time = now + timeout;
+                    println!(
+                        "DRRServer {} busy_until updated to: {:.8e}",
+                        self.scheduler_id, self.busy_until
+                    );
+                    self.time += timeout;
 
-                    // schedules the future event sending the packet and the next run
-                    schedule_event(now + timeout, outbound);
+                    // schedules two future events: sending the packet and the next run
+                    schedule_event(timeout, outbound);
 
-                    debug!(
-                        "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                    println!(
+                        "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                            {} packets in the class queue.",
                         self.scheduler_id,
                         packet.packet_id,
@@ -308,7 +317,8 @@ impl DRRServer {
 
         // to be removed after more thorough testing
         println!(
-            "now = {:.7e}, global_time = {:.7e}, abs = {:.7e}",
+            "DRRServer {}: now = {:.7e}, global_time = {:.7e}, abs = {:.7e}",
+            self.scheduler_id,
             now,
             global_time,
             (now - global_time).abs()
@@ -321,7 +331,7 @@ impl DRRServer {
                 .unwrap();
 
             // schedules the next run
-            println!("timeout = {:.8e}", timeout);
+            println!("DRRServer: timeout = {:.8e}", timeout);
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
                 .unwrap();
         });

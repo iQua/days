@@ -2,7 +2,6 @@
 //! inter-arrival times and packet sizes.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use log::debug;
 use rand::distributions::Distribution;
@@ -87,7 +86,7 @@ impl DistPacketSource {
         );
     }
 
-    pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+    pub fn produce_packet(&mut self, now: f64) -> (Packet, f64) {
         let interval = match self.traffic.arr_dist {
             DistributionInfo::DiscreteUniform { low, high } => {
                 let dist = DiscreteUniform::new(low, high).unwrap();
@@ -136,10 +135,10 @@ impl DistPacketSource {
             packet.last_packet = true;
         }
 
-        (packet, Duration::from_secs_f64(interval))
+        (packet, interval)
     }
 
-    pub async fn send_packet(&mut self, now: f64) -> Duration {
+    pub async fn send_packet(&mut self, now: f64) -> f64 {
         let (packet, interval) = self.produce_packet(now);
 
         self.output.send(packet.clone()).await;

@@ -180,12 +180,8 @@ impl PacketSource {
                 source.busy_until = now + initial_delay;
 
                 // schedules AppDataSource to send next data
-                cx.schedule_event(
-                    Duration::from_secs_f64(initial_delay) + interval,
-                    Self::fetch_app_data,
-                    (),
-                )
-                .unwrap();
+                cx.schedule_event(Duration::from_secs_f64(interval), Self::fetch_app_data, ())
+                    .unwrap();
             }
         }
     }
@@ -209,8 +205,12 @@ impl PacketSource {
                         source.send_buffer += data.size;
 
                         // schedules AppDataSource to send next data
-                        cx.schedule_event(interval, Self::fetch_app_data, ())
-                            .unwrap();
+                        cx.schedule_event(
+                            Duration::from_secs_f64(interval),
+                            Self::fetch_app_data,
+                            (),
+                        )
+                        .unwrap();
                     } else {
                         source.traffic_exceeded = true;
                     }
@@ -223,7 +223,7 @@ impl PacketSource {
                     } else {
                         // the TCPPacketSource is considered busy retrieving
                         // the next packet from the (application-layer) flow
-                        source.busy_until = now + interval.as_secs_f64();
+                        source.busy_until = now + interval;
                     }
                 }
             }
@@ -246,9 +246,10 @@ impl PacketSource {
                 if !source.traffic_exceeded(now) {
                     let interval = source.send_packet(now).await;
                     // updates the locally maintained simulation time
-                    source.time = now + interval.as_secs_f64();
+                    source.time = now + interval;
                     // schedules the next packet to be sent
-                    cx.schedule_event(interval, Self::run, ()).unwrap();
+                    cx.schedule_event(Duration::from_secs_f64(interval), Self::run, ())
+                        .unwrap();
                 }
             }
             PacketSource::TCPPacketSource(source) => source.send_packet(now).await,

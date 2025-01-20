@@ -1,7 +1,6 @@
 //! Implements an application data source used by TCP.
 
 use rand::rngs::SmallRng;
-use std::time::Duration;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
@@ -37,7 +36,7 @@ impl AppDataSource {
         }
     }
 
-    pub fn produce_data(&mut self, now: f64) -> (Packet, Duration) {
+    pub fn produce_data(&mut self, now: f64) -> (Packet, f64) {
         let (packet, duration) = match self {
             AppDataSource::DistDataSource(source) => source.produce_packet(now),
         };
