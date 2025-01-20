@@ -235,7 +235,11 @@ impl WFQServer {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
         assert!((packet.time - global_time).abs() <= 1e-8);
 
         self.on_packet_received(packet);
@@ -314,7 +318,7 @@ impl WFQServer {
         self.time = packet.0;
         let packet_data = packet.1;
 
-        self.output.send(packet_data.clone()).await;
+        self.output.send(packet_data).await;
         self.update_stats_on_packet_forwarded(&packet_data);
         self.update_internal_states(&packet_data, self.time_packet_sent);
     }
@@ -344,7 +348,7 @@ impl WFQServer {
             self.busy_until = self.time + timeout;
 
             debug!(
-                "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                         {} packets in the queue.",
                 self.scheduler_id,
                 outbound.packet_id,
@@ -373,7 +377,7 @@ impl WFQServer {
             cx.schedule_event(
                 Duration::from_secs_f64(timeout),
                 Self::send,
-                (timeout, outbound.packet.clone()),
+                (timeout, outbound.packet),
             )
             .unwrap();
 
