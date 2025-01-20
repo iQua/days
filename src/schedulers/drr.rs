@@ -166,7 +166,7 @@ impl DRRServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                self.time
+                packet.time
             }
             return;
         }
@@ -190,7 +190,7 @@ impl DRRServer {
             packet.size,
             packet.flow_id,
             class_id,
-            self.time,
+            packet.time,
             self.queues[class_id].len(),
             class_id
         );
