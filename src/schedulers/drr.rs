@@ -207,23 +207,11 @@ impl DRRServer {
         self.on_packet_received(packet);
 
         if packet.time >= self.busy_until {
-            println!(
-                "DRRServer {} running myself: time = {:.8e}, packet.time = {:.8e}",
-                self.scheduler_id, self.time, packet.time
-            );
             self.run(packet.time, cx);
         }
     }
 
-    pub async fn send(&mut self, packet: (f64, Packet), cx: &mut Context<Self>) {
-        // to be removed after more thorough testing
-        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        println!(
-            "DRRServer {} sending packet at global time {:.8e} and local time {:.8e}.",
-            self.scheduler_id, global_time, self.time
-        );
-
+    pub async fn send(&mut self, packet: (f64, Packet)) {
         self.time = packet.0;
         self.update_stats_on_packet_forwarded(&packet.1);
         self.output.send(packet.1).await;
@@ -276,15 +264,11 @@ impl DRRServer {
                     let timeout = packet.size as f64 * 8.0 / self.rate;
                     outbound.departure_update(self.time + timeout);
                     self.busy_until = self.time + timeout;
-                    println!(
-                        "DRRServer {} busy_until updated to: {:.8e}",
-                        self.scheduler_id, self.busy_until
-                    );
 
                     // schedules two future events: sending the packet and the next run
                     schedule_event(self.time, timeout, outbound);
 
-                    println!(
+                    debug!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                            {} packets in the class queue.",
                         self.scheduler_id,
@@ -315,15 +299,6 @@ impl DRRServer {
             self.time = global_time;
         }
 
-        // to be removed after more thorough testing
-        println!(
-            "DRRServer {}: now = {:.7e}, global_time = {:.7e}, abs = {:.7e}",
-            self.scheduler_id,
-            now,
-            global_time,
-            (now - global_time).abs()
-        );
-
         assert!((now - global_time).abs() <= 1e-8);
 
         self.schedule_packet(|now, timeout, outbound| {
@@ -336,7 +311,6 @@ impl DRRServer {
             .unwrap();
 
             // schedules the next run
-            println!("DRRServer: timeout = {:.8e}", timeout);
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                 .unwrap();
         });
@@ -348,7 +322,7 @@ impl DRRServer {
         let mut events = Vec::new();
 
         // calls schedule_packets() without borrowing self inside the closure
-        self.schedule_packet(now, |timeout, mut outbound| {
+        self.schedule_packet(|now, timeout, mut outbound| {
             // simulates sending the packet
             outbound.departure_update(now + timeout);
 
