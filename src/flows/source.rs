@@ -130,6 +130,11 @@ impl PacketSource {
             PacketSource::TCPPacketSource(source) => source.time,
         };
 
+        println!(
+            "source packet_received: local_time = {}, global_time = {}",
+            local_time, global_time
+        );
+
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
         assert!((packet.time - global_time).abs() <= 1e-8);
@@ -303,7 +308,7 @@ impl PacketSource {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             // retrieves the current simulation time from the locally stored simulation time
-            let now = match self {
+            let mut now = match self {
                 PacketSource::DistPacketSource(source) => source.time,
                 PacketSource::TCPPacketSource(source) => source.time,
             };
@@ -319,7 +324,8 @@ impl PacketSource {
                     PacketSource::TCPPacketSource(source) => {
                         source.time = global_time;
                     }
-                }
+                };
+                now = global_time;
             }
 
             // to be removed after more thorough testing
