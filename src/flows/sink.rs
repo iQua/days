@@ -282,7 +282,7 @@ impl PacketSink {
         // the packet itself
         assert!(
             (packet.time - global_time).abs() <= 1e-7,
-            "Timing mismatch: now = {}, global_time = {}",
+            "Timing mismatch: packet.time = {}, global_time = {}",
             packet.time,
             global_time
         );

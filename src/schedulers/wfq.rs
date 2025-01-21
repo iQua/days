@@ -335,17 +335,17 @@ impl WFQServer {
     {
         // schedules one packet with the smallest finish time
         if !self.scheduler_queue.is_empty() {
-            let tagged_outbound = self.scheduler_queue.pop().unwrap();
-            let mut outbound = tagged_outbound.packet;
+            let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
+            let outbound = tagged_outbound.packet;
             let class_id = (self.flow_classes)(outbound.flow_id);
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;
-            outbound.queueing_delay_update(self.time);
+            tagged_outbound.packet.queueing_delay_update(self.time);
 
             // sends the packet out to the next element after a timeout
             let timeout = outbound.size as f64 * 8.0 / self.rate;
 
-            outbound.departure_update(self.time + timeout);
+            tagged_outbound.packet.departure_update(self.time + timeout);
 
             self.time_packet_sent = self.time + timeout;
             schedule_event(self.time, timeout, tagged_outbound.clone());
