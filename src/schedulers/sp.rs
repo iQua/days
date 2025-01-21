@@ -127,7 +127,7 @@ impl SPServer {
         self.scheduler_id
     }
 
-    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
+    pub fn on_packet_received(&mut self, packet: Packet) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -143,7 +143,7 @@ impl SPServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                arrival_time
+                packet.time
             }
             return;
         }
@@ -169,29 +169,40 @@ impl SPServer {
             packet.size,
             packet.flow_id,
             class_id,
-            arrival_time,
+            packet.time,
             queue.len(),
             class_id
         );
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        self.on_packet_received(packet, arrival_time);
+        // to be removed after more thorough testing
+        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        if arrival_time >= self.busy_until {
-            self.run((), cx);
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(
+            (packet.time - global_time).abs() <= 1e-7,
+            "Timing mismatch: packet.time = {}, global_time = {}",
+            packet.time,
+            global_time
+        );
+
+        self.on_packet_received(packet);
+
+        if packet.time >= self.busy_until {
+            self.run(packet.time, cx);
         }
     }
 
-    pub async fn send(&mut self, packet: Packet) {
-        self.update_stats_on_packet_forwarded(&packet);
+    pub async fn send(&mut self, packet: (f64, Packet)) {
+        self.time = packet.0;
+        self.update_stats_on_packet_forwarded(&packet.1);
 
         #[cfg(test)]
         self.sent_packets.push(packet.clone());
 
-        self.output.send(packet).await;
+        self.output.send(packet.1).await;
     }
 
     /// Moves on to the next non-empty priority queue if the current queue is empty.
@@ -204,9 +215,9 @@ impl SPServer {
         None
     }
     /// Schedule packets using provided event handler
-    fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
+    fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
-        F: FnMut(f64, Packet),
+        F: FnMut(f64, f64, Packet),
     {
         if let Some(current_priority) = self.next_priority() {
             let queue = self.queues.get_mut(&current_priority).unwrap();
@@ -217,40 +228,52 @@ impl SPServer {
             self.byte_sizes[class_id] -= packet.size;
             self.total_queued_bytes -= packet.size;
 
-            packet.queueing_delay_update(now);
+            packet.queueing_delay_update(self.time);
 
             // calculate send timeout
             let timeout = packet.size as f64 * 8.0 / self.rate;
-            packet.departure_update(now + timeout);
+            packet.departure_update(self.time + timeout);
 
             // call provided event handler
-            schedule_events(timeout, packet);
+            schedule_event(self.time, timeout, packet);
 
-            self.busy_until = now + timeout;
+            self.busy_until = self.time + timeout;
 
             debug!(
-                "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.3}. {} packets in the priority queue.",
+                "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.8e}. {} packets in the priority queue.",
                 self.scheduler_id,
                 packet.packet_id,
                 packet.size,
                 current_priority,
                 packet.flow_id,
-                now + timeout,
+                self.time + timeout,
                 queue.len(),
             );
         }
     }
 
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
+        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        self.time = now;
 
-        self.schedule_packets(now, |timeout, outbound| {
+        if self.time == 0.0 {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            self.time = global_time;
+        }
+
+        assert!((now - global_time).abs() <= 1e-8);
+
+        self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(timeout),
+                Self::send,
+                (timeout, outbound),
+            )
+            .unwrap();
 
             // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                 .unwrap();
         });
     }
@@ -260,7 +283,7 @@ impl SPServer {
         // creates vector to collect events
         let mut events = Vec::new();
 
-        self.schedule_packets(now, |timeout, outbound| {
+        self.schedule_packet(|now, timeout, mut outbound| {
             // collects the events
             events.push((timeout, outbound));
         });
@@ -374,7 +397,7 @@ mod tests {
         let packet = Packet::new(1024, 1, 0, 0.0);
 
         // sends packet to SPServer
-        sp.on_packet_received(packet.clone(), 0.0);
+        sp.on_packet_received(packet.clone());
 
         // checks that the packet is in the queue
         assert_eq!(sp.queues[&1].len(), 1);
@@ -406,8 +429,8 @@ mod tests {
         let high_prio_packet = Packet::new(1024, 2, 1, 0.0);
 
         // sends low priority packet first
-        sp.on_packet_received(low_prio_packet.clone(), 0.0);
-        sp.on_packet_received(high_prio_packet.clone(), 0.0);
+        sp.on_packet_received(low_prio_packet.clone());
+        sp.on_packet_received(high_prio_packet.clone());
 
         // runs the scheduler
         sp.test_run(0.0);
@@ -437,9 +460,9 @@ mod tests {
         let packet3 = Packet::new(1024, 3, 0, 0.0);
 
         // sends packets to SPServer
-        sp.on_packet_received(packet1, 0.0);
-        sp.on_packet_received(packet2, 0.0);
-        sp.on_packet_received(packet3, 0.0);
+        sp.on_packet_received(packet1);
+        sp.on_packet_received(packet2);
+        sp.on_packet_received(packet3);
 
         // verifies only two packets are in queue due to capacity limit
         assert_eq!(sp.queues[&1].len(), 2);
@@ -462,7 +485,7 @@ mod tests {
         // sends multiple packets
         for i in 0..100 {
             let packet = Packet::new(1024, i, 0, 0.0);
-            sp.on_packet_received(packet, 0.0);
+            sp.on_packet_received(packet);
         }
 
         // verifies no packets were dropped
@@ -485,7 +508,7 @@ mod tests {
         // sends multiple packets to fill the queue
         for i in 0..20 {
             let packet = Packet::new(1024, i, 0, 0.0);
-            sp.on_packet_received(packet, 0.0);
+            sp.on_packet_received(packet);
         }
 
         // verifies RED dropped some packets before reaching capacity
@@ -511,9 +534,9 @@ mod tests {
         let packet3 = Packet::new(1024, 3, 2, 0.0); // flow 2 -> class 0 (low priority)
 
         // sends packets
-        sp.on_packet_received(packet2, 0.0);
-        sp.on_packet_received(packet3, 0.0);
-        sp.on_packet_received(packet1, 0.0);
+        sp.on_packet_received(packet2);
+        sp.on_packet_received(packet3);
+        sp.on_packet_received(packet1);
 
         // runs scheduler
         sp.test_run(0.0);
@@ -538,7 +561,7 @@ mod tests {
         // sends multiple packets with same priority
         for i in 0..3 {
             let packet = Packet::new(1024, i, 0, 0.0);
-            sp.on_packet_received(packet, 0.0);
+            sp.on_packet_received(packet);
         }
 
         // runs scheduler
@@ -566,7 +589,7 @@ mod tests {
         // initially sends only low priority packets
         for i in 0..5 {
             let packet = Packet::new(10, i, 0, 0.0);
-            sp.on_packet_received(packet, 0.0);
+            sp.on_packet_received(packet);
         }
 
         sp.test_run(0.0);
@@ -575,7 +598,7 @@ mod tests {
         // then sends high priority packets
         for i in 5..10 {
             let packet = Packet::new(10, i, 1, 1.0); // high priority packets
-            sp.on_packet_received(packet, 1.0);
+            sp.on_packet_received(packet);
         }
 
         // runs scheduler again
@@ -607,7 +630,7 @@ mod tests {
 
         // creates a packet larger than capacity
         let large_packet = Packet::new(1501, 1, 0, 0.0);
-        sp.on_packet_received(large_packet, 0.0);
+        sp.on_packet_received(large_packet);
 
         // verifies packet was dropped
         assert_eq!(sp.packets_dropped, 1);
@@ -615,7 +638,7 @@ mod tests {
 
         // sends a packet within capacity limits
         let normal_packet = Packet::new(1000, 2, 0, 0.0);
-        sp.on_packet_received(normal_packet, 0.0);
+        sp.on_packet_received(normal_packet);
 
         // verifies normal packet was accepted
         assert_eq!(sp.queues[&1].len(), 1);
@@ -639,9 +662,9 @@ mod tests {
         let packet2 = Packet::new(1024, 2, 1, 0.0); // medium priority
         let packet3 = Packet::new(1024, 3, 2, 0.0); // highest priority
 
-        sp.on_packet_received(packet1, 0.0);
-        sp.on_packet_received(packet2, 0.0);
-        sp.on_packet_received(packet3, 0.0);
+        sp.on_packet_received(packet1);
+        sp.on_packet_received(packet2);
+        sp.on_packet_received(packet3);
 
         // runs scheduler
         sp.test_run(0.0);
