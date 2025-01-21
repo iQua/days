@@ -200,7 +200,7 @@ impl SPServer {
         self.update_stats_on_packet_forwarded(&packet.1);
 
         #[cfg(test)]
-        self.sent_packets.push(packet.clone());
+        self.sent_packets.push(packet.1.clone());
 
         self.output.send(packet.1).await;
     }
