@@ -278,6 +278,10 @@ impl PacketSink {
             PacketSink::TCPPacketSink(sink) => sink.time,
         };
 
+        println!(
+            "TEST packet.time {:?}, global_time {:?}, local_time {:?}",
+            packet.time, global_time, local_time
+        );
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
         assert!(
