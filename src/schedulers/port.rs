@@ -96,8 +96,16 @@ impl Port {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(
+            (packet.time - global_time).abs() <= 1e-7,
+            "Timing mismatch: packet.time = {}, global_time = {}",
+            packet.time,
+            global_time
+        );
 
         // drops the packet if the buffer is full
         let should_drop_packet =
@@ -108,8 +116,8 @@ impl Port {
         if should_drop_packet {
             self.packets_dropped += 1;
             debug!(
-                "Port {} dropped packet {} from flow {} at time {:.3}",
-                self.scheduler_id, packet.packet_id, packet.flow_id, arrival_time
+                "Port {} dropped packet {} from flow {} at time {:.8e}",
+                self.scheduler_id, packet.packet_id, packet.flow_id, packet.time
             );
             return;
         }
@@ -119,24 +127,25 @@ impl Port {
         self.queue.push_back(packet.clone());
 
         debug!(
-            "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "Port {} received packet {} ({} bytes) from flow {} at time {:.8e}. \
             {} packets in queue.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            arrival_time,
+            packet.time,
             self.queue.len()
         );
 
-        if arrival_time >= self.busy_until {
-            self.run((), cx).await;
+        if packet.time >= self.busy_until {
+            self.run(packet.time, cx).await;
         }
     }
 
-    pub async fn send(&mut self, packet: Packet) {
-        self.update_stats_on_packet_forwarded(&packet);
-        self.output.send(packet).await;
+    pub async fn send(&mut self, packet: (f64, Packet)) {
+        self.time = packet.0;
+        self.update_stats_on_packet_forwarded(&packet.1);
+        self.output.send(packet.1).await;
     }
 
     fn packet_sent(&mut self, now: f64, packet: Packet) {
@@ -156,21 +165,35 @@ impl Port {
 
     pub fn run<'a>(
         &'a mut self,
-        _: (),
+        now: f64,
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            // let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            // to be removed after more thorough testing
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            assert!((now - global_time).abs() <= 1e-8);
+
+            self.time = now;
+
+            if self.time == 0.0 {
+                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                self.time = global_time;
+            }
 
             if let Some(mut packet) = self.queue.pop_front() {
                 packet.queueing_delay_update(now);
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 packet.departure_update(now + timeout);
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(timeout),
+                    Self::send,
+                    (timeout, packet.clone()),
+                )
+                .unwrap();
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                     .unwrap();
 
                 self.packet_sent(now + timeout, packet);
