@@ -283,7 +283,7 @@ impl SPServer {
         // creates vector to collect events
         let mut events = Vec::new();
 
-        self.schedule_packet(|now, timeout, mut outbound| {
+        self.schedule_packet(|_now, timeout, outbound| {
             // collects the events
             events.push((timeout, outbound));
         });
