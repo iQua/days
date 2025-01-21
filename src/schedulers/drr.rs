@@ -222,7 +222,7 @@ impl DRRServer {
         self.output.send(packet.1).await;
     }
 
-    /// moves on to the next queue if the current queue is empty.
+    /// Moves on to the next queue if the current queue is empty.
     fn next_queue(&mut self) {
         self.current_queue += 1;
 
@@ -241,6 +241,7 @@ impl DRRServer {
         }
     }
 
+    /// Schedules a packet by accepting a closure to handle packet sending based on context.
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
         F: FnMut(f64, f64, Packet),

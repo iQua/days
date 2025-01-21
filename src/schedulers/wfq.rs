@@ -328,7 +328,7 @@ impl WFQServer {
         self.update_internal_states(&packet_data, self.time_packet_sent);
     }
 
-    /// schedules packets by accepting a closure to handle packet sending based on context.
+    /// Schedules a packet by accepting a closure to handle packet sending based on context.
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
         F: FnMut(f64, f64, TaggedPacket),
