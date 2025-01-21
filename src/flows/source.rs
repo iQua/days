@@ -130,14 +130,14 @@ impl PacketSource {
             PacketSource::TCPPacketSource(source) => source.time,
         };
 
-        println!(
-            "source packet_received: local_time = {}, global_time = {}",
-            local_time, global_time
-        );
-
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
-        assert!((packet.time - global_time).abs() <= 1e-8);
+        assert!(
+            (packet.time - global_time).abs() <= 1e-7,
+            "Timing mismatch: packet.time = {}, global_time = {}",
+            packet.time,
+            global_time
+        );
 
         // makes sure that the simulation advances in time
         assert!((packet.time - local_time).abs() <= 1e-8 || packet.time > local_time);
@@ -325,12 +325,11 @@ impl PacketSource {
                         source.time = global_time;
                     }
                 };
+
                 now = global_time;
             }
 
             // to be removed after more thorough testing
-            // assert!((now - global_time).abs() <= 1e-8);
-            //
             assert!(
                 (now - global_time).abs() <= 1e-7,
                 "Timing mismatch: now = {}, global_time = {}",

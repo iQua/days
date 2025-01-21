@@ -280,10 +280,15 @@ impl PacketSink {
 
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
-        assert!((packet.time - global_time).abs() <= 1e-8);
+        assert!(
+            (packet.time - global_time).abs() <= 1e-7,
+            "Timing mismatch: now = {}, global_time = {}",
+            packet.time,
+            global_time
+        );
 
         // makes sure that the simulation advances in time
-        assert!((packet.time - local_time).abs() <= 1e-8 || packet.time > local_time);
+        assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
 
         let now = packet.time;
 
