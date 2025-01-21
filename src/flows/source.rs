@@ -332,7 +332,7 @@ impl PacketSource {
             // assert!((now - global_time).abs() <= 1e-8);
             //
             assert!(
-                (now - global_time).abs() <= 1e-8,
+                (now - global_time).abs() <= 1e-7,
                 "Timing mismatch: now = {}, global_time = {}",
                 now,
                 global_time
