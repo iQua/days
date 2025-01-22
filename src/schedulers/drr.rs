@@ -16,7 +16,6 @@ use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
-use crate::utils::tracing::current_concurrency;
 
 pub struct DRRServer {
     scheduler_id: usize,
@@ -200,8 +199,6 @@ impl DRRServer {
 
     #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        tracing::info!("Current concurrency: {}", current_concurrency());
-
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
