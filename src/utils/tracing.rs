@@ -19,3 +19,7 @@ where
         ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+pub fn current_concurrency() -> usize {
+    ACTIVE_TASKS.load(Ordering::Relaxed)
+}
