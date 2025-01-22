@@ -4,6 +4,8 @@ use std::env;
 
 use log::info;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter};
+
 // use petgraph::graph::UnGraph;
 
 use daytone::flows::collective::Collective;
@@ -14,14 +16,15 @@ use daytone::topos::topo::Topology;
 use daytone::utils::tracing::ConcurrencyTrackerLayer;
 
 fn main() {
-    // initializes the tracing registry for tracking active tasks
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer()) // Console logging
-        .with(ConcurrencyTrackerLayer) // Concurrency tracking
-        .init(); // Set as global default
+    // Build an EnvFilter that reads the RUST_LOG environment variable,
+    // defaulting to "info" if not set
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
-    env_logger::init_from_env(env);
+    tracing_subscriber::registry()
+        .with(fmt::layer()) // console formatting
+        .with(env_filter) // env-based filtering
+        .with(ConcurrencyTrackerLayer) // concurrency tracking
+        .init(); // sets as global default
 
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
