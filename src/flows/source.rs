@@ -9,6 +9,7 @@ use std::time::Duration;
 use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
@@ -121,6 +122,7 @@ impl PacketSource {
         }
     }
 
+    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         #[cfg(test)]
         {
@@ -256,6 +258,7 @@ impl PacketSource {
         }
     }
 
+    #[instrument(skip(self, cx))]
     async fn send_packet(&mut self, cx: &Context<Self>, now: f64) {
         match self {
             PacketSource::DistPacketSource(source) => {
@@ -302,6 +305,7 @@ impl PacketSource {
         }
     }
 
+    #[instrument(skip(self, cx))]
     pub fn run<'a>(
         &'a mut self,
         _: (),
