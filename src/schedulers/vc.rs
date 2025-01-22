@@ -283,6 +283,7 @@ impl VirtualClockServer {
     {
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
+
             let outbound = tagged_outbound.packet;
             let class_id = (self.flow_classes)(outbound.flow_id);
             let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
@@ -294,11 +295,10 @@ impl VirtualClockServer {
 
             // sends the packet out to the next element after a timeout
             let timeout = outbound.size as f64 * 8.0 / self.rate;
-
             tagged_outbound.packet.departure_update(self.time + timeout);
             self.time_packet_sent = self.time + timeout;
 
-            schedule_event(self.time, timeout, tagged_outbound.clone());
+            schedule_event(self.time, timeout, tagged_outbound);
 
             self.busy_until = self.time + timeout;
 
