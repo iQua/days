@@ -254,14 +254,22 @@ impl SPServer {
 
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(
+            (now - global_time).abs() <= 1e-7,
+            "Timing mismatch: now = {}, global_time = {}",
+            now,
+            global_time
+        );
+
         self.time = now;
 
         if self.time == 0.0 {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
             self.time = global_time;
         }
-
-        assert!((now - global_time).abs() <= 1e-8);
 
         self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event

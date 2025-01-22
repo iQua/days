@@ -262,12 +262,6 @@ impl WRRServer {
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        self.time = now;
-
-        if self.time == 0.0 {
-            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            self.time = global_time;
-        }
 
         // makes sure that the current simulation time can be correctly retrieved from
         // the packet itself
@@ -277,6 +271,13 @@ impl WRRServer {
             now,
             global_time
         );
+
+        self.time = now;
+
+        if self.time == 0.0 {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            self.time = global_time;
+        }
 
         self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event

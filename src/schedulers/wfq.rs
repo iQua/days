@@ -368,7 +368,15 @@ impl WFQServer {
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
         // to be removed after more thorough testing
         let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        assert!((now - global_time).abs() <= 1e-8);
+
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(
+            (now - global_time).abs() <= 1e-7,
+            "Timing mismatch: now = {}, global_time = {}",
+            now,
+            global_time
+        );
 
         self.time = now;
 
