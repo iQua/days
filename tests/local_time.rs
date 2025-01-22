@@ -1,7 +1,5 @@
 #![cfg(feature = "test")]
 
-use std::env;
-
 use log::info;
 
 use daytone::flows::collective::Collective;
@@ -9,17 +7,15 @@ use daytone::flows::flow::Flow;
 use daytone::seed_from_config;
 use daytone::topos::build::build_graph;
 use daytone::topos::topo::Topology;
-use daytone::utils::logger::CsvLogger;
 
+#[test]
 fn test_local_time() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Info) // explicitly set log level
+        .try_init();
 
-    // Initialize the logger
-    if let Err(e) = CsvLogger::get_instance().init("logs/local_time_test") {
-        panic!("Failed to initialize CsvLogger: {}", e);
-    }
-
-    let path = "tests/tcp_fattree.toml";
+    let path = "tests/local_time.toml";
     let _ = seed_from_config(&path);
 
     let Ok((graph, hosts)) = build_graph(&path) else {

@@ -96,16 +96,19 @@ impl Port {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        // makes sure that the current simulation time can be correctly retrieved from
-        // the packet itself
-        assert!(
-            (packet.time - global_time).abs() <= 1e-7,
-            "Timing mismatch: packet.time = {}, global_time = {}",
-            packet.time,
-            global_time
-        );
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+        }
 
         // drops the packet if the buffer is full
         let should_drop_packet =
@@ -169,7 +172,7 @@ impl Port {
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            #[cfg(test)]
+            #[cfg(feature = "test")]
             {
                 let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 

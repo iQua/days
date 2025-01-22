@@ -15,13 +15,13 @@ where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`.
 To run both unit and integration tests, use the command:
 
 ```sh
-cargo test --features test
+cargo test --features test -- --show-output
 ```
 
 Or if [cargo-nextest](https://nexte.st/) has been installed (by using the command `brew install cargo-nextest`), run the following command instead to take advantage of its speed and more streamlined user interface:
 
 ```sh
-cargo nextest run --all-features
+cargo nextest run --all-features --no-capture
 ```
 
 ## Configuration Settings

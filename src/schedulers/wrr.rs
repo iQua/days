@@ -185,7 +185,7 @@ impl WRRServer {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        #[cfg(test)]
+        #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -262,7 +262,7 @@ impl WRRServer {
     }
 
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
-        #[cfg(test)]
+        #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 

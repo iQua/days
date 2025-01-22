@@ -64,7 +64,7 @@ impl PacketSwitch {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
-        #[cfg(test)]
+        #[cfg(feature = "test")]
         {
             use nexosim::time::MonotonicTime;
 
