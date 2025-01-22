@@ -73,3 +73,7 @@ pub fn update_next_flow_id(next_flow_id: usize) {
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
 }
+
+pub fn current_concurrency() -> usize {
+    ACTIVE_TASKS.load(Ordering::Relaxed)
+}

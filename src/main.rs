@@ -10,8 +10,15 @@ use daytone::flows::flow::Flow;
 use daytone::seed_from_config;
 use daytone::topos::build::build_graph;
 use daytone::topos::topo::Topology;
+use daytone::utils::tracing::ConcurrencyTrackerLayer;
 
 fn main() {
+    // initializes the tracing registry for tracking active tasks
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer()) // Console logging
+        .with(ConcurrencyTrackerLayer) // Concurrency tracking
+        .init(); // Set as global default
+
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
