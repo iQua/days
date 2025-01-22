@@ -125,9 +125,8 @@ impl DistPacketSource {
 
         // Ensure that the packet size is non-negative and at least 1 byte
         let rounded_packet_size = packet_size.round().max(1.0) as usize;
+
         let mut packet = Packet::new(rounded_packet_size, self.packets_sent, self.flow_id, now);
-        println!("TEST packet.time {:?}", packet.time);
-        println!("TEST now {:?}", now);
         if self.traffic.size.exceeded(
             self.sent_size + rounded_packet_size,
             self.flow_start_time,

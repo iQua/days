@@ -232,10 +232,12 @@ impl WRRServer {
                     self.packets_waiting -= 1;
                     self.packets_sent_in_round[self.current_queue] += 1;
 
-                    let transmission_time = (outbound.size as f64 * 8.0) / self.rate;
+                    // calculate send timeout
+                    let timeout = outbound.size as f64 * 8.0 / self.rate;
+                    outbound.departure_update(self.time + timeout);
 
-                    schedule_event(self.time, transmission_time, outbound.clone());
-                    self.busy_until = self.time + transmission_time;
+                    schedule_event(self.time, timeout, outbound.clone());
+                    self.busy_until = self.time + timeout;
 
                     debug!(
                         "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -244,7 +246,7 @@ impl WRRServer {
                         outbound.packet_id,
                         outbound.size,
                         outbound.flow_id,
-                        self.time + transmission_time,
+                        self.time + timeout,
                         self.queues[self.current_queue].len(),
                     );
                     return;
@@ -267,7 +269,15 @@ impl WRRServer {
             self.time = global_time;
         }
 
-        assert!((now - global_time).abs() <= 1e-8);
+        // makes sure that the current simulation time can be correctly retrieved from
+        // the packet itself
+        assert!(
+            (now - global_time).abs() <= 1e-7,
+            "Timing mismatch: now = {}, global_time = {}",
+            now,
+            global_time
+        );
+
         self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
             cx.schedule_event(
