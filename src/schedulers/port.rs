@@ -142,10 +142,10 @@ impl Port {
         }
     }
 
-    pub async fn send(&mut self, packet: (f64, Packet)) {
-        self.time = packet.0;
-        self.update_stats_on_packet_forwarded(&packet.1);
-        self.output.send(packet.1).await;
+    pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
+        self.update_stats_on_packet_forwarded(&packet);
+        self.output.send(packet).await;
     }
 
     fn packet_sent(&mut self, now: f64, packet: Packet) {
@@ -191,12 +191,8 @@ impl Port {
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 packet.departure_update(now + timeout);
 
-                cx.schedule_event(
-                    Duration::from_secs_f64(timeout),
-                    Self::send,
-                    (timeout, packet.clone()),
-                )
-                .unwrap();
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
+                    .unwrap();
 
                 cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                     .unwrap();

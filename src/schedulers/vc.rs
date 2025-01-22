@@ -278,7 +278,7 @@ impl VirtualClockServer {
 
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
-        F: FnMut(f64, f64, Packet),
+        F: FnMut(f64, f64, TaggedPacket),
     {
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
@@ -297,7 +297,8 @@ impl VirtualClockServer {
             tagged_outbound.packet.departure_update(self.time + timeout);
             self.time_packet_sent = self.time + timeout;
 
-            schedule_event(self.time, timeout, tagged_outbound.packet);
+            // schedules the future send event with TaggedPacket to facilitate testing
+            schedule_event(self.time, timeout, tagged_outbound);
 
             self.busy_until = self.time + timeout;
 
@@ -336,8 +337,12 @@ impl VirtualClockServer {
 
         self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
-                .unwrap();
+            cx.schedule_event(
+                Duration::from_secs_f64(timeout),
+                Self::send,
+                outbound.packet,
+            )
+            .unwrap();
 
             // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
