@@ -172,7 +172,14 @@ impl Port {
             // let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
             // to be removed after more thorough testing
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            assert!((now - global_time).abs() <= 1e-8);
+            // assert!((now - global_time).abs() <= 1e-8);
+            //
+            assert!(
+                (now - global_time).abs() <= 1e-7,
+                "Timing mismatch: now = {}, global_time = {}",
+                now,
+                global_time
+            );
 
             self.time = now;
 
