@@ -7,6 +7,7 @@ use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
+use tracing::instrument;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
@@ -76,6 +77,7 @@ impl DistPacketSource {
         );
     }
 
+    #[instrument(skip(self))]
     pub fn packet_received(&mut self, packet: Packet, now: f64) {
         // updates the locally maintained simulation time
         self.time = now;
@@ -137,7 +139,7 @@ impl DistPacketSource {
 
         (packet, interval)
     }
-
+    #[instrument(skip(self))]
     pub async fn send_packet(&mut self, now: f64) -> f64 {
         let (packet, interval) = self.produce_packet(now);
 
