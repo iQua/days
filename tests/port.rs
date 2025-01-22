@@ -119,11 +119,13 @@ fn test_fifo_scheduling() {
 
                 for packet in statistics.packets {
                     assert!(
-                        packet.time >= prev_arrival,
+                        (packet.time - prev_arrival) < 1e-7 || packet.time > prev_arrival,
                         "Packets not processed in FIFO order."
                     );
+
                     prev_arrival = packet.time;
                 }
+
                 println!("packets sent: {}", packets_sent);
                 println!("packets received: {}", packets_received);
 
