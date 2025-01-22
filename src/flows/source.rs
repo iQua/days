@@ -122,25 +122,27 @@ impl PacketSource {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        // to be removed after more thorough testing
-        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        #[cfg(test)]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        let local_time = match self {
-            PacketSource::DistPacketSource(source) => source.time,
-            PacketSource::TCPPacketSource(source) => source.time,
-        };
+            let local_time = match self {
+                PacketSource::DistPacketSource(source) => source.time,
+                PacketSource::TCPPacketSource(source) => source.time,
+            };
 
-        // makes sure that the current simulation time can be correctly retrieved from
-        // the packet itself
-        assert!(
-            (packet.time - global_time).abs() <= 1e-7,
-            "Timing mismatch: packet.time = {}, global_time = {}",
-            packet.time,
-            global_time
-        );
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
 
-        // makes sure that the simulation advances in time
-        assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+            // makes sure that the simulation advances in time
+            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+        }
 
         let now = packet.time;
 
@@ -206,9 +208,11 @@ impl PacketSource {
                 PacketSource::TCPPacketSource(source) => {
                     source.time = current_time;
 
-                    // to be removed after further testing
-                    let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-                    assert!((now - source.time).abs() <= 1e-7);
+                    #[cfg(test)]
+                    {
+                        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                        assert!((now - source.time).abs() <= 1e-7);
+                    }
 
                     let (data, interval) = source.datasource.produce_data(source.time);
 
@@ -304,7 +308,7 @@ impl PacketSource {
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            // to be removed after more thorough testing
+            #[cfg(test)]
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             // retrieves the current simulation time from the locally stored simulation time
@@ -329,7 +333,7 @@ impl PacketSource {
                 now = global_time;
             }
 
-            // to be removed after more thorough testing
+            #[cfg(test)]
             assert!(
                 (now - global_time).abs() <= 1e-7,
                 "Timing mismatch: now = {}, global_time = {}",

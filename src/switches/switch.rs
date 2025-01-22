@@ -6,7 +6,6 @@ use log::debug;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_switch_id;
@@ -64,20 +63,26 @@ impl PacketSwitch {
         self.r_fib.insert(flow_id, next_id);
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        // to be removed after more thorough testing
-        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        let local_time = self.time;
+    pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            use nexosim::time::MonotonicTime;
 
-        // makes sure that the current simulation time can be correctly retrieved from
-        // the packet itself
-        assert!((packet.time - global_time).abs() <= 1e-7);
+            let global_time = _cx
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+            let local_time = self.time;
 
-        // makes sure that the simulation advances in time
-        assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!((packet.time - global_time).abs() <= 1e-7);
 
-        let now = packet.time;
-        self.time = now;
+            // makes sure that the simulation advances in time
+            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+        }
+
+        self.time = packet.time;
 
         if packet.ack.is_none() {
             self.packets_received += 1;
@@ -89,7 +94,7 @@ impl PacketSwitch {
                 packet.packet_id,
                 packet.size,
                 packet.flow_id,
-                now,
+                self.time,
                 self.packets_received
             );
 
@@ -102,7 +107,7 @@ impl PacketSwitch {
         } else {
             debug!(
                 "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.switch_id, packet.packet_id, packet.size, packet.flow_id, now,
+                self.switch_id, packet.packet_id, packet.size, packet.flow_id, self.time,
             );
 
             // forwards acknowledgment packets to their corresponding upstream elements

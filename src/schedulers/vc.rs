@@ -230,15 +230,19 @@ impl VirtualClockServer {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        // makes sure that the current simulation time can be correctly retrieved from
-        // the packet itself
-        assert!(
-            (packet.time - global_time).abs() <= 1e-7,
-            "Timing mismatch: packet.time = {}, global_time = {}",
-            packet.time,
-            global_time
-        );
+        #[cfg(test)]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+        }
 
         self.on_packet_received(packet);
 
@@ -316,17 +320,19 @@ impl VirtualClockServer {
     }
 
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
-        // to be removed after more thorough testing
-        let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        #[cfg(test)]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        // makes sure that the current simulation time can be correctly retrieved from
-        // the packet itself
-        assert!(
-            (now - global_time).abs() <= 1e-7,
-            "Timing mismatch: now = {}, global_time = {}",
-            now,
-            global_time
-        );
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (now - global_time).abs() <= 1e-7,
+                "Timing mismatch: now = {}, global_time = {}",
+                now,
+                global_time
+            );
+        }
 
         self.time = now;
 
