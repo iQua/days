@@ -169,11 +169,9 @@ impl Port {
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            // let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
             // to be removed after more thorough testing
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            // assert!((now - global_time).abs() <= 1e-8);
-            //
+
             assert!(
                 (now - global_time).abs() <= 1e-7,
                 "Timing mismatch: now = {}, global_time = {}",

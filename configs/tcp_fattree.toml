@@ -17,8 +17,8 @@ k = 96
 [switch]
 port_rate = 100000000 # 100 Mbps
 capacity = 1000
-weights = [1]
-discipline = "WRR"
+vticks = [1]
+discipline = "VirtualClock"
 drop = "RED"
 
 [[flow_set]]
