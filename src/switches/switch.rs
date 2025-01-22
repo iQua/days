@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use log::debug;
+use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
@@ -63,6 +64,7 @@ impl PacketSwitch {
         self.r_fib.insert(flow_id, next_id);
     }
 
+    #[instrument(skip(self))]
     pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {
