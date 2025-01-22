@@ -56,6 +56,10 @@ impl Eq for TaggedPacket {}
 pub struct VirtualClockServer {
     scheduler_id: usize,
 
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     /// the bit rate of the server
     rate: f64,
 
@@ -140,6 +144,7 @@ impl VirtualClockServer {
 
         VirtualClockServer {
             scheduler_id,
+            time: 0.0,
             rate,
             flow_classes,
             drop_strategy: packet_drop,
@@ -170,7 +175,7 @@ impl VirtualClockServer {
         self.scheduler_id
     }
 
-    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
+    pub fn on_packet_received(&mut self, packet: Packet) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -186,7 +191,7 @@ impl VirtualClockServer {
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                arrival_time
+                packet.time
             }
             return;
         }
@@ -196,7 +201,7 @@ impl VirtualClockServer {
 
         // computes a virtual clock finish time and adds it as a tag to the
         // packet
-        let tagged_packet = self.tag(packet.clone(), arrival_time);
+        let tagged_packet = self.tag(packet.clone(), packet.time);
         let aux_vc = tagged_packet.tag;
 
         // pushes the packet into a min-heap according to the packet's virtual
@@ -219,18 +224,30 @@ impl VirtualClockServer {
             aux_vc,
             packet.flow_id,
             class_id,
-            arrival_time,
+            packet.time,
             self.scheduler_queue.len(),
         );
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        self.on_packet_received(packet, arrival_time);
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        if arrival_time >= self.busy_until {
-            self.run((), cx);
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+        }
+
+        self.on_packet_received(packet);
+
+        if packet.time >= self.busy_until {
+            self.run(packet.time, cx);
         }
     }
 
@@ -258,62 +275,83 @@ impl VirtualClockServer {
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
 
-    fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
+    fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
-        F: FnMut(f64, TaggedPacket),
+        F: FnMut(f64, f64, TaggedPacket),
     {
         if !self.scheduler_queue.is_empty() {
-            let tagged_outbound = self.scheduler_queue.pop().unwrap();
-            let mut outbound = tagged_outbound.packet;
+            let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
+
+            let outbound = tagged_outbound.packet;
             let class_id = (self.flow_classes)(outbound.flow_id);
             let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
             *flow_queue_count -= 1;
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;
 
-            outbound.queueing_delay_update(now);
+            tagged_outbound.packet.queueing_delay_update(self.time);
 
             // sends the packet out to the next element after a timeout
             let timeout = outbound.size as f64 * 8.0 / self.rate;
+            tagged_outbound.packet.departure_update(self.time + timeout);
+            self.time_packet_sent = self.time + timeout;
 
-            outbound.departure_update(now + timeout);
-            self.time_packet_sent = now + timeout;
+            // schedules the future send event with TaggedPacket to facilitate testing
+            schedule_event(self.time, timeout, tagged_outbound);
 
-            schedule_events(timeout, tagged_outbound.clone());
-
-            self.busy_until = now + timeout;
+            self.busy_until = self.time + timeout;
 
             debug!(
-                "VirtualClockServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                "VirtualClockServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                         {} packets in the queue.",
                 self.scheduler_id,
                 outbound.packet_id,
                 outbound.size,
                 outbound.flow_id,
-                now + timeout,
+                self.time + timeout,
                 self.scheduler_queue.len(),
             );
         }
     }
 
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        self.schedule_packets(now, |timeout, outbound| {
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (now - global_time).abs() <= 1e-7,
+                "Timing mismatch: now = {}, global_time = {}",
+                now,
+                global_time
+            );
+        }
+
+        self.time = now;
+
+        if self.time == 0.0 {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            self.time = global_time;
+        }
+
+        self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
             cx.schedule_event(
                 Duration::from_secs_f64(timeout),
                 Self::send,
-                outbound.packet.clone(),
+                outbound.packet,
             )
             .unwrap();
 
             // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                 .unwrap();
         });
     }
@@ -324,7 +362,7 @@ impl VirtualClockServer {
         let mut events = Vec::new();
 
         // calls schedule_packets() without borrowing self inside the closure
-        self.schedule_packets(now, |timeout, mut outbound| {
+        self.schedule_packet(|now, timeout, mut outbound| {
             // simulates sending the packet
             outbound.packet.departure_update(now + timeout);
 
@@ -411,6 +449,7 @@ impl ReportStatistics for VirtualClockServer {
 impl Model for VirtualClockServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
+
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
@@ -444,7 +483,7 @@ mod tests {
         );
 
         let packet = Packet::new(1024, 1, 0, 0.0);
-        vc.on_packet_received(packet.clone(), 0.0);
+        vc.on_packet_received(packet.clone());
 
         assert_eq!(vc.scheduler_queue.len(), 1);
         assert_eq!(vc.packets_received, 1);
@@ -469,9 +508,9 @@ mod tests {
         let packet2 = Packet::new(1024, 2, 1, 0.0); // flow_id 1, class 1
         let packet3 = Packet::new(1024, 3, 2, 0.0); // flow_id 2, class 0
 
-        vc.on_packet_received(packet1, 0.0);
-        vc.on_packet_received(packet2, 0.0);
-        vc.on_packet_received(packet3, 0.0);
+        vc.on_packet_received(packet1);
+        vc.on_packet_received(packet2);
+        vc.on_packet_received(packet3);
 
         vc.test_run(0.0);
 
@@ -497,9 +536,9 @@ mod tests {
         let packet2 = Packet::new(1024, 2, 0, 0.0);
         let packet3 = Packet::new(1024, 3, 0, 0.0);
 
-        vc.on_packet_received(packet1, 0.0);
-        vc.on_packet_received(packet2, 0.0);
-        vc.on_packet_received(packet3, 0.0);
+        vc.on_packet_received(packet1);
+        vc.on_packet_received(packet2);
+        vc.on_packet_received(packet3);
 
         assert_eq!(vc.packets_dropped, 1);
     }
@@ -517,7 +556,7 @@ mod tests {
         );
 
         let packet = Packet::new(1024, 1, 0, 0.0);
-        vc.on_packet_received(packet, 0.0);
+        vc.on_packet_received(packet);
 
         assert_eq!(vc.packets_dropped, 0);
     }
@@ -535,7 +574,7 @@ mod tests {
         );
 
         let packet = Packet::new(1501, 1, 0, 0.0);
-        vc.on_packet_received(packet, 0.0);
+        vc.on_packet_received(packet);
 
         assert_eq!(vc.packets_dropped, 1);
     }
@@ -555,8 +594,8 @@ mod tests {
         let packet1 = Packet::new(1024, 1, 0, 0.0);
         let packet2 = Packet::new(1024, 2, 1, 0.1);
 
-        vc.on_packet_received(packet1, 0.0);
-        vc.on_packet_received(packet2, 0.1);
+        vc.on_packet_received(packet1);
+        vc.on_packet_received(packet2);
 
         vc.test_run(0.0);
 
@@ -578,7 +617,7 @@ mod tests {
         );
 
         let packet = Packet::new(1000, 1, 0, 0.0);
-        vc.on_packet_received(packet, 0.0);
+        vc.on_packet_received(packet);
 
         vc.test_run(0.0);
 
@@ -600,7 +639,7 @@ mod tests {
 
         for i in 0..20 {
             let packet = Packet::new(1024, i, 0, 0.0);
-            vc.on_packet_received(packet, 0.0);
+            vc.on_packet_received(packet);
         }
 
         assert!(vc.packets_dropped >= 10);
@@ -622,9 +661,9 @@ mod tests {
         let packet2 = Packet::new(1024, 2, 2, 0.0); // flow_id 2 -> class 2
         let packet3 = Packet::new(1024, 3, 3, 0.0); // flow_id 3 -> class 3
 
-        vc.on_packet_received(packet2, 0.0);
-        vc.on_packet_received(packet1, 0.0);
-        vc.on_packet_received(packet3, 0.0);
+        vc.on_packet_received(packet2);
+        vc.on_packet_received(packet1);
+        vc.on_packet_received(packet3);
 
         vc.test_run(0.0);
 
@@ -648,8 +687,8 @@ mod tests {
         let packet1 = Packet::new(10, 1, 0, 0.0);
         let packet2 = Packet::new(10, 2, 1, 0.0);
 
-        vc.on_packet_received(packet1, 0.0);
-        vc.on_packet_received(packet2, 0.0);
+        vc.on_packet_received(packet1);
+        vc.on_packet_received(packet2);
 
         vc.test_run(0.0);
 
@@ -672,8 +711,8 @@ mod tests {
         let packet1 = Packet::new(10, 1, 0, 0.0);
         let packet2 = Packet::new(10, 2, 1, 0.0);
 
-        vc.on_packet_received(packet1, 0.0);
-        vc.on_packet_received(packet2, 0.0);
+        vc.on_packet_received(packet1);
+        vc.on_packet_received(packet2);
 
         vc.test_run(0.0);
 
@@ -700,8 +739,8 @@ mod tests {
         for i in 0..50 {
             let packet1 = Packet::new(10, i * 2, 0, 0.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 0.0);
-            vc.on_packet_received(packet1, 0.0);
-            vc.on_packet_received(packet2, 0.0);
+            vc.on_packet_received(packet1);
+            vc.on_packet_received(packet2);
         }
 
         vc.test_run(0.0);
@@ -740,9 +779,9 @@ mod tests {
             let packet1 = Packet::new(100, i * 3 + 1, 1, arrival_time);
             let packet2 = Packet::new(100, i * 3 + 2, 2, arrival_time);
 
-            vc.on_packet_received(packet0, arrival_time);
-            vc.on_packet_received(packet1, arrival_time);
-            vc.on_packet_received(packet2, arrival_time);
+            vc.on_packet_received(packet0);
+            vc.on_packet_received(packet1);
+            vc.on_packet_received(packet2);
 
             // Small time increment between bursts
             arrival_time += 0.0001;
@@ -792,14 +831,14 @@ mod tests {
 
         for i in 0..10 {
             let packet = Packet::new(10, i, 0, 0.0);
-            vc.on_packet_received(packet, 0.0);
+            vc.on_packet_received(packet);
         }
 
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0);
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0);
-            vc.on_packet_received(packet1, 1.0);
-            vc.on_packet_received(packet2, 1.0);
+            vc.on_packet_received(packet1);
+            vc.on_packet_received(packet2);
         }
 
         vc.test_run(0.0);

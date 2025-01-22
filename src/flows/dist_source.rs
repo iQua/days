@@ -2,7 +2,6 @@
 //! inter-arrival times and packet sizes.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use log::debug;
 use rand::distributions::Distribution;
@@ -22,6 +21,10 @@ use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct DistPacketSource {
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub flow_start_after: HashSet<usize>,
@@ -46,6 +49,7 @@ impl DistPacketSource {
         rng: SmallRng,
     ) -> DistPacketSource {
         DistPacketSource {
+            time: 0.0,
             endpoint_id: next_endpoint_id(),
             flow_id,
             flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
@@ -73,13 +77,16 @@ impl DistPacketSource {
     }
 
     pub fn packet_received(&mut self, packet: Packet, now: f64) {
+        // updates the locally maintained simulation time
+        self.time = now;
+
         debug!(
             "DistPacketSource {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.endpoint_id, packet.packet_id, packet.size, packet.flow_id, now,
         );
     }
 
-    pub fn produce_packet(&mut self, now: f64) -> (Packet, Duration) {
+    pub fn produce_packet(&mut self, now: f64) -> (Packet, f64) {
         let interval = match self.traffic.arr_dist {
             DistributionInfo::DiscreteUniform { low, high } => {
                 let dist = DiscreteUniform::new(low, high).unwrap();
@@ -118,8 +125,8 @@ impl DistPacketSource {
 
         // Ensure that the packet size is non-negative and at least 1 byte
         let rounded_packet_size = packet_size.round().max(1.0) as usize;
-        let mut packet = Packet::new(rounded_packet_size, self.packets_sent, self.flow_id, now);
 
+        let mut packet = Packet::new(rounded_packet_size, self.packets_sent, self.flow_id, now);
         if self.traffic.size.exceeded(
             self.sent_size + rounded_packet_size,
             self.flow_start_time,
@@ -128,14 +135,13 @@ impl DistPacketSource {
             packet.last_packet = true;
         }
 
-        (packet, Duration::from_secs_f64(interval))
+        (packet, interval)
     }
 
-    pub async fn send_packet(&mut self, now: f64) -> Duration {
+    pub async fn send_packet(&mut self, now: f64) -> f64 {
         let (packet, interval) = self.produce_packet(now);
 
         self.output.send(packet.clone()).await;
-
         self.packet_sent(&packet, now);
 
         interval

@@ -55,6 +55,10 @@ impl Ord for PacketTimeout {
 impl Eq for PacketTimeout {}
 
 pub struct TCPPacketSource {
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     pub endpoint_id: usize,
     pub flow_id: usize,
     pub flow_start_after: HashSet<usize>,
@@ -137,6 +141,7 @@ impl TCPPacketSource {
         };
 
         TCPPacketSource {
+            time: 0.0,
             endpoint_id: next_endpoint_id(),
             flow_id,
             flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
@@ -172,6 +177,9 @@ impl TCPPacketSource {
     /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
+        // updates the locally maintained simulation time
+        self.time = now;
+
         // the received packet must be an acknowledgment
         assert!(ack_packet.ack.is_some());
 
@@ -343,8 +351,7 @@ impl TCPPacketSource {
         );
     }
 
-    /// Checks if any sent packet reached timeout at regularly occurring
-    /// intervals.
+    /// Checks if any sent packet reached timeout at regularly occurring intervals.
     pub async fn timer_tick(&mut self, now: f64) {
         while !self.timeout_queue.is_empty() {
             let timeout_time = self.timeout_queue.peek().unwrap().timeout;

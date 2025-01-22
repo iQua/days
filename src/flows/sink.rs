@@ -270,8 +270,32 @@ impl PacketSink {
         }
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
+        #[cfg(feature = "test")]
+        {
+            let global_time = _cx
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+            let local_time = match self {
+                PacketSink::BasicPacketSink(sink) => sink.time,
+                PacketSink::TCPPacketSink(sink) => sink.time,
+            };
+
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+
+            // makes sure that the simulation advances in time
+            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+        }
+
+        let now = packet.time;
 
         debug!(
             "{} received packet {} ({} bytes) from flow {} at time {:.3}.",

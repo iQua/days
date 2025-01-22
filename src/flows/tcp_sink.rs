@@ -16,6 +16,10 @@ use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
 pub struct TCPPacketSink {
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     pub endpoint_id: usize,
     flow_id: usize,
     /// the statistics of received packets
@@ -46,6 +50,7 @@ impl TCPPacketSink {
         let sink_name = format!("TCPPacketSink {endpoint_id}");
 
         TCPPacketSink {
+            time: 0.0,
             endpoint_id,
             flow_id,
             packet_statistics: PacketStatistics::new(sink_name),
@@ -145,6 +150,9 @@ impl TCPPacketSink {
     }
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
+        // updates the locally maintained simulation time
+        self.time = now;
+
         self.packet_statistics.update(&packet, now);
         self.update_report_stats(&packet, now);
         self.produce_ack(packet, now).await;

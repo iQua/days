@@ -6,13 +6,16 @@ use log::debug;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_switch_id;
 
 pub struct PacketSwitch {
     switch_id: usize,
+
+    /// locally maintained simulation time
+    pub time: f64,
+
     /// the number of packets received by the switch
     packets_received: usize,
     /// the flow information base (FIB) of the switch
@@ -44,6 +47,7 @@ impl PacketSwitch {
             r_fib,
             packets_received: 0,
             outputs,
+            time: 0.0, // Initialize local simulation time
         }
     }
 
@@ -59,25 +63,42 @@ impl PacketSwitch {
         self.r_fib.insert(flow_id, next_id);
     }
 
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
+        #[cfg(feature = "test")]
+        {
+            use nexosim::time::MonotonicTime;
+
+            let global_time = _cx
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+            let local_time = self.time;
+
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!((packet.time - global_time).abs() <= 1e-7);
+
+            // makes sure that the simulation advances in time
+            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+        }
+
+        self.time = packet.time;
 
         if packet.ack.is_none() {
             self.packets_received += 1;
 
             debug!(
                 "PacketSwitch {} received packet {} ({} bytes) from flow {} at time {:.3}. \
-                {} packets received.",
+                        {} packets received.",
                 self.switch_id,
                 packet.packet_id,
                 packet.size,
                 packet.flow_id,
-                now,
+                self.time,
                 self.packets_received
             );
 
-            // forwards packets that are not acknowledgment to their
-            // corresponding downstream elements
+            // forwards packets that are not acknowledgments to their corresponding downstream elements
             let switch_id = self.fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
@@ -86,11 +107,10 @@ impl PacketSwitch {
         } else {
             debug!(
                 "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
-                self.switch_id, packet.packet_id, packet.size, packet.flow_id, now,
+                self.switch_id, packet.packet_id, packet.size, packet.flow_id, self.time,
             );
 
-            // forwards acknowledgment packets to their corresponding upstream
-            // elements
+            // forwards acknowledgment packets to their corresponding upstream elements
             let switch_id = self.r_fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {

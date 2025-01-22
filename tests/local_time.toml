@@ -6,24 +6,24 @@ duration = 0.2
 ui_interval = 0.01
 report_interval = 0.1
 num_threads = 10
-log_path = "logs/tcp_fattree"
+log_path = "logs/local_time"
 
 [topology]
 category = "FatTree"
 
 [topology.fat_tree]
-k = 96
+k = 16
 
 [switch]
 port_rate = 100000000 # 100 Mbps
 capacity = 1000
 weights = [1]
-discipline = "FIFO"
+discipline = "DRR"
 drop = "RED"
 
 [[flow_set]]
 flow_type = "TCP"
-flow_count = 500
+flow_count = 100
 routing = "ShortestPath"
 [flow_set.traffic]
 initial_delay = 0.0

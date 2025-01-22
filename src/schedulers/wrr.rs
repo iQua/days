@@ -20,6 +20,10 @@ use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 pub struct WRRServer {
     scheduler_id: usize,
 
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     /// the bit rate of the server
     rate: f64,
 
@@ -105,6 +109,7 @@ impl WRRServer {
 
         WRRServer {
             scheduler_id,
+            time: 0.0,
             rate,
             flow_classes,
             drop_strategy: packet_drop,
@@ -134,7 +139,7 @@ impl WRRServer {
         self.scheduler_id
     }
 
-    pub fn on_packet_received(&mut self, packet: Packet, arrival_time: f64) {
+    pub fn on_packet_received(&mut self, packet: Packet) {
         // drops the packet if the buffer is full
         let should_drop_packet = self.drop_strategy.should_drop(
             packet.size,
@@ -146,11 +151,11 @@ impl WRRServer {
         if should_drop_packet {
             self.packets_dropped += 1;
             debug! {
-                "WRRServer {} dropped packet {} from flow {} at time {:.3}",
+                "WRRServer {} dropped packet {} from flow {} at time {:.8e}",
                 self.scheduler_id,
                 packet.packet_id,
                 packet.flow_id,
-                arrival_time
+                packet.time
             }
             return;
         }
@@ -173,30 +178,43 @@ impl WRRServer {
             packet.size,
             packet.flow_id,
             class_id,
-            arrival_time,
+            packet.time,
             self.queues[class_id].len(),
             class_id
         );
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
-        self.on_packet_received(packet, arrival_time);
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        if arrival_time >= self.busy_until {
-            self.run((), cx);
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+        }
+
+        self.on_packet_received(packet);
+
+        if packet.time >= self.busy_until {
+            self.run(packet.time, cx);
         }
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
 
-    fn schedule_packets<F>(&mut self, now: f64, mut schedule_events: F)
+    fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
-        F: FnMut(f64, Packet),
+        F: FnMut(f64, f64, Packet),
     {
         loop {
             // Return if no packets are waiting
@@ -211,15 +229,17 @@ impl WRRServer {
             {
                 if let Some(mut outbound) = self.queues[self.current_queue].pop_front() {
                     self.byte_sizes[self.current_queue] -= outbound.size;
-                    outbound.queueing_delay_update(now);
+                    outbound.queueing_delay_update(self.time);
 
                     self.packets_waiting -= 1;
                     self.packets_sent_in_round[self.current_queue] += 1;
 
-                    let transmission_time = (outbound.size as f64 * 8.0) / self.rate;
+                    // calculate send timeout
+                    let timeout = outbound.size as f64 * 8.0 / self.rate;
+                    outbound.departure_update(self.time + timeout);
 
-                    schedule_events(transmission_time, outbound.clone());
-                    self.busy_until = now + transmission_time;
+                    schedule_event(self.time, timeout, outbound.clone());
+                    self.busy_until = self.time + timeout;
 
                     debug!(
                         "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -228,7 +248,7 @@ impl WRRServer {
                         outbound.packet_id,
                         outbound.size,
                         outbound.flow_id,
-                        now + transmission_time,
+                        self.time + timeout,
                         self.queues[self.current_queue].len(),
                     );
                     return;
@@ -241,16 +261,35 @@ impl WRRServer {
         }
     }
 
-    pub fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+    pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
-        self.schedule_packets(now, |timeout, outbound| {
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (now - global_time).abs() <= 1e-7,
+                "Timing mismatch: now = {}, global_time = {}",
+                now,
+                global_time
+            );
+        }
+
+        self.time = now;
+
+        if self.time == 0.0 {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            self.time = global_time;
+        }
+
+        self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
                 .unwrap();
 
             // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                 .unwrap();
         });
     }
@@ -261,7 +300,7 @@ impl WRRServer {
         let mut events = Vec::new();
 
         // calls schedule_packets() without borrowing self inside the closure
-        self.schedule_packets(now, |transmission_time, mut outbound| {
+        self.schedule_packet(|now, transmission_time, mut outbound| {
             // simulates sending the packet
             outbound.departure_update(now + transmission_time);
 
@@ -348,6 +387,7 @@ impl ReportStatistics for WRRServer {
 impl Model for WRRServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
+
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
@@ -381,7 +421,7 @@ mod tests {
         );
 
         let packet = Packet::new(1024, 1, 0, 0.0);
-        wrr.on_packet_received(packet.clone(), 0.0);
+        wrr.on_packet_received(packet.clone());
 
         assert_eq!(wrr.queues[0].len(), 1);
         assert_eq!(wrr.packets_received, 1);
@@ -409,10 +449,10 @@ mod tests {
         let packet3 = Packet::new(1, 3, 2, 0.0);
         let packet4 = Packet::new(1, 4, 0, 0.0);
 
-        wrr.on_packet_received(packet1, 0.0);
-        wrr.on_packet_received(packet2, 0.0);
-        wrr.on_packet_received(packet3, 0.0);
-        wrr.on_packet_received(packet4, 0.0);
+        wrr.on_packet_received(packet1);
+        wrr.on_packet_received(packet2);
+        wrr.on_packet_received(packet3);
+        wrr.on_packet_received(packet4);
 
         wrr.test_run(0.0);
 
@@ -438,9 +478,9 @@ mod tests {
         let packet2 = Packet::new(1024, 2, 1, 0.0);
         let packet3 = Packet::new(1024, 3, 0, 0.0);
 
-        wrr.on_packet_received(packet1, 0.0);
-        wrr.on_packet_received(packet2, 0.0);
-        wrr.on_packet_received(packet3, 0.0);
+        wrr.on_packet_received(packet1);
+        wrr.on_packet_received(packet2);
+        wrr.on_packet_received(packet3);
 
         assert_eq!(wrr.queues[0].len() + wrr.queues[1].len(), 2);
         assert_eq!(wrr.packets_dropped, 1);
@@ -466,13 +506,13 @@ mod tests {
         for i in 0..40 {
             // sends one packet to each flow in sequence
             let packet1 = Packet::new(packet_size, i * 3, 0, arrival_time);
-            wrr.on_packet_received(packet1, arrival_time);
+            wrr.on_packet_received(packet1);
 
             let packet2 = Packet::new(packet_size, i * 3 + 1, 1, arrival_time);
-            wrr.on_packet_received(packet2, arrival_time);
+            wrr.on_packet_received(packet2);
 
             let packet3 = Packet::new(packet_size, i * 3 + 2, 2, arrival_time);
-            wrr.on_packet_received(packet3, arrival_time);
+            wrr.on_packet_received(packet3);
 
             arrival_time += arrival_interval;
         }
@@ -516,7 +556,7 @@ mod tests {
         // Send many packets to trigger RED dropping
         for i in 0..20 {
             let packet = Packet::new(1024, i, 0, 0.0);
-            wrr.on_packet_received(packet, 0.0);
+            wrr.on_packet_received(packet);
         }
 
         assert!(wrr.packets_dropped > 0);
@@ -563,24 +603,24 @@ mod tests {
         ];
 
         for packet in &packets {
-            wrr.on_packet_received(packet.clone(), 0.0);
+            wrr.on_packet_received(packet.clone());
         }
 
         // runs the WRR at time = 0.0
         wrr.test_run(0.0);
 
-        // Split sent packets into rounds (each round sends 6 packets)
+        // splits sent packets into rounds (each round sends 6 packets)
         let mut rounds: Vec<Vec<usize>> = vec![vec![], vec![]];
         for (i, packet) in wrr.sent_packets.iter().enumerate() {
             let round = i / 6;
             rounds[round].push(packet.packet_id);
         }
 
-        // Expected packet IDs for each round
+        // expects packet IDs for each round
         let expected_round1 = vec![0, 1, 4, 2, 5, 8];
         let expected_round2 = vec![3, 7, 10, 11, 14, 17];
 
-        // Assert that packets sent in each round match the expected IDs
+        // asserts that packets sent in each round match the expected IDs
         assert_eq!(rounds[0], expected_round1, "Round 1 packet IDs mismatch");
         assert_eq!(rounds[1], expected_round2, "Round 2 packet IDs mismatch");
 
@@ -604,12 +644,12 @@ mod tests {
             .map(|p| p.packet_id)
             .collect();
 
-        // Expected packet IDs by class in the correct round-robin order
+        // expects packet IDs by class in the correct round-robin order
         let expected_class0_ids = vec![0, 3];
         let expected_class1_ids = vec![1, 4, 7, 10];
         let expected_class2_ids = vec![2, 5, 8, 11, 14, 17];
 
-        // Assert packet IDs match the expected order for each class
+        // asserts packet IDs match the expected order for each class
         assert_eq!(
             class0_packets, expected_class0_ids,
             "Class 0 packet IDs mismatch"
@@ -622,7 +662,7 @@ mod tests {
             class2_packets, expected_class2_ids,
             "Class 2 packet IDs mismatch"
         );
-        // Now the test can truly expect 2, 4, and 6.
+        // now the test can truly expect 2, 4, and 6
         assert_eq!(
             class0_packets.len(),
             2,
@@ -651,23 +691,23 @@ mod tests {
             vec![1, 1], // Equal weights for two classes
         );
 
-        // First phase: only send to flow 0 (class 0)
+        // first phase: only send to flow 0 (class 0)
         for i in 0..10 {
             let packet = Packet::new(10, i, 0, 0.0);
-            wrr.on_packet_received(packet, 0.0);
+            wrr.on_packet_received(packet);
         }
 
-        // Second phase: send to both flows
+        // second phase: send to both flows
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0); // Flow 0 -> class 0
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0); // Flow 1 -> class 1
-            wrr.on_packet_received(packet1, 1.0);
-            wrr.on_packet_received(packet2, 1.0);
+            wrr.on_packet_received(packet1);
+            wrr.on_packet_received(packet2);
         }
 
         wrr.test_run(0.0);
 
-        // Count packets in second phase
+        // counts packets in second phase
         let phase2_packets = wrr
             .sent_packets
             .iter()
@@ -683,7 +723,7 @@ mod tests {
             .filter(|p| p.flow_id % 2 == 1) // Class 1 packets
             .count();
 
-        // In second phase, flows should get equal treatment
+        // in the second phase, flows should get equal treatment
         assert!((flow0_phase2 as i32 - flow1_phase2 as i32).abs() <= 1);
     }
 
@@ -702,8 +742,8 @@ mod tests {
         let packet1 = Packet::new(1024, 1, 0, 0.0);
         let packet2 = Packet::new(1024, 2, 2, 0.0);
 
-        wrr.on_packet_received(packet1, 0.0);
-        wrr.on_packet_received(packet2, 0.0);
+        wrr.on_packet_received(packet1);
+        wrr.on_packet_received(packet2);
 
         wrr.test_run(0.0);
 
@@ -727,7 +767,7 @@ mod tests {
 
         // Send a packet of 100 bits (size 12.5 bytes)
         let packet = Packet::new(12, 1, 0, 0.0);
-        wrr.on_packet_received(packet, 0.0);
+        wrr.on_packet_received(packet);
 
         wrr.test_run(0.0);
 

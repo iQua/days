@@ -18,6 +18,11 @@ use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 pub struct Port {
     scheduler_id: usize,
+
+    /// the current simulation time, maintained locally. This is useful for reducing the competition
+    /// for access the global simulation clock, which will only be accessed when absolutely necessary
+    pub time: f64,
+
     /// the bit rate of the port (0 for unlimited)
     rate: f64,
     /// a closure that determines whether an inbound packet should be dropped or
@@ -68,6 +73,7 @@ impl Port {
 
         Port {
             scheduler_id,
+            time: 0.0,
             rate,
             drop_strategy: packet_drop,
             packets_received: 0,
@@ -90,8 +96,19 @@ impl Port {
     }
 
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time();
-        let arrival_time = now.duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+        }
 
         // drops the packet if the buffer is full
         let should_drop_packet =
@@ -102,8 +119,8 @@ impl Port {
         if should_drop_packet {
             self.packets_dropped += 1;
             debug!(
-                "Port {} dropped packet {} from flow {} at time {:.3}",
-                self.scheduler_id, packet.packet_id, packet.flow_id, arrival_time
+                "Port {} dropped packet {} from flow {} at time {:.8e}",
+                self.scheduler_id, packet.packet_id, packet.flow_id, packet.time
             );
             return;
         }
@@ -113,22 +130,23 @@ impl Port {
         self.queue.push_back(packet.clone());
 
         debug!(
-            "Port {} received packet {} ({} bytes) from flow {} at time {:.3}. \
+            "Port {} received packet {} ({} bytes) from flow {} at time {:.8e}. \
             {} packets in queue.",
             self.scheduler_id,
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            arrival_time,
+            packet.time,
             self.queue.len()
         );
 
-        if arrival_time >= self.busy_until {
-            self.run((), cx).await;
+        if packet.time >= self.busy_until {
+            self.run(packet.time, cx).await;
         }
     }
 
     pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
@@ -150,11 +168,28 @@ impl Port {
 
     pub fn run<'a>(
         &'a mut self,
-        _: (),
+        now: f64,
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            #[cfg(feature = "test")]
+            {
+                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+                assert!(
+                    (now - global_time).abs() <= 1e-7,
+                    "Timing mismatch: now = {}, global_time = {}",
+                    now,
+                    global_time
+                );
+            }
+
+            self.time = now;
+
+            if self.time == 0.0 {
+                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                self.time = global_time;
+            }
 
             if let Some(mut packet) = self.queue.pop_front() {
                 packet.queueing_delay_update(now);
@@ -164,7 +199,7 @@ impl Port {
                 cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
                     .unwrap();
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, ())
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
                     .unwrap();
 
                 self.packet_sent(now + timeout, packet);
@@ -235,6 +270,7 @@ impl ReportStatistics for Port {
 impl Model for Port {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
+
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
