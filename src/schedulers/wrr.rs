@@ -607,18 +607,18 @@ mod tests {
         // runs the WRR at time = 0.0
         wrr.test_run(0.0);
 
-        // Split sent packets into rounds (each round sends 6 packets)
+        // splits sent packets into rounds (each round sends 6 packets)
         let mut rounds: Vec<Vec<usize>> = vec![vec![], vec![]];
         for (i, packet) in wrr.sent_packets.iter().enumerate() {
             let round = i / 6;
             rounds[round].push(packet.packet_id);
         }
 
-        // Expected packet IDs for each round
+        // expects packet IDs for each round
         let expected_round1 = vec![0, 1, 4, 2, 5, 8];
         let expected_round2 = vec![3, 7, 10, 11, 14, 17];
 
-        // Assert that packets sent in each round match the expected IDs
+        // asserts that packets sent in each round match the expected IDs
         assert_eq!(rounds[0], expected_round1, "Round 1 packet IDs mismatch");
         assert_eq!(rounds[1], expected_round2, "Round 2 packet IDs mismatch");
 
@@ -642,12 +642,12 @@ mod tests {
             .map(|p| p.packet_id)
             .collect();
 
-        // Expected packet IDs by class in the correct round-robin order
+        // expects packet IDs by class in the correct round-robin order
         let expected_class0_ids = vec![0, 3];
         let expected_class1_ids = vec![1, 4, 7, 10];
         let expected_class2_ids = vec![2, 5, 8, 11, 14, 17];
 
-        // Assert packet IDs match the expected order for each class
+        // asserts packet IDs match the expected order for each class
         assert_eq!(
             class0_packets, expected_class0_ids,
             "Class 0 packet IDs mismatch"
@@ -660,7 +660,7 @@ mod tests {
             class2_packets, expected_class2_ids,
             "Class 2 packet IDs mismatch"
         );
-        // Now the test can truly expect 2, 4, and 6.
+        // now the test can truly expect 2, 4, and 6
         assert_eq!(
             class0_packets.len(),
             2,
@@ -689,13 +689,13 @@ mod tests {
             vec![1, 1], // Equal weights for two classes
         );
 
-        // First phase: only send to flow 0 (class 0)
+        // first phase: only send to flow 0 (class 0)
         for i in 0..10 {
             let packet = Packet::new(10, i, 0, 0.0);
             wrr.on_packet_received(packet);
         }
 
-        // Second phase: send to both flows
+        // second phase: send to both flows
         for i in 10..20 {
             let packet1 = Packet::new(10, i * 2, 0, 1.0); // Flow 0 -> class 0
             let packet2 = Packet::new(10, i * 2 + 1, 1, 1.0); // Flow 1 -> class 1
@@ -705,7 +705,7 @@ mod tests {
 
         wrr.test_run(0.0);
 
-        // Count packets in second phase
+        // counts packets in second phase
         let phase2_packets = wrr
             .sent_packets
             .iter()
@@ -721,7 +721,7 @@ mod tests {
             .filter(|p| p.flow_id % 2 == 1) // Class 1 packets
             .count();
 
-        // In second phase, flows should get equal treatment
+        // in the second phase, flows should get equal treatment
         assert!((flow0_phase2 as i32 - flow1_phase2 as i32).abs() <= 1);
     }
 
