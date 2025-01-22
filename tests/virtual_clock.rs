@@ -20,12 +20,12 @@ use daytone::utils::logger::CsvLogger;
 fn test_virtual_clock_scheduler() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    // Initialize the logger
+    // initializes the logger
     if let Err(e) = CsvLogger::get_instance().init("logs/vc_test") {
         panic!("Failed to initialize CsvLogger: {}", e);
     }
 
-    // Create packet sources with different rates and packet sizes
+    // creates packet sources with different rates and packet sizes
     let mut source_1 = PacketSource::new(
         0,
         Vec::new(),
