@@ -3,6 +3,7 @@
 use std::env;
 
 use log::info;
+use tracing_subscriber::prelude::*;
 // use petgraph::graph::UnGraph;
 
 use daytone::flows::collective::Collective;
