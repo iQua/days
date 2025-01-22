@@ -10,10 +10,8 @@ use daytone::flows::flow::Flow;
 use daytone::seed_from_config;
 use daytone::topos::build::build_graph;
 use daytone::topos::topo::Topology;
-mod task_tracker;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
@@ -82,11 +80,5 @@ async fn main() {
     // topology.run(graph);
 
     // Execute topology simulation with instrumentation
-    task_tracker::instrumented_task(async {
-        topology.run(graph);
-    })
-    .await;
-
-    // Output the current number of running tasks
-    info!("Current running tasks: {}", task_tracker::current_tasks());
+    topology.run(graph);
 }

@@ -14,6 +14,9 @@ pub struct SeedConfig {
     seed: usize,
 }
 
+// for tracking the number of active async tasks (coroutines)
+static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+
 static SEED: AtomicUsize = AtomicUsize::new(0);
 static NUM_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 static SWITCH_ID: AtomicUsize = AtomicUsize::new(0);
