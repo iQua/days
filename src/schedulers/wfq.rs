@@ -319,13 +319,12 @@ impl WFQServer {
         self.last_updated = arrival_time;
     }
 
-    pub async fn send(&mut self, packet: (f64, Packet)) {
-        self.time = packet.0;
-        let packet_data = packet.1;
+    pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
 
-        self.output.send(packet_data).await;
-        self.update_stats_on_packet_forwarded(&packet_data);
-        self.update_internal_states(&packet_data, self.time_packet_sent);
+        self.output.send(packet).await;
+        self.update_stats_on_packet_forwarded(&packet);
+        self.update_internal_states(&packet, self.time_packet_sent);
     }
 
     /// Schedules a packet by accepting a closure to handle packet sending based on context.
@@ -390,7 +389,7 @@ impl WFQServer {
             cx.schedule_event(
                 Duration::from_secs_f64(timeout),
                 Self::send,
-                (timeout, outbound.packet),
+                outbound.packet,
             )
             .unwrap();
 
@@ -495,6 +494,7 @@ impl ReportStatistics for WFQServer {
 impl Model for WFQServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
+
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),

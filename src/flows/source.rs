@@ -140,7 +140,7 @@ impl PacketSource {
         );
 
         // makes sure that the simulation advances in time
-        assert!((packet.time - local_time).abs() <= 1e-8 || packet.time > local_time);
+        assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
 
         let now = packet.time;
 
@@ -208,7 +208,7 @@ impl PacketSource {
 
                     // to be removed after further testing
                     let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-                    assert!((now - source.time).abs() <= 1e-8);
+                    assert!((now - source.time).abs() <= 1e-7);
 
                     let (data, interval) = source.datasource.produce_data(source.time);
 

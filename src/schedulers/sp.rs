@@ -195,14 +195,14 @@ impl SPServer {
         }
     }
 
-    pub async fn send(&mut self, packet: (f64, Packet)) {
-        self.time = packet.0;
-        self.update_stats_on_packet_forwarded(&packet.1);
+    pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
+        self.update_stats_on_packet_forwarded(&packet);
 
         #[cfg(test)]
-        self.sent_packets.push(packet.1.clone());
+        self.sent_packets.push(packet.clone());
 
-        self.output.send(packet.1).await;
+        self.output.send(packet).await;
     }
 
     /// Moves on to the next non-empty priority queue if the current queue is empty.
@@ -273,12 +273,8 @@ impl SPServer {
 
         self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
-            cx.schedule_event(
-                Duration::from_secs_f64(timeout),
-                Self::send,
-                (timeout, outbound),
-            )
-            .unwrap();
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                .unwrap();
 
             // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
@@ -370,6 +366,7 @@ impl ReportStatistics for SPServer {
 impl Model for SPServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
+
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),

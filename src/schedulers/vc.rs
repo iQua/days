@@ -270,16 +270,15 @@ impl VirtualClockServer {
         }
     }
 
-    pub async fn send(&mut self, packet: (f64, Packet)) {
-        self.time = packet.0;
-        let packet_data = packet.1;
-        self.update_stats_on_packet_forwarded(&packet_data);
-        self.output.send(packet_data).await;
+    pub async fn send(&mut self, packet: Packet) {
+        self.time = packet.time;
+        self.update_stats_on_packet_forwarded(&packet);
+        self.output.send(packet).await;
     }
 
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
-        F: FnMut(f64, f64, TaggedPacket),
+        F: FnMut(f64, f64, Packet),
     {
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
@@ -298,7 +297,7 @@ impl VirtualClockServer {
             tagged_outbound.packet.departure_update(self.time + timeout);
             self.time_packet_sent = self.time + timeout;
 
-            schedule_event(self.time, timeout, tagged_outbound);
+            schedule_event(self.time, timeout, tagged_outbound.packet);
 
             self.busy_until = self.time + timeout;
 
@@ -337,12 +336,8 @@ impl VirtualClockServer {
 
         self.schedule_packet(|now, timeout, outbound| {
             // schedules the send event
-            cx.schedule_event(
-                Duration::from_secs_f64(timeout),
-                Self::send,
-                (timeout, outbound.packet),
-            )
-            .unwrap();
+            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
+                .unwrap();
 
             // schedules the next run
             cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
@@ -443,6 +438,7 @@ impl ReportStatistics for VirtualClockServer {
 impl Model for VirtualClockServer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
+
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
