@@ -7,10 +7,10 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use log::debug;
-use rand::rngs::SmallRng;
-
 use nexosim::model::Model;
 use nexosim::ports::Output;
+use rand::rngs::SmallRng;
+use tracing::instrument;
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::bbr::TCPBBR;
@@ -176,6 +176,7 @@ impl TCPPacketSource {
 
     /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
+    #[instrument(skip(self))]
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
         // updates the locally maintained simulation time
         self.time = now;
@@ -409,7 +410,7 @@ impl TCPPacketSource {
             }
         }
     }
-
+    #[instrument(skip(self))]
     pub async fn send_packet(&mut self, now: f64) {
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
