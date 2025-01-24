@@ -10,7 +10,6 @@ use log::debug;
 use nexosim::model::Model;
 use nexosim::ports::Output;
 use rand::rngs::SmallRng;
-use tracing::instrument;
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::bbr::TCPBBR;
@@ -176,7 +175,6 @@ impl TCPPacketSource {
 
     /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
-    #[instrument(skip(self))]
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
         // updates the locally maintained simulation time
         self.time = now;
