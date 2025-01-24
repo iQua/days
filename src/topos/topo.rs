@@ -44,6 +44,13 @@ pub struct UIConfig {
 }
 
 #[derive(Deserialize)]
+pub struct TracingConfig {
+    pub tracing_active: Option<bool>,
+    pub tracing_interval: Option<f64>,
+    pub duration: Option<f64>,
+}
+
+#[derive(Deserialize)]
 struct ConcurrencyConfig {
     num_threads: Option<usize>,
 }
@@ -697,7 +704,7 @@ impl Topology {
     /// Creates and activates a ConcurrencyTracer coroutine, which saves and prints the level
     /// of coroutine (async task) concurrency during execution.
     fn activate_concurrency_tracing(mut self) -> Self {
-        let tracer = ConcurrencyTracer::new();
+        let tracer = ConcurrencyTracer::new(self.config_path.as_str());
         let tracer_mbox = Mailbox::new();
         self.sim_init = self
             .sim_init
