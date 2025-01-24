@@ -16,8 +16,8 @@ use daytone::topos::topo::Topology;
 use daytone::utils::tracing::ConcurrencyTrackerLayer;
 
 fn main() {
-    // Build an EnvFilter that reads the RUST_LOG environment variable,
-    // defaulting to "info" if not set
+    // builds an EnvFilter that reads the RUST_LOG environment variable, defaulting to `info` if
+    // not set
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
@@ -88,8 +88,5 @@ fn main() {
     let topology = Topology::new(&path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
-    // topology.run(graph);
-
-    // Execute topology simulation with instrumentation
     topology.run(graph);
 }

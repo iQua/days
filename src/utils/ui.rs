@@ -56,6 +56,7 @@ impl UserInterface {
             finished_sources: 0,
         }
     }
+
     pub fn flow_finished(&mut self, _finished: FlowFinishMsg, cx: &mut Context<Self>) {
         self.finished_sources += 1;
         debug!(
