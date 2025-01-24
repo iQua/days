@@ -7,24 +7,23 @@ report_interval = 1
 log_path = "logs/fattree"
 
 [topology]
-category = "FatTree"
+    category = "FatTree"
 
 [topology.fat_tree]
     k = 32
 
 [switch]
-port_rate = 1000000000 # 1Gbps
-capacity = 1000
-weights = [1]
-discipline = "FIFO"
-drop = "RED"
-
+    port_rate = 1000000000 # 1Gbps
+    capacity = 1000
+    weights = [1]
+    discipline = "FIFO"
+    drop = "RED"
 
 [[flow_set]]
-flow_type = "PacketDistribution"
-flow_count = 200
-[flow_set.traffic]
-    initial_delay = 0.0
-    duration = 10.0
-    arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}  # 10Mbps
-    pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
+    flow_type = "PacketDistribution"
+    flow_count = 200
+    [flow_set.traffic]
+        initial_delay = 0.0
+        duration = 10.0
+        arr_dist = {type = "Uniform", low = 0.0008, high = 0.0008}  # 10Mbps
+        pkt_size_dist = {type = "Uniform", low = 1024, high = 1024}
