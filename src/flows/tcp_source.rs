@@ -410,7 +410,7 @@ impl TCPPacketSource {
             }
         }
     }
-    #[instrument(skip(self))]
+
     pub async fn send_packet(&mut self, now: f64) {
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer

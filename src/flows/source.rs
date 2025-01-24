@@ -199,6 +199,7 @@ impl PacketSource {
         }
     }
 
+    #[instrument(skip(self, cx))]
     fn fetch_app_data<'a>(
         &'a mut self,
         current_time: f64,
@@ -258,7 +259,6 @@ impl PacketSource {
         }
     }
 
-    #[instrument(skip(self, cx))]
     async fn send_packet(&mut self, cx: &Context<Self>, now: f64) {
         match self {
             PacketSource::DistPacketSource(source) => {

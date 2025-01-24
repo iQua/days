@@ -140,7 +140,7 @@ impl DistPacketSource {
 
         (packet, interval)
     }
-    #[instrument(skip(self))]
+
     pub async fn send_packet(&mut self, now: f64) -> f64 {
         let (packet, interval) = self.produce_packet(now);
 
