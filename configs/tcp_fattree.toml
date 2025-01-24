@@ -7,6 +7,8 @@ ui_interval = 0.01
 report_interval = 0.1
 num_threads = 10
 log_path = "logs/tcp_fattree"
+tracing_active = true
+tracing_interval = 0.01
 
 [topology]
 category = "FatTree"

@@ -33,12 +33,20 @@ use crate::schedulers::wrr::WRRServer;
 use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
 use crate::utils::logger::CsvLogger;
+use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
 #[derive(Deserialize)]
 pub struct UIConfig {
     pub ui_interval: Option<f64>,
+    pub duration: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub struct TracingConfig {
+    pub tracing_active: Option<bool>,
+    pub tracing_interval: Option<f64>,
     pub duration: Option<f64>,
 }
 
@@ -693,6 +701,18 @@ impl Topology {
         self
     }
 
+    /// Creates and activates a ConcurrencyTracer coroutine, which saves and prints the level
+    /// of coroutine (async task) concurrency during execution.
+    fn activate_concurrency_tracing(mut self) -> Self {
+        let tracer = ConcurrencyTracer::new(self.config_path.as_str());
+        let tracer_mbox = Mailbox::new();
+        self.sim_init = self
+            .sim_init
+            .add_model(tracer, tracer_mbox, "ConcurrencyTracer");
+
+        self
+    }
+
     /// Activates all the switches and initializes the simulation.
     fn init_sim(mut self) -> Simulation {
         info!(
@@ -737,6 +757,9 @@ impl Topology {
         // creates and activates a UserInterface coroutine
         self = self.activate_ui(ui_mbox);
         let duration = self.duration;
+
+        // creates and activates a ConcurrencyTracer coroutine
+        self = self.activate_concurrency_tracing();
 
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();

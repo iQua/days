@@ -6,6 +6,7 @@ use std::fmt::Debug;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
+use tracing::instrument;
 
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
@@ -101,7 +102,7 @@ impl TCPPacketSink {
         self.received_packets = 0;
         self.received_sizes = 0;
     }
-
+    #[instrument(skip(self))]
     pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
 

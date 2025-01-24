@@ -7,10 +7,9 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use log::debug;
-use rand::rngs::SmallRng;
-
 use nexosim::model::Model;
 use nexosim::ports::Output;
+use rand::rngs::SmallRng;
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::bbr::TCPBBR;

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
+use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
@@ -234,6 +235,7 @@ impl WFQServer {
         );
     }
 
+    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -321,6 +323,7 @@ impl WFQServer {
         self.last_updated = arrival_time;
     }
 
+    #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
 
@@ -366,6 +369,7 @@ impl WFQServer {
         }
     }
 
+    #[instrument(skip(self, cx))]
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {

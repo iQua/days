@@ -30,7 +30,7 @@ impl UserInterface {
         // Obtain the user interface progress interval from the configuration file
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-        let duration = ui_config.duration.unwrap_or(1500.);
+        let duration = ui_config.duration.unwrap_or(1.);
         let ui_interval = ui_config.ui_interval.unwrap_or(duration / 100.);
 
         let multi = MultiProgress::new();
@@ -56,6 +56,7 @@ impl UserInterface {
             finished_sources: 0,
         }
     }
+
     pub fn flow_finished(&mut self, _finished: FlowFinishMsg, cx: &mut Context<Self>) {
         self.finished_sources += 1;
         debug!(

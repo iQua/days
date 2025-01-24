@@ -14,6 +14,9 @@ pub struct SeedConfig {
     seed: usize,
 }
 
+// for tracking the number of active async tasks (coroutines)
+static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+
 static SEED: AtomicUsize = AtomicUsize::new(0);
 static NUM_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 static SWITCH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -69,4 +72,8 @@ pub fn update_next_flow_id(next_flow_id: usize) {
 
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn current_concurrency() -> usize {
+    ACTIVE_TASKS.load(Ordering::Relaxed)
 }
