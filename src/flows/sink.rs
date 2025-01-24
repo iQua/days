@@ -271,7 +271,7 @@ impl PacketSink {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, _cx))]
     pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {

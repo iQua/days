@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
+use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
@@ -229,6 +230,7 @@ impl VirtualClockServer {
         );
     }
 
+    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -274,6 +276,7 @@ impl VirtualClockServer {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
         self.update_stats_on_packet_forwarded(&packet);
@@ -319,6 +322,7 @@ impl VirtualClockServer {
         }
     }
 
+    #[instrument(skip(self, cx))]
     pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {

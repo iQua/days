@@ -1,11 +1,13 @@
 //! Implements a wire element that adds a propagation delay to packets.
 
+use std::time::Duration;
+
 use log::debug;
 use rand::distributions::Distribution;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use statrs::distribution::{DiscreteUniform, Exp, Uniform};
-use std::time::Duration;
+use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
@@ -40,8 +42,23 @@ impl Wire {
         }
     }
 
+    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        #[cfg(feature = "test")]
+        {
+            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+
+            // makes sure that the current simulation time can be correctly retrieved from
+            // the packet itself
+            assert!(
+                (packet.time - global_time).abs() <= 1e-7,
+                "Timing mismatch: packet.time = {}, global_time = {}",
+                packet.time,
+                global_time
+            );
+        }
+
+        let now = packet.time;
 
         debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -78,6 +95,7 @@ impl Wire {
         }
     }
 
+    #[instrument(skip(self))]
     async fn forward_packet(&mut self, packet: Packet) {
         debug!(
             "Wire {} sent packet {} ({} bytes) from flow {} at time {:.3}.",
