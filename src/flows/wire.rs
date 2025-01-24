@@ -11,7 +11,6 @@ use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::flows::DistributionInfo;
@@ -46,6 +45,8 @@ impl Wire {
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {
+            use nexosim::time::MonotonicTime;
+
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             // makes sure that the current simulation time can be correctly retrieved from

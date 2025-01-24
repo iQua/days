@@ -200,7 +200,7 @@ impl Port {
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 packet.departure_update(now + timeout);
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)
                     .unwrap();
 
                 cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
