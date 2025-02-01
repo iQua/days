@@ -3,10 +3,11 @@
 use std::time::Duration;
 
 use log::debug;
-use rand::distributions::Distribution;
+use rand::distr::Distribution;
+use rand::distr::Uniform;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
-use statrs::distribution::{DiscreteUniform, Exp, Uniform};
+use rand_distr::Exp;
 use tracing::instrument;
 
 use nexosim::model::{Context, Model};
@@ -30,7 +31,7 @@ impl Wire {
         let seed = get_seed();
         let rng = match seed {
             1.. => SmallRng::seed_from_u64(seed as u64),
-            _ => SmallRng::from_entropy(),
+            _ => SmallRng::from_os_rng(),
         };
 
         Wire {
@@ -67,9 +68,10 @@ impl Wire {
         );
 
         let delay = match self.delay_dist {
-            DistributionInfo::DiscreteUniform { low, high } => DiscreteUniform::new(low, high)
-                .unwrap()
-                .sample(&mut self.rng),
+            DistributionInfo::DiscreteUniform { low, high } => {
+                let dist = Uniform::new_inclusive(low, high).unwrap();
+                dist.sample(&mut self.rng) as f64
+            }
             DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
             DistributionInfo::Uniform { low, high } => {
                 if low == high {

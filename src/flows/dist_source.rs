@@ -4,9 +4,10 @@
 use std::collections::HashSet;
 
 use log::debug;
-use rand::distributions::Distribution;
+use rand::distr::Distribution;
+use rand::distr::Uniform;
 use rand::rngs::SmallRng;
-use statrs::distribution::{DiscreteUniform, Exp, Uniform};
+use rand_distr::Exp;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
@@ -89,8 +90,8 @@ impl DistPacketSource {
     pub fn produce_packet(&mut self, now: f64) -> (Packet, f64) {
         let interval = match self.traffic.arr_dist {
             DistributionInfo::DiscreteUniform { low, high } => {
-                let dist = DiscreteUniform::new(low, high).unwrap();
-                dist.sample(&mut self.rng)
+                let dist = Uniform::new_inclusive(low, high).unwrap();
+                dist.sample(&mut self.rng) as f64
             }
             DistributionInfo::Exp { lambda } => {
                 let dist = Exp::new(lambda).unwrap();
@@ -107,8 +108,8 @@ impl DistPacketSource {
 
         let packet_size = match self.traffic.pkt_size_dist {
             DistributionInfo::DiscreteUniform { low, high } => {
-                let dist = DiscreteUniform::new(low, high).unwrap();
-                dist.sample(&mut self.rng)
+                let dist = Uniform::new_inclusive(low, high).unwrap();
+                dist.sample(&mut self.rng) as f64
             }
             DistributionInfo::Exp { lambda } => {
                 let dist = Exp::new(lambda).unwrap();

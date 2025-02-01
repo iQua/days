@@ -1,10 +1,10 @@
 //! Implements packet drop strategies for the scheduler.
 
-use rand::distributions::Distribution;
+use rand::distr::Distribution;
+use rand::distr::Uniform;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use serde::Deserialize;
-use statrs::distribution::Uniform;
 
 use crate::get_seed;
 
@@ -74,7 +74,7 @@ impl RED {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
-            _ => SmallRng::from_entropy(),
+            _ => SmallRng::from_os_rng(),
         };
 
         RED {

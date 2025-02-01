@@ -3,8 +3,8 @@
 use std::fs;
 
 use petgraph::graph::DiGraph;
+use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Deserialize;
 
