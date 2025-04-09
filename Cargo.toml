@@ -23,7 +23,7 @@ nexosim = { version = "0.3.0", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
 parking_lot = "0.12"
-petgraph = "0.7"
+petgraph = "0.8"
 rand_distr = "0.5"
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
