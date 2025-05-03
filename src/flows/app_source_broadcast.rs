@@ -30,6 +30,14 @@ impl AppDataSource {
         }
     }
 
+    pub fn new_from_shared_traffic(
+        flow_id: usize,
+        traffic: &TrafficCharacteristics,
+        rng: &SmallRng,
+    ) -> Self {
+        Self::new(flow_id, traffic.clone(), rng.clone())
+    }
+
     pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
         match self {
             AppDataSource::DistDataSource(source) => source.flow_start_time = flow_start_time,
