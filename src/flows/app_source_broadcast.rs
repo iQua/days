@@ -64,21 +64,13 @@ impl AppDataSource {
                 Some((packet, duration))
             }
 
-            AppDataSource::SharedDataSource {
-                data,
-                offset,
-                chunk_size,
-                flow_id,
-            } => {
-                if *offset >= data.len() {
+            AppDataSource::SharedPackets { packets, cursor } => {
+                if *cursor >= packets.len() {
                     return None;
                 }
-
-                let end = (*offset + *chunk_size).min(data.len());
-                let payload = data[*offset..end].to_vec();
-                *offset = end;
-
-                Some((Packet::new(payload, *flow_id), 0.0))
+                let packet = packets[*cursor].clone();
+                *cursor += 1;
+                Some((packet, 0.0))
             }
         }
     }
