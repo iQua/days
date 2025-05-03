@@ -12,12 +12,7 @@ pub enum AppDataSource {
     DistDataSource(DistPacketSource),
 
     // Shares a buffer across multiple flows (e.g., for broadcast), reads in fixed-size chunks.
-    SharedDataSource {
-        data: Arc<[u8]>,
-        offset: usize,
-        chunk_size: usize,
-        flow_id: usize,
-    },
+    SharedPackets { packets: Vec<Packet>, cursor: usize },
 }
 
 pub enum AppDataType {
