@@ -27,4 +27,9 @@ impl SharedAppDataSource {
 
         SharedAppDataSource { packets }
     }
+
+    /// Clone packets for a new flow to use.
+    pub fn clone_packets(&self) -> Vec<Packet> {
+        self.packets.clone()
+    }
 }
