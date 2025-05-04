@@ -1,57 +1,30 @@
-//! Implements an application data source used by TCP.
-
-use rand::rngs::SmallRng;
-
-use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
-use crate::flows::TrafficCharacteristics;
 
-pub enum AppDataSource {
-    // The data source from the application generates packets based on probability distributions,
-    // but it can be trace-driven as well in the future.
-    DistDataSource(DistPacketSource),
+/// A pre-generated sequence of packets that can be shared among multiple flows.
+#[derive(Debug, Clone)]
+pub struct SharedAppDataSource {
+    packets: Vec<Packet>,
 }
 
-pub enum AppDataType {
-    DistData,
-}
-
-impl AppDataSource {
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
-        let app_type = AppDataType::DistData;
-
-        match app_type {
-            AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
+impl SharedAppDataSource {
+    pub fn new(
+        packet_size: usize,
+        num_packets: usize,
+        flow_id: usize,
+        start_time: f64,
+        interval: f64,
+    ) -> Self {
+        let mut packets = Vec::with_capacity(num_packets);
+        for i in 0..num_packets {
+            let p = Packet::new(
+                packet_size,
+                i * packet_size,
                 flow_id,
-                Vec::new(),
-                traffic,
-                rng,
-            )),
+                start_time + i as f64 * interval,
+            );
+            packets.push(p);
         }
-    }
 
-    pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
-        match self {
-            AppDataSource::DistDataSource(source) => source.flow_start_time = flow_start_time,
-        }
-    }
-
-    pub fn produce_data(&mut self, now: f64) -> (Packet, f64) {
-        let (packet, duration) = match self {
-            AppDataSource::DistDataSource(source) => source.produce_packet(now),
-        };
-
-        // the packet has just been produced, update statistics about traffic production
-        match self {
-            AppDataSource::DistDataSource(source) => source.packet_sent(&packet, now),
-        };
-
-        (packet, duration)
-    }
-
-    pub fn traffic_exceeded(&self, now: f64) -> bool {
-        match self {
-            AppDataSource::DistDataSource(source) => source.traffic_exceeded(now),
-        }
+        SharedAppDataSource { packets }
     }
 }
