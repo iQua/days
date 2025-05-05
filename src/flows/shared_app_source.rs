@@ -1,5 +1,6 @@
+use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
-use crate::flows::traffic::TrafficPattern;
+use crate::flows::TrafficCharacteristics;
 use rand::rngs::SmallRng;
 
 /// A pre-generated sequence of packets that can be shared among multiple flows.
@@ -9,11 +10,24 @@ pub struct SharedAppDataSource {
 }
 
 impl SharedAppDataSource {
-    /// Generates a shared sequence of packets using the same logic as AppDataSource.
-    ///
-    /// This enables multiple flows to reuse the same underlying packet data, e.g. for broadcast.
-    pub fn new(flow_id: usize, traffic: TrafficPattern, rng: SmallRng) -> Self {
-        let packets = traffic.generate_packets(flow_id, rng);
+    /// Generates a shared sequence of packets using DistPacketSource logic,
+    /// replicating AppDataSource::new() behavior but returning a packet vector.
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+        // Construct an internal DistPacketSource (used in AppDataSource)
+        let mut source = DistPacketSource::new(flow_id, vec![], traffic.clone(), rng);
+        source.flow_start_time = 0.0;
+
+        let mut packets = Vec::new();
+        let mut now = 0.0;
+
+        // Generate packets based on traffic model until traffic is exceeded
+        while !source.traffic_exceeded(now) {
+            let (packet, interval) = source.produce_packet(now);
+            source.packet_sent(&packet, now);
+            now += interval;
+            packets.push(packet);
+        }
+
         SharedAppDataSource { packets }
     }
 
