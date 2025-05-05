@@ -22,6 +22,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
+use crate::flows::shared_app_source::SharedAppDataSource;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::get_seed;
