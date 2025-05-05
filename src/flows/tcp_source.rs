@@ -107,6 +107,8 @@ pub struct TCPPacketSource {
 
     pub report_start_time: f64,
 
+    pub preloaded_packets: Vec<Packet>,
+
     /// Clock granularity in seconds for RTO calculation
     clock_granularity: f64,
     /// Minimum RTO value in seconds
@@ -157,7 +159,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
+            datasource: AppDataSource::dummy(),
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
@@ -170,6 +172,7 @@ impl TCPPacketSource {
             clock_granularity: 0.001, // 1ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
+            preloaded_packets,
         }
     }
 
