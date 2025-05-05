@@ -1,38 +1,29 @@
-use crate::flows::dist_source::DistPacketSource;
-use crate::flows::packet::Packet;
-use crate::flows::TrafficCharacteristics;
-use rand::rngs::SmallRng;
+//! A shared application-layer byte buffer used for TCP-based collective communication
+//! This buffer defines a fixed-size byte stream
+//! and provides a consistent view to each participating flow.
 
-/// A pre-generated sequence of packets that can be shared among multiple flows.
 #[derive(Debug, Clone)]
-pub struct SharedAppDataSource {
-    packets: Vec<Packet>,
+pub struct BufferedAppSource {
+    /// Total number of bytes to send in this shared buffer.
+    total_size: usize,
 }
 
-impl SharedAppDataSource {
-    /// Generates a shared sequence of packets using DistPacketSource logic,
-    /// replicating AppDataSource::new() behavior but returning a packet vector.
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
-        // Construct an internal DistPacketSource (used in AppDataSource)
-        let mut source = DistPacketSource::new(flow_id, vec![], traffic.clone(), rng);
-        source.flow_start_time = 0.0;
-
-        let mut packets = Vec::new();
-        let mut now = 0.0;
-
-        // Generate packets based on traffic model until traffic is exceeded
-        while !source.traffic_exceeded(now) {
-            let (packet, interval) = source.produce_packet(now);
-            source.packet_sent(&packet, now);
-            now += interval;
-            packets.push(packet);
-        }
-
-        SharedAppDataSource { packets }
+impl BufferedAppSource {
+    /// Constructs a new buffered source with a fixed number of total bytes.
+    ///
+    /// # Arguments
+    /// * `total_size` - The total number of bytes to be transmitted by each flow.
+    pub fn new(total_size: usize) -> Self {
+        BufferedAppSource { total_size }
     }
 
-    /// Clones the packet sequence so each flow can use an independent copy.
-    pub fn clone_packets(&self) -> Vec<Packet> {
-        self.packets.clone()
+    /// Returns the total number of bytes in the buffer.
+    pub fn total_size(&self) -> usize {
+        self.total_size
+    }
+
+    /// Returns a copy of the total size, which each TCP flow can use independently.
+    pub fn clone_total_size(&self) -> usize {
+        self.total_size
     }
 }
