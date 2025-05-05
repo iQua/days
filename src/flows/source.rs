@@ -61,7 +61,8 @@ impl PacketSource {
         flow_start_after: Vec<usize>,
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
-        seed: usize,
+        // seed: usize,
+        packets: Vec<Packet>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -80,7 +81,8 @@ impl PacketSource {
                 flow_id,
                 flow_start_after,
                 traffic,
-                rng,
+                // rng,
+                packets,
             )),
         }
     }
