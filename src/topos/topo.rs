@@ -550,13 +550,23 @@ impl Topology {
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
-            // creates a new packet source
+            // Determine if we need to preload shared packets
+            let preloaded_packets = match flow.flow_type {
+                FlowType::TCP => shared_sources
+                    .as_ref()
+                    .and_then(|map| map.get(&flow.id))
+                    .map(|shared| shared.clone_packets()),
+                _ => None,
+            };
+
+            // Create packet source with optional shared packets
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
                 flow.flow_type,
-                flow.traffic,
+                flow.traffic.clone(),
                 flow.seed,
+                preloaded_packets,
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
