@@ -1,6 +1,7 @@
 pub mod app_source;
 pub mod basic_sink;
 pub mod bbr;
+pub mod buffered_app_source;
 pub mod cc;
 pub mod collective;
 pub mod cubic;
@@ -9,7 +10,6 @@ pub mod flow;
 pub mod packet;
 pub mod reno;
 pub mod route;
-pub mod shared_app_source;
 pub mod sink;
 pub mod source;
 pub mod tcp_sink;

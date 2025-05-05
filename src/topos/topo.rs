@@ -21,9 +21,9 @@ use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
+use crate::flows::buffered_app_source::BufferedAppDataSource;
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
-use crate::flows::shared_app_source::SharedAppDataSource;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::get_seed;
@@ -758,32 +758,16 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        // Build shared data sources per collective if TCP + Broadcast
-        let mut shared_sources = HashMap::new();
+        let shared_sources = HashMap::new();
         for collective in &self.collectives {
-            match (collective.collective_type, collective.flow_type) {
-                (CollectiveType::Broadcast, FlowType::TCP) => {
-                    let global_seed = get_seed();
-                    let seed = collective.id;
-                    let rng = match global_seed {
-                        1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
-                        _ => SmallRng::from_os_rng(),
-                    };
-
-                    let shared_source = SharedAppDataSource::new(
-                        collective.first_flow_id,
-                        collective.traffic.clone(),
-                        rng,
-                    );
-                    shared_sources.insert(collective.id, shared_source);
-                }
-                (CollectiveType::AllReduce, FlowType::TCP) => {
-                    // TODO: maybe reuse shared source later, with different pattern
-                }
-
-                _ => {
-                    // do nothing for now
-                }
+            if matches!(
+                (collective.collective_type, collective.flow_type),
+                (CollectiveType::Broadcast, FlowType::TCP)
+            ) {
+                // get total size from collective config
+                let total_size = collective.traffic.size;
+                let shared = BufferedAppDataSource::new(total_size);
+                shared_sources.insert(collective.id, shared);
             }
         }
 
