@@ -62,7 +62,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        packets: Option<Vec<Packet>>,
+        total_size: Option<usize>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {

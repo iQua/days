@@ -13,8 +13,6 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, info};
 use petgraph::graph::UnGraph;
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use serde::Deserialize;
 
 use nexosim::ports::{EventSlot, Output};
@@ -26,7 +24,6 @@ use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
-use crate::get_seed;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
@@ -531,7 +528,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
-        shared_sources: Option<HashMap<usize, SharedAppDataSource>>,
+        shared_sources: Option<HashMap<usize, BufferedAppDataSource>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -552,14 +549,16 @@ impl Topology {
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
-            // Determine if we need to preload shared packets
-            let preloaded_packets = match flow.flow_type {
-                FlowType::TCP => shared_sources
-                    .as_ref()
-                    .and_then(|map| map.get(&flow.id))
-                    .map(|shared| shared.clone_packets()),
-                _ => None,
-            };
+            // Find the collective id that the flow belong to
+            let collective_id_opt = self
+                .collectives
+                .iter()
+                .find(|c| c.first_flow_id <= flow.id && flow.id < c.first_flow_id + c.sources.len())
+                .map(|c| c.id);
+            // get the total_size of the buffer from the buffered sources
+            let total_size = collective_id_opt
+                .and_then(|id| shared_sources.as_ref()?.get(&id))
+                .map(|shared| shared.clone_total_size());
 
             // Create packet source with optional shared packets
             let mut source = PacketSource::new(
@@ -568,7 +567,7 @@ impl Topology {
                 flow.flow_type,
                 flow.traffic.clone(),
                 flow.seed,
-                preloaded_packets,
+                total_size,
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
@@ -758,7 +757,7 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        let shared_sources = HashMap::new();
+        let mut shared_sources = HashMap::new();
         for collective in &self.collectives {
             if matches!(
                 (collective.collective_type, collective.flow_type),
