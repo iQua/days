@@ -529,6 +529,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
+        shared_sources: Option<HashMap<usize, SharedAppDataSource>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -780,7 +781,7 @@ impl Topology {
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox);
+        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox, Some(shared_sources));
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
