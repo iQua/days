@@ -527,6 +527,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
+        shared_packets: Option<SharedAppDataSource>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -548,12 +549,18 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
+            let packet_vec = match flow.flow_type {
+                FlowType::TCP => shared_packets.as_ref().map(|d| d.clone_packets()),
+                _ => None,
+            };
+
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
                 flow.flow_type,
                 flow.traffic,
                 flow.seed,
+                packet_vec,
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in

@@ -77,13 +77,16 @@ impl PacketSource {
                 traffic,
                 rng,
             )),
-            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
-                flow_id,
-                flow_start_after,
-                traffic,
-                rng,
-                packets,
-            )),
+            FlowType::TCP => {
+                let preloaded = packets.unwrap_or_else(Vec::new);
+                PacketSource::TCPPacketSource(TCPPacketSource::new(
+                    flow_id,
+                    flow_start_after,
+                    traffic,
+                    rng,
+                    preloaded,
+                ))
+            }
         }
     }
 
