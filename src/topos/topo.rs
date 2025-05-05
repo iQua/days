@@ -13,6 +13,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, info};
 use petgraph::graph::UnGraph;
+use rand::rngs::SmallRng;
 use serde::Deserialize;
 
 use nexosim::ports::{EventSlot, Output};
@@ -23,6 +24,7 @@ use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
+use crate::get_seed;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
@@ -527,7 +529,6 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
-        shared_packets: Option<SharedAppDataSource>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -549,18 +550,12 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             // creates a new packet source
-            let packet_vec = match flow.flow_type {
-                FlowType::TCP => shared_packets.as_ref().map(|d| d.clone_packets()),
-                _ => None,
-            };
-
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
                 flow.flow_type,
                 flow.traffic,
                 flow.seed,
-                packet_vec,
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
@@ -749,6 +744,35 @@ impl Topology {
 
         // produces flows within all collectives in the network graph
         self.process_collectives();
+
+        // Build shared data sources per collective if TCP + Broadcast
+        let mut shared_sources = HashMap::new();
+        for collective in &self.collectives {
+            match (collective.collective_type, collective.flow_type) {
+                (CollectiveType::Broadcast, FlowType::TCP) => {
+                    let global_seed = get_seed();
+                    let seed = collective.id;
+                    let rng = match global_seed {
+                        1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
+                        _ => SmallRng::from_os_rng(),
+                    };
+
+                    let shared_source = SharedAppDataSource::new(
+                        collective.first_flow_id,
+                        collective.traffic.clone(),
+                        rng,
+                    );
+                    shared_sources.insert(collective.id, shared_source);
+                }
+                (CollectiveType::AllReduce, FlowType::TCP) => {
+                    // TODO: maybe reuse shared source later, with different pattern
+                }
+
+                _ => {
+                    // do nothing for now
+                }
+            }
+        }
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
