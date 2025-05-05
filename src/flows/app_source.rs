@@ -10,6 +10,7 @@ pub enum AppDataSource {
     // The data source from the application generates packets based on probability distributions,
     // but it can be trace-driven as well in the future.
     DistDataSource(DistPacketSource),
+    Dummy,
 }
 
 pub enum AppDataType {
@@ -17,6 +18,10 @@ pub enum AppDataType {
 }
 
 impl AppDataSource {
+    pub fn dummy() -> Self {
+        AppDataSource::Dummy
+    }
+
     pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
         let app_type = AppDataType::DistData;
 
@@ -33,6 +38,7 @@ impl AppDataSource {
     pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
         match self {
             AppDataSource::DistDataSource(source) => source.flow_start_time = flow_start_time,
+            AppDataSource::Dummy => {}
         }
     }
 
@@ -44,6 +50,9 @@ impl AppDataSource {
         // the packet has just been produced, update statistics about traffic production
         match self {
             AppDataSource::DistDataSource(source) => source.packet_sent(&packet, now),
+            AppDataSource::Dummy => {
+                panic!("Dummy AppDataSource should not produce data")
+            }
         };
 
         (packet, duration)
@@ -52,6 +61,7 @@ impl AppDataSource {
     pub fn traffic_exceeded(&self, now: f64) -> bool {
         match self {
             AppDataSource::DistDataSource(source) => source.traffic_exceeded(now),
+            AppDataSource::Dummy => true,
         }
     }
 }

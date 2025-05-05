@@ -131,7 +131,7 @@ impl TCPPacketSource {
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
-        // rng: SmallRng,
+        rng: SmallRng,
         preloaded_packets: Vec<Packet>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;

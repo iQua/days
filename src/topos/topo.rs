@@ -14,6 +14,7 @@ use indicatif_log_bridge::LogWrapper;
 use log::{debug, info};
 use petgraph::graph::UnGraph;
 use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use serde::Deserialize;
 
 use nexosim::ports::{EventSlot, Output};
