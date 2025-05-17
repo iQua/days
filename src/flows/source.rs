@@ -62,7 +62,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        total_size: Option<usize>,
+        preload_packets: Option<Vec<Packet>>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -77,16 +77,13 @@ impl PacketSource {
                 traffic,
                 rng,
             )),
-            FlowType::TCP => {
-                let preloaded = packets.unwrap_or_else(Vec::new);
-                PacketSource::TCPPacketSource(TCPPacketSource::new(
-                    flow_id,
-                    flow_start_after,
-                    traffic,
-                    rng,
-                    preloaded,
-                ))
-            }
+            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                rng,
+                Some(preload_packets),
+            )),
         }
     }
 
