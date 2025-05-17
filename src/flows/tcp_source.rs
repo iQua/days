@@ -2,14 +2,14 @@
 //! support for various congestion control mechanisms.
 
 use core::fmt;
-use std::cmp::min;
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-
 use log::debug;
 use nexosim::model::Model;
 use nexosim::ports::Output;
 use rand::rngs::SmallRng;
+use std::cmp::min;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::bbr::TCPBBR;
@@ -89,7 +89,7 @@ pub struct TCPPacketSource {
     timeout_queue: BinaryHeap<PacketTimeout>,
 
     pub datasource: AppDataSource,
-    pub buffered_source: Option<BufferedAppDataSource>,
+    pub buffered_source: Option<Arc<BufferedAppDataSource>>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -131,7 +131,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        buffered_source: Option<BufferedAppDataSource>,
+        buffered_source: Option<Arc<BufferedAppDataSource>>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -172,7 +172,7 @@ impl TCPPacketSource {
             clock_granularity: 0.001, // 1ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
-            buffered_source: buffered_source,
+            buffered_source,
         }
     }
 

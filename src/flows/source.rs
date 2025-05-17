@@ -4,6 +4,7 @@
 use std::borrow::BorrowMut;
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
@@ -63,7 +64,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        buffered_source: Option<BufferedAppDataSource>,
+        buffered_source: Option<Arc<BufferedAppDataSource>>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
