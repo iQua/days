@@ -130,6 +130,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
+        shared_sources: Option<HashMap<usize, BufferedAppDataSource>>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -137,6 +138,12 @@ impl TCPPacketSource {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
+        };
+
+        let datasource = if let Some(shared) = shared_sources {
+            shared
+        } else {
+            AppDataSource::new(flow_id, traffic.clone(), rng.clone())
         };
 
         TCPPacketSource {
@@ -157,7 +164,8 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
+            datasource,
+            // datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
