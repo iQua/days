@@ -528,7 +528,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
-        shared_sources: Option<HashMap<usize, BufferedAppDataSource>>,
+        shared_sources: Option<HashMap<usize, Arc<BufferedAppDataSource>>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -575,14 +575,15 @@ impl Topology {
                         let shared = shared_sources
                             .as_ref()
                             .and_then(|s| s.get(&collective_id))
-                            .expect("Missing shared source for broadcast");
+                            .expect("Missing shared source for broadcast")
+                            .clone();
                         let src = PacketSource::new(
                             flow.id,
                             flow.starts_after.clone(),
                             flow.flow_type,
                             flow.traffic, //TODO: to be removed
                             flow.seed,
-                            shared, // share app source
+                            Some(shared), // share app source
                         );
                         flow.source_id = src.id();
                         collective_source_map.insert(collective_id, src);
@@ -780,7 +781,7 @@ impl Topology {
                     &mut SmallRng::seed_from_u64(seed as u64),
                 ); // TODO: the actual packets will from the input config.
 
-                let shared = BufferedAppDataSource::new(packets);
+                let shared = Arc::new(BufferedAppDataSource::new(packets));
                 shared_sources.insert(collective.id, shared);
             }
         }
