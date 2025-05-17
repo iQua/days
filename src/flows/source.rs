@@ -2,6 +2,7 @@
 //! packet sources.
 
 use std::borrow::BorrowMut;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::Serialize;
 
+use crate::flows::buffered_app_source::BufferedAppDataSource;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
@@ -62,7 +64,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        preload_packets: Option<Vec<Packet>>,
+        shared_sources: Option<HashMap<usize, BufferedAppDataSource>>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -82,7 +84,7 @@ impl PacketSource {
                 flow_start_after,
                 traffic,
                 rng,
-                Some(preload_packets),
+                Some(shared_sources),
             )),
         }
     }
