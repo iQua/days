@@ -566,29 +566,28 @@ impl Topology {
                 .expect("No collective found");
 
             // Source creation or reuse
-            let source = match collective.collective_type {
+            let source: &mut PacketSource = match collective.collective_type {
                 CollectiveType::Broadcast => {
-                    if let Some(existing) = collective_source_map.get(&collective_id) {
-                        flow.source_id = existing.id();
-                        existing
-                    } else {
+                    if !collective_source_map.contains_key(&collective_id) {
                         let shared = shared_sources
                             .as_ref()
                             .and_then(|s| s.get(&collective_id))
                             .expect("Missing shared source for broadcast")
                             .clone();
+
                         let src = PacketSource::new(
                             flow.id,
                             flow.starts_after.clone(),
                             flow.flow_type,
-                            flow.traffic, //TODO: to be removed
+                            flow.traffic,
                             flow.seed,
-                            Some(shared), // share app source
+                            Some(shared),
                         );
+
                         flow.source_id = src.id();
                         collective_source_map.insert(collective_id, src);
-                        collective_source_map.get(&collective_id).unwrap()
                     }
+                    collective_source_map.get_mut(&collective_id).unwrap()
                 }
                 _ => {
                     let src = PacketSource::new(
@@ -601,7 +600,7 @@ impl Topology {
                     );
                     flow.source_id = src.id();
                     sources.insert(flow.id, src);
-                    sources.get(&flow.id).unwrap()
+                    sources.get_mut(&flow.id).unwrap()
                 }
             };
 
