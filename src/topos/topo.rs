@@ -537,15 +537,24 @@ impl Topology {
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
-        for flow in self.flows.iter() {
-            let source_mbox: Mailbox<PacketSource> = Mailbox::with_capacity(self.mailbox_capacity);
-            source_mboxes.insert(flow.id, source_mbox);
+        let mut collective_source_map: HashMap<usize, PacketSource> = HashMap::new();
+
+        // build flow_id → collective_id and collective_id → &Collective mappings
+        let mut flow_to_collective = HashMap::new();
+        let collective_map: HashMap<usize, &Collective> =
+            self.collectives.iter().map(|c| (c.id, c)).collect();
+        for collective in &self.collectives {
+            for i in 0..collective.flow_count {
+                flow_to_collective.insert(collective.first_flow_id + i, collective.id);
+            }
+        }
+
+        // pre-allocate source mailboxes
+        for flow in &self.flows {
+            source_mboxes.insert(flow.id, Mailbox::with_capacity(self.mailbox_capacity));
         }
 
         for flow in self.flows.iter_mut() {
-            // creates and attaches a packet source and sink for each flow
-
-            // packet sources and sinks must be attached to hosts
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
