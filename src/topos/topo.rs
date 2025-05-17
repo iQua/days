@@ -582,7 +582,7 @@ impl Topology {
                             flow.flow_type,
                             flow.traffic, //TODO: to be removed
                             flow.seed,
-                            Some(shared), // share app source
+                            shared, // share app source
                         );
                         flow.source_id = src.id();
                         collective_source_map.insert(collective_id, src);

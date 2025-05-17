@@ -13,6 +13,7 @@ use rand::rngs::SmallRng;
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::bbr::TCPBBR;
+use crate::flows::buffered_app_source::BufferedAppDataSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::packet::Packet;
@@ -88,7 +89,7 @@ pub struct TCPPacketSource {
     timeout_queue: BinaryHeap<PacketTimeout>,
 
     pub datasource: AppDataSource,
-
+    pub buffered_source: Option<BufferedAppDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -130,7 +131,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        shared_sources: Option<HashMap<usize, BufferedAppDataSource>>,
+        buffered_source: Option<BufferedAppDataSource>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -138,12 +139,6 @@ impl TCPPacketSource {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
-        };
-
-        let datasource = if let Some(shared) = shared_sources {
-            shared
-        } else {
-            AppDataSource::new(flow_id, traffic.clone(), rng.clone())
         };
 
         TCPPacketSource {
@@ -164,8 +159,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource,
-            // datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
+            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
@@ -178,6 +172,7 @@ impl TCPPacketSource {
             clock_granularity: 0.001, // 1ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
+            buffered_source: buffered_source,
         }
     }
 

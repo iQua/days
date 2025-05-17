@@ -2,7 +2,6 @@
 //! packet sources.
 
 use std::borrow::BorrowMut;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::time::Duration;
@@ -64,7 +63,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        shared_sources: Option<HashMap<usize, BufferedAppDataSource>>,
+        buffered_source: Option<BufferedAppDataSource>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -84,7 +83,7 @@ impl PacketSource {
                 flow_start_after,
                 traffic,
                 rng,
-                Some(shared_sources),
+                buffered_source,
             )),
         }
     }
