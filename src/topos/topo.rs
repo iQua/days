@@ -583,9 +583,6 @@ impl Topology {
             // obtains the host switch and its mailbox for the packet source
             let source_host = self.switches.get_mut(&flow.source_host).unwrap();
             let host_mbox = self.switch_mailboxes.get(&flow.source_host).unwrap();
-
-            // establishes a bi-directional connection between the packet source
-            // and the host
             let source_mbox = &source_mboxes[&flow.id];
             source
                 .output()
@@ -764,8 +761,13 @@ impl Topology {
                 (CollectiveType::Broadcast, FlowType::TCP)
             ) {
                 // get total size from collective config
-                let total_size = collective.traffic.size;
-                let shared = BufferedAppDataSource::new(total_size);
+                let seed = collective.id;
+                let packets = collective.traffic.generate_packets(
+                    collective.first_flow_id,
+                    &mut SmallRng::seed_from_u64(seed as u64),
+                ); // TODO: the actual packets will from the input config.
+
+                let shared = BufferedAppDataSource::new(packets);
                 shared_sources.insert(collective.id, shared);
             }
         }
