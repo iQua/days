@@ -322,6 +322,24 @@ impl TCPPacketSource {
             if now >= self.busy_until {
                 return true;
             }
+
+            // Try pulling more data from BufferedAppDataSource if cwnd has space
+            let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
+
+            // If there's room for at least one packet beyond next_seq
+            if self.next_seq + self.mss <= cwnd_limit {
+                if let Some(buffered) = &mut self.buffered_packets {
+                    if !buffered.is_empty() {
+                        let packet = buffered.remove(0);
+                        self.send_buffer += packet.size;
+
+                        debug!(
+                            "TCPPacketSource {} pulled {} bytes from BufferedAppDataSource at time {:.3}.",
+                            self.endpoint_id, packet.size, now
+                        );
+                    }
+                }
+            }
         }
 
         false
