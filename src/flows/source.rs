@@ -185,27 +185,25 @@ impl PacketSource {
                 )
                 .unwrap();
 
-                let (data, interval) = match &source.buffered_source {
-                    Some(buffered) => {
-                        let data = buffered.clone_packets();
-                        let interval = 0;
-                        (data, interval)
-                    }
+                if let Some(buffered) = &source.buffered_source {
+                    let data = buffered.clone_packets();
+                    source.send_buffer = packets.iter().map(|p| p.size).sum();
+                    source.buffered_packets = Some(packets);
+                } else {
                     // lets AppDataSource to send data to TCPPacketSource
-                    None => source.datasource.produce_data(now + initial_delay),
-                };
+                    let (data, interval) = source.datasource.produce_data(now + initial_delay);
+                    // TCPPacketSource now owns the data from the application
+                    source.send_buffer += data.size;
+                    source.busy_until = now + initial_delay;
 
-                // TCPPacketSource now owns the data from the application
-                source.send_buffer += data.size;
-                source.busy_until = now + initial_delay;
-
-                // schedules AppDataSource to send next data
-                cx.schedule_event(
-                    Duration::from_secs_f64(interval),
-                    Self::fetch_app_data,
-                    source.time + interval,
-                )
-                .unwrap();
+                    // schedules AppDataSource to send next data
+                    cx.schedule_event(
+                        Duration::from_secs_f64(interval),
+                        Self::fetch_app_data,
+                        source.time + interval,
+                    )
+                    .unwrap();
+                }
             }
         }
     }
