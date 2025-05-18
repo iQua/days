@@ -421,38 +421,9 @@ impl TCPPacketSource {
                     self.last_ack + self.congestion_control.get_cwnd(),
                 )
         {
-            // If there is not enough data left to send a full MSS-sized packet,
-            // attempt to pull more data from the application source.
-            if self.send_buffer - self.next_seq < self.mss {
-                if let Some(buffered) = &mut self.buffered_packets {
-                    // If using pre-buffered data (e.g., broadcast scenario), clone one packet
-                    if !buffered.is_empty() {
-                        let packet = buffered.remove(0);
-                        self.send_buffer += packet.size;
-                    } else {
-                        // No more data available to send
-                        break;
-                    }
-                } else {
-                    // Otherwise, generate more data from AppDataSource
-                    let (data, _) = self.datasource.produce_data(self.time);
-                    if data.size == 0 {
-                        // No more data to produce
-                        break;
-                    }
-                    self.send_buffer += data.size;
-                }
-            }
-
-            // If we now have enough data to send a packet, construct and send it
-            if self.next_seq + self.mss <= self.send_buffer {
-                let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
-                self.output.send(packet.clone()).await;
-                self.packet_sent(&packet, now);
-            } else {
-                // We pulled data, but it's still not enough for one full packet
-                break;
-            }
+            let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+            self.output.send(packet.clone()).await;
+            self.packet_sent(&packet, now);
         }
     }
 
