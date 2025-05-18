@@ -185,8 +185,12 @@ impl PacketSource {
                 )
                 .unwrap();
 
-                // lets AppDataSource to send data to TCPPacketSource
-                let (data, interval) = source.datasource.produce_data(now + initial_delay);
+                if let Some(buffered) = &source.buffered_source {
+                    let data = buffered.clone_packets();
+                } else {
+                    // lets AppDataSource to send data to TCPPacketSource
+                    let (data, interval) = source.datasource.produce_data(now + initial_delay);
+                }
 
                 // TCPPacketSource now owns the data from the application
                 source.send_buffer += data.size;
