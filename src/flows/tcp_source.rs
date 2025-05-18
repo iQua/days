@@ -328,9 +328,10 @@ impl TCPPacketSource {
 
             // If there's room for at least one packet beyond next_seq
             if self.next_seq + self.mss <= cwnd_limit {
-                if let Some(buffered) = &mut self.buffered_packets {
-                    if !buffered.is_empty() {
-                        let packet = buffered.remove(0);
+                if let Some(buffered_source) = &self.buffered_source {
+                    let mut packets = buffered_source.clone_packets();
+                    if !packets.is_empty() {
+                        let packet = packets.remove(0);
                         self.send_buffer += packet.size;
 
                         debug!(
