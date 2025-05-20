@@ -329,14 +329,29 @@ impl TCPPacketSource {
             // If there's room for at least one packet beyond next_seq
             if self.next_seq + self.mss <= cwnd_limit {
                 if let Some(buffered_source) = &self.buffered_source {
-                    let mut packets = buffered_source.clone_packets();
-                    if !packets.is_empty() {
-                        let packet = packets.remove(0);
+                    let packets = buffered_source.clone_packets();
+                    let mut total_pulled = 0;
+
+                    for packet in packets {
+                        if self.next_seq + self.mss > cwnd_limit {
+                            break;
+                        }
+
+                        self.output.send(packet.clone()).await;
+                        self.packet_sent(&packet, now);
                         self.send_buffer += packet.size;
+                        total_pulled += packet.size;
 
                         debug!(
-                            "TCPPacketSource {} pulled {} bytes from BufferedAppDataSource at time {:.3}.",
-                            self.endpoint_id, packet.size, now
+                            "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3} from BufferedAppDataSource.",
+                            self.endpoint_id, packet.packet_id, packet.size, now
+                        );
+                    }
+
+                    if total_pulled > 0 {
+                        debug!(
+                            "TCPPacketSource {} pulled and sent {} bytes from BufferedAppDataSource at time {:.3}.",
+                            self.endpoint_id, total_pulled, now
                         );
                     }
                 }
