@@ -1,0 +1,24 @@
+[[collective]]
+collective_type = "Broadcast"
+flow_type = "TCP"
+flow_count = 4
+sources = [0]
+sinks = [1, 2, 3, 4]
+
+[collective.traffic]
+initial_delay = 1.0
+
+[[collective.traffic.packets]]
+size = 2000
+timestamp = 1.0
+
+[[collective.traffic.packets]]
+size = 2200
+timestamp = 1.5
+
+[[collective.traffic.packets]]
+size = 2500
+timestamp = 2.0
+
+[collective.traffic.tcp]
+cc_algorithm = "Cubic"
