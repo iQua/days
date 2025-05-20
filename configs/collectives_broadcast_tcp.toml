@@ -9,16 +9,22 @@ sinks = [1, 2, 3, 4]
 initial_delay = 1.0
 
 [[collective.traffic.packets]]
-size = 2000
+packet_id = 100
+size = 2048
+sequence_number = 0
 timestamp = 1.0
 
 [[collective.traffic.packets]]
-size = 2200
-timestamp = 1.5
+packet_id = 101
+size = 2048
+sequence_number = 2048
+timestamp = 1.2
 
 [[collective.traffic.packets]]
-size = 2500
-timestamp = 2.0
+packet_id = 102
+size = 1024
+sequence_number = 4096
+timestamp = 1.4
 
 [collective.traffic.tcp]
 cc_algorithm = "Cubic"
