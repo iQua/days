@@ -6,6 +6,8 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 
+use crate::flows::buffered_app_source::AppDataSourceTrait;
+
 pub enum AppDataSource {
     // The data source from the application generates packets based on probability distributions,
     // but it can be trace-driven as well in the future.
