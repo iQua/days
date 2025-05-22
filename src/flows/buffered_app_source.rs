@@ -1,5 +1,17 @@
 use crate::flows::packet::Packet;
 
+/// A unified trait for any application-level data source used by TCP or other flows.
+pub trait AppDataSourceTrait {
+    /// Produce packets based on the application's sending logic at time `now`.
+    fn produce_data(&mut self, now: f64) -> Vec<Packet>;
+
+    /// Return the total data size the app will generate (in bytes).
+    fn total_size(&self) -> usize;
+
+    /// Optionally set the flow's start time (no-op for buffered source).
+    fn set_flow_start_time(&mut self, _t: f64) {}
+}
+
 #[derive(Debug, Clone)]
 pub struct BufferedAppDataSource {
     total_size: usize,
@@ -25,18 +37,6 @@ impl BufferedAppDataSource {
     pub fn total_size(&self) -> usize {
         self.total_size
     }
-}
-
-/// A unified trait for any application-level data source used by TCP or other flows.
-pub trait AppDataSourceTrait {
-    /// Produce packets based on the application's sending logic at time `now`.
-    fn produce_data(&mut self, now: f64) -> Vec<Packet>;
-
-    /// Return the total data size the app will generate (in bytes).
-    fn total_size(&self) -> usize;
-
-    /// Optionally set the flow's start time (no-op for buffered source).
-    fn set_flow_start_time(&mut self, _t: f64) {}
 }
 
 impl AppDataSourceTrait for BufferedAppDataSource {
