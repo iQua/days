@@ -62,3 +62,32 @@ impl AppDataSource {
         }
     }
 }
+
+impl AppDataSourceTrait for AppDataSource {
+    fn produce_data(&mut self, now: f64) -> Vec<Packet> {
+        match self {
+            AppDataSource::DistDataSource(source) => {
+                let (packet, _) = source.produce_packet(now);
+                source.packet_sent(&packet, now);
+                vec![packet]
+            }
+            AppDataSource::Dummy => {
+                panic!("Dummy source should not produce data");
+            }
+        }
+    }
+
+    fn total_size(&self) -> usize {
+        match self {
+            AppDataSource::DistDataSource(source) => source.total_size(),
+            AppDataSource::Dummy => 0,
+        }
+    }
+
+    fn set_flow_start_time(&mut self, t: f64) {
+        match self {
+            AppDataSource::DistDataSource(source) => source.flow_start_time = t,
+            AppDataSource::Dummy => {}
+        }
+    }
+}
