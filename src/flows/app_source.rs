@@ -81,7 +81,7 @@ impl AppDataSourceTrait for AppDataSource {
 
     fn total_size(&self) -> usize {
         match self {
-            AppDataSource::DistDataSource(source) => source.total_size(),
+            AppDataSource::DistDataSource(_source) => 0, // TODO: implement real total size
             AppDataSource::Dummy => 0,
         }
     }
