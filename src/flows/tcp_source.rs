@@ -1,19 +1,8 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
 
-use core::fmt;
-use log::debug;
-use nexosim::model::Model;
-use nexosim::ports::Output;
-use rand::rngs::SmallRng;
-use std::cmp::min;
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
-
-use crate::flows::app_source::AppDataSource;
 use crate::flows::bbr::TCPBBR;
-use crate::flows::buffered_app_source::BufferedAppDataSource;
+use crate::flows::buffered_app_source::AppSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::packet::Packet;
@@ -23,6 +12,14 @@ use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
+use core::fmt;
+use log::debug;
+use nexosim::model::Model;
+use nexosim::ports::Output;
+use rand::rngs::SmallRng;
+use std::cmp::min;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
@@ -88,8 +85,7 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub datasource: AppDataSource,
-    pub buffered_source: Option<Arc<BufferedAppDataSource>>,
+    pub datasource: Box<dyn AppSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -131,7 +127,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        buffered_source: Option<Arc<BufferedAppDataSource>>,
+        datasource: Box<dyn AppSource>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -159,7 +155,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
+            datasource,
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
@@ -172,7 +168,6 @@ impl TCPPacketSource {
             clock_granularity: 0.001, // 1ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
-            buffered_source,
         }
     }
 
