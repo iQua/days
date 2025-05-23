@@ -6,7 +6,7 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 
-use crate::flows::buffered_app_source::AppDataSourceTrait;
+use crate::flows::buffered_app_source::AppSource;
 
 pub enum AppDataSource {
     // The data source from the application generates packets based on probability distributions,
@@ -65,7 +65,7 @@ impl AppDataSource {
     }
 }
 
-impl AppDataSourceTrait for AppDataSource {
+impl AppSource for AppDataSource {
     fn produce_data(&mut self, now: f64) -> Vec<Packet> {
         match self {
             AppDataSource::DistDataSource(source) => {
