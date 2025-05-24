@@ -217,9 +217,9 @@ impl TCPPacketSource {
                 self.output.send(resent_pkt.clone()).await;
 
                 debug!(
-                        "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                        self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
-                    );
+                            "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                            self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+                        );
             }
 
             if self.dupack > 3 {
@@ -230,9 +230,9 @@ impl TCPPacketSource {
                     && self.next_seq < self.send_buffer
                 {
                     debug!(
-                            "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
-                            self.endpoint_id, self.next_seq, self.mss, now,
-                        );
+                                "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
+                                self.endpoint_id, self.next_seq, self.mss, now,
+                            );
 
                     let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
                     self.output.send(packet.clone()).await;
@@ -323,39 +323,9 @@ impl TCPPacketSource {
                 return true;
             }
 
-            // Try pulling more data from BufferedAppDataSource if cwnd has space
+            // Try pulling more data from the channel if cwnd allows
             let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
-
-            // If there's room for at least one packet beyond next_seq
-            if self.next_seq + self.mss <= cwnd_limit {
-                if let Some(buffered_source) = &self.buffered_source {
-                    let packets = buffered_source.clone_packets();
-                    let mut total_pulled = 0;
-
-                    for packet in packets {
-                        if self.next_seq + self.mss > cwnd_limit {
-                            break;
-                        }
-
-                        self.output.send(packet.clone()).await;
-                        self.packet_sent(&packet, now);
-                        self.send_buffer += packet.size;
-                        total_pulled += packet.size;
-
-                        debug!(
-                            "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3} from BufferedAppDataSource.",
-                            self.endpoint_id, packet.packet_id, packet.size, now
-                        );
-                    }
-
-                    if total_pulled > 0 {
-                        debug!(
-                            "TCPPacketSource {} pulled and sent {} bytes from BufferedAppDataSource at time {:.3}.",
-                            self.endpoint_id, total_pulled, now
-                        );
-                    }
-                }
-            }
+            self.try_pull_from_channel(now, cwnd_limit).await;
         }
 
         false
