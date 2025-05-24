@@ -3,10 +3,10 @@
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
-use futures_executor::ThreadPool;
+use futures::executor::ThreadPool;
+use futures::future::join_all;
 use rand::rngs::SmallRng;
-use tachyonix;
-use tachyonix::{channel, Receiver};
+use tachyonix::{channel, Receiver, Sender};
 
 /// Trait for application-level data sources (not a simulation model).
 pub trait AppSource: Send {
@@ -63,38 +63,8 @@ impl AppDataSource {
         AppDataSource::Dummy
     }
 
-    /// Creates an AppDataSource and spawns a coroutine to produce packets into a channel.
-    /// Returns the receiver side of the channel to be consumed by TCPPacketSource.
-    pub fn spawn_and_channel(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        rng: SmallRng,
-    ) -> Receiver<Packet> {
-        let mut source = match AppDataType::DistData {
-            AppDataType::DistData => AppDataSource::DistDataSource(DistPacketSource::new(
-                flow_id,
-                Vec::new(),
-                traffic,
-                rng,
-            )),
-        };
-
-        let (tx, rx) = channel::<Packet>(128);
-        let pool = ThreadPool::new().expect("Failed to create thread pool");
-
-        pool.spawn_ok(async move {
-            loop {
-                let packets = source.produce_data(0.0); // dummy timestamp
-                for packet in packets {
-                    if tx.send(packet).await.is_err() {
-                        return; // Receiver dropped
-                    }
-                }
-                break; // Send once; change this if a continuous stream is desired
-            }
-        });
-
-        rx
+    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+        AppDataSource::DistDataSource(DistPacketSource::new(flow_id, Vec::new(), traffic, rng))
     }
 
     pub fn traffic_exceeded(&self, now: f64) -> bool {
@@ -130,4 +100,31 @@ impl AppSource for AppDataSource {
             AppDataSource::Dummy => {}
         }
     }
+}
+
+/// Spawns a background task that pushes packets from the given AppSource into a channel.
+/// Returns `n` receivers cloned from the same channel.
+pub fn spawn_appsource_channel(
+    mut source: Box<dyn AppSource + Send>,
+    n_receivers: usize,
+) -> Vec<Receiver<Packet>> {
+    let (senders, receivers): (Vec<Sender<Packet>>, Vec<Receiver<Packet>>) =
+        (0..n_receivers).map(|_| channel::<Packet>(128)).unzip();
+
+    let pool = ThreadPool::new().expect("Failed to create thread pool");
+
+    // Share AppSource logic into a thread
+    pool.spawn_ok(async move {
+        let packets = source.produce_data(0.0); // dummy timestamp
+        for packet in packets {
+            let sends = senders
+                .iter()
+                .map(|tx| tx.send(packet.clone()))
+                .collect::<Vec<_>>();
+
+            let _ = join_all(sends).await;
+        }
+    });
+
+    receivers
 }
