@@ -1,8 +1,8 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
 
+use crate::flows::app_source::{spawn_appsource_channel, AppSource};
 use crate::flows::bbr::TCPBBR;
-use crate::flows::buffered_app_source::AppSource;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::packet::Packet;
@@ -20,6 +20,7 @@ use rand::rngs::SmallRng;
 use std::cmp::min;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use tachyonix::{Receiver, TryRecvError};
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
@@ -85,7 +86,8 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub datasource: Box<dyn AppSource>,
+    pub receiver: Receiver<Packet>,
+    // pub datasource: Box<dyn AppSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -127,7 +129,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        datasource: Box<dyn AppSource>,
+        app_source: Box<dyn AppSource>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -136,6 +138,9 @@ impl TCPPacketSource {
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
+
+        let mut receivers = spawn_appsource_channel(app_source, 1);
+        let rx = receivers.remove(0);
 
         TCPPacketSource {
             time: 0.0,
@@ -155,7 +160,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource,
+            receiver: rx,
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
