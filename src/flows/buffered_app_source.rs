@@ -1,7 +1,7 @@
 use crate::flows::packet::Packet;
 
 /// A unified trait for any application-level data source used by TCP or other flows.
-pub trait AppSource {
+pub trait AppSource: Send {
     /// Produce packets based on the application's sending logic at time `now`.
     fn produce_data(&mut self, now: f64) -> Vec<Packet>;
 
