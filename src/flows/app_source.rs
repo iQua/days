@@ -3,9 +3,10 @@
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
+use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
-use tachyonix::channel::{self, Receiver};
-use tachyonix::spawn;
+use tachyonix;
+use tachyonix::{channel, Receiver};
 
 /// Trait for application-level data sources (not a simulation model).
 pub trait AppSource: Send {
@@ -49,8 +50,6 @@ impl AppSource for BufferedAppDataSource {
 }
 
 pub enum AppDataSource {
-    // The data source from the application generates packets based on probability distributions,
-    // but it can be trace-driven as well in the future.
     DistDataSource(DistPacketSource),
     Dummy,
 }
@@ -81,8 +80,9 @@ impl AppDataSource {
         };
 
         let (tx, rx) = channel::<Packet>(128);
+        let pool = ThreadPool::new().expect("Failed to create thread pool");
 
-        spawn(async move {
+        pool.spawn_ok(async move {
             loop {
                 let packets = source.produce_data(0.0); // dummy timestamp
                 for packet in packets {
@@ -90,7 +90,7 @@ impl AppDataSource {
                         return; // Receiver dropped
                     }
                 }
-                break; // Exit after sending one burst, or loop to simulate a stream
+                break; // Send once; change this if a continuous stream is desired
             }
         });
 
