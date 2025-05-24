@@ -361,6 +361,30 @@ impl TCPPacketSource {
         false
     }
 
+    pub async fn try_pull_from_channel(&mut self, now: f64, cwnd_limit: usize) {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(packet) => {
+                    if self.next_seq + self.mss > cwnd_limit {
+                        break;
+                    }
+                    self.output.send(packet.clone()).await;
+                    self.packet_sent(&packet, now);
+                    self.send_buffer += packet.size;
+                    debug!(
+                        "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
+                        self.endpoint_id, packet.packet_id, packet.size, now
+                    );
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.traffic_exceeded = true;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
