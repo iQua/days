@@ -376,9 +376,15 @@ impl TCPPacketSource {
                         self.endpoint_id, packet.packet_id, packet.size, now
                     );
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+                Err(TryRecvError::Empty) => {
+                    break;
+                }
+                Err(TryRecvError::Closed) => {
                     self.traffic_exceeded = true;
+                    debug!(
+                        "TCPPacketSource {} detected source closed at time {:.3}.",
+                        self.endpoint_id, now
+                    );
                     break;
                 }
             }
