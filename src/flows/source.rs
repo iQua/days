@@ -4,7 +4,6 @@
 use std::borrow::BorrowMut;
 use std::fmt::Debug;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
@@ -16,8 +15,8 @@ use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::Serialize;
+use tachyonix::Receiver;
 
-use crate::flows::buffered_app_source::BufferedAppDataSource;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
@@ -64,7 +63,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        buffered_source: Option<Arc<BufferedAppDataSource>>,
+        receiver: Option<Receiver<Packet>>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -79,13 +78,16 @@ impl PacketSource {
                 traffic,
                 rng,
             )),
-            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
-                flow_id,
-                flow_start_after,
-                traffic,
-                rng,
-                buffered_source,
-            )),
+            FlowType::TCP => {
+                let rx = receiver.expect("TCP flow must have a Receiver<Packet>");
+                PacketSource::TCPPacketSource(TCPPacketSource::new(
+                    flow_id,
+                    flow_start_after,
+                    traffic,
+                    rng,
+                    rx,
+                ))
+            }
         }
     }
 
@@ -185,25 +187,20 @@ impl PacketSource {
                 )
                 .unwrap();
 
-                if let Some(buffered) = &source.buffered_source {
-                    let data = buffered.clone_packets();
-                    source.send_buffer = packets.iter().map(|p| p.size).sum();
-                    source.buffered_packets = Some(packets);
-                } else {
-                    // lets AppDataSource to send data to TCPPacketSource
-                    let (data, interval) = source.datasource.produce_data(now + initial_delay);
-                    // TCPPacketSource now owns the data from the application
-                    source.send_buffer += data.size;
-                    source.busy_until = now + initial_delay;
+                // lets AppDataSource to send data to TCPPacketSource
+                let (data, interval) = source.datasource.produce_data(now + initial_delay);
 
-                    // schedules AppDataSource to send next data
-                    cx.schedule_event(
-                        Duration::from_secs_f64(interval),
-                        Self::fetch_app_data,
-                        source.time + interval,
-                    )
-                    .unwrap();
-                }
+                // TCPPacketSource now owns the data from the application
+                source.send_buffer += data.size;
+                source.busy_until = now + initial_delay;
+
+                // schedules AppDataSource to send next data
+                cx.schedule_event(
+                    Duration::from_secs_f64(interval),
+                    Self::fetch_app_data,
+                    source.time + interval,
+                )
+                .unwrap();
             }
         }
     }
