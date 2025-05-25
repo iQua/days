@@ -3,8 +3,8 @@
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
-use futures::executor::ThreadPool;
 use futures::future::join_all;
+use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
 use tachyonix::{channel, Receiver, Sender};
 
