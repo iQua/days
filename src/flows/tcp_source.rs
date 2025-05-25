@@ -1,7 +1,6 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
 
-use crate::flows::app_source::{spawn_appsource_channel, AppSource};
 use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
