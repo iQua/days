@@ -139,9 +139,6 @@ impl TCPPacketSource {
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
 
-        let mut receivers = spawn_appsource_channel(app_source, 1);
-        let rx = receivers.remove(0);
-
         TCPPacketSource {
             time: 0.0,
             endpoint_id: next_endpoint_id(),
@@ -160,7 +157,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            receiver: rx,
+            receiver,
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
