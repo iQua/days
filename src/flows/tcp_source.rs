@@ -129,7 +129,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        app_source: Box<dyn AppSource>,
+        receiver: Receiver<Packet>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
