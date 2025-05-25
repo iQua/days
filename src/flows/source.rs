@@ -210,32 +210,11 @@ impl PacketSource {
                         assert!((now - source.time).abs() <= 1e-7);
                     }
 
-                    let (data, interval) = source.datasource.produce_data(source.time);
-
-                    if !source.datasource.traffic_exceeded(source.time) {
-                        // TCPPacketSource now owns the data from the application
-                        source.send_buffer += data.size;
-
-                        // schedules AppDataSource to send next data
-                        cx.schedule_event(
-                            Duration::from_secs_f64(interval),
-                            Self::fetch_app_data,
-                            source.time + interval,
-                        )
-                        .unwrap();
-                    } else {
-                        source.traffic_exceeded = true;
-                    }
-
                     if source.next_seq < source.send_buffer {
                         // the TCPPacketSource could send a new packet at this
                         // point, if the size of the congestion window
                         // allows
                         self.run((), cx).await;
-                    } else {
-                        // the TCPPacketSource is considered busy retrieving
-                        // the next packet from the (application-layer) flow
-                        source.busy_until = source.time + interval;
                     }
                 }
             }
