@@ -531,6 +531,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
+        tcp_receivers: &mut HashMap<usize, Arc<Receiver<Packet>>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -551,13 +552,15 @@ impl Topology {
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
-            // creates a new packet source
+            let rx = tcp_receivers.remove(&flow.id); // Option<Arc<Receiver<Packet>>>
+                                                     // creates a new packet source
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
                 flow.flow_type,
                 flow.traffic,
                 flow.seed,
+                rx.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())),
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
@@ -792,7 +795,7 @@ impl Topology {
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox);
+        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox, &mut tcp_receivers);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
