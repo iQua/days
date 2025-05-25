@@ -750,7 +750,7 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        let mut tcp_receivers: HashMap<usize, Arc<Receiver<Packet>>> = HashMap::new();
+        let mut tcp_receivers: HashMap<usize, Receiver<Packet>> = HashMap::new();
 
         for collective in &self.collectives {
             if matches!(
@@ -780,11 +780,11 @@ impl Topology {
                 let app_source = Box::new(BufferedAppDataSource::new(packets));
                 let receivers = spawn_appsource_channel(app_source, collective.flow_count);
 
-                for (i, flow_id) in (collective.first_flow_id
+                for (flow_id, rx) in (collective.first_flow_id
                     ..collective.first_flow_id + collective.flow_count)
-                    .enumerate()
+                    .zip(receivers.into_iter())
                 {
-                    tcp_receivers.insert(flow_id, Arc::clone(&receivers[i]));
+                    tcp_receivers.insert(flow_id, rx);
                 }
             }
         }
