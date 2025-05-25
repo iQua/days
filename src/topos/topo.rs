@@ -37,6 +37,10 @@ use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
+use crate::flows::app_source::{spawn_appsource_channel, BufferedAppDataSource};
+use crate::flows::packet::Packet;
+use tachyonix::Receiver;
+
 #[derive(Deserialize)]
 pub struct UIConfig {
     pub ui_interval: Option<f64>,
@@ -742,6 +746,45 @@ impl Topology {
 
         // produces flows within all collectives in the network graph
         self.process_collectives();
+
+        let mut tcp_receivers: HashMap<usize, Receiver<Packet>> = HashMap::new();
+
+        for collective in &self.collectives {
+            if matches!(
+                (collective.collective_type, collective.flow_type),
+                (CollectiveType::Broadcast, FlowType::TCP)
+            ) {
+                // only support FlowSize::Bytes here
+                let total_size = match collective.traffic.size {
+                    crate::flows::FlowSize::Bytes(size) => size,
+                    crate::flows::FlowSize::Duration(_) => {
+                        panic!("Duration-based TCP traffic not supported for BufferedAppDataSource")
+                    }
+                };
+
+                let mut packets = Vec::new();
+                let mut remaining = total_size;
+                let mss = 512;
+                let mut seq = 0;
+
+                while remaining > 0 {
+                    let size = mss.min(remaining);
+                    packets.push(Packet::new(size, seq, collective.first_flow_id, 0.0));
+                    seq += size;
+                    remaining -= size;
+                }
+
+                let app_source = Box::new(BufferedAppDataSource::new(packets));
+                let receivers = spawn_appsource_channel(app_source, collective.flow_count);
+
+                for (i, flow_id) in (collective.first_flow_id
+                    ..collective.first_flow_id + collective.flow_count)
+                    .enumerate()
+                {
+                    tcp_receivers.insert(flow_id, receivers[i].clone());
+                }
+            }
+        }
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
