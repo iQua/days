@@ -172,7 +172,6 @@ impl PacketSource {
             }
             PacketSource::TCPPacketSource(source) => {
                 source.report_start_time = now + initial_delay;
-                source.datasource.set_flow_start_time(now + initial_delay);
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
@@ -187,20 +186,8 @@ impl PacketSource {
                 )
                 .unwrap();
 
-                // lets AppDataSource to send data to TCPPacketSource
-                let (data, interval) = source.datasource.produce_data(now + initial_delay);
-
                 // TCPPacketSource now owns the data from the application
-                source.send_buffer += data.size;
                 source.busy_until = now + initial_delay;
-
-                // schedules AppDataSource to send next data
-                cx.schedule_event(
-                    Duration::from_secs_f64(interval),
-                    Self::fetch_app_data,
-                    source.time + interval,
-                )
-                .unwrap();
             }
         }
     }
