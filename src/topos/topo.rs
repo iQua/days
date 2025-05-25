@@ -747,7 +747,7 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        let mut tcp_receivers: HashMap<usize, Receiver<Packet>> = HashMap::new();
+        let mut tcp_receivers: HashMap<usize, Arc<Receiver<Packet>>> = HashMap::new();
 
         for collective in &self.collectives {
             if matches!(
@@ -781,7 +781,7 @@ impl Topology {
                     ..collective.first_flow_id + collective.flow_count)
                     .enumerate()
                 {
-                    tcp_receivers.insert(flow_id, receivers[i].clone());
+                    tcp_receivers.insert(flow_id, Arc::clone(&receivers[i]));
                 }
             }
         }

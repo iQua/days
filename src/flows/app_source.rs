@@ -6,8 +6,8 @@ use crate::flows::TrafficCharacteristics;
 use futures::future::join_all;
 use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
+use std::sync::Arc;
 use tachyonix::{channel, Receiver, Sender};
-
 /// Trait for application-level data sources (not a simulation model).
 pub trait AppSource: Send {
     fn produce_data(&mut self, now: f64) -> Vec<Packet>;
@@ -107,10 +107,11 @@ impl AppSource for AppDataSource {
 pub fn spawn_appsource_channel(
     mut source: Box<dyn AppSource + Send>,
     n_receivers: usize,
-) -> Vec<Receiver<Packet>> {
+) -> Vec<Arc<Receiver<Packet>>> {
     let (senders, receivers): (Vec<Sender<Packet>>, Vec<Receiver<Packet>>) =
         (0..n_receivers).map(|_| channel::<Packet>(128)).unzip();
 
+    let receivers = receivers.into_iter().map(Arc::new).collect::<Vec<_>>();
     let pool = ThreadPool::new().expect("Failed to create thread pool");
 
     // Share AppSource logic into a thread
