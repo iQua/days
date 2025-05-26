@@ -400,6 +400,10 @@ impl TCPPacketSource {
         }
     }
 
+    pub fn get_cwnd_limit(&self) -> usize {
+        self.last_ack + self.congestion_control.get_cwnd()
+    }
+
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;

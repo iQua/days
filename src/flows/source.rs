@@ -188,6 +188,8 @@ impl PacketSource {
 
                 // TCPPacketSource now owns the data from the application
                 source.busy_until = now + initial_delay;
+                let cwnd_limit = source.get_cwnd_limit();
+                source.try_pull_from_channel_sync(now + initial_delay, cwnd_limit);
             }
         }
     }
