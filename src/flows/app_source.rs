@@ -116,12 +116,31 @@ pub fn spawn_appsource_channel(
     // Share AppSource logic into a thread
     pool.spawn_ok(async move {
         let packets = source.produce_data(0.0); // dummy timestamp
+        println!(
+            "[AppSourceChannel] Generated {} packets, broadcasting to {} receivers",
+            packets.len(),
+            senders.len()
+        );
         for packet in packets {
-            let sends = senders
-                .iter()
-                .map(|tx| tx.send(packet.clone()))
-                .collect::<Vec<_>>();
-
+            println!(
+                "[AppSourceChannel] Broadcasting packet_id={}",
+                packet.packet_id
+            );
+            // let sends = senders
+            //     .iter()
+            //     .map(|tx| tx.send(packet.clone()))
+            //     .collect::<Vec<_>>();
+            let sends = senders.iter().map(|tx| {
+                let packet_id = packet.packet_id;
+                async move {
+                    if let Err(e) = tx.send(packet.clone()).await {
+                        println!(
+                            "[AppSourceChannel] Failed to send packet_id={} to one receiver: {:?}",
+                            packet_id, e
+                        );
+                    }
+                }
+            });
             let _ = join_all(sends).await;
         }
     });
