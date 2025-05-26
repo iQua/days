@@ -269,6 +269,7 @@ impl Topology {
         for collective in self.collectives.iter_mut() {
             for (index, &source) in collective.sources.iter().enumerate() {
                 let sink = collective.sinks[index];
+                println!("[DEBUG] sink {}", sink);
                 let flow_id = collective.first_flow_id + index;
                 let path = collective.paths.as_ref().map(|paths| paths[index].clone());
 
@@ -546,6 +547,11 @@ impl Topology {
         }
 
         for flow in self.flows.iter_mut() {
+            println!(
+                "[DEBUG] Attaching flow_id={} from src_host={} to dst_host={}",
+                flow.id, flow.source_host, flow.sink_host
+            );
+
             // creates and attaches a packet source and sink for each flow
 
             // packet sources and sinks must be attached to hosts
@@ -630,6 +636,11 @@ impl Topology {
                     }
                 }
             }
+
+            // if flow.flow_type == FlowType::TCP {
+            //     sink.output()
+            //         .connect(PacketSource::packet_received, &source_mboxes[&flow.id]);
+            // }
 
             sources.insert(flow.id, source);
 
