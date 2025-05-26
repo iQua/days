@@ -328,9 +328,17 @@ impl TCPPacketSource {
     }
 
     pub async fn try_pull_from_channel(&mut self, now: f64, cwnd_limit: usize) {
+        println!(
+            "[TCPSource] try_pull_from_channel() called at time {:.3}, cwnd_limit={}",
+            now, cwnd_limit
+        );
         loop {
             match self.receiver.try_recv() {
                 Ok(packet) => {
+                    println!(
+                        "[DEBUG] Successfully received packet_id={} (size={}) at time {:.3}",
+                        packet.packet_id, packet.size, now
+                    );
                     if self.next_seq + self.mss > cwnd_limit {
                         break;
                     }
@@ -343,12 +351,13 @@ impl TCPPacketSource {
                     );
                 }
                 Err(TryRecvError::Empty) => {
+                    println!("[TCPSource] Channel empty at time {:.3}", now);
                     break;
                 }
                 Err(TryRecvError::Closed) => {
                     self.traffic_exceeded = true;
-                    debug!(
-                        "TCPPacketSource {} detected source closed at time {:.3}.",
+                    println!(
+                        "[TCPSource] {} detected channel closed at time {:.3}.",
                         self.endpoint_id, now
                     );
                     break;
