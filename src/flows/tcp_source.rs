@@ -366,6 +366,40 @@ impl TCPPacketSource {
         }
     }
 
+    pub fn try_pull_from_channel_sync(&mut self, now: f64, cwnd_limit: usize) {
+        println!(
+            "[TCPSource] try_pull_from_channel_sync() called at time {:.3}, cwnd_limit={}",
+            now, cwnd_limit
+        );
+
+        loop {
+            match self.receiver.try_recv() {
+                Ok(packet) => {
+                    if self.next_seq + self.mss > cwnd_limit {
+                        println!("[TCPSource] cwnd limit reached.");
+                        break;
+                    }
+                    self.output.send(packet.clone());
+                    self.packet_sent(&packet, now);
+                    self.send_buffer += packet.size;
+                    println!(
+                        "[TCPSource] Pulled packet_id={} at time {:.3}",
+                        packet.packet_id, now
+                    );
+                }
+                Err(TryRecvError::Empty) => {
+                    println!("[TCPSource] Channel empty at time {:.3}", now);
+                    break;
+                }
+                Err(TryRecvError::Closed) => {
+                    println!("[TCPSource] Channel closed at time {:.3}", now);
+                    self.traffic_exceeded = true;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
         self.packets_sent += 1;
         self.sent_size += packet.size;
