@@ -776,7 +776,11 @@ impl Topology {
                     seq += size;
                     remaining -= size;
                 }
-
+                println!("Total packets generated: {}", packets.len());
+                println!(
+                    "Total bytes: {}",
+                    packets.iter().map(|p| p.size).sum::<usize>()
+                );
                 let app_source = Box::new(BufferedAppDataSource::new(packets));
                 let receivers = spawn_appsource_channel(app_source, collective.flow_count);
 
