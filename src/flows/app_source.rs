@@ -5,7 +5,7 @@ use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
-use tachyonix::channel::{bounded, unbounded, Receiver, Sender};
+use tachyonix::{channel, Receiver, Sender};
 
 #[derive(Debug)]
 enum AppSourceRequest {
@@ -27,7 +27,7 @@ impl AppSourceHandle {
     }
 
     pub async fn pull(&self, size: usize) -> Vec<Packet> {
-        let (resp_tx, resp_rx) = bounded(1);
+        let (resp_tx, mut resp_rx) = channel(128);
         self.tx
             .send(AppSourceRequest::Pull {
                 size,
@@ -68,12 +68,12 @@ impl BufferedAppDataSource {
 }
 
 pub fn spawn_buffered_appsource(packets: Vec<Packet>) -> AppSourceHandle {
-    let (tx, mut rx) = unbounded();
+    let (tx, mut rx) = channel(128);
     let mut buffer = packets;
     let pool = ThreadPool::new().unwrap();
 
     pool.spawn_ok(async move {
-        while let Some(req) = rx.recv().await {
+        while let Ok(req) = rx.recv().await {
             match req {
                 AppSourceRequest::Pull { size, respond_to } => {
                     let mut out = Vec::new();
@@ -98,11 +98,12 @@ pub fn spawn_dist_appsource(
     traffic: TrafficCharacteristics,
     rng: SmallRng,
 ) -> AppSourceHandle {
-    let (tx, mut rx) = unbounded();
+    let (tx, mut rx) = channel(128);
     let mut source = DistPacketSource::new(flow_id, Vec::new(), traffic, rng);
+    let pool = ThreadPool::new().unwrap();
 
-    tachyonix::spawn(async move {
-        while let Some(req) = rx.recv().await {
+    pool.spawn_ok(async move {
+        while let Ok(req) = rx.recv().await {
             match req {
                 AppSourceRequest::Pull { size, respond_to } => {
                     let mut out = Vec::new();
@@ -124,10 +125,11 @@ pub fn spawn_dist_appsource(
 }
 
 pub fn spawn_dummy_appsource() -> AppSourceHandle {
-    let (tx, mut rx) = unbounded();
+    let (tx, mut rx) = channel(128);
+    let pool = ThreadPool::new().unwrap();
 
-    tachyonix::spawn(async move {
-        while let Some(req) = rx.recv().await {
+    pool.spawn_ok(async move {
+        while let Ok(req) = rx.recv().await {
             match req {
                 AppSourceRequest::Pull { respond_to, .. } => {
                     let _ = respond_to.send(Vec::new()).await;

@@ -37,7 +37,7 @@ use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
-use crate::flows::app_source::{spawn_appsource_channel, BufferedAppDataSource};
+use crate::flows::app_source::{spawn_buffered_appsource, BufferedAppDataSource};
 use crate::flows::packet::Packet;
 use tachyonix::Receiver;
 
