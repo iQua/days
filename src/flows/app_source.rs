@@ -70,8 +70,9 @@ impl BufferedAppDataSource {
 pub fn spawn_buffered_appsource(packets: Vec<Packet>) -> AppSourceHandle {
     let (tx, mut rx) = unbounded();
     let mut buffer = packets;
+    let pool = ThreadPool::new().unwrap();
 
-    tachyonix::spawn(async move {
+    pool.spawn_ok(async move {
         while let Some(req) = rx.recv().await {
             match req {
                 AppSourceRequest::Pull { size, respond_to } => {
