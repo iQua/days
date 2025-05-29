@@ -3,10 +3,9 @@
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
-use futures::future::join_all;
 use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
-use tachyonix::{channel, Receiver, Sender};
+use tachyonix::channel::{bounded, unbounded, Receiver, Sender};
 
 #[derive(Debug)]
 enum AppSourceRequest {
