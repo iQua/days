@@ -123,6 +123,23 @@ pub fn spawn_dist_appsource(
     AppSourceHandle::new(tx)
 }
 
+pub fn spawn_dummy_appsource() -> AppSourceHandle {
+    let (tx, mut rx) = unbounded();
+
+    tachyonix::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            match req {
+                AppSourceRequest::Pull { respond_to, .. } => {
+                    let _ = respond_to.send(Vec::new()).await;
+                }
+                AppSourceRequest::Shutdown => break,
+            }
+        }
+    });
+
+    AppSourceHandle::new(tx)
+}
+
 pub enum AppDataSource {
     DistDataSource(DistPacketSource),
     Dummy,
