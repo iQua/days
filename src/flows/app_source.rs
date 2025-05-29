@@ -141,27 +141,27 @@ pub fn spawn_dummy_appsource() -> AppSourceHandle {
 }
 
 pub enum AppDataSource {
-    DistDataSource(DistPacketSource),
-    Dummy,
-}
-
-pub enum AppDataType {
-    DistData,
+    Buffered(AppSourceHandle),
+    Dist(AppSourceHandle),
+    Dummy(AppSourceHandle),
 }
 
 impl AppDataSource {
+    pub fn buffered(packets: Vec<Packet>) -> Self {
+        Self::Buffered(spawn_buffered_appsource(packets))
+    }
+
+    pub fn dist(flow_id: usize, tr: TrafficCharacteristics, rng: SmallRng) -> Self {
+        Self::Dist(spawn_dist_appsource(flow_id, tr, rng))
+    }
+
     pub fn dummy() -> Self {
-        AppDataSource::Dummy
+        Self::Dummy(spawn_dummy_appsource())
     }
 
-    pub fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
-        AppDataSource::DistDataSource(DistPacketSource::new(flow_id, Vec::new(), traffic, rng))
-    }
-
-    pub fn traffic_exceeded(&self, now: f64) -> bool {
+    pub fn handle(&self) -> AppSourceHandle {
         match self {
-            AppDataSource::DistDataSource(source) => source.traffic_exceeded(now),
-            AppDataSource::Dummy => true,
+            Self::Buffered(h) | Self::Dist(h) | Self::Dummy(h) => h.clone(),
         }
     }
 }

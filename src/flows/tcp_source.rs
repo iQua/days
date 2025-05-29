@@ -321,6 +321,11 @@ impl TCPPacketSource {
 
             // Try pulling more data from the channel if cwnd allows
             let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
+
+            println!(
+                "[ACK_RECEIVED] Source {} received ACK for seq={}, triggering next pull.",
+                self.endpoint_id, ack.sequence_num,
+            );
             self.try_pull_from_channel(now, cwnd_limit).await;
         }
 
@@ -332,6 +337,7 @@ impl TCPPacketSource {
             "[TCPSource] try_pull_from_channel() called at time {:.3}, cwnd_limit={}",
             now, cwnd_limit
         );
+
         loop {
             match self.receiver.try_recv() {
                 Ok(packet) => {
@@ -366,39 +372,39 @@ impl TCPPacketSource {
         }
     }
 
-    pub fn try_pull_from_channel_sync(&mut self, now: f64, cwnd_limit: usize) {
-        println!(
-            "[TCPSource] try_pull_from_channel_sync() called at time {:.3}, cwnd_limit={}",
-            now, cwnd_limit
-        );
+    // pub fn try_pull_from_channel_sync(&mut self, now: f64, cwnd_limit: usize) {
+    //     println!(
+    //         "[TCPSource] try_pull_from_channel_sync() called at time {:.3}, cwnd_limit={}",
+    //         now, cwnd_limit
+    //     );
 
-        loop {
-            match self.receiver.try_recv() {
-                Ok(packet) => {
-                    if self.next_seq + self.mss > cwnd_limit {
-                        println!("[TCPSource] cwnd limit reached.");
-                        break;
-                    }
-                    self.output.send(packet.clone());
-                    self.packet_sent(&packet, now);
-                    self.send_buffer += packet.size;
-                    println!(
-                        "[TCPSource] Pulled packet_id={} at time {:.3}",
-                        packet.packet_id, now
-                    );
-                }
-                Err(TryRecvError::Empty) => {
-                    println!("[TCPSource] Channel empty at time {:.3}", now);
-                    break;
-                }
-                Err(TryRecvError::Closed) => {
-                    println!("[TCPSource] Channel closed at time {:.3}", now);
-                    self.traffic_exceeded = true;
-                    break;
-                }
-            }
-        }
-    }
+    //     loop {
+    //         match self.receiver.try_recv() {
+    //             Ok(packet) => {
+    //                 if self.next_seq + self.mss > cwnd_limit {
+    //                     println!("[TCPSource] cwnd limit reached.");
+    //                     break;
+    //                 }
+    //                 self.output.send(packet.clone());
+    //                 self.packet_sent(&packet, now);
+    //                 self.send_buffer += packet.size;
+    //                 println!(
+    //                     "[TCPSource] Pulled packet_id={} at time {:.3}",
+    //                     packet.packet_id, now
+    //                 );
+    //             }
+    //             Err(TryRecvError::Empty) => {
+    //                 println!("[TCPSource] Channel empty at time {:.3}", now);
+    //                 break;
+    //             }
+    //             Err(TryRecvError::Closed) => {
+    //                 println!("[TCPSource] Channel closed at time {:.3}", now);
+    //                 self.traffic_exceeded = true;
+    //                 break;
+    //             }
+    //         }
+    //     }
+    // }
 
     pub fn get_cwnd_limit(&self) -> usize {
         self.last_ack + self.congestion_control.get_cwnd()
@@ -490,6 +496,8 @@ impl TCPPacketSource {
     }
 
     pub async fn send_packet(&mut self, now: f64) {
+        let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
+        self.try_pull_from_channel(now, cwnd_limit).await;
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
             && self.next_seq + self.mss

@@ -16,6 +16,8 @@ drop = "RED"
 collective_type = "Broadcast"
 flow_type = "TCP"
 flow_count = 4
+sources = [4, 4, 4, 4]
+sinks = [2, 3, 0, 1]
 
 [collective.traffic]
 initial_delay = 1.0
