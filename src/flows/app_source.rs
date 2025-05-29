@@ -66,6 +66,31 @@ impl BufferedAppDataSource {
     pub fn total_size(&self) -> usize {
         self.total_size
     }
+
+    pub fn spawn_buffered_appsource(packets: Vec<Packet>) -> AppSourceHandle {
+        let (tx, mut rx) = unbounded();
+        let mut buffer = packets;
+
+        tachyonix::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                match req {
+                    AppSourceRequest::Pull { size, respond_to } => {
+                        let mut out = Vec::new();
+                        let mut sent = 0;
+                        while sent < size && !buffer.is_empty() {
+                            let pkt = buffer.remove(0);
+                            sent += pkt.size;
+                            out.push(pkt);
+                        }
+                        let _ = respond_to.send(out).await;
+                    }
+                    AppSourceRequest::Shutdown => break,
+                }
+            }
+        });
+
+        AppSourceHandle::new(tx)
+    }
 }
 
 pub enum AppDataSource {
