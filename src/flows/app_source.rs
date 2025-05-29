@@ -66,31 +66,61 @@ impl BufferedAppDataSource {
     pub fn total_size(&self) -> usize {
         self.total_size
     }
+}
 
-    pub fn spawn_buffered_appsource(packets: Vec<Packet>) -> AppSourceHandle {
-        let (tx, mut rx) = unbounded();
-        let mut buffer = packets;
+pub fn spawn_buffered_appsource(packets: Vec<Packet>) -> AppSourceHandle {
+    let (tx, mut rx) = unbounded();
+    let mut buffer = packets;
 
-        tachyonix::spawn(async move {
-            while let Some(req) = rx.recv().await {
-                match req {
-                    AppSourceRequest::Pull { size, respond_to } => {
-                        let mut out = Vec::new();
-                        let mut sent = 0;
-                        while sent < size && !buffer.is_empty() {
-                            let pkt = buffer.remove(0);
-                            sent += pkt.size;
-                            out.push(pkt);
-                        }
-                        let _ = respond_to.send(out).await;
+    tachyonix::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            match req {
+                AppSourceRequest::Pull { size, respond_to } => {
+                    let mut out = Vec::new();
+                    let mut sent = 0;
+                    while sent < size && !buffer.is_empty() {
+                        let pkt = buffer.remove(0);
+                        sent += pkt.size;
+                        out.push(pkt);
                     }
-                    AppSourceRequest::Shutdown => break,
+                    let _ = respond_to.send(out).await;
                 }
+                AppSourceRequest::Shutdown => break,
             }
-        });
+        }
+    });
 
-        AppSourceHandle::new(tx)
-    }
+    AppSourceHandle::new(tx)
+}
+
+pub fn spawn_dist_appsource(
+    flow_id: usize,
+    traffic: TrafficCharacteristics,
+    rng: SmallRng,
+) -> AppSourceHandle {
+    let (tx, mut rx) = unbounded();
+    let mut source = DistPacketSource::new(flow_id, Vec::new(), traffic, rng);
+
+    tachyonix::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            match req {
+                AppSourceRequest::Pull { size, respond_to } => {
+                    let mut out = Vec::new();
+                    let mut sent = 0;
+                    while sent < size {
+                        let (pkt, _) = source.produce_packet(0.0);
+                        source.packet_sent(&pkt, 0.0);
+                        sent += pkt.size;
+                        out.push(pkt);
+                    }
+                    let _ = respond_to.send(out).await;
+                }
+                AppSourceRequest::Shutdown => break,
+            }
+        }
+    });
+
+    AppSourceHandle::new(tx)
 }
 
 pub enum AppDataSource {
