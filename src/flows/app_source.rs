@@ -8,6 +8,42 @@ use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
 use tachyonix::{channel, Receiver, Sender};
 
+#[derive(Debug)]
+enum AppSourceRequest {
+    Pull {
+        size: usize,
+        respond_to: Sender<Vec<Packet>>,
+    },
+    Shutdown,
+}
+
+#[derive(Clone)]
+pub struct AppSourceHandle {
+    tx: Sender<AppSourceRequest>,
+}
+
+impl AppSourceHandle {
+    pub fn new(tx: Sender<AppSourceRequest>) -> Self {
+        Self { tx }
+    }
+
+    pub async fn pull(&self, size: usize) -> Vec<Packet> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(AppSourceRequest::Pull {
+                size,
+                respond_to: resp_tx,
+            })
+            .await
+            .unwrap();
+        resp_rx.recv().await.unwrap()
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.tx.send(AppSourceRequest::Shutdown).await;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BufferedAppDataSource {
     total_size: usize,
