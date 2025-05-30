@@ -523,7 +523,7 @@ impl TCPPacketSource {
 
     pub async fn send_packet(&mut self, now: f64) {
         let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
-        self.try_pull_from_channel(now, cwnd_limit).await;
+        self.try_pull_from_appsource(now, cwnd_limit).await;
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
             && self.next_seq + self.mss
