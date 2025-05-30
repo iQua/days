@@ -352,7 +352,7 @@ impl TCPPacketSource {
                 "[ACK_RECEIVED] Source {} received ACK for seq={}, triggering next pull.",
                 self.endpoint_id, ack.sequence_num,
             );
-            self.try_pull_from_channel(now, cwnd_limit).await;
+            self.try_pull_from_appsource(now, cwnd_limit).await;
         }
 
         false
