@@ -189,7 +189,7 @@ impl PacketSource {
                 source.busy_until = now + initial_delay;
                 let cwnd_limit = source.get_cwnd_limit();
                 source
-                    .try_pull_from_channel(now + initial_delay, cwnd_limit)
+                    .try_pull_from_appsource(now + initial_delay, cwnd_limit)
                     .await;
             }
         }
