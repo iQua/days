@@ -1,6 +1,7 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
 
+use crate::flows::app_source::AppSourceHandle;
 use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
@@ -85,7 +86,7 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub receiver: Receiver<Packet>,
+    pub app_source: AppSourceHandle,
     // pub datasource: Box<dyn AppSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
