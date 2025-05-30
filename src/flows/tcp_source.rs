@@ -129,7 +129,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        receiver: Receiver<Packet>,
+        app_source: AppSourceHandle,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -157,7 +157,7 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            receiver,
+            app_source,
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
