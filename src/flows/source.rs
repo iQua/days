@@ -12,7 +12,7 @@ use rand::SeedableRng;
 use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
-use nexosim::ports::Output;
+use nexosim::ports::Output;g
 use nexosim::time::MonotonicTime;
 use serde::Serialize;
 use tachyonix::Receiver;
@@ -63,7 +63,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        receiver: Option<Receiver<Packet>>,
+        app_source: Option<AppSourceHandle>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -79,13 +79,13 @@ impl PacketSource {
                 rng,
             )),
             FlowType::TCP => {
-                let rx = receiver.expect("TCP flow must have a Receiver<Packet>");
+                let handle = app_source.expect("TCP flow must provide AppSourceHandle");
                 PacketSource::TCPPacketSource(TCPPacketSource::new(
                     flow_id,
                     flow_start_after,
                     traffic,
                     rng,
-                    rx,
+                    handle,
                 ))
             }
         }
