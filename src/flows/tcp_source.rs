@@ -173,6 +173,31 @@ impl TCPPacketSource {
         }
     }
 
+    pub async fn try_pull_from_appsource(&mut self, now: f64, cwnd_limit: usize) {
+        let size_to_pull = cwnd_limit.saturating_sub(self.next_seq);
+
+        println!(
+            "[TCPSource] Pulling {} bytes from app source at time {:.3}",
+            size_to_pull, now
+        );
+
+        let packets = self.app_source.pull(size_to_pull).await;
+
+        for packet in packets {
+            if self.next_seq + self.mss > cwnd_limit {
+                break;
+            }
+            self.output.send(packet.clone()).await;
+            self.packet_sent(&packet, now);
+            self.send_buffer += packet.size;
+
+            debug!(
+                "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
+                self.endpoint_id, packet.packet_id, packet.size, now
+            );
+        }
+    }
+
     /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
     pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
