@@ -12,10 +12,9 @@ use rand::SeedableRng;
 use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
-use nexosim::ports::Output;g
+use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::Serialize;
-use tachyonix::Receiver;
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
