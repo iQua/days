@@ -760,7 +760,7 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        let mut tcp_receivers: HashMap<usize, Receiver<Packet>> = HashMap::new();
+        let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
 
         for collective in &self.collectives {
             if matches!(
@@ -791,8 +791,12 @@ impl Topology {
                     "Total bytes: {}",
                     packets.iter().map(|p| p.size).sum::<usize>()
                 );
-                let app_source = Box::new(BufferedAppDataSource::new(packets));
-                let receivers = spawn_appsource_channel(app_source, collective.flow_count);
+                let appsource = AppDataSource::buffered(packets);
+                for flow_id in
+                    collective.first_flow_id..collective.first_flow_id + collective.flow_count
+                {
+                    app_sources.insert(flow_id, appsource.clone());
+                }
 
                 for (flow_id, rx) in (collective.first_flow_id
                     ..collective.first_flow_id + collective.flow_count)
