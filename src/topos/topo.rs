@@ -793,11 +793,11 @@ impl Topology {
                     packets.iter().map(|p| p.size).sum::<usize>()
                 );
                 let appsource = AppDataSource::buffered(packets);
+                let handle = appsource.handle(); // clone-able AppSourceHandle
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
-                    let handle = appsource.handle(); // clone internally handled
-                    app_sources.insert(flow_id, appsource);
+                    app_sources.insert(flow_id, AppDataSource::Buffered(handle.clone()));
                 }
             }
         }
