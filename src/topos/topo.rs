@@ -558,15 +558,14 @@ impl Topology {
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
-            let rx = tcp_receivers.remove(&flow.id); // Option<Arc<Receiver<Packet>>>
-                                                     // creates a new packet source
+            let appsource = app_sources.remove(&flow.id); // HashMap<usize, AppDataSource>
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
                 flow.flow_type,
                 flow.traffic,
                 flow.seed,
-                rx,
+                Some(appsource),
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
