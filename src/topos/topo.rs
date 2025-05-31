@@ -37,7 +37,7 @@ use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
-use crate::flows::app_source::{spawn_buffered_appsource, BufferedAppDataSource};
+use crate::flows::app_source::AppDataSource;
 use crate::flows::packet::Packet;
 use tachyonix::Receiver;
 
@@ -532,7 +532,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
-        mut tcp_receivers: HashMap<usize, Receiver<Packet>>,
+        mut app_sources: HashMap<usize, AppDataSource>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -797,13 +797,6 @@ impl Topology {
                 {
                     app_sources.insert(flow_id, appsource.clone());
                 }
-
-                for (flow_id, rx) in (collective.first_flow_id
-                    ..collective.first_flow_id + collective.flow_count)
-                    .zip(receivers.into_iter())
-                {
-                    tcp_receivers.insert(flow_id, rx);
-                }
             }
         }
 
@@ -813,7 +806,7 @@ impl Topology {
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox, tcp_receivers);
+        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox, app_sources);
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
