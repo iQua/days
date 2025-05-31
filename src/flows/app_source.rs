@@ -85,6 +85,10 @@ impl AppActor {
             let (p, _) = src.produce_packet(0.0);
             packets.push(p);
         }
+        println!(
+            "[AppActor] Initialized buffer with {} packets",
+            packets.len()
+        );
         let actor = AppActor {
             rx,
             buffer: packets,
@@ -127,6 +131,7 @@ impl AppActor {
     }
 }
 
+#[derive(Clone)]
 pub enum AppDataSource {
     Buffered(AppSourceHandle),
     Dist(AppSourceHandle),

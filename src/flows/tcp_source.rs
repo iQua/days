@@ -190,7 +190,7 @@ impl TCPPacketSource {
             self.packet_sent(&packet, now);
             self.send_buffer += packet.size;
 
-            debug!(
+            println!(
                 "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
                 self.endpoint_id, packet.packet_id, packet.size, now
             );
@@ -447,6 +447,14 @@ impl TCPPacketSource {
     }
 
     pub async fn send_packet(&mut self, now: f64) {
+        println!("[TCPSource] Trying to send packet at time {}", now);
+        println!(
+            "[TCPSource] Status before sending: next_seq={}, send_buffer={}, cwnd={}, last_ack={}",
+            self.next_seq,
+            self.send_buffer,
+            self.congestion_control.get_cwnd(),
+            self.last_ack
+        );
         let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
         self.try_pull_from_appsource(now, cwnd_limit).await;
         // the sender can transmit up to the size of the congestion window
@@ -458,7 +466,16 @@ impl TCPPacketSource {
                 )
         {
             let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+            println!(
+                "[TCPSource] Sending packet id={}, size={} at time {}",
+                packet.packet_id, packet.size, now
+            );
+
             self.output.send(packet.clone()).await;
+            println!(
+                "[TCPSource] Packet sent into output: flow_id={}, seq={}",
+                self.flow_id, packet.packet_id
+            );
             self.packet_sent(&packet, now);
         }
     }

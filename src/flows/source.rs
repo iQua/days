@@ -235,7 +235,7 @@ impl PacketSource {
         }
     }
 
-    async fn send_packet(&mut self, cx: &mut Context<Self>, now: f64) {
+    async fn send_packet(&mut self, cx: &Context<Self>, now: f64) {
         match self {
             PacketSource::DistPacketSource(source) => {
                 if !source.traffic_exceeded(now) {
@@ -247,14 +247,7 @@ impl PacketSource {
                         .unwrap();
                 }
             }
-            PacketSource::TCPPacketSource(source) => {
-                source.send_packet(now).await;
-
-                if source.next_seq < source.send_buffer || !source.traffic_exceeded {
-                    cx.schedule_event(Duration::from_secs_f64(0.0001), Self::run, ())
-                        .unwrap();
-                }
-            }
+            PacketSource::TCPPacketSource(source) => source.send_packet(now).await,
         }
     }
 
@@ -344,11 +337,8 @@ impl PacketSource {
                 };
 
                 // notifies the Progress coroutine that the packet source finished running
-                // self.ui_output().send(FlowFinishMsg { flow_id: 0 }).await;
-                let flow_id = self.flow_id();
-                self.ui_output()
-                    .send(FlowFinishMsg { flow_id: flow_id })
-                    .await;
+                self.ui_output().send(FlowFinishMsg { flow_id: 0 }).await;
+
                 debug!("{} finished running at {:.3}.", name, now);
             }
         }
