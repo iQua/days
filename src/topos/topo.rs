@@ -39,7 +39,6 @@ use crate::{num_switches, set_num_switches};
 
 use crate::flows::app_source::AppDataSource;
 use crate::flows::packet::Packet;
-use tachyonix::Receiver;
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -793,7 +792,8 @@ impl Topology {
                     packets.iter().map(|p| p.size).sum::<usize>()
                 );
                 let appsource = AppDataSource::buffered(packets);
-                let handle = appsource.handle(); // clone-able AppSourceHandle
+                let (data_source, _) = appsource;
+                let handle = data_source.handle(); // AppDataSource::handle() returns AppSourceHandle
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {

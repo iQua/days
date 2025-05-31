@@ -1,19 +1,21 @@
-//! Implements a unified interface for application-level sources with channel-based delivery to TCPPacketSource.
+//! Implements a unified interface for application-level sources with channel-based delivery to TCPPacketSource using actor model compatible with `nexosim`.
 
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
-use futures_executor::ThreadPool;
+use crate::get_seed;
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::Output;
 use rand::rngs::SmallRng;
-use tachyonix::{channel, Sender};
+use rand::SeedableRng;
+use std::future::Future;
+use std::time::Duration;
+use tachyonix::{channel, Receiver, Sender};
 
 #[derive(Debug)]
-pub(crate) enum AppSourceRequest {
-    Pull {
-        size: usize,
-        respond_to: Sender<Vec<Packet>>,
-    },
-    Shutdown,
+pub struct AppSourceRequest {
+    pub size: usize,
+    pub respond_to: Sender<Vec<Packet>>,
 }
 
 #[derive(Clone)]
@@ -22,148 +24,130 @@ pub struct AppSourceHandle {
 }
 
 impl AppSourceHandle {
-    pub(crate) fn new(tx: Sender<AppSourceRequest>) -> Self {
+    pub fn new(tx: Sender<AppSourceRequest>) -> Self {
         Self { tx }
     }
 
     pub async fn pull(&self, size: usize) -> Vec<Packet> {
-        let (resp_tx, mut resp_rx) = channel(128);
-        self.tx
-            .send(AppSourceRequest::Pull {
+        let (resp_tx, mut resp_rx) = channel(1);
+        let _ = self
+            .tx
+            .send(AppSourceRequest {
                 size,
                 respond_to: resp_tx,
             })
-            .await
-            .unwrap();
-        resp_rx.recv().await.unwrap()
+            .await;
+        resp_rx.recv().await.unwrap_or_default()
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.tx.send(AppSourceRequest::Shutdown).await;
+        let (resp_tx, _resp_rx) = channel(1);
+        let _ = self
+            .tx
+            .send(AppSourceRequest {
+                size: 0,
+                respond_to: resp_tx,
+            })
+            .await;
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct BufferedAppDataSource {
-    total_size: usize,
-    packets: Vec<Packet>,
+pub struct AppActor {
+    rx: Receiver<AppSourceRequest>,
+    buffer: Vec<Packet>,
+    traffic: Option<TrafficCharacteristics>,
+    rng: Option<SmallRng>,
+    pub out: Output<Packet>,
 }
 
-impl BufferedAppDataSource {
-    pub fn new(packets: Vec<Packet>) -> Self {
-        let total_size = packets.iter().map(|p| p.size).sum();
-        Self {
-            total_size,
-            packets,
+impl AppActor {
+    pub fn buffered(packets: Vec<Packet>) -> (Self, Sender<AppSourceRequest>) {
+        let (tx, rx) = channel(128);
+        let actor = AppActor {
+            rx,
+            buffer: packets,
+            traffic: None,
+            rng: None,
+            out: Output::default(),
+        };
+        (actor, tx)
+    }
+
+    pub fn dist(
+        flow_id: usize,
+        tr: TrafficCharacteristics,
+        rng: SmallRng,
+    ) -> (Self, Sender<AppSourceRequest>) {
+        let (tx, rx) = channel(128);
+        let mut src = DistPacketSource::new(flow_id, Vec::new(), tr.clone(), rng.clone());
+        let mut packets = Vec::new();
+        for _ in 0..512 {
+            let (p, _) = src.produce_packet(0.0);
+            packets.push(p);
         }
-    }
-
-    pub fn clone_packets(&self) -> Vec<Packet> {
-        self.packets.clone()
-    }
-
-    pub fn total_size(&self) -> usize {
-        self.total_size
+        let actor = AppActor {
+            rx,
+            buffer: packets,
+            traffic: Some(tr),
+            rng: Some(rng),
+            out: Output::default(),
+        };
+        (actor, tx)
     }
 }
 
-pub fn spawn_buffered_appsource(packets: Vec<Packet>) -> AppSourceHandle {
-    let (tx, mut rx) = channel(128);
-    let mut buffer = packets;
-    let pool = ThreadPool::new().unwrap();
+impl Model for AppActor {
+    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        cx.schedule_event(Duration::ZERO, Self::run_once, ())
+            .unwrap();
+        self.into()
+    }
+}
 
-    pool.spawn_ok(async move {
-        while let Ok(req) = rx.recv().await {
-            match req {
-                AppSourceRequest::Pull { size, respond_to } => {
-                    let mut out = Vec::new();
-                    let mut sent = 0;
-                    while sent < size && !buffer.is_empty() {
-                        let pkt = buffer.remove(0);
-                        sent += pkt.size;
-                        out.push(pkt);
-                    }
-                    let _ = respond_to.send(out).await;
+impl AppActor {
+    fn run_once<'a>(
+        &'a mut self,
+        _: (),
+        cx: &'a mut Context<Self>,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            while let Ok(req) = self.rx.try_recv() {
+                let mut out = Vec::new();
+                let mut sent = 0;
+                while sent < req.size && !self.buffer.is_empty() {
+                    let pkt = self.buffer.remove(0);
+                    sent += pkt.size;
+                    out.push(pkt);
                 }
-                AppSourceRequest::Shutdown => break,
+                let _ = req.respond_to.try_send(out);
             }
+            cx.schedule_event(Duration::from_micros(50), Self::run_once, ())
+                .unwrap();
         }
-    });
-
-    AppSourceHandle::new(tx)
-}
-
-pub fn spawn_dist_appsource(
-    flow_id: usize,
-    traffic: TrafficCharacteristics,
-    rng: SmallRng,
-) -> AppSourceHandle {
-    let (tx, mut rx) = channel(128);
-    let mut source = DistPacketSource::new(flow_id, Vec::new(), traffic, rng);
-    let pool = ThreadPool::new().unwrap();
-
-    pool.spawn_ok(async move {
-        while let Ok(req) = rx.recv().await {
-            match req {
-                AppSourceRequest::Pull { size, respond_to } => {
-                    let mut out = Vec::new();
-                    let mut sent = 0;
-                    while sent < size {
-                        let (pkt, _) = source.produce_packet(0.0);
-                        source.packet_sent(&pkt, 0.0);
-                        sent += pkt.size;
-                        out.push(pkt);
-                    }
-                    let _ = respond_to.send(out).await;
-                }
-                AppSourceRequest::Shutdown => break,
-            }
-        }
-    });
-
-    AppSourceHandle::new(tx)
-}
-
-pub fn spawn_dummy_appsource() -> AppSourceHandle {
-    let (tx, mut rx) = channel(128);
-    let pool = ThreadPool::new().unwrap();
-
-    pool.spawn_ok(async move {
-        while let Ok(req) = rx.recv().await {
-            match req {
-                AppSourceRequest::Pull { respond_to, .. } => {
-                    let _ = respond_to.send(Vec::new()).await;
-                }
-                AppSourceRequest::Shutdown => break,
-            }
-        }
-    });
-
-    AppSourceHandle::new(tx)
+    }
 }
 
 pub enum AppDataSource {
     Buffered(AppSourceHandle),
     Dist(AppSourceHandle),
-    Dummy(AppSourceHandle),
 }
 
 impl AppDataSource {
-    pub fn buffered(packets: Vec<Packet>) -> Self {
-        Self::Buffered(spawn_buffered_appsource(packets))
+    pub fn buffered(packets: Vec<Packet>) -> (Self, AppActor) {
+        let (actor, tx) = AppActor::buffered(packets);
+        (Self::Buffered(AppSourceHandle::new(tx)), actor)
     }
 
-    pub fn dist(flow_id: usize, tr: TrafficCharacteristics, rng: SmallRng) -> Self {
-        Self::Dist(spawn_dist_appsource(flow_id, tr, rng))
-    }
-
-    pub fn dummy() -> Self {
-        Self::Dummy(spawn_dummy_appsource())
+    pub fn dist(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
+        let seed = get_seed();
+        let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
+        let (actor, tx) = AppActor::dist(flow_id, tr, rng);
+        (Self::Dist(AppSourceHandle::new(tx)), actor)
     }
 
     pub fn handle(&self) -> AppSourceHandle {
         match self {
-            Self::Buffered(h) | Self::Dist(h) | Self::Dummy(h) => h.clone(),
+            Self::Buffered(h) | Self::Dist(h) => h.clone(),
         }
     }
 }
