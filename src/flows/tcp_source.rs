@@ -20,7 +20,6 @@ use rand::rngs::SmallRng;
 use std::cmp::min;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use tachyonix::{Receiver, TryRecvError};
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {

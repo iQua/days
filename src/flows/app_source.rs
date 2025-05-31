@@ -5,10 +5,10 @@ use crate::flows::packet::Packet;
 use crate::flows::TrafficCharacteristics;
 use futures_executor::ThreadPool;
 use rand::rngs::SmallRng;
-use tachyonix::{channel, Receiver, Sender};
+use tachyonix::{channel, Sender};
 
 #[derive(Debug)]
-enum AppSourceRequest {
+pub(crate) enum AppSourceRequest {
     Pull {
         size: usize,
         respond_to: Sender<Vec<Packet>>,
