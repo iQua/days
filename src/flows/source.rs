@@ -1,6 +1,7 @@
 //! Implements a general packet source that provides interfaces of all kinds of
 //! packet sources.
 
+use crate::flows::app_source::AppSourceHandle;
 use std::borrow::BorrowMut;
 use std::fmt::Debug;
 use std::future::Future;
