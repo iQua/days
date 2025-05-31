@@ -795,7 +795,8 @@ impl Topology {
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
-                    app_sources.insert(flow_id, appsource.clone());
+                    let handle = appsource.handle(); // clone internally handled
+                    app_sources.insert(flow_id, appsource);
                 }
             }
         }
