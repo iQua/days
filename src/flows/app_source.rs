@@ -22,7 +22,7 @@ pub struct AppSourceHandle {
 }
 
 impl AppSourceHandle {
-    pub fn new(tx: Sender<AppSourceRequest>) -> Self {
+    pub(crate) fn new(tx: Sender<AppSourceRequest>) -> Self {
         Self { tx }
     }
 
