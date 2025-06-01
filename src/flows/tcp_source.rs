@@ -173,23 +173,37 @@ impl TCPPacketSource {
     }
 
     pub async fn try_pull_from_appsource(&mut self, now: f64, cwnd_limit: usize) {
-        let size_to_pull = cwnd_limit.saturating_sub(self.next_seq);
+        let win_left = cwnd_limit.saturating_sub(self.next_seq);
+
+        if win_left == 0 {
+            return; // 没窗口就别拉
+        }
 
         println!(
-            "[TCPSource] Pulling {} bytes from app source at time {:.3}",
-            size_to_pull, now
+            "[TCPSource {}] Pulling {} bytes from app source at time {:.3}",
+            self.endpoint_id, win_left, now
         );
 
-        let packets = self.app_source.pull(size_to_pull).await;
-        println!("[TCPSource] pulled {} packets", packets.len());
+        let packets = self.app_source.pull(win_left).await;
+        println!(
+            "[TCPSource {}] pulled {} packets",
+            self.endpoint_id,
+            packets.len()
+        );
 
-        for packet in packets {
-            if self.next_seq + self.mss > cwnd_limit {
-                break;
+        for mut packet in packets {
+            if self.next_seq + packet.size > cwnd_limit {
+                break; // 窗口放不下就留着下次
             }
+
+            packet.flow_id = self.flow_id;
+            packet.packet_id = self.next_seq;
+
             self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);
-            self.send_buffer += packet.size;
+
+            // self.next_seq += packet.size;
+            // self.send_buffer += packet.size;
 
             println!(
                 "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
@@ -448,9 +462,13 @@ impl TCPPacketSource {
     }
 
     pub async fn send_packet(&mut self, now: f64) {
-        println!("[TCPSource] Trying to send packet at time {}", now);
         println!(
-            "[TCPSource] Status before sending: next_seq={}, send_buffer={}, cwnd={}, last_ack={}",
+            "[TCPSource {}] Trying to send packet at time {}",
+            self.endpoint_id, now
+        );
+        println!(
+            "[TCPSource {}] Status before sending: next_seq={}, send_buffer={}, cwnd={}, last_ack={}",
+            self.endpoint_id,
             self.next_seq,
             self.send_buffer,
             self.congestion_control.get_cwnd(),
@@ -468,14 +486,14 @@ impl TCPPacketSource {
         {
             let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
             println!(
-                "[TCPSource] Sending packet id={}, size={} at time {}",
-                packet.packet_id, packet.size, now
+                "[TCPSource {}] Sending packet id={}, size={} at time {}",
+                self.endpoint_id, packet.packet_id, packet.size, now
             );
 
             self.output.send(packet.clone()).await;
             println!(
-                "[TCPSource] Packet sent into output: flow_id={}, seq={}",
-                self.flow_id, packet.packet_id
+                "[TCPSource {}] Packet sent into output: flow_id={}, seq={}",
+                self.endpoint_id, self.flow_id, packet.packet_id
             );
             self.packet_sent(&packet, now);
         }
