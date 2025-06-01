@@ -37,7 +37,7 @@ use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
 
-use crate::flows::app_source::AppDataSource;
+use crate::flows::app_source::{AppActor, AppDataSource};
 use crate::flows::packet::Packet;
 
 #[derive(Deserialize)]
@@ -761,7 +761,7 @@ impl Topology {
         self.process_collectives();
 
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
-
+        let mut app_actors: Vec<AppActor> = Vec::new();
         for collective in &self.collectives {
             if matches!(
                 (collective.collective_type, collective.flow_type),
@@ -791,13 +791,14 @@ impl Topology {
                     "Total bytes: {}",
                     packets.iter().map(|p| p.size).sum::<usize>()
                 );
-                let appsource = AppDataSource::buffered(packets);
-                let (data_source, _) = appsource;
-                let handle = data_source.handle(); // AppDataSource::handle() returns AppSourceHandle
+                let (datasrc, actor) = AppDataSource::buffered(packets);
+                app_actors.push(actor);
+                let handle = datasrc.handle();
+
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
-                    app_sources.insert(flow_id, AppDataSource::Buffered(handle.clone()));
+                    app_sources.insert(flow_id, datasrc.clone());
                 }
             }
         }
@@ -812,6 +813,11 @@ impl Topology {
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
+
+        for actor in app_actors {
+            let mbox = Mailbox::new();
+            self.sim_init = self.sim_init.add_model(actor, mbox, "AppActor");
+        }
 
         // creates and activates a UserInterface coroutine
         self = self.activate_ui(ui_mbox);
