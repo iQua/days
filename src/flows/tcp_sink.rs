@@ -156,6 +156,17 @@ impl TCPPacketSink {
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
         // updates the locally maintained simulation time
+        // println!(
+        //     "[RECV] sink={} flow={} pkt_id={} now={:.3}",
+        //     self.endpoint_id, packet.flow_id, packet.packet_id, now
+        // );
+        //
+        if packet.packet_id < self.next_seq_expected {
+            println!(
+                "[DUP ] TCP sink={} flow={} pkt_id={} now={:.3}",
+                self.endpoint_id, packet.flow_id, packet.packet_id, now
+            );
+        }
         self.time = now;
 
         self.packet_statistics.update(&packet, now);
