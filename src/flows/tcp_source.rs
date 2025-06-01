@@ -181,6 +181,7 @@ impl TCPPacketSource {
         );
 
         let packets = self.app_source.pull(size_to_pull).await;
+        println!("[TCPSource] pulled {} packets", packets.len());
 
         for packet in packets {
             if self.next_seq + self.mss > cwnd_limit {
