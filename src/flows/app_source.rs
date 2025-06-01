@@ -102,8 +102,8 @@ impl AppActor {
 
 impl Model for AppActor {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(Duration::ZERO, Self::run_once, ())
-            .unwrap();
+        cx.schedule_event(Duration::from_micros(1), Self::run_once, ())
+            .expect("schedule_event failed");
         self.into()
     }
 }
