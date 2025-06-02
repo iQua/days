@@ -85,7 +85,7 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub app_source: AppSourceHandle,
+    pub app_source: Option<AppSourceHandle>,
     // pub datasource: Box<dyn AppSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
@@ -128,7 +128,7 @@ impl TCPPacketSource {
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        app_source: AppSourceHandle,
+        app_source: Option<AppSourceHandle>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
 
@@ -184,31 +184,36 @@ impl TCPPacketSource {
             self.endpoint_id, win_left, now
         );
 
-        let packets = self.app_source.pull(win_left).await;
-        println!(
-            "[TCPSource {}] pulled {} packets",
-            self.endpoint_id,
-            packets.len()
-        );
-
-        for mut packet in packets {
-            if self.next_seq + packet.size > cwnd_limit {
-                break; // 窗口放不下就留着下次
-            }
-
-            packet.flow_id = self.flow_id;
-            packet.packet_id = self.next_seq;
-
-            self.output.send(packet.clone()).await;
-            self.packet_sent(&packet, now);
-
-            // self.next_seq += packet.size;
-            // self.send_buffer += packet.size;
-
+        // let packets = self.app_source.pull(win_left).await;
+        if let Some(ref handle) = self.app_source {
+            let packets = handle.pull(win_left).await;
             println!(
-                "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
-                self.endpoint_id, packet.packet_id, packet.size, now
+                "[TCPSource {}] pulled {} packets",
+                self.endpoint_id,
+                packets.len()
             );
+
+            for mut packet in packets {
+                if self.next_seq + packet.size > cwnd_limit {
+                    break; // 窗口放不下就留着下次
+                }
+
+                packet.flow_id = self.flow_id;
+                packet.packet_id = self.next_seq;
+
+                self.output.send(packet.clone()).await;
+                self.packet_sent(&packet, now);
+
+                // self.next_seq += packet.size;
+                // self.send_buffer += packet.size;
+
+                println!(
+                    "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
+                    self.endpoint_id, packet.packet_id, packet.size, now
+                );
+            }
+        } else {
+            println!("AppSourceHandle not provided, skipping pull.");
         }
     }
 

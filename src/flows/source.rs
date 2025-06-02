@@ -79,13 +79,13 @@ impl PacketSource {
                 rng,
             )),
             FlowType::TCP => {
-                let handle = app_source.expect("TCP flow must provide AppSourceHandle");
+                // let handle = app_source.expect("TCP flow must provide AppSourceHandle");
                 PacketSource::TCPPacketSource(TCPPacketSource::new(
                     flow_id,
                     flow_start_after,
                     traffic,
                     rng,
-                    handle,
+                    app_source,
                 ))
             }
         }
