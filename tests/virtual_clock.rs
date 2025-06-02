@@ -47,6 +47,7 @@ fn test_virtual_clock_scheduler() {
             None, // TCP characteristics
         ),
         0,
+        None,
     );
 
     let mut source_2 = PacketSource::new(
@@ -68,6 +69,7 @@ fn test_virtual_clock_scheduler() {
             None,
         ),
         0,
+        None,
     );
 
     // Create Virtual Clock scheduler with weights 1:2 for flow 0 and flow 1
