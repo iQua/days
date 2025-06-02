@@ -45,6 +45,7 @@ fn main() {
             None,
         ),
         0,
+        None,
     );
 
     let mut wire = Wire::new(
