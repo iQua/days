@@ -12,12 +12,15 @@ use std::future::Future;
 use std::time::Duration;
 use tachyonix::{channel, Receiver, Sender};
 
+// A request sent to the AppActor asking for `size` bytes worth of packets.
+// The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
     pub size: usize,
     pub respond_to: Sender<Vec<Packet>>,
 }
 
+// A handle to an application source actor. Allows TCPPacketSource to `pull()` packets asynchronously.
 #[derive(Clone)]
 pub struct AppSourceHandle {
     tx: Sender<AppSourceRequest>,
@@ -27,7 +30,7 @@ impl AppSourceHandle {
     pub fn new(tx: Sender<AppSourceRequest>) -> Self {
         Self { tx }
     }
-
+    // Send a pull request to the actor, and await the returned packets.
     pub async fn pull(&self, size: usize) -> Vec<Packet> {
         let (resp_tx, mut resp_rx) = channel(1);
         let _ = self
@@ -39,7 +42,7 @@ impl AppSourceHandle {
             .await;
         resp_rx.recv().await.unwrap_or_default()
     }
-
+    // A shutdown signal by sending a request with size=0 (not actually handled yet).
     pub async fn shutdown(&self) {
         let (resp_tx, _resp_rx) = channel(1);
         let _ = self
@@ -52,6 +55,7 @@ impl AppSourceHandle {
     }
 }
 
+// The actor that holds a buffer of packets and services pull requests.
 pub struct AppActor {
     rx: Receiver<AppSourceRequest>,
     buffer: Vec<Packet>,
@@ -60,6 +64,7 @@ pub struct AppActor {
     pub out: Output<Packet>,
 }
 
+// Construct a buffered actor with pre-generated packets.
 impl AppActor {
     pub fn buffered(packets: Vec<Packet>) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(128);
@@ -73,6 +78,7 @@ impl AppActor {
         (actor, tx)
     }
 
+    // Construct a dist actor that dynamically generates packets using traffic profile.
     pub fn dist(
         flow_id: usize,
         tr: TrafficCharacteristics,
@@ -102,6 +108,7 @@ impl AppActor {
 
 impl Model for AppActor {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        // Schedule the actor's run_once function every 1µs after simulation start
         cx.schedule_event(Duration::from_micros(1), Self::run_once, ())
             .expect("schedule_event failed");
         self.into()
@@ -109,6 +116,7 @@ impl Model for AppActor {
 }
 
 impl AppActor {
+    // Event loop that services pull requests and sends packet vectors back
     fn run_once<'a>(
         &'a mut self,
         _: (),
@@ -125,12 +133,14 @@ impl AppActor {
                 }
                 let _ = req.respond_to.try_send(out);
             }
+            // Re-schedule next run in 50µs
             cx.schedule_event(Duration::from_micros(50), Self::run_once, ())
                 .unwrap();
         }
     }
 }
 
+// Enum wrapper around different types of app sources.
 #[derive(Clone)]
 pub enum AppDataSource {
     Buffered(AppSourceHandle),
@@ -138,18 +148,19 @@ pub enum AppDataSource {
 }
 
 impl AppDataSource {
+    // Create a buffered source with pre-generated packets
     pub fn buffered(packets: Vec<Packet>) -> (Self, AppActor) {
         let (actor, tx) = AppActor::buffered(packets);
         (Self::Buffered(AppSourceHandle::new(tx)), actor)
     }
-
+    // Create a dist source from traffic profile and flow ID
     pub fn dist(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
         let (actor, tx) = AppActor::dist(flow_id, tr, rng);
         (Self::Dist(AppSourceHandle::new(tx)), actor)
     }
-
+    // Get the underlying handle to use in TCPPacketSource
     pub fn handle(&self) -> AppSourceHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => h.clone(),

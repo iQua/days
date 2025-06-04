@@ -760,6 +760,7 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
+        // Prepares application-level packet sources and their actors (only for TCP Broadcast).
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
         let mut app_actors: Vec<AppActor> = Vec::new();
         for collective in &self.collectives {
@@ -777,7 +778,7 @@ impl Topology {
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
-                    // 1. 为这条流（flow_id）单独生成一份 packets
+                    // generate packets for each flow
                     let total_size = match collective.traffic.size {
                         crate::flows::FlowSize::Bytes(s) => s,
                         crate::flows::FlowSize::Duration(_) => {
@@ -802,10 +803,10 @@ impl Topology {
                         total_size
                     );
 
-                    // 2. 给这条流独立创建 AppActor / AppDataSource
+                    // create AppActor and AppDataSource for this flow
                     let (datasrc, actor) = AppDataSource::buffered(packets);
                     app_actors.push(actor);
-                    app_sources.insert(flow_id, datasrc); // ← 不再 clone
+                    app_sources.insert(flow_id, datasrc);
                 }
             }
         }
