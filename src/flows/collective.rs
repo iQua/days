@@ -18,6 +18,7 @@ pub enum CollectiveType {
     Broadcast,
     Gather,
     AllReduce,
+    RingAllReduce,
 }
 
 #[derive(Deserialize, Debug)]
