@@ -296,6 +296,38 @@ impl Topology {
                             flow_id, collective.id
                         );
                     }
+                    CollectiveType::RingAllReduce => {
+                        let num_hosts = collective.sources.len();
+                        assert_eq!(
+                            num_hosts, collective.flow_count,
+                            "RingAllReduce expects flow_count == hosts.len()"
+                        );
+
+                        for i in 0..num_hosts {
+                            let source = collective.sources[i];
+                            let sink = collective.sources[(i + 1) % num_hosts]; // form a ring
+                            let flow_id = collective.first_flow_id + i;
+                            let path = collective.paths.as_ref().map(|paths| paths[i].clone());
+
+                            self.flows.push(Flow::new(FlowParams {
+                                id: flow_id,
+                                path,
+                                starts_before: Vec::new(),
+                                starts_after: Vec::new(),
+                                flow_type: collective.flow_type,
+                                source_host: source,
+                                sink_host: sink,
+                                routing: collective.routing,
+                                traffic: collective.traffic,
+                                seed: flow_id, // allow per-flow variation
+                            }));
+
+                            debug!(
+                                "Produced Flow {} of RingAllReduce collective {}: {} -> {}",
+                                flow_id, collective.id, source, sink
+                            );
+                        }
+                    }
                     CollectiveType::Gather => {
                         self.flows.push(Flow::new(FlowParams {
                             id: flow_id,
