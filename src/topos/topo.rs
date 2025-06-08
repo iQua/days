@@ -860,6 +860,43 @@ impl Topology {
                     app_sources.insert(flow_id, datasrc);
                 }
             }
+            if matches!(
+                (collective.collective_type, collective.flow_type),
+                (CollectiveType::RingAllReduce, FlowType::TCP)
+            ) {
+                let total_size = match collective.traffic.size {
+                    crate::flows::FlowSize::Bytes(size) => size,
+                    crate::flows::FlowSize::Duration(_) => {
+                        panic!("Duration-based TCP traffic not supported for RingAllReduce")
+                    }
+                };
+
+                for flow_id in
+                    collective.first_flow_id..collective.first_flow_id + collective.flow_count
+                {
+                    let mut packets = Vec::new();
+                    let mut remaining = total_size;
+                    let mss = 512;
+                    let mut seq = 0;
+
+                    while remaining > 0 {
+                        let sz = mss.min(remaining);
+                        packets.push(Packet::new(sz, seq, flow_id, 0.0));
+                        seq += sz;
+                        remaining -= sz;
+                    }
+
+                    println!(
+                        "Flow {flow_id}: generated {} packets ({} B)",
+                        packets.len(),
+                        total_size
+                    );
+
+                    let (datasrc, actor) = AppDataSource::buffered(packets);
+                    app_actors.push(actor);
+                    app_sources.insert(flow_id, datasrc);
+                }
+            }
         }
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
