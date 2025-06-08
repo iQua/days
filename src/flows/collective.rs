@@ -184,6 +184,15 @@ impl Collective {
                     );
                 }
                 CollectiveType::AllReduce => {}
+                CollectiveType::RingAllReduce => {
+                    for i in 0..flow_count {
+                        assert_eq!(
+                            sources[i],
+                            sinks[(i + flow_count - 1) % flow_count],
+                            "In RingAllReduce, sources[i] must equal sinks[i-1]"
+                        );
+                    }
+                }
             }
 
             return (sources, sinks);
@@ -197,6 +206,26 @@ impl Collective {
                 flow_paths.len(),
                 flow_count
             );
+
+            match collective_type {
+                CollectiveType::RingAllReduce => {
+                    for (i, path) in flow_paths.iter().enumerate() {
+                        assert!(
+                            path.len() >= 2,
+                            "Each RingAllReduce path must contain at least two nodes"
+                        );
+                        let expected_next = flow_paths[(i + 1) % flow_count][0];
+                        let actual_sink = path[path.len() - 1];
+                        assert_eq!(
+                        actual_sink, expected_next,
+                        "RingAllReduce path mismatch: sink of flow {} should match source of next",
+                        i
+                    );
+                    }
+                }
+                _ => {}
+            }
+
             let sources = flow_paths.iter().map(|path| path[0]).collect();
             let sinks = flow_paths.iter().map(|path| path[path.len() - 1]).collect();
 
@@ -221,6 +250,25 @@ impl Collective {
                 let sources = (0..flow_count)
                     .map(|_| *source_hosts.choose(&mut rng).unwrap())
                     .collect();
+
+                (sources, sinks)
+            }
+            CollectiveType::RingAllReduce => {
+                assert_eq!(
+                    flow_count,
+                    hosts.len(),
+                    "RingAllReduce requires flow_count to match the number of hosts"
+                );
+
+                let mut ring_hosts = hosts.to_vec();
+
+                let mut sources = Vec::new();
+                let mut sinks = Vec::new();
+
+                for i in 0..ring_hosts.len() {
+                    sources.push(ring_hosts[i]);
+                    sinks.push(ring_hosts[(i + 1) % ring_hosts.len()]);
+                }
 
                 (sources, sinks)
             }
