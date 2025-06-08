@@ -298,33 +298,52 @@ impl Topology {
                     }
                     CollectiveType::RingAllReduce => {
                         let num_hosts = collective.sources.len();
-                        assert_eq!(
-                            num_hosts, collective.flow_count,
-                            "RingAllReduce expects flow_count == hosts.len()"
-                        );
 
                         for i in 0..num_hosts {
-                            let source = collective.sources[i];
-                            let sink = collective.sources[(i + 1) % num_hosts]; // form a ring
-                            let flow_id = collective.first_flow_id + i;
-                            let path = collective.paths.as_ref().map(|paths| paths[i].clone());
+                            let src = collective.sources[i];
+                            let dst = collective.sources[(i + 1) % num_hosts];
+                            let reverse_src = dst;
+                            let reverse_dst = src;
 
+                            let flow_id_scatter = collective.first_flow_id + i;
+                            let flow_id_gather = collective.first_flow_id + num_hosts + i;
+
+                            let path_scatter =
+                                collective.paths.as_ref().map(|paths| paths[i].clone());
+                            let path_gather =
+                                collective.paths.as_ref().map(|paths| paths[i].clone()); // use same path
+
+                            // Scatter-Reduce flow
                             self.flows.push(Flow::new(FlowParams {
-                                id: flow_id,
-                                path,
+                                id: flow_id_scatter,
+                                path: path_scatter,
                                 starts_before: Vec::new(),
                                 starts_after: Vec::new(),
                                 flow_type: collective.flow_type,
-                                source_host: source,
-                                sink_host: sink,
+                                source_host: src,
+                                sink_host: dst,
                                 routing: collective.routing,
                                 traffic: collective.traffic,
-                                seed: flow_id, // allow per-flow variation
+                                seed: collective.id, // shared seed ensures same data pattern
+                            }));
+
+                            // All-Gather flow (reverse direction)
+                            self.flows.push(Flow::new(FlowParams {
+                                id: flow_id_gather,
+                                path: path_gather,
+                                starts_before: Vec::new(),
+                                starts_after: Vec::new(),
+                                flow_type: collective.flow_type,
+                                source_host: reverse_src,
+                                sink_host: reverse_dst,
+                                routing: collective.routing,
+                                traffic: collective.traffic,
+                                seed: collective.id, // same seed
                             }));
 
                             debug!(
-                                "Produced Flow {} of RingAllReduce collective {}: {} -> {}",
-                                flow_id, collective.id, source, sink
+                                "Produced RingAllReduce flows {} (→ {}) and {} (← {})",
+                                flow_id_scatter, flow_id_gather, dst, src
                             );
                         }
                     }
