@@ -260,7 +260,7 @@ impl Collective {
                     "RingAllReduce requires flow_count to match the number of hosts"
                 );
 
-                let mut ring_hosts = hosts.to_vec();
+                let ring_hosts = hosts.to_vec();
 
                 let mut sources = Vec::new();
                 let mut sinks = Vec::new();
