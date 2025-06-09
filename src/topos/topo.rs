@@ -15,10 +15,7 @@ use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
-use nexosim::ports::{EventSlot, Output};
-use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
-use nexosim::time::MonotonicTime;
-
+use crate::flows::app_source::AppSourceHandle;
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
@@ -36,6 +33,9 @@ use crate::utils::logger::CsvLogger;
 use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
+use nexosim::ports::{EventSlot, Output};
+use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
+use nexosim::time::MonotonicTime;
 
 use crate::flows::app_source::{AppActor, AppDataSource};
 use crate::flows::packet::Packet;
@@ -583,6 +583,7 @@ impl Topology {
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
         mut app_sources: HashMap<usize, AppDataSource>,
+        flow_id_to_source_handle: Option<HashMap<usize, AppSourceHandle>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -609,7 +610,10 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             let appsource = app_sources.remove(&flow.id);
-            let handle = appsource.map(|src| src.handle());
+            // let handle = appsource.map(|src| src.handle());
+            let handle = flow_id_to_source_handle
+                .as_ref()
+                .and_then(|m| m.get(&flow.id).cloned());
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
@@ -814,6 +818,8 @@ impl Topology {
         // Prepares application-level packet sources and their actors (only for TCP Broadcast).
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
         let mut app_actors: Vec<AppActor> = Vec::new();
+        let mut flow_id_to_source_handle: HashMap<usize, AppSourceHandle> = HashMap::new();
+
         for collective in &self.collectives {
             if matches!(
                 (collective.collective_type, collective.flow_type),
@@ -870,27 +876,37 @@ impl Topology {
                 };
 
                 let mss = 512;
+                let num_nodes = collective.flow_count;
+                let chunk_size = total_size / num_nodes;
 
-                for flow_id in
-                    collective.first_flow_id..collective.first_flow_id + collective.flow_count
-                {
-                    let mut packets = Vec::new();
-                    let mut remaining = total_size;
-                    let mut seq = 0;
-                    while remaining > 0 {
-                        let sz = mss.min(remaining);
-                        packets.push(Packet::new(sz, seq, flow_id, 0.0));
-                        seq += sz;
-                        remaining -= sz;
+                for node_rank in 0..num_nodes {
+                    for step in 1..num_nodes {
+                        let dst = (node_rank + step) % num_nodes;
+                        let flow_id =
+                            collective.first_flow_id + node_rank * (num_nodes - 1) + (step - 1);
+
+                        let mut packets = Vec::new();
+                        let mut remaining = chunk_size;
+                        let mut seq = 0;
+
+                        while remaining > 0 {
+                            let sz = mss.min(remaining);
+                            packets.push(Packet::new(sz, seq, flow_id, 0.0));
+                            seq += sz;
+                            remaining -= sz;
+                        }
+
+                        println!(
+                            "Flow {flow_id} (rank {node_rank} -> {dst}): {} packets ({} B)",
+                            packets.len(),
+                            chunk_size
+                        );
+
+                        let (datasrc, actor) = AppDataSource::buffered(packets);
+                        flow_id_to_source_handle.insert(flow_id, datasrc.handle());
+                        app_actors.push(actor);
+                        app_sources.insert(flow_id, datasrc);
                     }
-                    println!(
-                        "Flow {flow_id}: generated {} packets ({} B)",
-                        packets.len(),
-                        total_size
-                    );
-                    let (datasrc, actor) = AppDataSource::buffered(packets);
-                    app_actors.push(actor);
-                    app_sources.insert(flow_id, datasrc); // Each flow has its own AppSource
                 }
             }
         }
@@ -901,7 +917,12 @@ impl Topology {
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox, app_sources);
+        (self, ui_mbox) = self.attach_flows(
+            &mut statistics,
+            ui_mbox,
+            app_sources,
+            Some(flow_id_to_source_handle),
+        );
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();

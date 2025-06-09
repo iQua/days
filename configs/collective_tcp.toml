@@ -35,13 +35,12 @@ flow_type = "TCP"
 flow_count = 4
 sources = [0, 1, 2, 3]
 sinks = [1, 2, 3, 0]
-routing = "ShortestPath"
 
 [collective.traffic]
 initial_delay = 0.0
-size = 4000
-arr_dist = { type = "Uniform", low = 2, high = 3 }
-pkt_size_dist = { type = "Uniform", low = 1000, high = 1200 }
+size = 3000
+arr_dist = { type = "Uniform", low = 3, high = 4 }
+pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
 
 [collective.traffic.tcp]
 cc_algorithm = "TCPReno"
