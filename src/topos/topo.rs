@@ -555,10 +555,10 @@ impl Topology {
             assert!(self.hosts.contains(&flow.sink_host));
 
             let appsource = app_sources.remove(&flow.id);
-            // let handle = appsource.map(|src| src.handle());
-            let handle = flow_id_to_source_handle
-                .as_ref()
-                .and_then(|m| m.get(&flow.id).cloned());
+            let handle = appsource.map(|src| src.handle());
+            // let handle = flow_id_to_source_handle
+            //     .as_ref()
+            //     .and_then(|m| m.get(&flow.id).cloned());
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
