@@ -6,7 +6,7 @@ duration = 20.0
 log_path = "logs/collective_tcp"
 
 [switch]
-port_rate = 4096
+port_rate = 1000000
 capacity = 100
 weights = [1]
 discipline = "FIFO"
@@ -38,7 +38,7 @@ sinks = [1, 2, 3, 0]
 
 [collective.traffic]
 initial_delay = 0.0
-size = 3000
+size = 1000
 arr_dist = { type = "Uniform", low = 3, high = 4 }
 pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
 

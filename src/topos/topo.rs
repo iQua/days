@@ -264,90 +264,57 @@ impl Topology {
             self.collectives.len()
         );
 
-        // constructs, attaches, and routes flows in each collective
         for collective in self.collectives.iter_mut() {
-            for (index, &source) in collective.sources.iter().enumerate() {
-                let sink = collective.sinks[index];
-                println!("[DEBUG] sink {}", sink);
-                let flow_id = collective.first_flow_id + index;
-                let path = collective.paths.as_ref().map(|paths| paths[index].clone());
+            match collective.collective_type {
+                CollectiveType::RingAllReduce => {
+                    let num_hosts = collective.sources.len();
+                    let mut flow_id = collective.first_flow_id;
 
-                match collective.collective_type {
-                    CollectiveType::Broadcast => {
-                        self.flows.push(Flow::new(FlowParams {
-                            id: flow_id,
-                            path,
-                            starts_before: Vec::new(),
-                            starts_after: Vec::new(),
-                            flow_type: collective.flow_type,
-                            source_host: source,
-                            sink_host: sink,
-                            routing: collective.routing,
-                            traffic: collective.traffic,
-                            // uses collective_id as the random seed for the
-                            // flow, which ensures that all flows in the
-                            // broadcast have the same arrival and size
-                            // distribution
-                            seed: collective.id,
-                        }));
+                    for phase in ["Scatter", "Gather"] {
+                        for rank in 0..num_hosts {
+                            for step in 1..num_hosts {
+                                let src = collective.sources[rank];
+                                let dst = collective.sources[(rank + 1) % num_hosts];
+                                let chunk_owner = if phase == "Scatter" {
+                                    (rank + num_hosts - step) % num_hosts
+                                } else {
+                                    (rank + step) % num_hosts
+                                };
+                                let chunk_from = collective.sources[chunk_owner];
 
-                        debug!(
-                            "Produced Flow {} of Broadcast collective communication operation {}.",
-                            flow_id, collective.id
-                        );
-                    }
-                    CollectiveType::RingAllReduce => {
-                        let num_hosts = collective.sources.len();
+                                let flow = Flow::new(FlowParams {
+                                    id: flow_id,
+                                    path: None,
+                                    starts_before: Vec::new(),
+                                    starts_after: Vec::new(),
+                                    flow_type: collective.flow_type,
+                                    source_host: src,
+                                    sink_host: dst,
+                                    routing: collective.routing,
+                                    traffic: collective.traffic,
+                                    seed: collective.id,
+                                });
 
-                        for i in 0..num_hosts {
-                            let src = collective.sources[i];
-                            let dst = collective.sources[(i + 1) % num_hosts];
-                            let reverse_src = dst;
-                            let reverse_dst = src;
+                                debug!(
+                                    "Produced RingAllReduce {phase} flow {} ({} -> {}), chunk from node {}",
+                                    flow_id, src, dst, chunk_from
+                                );
 
-                            let flow_id_scatter = collective.first_flow_id + i;
-                            let flow_id_gather = collective.first_flow_id + num_hosts + i;
-
-                            let path_scatter =
-                                collective.paths.as_ref().map(|paths| paths[i].clone());
-                            let path_gather =
-                                collective.paths.as_ref().map(|paths| paths[i].clone()); // use same path
-
-                            // Scatter-Reduce flow
-                            self.flows.push(Flow::new(FlowParams {
-                                id: flow_id_scatter,
-                                path: path_scatter,
-                                starts_before: Vec::new(),
-                                starts_after: Vec::new(),
-                                flow_type: collective.flow_type,
-                                source_host: src,
-                                sink_host: dst,
-                                routing: collective.routing,
-                                traffic: collective.traffic,
-                                seed: collective.id, // shared seed ensures same data pattern
-                            }));
-
-                            // All-Gather flow (reverse direction)
-                            self.flows.push(Flow::new(FlowParams {
-                                id: flow_id_gather,
-                                path: path_gather,
-                                starts_before: Vec::new(),
-                                starts_after: Vec::new(),
-                                flow_type: collective.flow_type,
-                                source_host: reverse_src,
-                                sink_host: reverse_dst,
-                                routing: collective.routing,
-                                traffic: collective.traffic,
-                                seed: collective.id, // same seed
-                            }));
-
-                            debug!(
-                                "Produced RingAllReduce flows {} (→ {}) and {} (← {})",
-                                flow_id_scatter, flow_id_gather, dst, src
-                            );
+                                self.flows.push(flow);
+                                flow_id += 1;
+                            }
                         }
                     }
-                    CollectiveType::Gather => {
+
+                    collective.flow_count = flow_id - collective.first_flow_id;
+                }
+
+                _ => {
+                    for (index, &source) in collective.sources.iter().enumerate() {
+                        let sink = collective.sinks[index];
+                        let flow_id = collective.first_flow_id + index;
+                        let path = collective.paths.as_ref().map(|paths| paths[index].clone());
+
                         self.flows.push(Flow::new(FlowParams {
                             id: flow_id,
                             path,
@@ -358,39 +325,17 @@ impl Topology {
                             sink_host: sink,
                             routing: collective.routing,
                             traffic: collective.traffic,
-                            // uses flow_id as the random seed for the flow,
-                            // which ensures that different flows have different
-                            // arrival and size distributions
-                            seed: flow_id,
+                            seed: match collective.collective_type {
+                                CollectiveType::Broadcast => collective.id,
+                                CollectiveType::Gather => flow_id,
+                                CollectiveType::AllReduce => source,
+                                _ => 0, // fallback
+                            },
                         }));
 
                         debug!(
-                            "Produced Flow {} of Gather collective communication operation {}.",
-                            flow_id, collective.id
-                        );
-                    }
-                    CollectiveType::AllReduce => {
-                        self.flows.push(Flow::new(FlowParams {
-                            id: flow_id,
-                            path,
-                            starts_before: Vec::new(),
-                            starts_after: Vec::new(),
-                            flow_type: collective.flow_type,
-                            source_host: source,
-                            sink_host: sink,
-                            routing: collective.routing,
-                            traffic: collective.traffic,
-                            // uses the source host's id as the random seed for
-                            // the flow, which ensures that different hosts have
-                            // different arrival and size distributions, but
-                            // packet sources attached to the same host have the
-                            // same distribution
-                            seed: source,
-                        }));
-
-                        debug!(
-                            "Produced Flow {} of AllReduce collective communication operation {}.",
-                            flow_id, collective.id
+                            "Produced Flow {} of {:?} collective communication operation {}.",
+                            flow_id, collective.collective_type, collective.id
                         );
                     }
                 }
@@ -876,7 +821,7 @@ impl Topology {
                 };
 
                 let mss = 512;
-                let num_nodes = collective.flow_count;
+                let num_nodes = collective.sources.len();
                 let chunk_size = total_size / num_nodes;
                 let mut flow_id = collective.first_flow_id;
 
@@ -919,6 +864,11 @@ impl Topology {
                 }
             }
         }
+        println!("[Debug] Total AppSources: {}", app_sources.len());
+        println!(
+            "[Debug] Total source handles: {}",
+            flow_id_to_source_handle.len()
+        );
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
