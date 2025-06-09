@@ -878,34 +878,43 @@ impl Topology {
                 let mss = 512;
                 let num_nodes = collective.flow_count;
                 let chunk_size = total_size / num_nodes;
+                let mut flow_id = collective.first_flow_id;
 
-                for node_rank in 0..num_nodes {
-                    for step in 1..num_nodes {
-                        let dst = (node_rank + step) % num_nodes;
-                        let flow_id =
-                            collective.first_flow_id + node_rank * (num_nodes - 1) + (step - 1);
+                // Two phases: Scatter-Reduce and All-Gather
+                for phase in ["Scatter", "Gather"] {
+                    for node_rank in 0..num_nodes {
+                        for step in 1..num_nodes {
+                            let dst = (node_rank + 1) % num_nodes;
+                            let chunk_owner = if phase == "Scatter" {
+                                (node_rank - step + num_nodes) % num_nodes
+                            } else {
+                                (node_rank + step) % num_nodes
+                            };
 
-                        let mut packets = Vec::new();
-                        let mut remaining = chunk_size;
-                        let mut seq = 0;
+                            let mut packets = Vec::new();
+                            let mut remaining = chunk_size;
+                            let mut seq = 0;
 
-                        while remaining > 0 {
-                            let sz = mss.min(remaining);
-                            packets.push(Packet::new(sz, seq, flow_id, 0.0));
-                            seq += sz;
-                            remaining -= sz;
+                            while remaining > 0 {
+                                let sz = mss.min(remaining);
+                                packets.push(Packet::new(sz, seq, flow_id, 0.0));
+                                seq += sz;
+                                remaining -= sz;
+                            }
+
+                            println!(
+                                "[{phase}] Flow {flow_id} (rank {node_rank} -> {dst}), chunk from node {chunk_owner}: {} packets ({} B)",
+                                packets.len(),
+                                chunk_size
+                            );
+
+                            let (datasrc, actor) = AppDataSource::buffered(packets);
+                            flow_id_to_source_handle.insert(flow_id, datasrc.handle());
+                            app_actors.push(actor);
+                            app_sources.insert(flow_id, datasrc);
+
+                            flow_id += 1;
                         }
-
-                        println!(
-                            "Flow {flow_id} (rank {node_rank} -> {dst}): {} packets ({} B)",
-                            packets.len(),
-                            chunk_size
-                        );
-
-                        let (datasrc, actor) = AppDataSource::buffered(packets);
-                        flow_id_to_source_handle.insert(flow_id, datasrc.handle());
-                        app_actors.push(actor);
-                        app_sources.insert(flow_id, datasrc);
                     }
                 }
             }
