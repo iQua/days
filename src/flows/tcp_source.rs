@@ -191,7 +191,7 @@ impl TCPPacketSource {
         );
 
         // Try to pull data if app_source is configured
-        if let Some(ref handle) = self.app_source {
+        if let Some(ref mut handle) = self.app_source {
             let packets = handle.pull(win_left).await;
             println!(
                 "[TCPSource {}] pulled {} packets",

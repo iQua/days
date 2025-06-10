@@ -16,6 +16,7 @@ use tachyonix::{channel, Receiver, Sender};
 // The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
+    pub start: usize,
     pub size: usize,
     pub respond_to: Sender<Vec<Packet>>,
 }
@@ -24,23 +25,29 @@ pub struct AppSourceRequest {
 #[derive(Clone)]
 pub struct AppSourceHandle {
     tx: Sender<AppSourceRequest>,
+    cursor: usize,
 }
 
 impl AppSourceHandle {
     pub fn new(tx: Sender<AppSourceRequest>) -> Self {
-        Self { tx }
+        Self { tx, cursor: 0 }
     }
     // Send a pull request to the actor, and await the returned packets.
-    pub async fn pull(&self, size: usize) -> Vec<Packet> {
+    pub async fn pull(&mut self, size: usize) -> Vec<Packet> {
         let (resp_tx, mut resp_rx) = channel(1);
+        // send the current cursor to the actor
         let _ = self
             .tx
             .send(AppSourceRequest {
+                start: self.cursor,
                 size,
                 respond_to: resp_tx,
             })
             .await;
-        resp_rx.recv().await.unwrap_or_default()
+        let pkts = resp_rx.recv().await.unwrap_or_default();
+        // move the cursor
+        self.cursor += pkts.iter().map(|p| p.size).sum::<usize>();
+        pkts
     }
     // A shutdown signal by sending a request with size=0 (not actually handled yet).
     pub async fn shutdown(&self) {
@@ -48,6 +55,7 @@ impl AppSourceHandle {
         let _ = self
             .tx
             .send(AppSourceRequest {
+                start: 0,
                 size: 0,
                 respond_to: resp_tx,
             })
@@ -116,26 +124,41 @@ impl Model for AppActor {
 }
 
 impl AppActor {
-    // Event loop that services pull requests and sends packet vectors back
+    /// 定时事件：处理所有 Pull 请求并立即返回所需数据（只 clone，不 pop）
     fn run_once<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
+            // 逐条处理 channel 中积压的请求
             while let Ok(req) = self.rx.try_recv() {
                 let mut out = Vec::new();
-                let mut sent = 0;
-                while sent < req.size && !self.buffer.is_empty() {
-                    let pkt = self.buffer.remove(0);
+                let mut sent = 0usize; // 已返回的总字节
+                let mut idx = 0usize; // packet 下标
+                let mut byte_pos = 0usize; // 当前 packet 起始字节位置
+
+                // ① 找到 start 所在的 packet 下标
+                while idx < self.buffer.len() && byte_pos + self.buffer[idx].size <= req.start {
+                    byte_pos += self.buffer[idx].size;
+                    idx += 1;
+                }
+
+                // ② 从 idx 开始 clone，直到满足 size
+                while idx < self.buffer.len() && sent < req.size {
+                    let pkt = self.buffer[idx].clone(); // 只 clone，不删除
                     sent += pkt.size;
                     out.push(pkt);
+                    idx += 1;
                 }
+
+                // ③ 将结果异步返回
                 let _ = req.respond_to.try_send(out);
             }
-            // Re-schedule next run in 50µs
+
+            // 重新调度下一轮（50 µs 后）
             cx.schedule_event(Duration::from_micros(50), Self::run_once, ())
-                .unwrap();
+                .expect("reschedule run_once failed");
         }
     }
 }

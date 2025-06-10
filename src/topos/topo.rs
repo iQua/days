@@ -554,8 +554,9 @@ impl Topology {
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
-            let appsource = app_sources.remove(&flow.id);
-            let handle = appsource.map(|src| src.handle());
+            let handle = flow_id_to_source_handle
+                .as_ref()
+                .and_then(|m| m.get(&flow.id).cloned());
             // let handle = flow_id_to_source_handle
             //     .as_ref()
             //     .and_then(|m| m.get(&flow.id).cloned());
@@ -770,46 +771,35 @@ impl Topology {
                 (collective.collective_type, collective.flow_type),
                 (CollectiveType::Broadcast, FlowType::TCP)
             ) {
-                // only support FlowSize::Bytes here
                 let total_size = match collective.traffic.size {
-                    crate::flows::FlowSize::Bytes(size) => size,
-                    crate::flows::FlowSize::Duration(_) => {
-                        panic!("Duration-based TCP traffic not supported for BufferedAppDataSource")
-                    }
+                    crate::flows::FlowSize::Bytes(s) => s,
+                    _ => panic!("Only byte-based broadcast is supported"),
                 };
+
+                // 只生成一次完整的 packets（Flow ID 在此处可以忽略，因为每个 flow 都会在使用 handle 时独立设置）
+                let mut packets = Vec::new();
+                let mut remaining = total_size;
+                let mss = 512;
+                let mut seq = 0;
+
+                while remaining > 0 {
+                    let sz = mss.min(remaining);
+                    packets.push(Packet::new(sz, seq, 0, 0.0)); // 此处流标识不重要
+                    seq += sz;
+                    remaining -= sz;
+                }
+
+                // 创建唯一的 AppDataSource 和 actor
+                let (datasrc, actor) = AppDataSource::buffered(packets);
+                // 分发 handle 给每个 flow：所有 flow 从同一个 datasrc 获取数据
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
-                    // generate packets for each flow
-                    let total_size = match collective.traffic.size {
-                        crate::flows::FlowSize::Bytes(s) => s,
-                        crate::flows::FlowSize::Duration(_) => {
-                            panic!("Duration-based TCP traffic not supported")
-                        }
-                    };
-
-                    let mut packets = Vec::new();
-                    let mut remaining = total_size;
-                    let mss = 512;
-                    let mut seq = 0;
-
-                    while remaining > 0 {
-                        let sz = mss.min(remaining);
-                        packets.push(Packet::new(sz, seq, flow_id, 0.0));
-                        seq += sz;
-                        remaining -= sz;
-                    }
-                    println!(
-                        "Flow {flow_id}: generated {} packets ({} B)",
-                        packets.len(),
-                        total_size
-                    );
-
-                    // create AppActor and AppDataSource for this flow
-                    let (datasrc, actor) = AppDataSource::buffered(packets);
-                    app_actors.push(actor);
-                    app_sources.insert(flow_id, datasrc);
+                    flow_id_to_source_handle.insert(flow_id, datasrc.handle());
                 }
+                // 用 collective.id 作为 key 存入 app_sources（只保存一次）
+                app_sources.insert(collective.id, datasrc);
+                app_actors.push(actor);
             }
             if matches!(
                 (collective.collective_type, collective.flow_type),

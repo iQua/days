@@ -12,35 +12,35 @@ weights = [1]
 discipline = "FIFO"
 drop = "RED"
 
-# [[collective]]
-# collective_type = "Broadcast"
-# flow_type = "TCP"
-# flow_count = 4
-# sources = [4, 4, 4, 4]
-# sinks = [2, 3, 0, 1]
-
-# [collective.traffic]
-# initial_delay = 0.0
-# size = 3000
-# arr_dist = { type = "Uniform", low = 3, high = 4 }
-# pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
-
-# [collective.traffic.tcp]
-# cc_algorithm = "TCPReno"
-
-
 [[collective]]
-collective_type = "RingAllReduce"
+collective_type = "Broadcast"
 flow_type = "TCP"
 flow_count = 4
-sources = [0, 1, 2, 3]
-sinks = [1, 2, 3, 0]
+sources = [4, 4, 4, 4]
+sinks = [2, 3, 0, 1]
 
 [collective.traffic]
 initial_delay = 0.0
-size = 1000
+size = 3000
 arr_dist = { type = "Uniform", low = 3, high = 4 }
 pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
 
 [collective.traffic.tcp]
 cc_algorithm = "TCPReno"
+
+
+# [[collective]]
+# collective_type = "RingAllReduce"
+# flow_type = "TCP"
+# flow_count = 4
+# sources = [0, 1, 2, 3]
+# sinks = [1, 2, 3, 0]
+
+# [collective.traffic]
+# initial_delay = 0.0
+# size = 1000
+# arr_dist = { type = "Uniform", low = 3, high = 4 }
+# pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
+
+# [collective.traffic.tcp]
+# cc_algorithm = "TCPReno"
