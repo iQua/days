@@ -267,21 +267,32 @@ impl Topology {
         for collective in self.collectives.iter_mut() {
             match collective.collective_type {
                 CollectiveType::RingAllReduce => {
-                    let num_hosts = collective.sources.len();
+                    let n = collective.sources.len();
                     let mut flow_id = collective.first_flow_id;
 
+                    // 记录每个节点上一条 flow 在 self.flows 中的“索引”
+                    let mut last_scatter: Vec<Option<usize>> = vec![None; n];
+                    let mut last_gather: Vec<Option<usize>> = vec![None; n];
+
                     for phase in ["Scatter", "Gather"] {
-                        for rank in 0..num_hosts {
-                            for step in 1..num_hosts {
+                        let last_table = if phase == "Scatter" {
+                            &mut last_scatter
+                        } else {
+                            &mut last_gather
+                        };
+
+                        for rank in 0..n {
+                            for step in 1..n {
                                 let src = collective.sources[rank];
-                                let dst = collective.sources[(rank + 1) % num_hosts];
+                                let dst = collective.sources[(rank + 1) % n];
                                 let chunk_owner = if phase == "Scatter" {
-                                    (rank + num_hosts - step) % num_hosts
+                                    (rank + n - step) % n
                                 } else {
-                                    (rank + step) % num_hosts
+                                    (rank + step) % n
                                 };
                                 let chunk_from = collective.sources[chunk_owner];
 
+                                // -------- 1. 先创建 Flow ---------------------------
                                 let flow = Flow::new(FlowParams {
                                     id: flow_id,
                                     path: None,
@@ -294,19 +305,36 @@ impl Topology {
                                     traffic: collective.traffic,
                                     seed: collective.id,
                                 });
+                                // 在向量中的索引
+                                let this_idx = self.flows.len();
+                                self.flows.push(flow);
+
+                                // -------- 2. 写依赖到“上一条 flow” -----------------
+                                if let Some(prev_idx) = last_table[rank] {
+                                    // 让上一条 flow 在完成后启动本 flow
+                                    self.flows[prev_idx].starts_before.push(flow_id);
+                                    println!(
+                                        "link: flow {} must wait flow {}",
+                                        flow_id, self.flows[prev_idx].id
+                                    );
+                                }
+                                // 更新表：当前 flow 成为最新
+                                last_table[rank] = Some(this_idx);
 
                                 debug!(
                                     "Produced RingAllReduce {phase} flow {} ({} -> {}), chunk from node {}",
                                     flow_id, src, dst, chunk_from
                                 );
-
-                                self.flows.push(flow);
                                 flow_id += 1;
                             }
                         }
                     }
-
                     collective.flow_count = flow_id - collective.first_flow_id;
+                    // for f in &self.flows {
+                    //     if !f.starts_before.is_empty() {
+                    //         println!("[DBG] flow {} starts_before {:?}", f.id, f.starts_before);
+                    //     }
+                    // }
                 }
 
                 _ => {
