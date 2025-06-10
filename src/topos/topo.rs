@@ -776,7 +776,6 @@ impl Topology {
                     _ => panic!("Only byte-based broadcast is supported"),
                 };
 
-                // 只生成一次完整的 packets（Flow ID 在此处可以忽略，因为每个 flow 都会在使用 handle 时独立设置）
                 let mut packets = Vec::new();
                 let mut remaining = total_size;
                 let mss = 512;
@@ -789,15 +788,14 @@ impl Topology {
                     remaining -= sz;
                 }
 
-                // 创建唯一的 AppDataSource 和 actor
+                // create unique AppDataSource and actor
                 let (datasrc, actor) = AppDataSource::buffered(packets);
-                // 分发 handle 给每个 flow：所有 flow 从同一个 datasrc 获取数据
+                //assign handle to each flow：all flows obtain data from the same datasrc
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
                     flow_id_to_source_handle.insert(flow_id, datasrc.handle());
                 }
-                // 用 collective.id 作为 key 存入 app_sources（只保存一次）
                 app_sources.insert(collective.id, datasrc);
                 app_actors.push(actor);
             }
