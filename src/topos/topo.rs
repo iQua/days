@@ -799,56 +799,70 @@ impl Topology {
                 app_sources.insert(collective.id, datasrc);
                 app_actors.push(actor);
             }
+            // --- Ring-AllReduce (TCP) -----------------------------------------------
             if matches!(
                 (collective.collective_type, collective.flow_type),
                 (CollectiveType::RingAllReduce, FlowType::TCP)
             ) {
                 let total_size = match collective.traffic.size {
-                    crate::flows::FlowSize::Bytes(size) => size,
+                    crate::flows::FlowSize::Bytes(b) => b,
                     _ => panic!("RingAllReduce only supports byte-based flows"),
                 };
-
                 let mss = 512;
-                let num_nodes = collective.sources.len();
-                let chunk_size = total_size / num_nodes;
+                let n = collective.sources.len();
+                let chunk_size = total_size / n;
+
+                // one data-source + actor per *source node*
+                let mut host_map: HashMap<usize, (AppDataSource, AppActor)> = HashMap::new();
+
                 let mut flow_id = collective.first_flow_id;
 
-                // Two phases: Scatter-Reduce and All-Gather
                 for phase in ["Scatter", "Gather"] {
-                    for node_rank in 0..num_nodes {
-                        for step in 1..num_nodes {
-                            let dst = (node_rank + 1) % num_nodes;
+                    for rank in 0..n {
+                        for step in 1..n {
+                            let src_host = collective.sources[rank]; // flow's sender
+                            let dst_host = collective.sources[(rank + 1) % n];
+
+                            // which chunk travels in this hop?
                             let chunk_owner = if phase == "Scatter" {
-                                (node_rank - step + num_nodes) % num_nodes
+                                (rank + n - step) % n
                             } else {
-                                (node_rank + step) % num_nodes
+                                (rank + step) % n
                             };
+                            let chunk_offset = chunk_owner * chunk_size;
 
-                            let mut packets = Vec::new();
-                            let mut remaining = chunk_size;
-                            let mut seq = 0;
+                            // ensure we have *one* AppActor for this src_host
+                            let (datasrc, _actor) = host_map.entry(src_host).or_insert_with(|| {
+                                // build full packet vector once
+                                let mut pkts = Vec::new();
+                                let mut left = total_size;
+                                let mut seq = 0;
+                                while left > 0 {
+                                    let sz = mss.min(left);
+                                    pkts.push(Packet::new(sz, seq, 0, 0.0));
+                                    seq += sz;
+                                    left -= sz;
+                                }
+                                AppDataSource::buffered(pkts) // -> (ds, actor)
+                            });
 
-                            while remaining > 0 {
-                                let sz = mss.min(remaining);
-                                packets.push(Packet::new(sz, seq, flow_id, 0.0));
-                                seq += sz;
-                                remaining -= sz;
-                            }
+                            // get handle with proper offset for this chunk
+                            let handle = datasrc.handle_with_offset(chunk_offset);
+                            flow_id_to_source_handle.insert(flow_id, handle);
 
                             println!(
-                                "[{phase}] Flow {flow_id} (rank {node_rank} -> {dst}), chunk from node {chunk_owner}: {} packets ({} B)",
-                                packets.len(),
-                                chunk_size
+                                "[{phase}] flow {flow_id}  src {src_host}->{dst_host}  chunk_owner {chunk_owner}"
                             );
-
-                            let (datasrc, actor) = AppDataSource::buffered(packets);
-                            flow_id_to_source_handle.insert(flow_id, datasrc.handle());
-                            app_actors.push(actor);
-                            app_sources.insert(flow_id, datasrc);
 
                             flow_id += 1;
                         }
                     }
+                }
+
+                // register every (datasrc, actor) exactly once
+                for (host, (ds, actor)) in host_map {
+                    app_sources.insert(host, ds);
+                    app_actors.push(actor);
                 }
             }
         }

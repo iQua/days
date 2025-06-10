@@ -25,12 +25,27 @@ pub struct AppSourceRequest {
 #[derive(Clone)]
 pub struct AppSourceHandle {
     tx: Sender<AppSourceRequest>,
+    offset: usize, // chunk start in the shared buffer
     cursor: usize,
 }
 
 impl AppSourceHandle {
+    /// handle that starts at byte‐offset 0 (broadcast case)
     pub fn new(tx: Sender<AppSourceRequest>) -> Self {
-        Self { tx, cursor: 0 }
+        Self {
+            tx,
+            offset: 0,
+            cursor: 0,
+        }
+    }
+
+    /// NEW: create a handle that starts at `offset` (Ring-AllReduce chunk)
+    pub fn with_offset(tx: Sender<AppSourceRequest>, offset: usize) -> Self {
+        Self {
+            tx,
+            offset,
+            cursor: 0,
+        }
     }
     // Send a pull request to the actor, and await the returned packets.
     pub async fn pull(&mut self, size: usize) -> Vec<Packet> {
@@ -39,7 +54,7 @@ impl AppSourceHandle {
         let _ = self
             .tx
             .send(AppSourceRequest {
-                start: self.cursor,
+                start: self.offset + self.cursor,
                 size,
                 respond_to: resp_tx,
             })
@@ -187,6 +202,11 @@ impl AppDataSource {
     pub fn handle(&self) -> AppSourceHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => h.clone(),
+        }
+    }
+    pub fn handle_with_offset(&self, offset: usize) -> AppSourceHandle {
+        match self {
+            Self::Buffered(h) | Self::Dist(h) => AppSourceHandle::with_offset(h.clone().tx, offset),
         }
     }
 }
