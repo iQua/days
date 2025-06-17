@@ -86,7 +86,6 @@ pub struct TCPPacketSource {
     timeout_queue: BinaryHeap<PacketTimeout>,
 
     pub app_source: Option<AppSourceHandle>,
-    // pub datasource: Box<dyn AppSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -172,27 +171,27 @@ impl TCPPacketSource {
         }
     }
 
-    /// try to pull packets from the app source based on remaining window
-    /// Try to pull application-layer packets through the async AppSourceHandle,
-    /// based on the remaining congestion window space (cwnd_limit - next_seq).
+    /// Pull packets from the app source based on the size of the remaining congestion window
+    /// (which is cwnd_limit - next_seq), using AppSourceHandle.
     /// This function is typically called:
     /// - after receiving new ACKs (to refill the window)
-    /// - before sending packets (to populate send buffer)
-    pub async fn try_pull_from_appsource(&mut self, now: f64, cwnd_limit: usize) {
+    /// - before sending packets (to populate the send buffer)
+    pub async fn pull_from_appsource(&mut self, now: f64, cwnd_limit: usize) {
         let win_left = cwnd_limit.saturating_sub(self.next_seq);
 
         if win_left == 0 {
-            return; //if no available window, cannot send
+            return; // if there is no available window, we are not able to send anything out
         }
 
         println!(
-            "[TCPSource {}] Pulling {} bytes from app source at time {:.3}",
+            "[TCPSource {}] Pulling {} bytes from the app source at time {:.3}",
             self.endpoint_id, win_left, now
         );
 
-        // Try to pull data if app_source is configured
+        // pulls data from the app source if it has been configured
         if let Some(ref mut handle) = self.app_source {
             let packets = handle.pull(win_left).await;
+
             println!(
                 "[TCPSource {}] pulled {} packets",
                 self.endpoint_id,
@@ -380,7 +379,7 @@ impl TCPPacketSource {
                 "[ACK_RECEIVED] Source {} received ACK for seq={}, triggering next pull.",
                 self.endpoint_id, ack.sequence_num,
             );
-            self.try_pull_from_appsource(now, cwnd_limit).await;
+            self.pull_from_appsource(now, cwnd_limit).await;
         }
 
         false
@@ -492,7 +491,7 @@ impl TCPPacketSource {
 
         // Attempt to pull fresh packets from the application layer before sending,
         // to ensure there is data ready within the current congestion window.
-        self.try_pull_from_appsource(now, cwnd_limit).await;
+        self.pull_from_appsource(now, cwnd_limit).await;
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
             && self.next_seq + self.mss

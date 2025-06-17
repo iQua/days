@@ -189,11 +189,12 @@ impl PacketSource {
                 // TCPPacketSource now owns the data from the application
                 source.busy_until = now + initial_delay;
                 let cwnd_limit = source.get_cwnd_limit();
-                // On flow start, proactively pull packets from the AppSourceHandle
-                // according to current congestion window size (cwnd).
-                // This populates the initial packets to be sent as soon as allowed.
+
+                // On flow start, proactively pull packets from the AppSourceHandle according to the current
+                // congestion window size (cwnd). This populates the initial packets to be sent as soon as
+                // they are allowed.
                 source
-                    .try_pull_from_appsource(now + initial_delay, cwnd_limit)
+                    .pull_from_appsource(now + initial_delay, cwnd_limit)
                     .await;
             }
         }
