@@ -113,8 +113,8 @@ impl AppActor {
         (actor, tx)
     }
 
-    // Construct a dist actor that dynamically generates packets using traffic profile.
-    pub fn dist(
+    // Construct a distributed actor that dynamically generates packets using traffic profile.
+    pub fn distributedActor(
         flow_id: usize,
         tr: TrafficCharacteristics,
         rng: SmallRng,
@@ -219,10 +219,10 @@ impl AppDataSource {
     }
 
     // Create a dist source from traffic profile and flow ID
-    pub fn dist(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
+    pub fn distributed_source(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
-        let (actor, tx) = AppActor::dist(flow_id, tr, rng);
+        let (actor, tx) = AppActor::distributedActor(flow_id, tr, rng);
         (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }
 
