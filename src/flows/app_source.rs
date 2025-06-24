@@ -27,26 +27,38 @@ pub struct AppSourceHandle {
     tx: Sender<AppSourceRequest>,
     offset: usize, // chunk start in the shared buffer
     cursor: usize,
+    total_size: Option<usize>,
 }
 
 impl AppSourceHandle {
     /// handle that starts at byte‐offset 0 (broadcast case)
-    pub fn new(tx: Sender<AppSourceRequest>) -> Self {
+    pub fn new(tx: Sender<AppSourceRequest>, total_size: Option<usize>) -> Self {
         Self {
             tx,
             offset: 0,
             cursor: 0,
+            total_size,
         }
     }
 
     /// NEW: create a handle that starts at `offset` (Ring-AllReduce chunk)
-    pub fn with_offset(tx: Sender<AppSourceRequest>, offset: usize) -> Self {
+    pub fn with_offset(
+        tx: Sender<AppSourceRequest>,
+        offset: usize,
+        total_size: Option<usize>,
+    ) -> Self {
         Self {
             tx,
             offset,
             cursor: 0,
+            total_size,
         }
     }
+
+    pub fn get_total_size(&self) -> Option<usize> {
+        self.total_size
+    }
+
     // Send a pull request to the actor, and await the returned packets.
     pub async fn pull(&mut self, size: usize) -> Vec<Packet> {
         let (resp_tx, mut resp_rx) = channel(1);
@@ -139,39 +151,36 @@ impl Model for AppActor {
 }
 
 impl AppActor {
-    /// 定时事件：处理所有 Pull 请求并立即返回所需数据（只 clone，不 pop）
     fn run_once<'a>(
         &'a mut self,
         _: (),
         cx: &'a mut Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            // 逐条处理 channel 中积压的请求
             while let Ok(req) = self.rx.try_recv() {
                 let mut out = Vec::new();
-                let mut sent = 0usize; // 已返回的总字节
-                let mut idx = 0usize; // packet 下标
-                let mut byte_pos = 0usize; // 当前 packet 起始字节位置
+                let mut sent = 0usize; // the total bytes of returned data
+                let mut idx = 0usize; // index of packet
+                let mut byte_pos = 0usize; // the current packet start position
 
-                // ① 找到 start 所在的 packet 下标
+                // find the index of current packet start
                 while idx < self.buffer.len() && byte_pos + self.buffer[idx].size <= req.start {
                     byte_pos += self.buffer[idx].size;
                     idx += 1;
                 }
 
-                // ② 从 idx 开始 clone，直到满足 size
+                // clone from idx, until sent < req.size
                 while idx < self.buffer.len() && sent < req.size {
-                    let pkt = self.buffer[idx].clone(); // 只 clone，不删除
+                    let pkt = self.buffer[idx].clone();
                     sent += pkt.size;
                     out.push(pkt);
                     idx += 1;
                 }
 
-                // ③ 将结果异步返回
+                // return result
                 let _ = req.respond_to.try_send(out);
             }
 
-            // 重新调度下一轮（50 µs 后）
             cx.schedule_event(Duration::from_micros(50), Self::run_once, ())
                 .expect("reschedule run_once failed");
         }
@@ -187,17 +196,36 @@ pub enum AppDataSource {
 
 impl AppDataSource {
     // Create a buffered source with pre-generated packets
-    pub fn buffered(packets: Vec<Packet>) -> (Self, AppActor) {
+    fn buffered_from_packets(packets: Vec<Packet>) -> (Self, AppActor) {
+        let total_size = packets.iter().map(|p| p.size).sum::<usize>();
         let (actor, tx) = AppActor::buffered(packets);
-        (Self::Buffered(AppSourceHandle::new(tx)), actor)
+        (
+            Self::Buffered(AppSourceHandle::new(tx, Some(total_size))),
+            actor,
+        )
     }
+
+    pub fn buffered(total_size: usize, mss: usize) -> (Self, AppActor) {
+        let mut packets = Vec::new();
+        let mut remaining = total_size;
+        let mut seq = 0;
+        while remaining > 0 {
+            let sz = mss.min(remaining);
+            packets.push(Packet::new(sz, seq, 0, 0.0));
+            seq += sz;
+            remaining -= sz;
+        }
+        Self::buffered_from_packets(packets)
+    }
+
     // Create a dist source from traffic profile and flow ID
     pub fn dist(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
         let (actor, tx) = AppActor::dist(flow_id, tr, rng);
-        (Self::Dist(AppSourceHandle::new(tx)), actor)
+        (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }
+
     // Get the underlying handle to use in TCPPacketSource
     pub fn handle(&self) -> AppSourceHandle {
         match self {
@@ -206,7 +234,9 @@ impl AppDataSource {
     }
     pub fn handle_with_offset(&self, offset: usize) -> AppSourceHandle {
         match self {
-            Self::Buffered(h) | Self::Dist(h) => AppSourceHandle::with_offset(h.clone().tx, offset),
+            Self::Buffered(h) | Self::Dist(h) => {
+                AppSourceHandle::with_offset(h.tx.clone(), offset, h.total_size)
+            }
         }
     }
 }
