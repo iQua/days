@@ -789,6 +789,7 @@ impl Topology {
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
         let mut app_actors: Vec<AppActor> = Vec::new();
         let mut flow_id_to_source_handle: HashMap<usize, AppSourceHandle> = HashMap::new();
+        let mut conn_map: HashMap<(usize, usize), (AppDataSource, AppActor)> = HashMap::new();
 
         for collective in &self.collectives {
             if matches!(
@@ -836,9 +837,6 @@ impl Topology {
                 let n = collective.sources.len();
                 let chunk_size = total_size / n;
 
-                // one data-source + actor per *source node*
-                let mut host_map: HashMap<usize, (AppDataSource, AppActor)> = HashMap::new();
-
                 let mut flow_id = collective.first_flow_id;
 
                 for phase in ["Scatter", "Gather"] {
@@ -847,7 +845,7 @@ impl Topology {
                             let src_host = collective.sources[rank]; // flow's sender
                             let dst_host = collective.sources[(rank + 1) % n];
 
-                            // which chunk travels in this hop?
+                            // which chunk travels in this hop
                             let chunk_owner = if phase == "Scatter" {
                                 (rank + n - step) % n
                             } else {
@@ -855,46 +853,53 @@ impl Topology {
                             };
                             let chunk_offset = chunk_owner * chunk_size;
 
-                            // ensure we have *one* AppActor for this src_host
-                            let (datasrc, _actor) = host_map.entry(src_host).or_insert_with(|| {
-                                // build full packet vector once
-                                // let mut pkts = Vec::new();
-                                // let mut left = total_size;
-                                // let mut seq = 0;
-                                // while left > 0 {
-                                //     let sz = mss.min(left);
-                                //     pkts.push(Packet::new(sz, seq, 0, 0.0));
-                                //     seq += sz;
-                                //     left -= sz;
-                                // }
-                                AppDataSource::buffered(total_size, mss) // -> (ds, actor)
-                            });
-
-                            // get handle with proper offset for this chunk
+                            // ensure we have one AppActor for this src_host
+                            let (datasrc, _actor) =
+                                conn_map.entry((src_host, dst_host)).or_insert_with(|| {
+                                    AppDataSource::buffered(total_size, mss) // => (ds, actor)
+                                });
+                            // build full packet vector once
+                            // let mut pkts = Vec::new();
+                            // let mut left = total_size;
+                            // let mut seq = 0;
+                            // while left > 0 {
+                            //     let sz = mss.min(left);
+                            //     pkts.push(Packet::new(sz, seq, 0, 0.0));
+                            //     seq += sz;
+                            //     left -= sz;
+                            // }
                             let handle = datasrc.handle_with_offset(chunk_offset);
                             flow_id_to_source_handle.insert(flow_id, handle);
 
                             println!(
-                                "[{phase}] flow {flow_id}  src {src_host}->{dst_host}  chunk_owner {chunk_owner}"
+                                "[{phase}] flow {flow_id}  {src_host}->{dst_host}  chunk_owner {chunk_owner}"
                             );
 
                             flow_id += 1;
                         }
                     }
                 }
-
-                // register every (datasrc, actor) exactly once
-                for (host, (ds, actor)) in host_map {
-                    app_sources.insert(host, ds);
-                    app_actors.push(actor);
-                }
             }
         }
-        println!("[Debug] Total AppSources: {}", app_sources.len());
+
         println!(
-            "[Debug] Total source handles: {}",
+            "[Debug] Unique TCP handles   : {}",
+            if conn_map.is_empty() {
+                app_sources.len()
+            } else {
+                conn_map.len()
+            }
+        );
+        println!(
+            "[Debug] Flow count            : {}",
             flow_id_to_source_handle.len()
         );
+        // register every (datasrc, actor) exactly once
+        for ((src, _dst), (ds, actor)) in conn_map.into_iter() {
+            app_sources.insert(src, ds);
+            app_actors.push(actor);
+        }
+        println!("[Debug] Total AppSources: {}", app_sources.len());
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
