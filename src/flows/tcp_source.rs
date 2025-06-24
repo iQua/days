@@ -182,20 +182,20 @@ impl TCPPacketSource {
     /// - after receiving new ACKs (to refill the window)
     /// - before sending packets (to populate the send buffer)
     pub async fn pull_from_appsource(&mut self, now: f64) {
-        // 1. 若已无数据可发，直接返回
+        // stop if all flow data has been sent
         if self.remaining_bytes == 0 {
             return;
         }
 
-        // 2. 计算当前可用窗口
+        // compute available sending window (cwnd - unacked data)
         let cwnd = self.congestion_control.get_cwnd();
         let win_left = self.last_ack + cwnd - self.next_seq;
         if win_left < self.mss {
-            // 不足 1 MSS，等待 ACK 释放窗口
+            // window too small to send a full segment, wait for ACKs
             return;
         }
 
-        // 3. 本轮至多拉这么多字节
+        // pull at most min(available window, remaining bytes)
         let pull_size = win_left.min(self.remaining_bytes);
 
         println!(
@@ -212,7 +212,7 @@ impl TCPPacketSource {
             );
 
             for mut pkt in pkts {
-                // 防御：再次确保不超窗口
+                // ensure we do not exceed the current window
                 if self.next_seq + pkt.size > self.last_ack + cwnd {
                     break;
                 }
@@ -221,13 +221,14 @@ impl TCPPacketSource {
                 pkt.packet_id = self.next_seq;
 
                 self.output.send(pkt.clone()).await;
-                self.packet_sent(&pkt, now); // ← 内部已自增 next_seq / send_buffer
+                // updates next_seq and send_buffer
+                self.packet_sent(&pkt, now);
 
                 self.remaining_bytes -= pkt.size;
             }
         }
 
-        // 4. 若全部字节已发且已确认，结束 flow
+        // if all bytes have been sent and acknowledged, complete the flow
         if self.remaining_bytes == 0 && self.send_buffer == 0 {
             println!(
                 "[TCPSource {}] All data sent & ACKed - wrap-up.",
@@ -384,9 +385,6 @@ impl TCPPacketSource {
                 return true;
             }
 
-            // Try pulling more data from the channel if cwnd allows
-            let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
-
             // After receiving a new ACK, some window space may have been freed.
             // Attempt to pull more packets from the application layer to keep the flow going.
             println!(
@@ -501,7 +499,6 @@ impl TCPPacketSource {
             self.congestion_control.get_cwnd(),
             self.last_ack
         );
-        let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
 
         // Attempt to pull fresh packets from the application layer before sending,
         // to ensure there is data ready within the current congestion window.
