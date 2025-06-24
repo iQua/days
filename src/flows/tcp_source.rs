@@ -110,6 +110,7 @@ pub struct TCPPacketSource {
     min_rto: f64,
     /// Maximum RTO value in seconds
     max_rto: f64,
+    remaining_bytes: usize,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -136,7 +137,10 @@ impl TCPPacketSource {
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
-
+        let remaining_bytes = app_source
+            .as_ref()
+            .and_then(|h| h.get_total_size())
+            .unwrap_or(usize::MAX);
         TCPPacketSource {
             time: 0.0,
             endpoint_id: next_endpoint_id(),
@@ -156,6 +160,7 @@ impl TCPPacketSource {
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
             app_source,
+            remaining_bytes,
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
@@ -176,50 +181,59 @@ impl TCPPacketSource {
     /// This function is typically called:
     /// - after receiving new ACKs (to refill the window)
     /// - before sending packets (to populate the send buffer)
-    pub async fn pull_from_appsource(&mut self, now: f64, cwnd_limit: usize) {
-        let win_left = cwnd_limit.saturating_sub(self.next_seq);
-
-        if win_left == 0 {
-            return; // if there is no available window, we are not able to send anything out
+    pub async fn pull_from_appsource(&mut self, now: f64) {
+        // 1. 若已无数据可发，直接返回
+        if self.remaining_bytes == 0 {
+            return;
         }
 
+        // 2. 计算当前可用窗口
+        let cwnd = self.congestion_control.get_cwnd();
+        let win_left = self.last_ack + cwnd - self.next_seq;
+        if win_left < self.mss {
+            // 不足 1 MSS，等待 ACK 释放窗口
+            return;
+        }
+
+        // 3. 本轮至多拉这么多字节
+        let pull_size = win_left.min(self.remaining_bytes);
+
         println!(
-            "[TCPSource {}] Pulling {} bytes from the app source at time {:.3}",
-            self.endpoint_id, win_left, now
+            "[TCPSource {}] Pulling {} bytes (win_left {}) at {:.3}",
+            self.endpoint_id, pull_size, win_left, now
         );
 
-        // pulls data from the app source if it has been configured
         if let Some(ref mut handle) = self.app_source {
-            let packets = handle.pull(win_left).await;
-
+            let pkts = handle.pull(pull_size).await;
             println!(
-                "[TCPSource {}] pulled {} packets",
+                "[TCPSource {}] pulled {} packet(s)",
                 self.endpoint_id,
-                packets.len()
+                pkts.len()
             );
 
-            for mut packet in packets {
-                // If packet size exceeds window, keep it for future
-                if self.next_seq + packet.size > cwnd_limit {
+            for mut pkt in pkts {
+                // 防御：再次确保不超窗口
+                if self.next_seq + pkt.size > self.last_ack + cwnd {
                     break;
                 }
 
-                packet.flow_id = self.flow_id;
-                packet.packet_id = self.next_seq;
+                pkt.flow_id = self.flow_id;
+                pkt.packet_id = self.next_seq;
 
-                self.output.send(packet.clone()).await;
-                self.packet_sent(&packet, now);
+                self.output.send(pkt.clone()).await;
+                self.packet_sent(&pkt, now); // ← 内部已自增 next_seq / send_buffer
 
-                // self.next_seq += packet.size;
-                // self.send_buffer += packet.size;
-
-                println!(
-                    "TCPPacketSource {} pulled packet {} ({} bytes) at {:.3}.",
-                    self.endpoint_id, packet.packet_id, packet.size, now
-                );
+                self.remaining_bytes -= pkt.size;
             }
-        } else {
-            println!("AppSourceHandle not provided, skipping pull.");
+        }
+
+        // 4. 若全部字节已发且已确认，结束 flow
+        if self.remaining_bytes == 0 && self.send_buffer == 0 {
+            println!(
+                "[TCPSource {}] All data sent & ACKed - wrap-up.",
+                self.endpoint_id
+            );
+            self.wrap_up(now).await;
         }
     }
 
@@ -379,7 +393,7 @@ impl TCPPacketSource {
                 "[ACK_RECEIVED] Source {} received ACK for seq={}, triggering next pull.",
                 self.endpoint_id, ack.sequence_num,
             );
-            self.pull_from_appsource(now, cwnd_limit).await;
+            self.pull_from_appsource(now).await;
         }
 
         false
@@ -491,7 +505,7 @@ impl TCPPacketSource {
 
         // Attempt to pull fresh packets from the application layer before sending,
         // to ensure there is data ready within the current congestion window.
-        self.pull_from_appsource(now, cwnd_limit).await;
+        self.pull_from_appsource(now).await;
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
             && self.next_seq + self.mss

@@ -78,16 +78,13 @@ impl PacketSource {
                 traffic,
                 rng,
             )),
-            FlowType::TCP => {
-                // let handle = app_source.expect("TCP flow must provide AppSourceHandle");
-                PacketSource::TCPPacketSource(TCPPacketSource::new(
-                    flow_id,
-                    flow_start_after,
-                    traffic,
-                    rng,
-                    app_source,
-                ))
-            }
+            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                rng,
+                app_source,
+            )),
         }
     }
 
@@ -193,9 +190,7 @@ impl PacketSource {
                 // On flow start, proactively pull packets from the AppSourceHandle according to the current
                 // congestion window size (cwnd). This populates the initial packets to be sent as soon as
                 // they are allowed.
-                source
-                    .pull_from_appsource(now + initial_delay, cwnd_limit)
-                    .await;
+                source.pull_from_appsource(now + initial_delay).await;
             }
         }
     }
