@@ -270,7 +270,6 @@ impl Topology {
                     let n = collective.sources.len();
                     let mut flow_id = collective.first_flow_id;
 
-                    // 记录每个节点上一条 flow 在 self.flows 中的“索引”
                     let mut last_scatter: Vec<Option<usize>> = vec![None; n];
                     let mut last_gather: Vec<Option<usize>> = vec![None; n];
 
@@ -292,7 +291,6 @@ impl Topology {
                                 };
                                 let chunk_from = collective.sources[chunk_owner];
 
-                                // -------- 1. 先创建 Flow ---------------------------
                                 let flow = Flow::new(FlowParams {
                                     id: flow_id,
                                     path: None,
@@ -305,20 +303,18 @@ impl Topology {
                                     traffic: collective.traffic,
                                     seed: collective.id,
                                 });
-                                // 在向量中的索引
+
                                 let this_idx = self.flows.len();
                                 self.flows.push(flow);
 
-                                // -------- 2. 写依赖到“上一条 flow” -----------------
                                 if let Some(prev_idx) = last_table[rank] {
-                                    // 让上一条 flow 在完成后启动本 flow
                                     self.flows[prev_idx].starts_before.push(flow_id);
                                     println!(
                                         "link: flow {} must wait flow {}",
                                         flow_id, self.flows[prev_idx].id
                                     );
                                 }
-                                // 更新表：当前 flow 成为最新
+
                                 last_table[rank] = Some(this_idx);
 
                                 debug!(
@@ -804,21 +800,21 @@ impl Topology {
                     _ => panic!("Only byte-based broadcast is supported"),
                 };
 
-                let mut packets = Vec::new();
-                let mut remaining = total_size;
+                // let mut packets = Vec::new();
+                // let mut remaining = total_size;
                 let mss = 512;
-                let mut seq = 0;
+                // let mut seq = 0;
 
-                while remaining > 0 {
-                    let sz = mss.min(remaining);
-                    packets.push(Packet::new(sz, seq, 0, 0.0)); // 此处流标识不重要
-                    seq += sz;
-                    remaining -= sz;
-                }
+                // while remaining > 0 {
+                //     let sz = mss.min(remaining);
+                //     packets.push(Packet::new(sz, seq, 0, 0.0));
+                //     seq += sz;
+                //     remaining -= sz;
+                // }
 
                 // create unique AppDataSource and actor
-                let (datasrc, actor) = AppDataSource::buffered(packets);
-                //assign handle to each flow：all flows obtain data from the same datasrc
+                let (datasrc, actor) = AppDataSource::buffered(total_size, mss);
+                // assign handle to each flow：all flows obtain data from the same datasrc
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
@@ -827,7 +823,7 @@ impl Topology {
                 app_sources.insert(collective.id, datasrc);
                 app_actors.push(actor);
             }
-            // --- Ring-AllReduce (TCP) -----------------------------------------------
+            // Ring-AllReduce (TCP)
             if matches!(
                 (collective.collective_type, collective.flow_type),
                 (CollectiveType::RingAllReduce, FlowType::TCP)
@@ -862,16 +858,16 @@ impl Topology {
                             // ensure we have *one* AppActor for this src_host
                             let (datasrc, _actor) = host_map.entry(src_host).or_insert_with(|| {
                                 // build full packet vector once
-                                let mut pkts = Vec::new();
-                                let mut left = total_size;
-                                let mut seq = 0;
-                                while left > 0 {
-                                    let sz = mss.min(left);
-                                    pkts.push(Packet::new(sz, seq, 0, 0.0));
-                                    seq += sz;
-                                    left -= sz;
-                                }
-                                AppDataSource::buffered(pkts) // -> (ds, actor)
+                                // let mut pkts = Vec::new();
+                                // let mut left = total_size;
+                                // let mut seq = 0;
+                                // while left > 0 {
+                                //     let sz = mss.min(left);
+                                //     pkts.push(Packet::new(sz, seq, 0, 0.0));
+                                //     seq += sz;
+                                //     left -= sz;
+                                // }
+                                AppDataSource::buffered(total_size, mss) // -> (ds, actor)
                             });
 
                             // get handle with proper offset for this chunk
