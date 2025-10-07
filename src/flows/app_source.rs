@@ -94,8 +94,6 @@ impl AppSourceHandle {
 pub struct AppActor {
     rx: Receiver<AppSourceRequest>,
     buffer: Vec<Packet>,
-    traffic: Option<TrafficCharacteristics>,
-    rng: Option<SmallRng>,
     pub out: Output<Packet>,
 }
 
@@ -103,18 +101,18 @@ pub struct AppActor {
 impl AppActor {
     pub fn buffered(packets: Vec<Packet>) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(128);
+
         let actor = AppActor {
             rx,
             buffer: packets,
-            traffic: None,
-            rng: None,
             out: Output::default(),
         };
+
         (actor, tx)
     }
 
     // Construct a distributed actor that dynamically generates packets using traffic profile.
-    pub fn distributedActor(
+    pub fn distributed_actor(
         flow_id: usize,
         tr: TrafficCharacteristics,
         rng: SmallRng,
@@ -133,8 +131,6 @@ impl AppActor {
         let actor = AppActor {
             rx,
             buffer: packets,
-            traffic: Some(tr),
-            rng: Some(rng),
             out: Output::default(),
         };
         (actor, tx)
@@ -222,7 +218,7 @@ impl AppDataSource {
     pub fn distributed_source(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
-        let (actor, tx) = AppActor::distributedActor(flow_id, tr, rng);
+        let (actor, tx) = AppActor::distributed_actor(flow_id, tr, rng);
         (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }
 

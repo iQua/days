@@ -1,5 +1,14 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
+use std::cmp::min;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+
+use core::fmt;
+use log::debug;
+
+use nexosim::model::Model;
+use nexosim::ports::Output;
 
 use crate::flows::app_source::AppSourceHandle;
 use crate::flows::bbr::TCPBBR;
@@ -12,14 +21,6 @@ use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
-use core::fmt;
-use log::debug;
-use nexosim::model::Model;
-use nexosim::ports::Output;
-use rand::rngs::SmallRng;
-use std::cmp::min;
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
@@ -127,7 +128,6 @@ impl TCPPacketSource {
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
-        rng: SmallRng,
         app_source: Option<AppSourceHandle>,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
@@ -170,7 +170,7 @@ impl TCPPacketSource {
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,
-            clock_granularity: 0.001, // 1ms granularity
+            clock_granularity: 0.001, // 1 ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
         }

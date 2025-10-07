@@ -20,6 +20,7 @@ use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
+use crate::flows::FlowSize;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
@@ -38,7 +39,6 @@ use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
 use crate::flows::app_source::{AppActor, AppDataSource};
-use crate::flows::packet::Packet;
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -551,7 +551,6 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
-        mut app_sources: HashMap<usize, AppDataSource>,
         flow_id_to_source_handle: Option<HashMap<usize, AppSourceHandle>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
@@ -797,8 +796,8 @@ impl Topology {
                 (CollectiveType::Broadcast, FlowType::TCP)
             ) {
                 let total_size = match collective.traffic.size {
-                    crate::flows::FlowSize::Bytes(s) => s,
-                    _ => panic!("Only byte-based broadcast is supported"),
+                    FlowSize::Bytes(s) => s,
+                    _ => panic!("Only byte-based broadcast is supported."),
                 };
 
                 // let mut packets = Vec::new();
@@ -830,8 +829,8 @@ impl Topology {
                 (CollectiveType::RingAllReduce, FlowType::TCP)
             ) {
                 let total_size = match collective.traffic.size {
-                    crate::flows::FlowSize::Bytes(b) => b,
-                    _ => panic!("RingAllReduce only supports byte-based flows"),
+                    FlowSize::Bytes(b) => b,
+                    _ => panic!("RingAllReduce only supports byte-based flows."),
                 };
                 let mss = 512;
                 let n = collective.sources.len();
@@ -907,12 +906,8 @@ impl Topology {
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(
-            &mut statistics,
-            ui_mbox,
-            app_sources,
-            Some(flow_id_to_source_handle),
-        );
+        (self, ui_mbox) =
+            self.attach_flows(&mut statistics, ui_mbox, Some(flow_id_to_source_handle));
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();

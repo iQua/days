@@ -1,7 +1,6 @@
 //! Implements a general packet source that provides interfaces of all kinds of
 //! packet sources.
 
-use crate::flows::app_source::AppSourceHandle;
 use std::borrow::BorrowMut;
 use std::fmt::Debug;
 use std::future::Future;
@@ -10,13 +9,14 @@ use std::time::Duration;
 use log::debug;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use serde::Serialize;
 use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
-use serde::Serialize;
 
+use crate::flows::app_source::AppSourceHandle;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
@@ -82,7 +82,6 @@ impl PacketSource {
                 flow_id,
                 flow_start_after,
                 traffic,
-                rng,
                 app_source,
             )),
         }
@@ -185,7 +184,6 @@ impl PacketSource {
 
                 // TCPPacketSource now owns the data from the application
                 source.busy_until = now + initial_delay;
-                let cwnd_limit = source.get_cwnd_limit();
 
                 // On flow start, proactively pull packets from the AppSourceHandle according to the current
                 // congestion window size (cwnd). This populates the initial packets to be sent as soon as
