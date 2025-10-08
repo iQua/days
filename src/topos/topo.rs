@@ -309,10 +309,6 @@ impl Topology {
 
                                 if let Some(prev_idx) = last_table[rank] {
                                     self.flows[prev_idx].starts_before.push(flow_id);
-                                    println!(
-                                        "link: flow {} must wait flow {}",
-                                        flow_id, self.flows[prev_idx].id
-                                    );
                                 }
 
                                 last_table[rank] = Some(this_idx);
@@ -565,14 +561,8 @@ impl Topology {
             source_mboxes.insert(flow.id, source_mbox);
         }
 
+        // creates and attaches a packet source and sink for each flow
         for flow in self.flows.iter_mut() {
-            println!(
-                "[DEBUG] Attaching flow_id={} from src_host={} to dst_host={}",
-                flow.id, flow.source_host, flow.sink_host
-            );
-
-            // creates and attaches a packet source and sink for each flow
-
             // packet sources and sinks must be attached to hosts
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
@@ -857,22 +847,9 @@ impl Topology {
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
                                     AppDataSource::buffered(total_size, mss) // => (ds, actor)
                                 });
-                            // build full packet vector once
-                            // let mut pkts = Vec::new();
-                            // let mut left = total_size;
-                            // let mut seq = 0;
-                            // while left > 0 {
-                            //     let sz = mss.min(left);
-                            //     pkts.push(Packet::new(sz, seq, 0, 0.0));
-                            //     seq += sz;
-                            //     left -= sz;
-                            // }
+
                             let handle = datasrc.handle_with_offset(chunk_offset);
                             flow_id_to_source_handle.insert(flow_id, handle);
-
-                            println!(
-                                "[{phase}] flow {flow_id}  {src_host}->{dst_host}  chunk_owner {chunk_owner}"
-                            );
 
                             flow_id += 1;
                         }

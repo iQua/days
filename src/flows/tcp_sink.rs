@@ -104,10 +104,6 @@ impl TCPPacketSink {
     }
     #[instrument(skip(self))]
     pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
-        println!(
-            "[ACK] Sink {} producing ack for packet_id={} at time {:.3}",
-            self.endpoint_id, packet.packet_id, now
-        );
         let sequence_num = packet.packet_id;
 
         // inserts the packet into the receive buffer and sorts based on the
@@ -156,11 +152,7 @@ impl TCPPacketSink {
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
         // updates the locally maintained simulation time
-        // println!(
-        //     "[RECV] sink={} flow={} pkt_id={} now={:.3}",
-        //     self.endpoint_id, packet.flow_id, packet.packet_id, now
-        // );
-        //
+
         if packet.packet_id < self.next_seq_expected {
             println!(
                 "[DUP ] TCP sink={} flow={} pkt_id={} now={:.3}",
