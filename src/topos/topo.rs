@@ -69,6 +69,12 @@ pub struct SwitchConfig {
     vticks: Option<Vec<f64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Scatter,
+    Gather,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum TopoCategory {
     FatTree,
@@ -273,23 +279,20 @@ impl Topology {
                     let mut last_scatter: Vec<Option<usize>> = vec![None; n];
                     let mut last_gather: Vec<Option<usize>> = vec![None; n];
 
-                    for phase in ["Scatter", "Gather"] {
-                        let last_table = if phase == "Scatter" {
-                            &mut last_scatter
-                        } else {
-                            &mut last_gather
+                    for phase in [Phase::Scatter, Phase::Gather] {
+                        let last_table = match phase {
+                            Phase::Scatter => &mut last_scatter,
+                            Phase::Gather => &mut last_gather,
                         };
 
                         for rank in 0..n {
-                            for step in 1..n {
+                            for _step in 1..n {
                                 let src = collective.sources[rank];
                                 let dst = collective.sources[(rank + 1) % n];
-                                let chunk_owner = if phase == "Scatter" {
-                                    (rank + n - step) % n
-                                } else {
-                                    (rank + step) % n
-                                };
-                                let chunk_from = collective.sources[chunk_owner];
+                                // let chunk_owner = match phase {
+                                //     Phase::Scatter => (rank + n - step) % n,
+                                //     Phase::Gather => (rank + step) % n,
+                                // };
 
                                 let flow = Flow::new(FlowParams {
                                     id: flow_id,
@@ -312,11 +315,6 @@ impl Topology {
                                 }
 
                                 last_table[rank] = Some(this_idx);
-
-                                debug!(
-                                    "Produced RingAllReduce {phase} flow {} ({} -> {}), chunk from node {}",
-                                    flow_id, src, dst, chunk_from
-                                );
                                 flow_id += 1;
                             }
                         }
@@ -828,17 +826,16 @@ impl Topology {
 
                 let mut flow_id = collective.first_flow_id;
 
-                for phase in ["Scatter", "Gather"] {
+                for phase in [Phase::Scatter, Phase::Gather] {
                     for rank in 0..n {
                         for step in 1..n {
                             let src_host = collective.sources[rank]; // flow's sender
                             let dst_host = collective.sources[(rank + 1) % n];
 
                             // which chunk travels in this hop
-                            let chunk_owner = if phase == "Scatter" {
-                                (rank + n - step) % n
-                            } else {
-                                (rank + step) % n
+                            let chunk_owner = match phase {
+                                Phase::Scatter => (rank + n - step) % n,
+                                Phase::Gather => (rank + step) % n,
                             };
                             let chunk_offset = chunk_owner * chunk_size;
 
