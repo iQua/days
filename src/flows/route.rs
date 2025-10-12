@@ -2,7 +2,7 @@
 //! takes. Currently, three routing protocols have been implemented:
 //!
 //! - Shortest path routing: Selects a random candidate from a set of shortest
-//! paths, which are computed by the `petgraph` crate using the A* algorithm.
+//!   paths, which are computed by the `petgraph` crate using the A* algorithm.
 //! - Path from configuration: Uses the path that is specified in the configuration.
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!

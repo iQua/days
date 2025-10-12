@@ -257,7 +257,7 @@ impl PacketSink {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         assert_eq!(endpoint_id, self.id());
-        debug!("{} reporting upon request.", format!("{self}"));
+        debug!("{} reporting upon request.", self);
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
@@ -301,11 +301,7 @@ impl PacketSink {
 
         debug!(
             "{} received packet {} ({} bytes) from flow {} at time {:.3}.",
-            format!("{self}"),
-            packet.packet_id,
-            packet.size,
-            packet.flow_id,
-            now,
+            self, packet.packet_id, packet.size, packet.flow_id, now,
         );
 
         match self {

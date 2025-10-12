@@ -43,8 +43,8 @@ pub struct PacketSourceReport {
 
 #[derive(Debug)]
 pub enum PacketSource {
-    DistPacketSource(DistPacketSource),
-    TCPPacketSource(TCPPacketSource),
+    DistPacketSource(Box<DistPacketSource>),
+    TCPPacketSource(Box<TCPPacketSource>),
 }
 
 impl std::fmt::Display for PacketSource {
@@ -72,18 +72,15 @@ impl PacketSource {
         };
 
         match flow_type {
-            FlowType::PacketDistribution => PacketSource::DistPacketSource(DistPacketSource::new(
-                flow_id,
-                flow_start_after,
-                traffic,
-                rng,
+            FlowType::PacketDistribution => PacketSource::DistPacketSource(Box::new(
+                DistPacketSource::new(flow_id, flow_start_after, traffic, rng),
             )),
-            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
+            FlowType::TCP => PacketSource::TCPPacketSource(Box::new(TCPPacketSource::new(
                 flow_id,
                 flow_start_after,
                 traffic,
                 app_source,
-            )),
+            ))),
         }
     }
 
