@@ -113,12 +113,13 @@ impl AppActor {
     // construct a distributed actor that dynamically generates packets using traffic profile.
     pub fn distributed_actor(
         flow_id: usize,
-        tr: TrafficCharacteristics,
+        traffic: TrafficCharacteristics,
         rng: SmallRng,
     ) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(128);
-        let mut src = DistPacketSource::new(flow_id, Vec::new(), tr.clone(), rng.clone());
+        let mut src = DistPacketSource::new(flow_id, Vec::new(), traffic, rng.clone());
         let mut packets = Vec::new();
+
         for _ in 0..512 {
             let (p, _) = src.produce_packet(0.0);
             packets.push(p);
@@ -146,6 +147,7 @@ impl Model for AppActor {
 }
 
 impl AppActor {
+    #[allow(clippy::manual_async_fn)]
     fn run_once<'a>(
         &'a mut self,
         _: (),
