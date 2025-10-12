@@ -9,7 +9,7 @@ fn test_build_graph() {
         panic!("Failed to build the network graph.");
     };
 
-    let ground_truth = UnGraph::<usize, ()>::from_edges(&[(0, 1)]);
+    let ground_truth = UnGraph::<usize, ()>::from_edges([(0, 1)]);
     assert!(algo::is_isomorphic(&simple_graph, &ground_truth));
 
     println!("The simple graph is:\n{:?}", simple_graph);

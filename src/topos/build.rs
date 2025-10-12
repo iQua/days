@@ -432,7 +432,7 @@ mod tests {
                 let core_neighbors: HashSet<_> = graph
                     .edges(node_idx)
                     .map(|e| e.target().index())
-                    .filter(|&n| n >= (k * k) as usize)
+                    .filter(|&n| n >= (k * k))
                     .collect();
 
                 assert_eq!(core_neighbors.len(), k / 2);

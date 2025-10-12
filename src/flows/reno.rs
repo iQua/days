@@ -175,13 +175,12 @@ impl TCPReno {
 
     /// Handles retransmission requirements
     fn handle_retransmission(&mut self, seq: usize) {
-        if self.retransmit_required
-            && seq > self.highest_ack {
-                self.mark_lost(seq);
-                if let Some(&next_seq) = self.retransmission_queue.first() {
-                    self.immediate_retransmit = Some(next_seq);
-                }
+        if self.retransmit_required && seq > self.highest_ack {
+            self.mark_lost(seq);
+            if let Some(&next_seq) = self.retransmission_queue.first() {
+                self.immediate_retransmit = Some(next_seq);
             }
+        }
     }
 
     /// Resets recovery state
@@ -780,7 +779,7 @@ mod tests {
 
         for rtt in 1..=total_rtt {
             // Calculate the number of ACKs per RTT
-            let acks_per_rtt = (reno.cwnd + mss - 1) / mss; // Ceiling division to ensure all data is acknowledged
+            let acks_per_rtt = reno.cwnd.div_ceil(mss); // Ceiling division to ensure all data is acknowledged
 
             // Simulate ACKs for the RTT
             for _ in 0..acks_per_rtt {
@@ -800,11 +799,7 @@ mod tests {
             let actual_cwnd = reno.get_cwnd();
 
             // Calculate deviation
-            let deviation = if actual_cwnd > expected_cwnd {
-                actual_cwnd - expected_cwnd
-            } else {
-                expected_cwnd - actual_cwnd
-            };
+            let deviation = actual_cwnd.abs_diff(expected_cwnd);
 
             // Assert that deviation is within acceptable range
             assert!(

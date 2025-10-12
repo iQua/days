@@ -650,7 +650,7 @@ mod tests {
 
         // verifies packet was dropped
         assert_eq!(sp.packets_dropped, 1);
-        assert!(sp.queues.get(&1).map_or(true, |q| q.is_empty()));
+        assert!(sp.queues.get(&1).is_none_or(|q| q.is_empty()));
 
         // sends a packet within capacity limits
         let normal_packet = Packet::new(1000, 2, 0, 0.0);

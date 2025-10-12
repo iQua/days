@@ -690,11 +690,7 @@ mod tests {
         cubic.ack_received(0, 0.1, 100.0, 512); // bytes_acked = 512
 
         // Calculate absolute difference manually
-        let diff = if cubic.cwnd > 2_000_000 {
-            cubic.cwnd - 2_000_000
-        } else {
-            2_000_000 - cubic.cwnd
-        };
+        let diff = cubic.cwnd.abs_diff(2_000_000);
 
         // Allow a small difference due to floating-point precision
         assert!(

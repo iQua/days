@@ -371,7 +371,6 @@ mod tests {
         // Count how many unique paths are selected
         let unique_paths = vec![path1, path2, path3]
             .into_iter()
-            .map(|p| p.clone())
             .collect::<std::collections::HashSet<_>>();
 
         // There are 2 possible paths, so unique_paths.len() should be <= 2

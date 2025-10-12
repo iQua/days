@@ -668,7 +668,7 @@ mod tests {
             1e6,
             10,
             CapacityUnit::Packets,
-            Arc::new(|flow_id| (flow_id % 3) as usize), // maps flow_ids to 3 classes
+            Arc::new(|flow_id| flow_id % 3), // maps flow_ids to 3 classes
             DropStrategy::TailDrop,
             vec![1, 2, 3], // different weights
         );
