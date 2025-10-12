@@ -142,7 +142,7 @@ impl DistPacketSource {
     pub async fn send_packet(&mut self, now: f64) -> f64 {
         let (packet, interval) = self.produce_packet(now);
 
-        self.output.send(packet.clone()).await;
+        self.output.send(packet).await;
         self.packet_sent(&packet, now);
 
         interval

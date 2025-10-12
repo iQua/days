@@ -58,6 +58,12 @@ pub struct CsvLogger {
     total_packets: Arc<AtomicUsize>,
 }
 
+impl Default for CsvLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CsvLogger {
     /// Creates a new CsvLogger instance with default settings.
     pub fn new() -> Self {
@@ -153,7 +159,7 @@ impl CsvLogger {
     /// Logs a report. Must be called after the logger has been initialized.
     pub fn log_report(report: Report, timing: ReportTiming) {
         let logger = CsvLogger::get_instance();
-        if !logger.log_path.get().is_some() {
+        if logger.log_path.get().is_none() {
             panic!("CsvLogger not initialized. Call init or init_from_config first.");
         }
 

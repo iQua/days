@@ -389,14 +389,13 @@ impl CongestionControl for TCPCubic {
         // Update HyStart state with improved RTT tracking
         self.update_hystart(rtt, current_time);
 
-        if self.in_recovery {
-            if bytes_acked >= 3 * self.mss {
+        if self.in_recovery
+            && bytes_acked >= 3 * self.mss {
                 // Full acknowledgment received, exit recovery
                 self.cwnd = self.ssthresh;
                 self.in_recovery = false;
                 return;
             }
-        }
 
         if self.cwnd <= self.ssthresh && !self.hystart.exit_slow_start {
             // Slow start with HyStart++ detection

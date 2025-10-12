@@ -207,23 +207,20 @@ impl Collective {
                 flow_count
             );
 
-            match collective_type {
-                CollectiveType::RingAllReduce => {
-                    for (i, path) in flow_paths.iter().enumerate() {
-                        assert!(
-                            path.len() >= 2,
-                            "Each RingAllReduce path must contain at least two nodes"
-                        );
-                        let expected_next = flow_paths[(i + 1) % flow_count][0];
-                        let actual_sink = path[path.len() - 1];
-                        assert_eq!(
-                            actual_sink, expected_next,
-                            "RingAllReduce path mismatch: sink of flow {} should match source of next",
-                            i
-                        );
-                    }
+            if let CollectiveType::RingAllReduce = collective_type {
+                for (i, path) in flow_paths.iter().enumerate() {
+                    assert!(
+                        path.len() >= 2,
+                        "Each RingAllReduce path must contain at least two nodes"
+                    );
+                    let expected_next = flow_paths[(i + 1) % flow_count][0];
+                    let actual_sink = path[path.len() - 1];
+                    assert_eq!(
+                        actual_sink, expected_next,
+                        "RingAllReduce path mismatch: sink of flow {} should match source of next",
+                        i
+                    );
                 }
-                _ => {}
             }
 
             let sources = flow_paths.iter().map(|path| path[0]).collect();

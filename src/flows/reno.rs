@@ -175,14 +175,13 @@ impl TCPReno {
 
     /// Handles retransmission requirements
     fn handle_retransmission(&mut self, seq: usize) {
-        if self.retransmit_required {
-            if seq > self.highest_ack {
+        if self.retransmit_required
+            && seq > self.highest_ack {
                 self.mark_lost(seq);
                 if let Some(&next_seq) = self.retransmission_queue.first() {
                     self.immediate_retransmit = Some(next_seq);
                 }
             }
-        }
     }
 
     /// Resets recovery state

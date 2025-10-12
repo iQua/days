@@ -208,7 +208,7 @@ impl WFQServer {
         self.update_stats_on_packet_received(&packet);
 
         // computes a finish time and adds it as a tag to the packet
-        let tagged_packet = self.tag(packet.clone(), packet.time);
+        let tagged_packet = self.tag(packet, packet.time);
         let finish_time = tagged_packet.tag;
 
         // pushes the packet into a min-heap according to the packet's finish time

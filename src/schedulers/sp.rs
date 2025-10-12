@@ -161,7 +161,7 @@ impl SPServer {
         // pushes the packet to the back of its priority queue
         let priority = self.priorities[class_id];
         let queue = self.queues.entry(priority).or_default();
-        queue.push_back(packet.clone());
+        queue.push_back(packet);
 
         debug!(
             "SPServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \

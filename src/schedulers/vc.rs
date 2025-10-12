@@ -202,7 +202,7 @@ impl VirtualClockServer {
 
         // computes a virtual clock finish time and adds it as a tag to the
         // packet
-        let tagged_packet = self.tag(packet.clone(), packet.time);
+        let tagged_packet = self.tag(packet, packet.time);
         let aux_vc = tagged_packet.tag;
 
         // pushes the packet into a min-heap according to the packet's virtual

@@ -129,7 +129,7 @@ impl Port {
 
         // the case that this packet will not be dropped
         self.update_stats_on_packet_received(&packet);
-        self.queue.push_back(packet.clone());
+        self.queue.push_back(packet);
 
         debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.8e}. \

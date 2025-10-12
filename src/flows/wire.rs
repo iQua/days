@@ -90,7 +90,7 @@ impl Wire {
             cx.schedule_event(
                 Duration::from_secs_f64(packet.time - now),
                 Self::forward_packet,
-                packet.clone(),
+                packet,
             )
             .unwrap();
         } else {

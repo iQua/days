@@ -142,7 +142,7 @@ impl TCPPacketSink {
         };
 
         // sends the acknowledgment packet out to the TCPPacketSource now
-        self.output.send(acknowledgment.clone()).await;
+        self.output.send(acknowledgment).await;
 
         debug!(
             "TCPPacketSink {} sent ack packet {} ({} bytes) at time {:.3}.",

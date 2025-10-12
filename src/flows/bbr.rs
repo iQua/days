@@ -70,7 +70,9 @@ pub struct BBRState {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Default)]
 pub enum BBRMode {
+    #[default]
     Startup,
     Drain,
     ProbeUp,
@@ -80,11 +82,6 @@ pub enum BBRMode {
     Stall,
 }
 
-impl Default for BBRMode {
-    fn default() -> Self {
-        BBRMode::Startup
-    }
-}
 
 impl BBRState {
     pub fn new(mss: usize) -> Self {
@@ -373,6 +370,12 @@ impl BBRState {
 #[derive(Debug)]
 pub struct TCPBBR {
     state: BBRState,
+}
+
+impl Default for TCPBBR {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TCPBBR {

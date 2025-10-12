@@ -179,7 +179,7 @@ impl DRRServer {
         let class_id = (self.flow_classes)(packet.flow_id);
 
         // pushes the packet to the back of its class queue
-        self.queues[class_id].push_back(packet.clone());
+        self.queues[class_id].push_back(packet);
 
         self.byte_sizes[class_id] += packet.size;
 
@@ -259,7 +259,7 @@ impl DRRServer {
             }
 
             if !self.queues[self.current_queue].is_empty() {
-                let packet = self.queues[self.current_queue].front().unwrap().clone();
+                let packet = *self.queues[self.current_queue].front().unwrap();
 
                 if self.deficit[self.current_queue] > 0
                     && packet.size <= self.deficit[self.current_queue]
