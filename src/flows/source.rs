@@ -343,7 +343,7 @@ impl PacketSource {
 
         debug!(
             "{} of flow {} received notification that flow {} ended at time {:.3}.",
-            format!("{self}"),
+            self,
             self.flow_id(),
             flow_finish_msg.flow_id,
             now
@@ -360,7 +360,7 @@ impl PacketSource {
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
-                        format!("{self}"),
+                        self,
                         self.flow_id(),
                         now
                     );
@@ -387,7 +387,7 @@ impl PacketSource {
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
-                        format!("{self}"),
+                        self,
                         self.flow_id(),
                         now
                     );
@@ -404,8 +404,7 @@ impl PacketSource {
 
         debug!(
             "{} will be waiting for {:.3} sec(s) at the beginning.",
-            format!("{self}"),
-            initial_delay
+            self, initial_delay
         );
 
         initial_delay
