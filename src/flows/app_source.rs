@@ -168,7 +168,7 @@ impl AppActor {
 
                 // clone from idx, until sent < req.size
                 while idx < self.buffer.len() && sent < req.size {
-                    let pkt = self.buffer[idx].clone();
+                    let pkt = self.buffer[idx];
                     sent += pkt.size;
                     out.push(pkt);
                     idx += 1;
