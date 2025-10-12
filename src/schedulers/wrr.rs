@@ -168,7 +168,7 @@ impl WRRServer {
         let class_id = (self.flow_classes)(packet.flow_id);
 
         // pushes the packet to the back of its class queue
-        self.queues[class_id].push_back(packet);
+        self.queues[class_id].push_back(packet.clone());
         self.byte_sizes[class_id] += packet.size;
 
         debug!(
@@ -201,10 +201,11 @@ impl WRRServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -241,7 +242,7 @@ impl WRRServer {
                     let timeout = outbound.size as f64 * 8.0 / self.rate;
                     outbound.departure_update(self.time + timeout);
 
-                    schedule_event(self.time, timeout, outbound);
+                    schedule_event(self.time, timeout, outbound.clone());
                     self.busy_until = self.time + timeout;
 
                     debug!(

@@ -142,11 +142,13 @@ impl TCPPacketSink {
         };
 
         // sends the acknowledgment packet out to the TCPPacketSource now
+        let ack_size = acknowledgment.size;
+        let packet_id = acknowledgment.packet_id;
         self.output.send(acknowledgment).await;
 
         debug!(
             "TCPPacketSink {} sent ack packet {} ({} bytes) at time {:.3}.",
-            self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
+            self.endpoint_id, packet_id, ack_size, now,
         );
     }
 

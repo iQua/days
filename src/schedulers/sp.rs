@@ -161,7 +161,7 @@ impl SPServer {
         // pushes the packet to the back of its priority queue
         let priority = self.priorities[class_id];
         let queue = self.queues.entry(priority).or_default();
-        queue.push_back(packet);
+        queue.push_back(packet.clone());
 
         debug!(
             "SPServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
@@ -193,10 +193,11 @@ impl SPServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -241,7 +242,7 @@ impl SPServer {
             packet.departure_update(self.time + timeout);
 
             // call provided event handler
-            schedule_event(self.time, timeout, packet);
+            schedule_event(self.time, timeout, packet.clone());
 
             self.busy_until = self.time + timeout;
 

@@ -211,7 +211,7 @@ impl TCPPacketSource {
                 pkt.flow_id = self.flow_id;
                 pkt.packet_id = self.next_seq;
 
-                self.output.send(pkt).await;
+                self.output.send(pkt.clone()).await;
                 self.packet_sent(&pkt, now);
 
                 self.remaining_bytes -= pkt.size;
@@ -262,7 +262,7 @@ impl TCPPacketSource {
 
             if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
                 resent_pkt.time = now;
-                self.output.send(*resent_pkt).await;
+                self.output.send(resent_pkt.clone()).await;
 
                 debug!(
                     "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -287,7 +287,7 @@ impl TCPPacketSource {
                     );
 
                     let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
-                    self.output.send(packet).await;
+                    self.output.send(packet.clone()).await;
                     self.packet_sent(&packet, now);
                 }
             }
@@ -395,7 +395,7 @@ impl TCPPacketSource {
             self.endpoint_id, packet.packet_id, packet.size, now, self.packets_sent,
         );
 
-        self.sent_packets.insert(packet.packet_id, *packet);
+        self.sent_packets.insert(packet.packet_id, packet.clone());
 
         self.next_seq += packet.size;
 
@@ -439,7 +439,7 @@ impl TCPPacketSource {
 
                 resent_pkt.departure_update(packet_timeout.timeout);
 
-                self.output.send(*resent_pkt).await;
+                self.output.send(resent_pkt.clone()).await;
 
                 debug!(
                     "Due to timeout, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -486,7 +486,7 @@ impl TCPPacketSource {
         {
             let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
 
-            self.output.send(packet).await;
+            self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);
         }
     }

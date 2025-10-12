@@ -110,7 +110,7 @@ impl AppActor {
         (actor, tx)
     }
 
-    // construct a distributed actor that dynamically generates packets using traffic profile.
+    // construct a distributed actor that dynamically generates packets using the traffic profile.
     pub fn distributed_actor(
         flow_id: usize,
         traffic: TrafficCharacteristics,
@@ -168,7 +168,7 @@ impl AppActor {
 
                 // clone from idx, until sent < req.size
                 while idx < self.buffer.len() && sent < req.size {
-                    let pkt = self.buffer[idx];
+                    let pkt = self.buffer[idx].clone();
                     sent += pkt.size;
                     out.push(pkt);
                     idx += 1;

@@ -208,7 +208,7 @@ impl WFQServer {
         self.update_stats_on_packet_received(&packet);
 
         // computes a finish time and adds it as a tag to the packet
-        let tagged_packet = self.tag(packet, packet.time);
+        let tagged_packet = self.tag(packet.clone(), packet.time);
         let finish_time = tagged_packet.tag;
 
         // pushes the packet into a min-heap according to the packet's finish time
@@ -251,10 +251,11 @@ impl WFQServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -327,7 +328,7 @@ impl WFQServer {
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
 
-        self.output.send(packet).await;
+        self.output.send(packet.clone()).await;
         self.update_stats_on_packet_forwarded(&packet);
         self.update_internal_states(&packet, self.time_packet_sent);
     }
@@ -340,7 +341,7 @@ impl WFQServer {
         // schedules one packet with the smallest finish time
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
-            let outbound = tagged_outbound.packet;
+            let outbound = tagged_outbound.packet.clone();
             let class_id = (self.flow_classes)(outbound.flow_id);
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;

@@ -129,7 +129,6 @@ impl Port {
 
         // the case that this packet will not be dropped
         self.update_stats_on_packet_received(&packet);
-        self.queue.push_back(packet);
 
         debug!(
             "Port {} received packet {} ({} bytes) from flow {} at time {:.8e}. \
@@ -142,8 +141,11 @@ impl Port {
             self.queue.len()
         );
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx).await;
+        let packet_time = packet.time;
+        self.queue.push_back(packet);
+
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx).await;
         }
     }
 
@@ -200,7 +202,7 @@ impl Port {
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 packet.departure_update(now + timeout);
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet)
+                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
                     .unwrap();
 
                 cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
