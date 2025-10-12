@@ -285,15 +285,10 @@ impl Topology {
                             Phase::Gather => &mut last_gather,
                         };
 
-                        for rank in 0..n {
-                            for _step in 1..n {
-                                let src = collective.sources[rank];
-                                let dst = collective.sources[(rank + 1) % n];
-                                // let chunk_owner = match phase {
-                                //     Phase::Scatter => (rank + n - step) % n,
-                                //     Phase::Gather => (rank + step) % n,
-                                // };
+                        for (rank, &src) in collective.sources.iter().enumerate() {
+                            let dst = collective.sources[(rank + 1) % n];
 
+                            for _ in 1..n {
                                 let flow = Flow::new(FlowParams {
                                     id: flow_id,
                                     path: None,
@@ -319,12 +314,8 @@ impl Topology {
                             }
                         }
                     }
+
                     collective.flow_count = flow_id - collective.first_flow_id;
-                    // for f in &self.flows {
-                    //     if !f.starts_before.is_empty() {
-                    //         println!("[DBG] flow {} starts_before {:?}", f.id, f.starts_before);
-                    //     }
-                    // }
                 }
 
                 _ => {
