@@ -15,12 +15,12 @@ use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
+use crate::flows::FlowSize;
 use crate::flows::app_source::AppSourceHandle;
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
-use crate::flows::FlowSize;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
@@ -28,8 +28,8 @@ use crate::schedulers::sp::SPServer;
 use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::schedulers::wrr::WRRServer;
-use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
+use crate::switches::switch::PacketSwitch;
 use crate::utils::logger::CsvLogger;
 use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
@@ -509,7 +509,9 @@ impl Topology {
 
             SchedulingDiscipline::WRR => {
                 let weights = self.switch_config.weights.as_ref().unwrap_or_else(|| {
-                    panic!("`weights` must be provided for Weighted Round Robin scheduling discipline.")
+                    panic!(
+                        "`weights` must be provided for Weighted Round Robin scheduling discipline."
+                    )
                 });
 
                 let weights_len = weights.len();

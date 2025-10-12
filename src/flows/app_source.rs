@@ -1,16 +1,16 @@
 //! Implements a unified interface for application-level sources with channel-based delivery to TCPPacketSource using actor model compatible with `nexosim`.
 
+use crate::flows::TrafficCharacteristics;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
-use crate::flows::TrafficCharacteristics;
 use crate::get_seed;
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
-use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use std::future::Future;
 use std::time::Duration;
-use tachyonix::{channel, Receiver, Sender};
+use tachyonix::{Receiver, Sender, channel};
 
 // a request sent to the AppActor asking for `size` bytes of packets. The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]

@@ -1,7 +1,7 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
-use std::cmp::min;
 use std::cmp::Ordering;
+use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use core::fmt;
@@ -266,7 +266,11 @@ impl TCPPacketSource {
 
                 debug!(
                     "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                    self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
+                    self.endpoint_id,
+                    resent_pkt.packet_id,
+                    resent_pkt.size,
+                    resent_pkt.flow_id,
+                    now,
                 );
             }
 
@@ -403,7 +407,10 @@ impl TCPPacketSource {
 
         debug!(
             "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-            self.endpoint_id, packet.packet_id, self.rto, self.rto + now
+            self.endpoint_id,
+            packet.packet_id,
+            self.rto,
+            self.rto + now
         );
     }
 

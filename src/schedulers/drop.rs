@@ -1,9 +1,9 @@
 //! Implements packet drop strategies for the scheduler.
 
+use rand::SeedableRng;
 use rand::distr::Distribution;
 use rand::distr::Uniform;
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::get_seed;

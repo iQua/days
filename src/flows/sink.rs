@@ -18,11 +18,11 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::Serialize;
 
+use crate::flows::FlowFinishMsg;
 use crate::flows::basic_sink::BasicPacketSink;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
-use crate::flows::FlowFinishMsg;
 use crate::utils::logger::{CsvLogger, ReportTiming};
 
 #[derive(Clone, Default, Debug, Serialize)]

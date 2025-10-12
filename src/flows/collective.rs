@@ -3,9 +3,9 @@
 use std::fs;
 
 use petgraph::graph::DiGraph;
+use rand::SeedableRng;
 use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
@@ -217,10 +217,10 @@ impl Collective {
                         let expected_next = flow_paths[(i + 1) % flow_count][0];
                         let actual_sink = path[path.len() - 1];
                         assert_eq!(
-                        actual_sink, expected_next,
-                        "RingAllReduce path mismatch: sink of flow {} should match source of next",
-                        i
-                    );
+                            actual_sink, expected_next,
+                            "RingAllReduce path mismatch: sink of flow {} should match source of next",
+                            i
+                        );
                     }
                 }
                 _ => {}

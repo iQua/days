@@ -8,9 +8,9 @@ use nexosim::model::Model;
 use nexosim::ports::Output;
 use tracing::instrument;
 
+use crate::flows::FlowFinishMsg;
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
-use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};

@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use log::info;
 use tracing::Subscriber;
-use tracing_subscriber::{registry::LookupSpan, Layer};
+use tracing_subscriber::{Layer, registry::LookupSpan};
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::time::MonotonicTime;
 
-use crate::topos::topo::TracingConfig;
 use crate::ACTIVE_TASKS;
+use crate::topos::topo::TracingConfig;
 
 pub struct ConcurrencyTrackerLayer;
 

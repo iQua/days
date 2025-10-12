@@ -12,9 +12,9 @@ use rand_distr::Exp;
 use nexosim::model::Model;
 use nexosim::ports::Output;
 
+use crate::flows::FlowFinishMsg;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::FlowFinishMsg;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;

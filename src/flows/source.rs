@@ -7,8 +7,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use log::debug;
-use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use serde::Serialize;
 use tracing::instrument;
 

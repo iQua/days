@@ -5,13 +5,13 @@ use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
+use rand::SeedableRng;
 use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::route::{
-    PathFromConfig, Routing, RoutingConfig, RoutingProtocol, ShortestPath, ECMP,
+    ECMP, PathFromConfig, Routing, RoutingConfig, RoutingProtocol, ShortestPath,
 };
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
