@@ -101,8 +101,10 @@ impl TrafficCharacteristics {
             tcp: traffic.tcp,
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for TrafficCharacteristics {
+    fn default() -> Self {
         Self::new(
             1.,
             Some(10.),

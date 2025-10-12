@@ -263,7 +263,7 @@ mod tests {
         let path = ecmp.compute_route(start, end);
 
         // There are two equal-cost paths: [0, 1, 3] and [0, 2, 3]
-        let possible_paths = vec![
+        let possible_paths = [
             vec![start, NodeIndex::new(1), end],
             vec![start, NodeIndex::new(2), end],
         ];
@@ -345,7 +345,7 @@ mod tests {
         let path3 = ecmp3.compute_route(start, end);
 
         // There are two equal-cost paths: [0, 1, 3] and [0, 2, 3]
-        let possible_paths = vec![
+        let possible_paths = [
             vec![start, NodeIndex::new(1), end],
             vec![start, NodeIndex::new(2), end],
         ];
