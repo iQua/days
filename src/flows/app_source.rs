@@ -217,7 +217,9 @@ impl AppDataSource {
     pub fn distributed_source(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
+
         let (actor, tx) = AppActor::distributed_actor(flow_id, tr, rng);
+
         (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }
 
