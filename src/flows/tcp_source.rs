@@ -130,7 +130,11 @@ impl TCPPacketSource {
         traffic: TrafficCharacteristics,
         app_source: Option<AppSourceHandle>,
     ) -> TCPPacketSource {
-        let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
+        let cc_algorithm = traffic
+            .tcp
+            .as_ref()
+            .expect("TCP traffic requires TCP characteristics")
+            .cc_algorithm;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),

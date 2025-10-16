@@ -15,7 +15,7 @@ pub enum CapacityUnit {
 }
 
 /// The packet drop strategy.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum DropStrategy {
     TailDrop,
     RED,

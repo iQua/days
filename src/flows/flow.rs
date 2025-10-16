@@ -17,7 +17,7 @@ use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
 /// Represents the type of a flow.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum FlowType {
     /// Represents a packet distribution flow.
     PacketDistribution,
@@ -267,10 +267,10 @@ impl Flow {
                         path: flow.path.clone(),
                         starts_before,
                         starts_after,
-                        flow_type: flow.flow_type,
+                        flow_type: flow.flow_type.clone(),
                         source_host: edge.source().index(),
                         sink_host: edge.target().index(),
-                        routing: flow.routing,
+                        routing: flow.routing.clone(),
                         traffic,
                         seed: flow_id,
                     }));
@@ -307,10 +307,10 @@ impl Flow {
                         path: None,
                         starts_before,
                         starts_after,
-                        flow_type: flow_set.flow_type,
+                        flow_type: flow_set.flow_type.clone(),
                         source_host: host_pair[0],
                         sink_host: host_pair[1],
-                        routing: flow_set.routing,
+                        routing: flow_set.routing.clone(),
                         traffic,
                         seed: flow_id,
                     }));

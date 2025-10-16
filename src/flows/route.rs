@@ -13,7 +13,7 @@ use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Copy, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub enum RoutingConfig {
     ShortestPath,
     PathFromConfig,

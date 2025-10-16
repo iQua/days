@@ -271,7 +271,8 @@ impl Topology {
         );
 
         for collective in self.collectives.iter_mut() {
-            match collective.collective_type {
+            let collective_type = collective.collective_type.clone();
+            match collective_type {
                 CollectiveType::RingAllReduce => {
                     let n = collective.sources.len();
                     let mut flow_id = collective.first_flow_id;
@@ -294,11 +295,11 @@ impl Topology {
                                     path: None,
                                     starts_before: Vec::new(),
                                     starts_after: Vec::new(),
-                                    flow_type: collective.flow_type,
+                        flow_type: collective.flow_type.clone(),
                                     source_host: src,
                                     sink_host: dst,
-                                    routing: collective.routing,
-                                    traffic: collective.traffic,
+                        routing: collective.routing.clone(),
+                                    traffic: collective.traffic.clone(),
                                     seed: collective.id,
                                 });
 
@@ -322,19 +323,22 @@ impl Topology {
                     for (index, &source) in collective.sources.iter().enumerate() {
                         let sink = collective.sinks[index];
                         let flow_id = collective.first_flow_id + index;
-                        let path = collective.paths.as_ref().map(|paths| paths[index].clone());
+                    let path = collective
+                        .paths
+                        .as_ref()
+                        .map(|paths| paths[index].clone());
 
                         self.flows.push(Flow::new(FlowParams {
                             id: flow_id,
                             path,
                             starts_before: Vec::new(),
                             starts_after: Vec::new(),
-                            flow_type: collective.flow_type,
+                            flow_type: collective.flow_type.clone(),
                             source_host: source,
                             sink_host: sink,
-                            routing: collective.routing,
-                            traffic: collective.traffic,
-                            seed: match collective.collective_type {
+                            routing: collective.routing.clone(),
+                            traffic: collective.traffic.clone(),
+                            seed: match collective_type.clone() {
                                 CollectiveType::Broadcast => collective.id,
                                 CollectiveType::Gather => flow_id,
                                 CollectiveType::AllReduce => source,
@@ -342,10 +346,10 @@ impl Topology {
                             },
                         }));
 
-                        debug!(
-                            "Produced Flow {} of {:?} collective communication operation {}.",
-                            flow_id, collective.collective_type, collective.id
-                        );
+                    debug!(
+                        "Produced Flow {} of {:?} collective communication operation {}.",
+                        flow_id, collective_type, collective.id
+                    );
                     }
                 }
             }
@@ -355,6 +359,8 @@ impl Topology {
     /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
+
+        let drop_strategy = self.switch_config.drop.clone();
 
         match self.switch_config.discipline {
             SchedulingDiscipline::DRR => {
@@ -370,7 +376,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     weights.clone(),
                 );
 
@@ -392,7 +398,7 @@ impl Topology {
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                 );
 
                 let mut output = Output::default();
@@ -420,7 +426,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % priorities_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     priorities.clone(),
                 );
 
@@ -448,7 +454,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % vticks_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     vticks.clone(),
                 );
 
@@ -481,7 +487,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     weights.clone(),
                 );
 
@@ -511,7 +517,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
-                    self.switch_config.drop,
+                    drop_strategy,
                     weights.clone(),
                 );
 
@@ -567,8 +573,8 @@ impl Topology {
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
-                flow.flow_type,
-                flow.traffic,
+                flow.flow_type.clone(),
+                flow.traffic.clone(),
                 flow.seed,
                 handle,
             );
@@ -773,7 +779,7 @@ impl Topology {
 
         for collective in &self.collectives {
             if matches!(
-                (collective.collective_type, collective.flow_type),
+                (&collective.collective_type, &collective.flow_type),
                 (CollectiveType::Broadcast, FlowType::TCP)
             ) {
                 let total_size = match collective.traffic.size {
@@ -806,7 +812,7 @@ impl Topology {
             }
             // Ring-AllReduce (TCP)
             if matches!(
-                (collective.collective_type, collective.flow_type),
+                (&collective.collective_type, &collective.flow_type),
                 (CollectiveType::RingAllReduce, FlowType::TCP)
             ) {
                 let total_size = match collective.traffic.size {

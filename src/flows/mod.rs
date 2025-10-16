@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::flows::cc::CCAlgorithm;
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 pub enum DistributionInfo {
     DiscreteUniform { low: i64, high: i64 },
@@ -27,7 +27,7 @@ pub enum DistributionInfo {
     Uniform { low: f64, high: f64 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FlowSize {
     Bytes(usize),
     Duration(f64),
@@ -42,7 +42,7 @@ impl FlowSize {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct TomlTrafficCharacteristics {
     pub initial_delay: Option<f64>,
     pub duration: Option<f64>,
@@ -52,7 +52,7 @@ pub struct TomlTrafficCharacteristics {
     pub tcp: Option<TCPCharacteristics>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficCharacteristics {
     pub initial_delay: f64,
     pub size: FlowSize,
@@ -96,9 +96,9 @@ impl TrafficCharacteristics {
                     None => panic!("Must specify duration or size of the flow."),
                 },
             },
-            arr_dist: traffic.arr_dist,
-            pkt_size_dist: traffic.pkt_size_dist,
-            tcp: traffic.tcp,
+            arr_dist: traffic.arr_dist.clone(),
+            pkt_size_dist: traffic.pkt_size_dist.clone(),
+            tcp: traffic.tcp.clone(),
         }
     }
 }
@@ -124,7 +124,7 @@ pub struct FlowFinishMsg {
     pub flow_id: usize,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
 }
