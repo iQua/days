@@ -295,10 +295,10 @@ impl Topology {
                                     path: None,
                                     starts_before: Vec::new(),
                                     starts_after: Vec::new(),
-                        flow_type: collective.flow_type.clone(),
+                                    flow_type: collective.flow_type.clone(),
                                     source_host: src,
                                     sink_host: dst,
-                        routing: collective.routing.clone(),
+                                    routing: collective.routing.clone(),
                                     traffic: collective.traffic.clone(),
                                     seed: collective.id,
                                 });
@@ -323,10 +323,7 @@ impl Topology {
                     for (index, &source) in collective.sources.iter().enumerate() {
                         let sink = collective.sinks[index];
                         let flow_id = collective.first_flow_id + index;
-                    let path = collective
-                        .paths
-                        .as_ref()
-                        .map(|paths| paths[index].clone());
+                        let path = collective.paths.as_ref().map(|paths| paths[index].clone());
 
                         self.flows.push(Flow::new(FlowParams {
                             id: flow_id,
@@ -346,10 +343,10 @@ impl Topology {
                             },
                         }));
 
-                    debug!(
-                        "Produced Flow {} of {:?} collective communication operation {}.",
-                        flow_id, collective_type, collective.id
-                    );
+                        debug!(
+                            "Produced Flow {} of {:?} collective communication operation {}.",
+                            flow_id, collective_type, collective.id
+                        );
                     }
                 }
             }
@@ -800,7 +797,7 @@ impl Topology {
                 // }
 
                 // create unique AppDataSource and actor
-                let (datasrc, actor) = AppDataSource::buffered(total_size, mss);
+                let (datasrc, actor) = AppDataSource::buffered_actor(total_size, mss);
                 // assign handle to each flow：all flows obtain data from the same datasrc
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
@@ -841,7 +838,7 @@ impl Topology {
                             // ensure we have one AppActor for this src_host
                             let (datasrc, _actor) =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                    AppDataSource::buffered(total_size, mss) // => (ds, actor)
+                                    AppDataSource::buffered_actor(total_size, mss) // => (ds, actor)
                                 });
 
                             let handle = datasrc.handle_with_offset(chunk_offset);

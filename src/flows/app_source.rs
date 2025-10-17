@@ -15,18 +15,24 @@ use tachyonix::{Receiver, Sender, channel};
 // a request sent to the AppActor asking for `size` bytes of packets. The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
+    /// Start reading at this byte position inside the stream.
     pub start: usize,
+    /// Total number of bytes the requester wants to receive
     pub size: usize,
+    /// One-shot channel used by the actor to send back the packets.
     pub respond_to: Sender<Vec<Packet>>,
 }
 
 // a handle to an application source actor. Allows TCPPacketSource to `pull()` packets asynchronously.
 #[derive(Clone)]
 pub struct AppSourceHandle {
+    /// Channel for sending requests to the app actor.
     tx: Sender<AppSourceRequest>,
-    // chunk start in the shared buffer
+    // First byte in the shared buffer assigned to this handle.
     offset: usize,
+    /// Number of bytes already consumed using this handle.
     cursor: usize,
+    /// Total length of the stream.
     total_size: Option<usize>,
 }
 
@@ -91,12 +97,15 @@ impl AppSourceHandle {
 
 // the actor that holds a buffer of packets and services pull requests.
 pub struct AppActor {
+    /// Receives pull requests from every handle.
     rx: Receiver<AppSourceRequest>,
+    /// Packet buffer that backs all responses.
     buffer: Vec<Packet>,
+    /// Simulation output port exposed to other actors.
     pub out: Output<Packet>,
 }
 
-// construct a buffered actor with pre-generated packets.
+
 impl AppActor {
     pub fn buffered(packets: Vec<Packet>) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(128);
@@ -110,8 +119,8 @@ impl AppActor {
         (actor, tx)
     }
 
-    // construct a distributed actor that dynamically generates packets using the traffic profile.
-    pub fn distributed_actor(
+    // construct a distributed actor that generates packets following the probability and size patterns defined by the PacketDistribution.
+    pub fn dist_actor(
         flow_id: usize,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
@@ -183,15 +192,19 @@ impl AppActor {
     }
 }
 
+
+// Application-level sources that can be used to feed data to a TCPPacketSource.
 #[derive(Clone)]
 pub enum AppDataSource {
+    // Application-level DataSource for pre-buffered packets.
     Buffered(AppSourceHandle),
+    /// Application-level DataSource for packets generated from traffic distributions.
     Dist(AppSourceHandle),
 }
 
 impl AppDataSource {
-    // create a buffered source with pre-generated packets
-    fn buffered_from_packets(packets: Vec<Packet>) -> (Self, AppActor) {
+    // Build a data source backed by the supplied packet list.
+    fn buffered_actor_from_packets(packets: Vec<Packet>) -> (Self, AppActor) {
         let total_size = packets.iter().map(|p| p.size).sum::<usize>();
         let (actor, tx) = AppActor::buffered(packets);
         (
@@ -200,7 +213,7 @@ impl AppDataSource {
         )
     }
 
-    pub fn buffered(total_size: usize, mss: usize) -> (Self, AppActor) {
+    pub fn buffered_actor(total_size: usize, mss: usize) -> (Self, AppActor) {
         let mut packets = Vec::new();
         let mut remaining = total_size;
         let mut seq = 0;
@@ -210,15 +223,15 @@ impl AppDataSource {
             seq += sz;
             remaining -= sz;
         }
-        Self::buffered_from_packets(packets)
+        Self::buffered_actor_from_packets(packets)
     }
 
-    // create a dist source from traffic profile and flow ID
+    // create a dist source from traffic distributions and flow ID
     pub fn distributed_source(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
 
-        let (actor, tx) = AppActor::distributed_actor(flow_id, tr, rng);
+        let (actor, tx) = AppActor::dist_actor(flow_id, tr, rng);
 
         (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }
