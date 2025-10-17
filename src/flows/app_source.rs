@@ -12,6 +12,24 @@ use std::future::Future;
 use std::time::Duration;
 use tachyonix::{Receiver, Sender, channel};
 
+#[derive(Clone, Copy, Debug)]
+pub struct AppSourceRuntimeConfig {
+    pub request_channel_capacity: usize,
+    pub dist_initial_buffer_packets: usize,
+    pub init_interval_micros: u64,
+    pub run_interval_micros: u64,
+}
+
+impl Default for AppSourceRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            request_channel_capacity: 128,
+            dist_initial_buffer_packets: 512,
+            init_interval_micros: 1,
+            run_interval_micros: 50,
+        }
+    }
+}
 // a request sent to the AppActor asking for `size` bytes of packets. The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
@@ -103,17 +121,25 @@ pub struct AppActor {
     buffer: Vec<Packet>,
     /// Simulation output port exposed to other actors.
     pub out: Output<Packet>,
+    /// Interval before first scheduling (µs)
+    init_interval_micros: u64,
+    /// Interval between ticks (µs)
+    run_interval_micros: u64,
 }
 
-
 impl AppActor {
-    pub fn buffered(packets: Vec<Packet>) -> (Self, Sender<AppSourceRequest>) {
-        let (tx, rx) = channel(128);
+    pub fn buffered(
+        packets: Vec<Packet>,
+        config: &AppSourceRuntimeConfig,
+    ) -> (Self, Sender<AppSourceRequest>) {
+        let (tx, rx) = channel(config.request_channel_capacity);
 
         let actor = AppActor {
             rx,
             buffer: packets,
             out: Output::default(),
+            init_interval_micros: config.init_interval_micros,
+            run_interval_micros: config.run_interval_micros,
         };
 
         (actor, tx)
@@ -124,12 +150,13 @@ impl AppActor {
         flow_id: usize,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
+        config: &AppSourceRuntimeConfig,
     ) -> (Self, Sender<AppSourceRequest>) {
-        let (tx, rx) = channel(128);
+        let (tx, rx) = channel(config.request_channel_capacity);
         let mut src = DistPacketSource::new(flow_id, Vec::new(), traffic, rng.clone());
         let mut packets = Vec::new();
 
-        for _ in 0..512 {
+        for _ in 0..config.dist_initial_buffer_packets {
             let (p, _) = src.produce_packet(0.0);
             packets.push(p);
         }
@@ -141,6 +168,8 @@ impl AppActor {
             rx,
             buffer: packets,
             out: Output::default(),
+            init_interval_micros: config.init_interval_micros,
+            run_interval_micros: config.run_interval_micros,
         };
         (actor, tx)
     }
@@ -148,8 +177,12 @@ impl AppActor {
 
 impl Model for AppActor {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        // schedule the actor's run_once function every 1µs after simulation start
-        cx.schedule_event(Duration::from_micros(1), Self::run_once, ())
+        // schedule the actor's run_once function after the configured initial interval
+        cx.schedule_event(
+            Duration::from_micros(self.init_interval_micros),
+            Self::run_once,
+            (),
+        )
             .expect("schedule_event failed");
         self.into()
     }
@@ -186,12 +219,15 @@ impl AppActor {
                 let _ = req.respond_to.try_send(out);
             }
 
-            cx.schedule_event(Duration::from_micros(50), Self::run_once, ())
+            cx.schedule_event(
+                Duration::from_micros(self.run_interval_micros),
+                Self::run_once,
+                (),
+            )
                 .expect("reschedule run_once failed");
         }
     }
 }
-
 
 // Application-level sources that can be used to feed data to a TCPPacketSource.
 #[derive(Clone)]
@@ -204,16 +240,23 @@ pub enum AppDataSource {
 
 impl AppDataSource {
     // Build a data source backed by the supplied packet list.
-    fn buffered_actor_from_packets(packets: Vec<Packet>) -> (Self, AppActor) {
+    fn buffered_actor_from_packets(
+        packets: Vec<Packet>,
+        config: AppSourceRuntimeConfig,
+    ) -> (Self, AppActor) {
         let total_size = packets.iter().map(|p| p.size).sum::<usize>();
-        let (actor, tx) = AppActor::buffered(packets);
+        let (actor, tx) = AppActor::buffered(packets, &config);
         (
             Self::Buffered(AppSourceHandle::new(tx, Some(total_size))),
             actor,
         )
     }
 
-    pub fn buffered_actor(total_size: usize, mss: usize) -> (Self, AppActor) {
+    pub fn buffered_actor(
+        total_size: usize,
+        mss: usize,
+        config: AppSourceRuntimeConfig,
+    ) -> (Self, AppActor) {
         let mut packets = Vec::new();
         let mut remaining = total_size;
         let mut seq = 0;
@@ -223,15 +266,19 @@ impl AppDataSource {
             seq += sz;
             remaining -= sz;
         }
-        Self::buffered_actor_from_packets(packets)
+        Self::buffered_actor_from_packets(packets, config)
     }
 
     // create a dist source from traffic distributions and flow ID
-    pub fn distributed_source(flow_id: usize, tr: TrafficCharacteristics) -> (Self, AppActor) {
+    pub fn distributed_source(
+        flow_id: usize,
+        tr: TrafficCharacteristics,
+        config: AppSourceRuntimeConfig,
+    ) -> (Self, AppActor) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
 
-        let (actor, tx) = AppActor::dist_actor(flow_id, tr, rng);
+        let (actor, tx) = AppActor::dist_actor(flow_id, tr, rng, &config);
 
         (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }

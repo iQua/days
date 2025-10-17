@@ -69,8 +69,7 @@ pub struct BBRState {
     pub stable_rounds: usize,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum BBRMode {
     #[default]
     Startup,
@@ -81,7 +80,6 @@ pub enum BBRMode {
     ProbeRTT,
     Stall,
 }
-
 
 impl BBRState {
     pub fn new(mss: usize) -> Self {

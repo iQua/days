@@ -16,7 +16,7 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
 use crate::flows::FlowSize;
-use crate::flows::app_source::AppSourceHandle;
+use crate::flows::app_source::{AppSourceHandle, AppSourceRuntimeConfig};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
@@ -103,6 +103,15 @@ pub struct TopoConfig {
 pub struct Config {
     pub switch: SwitchConfig,
     pub topology: Option<TopoConfig>,
+    pub app_source: Option<AppSourceToml>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct AppSourceToml {
+    pub request_channel_capacity: Option<usize>,
+    pub dist_initial_buffer_packets: Option<usize>,
+    pub init_interval_micros: Option<u64>,
+    pub run_interval_micros: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +170,8 @@ pub struct Topology {
     config_path: String,
     /// the duration of the simulation
     duration: f64,
+    /// app source runtime config
+    app_source_cfg: AppSourceRuntimeConfig,
 }
 
 impl Topology {
@@ -206,6 +217,17 @@ impl Topology {
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
+        let app_source_cfg = if let Some(app_src) = &config.app_source {
+            AppSourceRuntimeConfig {
+                request_channel_capacity: app_src.request_channel_capacity.unwrap_or(128),
+                dist_initial_buffer_packets: app_src.dist_initial_buffer_packets.unwrap_or(512),
+                init_interval_micros: app_src.init_interval_micros.unwrap_or(1),
+                run_interval_micros: app_src.run_interval_micros.unwrap_or(50),
+            }
+        } else {
+            AppSourceRuntimeConfig::default()
+        };
+
         Topology {
             sim_init,
             graph: graph.clone(),
@@ -218,6 +240,7 @@ impl Topology {
             mailbox_capacity,
             config_path: config_path.to_string(),
             duration,
+            app_source_cfg,
         }
     }
 
@@ -797,7 +820,8 @@ impl Topology {
                 // }
 
                 // create unique AppDataSource and actor
-                let (datasrc, actor) = AppDataSource::buffered_actor(total_size, mss);
+                let (datasrc, actor) =
+                    AppDataSource::buffered_actor(total_size, mss, self.app_source_cfg);
                 // assign handle to each flow：all flows obtain data from the same datasrc
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
@@ -838,7 +862,11 @@ impl Topology {
                             // ensure we have one AppActor for this src_host
                             let (datasrc, _actor) =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                    AppDataSource::buffered_actor(total_size, mss) // => (ds, actor)
+                                    AppDataSource::buffered_actor(
+                                        total_size,
+                                        mss,
+                                        self.app_source_cfg,
+                                    ) // => (ds, actor)
                                 });
 
                             let handle = datasrc.handle_with_offset(chunk_offset);
