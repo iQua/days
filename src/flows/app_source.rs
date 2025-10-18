@@ -204,7 +204,7 @@ impl AppSourceBuffer {
             config.chunk_size
         );
 
-        let actor = AppSourceBuffer {
+        let source_buffer = AppSourceBuffer {
             rx,
             buffer,
             out: Output::default(),
@@ -212,7 +212,7 @@ impl AppSourceBuffer {
             run_interval: config.run_interval,
         };
 
-        (actor, tx)
+        (source_buffer, tx)
     }
 }
 
