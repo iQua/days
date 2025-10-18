@@ -156,8 +156,8 @@ impl TCPPacketSink {
         // updates the locally maintained simulation time
 
         if packet.packet_id < self.next_seq_expected {
-            println!(
-                "[DUP ] TCP sink={} flow={} pkt_id={} now={:.3}",
+            log::debug!(
+                "Duplicate packet received: TCP sink={} flow={} pkt_id={} now={:.3}",
                 self.endpoint_id, packet.flow_id, packet.packet_id, now
             );
         }

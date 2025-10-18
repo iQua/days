@@ -353,7 +353,7 @@ mod tests {
 
         // Test 1: Request at exact buffer start
         let start = 0usize.min(buffer_size);
-        let end = (0 + 10).min(buffer_size);
+        let end = 10usize.min(buffer_size);
         assert_eq!(start, 0);
         assert_eq!(end, 10);
 
@@ -377,7 +377,7 @@ mod tests {
 
         // Test 5: Zero-size request
         let start = 50usize.min(buffer_size);
-        let end = (50 + 0).min(buffer_size);
+        let end = 50usize.min(buffer_size);
         assert_eq!(start, 50);
         assert_eq!(end, 50); // Empty range
     }
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(length_0, 250);
 
         // Chunk 1: bytes 250-499
-        let offset_1 = 1 * chunk_size;
+        let offset_1 = chunk_size;
         let length_1 = chunk_size;
         assert_eq!(offset_1, 250);
         assert_eq!(length_1, 250);
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(length_0, 333);
 
         // Chunk 1: bytes 333-665
-        let offset_1 = 1 * chunk_size;
+        let offset_1 = chunk_size;
         let length_1 = chunk_size;
         assert_eq!(offset_1, 333);
         assert_eq!(length_1, 333);
@@ -565,8 +565,8 @@ mod tests {
         let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
 
         // Create handles for each chunk
-        let chunk0 = datasrc.handle_with_offset(0 * chunk_size, Some(chunk_size));
-        let chunk1 = datasrc.handle_with_offset(1 * chunk_size, Some(chunk_size));
+        let chunk0 = datasrc.handle_with_offset(0, Some(chunk_size));
+        let chunk1 = datasrc.handle_with_offset(chunk_size, Some(chunk_size));
         let chunk2 = datasrc.handle_with_offset(2 * chunk_size, Some(chunk_size));
         let chunk3 = datasrc.handle_with_offset(3 * chunk_size, Some(chunk_size));
 

@@ -867,24 +867,18 @@ impl Topology {
             }
         }
 
-        println!(
-            "[Debug] Unique TCP handles   : {}",
-            if conn_map.is_empty() {
-                app_sources.len()
-            } else {
-                conn_map.len()
-            }
-        );
-        println!(
-            "[Debug] Flow count            : {}",
-            flow_id_to_source_handle.len()
-        );
-        // register every (datasrc, actor) exactly once
+        // Register every (datasrc, actor) exactly once
         for ((src, _dst), (ds, actor)) in conn_map.into_iter() {
             app_sources.insert(src, ds);
             app_actors.push(actor);
         }
-        println!("[Debug] Total AppSources: {}", app_sources.len());
+
+        debug!(
+            "Initialized {} AppSource actors for {} TCP flows with {} unique source handles",
+            app_actors.len(),
+            flow_id_to_source_handle.len(),
+            app_sources.len()
+        );
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
