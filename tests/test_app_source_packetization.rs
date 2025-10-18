@@ -12,8 +12,8 @@ fn test_tcp_packetization_sequence_numbers() {
     let total_size = 1536; // 3 MSS worth of data (512 * 3)
     let mss = 512;
 
-    let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
-    let _handle = datasrc.handle();
+    let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
+    let _handle = data_src.handle();
 
     // Simulate TCP packetization logic
     let mut packets = Vec::new();
@@ -118,13 +118,13 @@ fn test_broadcast_multiple_flows_same_data() {
     let config = AppSourceRuntimeConfig::default();
     let total_size = 1024;
 
-    let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
+    let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
 
     // Create handles for 4 different flows (simulating broadcast to 4 destinations)
-    let handle1 = datasrc.handle();
-    let handle2 = datasrc.handle();
-    let handle3 = datasrc.handle();
-    let handle4 = datasrc.handle();
+    let handle1 = data_src.handle();
+    let handle2 = data_src.handle();
+    let handle3 = data_src.handle();
+    let handle4 = data_src.handle();
 
     // All handles should access the same data range
     assert_eq!(handle1.get_offset(), 0);
@@ -152,7 +152,7 @@ fn test_ring_allreduce_chunk_partitioning() {
     let num_nodes = 4;
     let chunk_size = total_size / num_nodes; // 512 bytes per chunk
 
-    let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
+    let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
 
     // Create handles for each chunk (each flow in RingAllReduce sends one chunk)
     let mut handles = Vec::new();
@@ -163,7 +163,7 @@ fn test_ring_allreduce_chunk_partitioning() {
         } else {
             chunk_size
         };
-        let handle = datasrc.handle_with_offset(offset, Some(length));
+        let handle = data_src.handle_with_offset(offset, Some(length));
         handles.push(handle);
     }
 
@@ -259,13 +259,13 @@ fn test_ring_allreduce_uneven_chunks() {
     let num_nodes = 3;
     let chunk_size = total_size / num_nodes; // 333
 
-    let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
+    let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
 
-    let chunk0 = datasrc.handle_with_offset(0, Some(chunk_size));
-    let chunk1 = datasrc.handle_with_offset(chunk_size, Some(chunk_size));
+    let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
+    let chunk1 = data_src.handle_with_offset(chunk_size, Some(chunk_size));
     let chunk2_offset = 2 * chunk_size;
     let chunk2_len = total_size - chunk2_offset; // Remainder
-    let chunk2 = datasrc.handle_with_offset(chunk2_offset, Some(chunk2_len));
+    let chunk2 = data_src.handle_with_offset(chunk2_offset, Some(chunk2_len));
 
     assert_eq!(chunk0.get_offset(), 0);
     assert_eq!(chunk0.get_length(), Some(333));
@@ -277,6 +277,7 @@ fn test_ring_allreduce_uneven_chunks() {
     assert_eq!(chunk2.get_length(), Some(334)); // Gets the extra byte
 
     // Verify complete coverage
-    let total = chunk0.get_length().unwrap() + chunk1.get_length().unwrap() + chunk2.get_length().unwrap();
+    let total =
+        chunk0.get_length().unwrap() + chunk1.get_length().unwrap() + chunk2.get_length().unwrap();
     assert_eq!(total, total_size);
 }

@@ -272,10 +272,7 @@ pub enum AppDataSource {
 
 impl AppDataSource {
     // Build a data source backed by a byte buffer of the specified size.
-    pub fn buffered_actor(
-        total_size: usize,
-        config: AppSourceRuntimeConfig,
-    ) -> (Self, AppActor) {
+    pub fn buffered_actor(total_size: usize, config: AppSourceRuntimeConfig) -> (Self, AppActor) {
         // Create a buffer filled with zeros (or could be filled with meaningful data)
         let buffer = vec![0u8; total_size];
         let (actor, tx) = AppActor::buffered(buffer, &config);
@@ -391,7 +388,9 @@ mod tests {
 
         // First pull: 30 bytes
         let requested = 30;
-        let allowed = length.map(|len| len.saturating_sub(cursor)).unwrap_or(requested);
+        let allowed = length
+            .map(|len| len.saturating_sub(cursor))
+            .unwrap_or(requested);
         let actual_size = requested.min(allowed);
         assert_eq!(actual_size, 30);
         cursor += actual_size;
@@ -399,7 +398,9 @@ mod tests {
 
         // Second pull: 50 bytes
         let requested = 50;
-        let allowed = length.map(|len| len.saturating_sub(cursor)).unwrap_or(requested);
+        let allowed = length
+            .map(|len| len.saturating_sub(cursor))
+            .unwrap_or(requested);
         let actual_size = requested.min(allowed);
         assert_eq!(actual_size, 50);
         cursor += actual_size;
@@ -407,7 +408,9 @@ mod tests {
 
         // Third pull: 50 bytes (but only 20 remaining)
         let requested = 50;
-        let allowed = length.map(|len| len.saturating_sub(cursor)).unwrap_or(requested);
+        let allowed = length
+            .map(|len| len.saturating_sub(cursor))
+            .unwrap_or(requested);
         let actual_size = requested.min(allowed);
         assert_eq!(actual_size, 20);
         cursor += actual_size;
@@ -415,7 +418,9 @@ mod tests {
 
         // Fourth pull: should return 0 (exhausted)
         let requested = 10;
-        let allowed = length.map(|len| len.saturating_sub(cursor)).unwrap_or(requested);
+        let allowed = length
+            .map(|len| len.saturating_sub(cursor))
+            .unwrap_or(requested);
         let actual_size = requested.min(allowed);
         assert_eq!(actual_size, 0);
     }
@@ -508,7 +513,9 @@ mod tests {
         let length = Some(0usize);
 
         let requested = 100;
-        let allowed = length.map(|len| len.saturating_sub(cursor)).unwrap_or(requested);
+        let allowed = length
+            .map(|len| len.saturating_sub(cursor))
+            .unwrap_or(requested);
         let actual_size = requested.min(allowed);
 
         assert_eq!(actual_size, 0);
@@ -520,13 +527,13 @@ mod tests {
         let config = AppSourceRuntimeConfig::default();
         let total_size = 1024;
 
-        let (datasrc, actor) = AppDataSource::buffered_actor(total_size, config);
+        let (data_src, actor) = AppDataSource::buffered_actor(total_size, config);
 
         // Verify actor has correct buffer size
         assert_eq!(actor.buffer.len(), total_size);
 
         // Verify handle has correct total size
-        let handle = datasrc.handle();
+        let handle = data_src.handle();
         assert_eq!(handle.get_total_size(), Some(total_size));
         assert_eq!(handle.get_offset(), 0);
         assert_eq!(handle.get_cursor(), 0);
@@ -538,11 +545,11 @@ mod tests {
         let config = AppSourceRuntimeConfig::default();
         let total_size = 1000;
 
-        let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
+        let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
 
         // Create multiple handles with different offsets (simulating Broadcast)
-        let handle1 = datasrc.handle(); // Full buffer
-        let handle2 = datasrc.handle(); // Full buffer again
+        let handle1 = data_src.handle(); // Full buffer
+        let handle2 = data_src.handle(); // Full buffer again
 
         assert_eq!(handle1.get_offset(), 0);
         assert_eq!(handle1.get_length(), Some(total_size));
@@ -562,13 +569,13 @@ mod tests {
         let num_nodes = 4;
         let chunk_size = total_size / num_nodes; // 128 bytes per chunk
 
-        let (datasrc, _actor) = AppDataSource::buffered_actor(total_size, config);
+        let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
 
         // Create handles for each chunk
-        let chunk0 = datasrc.handle_with_offset(0, Some(chunk_size));
-        let chunk1 = datasrc.handle_with_offset(chunk_size, Some(chunk_size));
-        let chunk2 = datasrc.handle_with_offset(2 * chunk_size, Some(chunk_size));
-        let chunk3 = datasrc.handle_with_offset(3 * chunk_size, Some(chunk_size));
+        let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
+        let chunk1 = data_src.handle_with_offset(chunk_size, Some(chunk_size));
+        let chunk2 = data_src.handle_with_offset(2 * chunk_size, Some(chunk_size));
+        let chunk3 = data_src.handle_with_offset(3 * chunk_size, Some(chunk_size));
 
         // Verify offsets
         assert_eq!(chunk0.get_offset(), 0);

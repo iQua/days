@@ -808,15 +808,15 @@ impl Topology {
                 };
 
                 // create unique AppDataSource and actor (no MSS needed - TCP handles packetization)
-                let (datasrc, actor) =
+                let (data_src, actor) =
                     AppDataSource::buffered_actor(total_size, self.app_source_cfg);
-                // assign handle to each flow：all flows obtain data from the same datasrc
+                // assign handle to each flow：all flows obtain data from the same data_src
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
                 {
-                    flow_id_to_source_handle.insert(flow_id, datasrc.handle());
+                    flow_id_to_source_handle.insert(flow_id, data_src.handle());
                 }
-                app_sources.insert(collective.id, datasrc);
+                app_sources.insert(collective.id, data_src);
                 app_actors.push(actor);
             }
             // Ring-AllReduce (TCP)
@@ -852,12 +852,12 @@ impl Topology {
                             };
 
                             // ensure we have one AppActor for this src_host (no MSS - TCP handles packetization)
-                            let (datasrc, _actor) =
+                            let (data_src, _actor) =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
                                     AppDataSource::buffered_actor(total_size, self.app_source_cfg)
                                 });
 
-                            let handle = datasrc.handle_with_offset(chunk_offset, Some(chunk_len));
+                            let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
                             flow_id_to_source_handle.insert(flow_id, handle);
 
                             flow_id += 1;
@@ -867,7 +867,7 @@ impl Topology {
             }
         }
 
-        // Register every (datasrc, actor) exactly once
+        // Register every (data_src, actor) exactly once
         for ((src, _dst), (ds, actor)) in conn_map.into_iter() {
             app_sources.insert(src, ds);
             app_actors.push(actor);
