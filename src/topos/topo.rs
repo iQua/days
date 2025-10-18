@@ -858,6 +858,11 @@ impl Topology {
                                 Phase::Gather => (rank + step) % n,
                             };
                             let chunk_offset = chunk_owner * chunk_size;
+                            let chunk_len = if chunk_owner == n - 1 {
+                                total_size - chunk_offset
+                            } else {
+                                chunk_size
+                            };
 
                             // ensure we have one AppActor for this src_host
                             let (datasrc, _actor) =
@@ -869,7 +874,7 @@ impl Topology {
                                     ) // => (ds, actor)
                                 });
 
-                            let handle = datasrc.handle_with_offset(chunk_offset);
+                            let handle = datasrc.handle_with_offset(chunk_offset, Some(chunk_len));
                             flow_id_to_source_handle.insert(flow_id, handle);
 
                             flow_id += 1;

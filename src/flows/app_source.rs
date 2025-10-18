@@ -50,8 +50,8 @@ pub struct AppSourceHandle {
     offset: usize,
     /// Number of bytes already consumed using this handle.
     cursor: usize,
-    /// Total length of the stream.
-    total_size: Option<usize>,
+    /// Total length of the slice exposed through this handle.
+    length: Option<usize>,
 }
 
 impl AppSourceHandle {
@@ -61,42 +61,55 @@ impl AppSourceHandle {
             tx,
             offset: 0,
             cursor: 0,
-            total_size,
+            length: total_size,
         }
     }
 
     /// create a handle that starts at `offset` (Ring-AllReduce chunk)
-    pub fn with_offset(
-        tx: Sender<AppSourceRequest>,
-        offset: usize,
-        total_size: Option<usize>,
-    ) -> Self {
+    pub fn with_offset(tx: Sender<AppSourceRequest>, offset: usize, length: Option<usize>) -> Self {
         Self {
             tx,
             offset,
             cursor: 0,
-            total_size,
+            length,
         }
     }
 
     pub fn get_total_size(&self) -> Option<usize> {
-        self.total_size
+        self.length
     }
 
     // send a pull request to the actor, and await the returned packets.
     pub async fn pull(&mut self, size: usize) -> Vec<Packet> {
+        // Clamp the requested size to the remaining bytes exposed by this handle.
+        let allowed = self
+            .length
+            .map(|len| len.saturating_sub(self.cursor))
+            .unwrap_or(size);
+        let req_size = size.min(allowed);
+
+        if req_size == 0 {
+            return Vec::new();
+        }
+
         let (resp_tx, mut resp_rx) = channel(1);
         // send the current cursor to the actor
         let _ = self
             .tx
             .send(AppSourceRequest {
                 start: self.offset + self.cursor,
-                size,
+                size: req_size,
                 respond_to: resp_tx,
             })
             .await;
         let pkts = resp_rx.recv().await.unwrap_or_default();
-        self.cursor += pkts.iter().map(|p| p.size).sum::<usize>();
+        let consumed = pkts.iter().map(|p| p.size).sum::<usize>();
+        let consumed = if let Some(len) = self.length {
+            consumed.min(len.saturating_sub(self.cursor))
+        } else {
+            consumed
+        };
+        self.cursor += consumed;
         pkts
     }
     // a shutdown signal by sending a request with size=0 (not actually handled yet).
@@ -183,7 +196,7 @@ impl Model for AppActor {
             Self::run_once,
             (),
         )
-            .expect("schedule_event failed");
+        .expect("schedule_event failed");
         self.into()
     }
 }
@@ -202,6 +215,13 @@ impl AppActor {
                 let mut idx = 0usize; // index of packet
                 let mut byte_pos = 0usize; // the current packet start position
 
+                if req.size == 0 {
+                    let _ = req.respond_to.try_send(out);
+                    continue;
+                }
+
+                let req_end = req.start.saturating_add(req.size);
+
                 // find the index of current packet start
                 while idx < self.buffer.len() && byte_pos + self.buffer[idx].size <= req.start {
                     byte_pos += self.buffer[idx].size;
@@ -209,10 +229,42 @@ impl AppActor {
                 }
 
                 // clone from idx, until sent < req.size
-                while idx < self.buffer.len() && sent < req.size {
-                    let pkt = self.buffer[idx].clone();
-                    sent += pkt.size;
+                while idx < self.buffer.len() && sent < req.size && byte_pos < req_end {
+                    let base_pkt = &self.buffer[idx];
+                    let pkt_start = byte_pos;
+                    let pkt_end = pkt_start.saturating_add(base_pkt.size);
+
+                    if pkt_end <= req.start {
+                        byte_pos = pkt_end;
+                        idx += 1;
+                        continue;
+                    }
+
+                    if pkt_start >= req_end {
+                        break;
+                    }
+
+                    let slice_start = req.start.max(pkt_start);
+                    let max_take = req.size - sent;
+                    let slice_end = slice_start
+                        .saturating_add(max_take)
+                        .min(req_end)
+                        .min(pkt_end);
+                    let slice_len = slice_end.saturating_sub(slice_start);
+
+                    if slice_len == 0 {
+                        byte_pos = pkt_end;
+                        idx += 1;
+                        continue;
+                    }
+
+                    let mut pkt = base_pkt.clone();
+                    pkt.size = slice_len;
+                    sent += slice_len;
                     out.push(pkt);
+
+                    // advance to next packet
+                    byte_pos = pkt_end;
                     idx += 1;
                 }
 
@@ -224,7 +276,7 @@ impl AppActor {
                 Self::run_once,
                 (),
             )
-                .expect("reschedule run_once failed");
+            .expect("reschedule run_once failed");
         }
     }
 }
@@ -289,10 +341,13 @@ impl AppDataSource {
             Self::Buffered(h) | Self::Dist(h) => h.clone(),
         }
     }
-    pub fn handle_with_offset(&self, offset: usize) -> AppSourceHandle {
+    pub fn handle_with_offset(&self, offset: usize, length: Option<usize>) -> AppSourceHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => {
-                AppSourceHandle::with_offset(h.tx.clone(), offset, h.total_size)
+                let effective_length =
+                    length.or_else(|| h.length.map(|len| len.saturating_sub(offset)));
+                let absolute_offset = h.offset.saturating_add(offset);
+                AppSourceHandle::with_offset(h.tx.clone(), absolute_offset, effective_length)
             }
         }
     }
