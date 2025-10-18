@@ -16,7 +16,7 @@ use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
-use crate::flows::app_source::AppSourceHandle;
+use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
@@ -63,7 +63,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
-        app_source: Option<AppSourceHandle>,
+        app_source: Option<AppSourceBufferHandle>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -185,14 +185,16 @@ impl PacketSource {
                 source.busy_until = now + initial_delay;
 
                 if source.app_source.is_some() {
-                    // On flow start, proactively pull packets from the AppSourceHandle according to the current
+                    // On flow start, proactively pull packets from the AppSourceBufferHandle according to the current
                     // congestion window size (cwnd). This populates the initial packets to be sent as soon as
                     // they are allowed.
                     source.pull_from_appsource(now + initial_delay).await;
                 } else if source.has_synthetic_source() {
                     let start_time = now + initial_delay;
                     let (size, interval) = {
-                        let fallback = source.synthetic_source_mut().expect("fallback source missing");
+                        let fallback = source
+                            .synthetic_source_mut()
+                            .expect("fallback source missing");
                         fallback.set_flow_start_time(start_time);
                         let (data, interval) = fallback.produce_data(start_time);
                         (data.size, interval)
@@ -233,8 +235,9 @@ impl PacketSource {
                     if source.has_synthetic_source() {
                         let timestamp = source.time;
                         let (size, interval, exceeded) = {
-                            let fallback =
-                                source.synthetic_source_mut().expect("fallback source missing");
+                            let fallback = source
+                                .synthetic_source_mut()
+                                .expect("fallback source missing");
                             let (data, interval) = fallback.produce_data(timestamp);
                             let exceeded = fallback.traffic_exceeded(timestamp);
                             (data.size, interval, exceeded)

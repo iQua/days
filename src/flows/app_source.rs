@@ -51,9 +51,9 @@ pub struct AppSourceRequest {
     pub respond_to: Sender<Vec<u8>>,
 }
 
-// a handle to an application source actor. Allows TCPPacketSource to `pull()` packets asynchronously.
+// The handle for the AppSourceBuffer actor. Allows TCPPacketSource to `pull()` packets asynchronously.
 #[derive(Clone)]
-pub struct AppSourceHandle {
+pub struct AppSourceBufferHandle {
     /// Channel for sending requests to the app actor.
     tx: Sender<AppSourceRequest>,
     // First byte in the shared buffer assigned to this handle.
@@ -64,7 +64,7 @@ pub struct AppSourceHandle {
     length: Option<usize>,
 }
 
-impl AppSourceHandle {
+impl AppSourceBufferHandle {
     /// handle that starts at byte‐offset 0 (broadcast case)
     pub fn new(tx: Sender<AppSourceRequest>, total_size: Option<usize>) -> Self {
         Self {
@@ -266,9 +266,9 @@ impl AppSourceBuffer {
 #[derive(Clone)]
 pub enum AppDataSource {
     // Application-level DataSource for pre-buffered packets.
-    Buffered(AppSourceHandle),
+    Buffered(AppSourceBufferHandle),
     /// Application-level DataSource for packets generated from traffic distributions.
-    Dist(AppSourceHandle),
+    Dist(AppSourceBufferHandle),
 }
 
 impl AppDataSource {
@@ -278,7 +278,7 @@ impl AppDataSource {
         let buffer = vec![0u8; total_size];
         let (actor, tx) = AppSourceBuffer::buffered(buffer, &config);
         (
-            Self::Buffered(AppSourceHandle::new(tx, Some(total_size))),
+            Self::Buffered(AppSourceBufferHandle::new(tx, Some(total_size))),
             actor,
         )
     }
@@ -294,24 +294,28 @@ impl AppDataSource {
 
         let (actor, tx) = AppSourceBuffer::dist_actor(flow_id, tr, rng, &config);
 
-        (Self::Dist(AppSourceHandle::new(tx, None)), actor)
+        (Self::Dist(AppSourceBufferHandle::new(tx, None)), actor)
     }
 
     // Retrieves the underlying handle to use in TCPPacketSource.
-    pub fn handle(&self) -> AppSourceHandle {
+    pub fn handle(&self) -> AppSourceBufferHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => h.clone(),
         }
     }
 
-    pub fn handle_with_offset(&self, offset: usize, length: Option<usize>) -> AppSourceHandle {
+    pub fn handle_with_offset(
+        &self,
+        offset: usize,
+        length: Option<usize>,
+    ) -> AppSourceBufferHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => {
                 let effective_length =
                     length.or_else(|| h.length.map(|len| len.saturating_sub(offset)));
                 let absolute_offset = h.offset.saturating_add(offset);
 
-                AppSourceHandle::with_offset(h.tx.clone(), absolute_offset, effective_length)
+                AppSourceBufferHandle::with_offset(h.tx.clone(), absolute_offset, effective_length)
             }
         }
     }
@@ -382,7 +386,7 @@ mod tests {
         assert_eq!(end, 50); // Empty range
     }
 
-    /// Test AppSourceHandle cursor management
+    /// Test AppSourceBufferHandle cursor management
     #[test]
     fn test_handle_cursor_tracking() {
         // Simulate cursor advancement

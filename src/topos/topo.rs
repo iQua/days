@@ -16,7 +16,7 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
 use crate::flows::FlowSize;
-use crate::flows::app_source::{AppBufferConfig, AppSourceHandle};
+use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
@@ -564,7 +564,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
-        flow_id_to_source_handle: Option<HashMap<usize, AppSourceHandle>>,
+        flow_id_to_source_handle: Option<HashMap<usize, AppSourceBufferHandle>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -794,7 +794,7 @@ impl Topology {
         // Prepares application-level packet sources and their actors (only for TCP Broadcast).
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
         let mut app_actors: Vec<AppSourceBuffer> = Vec::new();
-        let mut flow_id_to_source_handle: HashMap<usize, AppSourceHandle> = HashMap::new();
+        let mut flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle> = HashMap::new();
         let mut conn_map: HashMap<(usize, usize), (AppDataSource, AppSourceBuffer)> =
             HashMap::new();
 

@@ -11,7 +11,7 @@ use rand::rngs::SmallRng;
 use nexosim::model::Model;
 use nexosim::ports::Output;
 
-use crate::flows::app_source::AppSourceHandle;
+use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
@@ -114,7 +114,7 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub app_source: Option<AppSourceHandle>,
+    pub app_source: Option<AppSourceBufferHandle>,
     synthetic_source: Option<SyntheticDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
@@ -165,7 +165,7 @@ impl TCPPacketSource {
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
-        app_source: Option<AppSourceHandle>,
+        app_source: Option<AppSourceBufferHandle>,
         rng: SmallRng,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic
