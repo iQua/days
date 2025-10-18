@@ -115,7 +115,7 @@ pub struct TCPPacketSource {
     timeout_queue: BinaryHeap<PacketTimeout>,
 
     pub app_source: Option<AppSourceHandle>,
-    legacy_source: Option<SyntheticDataSource>,
+    synthetic_source: Option<SyntheticDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -153,12 +153,12 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub fn legacy_source_mut(&mut self) -> Option<&mut SyntheticDataSource> {
-        self.legacy_source.as_mut()
+    pub fn synthetic_source_mut(&mut self) -> Option<&mut SyntheticDataSource> {
+        self.synthetic_source.as_mut()
     }
 
-    pub fn has_legacy_source(&self) -> bool {
-        self.legacy_source.is_some()
+    pub fn has_synthetic_source(&self) -> bool {
+        self.synthetic_source.is_some()
     }
 
     pub fn new(
@@ -179,7 +179,7 @@ impl TCPPacketSource {
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
-        let legacy_source = if app_source.is_some() {
+        let synthetic_source = if app_source.is_some() {
             None
         } else {
             Some(SyntheticDataSource::new(flow_id, traffic.clone(), rng))
@@ -207,7 +207,7 @@ impl TCPPacketSource {
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
             app_source,
-            legacy_source,
+            synthetic_source,
             remaining_bytes,
             busy_until: 0.0,
             packets_sent: 0,
