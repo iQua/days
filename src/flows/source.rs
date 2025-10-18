@@ -189,10 +189,10 @@ impl PacketSource {
                     // congestion window size (cwnd). This populates the initial packets to be sent as soon as
                     // they are allowed.
                     source.pull_from_appsource(now + initial_delay).await;
-                } else if source.has_legacy_source() {
+                } else if source.has_synthetic_source() {
                     let start_time = now + initial_delay;
                     let (size, interval) = {
-                        let fallback = source.legacy_source_mut().expect("fallback source missing");
+                        let fallback = source.synthetic_source_mut().expect("fallback source missing");
                         fallback.set_flow_start_time(start_time);
                         let (data, interval) = fallback.produce_data(start_time);
                         (data.size, interval)
@@ -230,11 +230,11 @@ impl PacketSource {
                         assert!((now - source.time).abs() <= 1e-7);
                     }
 
-                    if source.has_legacy_source() {
+                    if source.has_synthetic_source() {
                         let timestamp = source.time;
                         let (size, interval, exceeded) = {
                             let fallback =
-                                source.legacy_source_mut().expect("fallback source missing");
+                                source.synthetic_source_mut().expect("fallback source missing");
                             let (data, interval) = fallback.produce_data(timestamp);
                             let exceeded = fallback.traffic_exceeded(timestamp);
                             (data.size, interval, exceeded)

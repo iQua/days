@@ -807,21 +807,9 @@ impl Topology {
                     _ => panic!("Only byte-based broadcast is supported."),
                 };
 
-                // let mut packets = Vec::new();
-                // let mut remaining = total_size;
-                let mss = 512;
-                // let mut seq = 0;
-
-                // while remaining > 0 {
-                //     let sz = mss.min(remaining);
-                //     packets.push(Packet::new(sz, seq, 0, 0.0));
-                //     seq += sz;
-                //     remaining -= sz;
-                // }
-
-                // create unique AppDataSource and actor
+                // create unique AppDataSource and actor (no MSS needed - TCP handles packetization)
                 let (datasrc, actor) =
-                    AppDataSource::buffered_actor(total_size, mss, self.app_source_cfg);
+                    AppDataSource::buffered_actor(total_size, self.app_source_cfg);
                 // assign handle to each flow：all flows obtain data from the same datasrc
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
@@ -840,7 +828,6 @@ impl Topology {
                     FlowSize::Bytes(b) => b,
                     _ => panic!("RingAllReduce only supports byte-based flows."),
                 };
-                let mss = 512;
                 let n = collective.sources.len();
                 let chunk_size = total_size / n;
 
@@ -864,14 +851,10 @@ impl Topology {
                                 chunk_size
                             };
 
-                            // ensure we have one AppActor for this src_host
+                            // ensure we have one AppActor for this src_host (no MSS - TCP handles packetization)
                             let (datasrc, _actor) =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                    AppDataSource::buffered_actor(
-                                        total_size,
-                                        mss,
-                                        self.app_source_cfg,
-                                    ) // => (ds, actor)
+                                    AppDataSource::buffered_actor(total_size, self.app_source_cfg)
                                 });
 
                             let handle = datasrc.handle_with_offset(chunk_offset, Some(chunk_len));

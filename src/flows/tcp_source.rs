@@ -224,8 +224,8 @@ impl TCPPacketSource {
         }
     }
 
-    /// Pull packets from the app source based on the size of the remaining congestion window
-    /// (which is cwnd_limit - next_seq), using AppSourceHandle.
+    /// Pull data from the app source and create packets with proper TCP metadata.
+    /// Converts raw bytes from the application layer into TCP segments.
     /// This function is typically called:
     /// - after receiving new ACKs (to refill the window)
     /// - before sending packets (to populate the send buffer)
@@ -248,21 +248,32 @@ impl TCPPacketSource {
         let pull_size = win_left.min(self.remaining_bytes);
 
         if let Some(ref mut handle) = self.app_source {
-            let pkts = handle.pull(pull_size).await;
+            // Pull raw bytes from application layer
+            let data = handle.pull(pull_size).await;
 
-            for mut pkt in pkts {
+            // TCP layer creates packets with proper metadata
+            let mut offset = 0;
+            while offset < data.len() {
+                let chunk_size = self.mss.min(data.len() - offset);
+
                 // ensure we do not exceed the current window
-                if self.next_seq + pkt.size > self.last_ack + cwnd {
+                if self.next_seq + chunk_size > self.last_ack + cwnd {
                     break;
                 }
 
-                pkt.flow_id = self.flow_id;
-                pkt.packet_id = self.next_seq;
+                // Create packet with correct TCP metadata
+                let packet = Packet::new(
+                    chunk_size,
+                    self.next_seq,  // Correct sequence number
+                    self.flow_id,   // Correct flow ID
+                    now,            // Correct timestamp
+                );
 
-                self.output.send(pkt.clone()).await;
-                self.packet_sent(&pkt, now);
+                self.output.send(packet.clone()).await;
+                self.packet_sent(&packet, now);
 
-                self.remaining_bytes -= pkt.size;
+                self.remaining_bytes -= chunk_size;
+                offset += chunk_size;
             }
         }
 

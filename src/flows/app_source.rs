@@ -1,4 +1,9 @@
-//! Implements a unified interface for application-level sources with channel-based delivery to TCPPacketSource using actor model compatible with `nexosim`.
+//! Implements application-level data sources using an actor-based model.
+//!
+//! This module provides `AppActor` which manages byte buffers and serves
+//! byte-range requests from TCP sources via async channels. The actor is
+//! responsible ONLY for data management, not packetization - that responsibility
+//! belongs to the TCP layer (`TCPPacketSource`).
 
 use crate::flows::TrafficCharacteristics;
 use crate::flows::dist_source::DistPacketSource;
@@ -30,15 +35,15 @@ impl Default for AppSourceRuntimeConfig {
         }
     }
 }
-// a request sent to the AppActor asking for `size` bytes of packets. The `respond_to` channel is used to send back the result asynchronously.
+// a request sent to the AppActor asking for `size` bytes of data. The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
     /// Start reading at this byte position inside the stream.
     pub start: usize,
     /// Total number of bytes the requester wants to receive
     pub size: usize,
-    /// One-shot channel used by the actor to send back the packets.
-    pub respond_to: Sender<Vec<Packet>>,
+    /// One-shot channel used by the actor to send back the raw bytes.
+    pub respond_to: Sender<Vec<u8>>,
 }
 
 // a handle to an application source actor. Allows TCPPacketSource to `pull()` packets asynchronously.
@@ -79,8 +84,8 @@ impl AppSourceHandle {
         self.length
     }
 
-    // send a pull request to the actor, and await the returned packets.
-    pub async fn pull(&mut self, size: usize) -> Vec<Packet> {
+    // send a pull request to the actor, and await the returned bytes.
+    pub async fn pull(&mut self, size: usize) -> Vec<u8> {
         // Clamp the requested size to the remaining bytes exposed by this handle.
         let allowed = self
             .length
@@ -102,15 +107,15 @@ impl AppSourceHandle {
                 respond_to: resp_tx,
             })
             .await;
-        let pkts = resp_rx.recv().await.unwrap_or_default();
-        let consumed = pkts.iter().map(|p| p.size).sum::<usize>();
+        let data = resp_rx.recv().await.unwrap_or_default();
+        let consumed = data.len();
         let consumed = if let Some(len) = self.length {
             consumed.min(len.saturating_sub(self.cursor))
         } else {
             consumed
         };
         self.cursor += consumed;
-        pkts
+        data
     }
     // a shutdown signal by sending a request with size=0 (not actually handled yet).
     pub async fn shutdown(&self) {
@@ -126,12 +131,12 @@ impl AppSourceHandle {
     }
 }
 
-// the actor that holds a buffer of packets and services pull requests.
+// the actor that holds a buffer of bytes and services pull requests.
 pub struct AppActor {
     /// Receives pull requests from every handle.
     rx: Receiver<AppSourceRequest>,
-    /// Packet buffer that backs all responses.
-    buffer: Vec<Packet>,
+    /// Byte buffer that backs all responses.
+    buffer: Vec<u8>,
     /// Simulation output port exposed to other actors.
     pub out: Output<Packet>,
     /// Interval before first scheduling (µs)
@@ -142,14 +147,14 @@ pub struct AppActor {
 
 impl AppActor {
     pub fn buffered(
-        packets: Vec<Packet>,
+        buffer: Vec<u8>,
         config: &AppSourceRuntimeConfig,
     ) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.request_channel_capacity);
 
         let actor = AppActor {
             rx,
-            buffer: packets,
+            buffer,
             out: Output::default(),
             init_interval_micros: config.init_interval_micros,
             run_interval_micros: config.run_interval_micros,
@@ -158,7 +163,8 @@ impl AppActor {
         (actor, tx)
     }
 
-    // construct a distributed actor that generates packets following the probability and size patterns defined by the PacketDistribution.
+    // construct a distributed actor that generates bytes following the size patterns defined by the PacketDistribution.
+    // Note: This pre-generates a buffer of bytes. The distribution characteristics are approximated.
     pub fn dist_actor(
         flow_id: usize,
         traffic: TrafficCharacteristics,
@@ -167,19 +173,22 @@ impl AppActor {
     ) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.request_channel_capacity);
         let mut src = DistPacketSource::new(flow_id, Vec::new(), traffic, rng.clone());
-        let mut packets = Vec::new();
+        let mut buffer = Vec::new();
 
+        // Pre-generate bytes by creating packets and extracting their sizes
         for _ in 0..config.dist_initial_buffer_packets {
             let (p, _) = src.produce_packet(0.0);
-            packets.push(p);
+            // Extend buffer with 'size' bytes (filled with zeros for now)
+            buffer.extend(vec![0u8; p.size]);
         }
-        println!(
-            "[AppActor] Initialized buffer with {} packets",
-            packets.len()
+        log::debug!(
+            "[AppActor] Initialized distributed buffer with {} bytes from {} packet sizes",
+            buffer.len(),
+            config.dist_initial_buffer_packets
         );
         let actor = AppActor {
             rx,
-            buffer: packets,
+            buffer,
             out: Output::default(),
             init_interval_micros: config.init_interval_micros,
             run_interval_micros: config.run_interval_micros,
@@ -210,65 +219,21 @@ impl AppActor {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             while let Ok(req) = self.rx.try_recv() {
-                let mut out = Vec::new();
-                let mut sent = 0usize; // the total bytes of returned data
-                let mut idx = 0usize; // index of packet
-                let mut byte_pos = 0usize; // the current packet start position
-
+                // Handle shutdown signal
                 if req.size == 0 {
-                    let _ = req.respond_to.try_send(out);
-                    continue;
+                    log::debug!("[AppActor] Received shutdown signal, terminating actor");
+                    // Don't reschedule - actor terminates
+                    return;
                 }
 
-                let req_end = req.start.saturating_add(req.size);
+                // Simple byte-range extraction from the buffer
+                let start = req.start.min(self.buffer.len());
+                let end = (req.start + req.size).min(self.buffer.len());
+                let data = self.buffer[start..end].to_vec();
 
-                // find the index of current packet start
-                while idx < self.buffer.len() && byte_pos + self.buffer[idx].size <= req.start {
-                    byte_pos += self.buffer[idx].size;
-                    idx += 1;
+                if let Err(e) = req.respond_to.try_send(data) {
+                    log::warn!("[AppActor] Failed to send response: {:?}", e);
                 }
-
-                // clone from idx, until sent < req.size
-                while idx < self.buffer.len() && sent < req.size && byte_pos < req_end {
-                    let base_pkt = &self.buffer[idx];
-                    let pkt_start = byte_pos;
-                    let pkt_end = pkt_start.saturating_add(base_pkt.size);
-
-                    if pkt_end <= req.start {
-                        byte_pos = pkt_end;
-                        idx += 1;
-                        continue;
-                    }
-
-                    if pkt_start >= req_end {
-                        break;
-                    }
-
-                    let slice_start = req.start.max(pkt_start);
-                    let max_take = req.size - sent;
-                    let slice_end = slice_start
-                        .saturating_add(max_take)
-                        .min(req_end)
-                        .min(pkt_end);
-                    let slice_len = slice_end.saturating_sub(slice_start);
-
-                    if slice_len == 0 {
-                        byte_pos = pkt_end;
-                        idx += 1;
-                        continue;
-                    }
-
-                    let mut pkt = base_pkt.clone();
-                    pkt.size = slice_len;
-                    sent += slice_len;
-                    out.push(pkt);
-
-                    // advance to next packet
-                    byte_pos = pkt_end;
-                    idx += 1;
-                }
-
-                let _ = req.respond_to.try_send(out);
             }
 
             cx.schedule_event(
@@ -291,34 +256,18 @@ pub enum AppDataSource {
 }
 
 impl AppDataSource {
-    // Build a data source backed by the supplied packet list.
-    fn buffered_actor_from_packets(
-        packets: Vec<Packet>,
+    // Build a data source backed by a byte buffer of the specified size.
+    pub fn buffered_actor(
+        total_size: usize,
         config: AppSourceRuntimeConfig,
     ) -> (Self, AppActor) {
-        let total_size = packets.iter().map(|p| p.size).sum::<usize>();
-        let (actor, tx) = AppActor::buffered(packets, &config);
+        // Create a buffer filled with zeros (or could be filled with meaningful data)
+        let buffer = vec![0u8; total_size];
+        let (actor, tx) = AppActor::buffered(buffer, &config);
         (
             Self::Buffered(AppSourceHandle::new(tx, Some(total_size))),
             actor,
         )
-    }
-
-    pub fn buffered_actor(
-        total_size: usize,
-        mss: usize,
-        config: AppSourceRuntimeConfig,
-    ) -> (Self, AppActor) {
-        let mut packets = Vec::new();
-        let mut remaining = total_size;
-        let mut seq = 0;
-        while remaining > 0 {
-            let sz = mss.min(remaining);
-            packets.push(Packet::new(sz, seq, 0, 0.0));
-            seq += sz;
-            remaining -= sz;
-        }
-        Self::buffered_actor_from_packets(packets, config)
     }
 
     // create a dist source from traffic distributions and flow ID
