@@ -80,6 +80,7 @@ impl PacketSource {
                 flow_start_after,
                 traffic,
                 app_source,
+                rng,
             ))),
         }
     }
@@ -165,6 +166,7 @@ impl PacketSource {
             }
             PacketSource::TCPPacketSource(source) => {
                 source.report_start_time = now + initial_delay;
+                source.time = now + initial_delay;
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
@@ -182,10 +184,30 @@ impl PacketSource {
                 // TCPPacketSource now owns the data from the application
                 source.busy_until = now + initial_delay;
 
-                // On flow start, proactively pull packets from the AppSourceHandle according to the current
-                // congestion window size (cwnd). This populates the initial packets to be sent as soon as
-                // they are allowed.
-                source.pull_from_appsource(now + initial_delay).await;
+                if source.app_source.is_some() {
+                    // On flow start, proactively pull packets from the AppSourceHandle according to the current
+                    // congestion window size (cwnd). This populates the initial packets to be sent as soon as
+                    // they are allowed.
+                    source.pull_from_appsource(now + initial_delay).await;
+                } else if source.has_legacy_source() {
+                    let start_time = now + initial_delay;
+                    let (size, interval) = {
+                        let fallback = source.legacy_source_mut().expect("fallback source missing");
+                        fallback.set_flow_start_time(start_time);
+                        let (data, interval) = fallback.produce_data(start_time);
+                        (data.size, interval)
+                    };
+
+                    source.send_buffer += size;
+                    source.busy_until = start_time;
+
+                    cx.schedule_event(
+                        Duration::from_secs_f64(interval),
+                        Self::fetch_app_data,
+                        start_time + interval,
+                    )
+                    .unwrap();
+                }
             }
         }
     }
@@ -208,10 +230,35 @@ impl PacketSource {
                         assert!((now - source.time).abs() <= 1e-7);
                     }
 
-                    if source.next_seq < source.send_buffer {
-                        // the TCPPacketSource could send a new packet at this
-                        // point, if the size of the congestion window
-                        // allows
+                    if source.has_legacy_source() {
+                        let timestamp = source.time;
+                        let (size, interval, exceeded) = {
+                            let fallback =
+                                source.legacy_source_mut().expect("fallback source missing");
+                            let (data, interval) = fallback.produce_data(timestamp);
+                            let exceeded = fallback.traffic_exceeded(timestamp);
+                            (data.size, interval, exceeded)
+                        };
+
+                        if !exceeded {
+                            source.send_buffer += size;
+                            cx.schedule_event(
+                                Duration::from_secs_f64(interval),
+                                Self::fetch_app_data,
+                                timestamp + interval,
+                            )
+                            .unwrap();
+                        } else {
+                            source.traffic_exceeded = true;
+                        }
+
+                        if source.next_seq < source.send_buffer {
+                            self.run((), cx).await;
+                        } else {
+                            source.busy_until = timestamp + interval;
+                        }
+                    } else if source.next_seq < source.send_buffer {
+                        // For handle-backed sources, simply resume sending if there is pending data.
                         self.run((), cx).await;
                     }
                 }

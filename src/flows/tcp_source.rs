@@ -9,11 +9,13 @@ use log::debug;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
+use rand::rngs::SmallRng;
 
 use crate::flows::app_source::AppSourceHandle;
 use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
+use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::reno::TCPReno;
 use crate::flows::source::PacketSourceReport;
@@ -27,6 +29,32 @@ pub struct PacketTimeout {
     pub packet_id: usize,
     pub rto: f64,
     pub timeout: f64,
+}
+
+pub(crate) struct LegacyAppDataSource {
+    dist: DistPacketSource,
+}
+
+impl LegacyAppDataSource {
+    pub(crate) fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+        Self {
+            dist: DistPacketSource::new(flow_id, Vec::new(), traffic, rng),
+        }
+    }
+
+    pub(crate) fn set_flow_start_time(&mut self, flow_start_time: f64) {
+        self.dist.flow_start_time = flow_start_time;
+    }
+
+    pub(crate) fn produce_data(&mut self, now: f64) -> (Packet, f64) {
+        let (packet, interval) = self.dist.produce_packet(now);
+        self.dist.packet_sent(&packet, now);
+        (packet, interval)
+    }
+
+    pub(crate) fn traffic_exceeded(&self, now: f64) -> bool {
+        self.dist.traffic_exceeded(now)
+    }
 }
 
 impl PartialOrd for PacketTimeout {
@@ -87,6 +115,7 @@ pub struct TCPPacketSource {
     timeout_queue: BinaryHeap<PacketTimeout>,
 
     pub app_source: Option<AppSourceHandle>,
+    legacy_source: Option<LegacyAppDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -124,11 +153,20 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
+    pub(crate) fn legacy_source_mut(&mut self) -> Option<&mut LegacyAppDataSource> {
+        self.legacy_source.as_mut()
+    }
+
+    pub(crate) fn has_legacy_source(&self) -> bool {
+        self.legacy_source.is_some()
+    }
+
     pub fn new(
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
         app_source: Option<AppSourceHandle>,
+        rng: SmallRng,
     ) -> TCPPacketSource {
         let cc_algorithm = traffic
             .tcp
@@ -140,6 +178,11 @@ impl TCPPacketSource {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
+        };
+        let legacy_source = if app_source.is_some() {
+            None
+        } else {
+            Some(LegacyAppDataSource::new(flow_id, traffic.clone(), rng))
         };
         let remaining_bytes = app_source
             .as_ref()
@@ -164,6 +207,7 @@ impl TCPPacketSource {
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
             app_source,
+            legacy_source,
             remaining_bytes,
             busy_until: 0.0,
             packets_sent: 0,
@@ -223,6 +267,9 @@ impl TCPPacketSource {
         }
 
         // if all bytes have been sent and acknowledged, complete the flow
+        if self.remaining_bytes == 0 {
+            self.traffic_exceeded = true;
+        }
         if self.remaining_bytes == 0 && self.send_buffer == 0 {
             self.wrap_up(now).await;
         }

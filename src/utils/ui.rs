@@ -69,9 +69,18 @@ impl UserInterface {
                 .inc((self.duration / self.ui_interval) as u64 - self.progress_bar.position());
 
             let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            let delay = if self.duration > now {
+                self.duration - now
+            } else {
+                0.0
+            };
 
-            cx.schedule_event(Duration::from_secs_f64(self.duration - now), Self::run, ())
-                .unwrap();
+            if delay <= 0.0 {
+                self.run((), cx);
+            } else {
+                cx.schedule_event(Duration::from_secs_f64(delay), Self::run, ())
+                    .unwrap();
+            }
         }
     }
 
