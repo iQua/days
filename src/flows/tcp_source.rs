@@ -31,28 +31,28 @@ pub struct PacketTimeout {
     pub timeout: f64,
 }
 
-pub(crate) struct LegacyAppDataSource {
+pub struct SyntheticDataSource {
     dist: DistPacketSource,
 }
 
-impl LegacyAppDataSource {
-    pub(crate) fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+impl SyntheticDataSource {
+    fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
         Self {
             dist: DistPacketSource::new(flow_id, Vec::new(), traffic, rng),
         }
     }
 
-    pub(crate) fn set_flow_start_time(&mut self, flow_start_time: f64) {
+    pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
         self.dist.flow_start_time = flow_start_time;
     }
 
-    pub(crate) fn produce_data(&mut self, now: f64) -> (Packet, f64) {
+    pub fn produce_data(&mut self, now: f64) -> (Packet, f64) {
         let (packet, interval) = self.dist.produce_packet(now);
         self.dist.packet_sent(&packet, now);
         (packet, interval)
     }
 
-    pub(crate) fn traffic_exceeded(&self, now: f64) -> bool {
+    pub fn traffic_exceeded(&self, now: f64) -> bool {
         self.dist.traffic_exceeded(now)
     }
 }
@@ -115,7 +115,7 @@ pub struct TCPPacketSource {
     timeout_queue: BinaryHeap<PacketTimeout>,
 
     pub app_source: Option<AppSourceHandle>,
-    legacy_source: Option<LegacyAppDataSource>,
+    legacy_source: Option<SyntheticDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -153,11 +153,11 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
-    pub(crate) fn legacy_source_mut(&mut self) -> Option<&mut LegacyAppDataSource> {
+    pub fn legacy_source_mut(&mut self) -> Option<&mut SyntheticDataSource> {
         self.legacy_source.as_mut()
     }
 
-    pub(crate) fn has_legacy_source(&self) -> bool {
+    pub fn has_legacy_source(&self) -> bool {
         self.legacy_source.is_some()
     }
 
@@ -182,7 +182,7 @@ impl TCPPacketSource {
         let legacy_source = if app_source.is_some() {
             None
         } else {
-            Some(LegacyAppDataSource::new(flow_id, traffic.clone(), rng))
+            Some(SyntheticDataSource::new(flow_id, traffic.clone(), rng))
         };
         let remaining_bytes = app_source
             .as_ref()
