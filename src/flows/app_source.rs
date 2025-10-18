@@ -20,15 +20,16 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::get_seed;
 
+/// Runtime configuration for AppSourceBuffer behavior
 #[derive(Clone, Copy, Debug)]
-pub struct AppSourceRuntimeConfig {
+pub struct AppBufferConfig {
     pub request_channel_capacity: usize,
     pub dist_initial_buffer_packets: usize,
     pub init_interval_micros: u64,
     pub run_interval_micros: u64,
 }
 
-impl Default for AppSourceRuntimeConfig {
+impl Default for AppBufferConfig {
     fn default() -> Self {
         Self {
             request_channel_capacity: 128,
@@ -164,10 +165,7 @@ pub struct AppSourceBuffer {
 }
 
 impl AppSourceBuffer {
-    pub fn buffered(
-        buffer: Vec<u8>,
-        config: &AppSourceRuntimeConfig,
-    ) -> (Self, Sender<AppSourceRequest>) {
+    pub fn buffered(buffer: Vec<u8>, config: &AppBufferConfig) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.request_channel_capacity);
 
         let actor = AppSourceBuffer {
@@ -187,7 +185,7 @@ impl AppSourceBuffer {
         flow_id: usize,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
-        config: &AppSourceRuntimeConfig,
+        config: &AppBufferConfig,
     ) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.request_channel_capacity);
         let mut src = DistPacketSource::new(flow_id, Vec::new(), traffic, rng.clone());
@@ -275,10 +273,7 @@ pub enum AppDataSource {
 
 impl AppDataSource {
     // Build a data source backed by a byte buffer of the specified size.
-    pub fn buffered_actor(
-        total_size: usize,
-        config: AppSourceRuntimeConfig,
-    ) -> (Self, AppSourceBuffer) {
+    pub fn buffered_actor(total_size: usize, config: AppBufferConfig) -> (Self, AppSourceBuffer) {
         // Create a buffer filled with zeros (or could be filled with meaningful data)
         let buffer = vec![0u8; total_size];
         let (actor, tx) = AppSourceBuffer::buffered(buffer, &config);
@@ -288,11 +283,11 @@ impl AppDataSource {
         )
     }
 
-    // Create a distributed source from traffic distributions and flow ID
+    // Create a distributed source from traffic distributions and flow ID.
     pub fn distributed_source(
         flow_id: usize,
         tr: TrafficCharacteristics,
-        config: AppSourceRuntimeConfig,
+        config: AppBufferConfig,
     ) -> (Self, AppSourceBuffer) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
@@ -329,7 +324,7 @@ mod tests {
     /// Test basic byte-range extraction logic
     #[test]
     fn test_app_actor_basic_byte_extraction() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
 
         // Create a buffer with known data: [0, 1, 2, 3, ..., 99]
         let buffer: Vec<u8> = (0..100u8).collect();
@@ -532,7 +527,7 @@ mod tests {
     /// Test AppDataSource buffered_actor constructor
     #[test]
     fn test_buffered_actor_creation() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 1024;
 
         let (data_src, actor) = AppDataSource::buffered_actor(total_size, config);
@@ -550,7 +545,7 @@ mod tests {
     /// Test that multiple handles can be created from the same datasource
     #[test]
     fn test_multiple_handles_from_same_source() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 1000;
 
         let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
@@ -572,7 +567,7 @@ mod tests {
     /// Test chunk offset handles for RingAllReduce
     #[test]
     fn test_ring_allreduce_chunk_handles() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 512;
         let num_nodes = 4;
         let chunk_size = total_size / num_nodes; // 128 bytes per chunk
@@ -609,7 +604,7 @@ mod tests {
     fn test_tcp_packetization_sequence_numbers() {
         use crate::flows::packet::Packet;
 
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 1536; // 3 MSS worth of data (512 * 3)
         let mss = 512;
 
@@ -720,7 +715,7 @@ mod tests {
     /// Test Broadcast scenario: multiple flows share the same data
     #[test]
     fn test_broadcast_multiple_flows_same_data() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 1024;
 
         let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
@@ -752,7 +747,7 @@ mod tests {
     /// Test RingAllReduce scenario: different flows access different chunks
     #[test]
     fn test_ring_allreduce_chunk_partitioning() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 2048;
         let num_nodes = 4;
         let chunk_size = total_size / num_nodes; // 512 bytes per chunk
@@ -861,7 +856,7 @@ mod tests {
     /// Test RingAllReduce with uneven chunk sizes
     #[test]
     fn test_ring_allreduce_uneven_chunks() {
-        let config = AppSourceRuntimeConfig::default();
+        let config = AppBufferConfig::default();
         let total_size = 1000; // Not evenly divisible by 3
         let num_nodes = 3;
         let chunk_size = total_size / num_nodes; // 333

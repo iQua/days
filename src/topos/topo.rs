@@ -16,7 +16,7 @@ use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
 use crate::flows::FlowSize;
-use crate::flows::app_source::{AppSourceHandle, AppSourceRuntimeConfig};
+use crate::flows::app_source::{AppBufferConfig, AppSourceHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
@@ -103,11 +103,11 @@ pub struct TopoConfig {
 pub struct Config {
     pub switch: SwitchConfig,
     pub topology: Option<TopoConfig>,
-    pub app_source: Option<AppSourceToml>,
+    pub app_source: Option<AppSourceConfig>,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
-pub struct AppSourceToml {
+#[derive(Deserialize)]
+pub struct AppSourceConfig {
     pub request_channel_capacity: Option<usize>,
     pub dist_initial_buffer_packets: Option<usize>,
     pub init_interval_micros: Option<u64>,
@@ -171,7 +171,7 @@ pub struct Topology {
     /// the duration of the simulation
     duration: f64,
     /// app source runtime config
-    app_source_cfg: AppSourceRuntimeConfig,
+    app_source_cfg: AppBufferConfig,
 }
 
 impl Topology {
@@ -218,14 +218,14 @@ impl Topology {
         let switches = Topology::init_switches();
 
         let app_source_cfg = if let Some(app_src) = &config.app_source {
-            AppSourceRuntimeConfig {
+            AppBufferConfig {
                 request_channel_capacity: app_src.request_channel_capacity.unwrap_or(128),
                 dist_initial_buffer_packets: app_src.dist_initial_buffer_packets.unwrap_or(512),
                 init_interval_micros: app_src.init_interval_micros.unwrap_or(1),
                 run_interval_micros: app_src.run_interval_micros.unwrap_or(50),
             }
         } else {
-            AppSourceRuntimeConfig::default()
+            AppBufferConfig::default()
         };
 
         Topology {
