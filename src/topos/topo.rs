@@ -108,10 +108,10 @@ pub struct Config {
 
 #[derive(Deserialize)]
 pub struct AppSourceConfig {
-    pub request_channel_capacity: Option<usize>,
-    pub dist_initial_buffer_packets: Option<usize>,
-    pub init_interval_micros: Option<u64>,
-    pub run_interval_micros: Option<u64>,
+    pub req_channel_capacity: Option<usize>,
+    pub chunk_size: Option<usize>,
+    pub initial_delay: Option<u64>,
+    pub run_interval: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -219,10 +219,10 @@ impl Topology {
 
         let app_source_cfg = if let Some(app_src) = &config.app_source {
             AppBufferConfig {
-                request_channel_capacity: app_src.request_channel_capacity.unwrap_or(128),
-                dist_initial_buffer_packets: app_src.dist_initial_buffer_packets.unwrap_or(512),
-                init_interval_micros: app_src.init_interval_micros.unwrap_or(1),
-                run_interval_micros: app_src.run_interval_micros.unwrap_or(50),
+                req_channel_capacity: app_src.req_channel_capacity.unwrap_or(128),
+                chunk_size: app_src.chunk_size.unwrap_or(512),
+                initial_delay: app_src.initial_delay.unwrap_or(1),
+                run_interval: app_src.run_interval.unwrap_or(50),
             }
         } else {
             AppBufferConfig::default()

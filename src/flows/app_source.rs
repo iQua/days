@@ -1,9 +1,9 @@
 //! Implements application-level data sources using an actor-based model.
 //!
-//! This module provides `AppSourceBuffer` which manages byte buffers and serves
-//! byte-range requests from TCP sources via async channels. The actor is
-//! responsible ONLY for data management, not packetization - that responsibility
-//! belongs to the TCP layer (`TCPPacketSource`).
+//! This module provides `AppSourceBuffer` as an actor, which manages byte buffers and serves
+//! byte-range requests from TCP sources via async channels. The actor is responsible *only*
+//! for data management, not packetization - that responsibility belongs to the TCP layer
+//! (`TCPPacketSource`).
 
 use std::future::Future;
 use std::time::Duration;
@@ -20,26 +20,27 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::get_seed;
 
-/// Runtime configuration for AppSourceBuffer behavior
+/// Runtime configuration for AppSourceBuffer
 #[derive(Clone, Copy, Debug)]
 pub struct AppBufferConfig {
-    pub request_channel_capacity: usize,
-    pub dist_initial_buffer_packets: usize,
-    pub init_interval_micros: u64,
-    pub run_interval_micros: u64,
+    pub req_channel_capacity: usize,
+    pub chunk_size: usize,
+    pub initial_delay: u64,
+    pub run_interval: u64,
 }
 
 impl Default for AppBufferConfig {
     fn default() -> Self {
         Self {
-            request_channel_capacity: 128,
-            dist_initial_buffer_packets: 512,
-            init_interval_micros: 1,
-            run_interval_micros: 50,
+            req_channel_capacity: 256,
+            chunk_size: 512,
+            initial_delay: 1,
+            run_interval: 50,
         }
     }
 }
-// a request sent to the AppSourceBuffer asking for `size` bytes of data. The `respond_to` channel is used to send back the result asynchronously.
+// Each request sent to the AppSourceBuffer asks for `size` bytes of data. The `respond_to` channel
+// is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
     /// Start reading at this byte position inside the stream.
@@ -150,7 +151,7 @@ impl AppSourceHandle {
     }
 }
 
-// the actor that holds a buffer of bytes and services pull requests.
+// An actor that holds a buffer of bytes in the application layer, and services pull requests.
 pub struct AppSourceBuffer {
     /// Receives pull requests from every handle.
     rx: Receiver<AppSourceRequest>,
@@ -159,56 +160,58 @@ pub struct AppSourceBuffer {
     /// Simulation output port exposed to other actors.
     pub out: Output<Packet>,
     /// Interval before first scheduling (µs)
-    init_interval_micros: u64,
+    initial_delay: u64,
     /// Interval between ticks (µs)
-    run_interval_micros: u64,
+    run_interval: u64,
 }
 
 impl AppSourceBuffer {
     pub fn buffered(buffer: Vec<u8>, config: &AppBufferConfig) -> (Self, Sender<AppSourceRequest>) {
-        let (tx, rx) = channel(config.request_channel_capacity);
+        let (tx, rx) = channel(config.req_channel_capacity);
 
         let actor = AppSourceBuffer {
             rx,
             buffer,
             out: Output::default(),
-            init_interval_micros: config.init_interval_micros,
-            run_interval_micros: config.run_interval_micros,
+            initial_delay: config.initial_delay,
+            run_interval: config.run_interval,
         };
 
         (actor, tx)
     }
 
-    // construct a distributed actor that generates bytes following the size patterns defined by the PacketDistribution.
-    // Note: This pre-generates a buffer of bytes. The distribution characteristics are approximated.
+    // Construct a distributed actor that generates bytes following the size patterns defined by the PacketDistribution.
     pub fn dist_actor(
         flow_id: usize,
         traffic: TrafficCharacteristics,
         rng: SmallRng,
         config: &AppBufferConfig,
     ) -> (Self, Sender<AppSourceRequest>) {
-        let (tx, rx) = channel(config.request_channel_capacity);
+        let (tx, rx) = channel(config.req_channel_capacity);
+
         let mut src = DistPacketSource::new(flow_id, Vec::new(), traffic, rng.clone());
         let mut buffer = Vec::new();
 
-        // Pre-generate bytes by creating packets and extracting their sizes
-        for _ in 0..config.dist_initial_buffer_packets {
+        // Pre-generate bytes by creating chunks and extracting their sizes
+        for _ in 0..config.chunk_size {
             let (p, _) = src.produce_packet(0.0);
             // Extend buffer with 'size' bytes (filled with zeros for now)
             buffer.extend(vec![0u8; p.size]);
         }
         log::debug!(
-            "[AppSourceBuffer] Initialized distributed buffer with {} bytes from {} packet sizes",
+            "[AppSourceBuffer] Initialized distributed buffer with {} bytes and a chunk size of {}.",
             buffer.len(),
-            config.dist_initial_buffer_packets
+            config.chunk_size
         );
+
         let actor = AppSourceBuffer {
             rx,
             buffer,
             out: Output::default(),
-            init_interval_micros: config.init_interval_micros,
-            run_interval_micros: config.run_interval_micros,
+            initial_delay: config.initial_delay,
+            run_interval: config.run_interval,
         };
+
         (actor, tx)
     }
 }
@@ -217,11 +220,12 @@ impl Model for AppSourceBuffer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         // schedule the actor's run_once function after the configured initial interval
         cx.schedule_event(
-            Duration::from_micros(self.init_interval_micros),
+            Duration::from_micros(self.initial_delay),
             Self::run_once,
             (),
         )
         .expect("schedule_event failed");
+
         self.into()
     }
 }
@@ -252,12 +256,8 @@ impl AppSourceBuffer {
                 }
             }
 
-            cx.schedule_event(
-                Duration::from_micros(self.run_interval_micros),
-                Self::run_once,
-                (),
-            )
-            .expect("reschedule run_once failed");
+            cx.schedule_event(Duration::from_micros(self.run_interval), Self::run_once, ())
+                .expect("reschedule run_once failed");
         }
     }
 }

@@ -6,10 +6,10 @@ duration = 20.0
 log_path = "logs/collective_tcp"
 
 [app_source]
-request_channel_capacity = 128
-dist_initial_buffer_packets = 512
-init_interval_micros = 1
-run_interval_micros = 50
+req_channel_capacity = 128
+app_chunk_size = 512
+initial_delay = 1
+run_interval = 50
 
 [switch]
 port_rate = 1000000
