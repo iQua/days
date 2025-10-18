@@ -1,12 +1,13 @@
 //! Implements a TCPSink, designed to send acknowledgement packets back to
 //! TCPPacketSource.
 
-use log::debug;
 use std::fmt::Debug;
+
+use log::debug;
+use tracing::instrument;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
-use tracing::instrument;
 
 use crate::flows::FlowFinishMsg;
 use crate::flows::packet::{Packet, TCPAck};
@@ -158,7 +159,10 @@ impl TCPPacketSink {
         if packet.packet_id < self.next_seq_expected {
             log::debug!(
                 "Duplicate packet received: TCP sink={} flow={} pkt_id={} now={:.3}",
-                self.endpoint_id, packet.flow_id, packet.packet_id, now
+                self.endpoint_id,
+                packet.flow_id,
+                packet.packet_id,
+                now
             );
         }
         self.time = now;

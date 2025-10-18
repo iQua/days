@@ -6,10 +6,10 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use core::fmt;
 use log::debug;
+use rand::rngs::SmallRng;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
-use rand::rngs::SmallRng;
 
 use crate::flows::app_source::AppSourceHandle;
 use crate::flows::bbr::TCPBBR;
@@ -264,9 +264,9 @@ impl TCPPacketSource {
                 // Create packet with correct TCP metadata
                 let packet = Packet::new(
                     chunk_size,
-                    self.next_seq,  // Correct sequence number
-                    self.flow_id,   // Correct flow ID
-                    now,            // Correct timestamp
+                    self.next_seq, // Correct sequence number
+                    self.flow_id,  // Correct flow ID
+                    now,           // Correct timestamp
                 );
 
                 self.output.send(packet.clone()).await;

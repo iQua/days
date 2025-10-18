@@ -3,8 +3,9 @@
 //! Based on the BBRv3 IETF Draft:
 //! https://ietf-wg-ccwg.github.io/draft-ietf-ccwg-bbr/draft-ietf-ccwg-bbr.html
 
-use crate::flows::cc::CongestionControl;
 use std::collections::VecDeque;
+
+use crate::flows::cc::CongestionControl;
 
 #[derive(Debug)]
 pub struct BBRState {

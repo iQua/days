@@ -38,7 +38,7 @@ use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
-use crate::flows::app_source::{AppActor, AppDataSource};
+use crate::flows::app_source::{AppDataSource, AppSourceBuffer};
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -793,9 +793,10 @@ impl Topology {
 
         // Prepares application-level packet sources and their actors (only for TCP Broadcast).
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
-        let mut app_actors: Vec<AppActor> = Vec::new();
+        let mut app_actors: Vec<AppSourceBuffer> = Vec::new();
         let mut flow_id_to_source_handle: HashMap<usize, AppSourceHandle> = HashMap::new();
-        let mut conn_map: HashMap<(usize, usize), (AppDataSource, AppActor)> = HashMap::new();
+        let mut conn_map: HashMap<(usize, usize), (AppDataSource, AppSourceBuffer)> =
+            HashMap::new();
 
         for collective in &self.collectives {
             if matches!(
@@ -851,7 +852,7 @@ impl Topology {
                                 chunk_size
                             };
 
-                            // ensure we have one AppActor for this src_host (no MSS - TCP handles packetization)
+                            // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
                             let (data_src, _actor) =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
                                     AppDataSource::buffered_actor(total_size, self.app_source_cfg)
@@ -894,7 +895,7 @@ impl Topology {
 
         for actor in app_actors {
             let mbox = Mailbox::new();
-            self.sim_init = self.sim_init.add_model(actor, mbox, "AppActor");
+            self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
         }
 
         // creates and activates a UserInterface coroutine

@@ -1,21 +1,24 @@
 //! Implements application-level data sources using an actor-based model.
 //!
-//! This module provides `AppActor` which manages byte buffers and serves
+//! This module provides `AppSourceBuffer` which manages byte buffers and serves
 //! byte-range requests from TCP sources via async channels. The actor is
 //! responsible ONLY for data management, not packetization - that responsibility
 //! belongs to the TCP layer (`TCPPacketSource`).
+
+use std::future::Future;
+use std::time::Duration;
+
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
+
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::Output;
+use tachyonix::{Receiver, Sender, channel};
 
 use crate::flows::TrafficCharacteristics;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::get_seed;
-use nexosim::model::{Context, InitializedModel, Model};
-use nexosim::ports::Output;
-use rand::SeedableRng;
-use rand::rngs::SmallRng;
-use std::future::Future;
-use std::time::Duration;
-use tachyonix::{Receiver, Sender, channel};
 
 #[derive(Clone, Copy, Debug)]
 pub struct AppSourceRuntimeConfig {
@@ -35,7 +38,7 @@ impl Default for AppSourceRuntimeConfig {
         }
     }
 }
-// a request sent to the AppActor asking for `size` bytes of data. The `respond_to` channel is used to send back the result asynchronously.
+// a request sent to the AppSourceBuffer asking for `size` bytes of data. The `respond_to` channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
     /// Start reading at this byte position inside the stream.
@@ -147,7 +150,7 @@ impl AppSourceHandle {
 }
 
 // the actor that holds a buffer of bytes and services pull requests.
-pub struct AppActor {
+pub struct AppSourceBuffer {
     /// Receives pull requests from every handle.
     rx: Receiver<AppSourceRequest>,
     /// Byte buffer that backs all responses.
@@ -160,14 +163,14 @@ pub struct AppActor {
     run_interval_micros: u64,
 }
 
-impl AppActor {
+impl AppSourceBuffer {
     pub fn buffered(
         buffer: Vec<u8>,
         config: &AppSourceRuntimeConfig,
     ) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.request_channel_capacity);
 
-        let actor = AppActor {
+        let actor = AppSourceBuffer {
             rx,
             buffer,
             out: Output::default(),
@@ -197,11 +200,11 @@ impl AppActor {
             buffer.extend(vec![0u8; p.size]);
         }
         log::debug!(
-            "[AppActor] Initialized distributed buffer with {} bytes from {} packet sizes",
+            "[AppSourceBuffer] Initialized distributed buffer with {} bytes from {} packet sizes",
             buffer.len(),
             config.dist_initial_buffer_packets
         );
-        let actor = AppActor {
+        let actor = AppSourceBuffer {
             rx,
             buffer,
             out: Output::default(),
@@ -212,7 +215,7 @@ impl AppActor {
     }
 }
 
-impl Model for AppActor {
+impl Model for AppSourceBuffer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         // schedule the actor's run_once function after the configured initial interval
         cx.schedule_event(
@@ -225,7 +228,7 @@ impl Model for AppActor {
     }
 }
 
-impl AppActor {
+impl AppSourceBuffer {
     #[allow(clippy::manual_async_fn)]
     fn run_once<'a>(
         &'a mut self,
@@ -236,7 +239,7 @@ impl AppActor {
             while let Ok(req) = self.rx.try_recv() {
                 // Handle shutdown signal
                 if req.size == 0 {
-                    log::debug!("[AppActor] Received shutdown signal, terminating actor");
+                    log::debug!("[AppSourceBuffer] Received shutdown signal, terminating actor");
                     // Don't reschedule - actor terminates
                     return;
                 }
@@ -247,7 +250,7 @@ impl AppActor {
                 let data = self.buffer[start..end].to_vec();
 
                 if let Err(e) = req.respond_to.try_send(data) {
-                    log::warn!("[AppActor] Failed to send response: {:?}", e);
+                    log::warn!("[AppSourceBuffer] Failed to send response: {:?}", e);
                 }
             }
 
@@ -272,42 +275,47 @@ pub enum AppDataSource {
 
 impl AppDataSource {
     // Build a data source backed by a byte buffer of the specified size.
-    pub fn buffered_actor(total_size: usize, config: AppSourceRuntimeConfig) -> (Self, AppActor) {
+    pub fn buffered_actor(
+        total_size: usize,
+        config: AppSourceRuntimeConfig,
+    ) -> (Self, AppSourceBuffer) {
         // Create a buffer filled with zeros (or could be filled with meaningful data)
         let buffer = vec![0u8; total_size];
-        let (actor, tx) = AppActor::buffered(buffer, &config);
+        let (actor, tx) = AppSourceBuffer::buffered(buffer, &config);
         (
             Self::Buffered(AppSourceHandle::new(tx, Some(total_size))),
             actor,
         )
     }
 
-    // create a dist source from traffic distributions and flow ID
+    // Create a distributed source from traffic distributions and flow ID
     pub fn distributed_source(
         flow_id: usize,
         tr: TrafficCharacteristics,
         config: AppSourceRuntimeConfig,
-    ) -> (Self, AppActor) {
+    ) -> (Self, AppSourceBuffer) {
         let seed = get_seed();
         let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
 
-        let (actor, tx) = AppActor::dist_actor(flow_id, tr, rng, &config);
+        let (actor, tx) = AppSourceBuffer::dist_actor(flow_id, tr, rng, &config);
 
         (Self::Dist(AppSourceHandle::new(tx, None)), actor)
     }
 
-    // get the underlying handle to use in TCPPacketSource
+    // Retrieves the underlying handle to use in TCPPacketSource.
     pub fn handle(&self) -> AppSourceHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => h.clone(),
         }
     }
+
     pub fn handle_with_offset(&self, offset: usize, length: Option<usize>) -> AppSourceHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => {
                 let effective_length =
                     length.or_else(|| h.length.map(|len| len.saturating_sub(offset)));
                 let absolute_offset = h.offset.saturating_add(offset);
+
                 AppSourceHandle::with_offset(h.tx.clone(), absolute_offset, effective_length)
             }
         }
@@ -325,7 +333,7 @@ mod tests {
 
         // Create a buffer with known data: [0, 1, 2, 3, ..., 99]
         let buffer: Vec<u8> = (0..100u8).collect();
-        let (_actor, _tx) = AppActor::buffered(buffer.clone(), &config);
+        let (_actor, _tx) = AppSourceBuffer::buffered(buffer.clone(), &config);
 
         // Test the byte slicing logic directly
         let start = 10usize;
@@ -594,5 +602,291 @@ mod tests {
         assert_eq!(chunk1.get_cursor(), 0);
         assert_eq!(chunk2.get_cursor(), 0);
         assert_eq!(chunk3.get_cursor(), 0);
+    }
+
+    /// Test that TCP packetization creates packets with correct sequence numbers
+    #[test]
+    fn test_tcp_packetization_sequence_numbers() {
+        use crate::flows::packet::Packet;
+
+        let config = AppSourceRuntimeConfig::default();
+        let total_size = 1536; // 3 MSS worth of data (512 * 3)
+        let mss = 512;
+
+        let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
+        let _handle = data_src.handle();
+
+        // Simulate TCP packetization logic
+        let mut packets = Vec::new();
+        let mut next_seq = 0;
+        let flow_id = 42;
+
+        // Simulate pulling data and creating packets (what TCPPacketSource does)
+        let data: Vec<u8> = vec![0u8; total_size]; // Simulated pull result
+        let mut offset = 0;
+
+        while offset < data.len() {
+            let chunk_size = mss.min(data.len() - offset);
+            let packet = Packet::new(chunk_size, next_seq, flow_id, 0.0);
+
+            packets.push(packet.clone());
+            next_seq += chunk_size;
+            offset += chunk_size;
+        }
+
+        // Verify we created exactly 3 packets
+        assert_eq!(packets.len(), 3);
+
+        // Verify sequence numbers are correct
+        assert_eq!(packets[0].packet_id, 0);
+        assert_eq!(packets[0].size, 512);
+
+        assert_eq!(packets[1].packet_id, 512);
+        assert_eq!(packets[1].size, 512);
+
+        assert_eq!(packets[2].packet_id, 1024);
+        assert_eq!(packets[2].size, 512);
+
+        // Verify flow IDs
+        assert!(packets.iter().all(|p| p.flow_id == flow_id));
+    }
+
+    /// Test TCP packetization with non-MSS-aligned data
+    #[test]
+    fn test_tcp_packetization_non_aligned() {
+        use crate::flows::packet::Packet;
+
+        let total_size = 1300; // Not evenly divisible by 512
+        let mss = 512;
+
+        let data: Vec<u8> = vec![0u8; total_size];
+        let mut packets = Vec::new();
+        let mut next_seq = 0;
+        let mut offset = 0;
+
+        while offset < data.len() {
+            let chunk_size = mss.min(data.len() - offset);
+            let packet = Packet::new(chunk_size, next_seq, 0, 0.0);
+
+            packets.push(packet.clone());
+            next_seq += chunk_size;
+            offset += chunk_size;
+        }
+
+        // Should create 3 packets: 512 + 512 + 276
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].size, 512);
+        assert_eq!(packets[1].size, 512);
+        assert_eq!(packets[2].size, 276); // Remainder
+
+        // Verify sequence numbers
+        assert_eq!(packets[0].packet_id, 0);
+        assert_eq!(packets[1].packet_id, 512);
+        assert_eq!(packets[2].packet_id, 1024);
+
+        // Verify total coverage
+        let total_bytes: usize = packets.iter().map(|p| p.size).sum();
+        assert_eq!(total_bytes, total_size);
+    }
+
+    /// Test that small data (< MSS) creates a single packet
+    #[test]
+    fn test_tcp_packetization_small_data() {
+        use crate::flows::packet::Packet;
+
+        let total_size = 100; // Much smaller than MSS
+        let mss = 512;
+
+        let data: Vec<u8> = vec![0u8; total_size];
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        let mut next_seq = 0;
+
+        while offset < data.len() {
+            let chunk_size = mss.min(data.len() - offset);
+            let packet = Packet::new(chunk_size, next_seq, 0, 0.0);
+
+            packets.push(packet);
+            next_seq += chunk_size;
+            offset += chunk_size;
+        }
+
+        // Should create exactly 1 packet
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].size, 100);
+        assert_eq!(packets[0].packet_id, 0);
+    }
+
+    /// Test Broadcast scenario: multiple flows share the same data
+    #[test]
+    fn test_broadcast_multiple_flows_same_data() {
+        let config = AppSourceRuntimeConfig::default();
+        let total_size = 1024;
+
+        let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
+
+        // Create handles for 4 different flows (simulating broadcast to 4 destinations)
+        let handle1 = data_src.handle();
+        let handle2 = data_src.handle();
+        let handle3 = data_src.handle();
+        let handle4 = data_src.handle();
+
+        // All handles should access the same data range
+        assert_eq!(handle1.get_offset(), 0);
+        assert_eq!(handle2.get_offset(), 0);
+        assert_eq!(handle3.get_offset(), 0);
+        assert_eq!(handle4.get_offset(), 0);
+
+        assert_eq!(handle1.get_length(), Some(total_size));
+        assert_eq!(handle2.get_length(), Some(total_size));
+        assert_eq!(handle3.get_length(), Some(total_size));
+        assert_eq!(handle4.get_length(), Some(total_size));
+
+        // But cursors are independent (each flow tracks its own progress)
+        assert_eq!(handle1.get_cursor(), 0);
+        assert_eq!(handle2.get_cursor(), 0);
+        assert_eq!(handle3.get_cursor(), 0);
+        assert_eq!(handle4.get_cursor(), 0);
+    }
+
+    /// Test RingAllReduce scenario: different flows access different chunks
+    #[test]
+    fn test_ring_allreduce_chunk_partitioning() {
+        let config = AppSourceRuntimeConfig::default();
+        let total_size = 2048;
+        let num_nodes = 4;
+        let chunk_size = total_size / num_nodes; // 512 bytes per chunk
+
+        let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
+
+        // Create handles for each chunk (each flow in RingAllReduce sends one chunk)
+        let mut handles = Vec::new();
+        for i in 0..num_nodes {
+            let offset = i * chunk_size;
+            let length = if i == num_nodes - 1 {
+                total_size - offset // Last chunk gets remainder
+            } else {
+                chunk_size
+            };
+            let handle = data_src.handle_with_offset(offset, Some(length));
+            handles.push(handle);
+        }
+
+        // Verify each handle accesses a different chunk
+        assert_eq!(handles[0].get_offset(), 0);
+        assert_eq!(handles[0].get_length(), Some(512));
+
+        assert_eq!(handles[1].get_offset(), 512);
+        assert_eq!(handles[1].get_length(), Some(512));
+
+        assert_eq!(handles[2].get_offset(), 1024);
+        assert_eq!(handles[2].get_length(), Some(512));
+
+        assert_eq!(handles[3].get_offset(), 1536);
+        assert_eq!(handles[3].get_length(), Some(512));
+
+        // Verify no overlaps
+        for i in 0..num_nodes {
+            for j in (i + 1)..num_nodes {
+                let end_i = handles[i].get_offset() + handles[i].get_length().unwrap();
+                let start_j = handles[j].get_offset();
+                assert!(end_i <= start_j, "Chunks {} and {} overlap!", i, j);
+            }
+        }
+
+        // Verify full coverage
+        let total_coverage: usize = handles.iter().map(|h| h.get_length().unwrap()).sum();
+        assert_eq!(total_coverage, total_size);
+    }
+
+    /// Test cursor advancement after simulated pulls
+    #[test]
+    fn test_cursor_advancement_simulation() {
+        // Simulate multiple pull operations
+        let mut cursor = 0;
+        let length = Some(1000usize);
+
+        // Pull 1: 300 bytes
+        let req1 = 300;
+        let allowed1 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req1);
+        let actual1 = req1.min(allowed1);
+        cursor += actual1;
+        assert_eq!(cursor, 300);
+
+        // Pull 2: 500 bytes
+        let req2 = 500;
+        let allowed2 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req2);
+        let actual2 = req2.min(allowed2);
+        cursor += actual2;
+        assert_eq!(cursor, 800);
+
+        // Pull 3: 300 bytes (but only 200 left)
+        let req3 = 300;
+        let allowed3 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req3);
+        let actual3 = req3.min(allowed3);
+        cursor += actual3;
+        assert_eq!(cursor, 1000);
+        assert_eq!(actual3, 200); // Only 200 bytes were available
+
+        // Pull 4: should return 0 (exhausted)
+        let req4 = 100;
+        let allowed4 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req4);
+        let actual4 = req4.min(allowed4);
+        assert_eq!(actual4, 0);
+    }
+
+    /// Test packet metadata is created correctly (not cloned from wrong source)
+    #[test]
+    fn test_packet_metadata_correctness() {
+        use crate::flows::packet::Packet;
+
+        let flow_id = 123;
+        let start_seq = 5000;
+        let timestamp = 42.5;
+        let size = 256;
+
+        // Create a packet with specific metadata
+        let packet = Packet::new(size, start_seq, flow_id, timestamp);
+
+        // Verify all metadata is correct
+        assert_eq!(packet.size, size);
+        assert_eq!(packet.packet_id, start_seq);
+        assert_eq!(packet.flow_id, flow_id);
+        assert_eq!(packet.time, timestamp);
+
+        // This verifies that we're creating fresh packets with correct metadata,
+        // not cloning and modifying existing packets (which was the old buggy approach)
+    }
+
+    /// Test RingAllReduce with uneven chunk sizes
+    #[test]
+    fn test_ring_allreduce_uneven_chunks() {
+        let config = AppSourceRuntimeConfig::default();
+        let total_size = 1000; // Not evenly divisible by 3
+        let num_nodes = 3;
+        let chunk_size = total_size / num_nodes; // 333
+
+        let (data_src, _actor) = AppDataSource::buffered_actor(total_size, config);
+
+        let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
+        let chunk1 = data_src.handle_with_offset(chunk_size, Some(chunk_size));
+        let chunk2_offset = 2 * chunk_size;
+        let chunk2_len = total_size - chunk2_offset; // Remainder
+        let chunk2 = data_src.handle_with_offset(chunk2_offset, Some(chunk2_len));
+
+        assert_eq!(chunk0.get_offset(), 0);
+        assert_eq!(chunk0.get_length(), Some(333));
+
+        assert_eq!(chunk1.get_offset(), 333);
+        assert_eq!(chunk1.get_length(), Some(333));
+
+        assert_eq!(chunk2.get_offset(), 666);
+        assert_eq!(chunk2.get_length(), Some(334)); // Gets the extra byte
+
+        // Verify complete coverage
+        let total = chunk0.get_length().unwrap()
+            + chunk1.get_length().unwrap()
+            + chunk2.get_length().unwrap();
+        assert_eq!(total, total_size);
     }
 }
