@@ -164,7 +164,7 @@ pub struct AppSourceBuffer {
 }
 
 impl AppSourceBuffer {
-    pub fn buffered(buffer: Vec<u8>, config: &AppBufferConfig) -> (Self, Sender<AppSourceRequest>) {
+    pub fn new(buffer: Vec<u8>, config: &AppBufferConfig) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.req_channel_capacity);
 
         let actor = AppSourceBuffer {
@@ -270,8 +270,9 @@ impl AppDataSource {
     pub fn buffered_actor(total_size: usize, config: AppBufferConfig) -> (Self, AppSourceBuffer) {
         // Create a buffer filled with zeros (or could be filled with meaningful data)
         let buffer = vec![0u8; total_size];
-        let (actor, tx) = AppSourceBuffer::buffered(buffer, &config);
+        let (actor, tx) = AppSourceBuffer::new(buffer, &config);
         let handle = AppSourceBufferHandle::new(tx, Some(total_size));
+
         (Self { handle }, actor)
     }
 
@@ -285,10 +286,15 @@ impl AppDataSource {
         offset: usize,
         length: Option<usize>,
     ) -> AppSourceBufferHandle {
-        let effective_length = length.or_else(|| self.handle.length.map(|len| len.saturating_sub(offset)));
+        let effective_length =
+            length.or_else(|| self.handle.length.map(|len| len.saturating_sub(offset)));
         let absolute_offset = self.handle.offset.saturating_add(offset);
 
-        AppSourceBufferHandle::with_offset(self.handle.tx.clone(), absolute_offset, effective_length)
+        AppSourceBufferHandle::with_offset(
+            self.handle.tx.clone(),
+            absolute_offset,
+            effective_length,
+        )
     }
 }
 
@@ -303,7 +309,7 @@ mod tests {
 
         // Create a buffer with known data: [0, 1, 2, 3, ..., 99]
         let buffer: Vec<u8> = (0..100u8).collect();
-        let (_actor, _tx) = AppSourceBuffer::buffered(buffer.clone(), &config);
+        let (_actor, _tx) = AppSourceBuffer::new(buffer.clone(), &config);
 
         // Test the byte slicing logic directly
         let start = 10usize;
