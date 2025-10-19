@@ -1068,3 +1068,156 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ring_allreduce_serialization_tests {
+    use super::*;
+    use crate::flows::collective::{Collective, CollectiveType};
+    use crate::flows::flow::FlowType;
+    use crate::flows::{DistributionInfo, TrafficCharacteristics};
+    use std::collections::HashMap;
+
+    // Helper: minimal, unused-in-test switch config. Adjust DropStrategy variant if needed.
+    fn dummy_switch_cfg() -> SwitchConfig {
+        use crate::schedulers::drop::DropStrategy;
+        use crate::switches::SchedulingDiscipline;
+        SwitchConfig {
+            port_rate: 1.0,
+            capacity: 64,
+            discipline: SchedulingDiscipline::FIFO,
+            // If your DropStrategy variant name differs, change it here
+            drop: DropStrategy::TailDrop,
+            weights: None,
+            priorities: None,
+            vticks: None,
+        }
+    }
+
+    #[test]
+    fn ring_allreduce_n4_serialization() {
+        let n = 4usize;
+        let sources: Vec<usize> = (0..n).collect();
+        let sinks: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
+
+        // Minimal traffic; only size matters (byte-based).
+        let traffic = TrafficCharacteristics::new(
+            0.0,        // initial_delay
+            None,       // duration
+            Some(4096), // size (bytes)
+            DistributionInfo::Exp { lambda: 1.0 },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
+            None, // tcp opts not needed for this test
+        );
+
+        // Construct a collective directly (no file parsing).
+        let collective = Collective {
+            id: 77,
+            collective_type: CollectiveType::RingAllReduce,
+            first_flow_id: 1000,
+            flow_type: FlowType::TCP,
+            flow_count: n, // ignored in ring branch; recomputed in process_collectives()
+            graph: None,
+            paths: None,
+            sources: sources.clone(),
+            sinks: sinks.clone(),
+            routing: None,
+            traffic: traffic.clone(),
+        };
+
+        // Build a minimal Topology that lets us call process_collectives() only.
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            graph: UnGraph::<usize, ()>::default(),
+            hosts: sources.clone(),
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![collective],
+            switch_config: dummy_switch_cfg(),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        // Produce flows for the collective (no scheduling, no routing).
+        topo.process_collectives();
+        topo.backfill_flow_dependencies();
+
+        // 2 * n * (n - 1) flows: scatter-reduce and allgather
+        assert_eq!(
+            topo.flows.len(),
+            2 * n * (n - 1),
+            "expected 24 flows for n=4"
+        );
+
+        // id -> &Flow lookup
+        let mut by_id: HashMap<usize, &crate::flows::flow::Flow> = HashMap::new();
+        for f in &topo.flows {
+            by_id.insert(f.id, f);
+        }
+
+        // By construction order: first n*(n-1) are scatter; remaining are gather.
+        let scatter = &topo.flows[..(n * (n - 1))];
+        let gather = &topo.flows[(n * (n - 1))..];
+
+        for rank in 0..n {
+            let src = sources[rank];
+            let dst = sources[(rank + 1) % n];
+
+            // There are exactly (n-1) flows on this link in each phase.
+            let mut s_ids: Vec<usize> = scatter
+                .iter()
+                .filter(|f| f.source_host == src && f.sink_host == dst)
+                .map(|f| f.id)
+                .collect();
+            s_ids.sort_unstable();
+
+            let mut g_ids: Vec<usize> = gather
+                .iter()
+                .filter(|f| f.source_host == src && f.sink_host == dst)
+                .map(|f| f.id)
+                .collect();
+            g_ids.sort_unstable();
+
+            assert_eq!(s_ids.len(), n - 1, "rank {} scatter count", rank);
+            assert_eq!(g_ids.len(), n - 1, "rank {} gather count", rank);
+
+            // --- These asserts require the fix that populates `starts_after` on successors. ---
+
+            // Scatter should be serialized: S1 -> S2 -> S3 via starts_after on successors.
+            assert!(
+                by_id[&s_ids[1]].starts_after.contains(&s_ids[0]),
+                "scatter[1] should wait for scatter[0] for rank {}",
+                rank
+            );
+            assert!(
+                by_id[&s_ids[2]].starts_after.contains(&s_ids[1]),
+                "scatter[2] should wait for scatter[1] for rank {}",
+                rank
+            );
+
+            // The first gather step should wait for the last scatter step (cross-phase gating).
+            assert!(
+                by_id[&g_ids[0]].starts_after.contains(&s_ids[n - 2]),
+                "gather[0] should wait for last scatter for rank {}",
+                rank
+            );
+
+            // Gather should be serialized: G1 -> G2 -> G3 via starts_after on successors.
+            assert!(
+                by_id[&g_ids[1]].starts_after.contains(&g_ids[0]),
+                "gather[1] should wait for gather[0] for rank {}",
+                rank
+            );
+            assert!(
+                by_id[&g_ids[2]].starts_after.contains(&g_ids[1]),
+                "gather[2] should wait for gather[1] for rank {}",
+                rank
+            );
+        }
+    }
+}
