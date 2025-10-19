@@ -1,5 +1,6 @@
 import os
 import re
+from pathlib import Path
 
 
 def count_loc_rust(directory):
@@ -16,8 +17,9 @@ def count_loc_rust(directory):
     total_loc = 0
 
     for root, _, files in os.walk(directory):
-        # Skip the 'tests' directory and its subdirectories
-        if "tests" in root.split(os.sep):
+        # Skip 'tests' and 'target' directories and their subdirectories
+        path_parts = root.split(os.sep)
+        if "tests" in path_parts or "target" in path_parts:
             continue
 
         for file in files:
@@ -58,8 +60,30 @@ def count_lines_before_test(file_path):
     return line_count
 
 
+def sanitize_base_directory(path_str):
+    """Removes any trailing 'target' segment from the provided base directory."""
+    expanded = os.path.expanduser(path_str.strip())
+    if not expanded:
+        return expanded
+
+    path = Path(expanded)
+    if "target" not in path.parts:
+        return os.path.normpath(expanded)
+
+    target_index = path.parts.index("target")
+    sanitized_parts = path.parts[:target_index]
+    sanitized_path = Path(*sanitized_parts) if sanitized_parts else Path(".")
+
+    # Normalize to remove redundant separators like trailing slashes
+    return os.path.normpath(str(sanitized_path))
+
+
 if __name__ == "__main__":
-    target_directory = input("Enter the directory to analyze: ")
+    raw_directory = input("Enter the directory to analyze: ")
+    target_directory = sanitize_base_directory(raw_directory)
+
+    if raw_directory.strip() and target_directory != os.path.normpath(raw_directory.strip()):
+        print(f"Sanitized base directory to exclude 'target/': {target_directory}")
 
     if not os.path.isdir(target_directory):
         print(f"{target_directory} is not a valid directory.")
