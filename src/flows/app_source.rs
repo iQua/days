@@ -8,14 +8,10 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rand::rngs::SmallRng;
-
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
 use tachyonix::{Receiver, Sender, channel};
 
-use crate::flows::TrafficCharacteristics;
-use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 
 /// Runtime configuration for AppSourceBuffer
@@ -79,6 +75,7 @@ impl AppSourceBufferHandle {
     pub fn from_buffer(buffer: Vec<u8>, config: &AppBufferConfig) -> Self {
         let total_size = buffer.len();
         let (actor, tx) = AppSourceBuffer::new(buffer, config);
+
         Self {
             tx,
             offset: 0,
@@ -98,6 +95,7 @@ impl AppSourceBufferHandle {
             actor: None,
         }
     }
+
     pub fn get_total_size(&self) -> Option<usize> {
         self.length
     }
@@ -121,9 +119,9 @@ impl AppSourceBufferHandle {
         self.actor.take()
     }
 
-    // send a pull request to the actor, and await the returned bytes.
+    // Send a pull request to the actor, and await the returned bytes.
     pub async fn pull(&mut self, size: usize) -> Vec<u8> {
-        // Clamp the requested size to the remaining bytes exposed by this handle.
+        // Clamp the requested size to the remaining bytes exposed by this handle
         let allowed = self
             .length
             .map(|len| len.saturating_sub(self.cursor))
@@ -154,9 +152,11 @@ impl AppSourceBufferHandle {
         self.cursor += consumed;
         data
     }
-    // a shutdown signal by sending a request with size=0 (not actually handled yet).
+
+    // Send a shutdown signal by sending a request with size = 0 (not actually handled yet).
     pub async fn shutdown(&self) {
         let (resp_tx, _resp_rx) = channel(1);
+
         let _ = self
             .tx
             .send(AppSourceRequest {
@@ -196,46 +196,11 @@ impl AppSourceBuffer {
 
         (actor, tx)
     }
-
-    // Construct a distributed actor that generates bytes following the size patterns defined by the PacketDistribution.
-    pub fn dist_actor(
-        flow_id: usize,
-        traffic: TrafficCharacteristics,
-        rng: SmallRng,
-        config: &AppBufferConfig,
-    ) -> (Self, Sender<AppSourceRequest>) {
-        let (tx, rx) = channel(config.req_channel_capacity);
-
-        let mut src = DistPacketSource::new(flow_id, Vec::new(), traffic, rng.clone());
-        let mut buffer = Vec::new();
-
-        // Pre-generate bytes by creating chunks and extracting their sizes
-        for _ in 0..config.chunk_size {
-            let (p, _) = src.produce_packet(0.0);
-            // Extend buffer with 'size' bytes (filled with zeros for now)
-            buffer.extend(vec![0u8; p.size]);
-        }
-        log::debug!(
-            "[AppSourceBuffer] Initialized distributed buffer with {} bytes and a chunk size of {}.",
-            buffer.len(),
-            config.chunk_size
-        );
-
-        let source_buffer = AppSourceBuffer {
-            rx,
-            buffer,
-            out: Output::default(),
-            initial_delay: config.initial_delay,
-            run_interval: config.run_interval,
-        };
-
-        (source_buffer, tx)
-    }
 }
 
 impl Model for AppSourceBuffer {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        // schedule the actor's run_once function after the configured initial interval
+        // schedules the actor's run_once function after the configured initial interval
         cx.schedule_event(
             Duration::from_micros(self.initial_delay),
             Self::run_once,
@@ -256,14 +221,15 @@ impl AppSourceBuffer {
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             while let Ok(req) = self.rx.try_recv() {
-                // Handle shutdown signal
+                // handles the shutdown signal
                 if req.size == 0 {
                     log::debug!("[AppSourceBuffer] Received shutdown signal, terminating actor");
+
                     // Don't reschedule - actor terminates
                     return;
                 }
 
-                // Simple byte-range extraction from the buffer
+                // simple byte-range extraction from the buffer
                 let start = req.start.min(self.buffer.len());
                 let end = (req.start + req.size).min(self.buffer.len());
                 let data = self.buffer[start..end].to_vec();
@@ -284,7 +250,7 @@ pub struct AppDataSource {
 }
 
 impl AppDataSource {
-    /// Build a data source backed by a byte buffer of the specified size.
+    /// Builds a data source backed by a byte buffer of the specified size.
     pub fn create_source_buffer(total_size: usize, config: AppBufferConfig) -> Self {
         let buffer = vec![0u8; total_size];
         let handle = AppSourceBufferHandle::from_buffer(buffer, &config);
