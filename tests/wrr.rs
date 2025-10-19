@@ -14,6 +14,7 @@ use daytone::flows::source::PacketSource;
 use daytone::flows::{DistributionInfo, TrafficCharacteristics};
 use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
 use daytone::schedulers::wrr::WRRServer;
+use daytone::seed_from_config;
 use daytone::utils::logger::CsvLogger;
 
 /// This integration test creates two packet sources and sends traffic to a
@@ -23,6 +24,9 @@ use daytone::utils::logger::CsvLogger;
 #[test]
 fn test_weighted_round_robin() {
     let _ = env_logger::builder().is_test(true).try_init();
+
+    // Fix the random seed to make the stochastic traffic patterns reproducible.
+    let _ = seed_from_config("tests/wrr_seed.toml");
 
     // Initialize the logger
     if let Err(e) = CsvLogger::get_instance().init("logs/wrr_test") {
