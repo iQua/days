@@ -38,7 +38,7 @@ use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
-use crate::flows::app_source::{AppDataSource, AppSourceBuffer};
+use crate::flows::app_source::AppDataSource;
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -823,10 +823,8 @@ impl Topology {
 
         // Prepares application-level packet sources and their actors (only for TCP Broadcast).
         let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
-        let mut app_actors: Vec<AppSourceBuffer> = Vec::new();
         let mut flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle> = HashMap::new();
-        let mut conn_map: HashMap<(usize, usize), (AppDataSource, AppSourceBuffer)> =
-            HashMap::new();
+        let mut conn_map: HashMap<(usize, usize), AppDataSource> = HashMap::new();
 
         for collective in &self.collectives {
             if matches!(
@@ -839,8 +837,7 @@ impl Topology {
                 };
 
                 // create unique AppDataSource and actor (no MSS needed - TCP handles packetization)
-                let (data_src, actor) =
-                    AppDataSource::create_source_buffer(total_size, self.app_source_cfg);
+                let data_src = AppDataSource::create_source_buffer(total_size, self.app_source_cfg);
                 // assign handle to each flow：all flows obtain data from the same data_src
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
@@ -848,7 +845,6 @@ impl Topology {
                     flow_id_to_source_handle.insert(flow_id, data_src.handle());
                 }
                 app_sources.insert(collective.id, data_src);
-                app_actors.push(actor);
             }
             // Ring-AllReduce (TCP)
             if matches!(
@@ -883,7 +879,7 @@ impl Topology {
                             };
 
                             // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
-                            let (data_src, _actor) =
+                            let data_src =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
                                     AppDataSource::create_source_buffer(
                                         total_size,
@@ -901,15 +897,28 @@ impl Topology {
             }
         }
 
-        // Register every (data_src, actor) exactly once
-        for ((src, _dst), (ds, actor)) in conn_map.into_iter() {
+        let mut actor_count = 0usize;
+
+        for ((src, _dst), mut ds) in conn_map.into_iter() {
+            if let Some(actor) = ds.take_actor() {
+                let mbox = Mailbox::new();
+                self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
+                actor_count += 1;
+            }
             app_sources.insert(src, ds);
-            app_actors.push(actor);
+        }
+
+        for ds in app_sources.values_mut() {
+            if let Some(actor) = ds.take_actor() {
+                let mbox = Mailbox::new();
+                self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
+                actor_count += 1;
+            }
         }
 
         debug!(
             "Initialized {} AppSource actors for {} TCP flows with {} unique source handles",
-            app_actors.len(),
+            actor_count,
             flow_id_to_source_handle.len(),
             app_sources.len()
         );
@@ -925,11 +934,6 @@ impl Topology {
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
-
-        for actor in app_actors {
-            let mbox = Mailbox::new();
-            self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
-        }
 
         // creates and activates a UserInterface coroutine
         self = self.activate_ui(ui_mbox);

@@ -49,40 +49,55 @@ pub struct AppSourceRequest {
     pub respond_to: Sender<Vec<u8>>,
 }
 
-// The handle for the AppSourceBuffer actor. Allows TCPPacketSource to `pull()` packets asynchronously.
-#[derive(Clone)]
 pub struct AppSourceBufferHandle {
     /// Channel for sending requests to the app actor.
     tx: Sender<AppSourceRequest>,
-    // First byte in the shared buffer assigned to this handle.
+    /// First byte in the shared buffer assigned to this handle.
     offset: usize,
     /// Number of bytes already consumed using this handle.
     cursor: usize,
     /// Total length of the slice exposed through this handle.
     length: Option<usize>,
+    /// Underlying actor, present only on the primary handle.
+    actor: Option<AppSourceBuffer>,
+}
+
+impl Clone for AppSourceBufferHandle {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            offset: self.offset,
+            cursor: 0,
+            length: self.length,
+            actor: None,
+        }
+    }
 }
 
 impl AppSourceBufferHandle {
-    /// handle that starts at byte‐offset 0 (broadcast case)
-    pub fn new(tx: Sender<AppSourceRequest>, total_size: Option<usize>) -> Self {
+    /// Build a handle (and actor) around the provided buffer.
+    pub fn from_buffer(buffer: Vec<u8>, config: &AppBufferConfig) -> Self {
+        let total_size = buffer.len();
+        let (actor, tx) = AppSourceBuffer::new(buffer, config);
         Self {
             tx,
             offset: 0,
             cursor: 0,
-            length: total_size,
+            length: Some(total_size),
+            actor: Some(actor),
         }
     }
 
-    /// create a handle that starts at `offset` (Ring-AllReduce chunk)
-    pub fn with_offset(tx: Sender<AppSourceRequest>, offset: usize, length: Option<usize>) -> Self {
+    /// Create a handle that starts at `offset` (Ring-AllReduce chunk) sharing the same actor.
+    pub fn with_offset(&self, offset: usize, length: Option<usize>) -> Self {
         Self {
-            tx,
+            tx: self.tx.clone(),
             offset,
             cursor: 0,
             length,
+            actor: None,
         }
     }
-
     pub fn get_total_size(&self) -> Option<usize> {
         self.length
     }
@@ -100,6 +115,10 @@ impl AppSourceBufferHandle {
     /// Get the length constraint (for testing and debugging)
     pub fn get_length(&self) -> Option<usize> {
         self.length
+    }
+
+    pub fn take_actor(&mut self) -> Option<AppSourceBuffer> {
+        self.actor.take()
     }
 
     // send a pull request to the actor, and await the returned bytes.
@@ -260,26 +279,19 @@ impl AppSourceBuffer {
     }
 }
 
-#[derive(Clone)]
 pub struct AppDataSource {
     handle: AppSourceBufferHandle,
 }
 
 impl AppDataSource {
-    // Build a data source backed by a byte buffer of the specified size.
-    pub fn create_source_buffer(
-        total_size: usize,
-        config: AppBufferConfig,
-    ) -> (Self, AppSourceBuffer) {
-        // Create a buffer filled with zeros (or could be filled with meaningful data)
+    /// Build a data source backed by a byte buffer of the specified size.
+    pub fn create_source_buffer(total_size: usize, config: AppBufferConfig) -> Self {
         let buffer = vec![0u8; total_size];
-        let (actor, tx) = AppSourceBuffer::new(buffer, &config);
-        let handle = AppSourceBufferHandle::new(tx, Some(total_size));
-
-        (Self { handle }, actor)
+        let handle = AppSourceBufferHandle::from_buffer(buffer, &config);
+        Self { handle }
     }
 
-    // Retrieves the underlying handle to be used in TCPPacketSource.
+    /// Retrieves the underlying handle to be used in TCPPacketSource.
     pub fn handle(&self) -> AppSourceBufferHandle {
         self.handle.clone()
     }
@@ -293,11 +305,11 @@ impl AppDataSource {
             length.or_else(|| self.handle.length.map(|len| len.saturating_sub(offset)));
         let absolute_offset = self.handle.offset.saturating_add(offset);
 
-        AppSourceBufferHandle::with_offset(
-            self.handle.tx.clone(),
-            absolute_offset,
-            effective_length,
-        )
+        self.handle.with_offset(absolute_offset, effective_length)
+    }
+
+    pub fn take_actor(&mut self) -> Option<AppSourceBuffer> {
+        self.handle.take_actor()
     }
 }
 
@@ -514,7 +526,10 @@ mod tests {
         let config = AppBufferConfig::default();
         let total_size = 1024;
 
-        let (data_src, actor) = AppDataSource::create_source_buffer(total_size, config);
+        let mut data_src = AppDataSource::create_source_buffer(total_size, config);
+        let actor = data_src
+            .take_actor()
+            .expect("actor should be available after creation");
 
         // Verify actor has correct buffer size
         assert_eq!(actor.buffer.len(), total_size);
@@ -532,7 +547,7 @@ mod tests {
         let config = AppBufferConfig::default();
         let total_size = 1000;
 
-        let (data_src, _actor) = AppDataSource::create_source_buffer(total_size, config);
+        let data_src = AppDataSource::create_source_buffer(total_size, config);
 
         // Create multiple handles with different offsets (simulating Broadcast)
         let handle1 = data_src.handle(); // Full buffer
@@ -556,7 +571,7 @@ mod tests {
         let num_nodes = 4;
         let chunk_size = total_size / num_nodes; // 128 bytes per chunk
 
-        let (data_src, _actor) = AppDataSource::create_source_buffer(total_size, config);
+        let data_src = AppDataSource::create_source_buffer(total_size, config);
 
         // Create handles for each chunk
         let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
@@ -592,7 +607,7 @@ mod tests {
         let total_size = 1536; // 3 MSS worth of data (512 * 3)
         let mss = 512;
 
-        let (data_src, _actor) = AppDataSource::create_source_buffer(total_size, config);
+        let data_src = AppDataSource::create_source_buffer(total_size, config);
         let _handle = data_src.handle();
 
         // Simulate TCP packetization logic
@@ -702,7 +717,7 @@ mod tests {
         let config = AppBufferConfig::default();
         let total_size = 1024;
 
-        let (data_src, _actor) = AppDataSource::create_source_buffer(total_size, config);
+        let data_src = AppDataSource::create_source_buffer(total_size, config);
 
         // Create handles for 4 different flows (simulating broadcast to 4 destinations)
         let handle1 = data_src.handle();
@@ -736,7 +751,7 @@ mod tests {
         let num_nodes = 4;
         let chunk_size = total_size / num_nodes; // 512 bytes per chunk
 
-        let (data_src, _actor) = AppDataSource::create_source_buffer(total_size, config);
+        let data_src = AppDataSource::create_source_buffer(total_size, config);
 
         // Create handles for each chunk (each flow in RingAllReduce sends one chunk)
         let mut handles = Vec::new();
@@ -845,7 +860,7 @@ mod tests {
         let num_nodes = 3;
         let chunk_size = total_size / num_nodes; // 333
 
-        let (data_src, _actor) = AppDataSource::create_source_buffer(total_size, config);
+        let data_src = AppDataSource::create_source_buffer(total_size, config);
 
         let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
         let chunk1 = data_src.handle_with_offset(chunk_size, Some(chunk_size));
