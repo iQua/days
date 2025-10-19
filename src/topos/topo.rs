@@ -307,11 +307,16 @@ impl Topology {
                         let dst = collective.sources[(rank + 1) % n];
 
                         for _step in 1..n {
+                            let mut starts_after = Vec::new();
+                            if let Some(prev_flow_id) = last_scatter[rank] {
+                                starts_after.push(prev_flow_id);
+                            }
+
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
                                 path: None,
                                 starts_before: Vec::new(),
-                                starts_after: Vec::new(),
+                                starts_after,
                                 flow_type: collective.flow_type.clone(),
                                 source_host: src,
                                 sink_host: dst,
@@ -320,14 +325,9 @@ impl Topology {
                                 seed: collective.id,
                             });
 
-                            let this_idx = self.flows.len();
                             self.flows.push(flow);
 
-                            if let Some(prev_idx) = last_scatter[rank] {
-                                self.flows[prev_idx].starts_before.push(flow_id);
-                            }
-
-                            last_scatter[rank] = Some(this_idx);
+                            last_scatter[rank] = Some(flow_id);
 
                             flow_id += 1;
                         }
@@ -337,11 +337,22 @@ impl Topology {
                         let dst = collective.sources[(rank + 1) % n];
 
                         for step in 1..n {
+                            let mut starts_after = Vec::new();
+                            if let Some(prev_flow_id) = last_gather[rank] {
+                                starts_after.push(prev_flow_id);
+                            }
+
+                            if step == 1 {
+                                if let Some(scatter_flow_id) = last_scatter[rank] {
+                                    starts_after.push(scatter_flow_id);
+                                }
+                            }
+
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
                                 path: None,
                                 starts_before: Vec::new(),
-                                starts_after: Vec::new(),
+                                starts_after,
                                 flow_type: collective.flow_type.clone(),
                                 source_host: src,
                                 sink_host: dst,
@@ -350,20 +361,9 @@ impl Topology {
                                 seed: collective.id,
                             });
 
-                            let this_idx = self.flows.len();
                             self.flows.push(flow);
 
-                            if let Some(prev_idx) = last_gather[rank] {
-                                self.flows[prev_idx].starts_before.push(flow_id);
-                            }
-
-                            if step == 1 {
-                                if let Some(scatter_idx) = last_scatter[rank] {
-                                    self.flows[scatter_idx].starts_before.push(flow_id);
-                                }
-                            }
-
-                            last_gather[rank] = Some(this_idx);
+                            last_gather[rank] = Some(flow_id);
 
                             flow_id += 1;
                         }
@@ -588,30 +588,6 @@ impl Topology {
         self
     }
 
-    /// Ensures `starts_after` mirrors the reverse of every `starts_before` edge.
-    fn backfill_flow_dependencies(&mut self) {
-        let mut flow_index: HashMap<usize, usize> = HashMap::new();
-        for (idx, flow) in self.flows.iter().enumerate() {
-            flow_index.insert(flow.id, idx);
-        }
-
-        let mut dependency_edges: Vec<(usize, usize)> = Vec::new();
-        for flow in self.flows.iter() {
-            for successor_id in flow.starts_before.iter() {
-                dependency_edges.push((*successor_id, flow.id));
-            }
-        }
-
-        for (successor_id, predecessor_id) in dependency_edges.into_iter() {
-            if let Some(&successor_idx) = flow_index.get(&successor_id) {
-                let starts_after = &mut self.flows[successor_idx].starts_after;
-                if !starts_after.contains(&predecessor_id) {
-                    starts_after.push(predecessor_id);
-                }
-            }
-        }
-    }
-
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
     fn attach_flows(
@@ -625,7 +601,37 @@ impl Topology {
             self.flows.len()
         );
 
-        self.backfill_flow_dependencies();
+        let mut successor_map: HashMap<usize, Vec<usize>> = HashMap::new();
+        for flow in self.flows.iter() {
+            if !flow.starts_before.is_empty() {
+                successor_map
+                    .entry(flow.id)
+                    .or_default()
+                    .extend(flow.starts_before.iter().copied());
+            }
+        }
+
+        for flow in self.flows.iter() {
+            for dependency_id in flow.starts_after.iter() {
+                successor_map
+                    .entry(*dependency_id)
+                    .or_default()
+                    .push(flow.id);
+            }
+        }
+
+        for successors in successor_map.values_mut() {
+            successors.sort_unstable();
+            successors.dedup();
+        }
+
+        for flow in self.flows.iter_mut() {
+            if let Some(dependents) = successor_map.get(&flow.id) {
+                flow.starts_before = dependents.clone();
+            } else {
+                flow.starts_before.clear();
+            }
+        }
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -1145,7 +1151,6 @@ mod ring_allreduce_serialization_tests {
 
         // Produce flows for the collective (no scheduling, no routing).
         topo.process_collectives();
-        topo.backfill_flow_dependencies();
 
         // 2 * n * (n - 1) flows: scatter-reduce and allgather
         assert_eq!(
