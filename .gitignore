@@ -6,3 +6,6 @@
 # These are files related to logged outputs
 **/*.csv
 logs/**
+
+# RepoPrompt
+.repoprompt/**
