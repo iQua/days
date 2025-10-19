@@ -297,7 +297,7 @@ impl AppDataSource {
         (Self::Dist(AppSourceBufferHandle::new(tx, None)), actor)
     }
 
-    // Retrieves the underlying handle to use in TCPPacketSource.
+    // Retrieves the underlying handle to be used in TCPPacketSource.
     pub fn handle(&self) -> AppSourceBufferHandle {
         match self {
             Self::Buffered(h) | Self::Dist(h) => h.clone(),

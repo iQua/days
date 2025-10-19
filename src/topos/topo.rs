@@ -873,7 +873,7 @@ impl Topology {
                             // which chunk travels in this hop
                             let chunk_owner = match phase {
                                 Phase::Scatter => (rank + n - step + 1) % n,
-                                Phase::Gather => (rank + n - step) % n,
+                                Phase::Gather => (rank + n - step + 1) % n,
                             };
                             let chunk_offset = chunk_owner * chunk_size;
                             let chunk_len = if chunk_owner == n - 1 {
