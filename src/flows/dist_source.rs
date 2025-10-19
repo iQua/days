@@ -12,9 +12,9 @@ use rand_distr::Exp;
 use nexosim::model::Model;
 use nexosim::ports::Output;
 
+use crate::flows::FlowFinishMsg;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::FlowFinishMsg;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
@@ -98,7 +98,7 @@ impl DistPacketSource {
                 dist.sample(&mut self.rng)
             }
             DistributionInfo::Uniform { low, high } => {
-                if low == high {
+                if (low - high).abs() < f64::EPSILON {
                     low
                 } else {
                     Uniform::new(low, high).unwrap().sample(&mut self.rng)
@@ -116,7 +116,7 @@ impl DistPacketSource {
                 dist.sample(&mut self.rng)
             }
             DistributionInfo::Uniform { low, high } => {
-                if low == high {
+                if (low - high).abs() < f64::EPSILON {
                     low
                 } else {
                     Uniform::new(low, high).unwrap().sample(&mut self.rng)

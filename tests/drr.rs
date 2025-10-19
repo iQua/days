@@ -45,6 +45,7 @@ fn test_deficit_round_robin() {
             None,
         ),
         0,
+        None,
     );
 
     let mut source_2 = PacketSource::new(
@@ -66,6 +67,7 @@ fn test_deficit_round_robin() {
             None,
         ),
         0,
+        None,
     );
 
     // Create DRR scheduler with weights 1:2

@@ -2,7 +2,7 @@
 //! takes. Currently, three routing protocols have been implemented:
 //!
 //! - Shortest path routing: Selects a random candidate from a set of shortest
-//! paths, which are computed by the `petgraph` crate using the A* algorithm.
+//!   paths, which are computed by the `petgraph` crate using the A* algorithm.
 //! - Path from configuration: Uses the path that is specified in the configuration.
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
@@ -13,7 +13,7 @@ use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Copy, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub enum RoutingConfig {
     ShortestPath,
     PathFromConfig,
@@ -263,7 +263,7 @@ mod tests {
         let path = ecmp.compute_route(start, end);
 
         // There are two equal-cost paths: [0, 1, 3] and [0, 2, 3]
-        let possible_paths = vec![
+        let possible_paths = [
             vec![start, NodeIndex::new(1), end],
             vec![start, NodeIndex::new(2), end],
         ];
@@ -345,7 +345,7 @@ mod tests {
         let path3 = ecmp3.compute_route(start, end);
 
         // There are two equal-cost paths: [0, 1, 3] and [0, 2, 3]
-        let possible_paths = vec![
+        let possible_paths = [
             vec![start, NodeIndex::new(1), end],
             vec![start, NodeIndex::new(2), end],
         ];
@@ -371,7 +371,6 @@ mod tests {
         // Count how many unique paths are selected
         let unique_paths = vec![path1, path2, path3]
             .into_iter()
-            .map(|p| p.clone())
             .collect::<std::collections::HashSet<_>>();
 
         // There are 2 possible paths, so unique_paths.len() should be <= 2

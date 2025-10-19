@@ -3,9 +3,9 @@
 use std::fs;
 
 use petgraph::graph::DiGraph;
+use rand::SeedableRng;
 use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
@@ -13,11 +13,12 @@ use crate::flows::route::RoutingConfig;
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_collective_id, next_flow_id, seed_from_config, update_next_flow_id};
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum CollectiveType {
     Broadcast,
     Gather,
     AllReduce,
+    RingAllReduce,
 }
 
 #[derive(Deserialize, Debug)]
@@ -126,7 +127,7 @@ impl Collective {
 
             let params = CollectiveParams {
                 id: next_collective_id(),
-                collective_type,
+                collective_type: collective_type.clone(),
                 first_flow_id,
                 flow_type: FlowType::PacketDistribution,
                 flow_count,
@@ -183,6 +184,15 @@ impl Collective {
                     );
                 }
                 CollectiveType::AllReduce => {}
+                CollectiveType::RingAllReduce => {
+                    for i in 0..flow_count {
+                        assert_eq!(
+                            sources[i],
+                            sinks[(i + flow_count - 1) % flow_count],
+                            "In RingAllReduce, sources[i] must equal sinks[i-1]"
+                        );
+                    }
+                }
             }
 
             return (sources, sinks);
@@ -196,6 +206,23 @@ impl Collective {
                 flow_paths.len(),
                 flow_count
             );
+
+            if let CollectiveType::RingAllReduce = collective_type {
+                for (i, path) in flow_paths.iter().enumerate() {
+                    assert!(
+                        path.len() >= 2,
+                        "Each RingAllReduce path must contain at least two nodes"
+                    );
+                    let expected_next = flow_paths[(i + 1) % flow_count][0];
+                    let actual_sink = path[path.len() - 1];
+                    assert_eq!(
+                        actual_sink, expected_next,
+                        "RingAllReduce path mismatch: sink of flow {} should match source of next",
+                        i
+                    );
+                }
+            }
+
             let sources = flow_paths.iter().map(|path| path[0]).collect();
             let sinks = flow_paths.iter().map(|path| path[path.len() - 1]).collect();
 
@@ -223,6 +250,25 @@ impl Collective {
 
                 (sources, sinks)
             }
+            CollectiveType::RingAllReduce => {
+                assert_eq!(
+                    flow_count,
+                    hosts.len(),
+                    "RingAllReduce requires flow_count to match the number of hosts"
+                );
+
+                let ring_hosts = hosts.to_vec();
+
+                let mut sources = Vec::new();
+                let mut sinks = Vec::new();
+
+                for i in 0..ring_hosts.len() {
+                    sources.push(ring_hosts[i]);
+                    sinks.push(ring_hosts[(i + 1) % ring_hosts.len()]);
+                }
+
+                (sources, sinks)
+            }
         }
     }
 
@@ -241,8 +287,12 @@ impl Collective {
             for collective in collectives_vec {
                 let graph = collective.graph.map(DiGraph::<usize, ()>::from_edges);
 
+                let collective_type = collective.collective_type.clone();
+                let flow_type = collective.flow_type.clone();
+                let routing = collective.routing.clone();
+
                 let (sources, sinks) = Self::generate_endpoints(
-                    collective.collective_type,
+                    collective_type.clone(),
                     collective.flow_count,
                     &collective.paths,
                     collective.sources.unwrap_or_default(),
@@ -254,8 +304,7 @@ impl Collective {
                 let traffic = TrafficCharacteristics::clone(&collective.traffic);
 
                 let mut first_flow_id = next_flow_id();
-                if collective.first_flow_id.is_some() {
-                    let new_first_flow_id = collective.first_flow_id.unwrap();
+                if let Some(new_first_flow_id) = collective.first_flow_id {
                     assert!(
                         new_first_flow_id >= first_flow_id,
                         "The specified first flow id {} of the collective should be at least {}",
@@ -266,26 +315,27 @@ impl Collective {
                 }
                 update_next_flow_id(first_flow_id + collective.flow_count);
 
-                let params = CollectiveParams {
+                collectives.push(Collective::new(CollectiveParams {
                     id: next_collective_id(),
-                    collective_type: collective.collective_type,
+                    collective_type,
                     first_flow_id,
-                    flow_type: collective.flow_type,
+                    flow_type: flow_type.clone(),
                     flow_count: collective.flow_count,
                     graph,
-                    paths: collective.paths,
-                    sources,
-                    sinks,
-                    routing: collective.routing,
+                    paths: collective.paths.clone(),
+                    sources: sources.clone(),
+                    sinks: sinks.clone(),
+                    routing: routing.clone(),
                     traffic,
-                };
-
-                collectives.push(Collective::new(params));
+                }));
             }
         }
 
         if let Some(collective_set_vec) = config.collective_set {
             for collective_set in collective_set_vec {
+                let collective_type = collective_set.collective_type.clone();
+                let flow_type = collective_set.flow_type.clone();
+                let routing = collective_set.routing.clone();
                 let mut sources_list = collective_set.sources.unwrap_or_default();
                 let mut sinks_list = collective_set.sinks.unwrap_or_default();
                 if sources_list.is_empty() && sinks_list.is_empty() {
@@ -309,8 +359,7 @@ impl Collective {
                 }
 
                 let mut first_flow_id = next_flow_id();
-                if collective_set.first_flow_id.is_some() {
-                    let new_first_flow_id = collective_set.first_flow_id.unwrap();
+                if let Some(new_first_flow_id) = collective_set.first_flow_id {
                     assert!(
                         new_first_flow_id >= first_flow_id,
                         "The specified first flow id {} of the collective set should be at least {}",
@@ -325,7 +374,7 @@ impl Collective {
 
                 for index in 0..collective_set.collective_count {
                     let (sources, sinks) = Self::generate_endpoints(
-                        collective_set.collective_type,
+                        collective_type.clone(),
                         collective_set.flow_count,
                         &None,
                         sources_list.remove(0),
@@ -336,21 +385,19 @@ impl Collective {
 
                     let traffic = TrafficCharacteristics::clone(&collective_set.traffic);
 
-                    let params = CollectiveParams {
+                    collectives.push(Collective::new(CollectiveParams {
                         id: next_collective_id(),
-                        collective_type: collective_set.collective_type,
+                        collective_type: collective_type.clone(),
                         first_flow_id: first_flow_id + index * collective_set.flow_count,
-                        flow_type: collective_set.flow_type,
+                        flow_type: flow_type.clone(),
                         flow_count: collective_set.flow_count,
                         graph: None,
                         paths: None,
                         sources,
                         sinks,
-                        routing: collective_set.routing,
+                        routing: routing.clone(),
                         traffic,
-                    };
-
-                    collectives.push(Collective::new(params));
+                    }));
                 }
             }
         }

@@ -20,7 +20,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
@@ -246,10 +246,11 @@ impl VirtualClockServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -290,7 +291,7 @@ impl VirtualClockServer {
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
 
-            let outbound = tagged_outbound.packet;
+            let outbound = tagged_outbound.packet.clone();
             let class_id = (self.flow_classes)(outbound.flow_id);
             let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
             *flow_queue_count -= 1;

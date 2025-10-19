@@ -22,7 +22,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
@@ -251,10 +251,11 @@ impl WFQServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -327,7 +328,7 @@ impl WFQServer {
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
 
-        self.output.send(packet).await;
+        self.output.send(packet.clone()).await;
         self.update_stats_on_packet_forwarded(&packet);
         self.update_internal_states(&packet, self.time_packet_sent);
     }
@@ -340,7 +341,7 @@ impl WFQServer {
         // schedules one packet with the smallest finish time
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
-            let outbound = tagged_outbound.packet;
+            let outbound = tagged_outbound.packet.clone();
             let class_id = (self.flow_classes)(outbound.flow_id);
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
             *byte_size -= outbound.size;
@@ -757,7 +758,7 @@ mod tests {
             1e6,
             10,
             CapacityUnit::Packets,
-            Arc::new(|flow_id| (flow_id % 3) as usize), // maps flow_ids to 3 classes
+            Arc::new(|flow_id| flow_id % 3), // maps flow_ids to 3 classes
             DropStrategy::TailDrop,
             vec![1, 2, 3], // different weights
         );

@@ -25,5 +25,6 @@
 
 <!--- Go over all the following points, and put an `x` in all the boxes that apply. -->
 <!--- If you're unsure about any of these, don't hesitate to ask. We're here to help! -->
+- [ ] My code has been formatted using the cargo formatter (`cargo fmt`) and checked using clippy (`cargo clippy`).
 - [ ] My change requires a change to the documentation.
 - [ ] I have updated the documentation accordingly.

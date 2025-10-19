@@ -14,7 +14,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
@@ -193,10 +193,11 @@ impl SPServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -241,7 +242,7 @@ impl SPServer {
             packet.departure_update(self.time + timeout);
 
             // call provided event handler
-            schedule_event(self.time, timeout, packet);
+            schedule_event(self.time, timeout, packet.clone());
 
             self.busy_until = self.time + timeout;
 
@@ -649,7 +650,7 @@ mod tests {
 
         // verifies packet was dropped
         assert_eq!(sp.packets_dropped, 1);
-        assert!(sp.queues.get(&1).map_or(true, |q| q.is_empty()));
+        assert!(sp.queues.get(&1).is_none_or(|q| q.is_empty()));
 
         // sends a packet within capacity limits
         let normal_packet = Packet::new(1000, 2, 0, 0.0);

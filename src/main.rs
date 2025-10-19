@@ -4,7 +4,7 @@ use std::env;
 
 use log::info;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 // use petgraph::graph::UnGraph;
 
@@ -13,7 +13,7 @@ use daytone::flows::flow::Flow;
 use daytone::seed_from_config;
 use daytone::topos::build::build_graph;
 use daytone::topos::topo::Topology;
-use daytone::utils::tracing::{is_tracing_active, ConcurrencyTrackerLayer};
+use daytone::utils::tracing::{ConcurrencyTrackerLayer, is_tracing_active};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

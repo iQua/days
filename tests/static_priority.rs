@@ -45,6 +45,7 @@ fn test_static_priority_scheduler() {
             None,
         ),
         0,
+        None,
     );
 
     let mut source_2 = PacketSource::new(
@@ -66,6 +67,7 @@ fn test_static_priority_scheduler() {
             None,
         ),
         0,
+        None,
     );
 
     let mut sp = SPServer::new(

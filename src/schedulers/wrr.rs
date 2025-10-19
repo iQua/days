@@ -14,7 +14,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
@@ -201,10 +201,11 @@ impl WRRServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 

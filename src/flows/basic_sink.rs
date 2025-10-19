@@ -6,9 +6,9 @@ use std::fmt::Debug;
 use nexosim::model::Model;
 use nexosim::ports::Output;
 
+use crate::flows::FlowFinishMsg;
 use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
-use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};

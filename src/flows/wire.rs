@@ -3,18 +3,18 @@
 use std::time::Duration;
 
 use log::debug;
+use rand::SeedableRng;
 use rand::distr::Distribution;
 use rand::distr::Uniform;
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use rand_distr::Exp;
 use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
 
-use crate::flows::packet::Packet;
 use crate::flows::DistributionInfo;
+use crate::flows::packet::Packet;
 use crate::get_seed;
 
 #[derive(Debug)]
@@ -90,7 +90,7 @@ impl Wire {
             cx.schedule_event(
                 Duration::from_secs_f64(packet.time - now),
                 Self::forward_packet,
-                packet.clone(),
+                packet,
             )
             .unwrap();
         } else {

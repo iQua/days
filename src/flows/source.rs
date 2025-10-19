@@ -7,15 +7,16 @@ use std::future::Future;
 use std::time::Duration;
 
 use log::debug;
-use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
+use serde::Serialize;
 use tracing::instrument;
 
 use nexosim::model::{Context, InitializedModel, Model};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
-use serde::Serialize;
 
+use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
@@ -42,8 +43,8 @@ pub struct PacketSourceReport {
 
 #[derive(Debug)]
 pub enum PacketSource {
-    DistPacketSource(DistPacketSource),
-    TCPPacketSource(TCPPacketSource),
+    DistPacketSource(Box<DistPacketSource>),
+    TCPPacketSource(Box<TCPPacketSource>),
 }
 
 impl std::fmt::Display for PacketSource {
@@ -62,6 +63,7 @@ impl PacketSource {
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
         seed: usize,
+        app_source: Option<AppSourceBufferHandle>,
     ) -> Self {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -70,18 +72,16 @@ impl PacketSource {
         };
 
         match flow_type {
-            FlowType::PacketDistribution => PacketSource::DistPacketSource(DistPacketSource::new(
+            FlowType::PacketDistribution => PacketSource::DistPacketSource(Box::new(
+                DistPacketSource::new(flow_id, flow_start_after, traffic, rng),
+            )),
+            FlowType::TCP => PacketSource::TCPPacketSource(Box::new(TCPPacketSource::new(
                 flow_id,
                 flow_start_after,
                 traffic,
+                app_source,
                 rng,
-            )),
-            FlowType::TCP => PacketSource::TCPPacketSource(TCPPacketSource::new(
-                flow_id,
-                flow_start_after,
-                traffic,
-                rng,
-            )),
+            ))),
         }
     }
 
@@ -158,7 +158,7 @@ impl PacketSource {
         }
     }
 
-    fn prepare_run(&mut self, now: f64, initial_delay: f64, cx: &Context<Self>) {
+    async fn prepare_run(&mut self, now: f64, initial_delay: f64, cx: &Context<Self>) {
         match self {
             PacketSource::DistPacketSource(source) => {
                 source.report_start_time = now + initial_delay;
@@ -166,7 +166,7 @@ impl PacketSource {
             }
             PacketSource::TCPPacketSource(source) => {
                 source.report_start_time = now + initial_delay;
-                source.datasource.set_flow_start_time(now + initial_delay);
+                source.time = now + initial_delay;
 
                 // schedules a periodic timer to notify TCPPacketSource to
                 // check if any of its sent packet reaches timeout
@@ -181,20 +181,35 @@ impl PacketSource {
                 )
                 .unwrap();
 
-                // lets AppDataSource to send data to TCPPacketSource
-                let (data, interval) = source.datasource.produce_data(now + initial_delay);
-
                 // TCPPacketSource now owns the data from the application
-                source.send_buffer += data.size;
                 source.busy_until = now + initial_delay;
 
-                // schedules AppDataSource to send next data
-                cx.schedule_event(
-                    Duration::from_secs_f64(interval),
-                    Self::fetch_app_data,
-                    source.time + interval,
-                )
-                .unwrap();
+                if source.app_source.is_some() {
+                    // On flow start, proactively pull packets from the AppSourceBufferHandle according to the current
+                    // congestion window size (cwnd). This populates the initial packets to be sent as soon as
+                    // they are allowed.
+                    source.pull_from_appsource(now + initial_delay).await;
+                } else if source.has_synthetic_source() {
+                    let start_time = now + initial_delay;
+                    let (size, interval) = {
+                        let fallback = source
+                            .synthetic_source_mut()
+                            .expect("fallback source missing");
+                        fallback.set_flow_start_time(start_time);
+                        let (data, interval) = fallback.produce_data(start_time);
+                        (data.size, interval)
+                    };
+
+                    source.send_buffer += size;
+                    source.busy_until = start_time;
+
+                    cx.schedule_event(
+                        Duration::from_secs_f64(interval),
+                        Self::fetch_app_data,
+                        start_time + interval,
+                    )
+                    .unwrap();
+                }
             }
         }
     }
@@ -217,32 +232,37 @@ impl PacketSource {
                         assert!((now - source.time).abs() <= 1e-7);
                     }
 
-                    let (data, interval) = source.datasource.produce_data(source.time);
+                    if source.has_synthetic_source() {
+                        let timestamp = source.time;
+                        let (size, interval, exceeded) = {
+                            let fallback = source
+                                .synthetic_source_mut()
+                                .expect("fallback source missing");
+                            let (data, interval) = fallback.produce_data(timestamp);
+                            let exceeded = fallback.traffic_exceeded(timestamp);
+                            (data.size, interval, exceeded)
+                        };
 
-                    if !source.datasource.traffic_exceeded(source.time) {
-                        // TCPPacketSource now owns the data from the application
-                        source.send_buffer += data.size;
+                        if !exceeded {
+                            source.send_buffer += size;
+                            cx.schedule_event(
+                                Duration::from_secs_f64(interval),
+                                Self::fetch_app_data,
+                                timestamp + interval,
+                            )
+                            .unwrap();
+                        } else {
+                            source.traffic_exceeded = true;
+                        }
 
-                        // schedules AppDataSource to send next data
-                        cx.schedule_event(
-                            Duration::from_secs_f64(interval),
-                            Self::fetch_app_data,
-                            source.time + interval,
-                        )
-                        .unwrap();
-                    } else {
-                        source.traffic_exceeded = true;
-                    }
-
-                    if source.next_seq < source.send_buffer {
-                        // the TCPPacketSource could send a new packet at this
-                        // point, if the size of the congestion window
-                        // allows
+                        if source.next_seq < source.send_buffer {
+                            self.run((), cx).await;
+                        } else {
+                            source.busy_until = timestamp + interval;
+                        }
+                    } else if source.next_seq < source.send_buffer {
+                        // For handle-backed sources, simply resume sending if there is pending data.
                         self.run((), cx).await;
-                    } else {
-                        // the TCPPacketSource is considered busy retrieving
-                        // the next packet from the (application-layer) flow
-                        source.busy_until = source.time + interval;
                     }
                 }
             }
@@ -373,7 +393,7 @@ impl PacketSource {
 
         debug!(
             "{} of flow {} received notification that flow {} ended at time {:.3}.",
-            format!("{self}"),
+            self,
             self.flow_id(),
             flow_finish_msg.flow_id,
             now
@@ -384,13 +404,13 @@ impl PacketSource {
                 source.flow_start_after.remove(&flow_finish_msg.flow_id);
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, cx);
+                    self.prepare_run(now, 0.0, cx).await;
                     self.run((), cx).await;
                     self.start_report_logger(0.0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
-                        format!("{self}"),
+                        self,
                         self.flow_id(),
                         now
                     );
@@ -411,13 +431,13 @@ impl PacketSource {
                 );
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, cx);
+                    self.prepare_run(now, 0.0, cx).await;
                     self.run((), cx).await;
                     self.start_report_logger(0.0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
-                        format!("{self}"),
+                        self,
                         self.flow_id(),
                         now
                     );
@@ -434,8 +454,7 @@ impl PacketSource {
 
         debug!(
             "{} will be waiting for {:.3} sec(s) at the beginning.",
-            format!("{self}"),
-            initial_delay
+            self, initial_delay
         );
 
         initial_delay
@@ -478,7 +497,7 @@ impl Model for PacketSource {
     async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
         if self.start_now() {
             let initial_delay = self.advance_initial_delay();
-            self.prepare_run(0.0, initial_delay, cx);
+            self.prepare_run(0.0, initial_delay, cx).await;
 
             if initial_delay > 0.0 {
                 cx.schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())

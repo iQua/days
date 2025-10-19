@@ -47,6 +47,7 @@ fn test_drop_strategy_red_early_drop() {
             None,
         ),
         0,
+        None,
     );
 
     // opted for a larger capacity (e.g., 10 packets) so pure TailDrop wouldn't

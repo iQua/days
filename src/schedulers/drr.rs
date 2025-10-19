@@ -13,7 +13,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, TailDrop, RED};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
@@ -177,11 +177,7 @@ impl DRRServer {
         self.packets_waiting += 1;
 
         let class_id = (self.flow_classes)(packet.flow_id);
-
-        // pushes the packet to the back of its class queue
-        self.queues[class_id].push_back(packet.clone());
-
-        self.byte_sizes[class_id] += packet.size;
+        let packet_size = packet.size;
 
         debug!(
             "DRRServer {} received packet {} ({} bytes) from flow {} belonging to class {} at time {:.3}. \
@@ -195,6 +191,10 @@ impl DRRServer {
             self.queues[class_id].len(),
             class_id
         );
+
+        // pushes the packet to the back of its class queue
+        self.queues[class_id].push_back(packet);
+        self.byte_sizes[class_id] += packet_size;
     }
 
     #[instrument(skip(self, cx))]
@@ -213,10 +213,11 @@ impl DRRServer {
             );
         }
 
+        let packet_time = packet.time;
         self.on_packet_received(packet);
 
-        if packet.time >= self.busy_until {
-            self.run(packet.time, cx);
+        if packet_time >= self.busy_until {
+            self.run(packet_time, cx);
         }
     }
 
@@ -667,7 +668,7 @@ mod tests {
             1e6,
             10,
             CapacityUnit::Packets,
-            Arc::new(|flow_id| (flow_id % 3) as usize), // maps flow_ids to 3 classes
+            Arc::new(|flow_id| flow_id % 3), // maps flow_ids to 3 classes
             DropStrategy::TailDrop,
             vec![1, 2, 3], // different weights
         );

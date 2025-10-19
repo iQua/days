@@ -45,6 +45,7 @@ fn test_weighted_fair_queueing() {
             None,
         ),
         0,
+        None,
     );
 
     let mut source_2 = PacketSource::new(
@@ -66,6 +67,7 @@ fn test_weighted_fair_queueing() {
             None,
         ),
         0,
+        None,
     );
 
     // Create WFQ scheduler with weights 1:2

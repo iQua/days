@@ -44,6 +44,7 @@ fn test_fifo_scheduling() {
             None,
         ),
         0,
+        None,
     );
 
     let mut source_2 = PacketSource::new(
@@ -65,6 +66,7 @@ fn test_fifo_scheduling() {
             None,
         ),
         0,
+        None,
     );
 
     // creates the FIFO port scheduler

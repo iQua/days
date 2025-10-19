@@ -15,10 +15,8 @@ use log::{debug, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
-use nexosim::ports::{EventSlot, Output};
-use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
-use nexosim::time::MonotonicTime;
-
+use crate::flows::FlowSize;
+use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::sink::{PacketSink, PacketStatistics};
@@ -30,12 +28,17 @@ use crate::schedulers::sp::SPServer;
 use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::schedulers::wrr::WRRServer;
-use crate::switches::switch::PacketSwitch;
 use crate::switches::SchedulingDiscipline;
+use crate::switches::switch::PacketSwitch;
 use crate::utils::logger::CsvLogger;
 use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
+use nexosim::ports::{EventSlot, Output};
+use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
+use nexosim::time::MonotonicTime;
+
+use crate::flows::app_source::AppDataSource;
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -66,6 +69,12 @@ pub struct SwitchConfig {
     vticks: Option<Vec<f64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Scatter,
+    Gather,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum TopoCategory {
     FatTree,
@@ -94,6 +103,15 @@ pub struct TopoConfig {
 pub struct Config {
     pub switch: SwitchConfig,
     pub topology: Option<TopoConfig>,
+    pub app_source: Option<AppSourceConfig>,
+}
+
+#[derive(Deserialize)]
+pub struct AppSourceConfig {
+    pub req_channel_capacity: Option<usize>,
+    pub chunk_size: Option<usize>,
+    pub initial_delay: Option<u64>,
+    pub run_interval: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +170,8 @@ pub struct Topology {
     config_path: String,
     /// the duration of the simulation
     duration: f64,
+    /// app source runtime config
+    app_source_cfg: AppBufferConfig,
 }
 
 impl Topology {
@@ -197,6 +217,17 @@ impl Topology {
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
 
+        let app_source_cfg = if let Some(app_src) = &config.app_source {
+            AppBufferConfig {
+                req_channel_capacity: app_src.req_channel_capacity.unwrap_or(128),
+                chunk_size: app_src.chunk_size.unwrap_or(512),
+                initial_delay: app_src.initial_delay.unwrap_or(1),
+                run_interval: app_src.run_interval.unwrap_or(50),
+            }
+        } else {
+            AppBufferConfig::default()
+        };
+
         Topology {
             sim_init,
             graph: graph.clone(),
@@ -209,6 +240,7 @@ impl Topology {
             mailbox_capacity,
             config_path: config_path.to_string(),
             duration,
+            app_source_cfg,
         }
     }
 
@@ -261,81 +293,112 @@ impl Topology {
             self.collectives.len()
         );
 
-        // constructs, attaches, and routes flows in each collective
         for collective in self.collectives.iter_mut() {
-            for (index, &source) in collective.sources.iter().enumerate() {
-                let sink = collective.sinks[index];
-                let flow_id = collective.first_flow_id + index;
-                let path = collective.paths.as_ref().map(|paths| paths[index].clone());
+            let collective_type = collective.collective_type.clone();
+            match collective_type {
+                CollectiveType::RingAllReduce => {
+                    let n = collective.sources.len();
+                    let mut flow_id = collective.first_flow_id;
 
-                match collective.collective_type {
-                    CollectiveType::Broadcast => {
-                        self.flows.push(Flow::new(FlowParams {
-                            id: flow_id,
-                            path,
-                            starts_before: Vec::new(),
-                            starts_after: Vec::new(),
-                            flow_type: collective.flow_type,
-                            source_host: source,
-                            sink_host: sink,
-                            routing: collective.routing,
-                            traffic: collective.traffic,
-                            // uses collective_id as the random seed for the
-                            // flow, which ensures that all flows in the
-                            // broadcast have the same arrival and size
-                            // distribution
-                            seed: collective.id,
-                        }));
+                    let mut last_scatter: Vec<Option<usize>> = vec![None; n];
+                    let mut last_gather: Vec<Option<usize>> = vec![None; n];
 
-                        debug!(
-                            "Produced Flow {} of Broadcast collective communication operation {}.",
-                            flow_id, collective.id
-                        );
+                    for (rank, &src) in collective.sources.iter().enumerate() {
+                        let dst = collective.sources[(rank + 1) % n];
+
+                        for _step in 1..n {
+                            let flow = Flow::new(FlowParams {
+                                id: flow_id,
+                                path: None,
+                                starts_before: Vec::new(),
+                                starts_after: Vec::new(),
+                                flow_type: collective.flow_type.clone(),
+                                source_host: src,
+                                sink_host: dst,
+                                routing: collective.routing.clone(),
+                                traffic: collective.traffic.clone(),
+                                seed: collective.id,
+                            });
+
+                            let this_idx = self.flows.len();
+                            self.flows.push(flow);
+
+                            if let Some(prev_idx) = last_scatter[rank] {
+                                self.flows[prev_idx].starts_before.push(flow_id);
+                            }
+
+                            last_scatter[rank] = Some(this_idx);
+
+                            flow_id += 1;
+                        }
                     }
-                    CollectiveType::Gather => {
-                        self.flows.push(Flow::new(FlowParams {
-                            id: flow_id,
-                            path,
-                            starts_before: Vec::new(),
-                            starts_after: Vec::new(),
-                            flow_type: collective.flow_type,
-                            source_host: source,
-                            sink_host: sink,
-                            routing: collective.routing,
-                            traffic: collective.traffic,
-                            // uses flow_id as the random seed for the flow,
-                            // which ensures that different flows have different
-                            // arrival and size distributions
-                            seed: flow_id,
-                        }));
 
-                        debug!(
-                            "Produced Flow {} of Gather collective communication operation {}.",
-                            flow_id, collective.id
-                        );
+                    for (rank, &src) in collective.sources.iter().enumerate() {
+                        let dst = collective.sources[(rank + 1) % n];
+
+                        for step in 1..n {
+                            let flow = Flow::new(FlowParams {
+                                id: flow_id,
+                                path: None,
+                                starts_before: Vec::new(),
+                                starts_after: Vec::new(),
+                                flow_type: collective.flow_type.clone(),
+                                source_host: src,
+                                sink_host: dst,
+                                routing: collective.routing.clone(),
+                                traffic: collective.traffic.clone(),
+                                seed: collective.id,
+                            });
+
+                            let this_idx = self.flows.len();
+                            self.flows.push(flow);
+
+                            if let Some(prev_idx) = last_gather[rank] {
+                                self.flows[prev_idx].starts_before.push(flow_id);
+                            }
+
+                            if step == 1 {
+                                if let Some(scatter_idx) = last_scatter[rank] {
+                                    self.flows[scatter_idx].starts_before.push(flow_id);
+                                }
+                            }
+
+                            last_gather[rank] = Some(this_idx);
+
+                            flow_id += 1;
+                        }
                     }
-                    CollectiveType::AllReduce => {
+
+                    collective.flow_count = flow_id - collective.first_flow_id;
+                }
+
+                _ => {
+                    for (index, &source) in collective.sources.iter().enumerate() {
+                        let sink = collective.sinks[index];
+                        let flow_id = collective.first_flow_id + index;
+                        let path = collective.paths.as_ref().map(|paths| paths[index].clone());
+
                         self.flows.push(Flow::new(FlowParams {
                             id: flow_id,
                             path,
                             starts_before: Vec::new(),
                             starts_after: Vec::new(),
-                            flow_type: collective.flow_type,
+                            flow_type: collective.flow_type.clone(),
                             source_host: source,
                             sink_host: sink,
-                            routing: collective.routing,
-                            traffic: collective.traffic,
-                            // uses the source host's id as the random seed for
-                            // the flow, which ensures that different hosts have
-                            // different arrival and size distributions, but
-                            // packet sources attached to the same host have the
-                            // same distribution
-                            seed: source,
+                            routing: collective.routing.clone(),
+                            traffic: collective.traffic.clone(),
+                            seed: match collective_type.clone() {
+                                CollectiveType::Broadcast => collective.id,
+                                CollectiveType::Gather => flow_id,
+                                CollectiveType::AllReduce => source,
+                                _ => 0, // fallback
+                            },
                         }));
 
                         debug!(
-                            "Produced Flow {} of AllReduce collective communication operation {}.",
-                            flow_id, collective.id
+                            "Produced Flow {} of {:?} collective communication operation {}.",
+                            flow_id, collective_type, collective.id
                         );
                     }
                 }
@@ -346,6 +409,8 @@ impl Topology {
     /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
+
+        let drop_strategy = self.switch_config.drop.clone();
 
         match self.switch_config.discipline {
             SchedulingDiscipline::DRR => {
@@ -361,7 +426,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     weights.clone(),
                 );
 
@@ -383,7 +448,7 @@ impl Topology {
                     self.switch_config.port_rate,
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                 );
 
                 let mut output = Output::default();
@@ -411,7 +476,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % priorities_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     priorities.clone(),
                 );
 
@@ -439,7 +504,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % vticks_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     vticks.clone(),
                 );
 
@@ -472,7 +537,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
-                    self.switch_config.drop,
+                    drop_strategy.clone(),
                     weights.clone(),
                 );
 
@@ -491,7 +556,9 @@ impl Topology {
 
             SchedulingDiscipline::WRR => {
                 let weights = self.switch_config.weights.as_ref().unwrap_or_else(|| {
-                    panic!("`weights` must be provided for Weighted Round Robin scheduling discipline.")
+                    panic!(
+                        "`weights` must be provided for Weighted Round Robin scheduling discipline."
+                    )
                 });
 
                 let weights_len = weights.len();
@@ -500,7 +567,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
-                    self.switch_config.drop,
+                    drop_strategy,
                     weights.clone(),
                 );
 
@@ -527,6 +594,7 @@ impl Topology {
         mut self,
         stats: &mut SinkStatistics,
         ui_mbox: Mailbox<UserInterface>,
+        flow_id_to_source_handle: Option<HashMap<usize, AppSourceBufferHandle>>,
     ) -> (Self, Mailbox<UserInterface>) {
         info!(
             "Attaching packet sources and sinks to their hosts in all {} flows.",
@@ -540,20 +608,25 @@ impl Topology {
             source_mboxes.insert(flow.id, source_mbox);
         }
 
+        // creates and attaches a packet source and sink for each flow
         for flow in self.flows.iter_mut() {
-            // creates and attaches a packet source and sink for each flow
-
             // packet sources and sinks must be attached to hosts
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
 
-            // creates a new packet source
+            let handle = flow_id_to_source_handle
+                .as_ref()
+                .and_then(|m| m.get(&flow.id).cloned());
+            // let handle = flow_id_to_source_handle
+            //     .as_ref()
+            //     .and_then(|m| m.get(&flow.id).cloned());
             let mut source = PacketSource::new(
                 flow.id,
                 flow.starts_after.clone(),
-                flow.flow_type,
-                flow.traffic,
+                flow.flow_type.clone(),
+                flow.traffic.clone(),
                 flow.seed,
+                handle,
             );
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
@@ -623,6 +696,11 @@ impl Topology {
                     }
                 }
             }
+
+            // if flow.flow_type == FlowType::TCP {
+            //     sink.output()
+            //         .connect(PacketSource::packet_received, &source_mboxes[&flow.id]);
+            // }
 
             sources.insert(flow.id, source);
 
@@ -743,13 +821,116 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
+        // Prepares application-level packet sources and their actors (only for TCP Broadcast).
+        let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
+        let mut flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle> = HashMap::new();
+        let mut conn_map: HashMap<(usize, usize), AppDataSource> = HashMap::new();
+
+        for collective in &self.collectives {
+            if matches!(
+                (&collective.collective_type, &collective.flow_type),
+                (CollectiveType::Broadcast, FlowType::TCP)
+            ) {
+                let total_size = match collective.traffic.size {
+                    FlowSize::Bytes(s) => s,
+                    _ => panic!("Only byte-based broadcast is supported."),
+                };
+
+                // create unique AppDataSource and actor (no MSS needed - TCP handles packetization)
+                let data_src = AppDataSource::create_source_buffer(total_size, self.app_source_cfg);
+                // assign handle to each flow：all flows obtain data from the same data_src
+                for flow_id in
+                    collective.first_flow_id..collective.first_flow_id + collective.flow_count
+                {
+                    flow_id_to_source_handle.insert(flow_id, data_src.handle());
+                }
+                app_sources.insert(collective.id, data_src);
+            }
+            // Ring-AllReduce (TCP)
+            if matches!(
+                (&collective.collective_type, &collective.flow_type),
+                (CollectiveType::RingAllReduce, FlowType::TCP)
+            ) {
+                let total_size = match collective.traffic.size {
+                    FlowSize::Bytes(b) => b,
+                    _ => panic!("RingAllReduce only supports byte-based flows."),
+                };
+                let n = collective.sources.len();
+                let chunk_size = total_size / n;
+
+                let mut flow_id = collective.first_flow_id;
+
+                for phase in [Phase::Scatter, Phase::Gather] {
+                    for rank in 0..n {
+                        for step in 1..n {
+                            let src_host = collective.sources[rank]; // flow's sender
+                            let dst_host = collective.sources[(rank + 1) % n];
+
+                            // which chunk travels in this hop
+                            let chunk_owner = match phase {
+                                Phase::Scatter => (rank + n - step + 1) % n,
+                                Phase::Gather => (rank + n - step + 1) % n,
+                            };
+                            let chunk_offset = chunk_owner * chunk_size;
+                            let chunk_len = if chunk_owner == n - 1 {
+                                total_size - chunk_offset
+                            } else {
+                                chunk_size
+                            };
+
+                            // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
+                            let data_src =
+                                conn_map.entry((src_host, dst_host)).or_insert_with(|| {
+                                    AppDataSource::create_source_buffer(
+                                        total_size,
+                                        self.app_source_cfg,
+                                    )
+                                });
+
+                            let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
+                            flow_id_to_source_handle.insert(flow_id, handle);
+
+                            flow_id += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut actor_count = 0usize;
+
+        for ((src, _dst), mut ds) in conn_map.into_iter() {
+            if let Some(actor) = ds.take_actor() {
+                let mbox = Mailbox::new();
+                self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
+                actor_count += 1;
+            }
+            app_sources.insert(src, ds);
+        }
+
+        for ds in app_sources.values_mut() {
+            if let Some(actor) = ds.take_actor() {
+                let mbox = Mailbox::new();
+                self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
+                actor_count += 1;
+            }
+        }
+
+        debug!(
+            "Initialized {} AppSource actors for {} TCP flows with {} unique source handles",
+            actor_count,
+            flow_id_to_source_handle.len(),
+            app_sources.len()
+        );
+
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
 
         // constructs the network graph by connecting the packet switches
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) = self.attach_flows(&mut statistics, ui_mbox);
+        (self, ui_mbox) =
+            self.attach_flows(&mut statistics, ui_mbox, Some(flow_id_to_source_handle));
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();

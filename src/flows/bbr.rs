@@ -3,8 +3,9 @@
 //! Based on the BBRv3 IETF Draft:
 //! https://ietf-wg-ccwg.github.io/draft-ietf-ccwg-bbr/draft-ietf-ccwg-bbr.html
 
-use crate::flows::cc::CongestionControl;
 use std::collections::VecDeque;
+
+use crate::flows::cc::CongestionControl;
 
 #[derive(Debug)]
 pub struct BBRState {
@@ -69,8 +70,9 @@ pub struct BBRState {
     pub stable_rounds: usize,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum BBRMode {
+    #[default]
     Startup,
     Drain,
     ProbeUp,
@@ -78,12 +80,6 @@ pub enum BBRMode {
     ProbeCruise,
     ProbeRTT,
     Stall,
-}
-
-impl Default for BBRMode {
-    fn default() -> Self {
-        BBRMode::Startup
-    }
 }
 
 impl BBRState {
@@ -373,6 +369,12 @@ impl BBRState {
 #[derive(Debug)]
 pub struct TCPBBR {
     state: BBRState,
+}
+
+impl Default for TCPBBR {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TCPBBR {

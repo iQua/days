@@ -71,7 +71,7 @@ struct HyStartState {
     /// - Significant RTT increase detected (>12.5% over baseline)
     /// - Sustained RTT increase trend observed
     /// - Maximum slow start threshold reached
-    /// Once true, triggers transition to congestion avoidance.
+    ///   Once true, triggers transition to congestion avoidance.
     exit_slow_start: bool,
 }
 
@@ -389,13 +389,12 @@ impl CongestionControl for TCPCubic {
         // Update HyStart state with improved RTT tracking
         self.update_hystart(rtt, current_time);
 
-        if self.in_recovery {
-            if bytes_acked >= 3 * self.mss {
-                // Full acknowledgment received, exit recovery
-                self.cwnd = self.ssthresh;
-                self.in_recovery = false;
-                return;
-            }
+        if self.in_recovery && bytes_acked >= 3 * self.mss {
+            // Full acknowledgment received, exit recovery
+            self.cwnd = self.ssthresh;
+            self.in_recovery = false;
+
+            return;
         }
 
         if self.cwnd <= self.ssthresh && !self.hystart.exit_slow_start {
@@ -691,11 +690,7 @@ mod tests {
         cubic.ack_received(0, 0.1, 100.0, 512); // bytes_acked = 512
 
         // Calculate absolute difference manually
-        let diff = if cubic.cwnd > 2_000_000 {
-            cubic.cwnd - 2_000_000
-        } else {
-            2_000_000 - cubic.cwnd
-        };
+        let diff = cubic.cwnd.abs_diff(2_000_000);
 
         // Allow a small difference due to floating-point precision
         assert!(

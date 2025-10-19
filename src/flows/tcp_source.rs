@@ -1,20 +1,21 @@
 //! Implements a packet source that simulates the TCP protocol, including
 //! support for various congestion control mechanisms.
-
-use core::fmt;
-use std::cmp::min;
 use std::cmp::Ordering;
+use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use core::fmt;
 use log::debug;
-use nexosim::model::Model;
-use nexosim::ports::Output;
 use rand::rngs::SmallRng;
 
-use crate::flows::app_source::AppDataSource;
+use nexosim::model::Model;
+use nexosim::ports::Output;
+
+use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{CCAlgorithm, CongestionControl};
 use crate::flows::cubic::TCPCubic;
+use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
 use crate::flows::reno::TCPReno;
 use crate::flows::source::PacketSourceReport;
@@ -28,6 +29,32 @@ pub struct PacketTimeout {
     pub packet_id: usize,
     pub rto: f64,
     pub timeout: f64,
+}
+
+pub struct SyntheticDataSource {
+    dist: DistPacketSource,
+}
+
+impl SyntheticDataSource {
+    fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
+        Self {
+            dist: DistPacketSource::new(flow_id, Vec::new(), traffic, rng),
+        }
+    }
+
+    pub fn set_flow_start_time(&mut self, flow_start_time: f64) {
+        self.dist.flow_start_time = flow_start_time;
+    }
+
+    pub fn produce_data(&mut self, now: f64) -> (Packet, f64) {
+        let (packet, interval) = self.dist.produce_packet(now);
+        self.dist.packet_sent(&packet, now);
+        (packet, interval)
+    }
+
+    pub fn traffic_exceeded(&self, now: f64) -> bool {
+        self.dist.traffic_exceeded(now)
+    }
 }
 
 impl PartialOrd for PacketTimeout {
@@ -87,8 +114,8 @@ pub struct TCPPacketSource {
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
 
-    pub datasource: AppDataSource,
-
+    pub app_source: Option<AppSourceBufferHandle>,
+    synthetic_source: Option<SyntheticDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
     pub busy_until: f64,
@@ -113,6 +140,7 @@ pub struct TCPPacketSource {
     min_rto: f64,
     /// Maximum RTO value in seconds
     max_rto: f64,
+    remaining_bytes: usize,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -125,20 +153,41 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
+    pub fn synthetic_source_mut(&mut self) -> Option<&mut SyntheticDataSource> {
+        self.synthetic_source.as_mut()
+    }
+
+    pub fn has_synthetic_source(&self) -> bool {
+        self.synthetic_source.is_some()
+    }
+
     pub fn new(
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
+        app_source: Option<AppSourceBufferHandle>,
         rng: SmallRng,
     ) -> TCPPacketSource {
-        let cc_algorithm = traffic.tcp.unwrap().cc_algorithm;
+        let cc_algorithm = traffic
+            .tcp
+            .as_ref()
+            .expect("TCP traffic requires TCP characteristics")
+            .cc_algorithm;
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
-
+        let synthetic_source = if app_source.is_some() {
+            None
+        } else {
+            Some(SyntheticDataSource::new(flow_id, traffic.clone(), rng))
+        };
+        let remaining_bytes = app_source
+            .as_ref()
+            .and_then(|h| h.get_total_size())
+            .unwrap_or(usize::MAX);
         TCPPacketSource {
             time: 0.0,
             endpoint_id: next_endpoint_id(),
@@ -157,7 +206,9 @@ impl TCPPacketSource {
             rto: 1.0,
             sent_packets: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
-            datasource: AppDataSource::new(flow_id, traffic, rng.clone()),
+            app_source,
+            synthetic_source,
+            remaining_bytes,
             busy_until: 0.0,
             packets_sent: 0,
             sent_size: 0,
@@ -167,9 +218,79 @@ impl TCPPacketSource {
             flow_finish_outputs: Vec::new(),
             sent_flow_finish_msg: false,
             report_start_time: 0.0,
-            clock_granularity: 0.001, // 1ms granularity
+            clock_granularity: 0.001, // 1 ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
+        }
+    }
+
+    /// Pull data from the app source and create packets with proper TCP metadata.
+    /// Converts raw bytes from the application layer into TCP segments.
+    /// This function is typically called:
+    /// - after receiving new ACKs (to refill the window)
+    /// - before sending packets (to populate the send buffer)
+    pub async fn pull_from_appsource(&mut self, now: f64) {
+        // stop if all flow data has been sent
+        if self.remaining_bytes == 0 {
+            return;
+        }
+
+        // compute available sending window (cwnd - unacked data)
+        let cwnd = self.congestion_control.get_cwnd();
+        let window_end = self.last_ack.saturating_add(cwnd);
+
+        if self.next_seq >= window_end {
+            return;
+        }
+
+        let win_left = window_end - self.next_seq;
+
+        // window too small to send a full segment, wait for ACKs
+        if win_left < self.mss {
+            return;
+        }
+
+        // pull at most min(available window, remaining bytes)
+        let pull_size = win_left.min(self.remaining_bytes);
+
+        if let Some(ref mut handle) = self.app_source {
+            // Pull raw bytes from application layer
+            let data = handle.pull(pull_size).await;
+
+            // TCP layer creates packets with proper metadata
+            let mut offset = 0;
+            while offset < data.len() {
+                let chunk_size = self.mss.min(data.len() - offset);
+
+                // ensure we do not exceed the current window
+                if self
+                    .next_seq
+                    .checked_add(chunk_size)
+                    .map(|next| next > window_end)
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+
+                // Create packet with correct TCP metadata
+                let packet = Packet::new(
+                    chunk_size,
+                    self.next_seq, // Correct sequence number
+                    self.flow_id,  // Correct flow ID
+                    now,           // Correct timestamp
+                );
+
+                self.output.send(packet.clone()).await;
+                self.packet_sent(&packet, now);
+
+                self.remaining_bytes -= chunk_size;
+                offset += chunk_size;
+            }
+        }
+
+        // if all bytes have been sent and acknowledged, complete the flow
+        if self.remaining_bytes == 0 {
+            self.traffic_exceeded = true;
         }
     }
 
@@ -214,9 +335,13 @@ impl TCPPacketSource {
                 self.output.send(resent_pkt.clone()).await;
 
                 debug!(
-                        "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                        self.endpoint_id, resent_pkt.packet_id, resent_pkt.size, resent_pkt.flow_id, now,
-                    );
+                    "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                    self.endpoint_id,
+                    resent_pkt.packet_id,
+                    resent_pkt.size,
+                    resent_pkt.flow_id,
+                    now,
+                );
             }
 
             if self.dupack > 3 {
@@ -227,9 +352,9 @@ impl TCPPacketSource {
                     && self.next_seq < self.send_buffer
                 {
                     debug!(
-                            "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
-                            self.endpoint_id, self.next_seq, self.mss, now,
-                        );
+                        "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
+                        self.endpoint_id, self.next_seq, self.mss, now,
+                    );
 
                     let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
                     self.output.send(packet.clone()).await;
@@ -319,9 +444,15 @@ impl TCPPacketSource {
             if now >= self.busy_until {
                 return true;
             }
+
+            self.pull_from_appsource(now).await;
         }
 
         false
+    }
+
+    pub fn get_cwnd_limit(&self) -> usize {
+        self.last_ack + self.congestion_control.get_cwnd()
     }
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
@@ -346,7 +477,10 @@ impl TCPPacketSource {
 
         debug!(
             "TCPPacketSource {} set a timer for packet {} with an RTO of {:.3} and expiry time of {:.3}.",
-            self.endpoint_id, packet.packet_id, self.rto, self.rto + now
+            self.endpoint_id,
+            packet.packet_id,
+            self.rto,
+            self.rto + now
         );
     }
 
@@ -410,6 +544,8 @@ impl TCPPacketSource {
     }
 
     pub async fn send_packet(&mut self, now: f64) {
+        // Attempt to pull fresh packets from the application layer before sending, to ensure there is data ready within the current congestion window.
+        self.pull_from_appsource(now).await;
         // the sender can transmit up to the size of the congestion window
         while self.next_seq < self.send_buffer
             && self.next_seq + self.mss
@@ -419,6 +555,7 @@ impl TCPPacketSource {
                 )
         {
             let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+
             self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);
         }

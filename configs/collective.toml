@@ -8,59 +8,45 @@ duration = 20.0
 log_path = "logs/collective"
 
 [switch]
-    port_rate = 8000
-    capacity = 100
-    weights = [1]
-    discipline = "FIFO"
-    drop = "RED"
+port_rate = 8000
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
 
 [[collective]]
-    collective_type = "AllReduce"
-    flow_type = "PacketDistribution"
-    flow_count = 2
-    graph = [[0, 2], [0, 3], [1, 2], [1, 3]]
-    sources = [0, 1]
-    sinks = [2, 3]
+collective_type = "Broadcast"
+flow_type = "PacketDistribution"
+flow_count = 4
 
-    [collective.traffic]
-        initial_delay = 1.0
-        duration = 10.0
-        arr_dist = {type = "Uniform", low = 1, high = 2}
-        pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+[collective.traffic]
+initial_delay = 1.0
+duration = 10.0
+arr_dist = { type = "Uniform", low = 3, high = 4 }
+pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
 
-[[collective]]
-    collective_type = "Broadcast"
-    flow_type = "PacketDistribution"
-    flow_count = 4
+# [[collective_set]]
+# collective_type = "Gather"
+# collective_count = 2
+# flow_type = "PacketDistribution"
+# flow_count = 2
+# sources = [[0, 1], [1, 2]]
+# sinks = [[2, 2], [3, 3]]
 
-    [collective.traffic]
-        initial_delay = 1.0
-        duration = 10.0
-        arr_dist = {type = "Uniform", low = 3, high = 4}
-        pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
+# [collective_set.traffic]
+# initial_delay = 1.0
+# duration = 10.0
+# arr_dist = { type = "Uniform", low = 3, high = 4 }
+# pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
 
-[[collective_set]]
-    collective_type = "Gather"
-    collective_count = 2
-    flow_type = "PacketDistribution"
-    flow_count = 2
-    sources = [[0, 1], [1, 2]]
-    sinks = [[2, 2], [3, 3]]
+# [[collective_set]]
+# collective_type = "AllReduce"
+# collective_count = 2
+# flow_type = "PacketDistribution"
+# flow_count = 2
 
-    [collective_set.traffic]
-        initial_delay = 1.0
-        duration = 10.0
-        arr_dist = {type = "Uniform", low = 3, high = 4}
-        pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
-
-[[collective_set]]
-    collective_type = "AllReduce"
-    collective_count = 2
-    flow_type = "PacketDistribution"
-    flow_count = 2
-
-    [collective_set.traffic]
-        initial_delay = 1.0
-        duration = 10.0
-        arr_dist = {type = "Uniform", low = 3, high = 4}
-        pkt_size_dist = {type = "Uniform", low = 2000, high = 2500}
+# [collective_set.traffic]
+# initial_delay = 1.0
+# duration = 10.0
+# arr_dist = { type = "Uniform", low = 3, high = 4 }
+# pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }

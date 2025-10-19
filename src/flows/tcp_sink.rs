@@ -1,16 +1,17 @@
 //! Implements a TCPSink, designed to send acknowledgement packets back to
 //! TCPPacketSource.
 
-use log::debug;
 use std::fmt::Debug;
+
+use log::debug;
+use tracing::instrument;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
-use tracing::instrument;
 
+use crate::flows::FlowFinishMsg;
 use crate::flows::packet::{Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
-use crate::flows::FlowFinishMsg;
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
@@ -142,16 +143,28 @@ impl TCPPacketSink {
         };
 
         // sends the acknowledgment packet out to the TCPPacketSource now
-        self.output.send(acknowledgment.clone()).await;
+        let ack_size = acknowledgment.size;
+        let packet_id = acknowledgment.packet_id;
+        self.output.send(acknowledgment).await;
 
         debug!(
             "TCPPacketSink {} sent ack packet {} ({} bytes) at time {:.3}.",
-            self.endpoint_id, acknowledgment.packet_id, acknowledgment.size, now,
+            self.endpoint_id, packet_id, ack_size, now,
         );
     }
 
     pub async fn process(&mut self, packet: Packet, now: f64) {
         // updates the locally maintained simulation time
+
+        if packet.packet_id < self.next_seq_expected {
+            log::debug!(
+                "Duplicate packet received: TCP sink={} flow={} pkt_id={} now={:.3}",
+                self.endpoint_id,
+                packet.flow_id,
+                packet.packet_id,
+                now
+            );
+        }
         self.time = now;
 
         self.packet_statistics.update(&packet, now);

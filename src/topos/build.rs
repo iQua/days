@@ -139,7 +139,7 @@ fn build_custom_graph(content: &str) -> Result<(UnGraph<usize, ()>, Vec<usize>)>
 }
 
 fn validate_fattree_params(k: u32) -> Result<()> {
-    if k % 2 != 0 {
+    if !k.is_multiple_of(2) {
         return Err(TopologyError::InvalidConfig("k must be even".into()));
     }
     if k == 0 {
@@ -432,7 +432,7 @@ mod tests {
                 let core_neighbors: HashSet<_> = graph
                     .edges(node_idx)
                     .map(|e| e.target().index())
-                    .filter(|&n| n >= (k * k) as usize)
+                    .filter(|&n| n >= (k * k))
                     .collect();
 
                 assert_eq!(core_neighbors.len(), k / 2);

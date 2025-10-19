@@ -46,6 +46,7 @@ fn test_drop_strategy_taildrop_small_buffer() {
             None,
         ),
         0,
+        None,
     );
 
     // a low-capacity (2 packets) TailDrop queue—will only drop when full

@@ -50,6 +50,7 @@ fn test_weighted_round_robin() {
             None,
         ),
         0, // route_id, if relevant
+        None,
     );
 
     let mut source_2 = PacketSource::new(
@@ -71,6 +72,7 @@ fn test_weighted_round_robin() {
             None,
         ),
         0,
+        None,
     );
 
     // Create Weighted Round Robin scheduler with two classes having weights 1:2.
