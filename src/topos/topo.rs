@@ -303,39 +303,69 @@ impl Topology {
                     let mut last_scatter: Vec<Option<usize>> = vec![None; n];
                     let mut last_gather: Vec<Option<usize>> = vec![None; n];
 
-                    for phase in [Phase::Scatter, Phase::Gather] {
-                        let last_table = match phase {
-                            Phase::Scatter => &mut last_scatter,
-                            Phase::Gather => &mut last_gather,
-                        };
+                    for (rank, &src) in collective.sources.iter().enumerate() {
+                        let dst = collective.sources[(rank + 1) % n];
 
-                        for (rank, &src) in collective.sources.iter().enumerate() {
-                            let dst = collective.sources[(rank + 1) % n];
+                        for _step in 1..n {
+                            let flow = Flow::new(FlowParams {
+                                id: flow_id,
+                                path: None,
+                                starts_before: Vec::new(),
+                                starts_after: Vec::new(),
+                                flow_type: collective.flow_type.clone(),
+                                source_host: src,
+                                sink_host: dst,
+                                routing: collective.routing.clone(),
+                                traffic: collective.traffic.clone(),
+                                seed: collective.id,
+                            });
 
-                            for _ in 1..n {
-                                let flow = Flow::new(FlowParams {
-                                    id: flow_id,
-                                    path: None,
-                                    starts_before: Vec::new(),
-                                    starts_after: Vec::new(),
-                                    flow_type: collective.flow_type.clone(),
-                                    source_host: src,
-                                    sink_host: dst,
-                                    routing: collective.routing.clone(),
-                                    traffic: collective.traffic.clone(),
-                                    seed: collective.id,
-                                });
+                            let this_idx = self.flows.len();
+                            self.flows.push(flow);
 
-                                let this_idx = self.flows.len();
-                                self.flows.push(flow);
-
-                                if let Some(prev_idx) = last_table[rank] {
-                                    self.flows[prev_idx].starts_before.push(flow_id);
-                                }
-
-                                last_table[rank] = Some(this_idx);
-                                flow_id += 1;
+                            if let Some(prev_idx) = last_scatter[rank] {
+                                self.flows[prev_idx].starts_before.push(flow_id);
                             }
+
+                            last_scatter[rank] = Some(this_idx);
+
+                            flow_id += 1;
+                        }
+                    }
+
+                    for (rank, &src) in collective.sources.iter().enumerate() {
+                        let dst = collective.sources[(rank + 1) % n];
+
+                        for step in 1..n {
+                            let flow = Flow::new(FlowParams {
+                                id: flow_id,
+                                path: None,
+                                starts_before: Vec::new(),
+                                starts_after: Vec::new(),
+                                flow_type: collective.flow_type.clone(),
+                                source_host: src,
+                                sink_host: dst,
+                                routing: collective.routing.clone(),
+                                traffic: collective.traffic.clone(),
+                                seed: collective.id,
+                            });
+
+                            let this_idx = self.flows.len();
+                            self.flows.push(flow);
+
+                            if let Some(prev_idx) = last_gather[rank] {
+                                self.flows[prev_idx].starts_before.push(flow_id);
+                            }
+
+                            if step == 1 {
+                                if let Some(scatter_idx) = last_scatter[rank] {
+                                    self.flows[scatter_idx].starts_before.push(flow_id);
+                                }
+                            }
+
+                            last_gather[rank] = Some(this_idx);
+
+                            flow_id += 1;
                         }
                     }
 
@@ -842,8 +872,8 @@ impl Topology {
 
                             // which chunk travels in this hop
                             let chunk_owner = match phase {
-                                Phase::Scatter => (rank + n - step) % n,
-                                Phase::Gather => (rank + step) % n,
+                                Phase::Scatter => (rank + n - step + 1) % n,
+                                Phase::Gather => (rank + n - step) % n,
                             };
                             let chunk_offset = chunk_owner * chunk_size;
                             let chunk_len = if chunk_owner == n - 1 {
