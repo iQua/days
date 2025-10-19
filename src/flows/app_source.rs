@@ -33,8 +33,8 @@ impl Default for AppBufferConfig {
         }
     }
 }
-// Each request sent to the AppSourceBuffer asks for `size` bytes of data. The `respond_to` channel
-// is used to send back the result asynchronously.
+// Each request sent to the AppSourceBuffer asks for `size` bytes of data. The `respond_to`
+// channel is used to send back the result asynchronously.
 #[derive(Debug)]
 pub struct AppSourceRequest {
     /// Start reading at this byte position inside the stream.
@@ -71,7 +71,7 @@ impl Clone for AppSourceBufferHandle {
 }
 
 impl AppSourceBufferHandle {
-    /// Build a handle (and actor) around the provided buffer.
+    /// Builds a handle (and actor) around the provided buffer.
     pub fn from_buffer(buffer: Vec<u8>, config: &AppBufferConfig) -> Self {
         let total_size = buffer.len();
         let (actor, tx) = AppSourceBuffer::new(buffer, config);
@@ -85,7 +85,8 @@ impl AppSourceBufferHandle {
         }
     }
 
-    /// Create a handle that starts at `offset` (Ring-AllReduce chunk) sharing the same actor.
+    /// Creates a handle that starts at `offset` (ring all-reduce chunk) sharing
+    /// the same actor.
     pub fn with_offset(&self, offset: usize, length: Option<usize>) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -100,28 +101,29 @@ impl AppSourceBufferHandle {
         self.length
     }
 
-    /// Get the current offset (for testing and debugging)
+    /// Gets the current offset (for testing and debugging)
     pub fn get_offset(&self) -> usize {
         self.offset
     }
 
-    /// Get the current cursor position (for testing and debugging)
+    /// Gets the current cursor position (for testing and debugging)
     pub fn get_cursor(&self) -> usize {
         self.cursor
     }
 
-    /// Get the length constraint (for testing and debugging)
+    /// Gets the length constraint (for testing and debugging)
     pub fn get_length(&self) -> Option<usize> {
         self.length
     }
 
+    // Used for the topology to register this actor as a nexosim task
     pub fn take_actor(&mut self) -> Option<AppSourceBuffer> {
         self.actor.take()
     }
 
-    // Send a pull request to the actor, and await the returned bytes.
+    // Sends a pull request to the actor, and await the returned bytes.
     pub async fn pull(&mut self, size: usize) -> Vec<u8> {
-        // Clamp the requested size to the remaining bytes exposed by this handle
+        // clamps the requested size to the remaining bytes exposed by this handle
         let allowed = self
             .length
             .map(|len| len.saturating_sub(self.cursor))
@@ -133,7 +135,7 @@ impl AppSourceBufferHandle {
         }
 
         let (resp_tx, mut resp_rx) = channel(1);
-        // send the current cursor to the actor
+        // sends the current cursor to the actor
         let _ = self
             .tx
             .send(AppSourceRequest {
@@ -153,7 +155,7 @@ impl AppSourceBufferHandle {
         data
     }
 
-    // Send a shutdown signal by sending a request with size = 0 (not actually handled yet).
+    // sends a shutdown signal by sending a request with size = 0 (not actually handled yet)
     pub async fn shutdown(&self) {
         let (resp_tx, _resp_rx) = channel(1);
 
