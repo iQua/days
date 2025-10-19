@@ -8,7 +8,6 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use nexosim::model::{Context, InitializedModel, Model};
@@ -18,7 +17,6 @@ use tachyonix::{Receiver, Sender, channel};
 use crate::flows::TrafficCharacteristics;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
-use crate::get_seed;
 
 /// Runtime configuration for AppSourceBuffer
 #[derive(Clone, Copy, Debug)]
@@ -267,8 +265,6 @@ impl AppSourceBuffer {
 pub enum AppDataSource {
     // Application-level DataSource for pre-buffered packets.
     Buffered(AppSourceBufferHandle),
-    /// Application-level DataSource for packets generated from traffic distributions.
-    Dist(AppSourceBufferHandle),
 }
 
 impl AppDataSource {
@@ -283,24 +279,10 @@ impl AppDataSource {
         )
     }
 
-    // Create a distributed source from traffic distributions and flow ID.
-    pub fn distributed_source(
-        flow_id: usize,
-        tr: TrafficCharacteristics,
-        config: AppBufferConfig,
-    ) -> (Self, AppSourceBuffer) {
-        let seed = get_seed();
-        let rng = SmallRng::seed_from_u64(seed as u64 + flow_id as u64);
-
-        let (actor, tx) = AppSourceBuffer::dist_actor(flow_id, tr, rng, &config);
-
-        (Self::Dist(AppSourceBufferHandle::new(tx, None)), actor)
-    }
-
     // Retrieves the underlying handle to be used in TCPPacketSource.
     pub fn handle(&self) -> AppSourceBufferHandle {
         match self {
-            Self::Buffered(h) | Self::Dist(h) => h.clone(),
+            Self::Buffered(h) => h.clone(),
         }
     }
 
@@ -310,7 +292,7 @@ impl AppDataSource {
         length: Option<usize>,
     ) -> AppSourceBufferHandle {
         match self {
-            Self::Buffered(h) | Self::Dist(h) => {
+            Self::Buffered(h) => {
                 let effective_length =
                     length.or_else(|| h.length.map(|len| len.saturating_sub(offset)));
                 let absolute_offset = h.offset.saturating_add(offset);
