@@ -237,7 +237,13 @@ impl TCPPacketSource {
 
         // compute available sending window (cwnd - unacked data)
         let cwnd = self.congestion_control.get_cwnd();
-        let win_left = self.last_ack + cwnd - self.next_seq;
+        let window_end = self.last_ack.saturating_add(cwnd);
+
+        if self.next_seq >= window_end {
+            return;
+        }
+
+        let win_left = window_end - self.next_seq;
 
         // window too small to send a full segment, wait for ACKs
         if win_left < self.mss {
@@ -257,7 +263,12 @@ impl TCPPacketSource {
                 let chunk_size = self.mss.min(data.len() - offset);
 
                 // ensure we do not exceed the current window
-                if self.next_seq + chunk_size > self.last_ack + cwnd {
+                if self
+                    .next_seq
+                    .checked_add(chunk_size)
+                    .map(|next| next > window_end)
+                    .unwrap_or(true)
+                {
                     break;
                 }
 
@@ -280,9 +291,6 @@ impl TCPPacketSource {
         // if all bytes have been sent and acknowledged, complete the flow
         if self.remaining_bytes == 0 {
             self.traffic_exceeded = true;
-        }
-        if self.remaining_bytes == 0 && self.send_buffer == 0 {
-            self.wrap_up(now).await;
         }
     }
 
