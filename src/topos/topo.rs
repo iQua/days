@@ -840,7 +840,7 @@ impl Topology {
 
                 // create unique AppDataSource and actor (no MSS needed - TCP handles packetization)
                 let (data_src, actor) =
-                    AppDataSource::buffered_actor(total_size, self.app_source_cfg);
+                    AppDataSource::create_source_buffer(total_size, self.app_source_cfg);
                 // assign handle to each flow：all flows obtain data from the same data_src
                 for flow_id in
                     collective.first_flow_id..collective.first_flow_id + collective.flow_count
@@ -885,7 +885,10 @@ impl Topology {
                             // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
                             let (data_src, _actor) =
                                 conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                    AppDataSource::buffered_actor(total_size, self.app_source_cfg)
+                                    AppDataSource::create_source_buffer(
+                                        total_size,
+                                        self.app_source_cfg,
+                                    )
                                 });
 
                             let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
