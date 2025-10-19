@@ -588,6 +588,30 @@ impl Topology {
         self
     }
 
+    /// Ensures `starts_after` mirrors the reverse of every `starts_before` edge.
+    fn backfill_flow_dependencies(&mut self) {
+        let mut flow_index: HashMap<usize, usize> = HashMap::new();
+        for (idx, flow) in self.flows.iter().enumerate() {
+            flow_index.insert(flow.id, idx);
+        }
+
+        let mut dependency_edges: Vec<(usize, usize)> = Vec::new();
+        for flow in self.flows.iter() {
+            for successor_id in flow.starts_before.iter() {
+                dependency_edges.push((*successor_id, flow.id));
+            }
+        }
+
+        for (successor_id, predecessor_id) in dependency_edges.into_iter() {
+            if let Some(&successor_idx) = flow_index.get(&successor_id) {
+                let starts_after = &mut self.flows[successor_idx].starts_after;
+                if !starts_after.contains(&predecessor_id) {
+                    starts_after.push(predecessor_id);
+                }
+            }
+        }
+    }
+
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
     fn attach_flows(
@@ -600,6 +624,8 @@ impl Topology {
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
+
+        self.backfill_flow_dependencies();
 
         let mut sources = HashMap::new();
         let mut source_mboxes = HashMap::new();
@@ -869,7 +895,7 @@ impl Topology {
                             // which chunk travels in this hop
                             let chunk_owner = match phase {
                                 Phase::Scatter => (rank + n - step + 1) % n,
-                                Phase::Gather => (rank + n - step + 1) % n,
+                                Phase::Gather => (rank + n - step) % n,
                             };
                             let chunk_offset = chunk_owner * chunk_size;
                             let chunk_len = if chunk_owner == n - 1 {
