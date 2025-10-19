@@ -260,11 +260,9 @@ impl AppSourceBuffer {
     }
 }
 
-// Application-level sources that can be used to feed data to a TCPPacketSource.
 #[derive(Clone)]
-pub enum AppDataSource {
-    // Application-level DataSource for pre-buffered packets.
-    Buffered(AppSourceBufferHandle),
+pub struct AppDataSource {
+    handle: AppSourceBufferHandle,
 }
 
 impl AppDataSource {
@@ -273,17 +271,13 @@ impl AppDataSource {
         // Create a buffer filled with zeros (or could be filled with meaningful data)
         let buffer = vec![0u8; total_size];
         let (actor, tx) = AppSourceBuffer::buffered(buffer, &config);
-        (
-            Self::Buffered(AppSourceBufferHandle::new(tx, Some(total_size))),
-            actor,
-        )
+        let handle = AppSourceBufferHandle::new(tx, Some(total_size));
+        (Self { handle }, actor)
     }
 
     // Retrieves the underlying handle to be used in TCPPacketSource.
     pub fn handle(&self) -> AppSourceBufferHandle {
-        match self {
-            Self::Buffered(h) => h.clone(),
-        }
+        self.handle.clone()
     }
 
     pub fn handle_with_offset(
@@ -291,15 +285,10 @@ impl AppDataSource {
         offset: usize,
         length: Option<usize>,
     ) -> AppSourceBufferHandle {
-        match self {
-            Self::Buffered(h) => {
-                let effective_length =
-                    length.or_else(|| h.length.map(|len| len.saturating_sub(offset)));
-                let absolute_offset = h.offset.saturating_add(offset);
+        let effective_length = length.or_else(|| self.handle.length.map(|len| len.saturating_sub(offset)));
+        let absolute_offset = self.handle.offset.saturating_add(offset);
 
-                AppSourceBufferHandle::with_offset(h.tx.clone(), absolute_offset, effective_length)
-            }
-        }
+        AppSourceBufferHandle::with_offset(self.handle.tx.clone(), absolute_offset, effective_length)
     }
 }
 
