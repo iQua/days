@@ -40,7 +40,7 @@ impl QueueState {
                 self.queued_bytes.load(Ordering::Relaxed) + packet_size <= self.capacity
             }
             CapacityUnit::Packets => {
-                self.queued_packets.load(Ordering::Relaxed) + 1 <= self.capacity
+                self.queued_packets.load(Ordering::Relaxed) < self.capacity
             }
         }
     }
