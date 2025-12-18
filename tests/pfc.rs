@@ -95,7 +95,9 @@ fn test_pfc_pause_frames_emitted() {
     let mut source = source;
     let sink = sink;
 
-    source.output.connect(PfcIngressPort::frame_received, &ingress_mbox);
+    source
+        .output
+        .connect(PfcIngressPort::frame_received, &ingress_mbox);
     ingress
         .pfc_output
         .connect(PfcSink::frame_received, &sink_mbox);

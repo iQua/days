@@ -279,7 +279,10 @@ impl PfcIngressPort {
             LinkFrame::Data(packet) => self.handle_packet(packet, now, cx).await,
             #[cfg(feature = "l2_pfc")]
             LinkFrame::Pfc(_) => {
-                debug!("PfcIngressPort {} ignoring inbound PFC frame.", self.port_id);
+                debug!(
+                    "PfcIngressPort {} ignoring inbound PFC frame.",
+                    self.port_id
+                );
             }
         }
     }
@@ -395,7 +398,10 @@ impl PfcEgressGate {
             }
             #[cfg(feature = "l2_pfc")]
             LinkFrame::Pfc(_) => {
-                debug!("PfcEgressGate {} ignoring inbound PFC frame on data path.", self.gate_id);
+                debug!(
+                    "PfcEgressGate {} ignoring inbound PFC frame on data path.",
+                    self.gate_id
+                );
             }
         }
     }
@@ -566,7 +572,9 @@ mod tests {
         assert!(gate.test_pop_ready(0.0).is_none());
 
         let resume_at = pfc.pause_duration(3, rate_bps);
-        let frame = gate.test_pop_ready(resume_at).expect("frame should be ready");
+        let frame = gate
+            .test_pop_ready(resume_at)
+            .expect("frame should be ready");
         assert!((frame.time() - resume_at).abs() <= 1e-9);
     }
 

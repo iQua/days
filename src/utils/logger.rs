@@ -11,9 +11,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
-use crate::schedulers::SchedulerReport;
 #[cfg(feature = "l2_pfc")]
 use crate::l2::pfc::PfcPortReport;
+use crate::schedulers::SchedulerReport;
 
 #[derive(Deserialize)]
 struct LogConfig {

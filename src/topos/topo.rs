@@ -29,11 +29,13 @@ use crate::l2::link::Link;
 #[cfg(feature = "l2_pfc")]
 use crate::l2::pfc::{PfcEgressGate, PfcIngressPort};
 #[cfg(feature = "l2_pfc")]
-use crate::schedulers::state::QueueState;
+use crate::next_link_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::sp::SPServer;
+#[cfg(feature = "l2_pfc")]
+use crate::schedulers::state::QueueState;
 use crate::schedulers::vc::VirtualClockServer;
 use crate::schedulers::wfq::WFQServer;
 use crate::schedulers::wrr::WRRServer;
@@ -43,8 +45,6 @@ use crate::utils::logger::CsvLogger;
 use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
-#[cfg(feature = "l2_pfc")]
-use crate::next_link_id;
 use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
@@ -407,7 +407,8 @@ impl Topology {
 
         scheduler_output.connect(PfcEgressGate::packet_received, &gate_mbox);
         gate.output.connect(Link::frame_received, &link_mbox);
-        link.output.connect(PfcIngressPort::frame_received, &ingress_mbox);
+        link.output
+            .connect(PfcIngressPort::frame_received, &ingress_mbox);
 
         let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
         ingress
