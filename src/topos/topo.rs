@@ -1400,6 +1400,11 @@ mod ring_allreduce_serialization_tests {
             flows: Vec::new(),
             collectives: vec![collective],
             switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
             duration: 1.0,

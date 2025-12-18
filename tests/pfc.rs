@@ -40,7 +40,7 @@ impl FrameSource {
 
 impl Model for FrameSource {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(Duration::from_secs_f64(0.0), Self::send_burst, ())
+        cx.schedule_event(Duration::from_secs_f64(1e-9), Self::send_burst, ())
             .unwrap();
         self.into()
     }
@@ -93,7 +93,7 @@ fn test_pfc_pause_frames_emitted() {
     let sink_mbox = Mailbox::new();
     let mut ingress = ingress;
     let mut source = source;
-    let mut sink = sink;
+    let sink = sink;
 
     source.output.connect(PfcIngressPort::frame_received, &ingress_mbox);
     ingress

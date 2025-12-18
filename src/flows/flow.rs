@@ -479,6 +479,7 @@ mod tests {
                 UnGraph::<usize, ()>::new_undirected(),
             )),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 0,
         };
 
@@ -510,6 +511,7 @@ mod tests {
                 3,
             )),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 0,
         };
 
@@ -539,6 +541,7 @@ mod tests {
             sink_id: 4,
             routing: Routing::PathFromConfig(PathFromConfig::new(vec![1, 2, 3])),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 0,
         };
 
