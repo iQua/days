@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::get_seed;
 
 /// Capacity unit for the packet drop strategy.
+#[derive(Clone, Copy, Debug)]
 pub enum CapacityUnit {
     Bytes,
     Packets,

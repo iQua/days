@@ -136,6 +136,7 @@ impl TCPPacketSink {
             flow_id: packet.flow_id,
             queueing_delay: packet.queueing_delay,
             last_packet: false,
+            priority: packet.priority,
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
                 acknowledged_size: packet.size,

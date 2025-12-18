@@ -12,6 +12,8 @@ use std::sync::{Arc, OnceLock};
 use crate::flows::sink::PacketSinkReport;
 use crate::flows::source::PacketSourceReport;
 use crate::schedulers::SchedulerReport;
+#[cfg(feature = "l2_pfc")]
+use crate::l2::pfc::PfcPortReport;
 
 #[derive(Deserialize)]
 struct LogConfig {
@@ -24,6 +26,8 @@ pub enum Report {
     PacketSourceReport(PacketSourceReport),
     SchedulerReport(SchedulerReport),
     PacketSinkReport(PacketSinkReport),
+    #[cfg(feature = "l2_pfc")]
+    PfcPortReport(PfcPortReport),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -38,6 +42,8 @@ struct SharedState {
     source_reports: Vec<PacketSourceReport>,
     scheduler_reports: Vec<SchedulerReport>,
     sink_reports: Vec<PacketSinkReport>,
+    #[cfg(feature = "l2_pfc")]
+    pfc_reports: Vec<PfcPortReport>,
     total_delay: f64,
 }
 
@@ -46,6 +52,8 @@ enum ElementType {
     Source,
     Scheduler,
     Sink,
+    #[cfg(feature = "l2_pfc")]
+    Pfc,
 }
 
 #[derive(Clone, Debug)]
@@ -135,7 +143,11 @@ impl CsvLogger {
             .map_err(|e| format!("Error creating log directory {}: {}", log_path, e))?;
 
         // Create output files
-        for element in ["sources", "switches", "sinks"] {
+        #[cfg(feature = "l2_pfc")]
+        let elements = vec!["sources", "switches", "sinks", "pfc"];
+        #[cfg(not(feature = "l2_pfc"))]
+        let elements = vec!["sources", "switches", "sinks"];
+        for element in elements {
             let file_name = format!("{}{}.csv", log_path, element);
             if let Err(e) = fs::File::create(&file_name) {
                 return Err(format!("Error creating log file {}: {}", &file_name, e));
@@ -176,6 +188,10 @@ impl CsvLogger {
             Report::PacketSinkReport(report) => {
                 state.sink_reports.push(report);
             }
+            #[cfg(feature = "l2_pfc")]
+            Report::PfcPortReport(report) => {
+                state.pfc_reports.push(report);
+            }
         }
 
         // Release the lock before potentially writing to disk
@@ -195,6 +211,8 @@ impl CsvLogger {
             ElementType::Source => format!("{}sources.csv", self.log_path.get().unwrap()),
             ElementType::Scheduler => format!("{}switches.csv", self.log_path.get().unwrap()),
             ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap()),
+            #[cfg(feature = "l2_pfc")]
+            ElementType::Pfc => format!("{}pfc.csv", self.log_path.get().unwrap()),
         };
 
         let csv_file = fs::OpenOptions::new()
@@ -286,6 +304,14 @@ impl CsvLogger {
             self.total_packets.fetch_add(new_packets, Ordering::SeqCst);
             state.total_delay += new_delay;
         }
+
+        #[cfg(feature = "l2_pfc")]
+        if state.pfc_reports.len() >= self.max_log_len {
+            let reports = std::mem::take(&mut state.pfc_reports);
+            if let Err(e) = self.write_to_csv(ElementType::Pfc, &reports) {
+                eprintln!("Error writing PFC reports to CSV: {}", e);
+            }
+        }
     }
 
     /// Flushes all remaining reports to CSV files.
@@ -316,6 +342,13 @@ impl CsvLogger {
             self.total_packets
                 .fetch_add(final_packets, Ordering::SeqCst);
             state.total_delay += final_delay;
+        }
+
+        #[cfg(feature = "l2_pfc")]
+        if !state.pfc_reports.is_empty() {
+            let reports = std::mem::take(&mut state.pfc_reports);
+            self.write_to_csv(ElementType::Pfc, &reports)
+                .expect("Error writing PFC reports to CSV");
         }
 
         let total_packets = self.total_packets.load(Ordering::SeqCst);

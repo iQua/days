@@ -47,6 +47,7 @@ fn test_drop_strategy_red_early_drop() {
             None,
         ),
         0,
+        0,
         None,
     );
 

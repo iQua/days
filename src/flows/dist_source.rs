@@ -28,6 +28,7 @@ pub struct DistPacketSource {
 
     pub endpoint_id: usize,
     pub flow_id: usize,
+    pub priority: u8,
     pub flow_start_after: HashSet<usize>,
     pub flow_start_time: f64,
     pub traffic: TrafficCharacteristics,
@@ -47,12 +48,14 @@ impl DistPacketSource {
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
+        priority: u8,
         rng: SmallRng,
     ) -> DistPacketSource {
         DistPacketSource {
             time: 0.0,
             endpoint_id: next_endpoint_id(),
             flow_id,
+            priority,
             flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
             flow_start_time: 0.0,
             traffic,
@@ -128,6 +131,7 @@ impl DistPacketSource {
         let rounded_packet_size = packet_size.round().max(1.0) as usize;
 
         let mut packet = Packet::new(rounded_packet_size, self.packets_sent, self.flow_id, now);
+        packet.set_priority(self.priority);
         if self.traffic.size.exceeded(
             self.sent_size + rounded_packet_size,
             self.flow_start_time,

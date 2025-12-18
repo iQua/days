@@ -42,6 +42,8 @@ pub struct Packet {
     pub flow_id: usize,
     /// the queueing delay experienced by the packet so far
     pub queueing_delay: f64,
+    /// 802.1Q priority code point (0-7). Default is 0 (best-effort).
+    pub priority: u8,
     /// whether this is the last packet of the flow
     pub last_packet: bool,
     /// used by TCPPacketSource and TCPPacketSink
@@ -59,8 +61,19 @@ impl Packet {
             creation_time,
             queueing_delay: 0.0,
             last_packet: false,
+            priority: 0,
             ack: None,
         }
+    }
+
+    /// Sets the packet priority (0-7).
+    pub fn set_priority(&mut self, priority: u8) {
+        assert!(
+            priority <= 7,
+            "priority must be within 0..=7, got {}",
+            priority
+        );
+        self.priority = priority;
     }
 
     /// Updates the queueing delay of the packet when it departs from a scheduler.
@@ -78,8 +91,13 @@ impl std::fmt::Display for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}",
-            self.packet_id, self.flow_id, self.creation_time, self.size, self.queueing_delay
+            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}, priority: {}",
+            self.packet_id,
+            self.flow_id,
+            self.creation_time,
+            self.size,
+            self.queueing_delay,
+            self.priority
         )
     }
 }

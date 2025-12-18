@@ -31,6 +31,7 @@ struct TomlFlow {
     starts_before: Option<Vec<usize>>,
     starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
+    priority: Option<u8>,
     graph: Vec<(u32, u32)>,
     routing: Option<RoutingConfig>,
     path: Option<Vec<usize>>,
@@ -44,6 +45,7 @@ struct TomlFlowSet {
     starts_after: Option<Vec<usize>>,
     flow_type: FlowType,
     flow_count: u32,
+    priority: Option<u8>,
     routing: Option<RoutingConfig>,
     traffic: TomlTrafficCharacteristics,
 }
@@ -75,6 +77,8 @@ pub struct FlowParams {
     pub routing: Option<RoutingConfig>,
     /// Traffic characteristics of the flow.
     pub traffic: TrafficCharacteristics,
+    /// 802.1Q priority code point (0-7).
+    pub priority: u8,
     /// Random seed for the packet source.
     pub seed: usize,
 }
@@ -102,8 +106,20 @@ pub struct Flow {
     pub routing: Routing,
     /// Traffic characteristics of the flow.
     pub traffic: TrafficCharacteristics,
+    /// 802.1Q priority code point (0-7).
+    pub priority: u8,
     /// Random seed for the packet source.
     pub seed: usize,
+}
+
+fn checked_priority(priority: Option<u8>) -> u8 {
+    let priority = priority.unwrap_or(0);
+    assert!(
+        priority <= 7,
+        "Flow priority must be within 0..=7, got {}",
+        priority
+    );
+    priority
 }
 
 impl Flow {
@@ -154,6 +170,7 @@ impl Flow {
             source_id: 0,
             sink_id: 0,
             traffic: params.traffic,
+            priority: params.priority,
             seed: params.seed,
             routing,
         }
@@ -191,6 +208,7 @@ impl Flow {
                     sink_host: edge.target().index(),
                     routing: Some(RoutingConfig::PathFromConfig),
                     traffic: TrafficCharacteristics::default(),
+                    priority: 0,
                     seed: 0,
                 };
                 flows.push(Flow::new(params));
@@ -261,6 +279,7 @@ impl Flow {
                     let starts_before = flow.starts_before.clone().unwrap_or_default();
                     let starts_after = flow.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
+                    let priority = checked_priority(flow.priority);
 
                     flows.push(Flow::new(FlowParams {
                         id: flow_id,
@@ -272,6 +291,7 @@ impl Flow {
                         sink_host: edge.target().index(),
                         routing: flow.routing.clone(),
                         traffic,
+                        priority,
                         seed: flow_id,
                     }));
                 }
@@ -292,6 +312,7 @@ impl Flow {
                     );
                     first_flow_id = new_first_flow_id;
                 }
+                let priority = checked_priority(flow_set.priority);
 
                 for id_counter in 0..flow_set.flow_count {
                     let host_pair: Vec<usize> =
@@ -312,6 +333,7 @@ impl Flow {
                         sink_host: host_pair[1],
                         routing: flow_set.routing.clone(),
                         traffic,
+                        priority,
                         seed: flow_id,
                     }));
                 }
@@ -401,6 +423,7 @@ mod tests {
             sink_host: 1,
             routing: Some(RoutingConfig::ShortestPath),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 42,
         };
 
@@ -456,6 +479,7 @@ mod tests {
                 UnGraph::<usize, ()>::new_undirected(),
             )),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 0,
         };
 
@@ -487,6 +511,7 @@ mod tests {
                 3,
             )),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 0,
         };
 
@@ -516,6 +541,7 @@ mod tests {
             sink_id: 4,
             routing: Routing::PathFromConfig(PathFromConfig::new(vec![1, 2, 3])),
             traffic: TrafficCharacteristics::default(),
+            priority: 0,
             seed: 0,
         };
 

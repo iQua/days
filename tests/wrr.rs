@@ -53,6 +53,7 @@ fn test_weighted_round_robin() {
             },
             None,
         ),
+        0,
         0, // route_id, if relevant
         None,
     );
@@ -75,6 +76,7 @@ fn test_weighted_round_robin() {
             },
             None,
         ),
+        0,
         0,
         None,
     );

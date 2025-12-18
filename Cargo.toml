@@ -12,6 +12,8 @@ edition = "2021"
 
 [features]
 test = []
+l2 = []
+l2_pfc = ["l2"]
 
 [dependencies]
 csv = "1.3"

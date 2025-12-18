@@ -1,0 +1,49 @@
+seed = 42
+edges = [[0, 1]]
+hosts = [0, 1]
+duration = 5.0
+report_interval = 1.0
+ui_interval = 0.5
+num_threads = 1
+log_path = "./logs/pfc"
+
+[switch]
+port_rate = 1_000_000 # 1 Mbps
+capacity = 50
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+# Per-priority thresholds (bytes)
+xoff = [8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192]
+xon  = [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
+pause_quanta= [65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535]
+buffer_capacity = [16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384]
+refresh_interval = 0.0002
+drain_interval = 0.000001
+
+[[flow]]
+flow_id = 0
+flow_type = "PacketDistribution"
+priority = 3 # lossless priority (PCP 3)
+graph = [[0, 1]]
+[flow.traffic]
+initial_delay = 0.1
+duration = 2.0
+arr_dist = {type = "Uniform", low = 0.001, high = 0.001}
+pkt_size_dist = {type = "Uniform", low = 9000, high = 9000}
+
+[[flow]]
+flow_id = 1
+flow_type = "PacketDistribution"
+priority = 0
+graph = [[0, 1]]
+[flow.traffic]
+initial_delay = 0.1
+duration = 2.0
+arr_dist = {type = "Uniform", low = 0.001, high = 0.001}
+pkt_size_dist = {type = "Uniform", low = 1500, high = 1500}
+
