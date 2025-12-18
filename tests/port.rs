@@ -44,6 +44,7 @@ fn test_fifo_scheduling() {
             None,
         ),
         0,
+        0,
         None,
     );
 
@@ -65,6 +66,7 @@ fn test_fifo_scheduling() {
             },
             None,
         ),
+        0,
         0,
         None,
     );

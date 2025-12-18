@@ -46,6 +46,7 @@ fn test_drop_strategy_taildrop_small_buffer() {
             None,
         ),
         0,
+        0,
         None,
     );
 

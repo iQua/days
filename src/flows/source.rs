@@ -62,6 +62,7 @@ impl PacketSource {
         flow_start_after: Vec<usize>,
         flow_type: FlowType,
         traffic: TrafficCharacteristics,
+        priority: u8,
         seed: usize,
         app_source: Option<AppSourceBufferHandle>,
     ) -> Self {
@@ -73,12 +74,13 @@ impl PacketSource {
 
         match flow_type {
             FlowType::PacketDistribution => PacketSource::DistPacketSource(Box::new(
-                DistPacketSource::new(flow_id, flow_start_after, traffic, rng),
+                DistPacketSource::new(flow_id, flow_start_after, traffic, priority, rng),
             )),
             FlowType::TCP => PacketSource::TCPPacketSource(Box::new(TCPPacketSource::new(
                 flow_id,
                 flow_start_after,
                 traffic,
+                priority,
                 app_source,
                 rng,
             ))),

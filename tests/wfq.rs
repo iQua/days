@@ -45,6 +45,7 @@ fn test_weighted_fair_queueing() {
             None,
         ),
         0,
+        0,
         None,
     );
 
@@ -66,6 +67,7 @@ fn test_weighted_fair_queueing() {
             },
             None,
         ),
+        0,
         0,
         None,
     );

@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+#[cfg(feature = "l2_pfc")]
+use std::sync::RwLock;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -19,8 +21,15 @@ use crate::flows::FlowSize;
 use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
+use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
+#[cfg(feature = "l2_pfc")]
+use crate::l2::link::Link;
+#[cfg(feature = "l2_pfc")]
+use crate::l2::pfc::{PfcEgressGate, PfcIngressPort};
+#[cfg(feature = "l2_pfc")]
+use crate::schedulers::state::QueueState;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
@@ -34,6 +43,8 @@ use crate::utils::logger::CsvLogger;
 use crate::utils::tracing::ConcurrencyTracer;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, set_num_switches};
+#[cfg(feature = "l2_pfc")]
+use crate::next_link_id;
 use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
@@ -67,6 +78,31 @@ pub struct SwitchConfig {
     weights: Option<Vec<usize>>,
     priorities: Option<Vec<usize>>,
     vticks: Option<Vec<f64>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum LinkMode {
+    None,
+    Pfc,
+}
+
+#[cfg_attr(not(feature = "l2_pfc"), allow(dead_code))]
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct PfcLinkConfig {
+    xoff: Option<Vec<usize>>,
+    xon: Option<Vec<usize>>,
+    pause_quanta: Option<Vec<u16>>,
+    buffer_capacity: Option<Vec<usize>>,
+    refresh_interval: Option<f64>,
+    drain_interval: Option<f64>,
+}
+
+#[cfg_attr(not(feature = "l2_pfc"), allow(dead_code))]
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct LinkConfig {
+    mode: Option<LinkMode>,
+    pfc: Option<PfcLinkConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +140,7 @@ pub struct Config {
     pub switch: SwitchConfig,
     pub topology: Option<TopoConfig>,
     pub app_source: Option<AppSourceConfig>,
+    pub link: Option<LinkConfig>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +201,12 @@ pub struct Topology {
     collectives: Vec<Collective>,
     /// configuration of packet switches in the topology
     switch_config: SwitchConfig,
+    /// configuration of link-layer behavior
+    link_config: LinkConfig,
+    #[cfg(feature = "l2_pfc")]
+    fib_views: HashMap<usize, Arc<RwLock<HashMap<usize, usize>>>>,
+    #[cfg(feature = "l2_pfc")]
+    output_states: Arc<RwLock<HashMap<usize, HashMap<usize, Arc<QueueState>>>>>,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
     /// the path to the configuration file
@@ -216,6 +259,14 @@ impl Topology {
 
         set_num_switches(graph.node_count());
         let switches = Topology::init_switches();
+        #[cfg(feature = "l2_pfc")]
+        let fib_views: HashMap<usize, Arc<RwLock<HashMap<usize, usize>>>> = switches
+            .keys()
+            .map(|id| (*id, Arc::new(RwLock::new(HashMap::new()))))
+            .collect();
+        #[cfg(feature = "l2_pfc")]
+        let output_states: Arc<RwLock<HashMap<usize, HashMap<usize, Arc<QueueState>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let app_source_cfg = if let Some(app_src) = &config.app_source {
             AppBufferConfig {
@@ -227,6 +278,13 @@ impl Topology {
         } else {
             AppBufferConfig::default()
         };
+        let link_config = config.link.clone().unwrap_or_default();
+        #[cfg(not(feature = "l2_pfc"))]
+        {
+            if matches!(link_config.mode.unwrap_or(LinkMode::None), LinkMode::Pfc) {
+                panic!("link.mode = \"Pfc\" requires building with --features l2_pfc");
+            }
+        }
 
         Topology {
             sim_init,
@@ -237,6 +295,11 @@ impl Topology {
             collectives,
             switch_mailboxes: HashMap::new(),
             switch_config: config.switch,
+            link_config,
+            #[cfg(feature = "l2_pfc")]
+            fib_views,
+            #[cfg(feature = "l2_pfc")]
+            output_states,
             mailbox_capacity,
             config_path: config_path.to_string(),
             duration,
@@ -267,6 +330,150 @@ impl Topology {
         }
 
         switches
+    }
+
+    fn link_mode(&self) -> LinkMode {
+        self.link_config.mode.unwrap_or(LinkMode::None)
+    }
+
+    fn attach_link(
+        &mut self,
+        _upstream_id: usize,
+        downstream_id: usize,
+        scheduler_output: &mut Output<Packet>,
+    ) {
+        match self.link_mode() {
+            LinkMode::None => {
+                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+                scheduler_output.connect(PacketSwitch::packet_received, downstream_mbox);
+            }
+            LinkMode::Pfc => {
+                #[cfg(feature = "l2_pfc")]
+                {
+                    self.attach_pfc_link(_upstream_id, downstream_id, scheduler_output);
+                }
+                #[cfg(not(feature = "l2_pfc"))]
+                {
+                    panic!("link.mode = \"Pfc\" requires building with --features l2_pfc");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "l2_pfc")]
+    fn attach_pfc_link(
+        &mut self,
+        _upstream_id: usize,
+        downstream_id: usize,
+        scheduler_output: &mut Output<Packet>,
+    ) {
+        let gate_id = next_link_id();
+        let link_id = next_link_id();
+        let ingress_id = next_link_id();
+        let pfc_config = self.build_pfc_config();
+        let fib_view = self
+            .fib_views
+            .get(&downstream_id)
+            .expect("Missing FIB view for switch")
+            .clone();
+        let output_states = self.output_states.clone();
+        let can_forward = Arc::new(move |packet: &Packet| {
+            let next_id = {
+                let fib_guard = fib_view.read().expect("FIB view lock poisoned");
+                fib_guard.get(&packet.flow_id).copied()
+            };
+            let Some(next_id) = next_id else {
+                return true;
+            };
+            let state = {
+                let states_guard = output_states.read().expect("Output state lock poisoned");
+                states_guard
+                    .get(&downstream_id)
+                    .and_then(|outputs| outputs.get(&next_id).cloned())
+            };
+            match state {
+                Some(state) => state.can_accept(packet.size),
+                None => true,
+            }
+        });
+
+        let mut gate = PfcEgressGate::new(gate_id, self.switch_config.port_rate);
+        let mut link = Link::new(link_id, self.switch_config.port_rate);
+        let mut ingress = PfcIngressPort::new(ingress_id, pfc_config, can_forward);
+
+        let gate_mbox: Mailbox<PfcEgressGate> = Mailbox::with_capacity(self.mailbox_capacity);
+        let link_mbox: Mailbox<Link> = Mailbox::with_capacity(self.mailbox_capacity);
+        let ingress_mbox: Mailbox<PfcIngressPort> = Mailbox::with_capacity(self.mailbox_capacity);
+
+        scheduler_output.connect(PfcEgressGate::packet_received, &gate_mbox);
+        gate.output.connect(Link::frame_received, &link_mbox);
+        link.output.connect(PfcIngressPort::frame_received, &ingress_mbox);
+
+        let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
+        ingress
+            .output
+            .connect(PacketSwitch::packet_received, downstream_mbox);
+        ingress
+            .pfc_output
+            .connect(PfcEgressGate::pfc_received, &gate_mbox);
+
+        let sim_init = std::mem::replace(&mut self.sim_init, SimInit::new());
+        self.sim_init = sim_init
+            .add_model(gate, gate_mbox, "PfcEgressGate")
+            .add_model(link, link_mbox, "Link")
+            .add_model(ingress, ingress_mbox, "PfcIngressPort");
+    }
+
+    #[cfg(feature = "l2_pfc")]
+    fn build_pfc_config(&self) -> crate::l2::pfc::PfcConfig {
+        use crate::l2::pfc::PfcConfig;
+
+        fn vec_to_array<T: Copy, const N: usize>(vec: Option<Vec<T>>, default: [T; N]) -> [T; N] {
+            if let Some(values) = vec {
+                assert!(
+                    values.len() == N,
+                    "Expected {} entries but got {}.",
+                    N,
+                    values.len()
+                );
+                let mut output = default;
+                for (idx, value) in values.into_iter().enumerate() {
+                    output[idx] = value;
+                }
+                output
+            } else {
+                default
+            }
+        }
+
+        let default_xoff = [64 * 1024; 8];
+        let default_xon = [48 * 1024; 8];
+        let default_pause_quanta = [65535; 8];
+        let default_capacity = [0; 8];
+
+        let pfc = self.link_config.pfc.clone().unwrap_or_default();
+        PfcConfig {
+            xoff: vec_to_array(pfc.xoff, default_xoff),
+            xon: vec_to_array(pfc.xon, default_xon),
+            pause_quanta: vec_to_array(pfc.pause_quanta, default_pause_quanta),
+            buffer_capacity: vec_to_array(pfc.buffer_capacity, default_capacity),
+            refresh_interval: pfc.refresh_interval,
+            drain_interval: pfc.drain_interval,
+        }
+    }
+
+    #[cfg(feature = "l2_pfc")]
+    fn register_queue_state(
+        &mut self,
+        upstream_id: usize,
+        downstream_id: usize,
+        state: Arc<QueueState>,
+    ) {
+        let mut guard = self.output_states.write().unwrap();
+        guard
+            .entry(upstream_id)
+            .or_insert_with(HashMap::new)
+            .insert(downstream_id, state);
     }
 
     /// Connects a hash map of packet switches according to edges in a network
@@ -322,6 +529,7 @@ impl Topology {
                                 sink_host: dst,
                                 routing: collective.routing.clone(),
                                 traffic: collective.traffic.clone(),
+                                priority: 0,
                                 seed: collective.id,
                             });
 
@@ -358,6 +566,7 @@ impl Topology {
                                 sink_host: dst,
                                 routing: collective.routing.clone(),
                                 traffic: collective.traffic.clone(),
+                                priority: 0,
                                 seed: collective.id,
                             });
 
@@ -388,6 +597,7 @@ impl Topology {
                             sink_host: sink,
                             routing: collective.routing.clone(),
                             traffic: collective.traffic.clone(),
+                            priority: 0,
                             seed: match collective_type.clone() {
                                 CollectiveType::Broadcast => collective.id,
                                 CollectiveType::Gather => flow_id,
@@ -408,8 +618,6 @@ impl Topology {
 
     /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
-        let upstream_switch = self.switches.get_mut(&upstream_id).unwrap();
-
         let drop_strategy = self.switch_config.drop.clone();
 
         match self.switch_config.discipline {
@@ -429,16 +637,23 @@ impl Topology {
                     drop_strategy.clone(),
                     weights.clone(),
                 );
+                #[cfg(feature = "l2_pfc")]
+                {
+                    let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
+                    drr_server.set_queue_state(state.clone());
+                    self.register_queue_state(upstream_id, downstream_id, state);
+                }
 
                 let mut output = Output::default();
                 let drr_mbox: Mailbox<DRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(DRRServer::packet_received, &drr_mbox);
-                upstream_switch.outputs.insert(downstream_id, output);
+                self.switches
+                    .get_mut(&upstream_id)
+                    .unwrap()
+                    .outputs
+                    .insert(downstream_id, output);
 
-                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                drr_server
-                    .output
-                    .connect(PacketSwitch::packet_received, downstream_mbox);
+                self.attach_link(upstream_id, downstream_id, &mut drr_server.output);
 
                 self.sim_init = self.sim_init.add_model(drr_server, drr_mbox, "DRR");
             }
@@ -450,15 +665,23 @@ impl Topology {
                     CapacityUnit::Packets,
                     drop_strategy.clone(),
                 );
+                #[cfg(feature = "l2_pfc")]
+                {
+                    let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
+                    port.set_queue_state(state.clone());
+                    self.register_queue_state(upstream_id, downstream_id, state);
+                }
 
                 let mut output = Output::default();
                 let port_mbox: Mailbox<Port> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(Port::packet_received, &port_mbox);
-                upstream_switch.outputs.insert(downstream_id, output);
+                self.switches
+                    .get_mut(&upstream_id)
+                    .unwrap()
+                    .outputs
+                    .insert(downstream_id, output);
 
-                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                port.output
-                    .connect(PacketSwitch::packet_received, downstream_mbox);
+                self.attach_link(upstream_id, downstream_id, &mut port.output);
 
                 self.sim_init = self.sim_init.add_model(port, port_mbox, "Port");
             }
@@ -479,16 +702,23 @@ impl Topology {
                     drop_strategy.clone(),
                     priorities.clone(),
                 );
+                #[cfg(feature = "l2_pfc")]
+                {
+                    let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
+                    sp_server.set_queue_state(state.clone());
+                    self.register_queue_state(upstream_id, downstream_id, state);
+                }
 
                 let mut output = Output::default();
                 let sp_mbox: Mailbox<SPServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(SPServer::packet_received, &sp_mbox);
-                upstream_switch.outputs.insert(downstream_id, output);
+                self.switches
+                    .get_mut(&upstream_id)
+                    .unwrap()
+                    .outputs
+                    .insert(downstream_id, output);
 
-                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                sp_server
-                    .output
-                    .connect(PacketSwitch::packet_received, downstream_mbox);
+                self.attach_link(upstream_id, downstream_id, &mut sp_server.output);
 
                 self.sim_init = self.sim_init.add_model(sp_server, sp_mbox, "SP");
             }
@@ -507,17 +737,24 @@ impl Topology {
                     drop_strategy.clone(),
                     vticks.clone(),
                 );
+                #[cfg(feature = "l2_pfc")]
+                {
+                    let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
+                    virtual_clock_server.set_queue_state(state.clone());
+                    self.register_queue_state(upstream_id, downstream_id, state);
+                }
 
                 let mut output = Output::default();
                 let virtual_clock_mbox: Mailbox<VirtualClockServer> =
                     Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(VirtualClockServer::packet_received, &virtual_clock_mbox);
-                upstream_switch.outputs.insert(downstream_id, output);
+                self.switches
+                    .get_mut(&upstream_id)
+                    .unwrap()
+                    .outputs
+                    .insert(downstream_id, output);
 
-                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                virtual_clock_server
-                    .output
-                    .connect(PacketSwitch::packet_received, downstream_mbox);
+                self.attach_link(upstream_id, downstream_id, &mut virtual_clock_server.output);
 
                 self.sim_init = self.sim_init.add_model(
                     virtual_clock_server,
@@ -540,16 +777,23 @@ impl Topology {
                     drop_strategy.clone(),
                     weights.clone(),
                 );
+                #[cfg(feature = "l2_pfc")]
+                {
+                    let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
+                    wfq_server.set_queue_state(state.clone());
+                    self.register_queue_state(upstream_id, downstream_id, state);
+                }
 
                 let mut output = Output::default();
                 let wfq_mbox: Mailbox<WFQServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(WFQServer::packet_received, &wfq_mbox);
-                upstream_switch.outputs.insert(downstream_id, output);
+                self.switches
+                    .get_mut(&upstream_id)
+                    .unwrap()
+                    .outputs
+                    .insert(downstream_id, output);
 
-                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                wfq_server
-                    .output
-                    .connect(PacketSwitch::packet_received, downstream_mbox);
+                self.attach_link(upstream_id, downstream_id, &mut wfq_server.output);
 
                 self.sim_init = self.sim_init.add_model(wfq_server, wfq_mbox, "WFQ");
             }
@@ -570,16 +814,23 @@ impl Topology {
                     drop_strategy,
                     weights.clone(),
                 );
+                #[cfg(feature = "l2_pfc")]
+                {
+                    let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
+                    wrr_server.set_queue_state(state.clone());
+                    self.register_queue_state(upstream_id, downstream_id, state);
+                }
 
                 let mut output = Output::default();
                 let wrr_mbox: Mailbox<WRRServer> = Mailbox::with_capacity(self.mailbox_capacity);
                 output.connect(WRRServer::packet_received, &wrr_mbox);
-                upstream_switch.outputs.insert(downstream_id, output);
+                self.switches
+                    .get_mut(&upstream_id)
+                    .unwrap()
+                    .outputs
+                    .insert(downstream_id, output);
 
-                let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                wrr_server
-                    .output
-                    .connect(PacketSwitch::packet_received, downstream_mbox);
+                self.attach_link(upstream_id, downstream_id, &mut wrr_server.output);
 
                 self.sim_init = self.sim_init.add_model(wrr_server, wrr_mbox, "WRR");
             }
@@ -657,6 +908,7 @@ impl Topology {
                 flow.starts_after.clone(),
                 flow.flow_type.clone(),
                 flow.traffic.clone(),
+                flow.priority,
                 flow.seed,
                 handle,
             );
@@ -785,6 +1037,11 @@ impl Topology {
                 if node_id != path.first().unwrap().index() {
                     let switch = self.switches.get_mut(&node_id).unwrap();
                     switch.set_fib(flow.id, next_id);
+                    #[cfg(feature = "l2_pfc")]
+                    if let Some(fib_view) = self.fib_views.get(&node_id) {
+                        let mut guard = fib_view.write().expect("FIB view lock poisoned");
+                        guard.insert(flow.id, next_id);
+                    }
                 }
 
                 // reverse FIBs do not include PacketSink

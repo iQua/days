@@ -14,6 +14,7 @@ use nexosim::time::MonotonicTime;
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
+use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
@@ -41,6 +42,8 @@ pub struct Port {
     busy_until: f64,
 
     pub output: Output<Packet>,
+
+    queue_state: Option<std::sync::Arc<QueueState>>,
 
     /// the statistics of a preiodic report
     report_start_time: f64,
@@ -83,6 +86,7 @@ impl Port {
             queue: VecDeque::new(),
             busy_until: 0.0,
             output: Output::default(),
+            queue_state: None,
             report_start_time: 0.0,
             queue_length: 0,
             received_sizes: 0,
@@ -94,6 +98,10 @@ impl Port {
 
     pub fn id(&self) -> usize {
         self.scheduler_id
+    }
+
+    pub fn set_queue_state(&mut self, state: std::sync::Arc<QueueState>) {
+        self.queue_state = Some(state);
     }
 
     #[instrument(skip(self, cx))]
@@ -233,6 +241,9 @@ impl ReportStatistics for Port {
         self.packets_received += 1;
         self.received_sizes += packet.size;
         self.queue_length += packet.size;
+        if let Some(state) = &self.queue_state {
+            state.record_enqueue(packet.size);
+        }
     }
 
     fn update_stats_on_packet_forwarded(&mut self, packet: &Packet) {
@@ -243,6 +254,9 @@ impl ReportStatistics for Port {
         self.forwarded_sizes += packet.size;
         self.queue_length -= packet.size;
         self.throughput_mean = self.forwarded_sizes as f64 / (packet.time - self.report_start_time);
+        if let Some(state) = &self.queue_state {
+            state.record_dequeue(packet.size);
+        }
     }
 
     fn prepare_report(&self, now: f64) -> SchedulerReport {

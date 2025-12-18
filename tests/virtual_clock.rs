@@ -47,6 +47,7 @@ fn test_virtual_clock_scheduler() {
             None, // TCP characteristics
         ),
         0,
+        0,
         None,
     );
 
@@ -68,6 +69,7 @@ fn test_virtual_clock_scheduler() {
             },
             None,
         ),
+        0,
         0,
         None,
     );

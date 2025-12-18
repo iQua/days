@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::Deserialize;
 
 pub mod flows;
+#[cfg(feature = "l2")]
+pub mod l2;
 pub mod schedulers;
 pub mod switches;
 pub mod topos;
@@ -24,6 +26,7 @@ static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_ID: AtomicUsize = AtomicUsize::new(0);
 static FLOW_ID: AtomicUsize = AtomicUsize::new(0);
 static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
+static LINK_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn seed_from_config(file_path: &str) -> usize {
     // reads the configuration
@@ -72,6 +75,10 @@ pub fn update_next_flow_id(next_flow_id: usize) {
 
 pub fn next_collective_id() -> usize {
     COLLECTIVE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn next_link_id() -> usize {
+    LINK_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn current_concurrency() -> usize {

@@ -38,7 +38,7 @@ pub struct SyntheticDataSource {
 impl SyntheticDataSource {
     fn new(flow_id: usize, traffic: TrafficCharacteristics, rng: SmallRng) -> Self {
         Self {
-            dist: DistPacketSource::new(flow_id, Vec::new(), traffic, rng),
+            dist: DistPacketSource::new(flow_id, Vec::new(), traffic, 0, rng),
         }
     }
 
@@ -87,6 +87,7 @@ pub struct TCPPacketSource {
 
     pub endpoint_id: usize,
     pub flow_id: usize,
+    pub priority: u8,
     pub flow_start_after: HashSet<usize>,
     pub traffic: TrafficCharacteristics,
     pub traffic_exceeded: bool,
@@ -165,6 +166,7 @@ impl TCPPacketSource {
         flow_id: usize,
         flow_start_after: Vec<usize>,
         traffic: TrafficCharacteristics,
+        priority: u8,
         app_source: Option<AppSourceBufferHandle>,
         rng: SmallRng,
     ) -> TCPPacketSource {
@@ -192,6 +194,7 @@ impl TCPPacketSource {
             time: 0.0,
             endpoint_id: next_endpoint_id(),
             flow_id,
+            priority,
             flow_start_after: HashSet::from_iter(flow_start_after.iter().cloned()),
             traffic,
             traffic_exceeded: false,
@@ -273,12 +276,13 @@ impl TCPPacketSource {
                 }
 
                 // Create packet with correct TCP metadata
-                let packet = Packet::new(
+                let mut packet = Packet::new(
                     chunk_size,
                     self.next_seq, // Correct sequence number
                     self.flow_id,  // Correct flow ID
                     now,           // Correct timestamp
                 );
+                packet.set_priority(self.priority);
 
                 self.output.send(packet.clone()).await;
                 self.packet_sent(&packet, now);
@@ -356,7 +360,8 @@ impl TCPPacketSource {
                         self.endpoint_id, self.next_seq, self.mss, now,
                     );
 
-                    let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+                    let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+                    packet.set_priority(self.priority);
                     self.output.send(packet.clone()).await;
                     self.packet_sent(&packet, now);
                 }
@@ -554,7 +559,8 @@ impl TCPPacketSource {
                     self.last_ack + self.congestion_control.get_cwnd(),
                 )
         {
-            let packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+            let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+            packet.set_priority(self.priority);
 
             self.output.send(packet.clone()).await;
             self.packet_sent(&packet, now);

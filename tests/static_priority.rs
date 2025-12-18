@@ -45,6 +45,7 @@ fn test_static_priority_scheduler() {
             None,
         ),
         0,
+        0,
         None,
     );
 
@@ -66,6 +67,7 @@ fn test_static_priority_scheduler() {
             },
             None,
         ),
+        0,
         0,
         None,
     );
