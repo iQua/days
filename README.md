@@ -300,6 +300,53 @@ The scheduling discipline.
   vticks = [2, 1]
   ```
 
+### Link (optional L2)
+
+The link layer is optional. If `mode = "None"` (default), Days uses the original L3/L4-only pipeline with no extra L2 models or events. If `mode = "Pfc"`, Days inserts PFC-capable L2 components on each link.
+
+#### mode
+
+- **Valid value**: `None` or `Pfc`
+- **Required**: No
+- **Default**: `None`
+- **Example**:
+
+  ```toml
+  [link]
+  mode = "Pfc"
+  ```
+
+#### pfc
+
+PFC parameters are configured under `[link.pfc]` when `mode = "Pfc"`.
+
+- **Attributes**:
+
+  | Attribute           | Meaning                                                            | Valid Value              |
+  | :------------------ | ------------------------------------------------------------------ | ------------------------ |
+  | `xoff`              | Per-priority XOFF thresholds (bytes)                               | Vector of 8 integers     |
+  | `xon`               | Per-priority XON thresholds (bytes)                                | Vector of 8 integers     |
+  | `pause_quanta`      | Per-priority pause quanta                                          | Vector of 8 integers     |
+  | `buffer_capacity`   | Per-priority ingress capacity (bytes, 0 = unlimited)               | Vector of 8 integers     |
+  | `refresh_interval`  | Pause refresh interval (seconds)                                   | Floating point number    |
+  | `drain_interval`    | Drain retry interval when downstream is congested (seconds)        | Floating point number    |
+
+- **Required**: No (uses defaults if omitted)
+- **Example**:
+
+  ```toml
+  [link]
+  mode = "Pfc"
+
+  [link.pfc]
+  xoff = [65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536]
+  xon = [49152, 49152, 49152, 49152, 49152, 49152, 49152, 49152]
+  pause_quanta = [65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535]
+  buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]
+  refresh_interval = 0.0002
+  drain_interval = 0.000001
+  ```
+
 ### Flow
 
 In **Days**, flows can be specified one by one:
@@ -310,6 +357,7 @@ flow_id = 2
 starts_before = [3]
 starts_after = [1]
 flow_type = "PacketDistribution"
+priority = 3
 graph = [[0, 1]]
 [flow.traffic]
     initial_delay = 1.0
@@ -341,6 +389,7 @@ The following table lists required, optional, or not supported attributes of a f
 | `starts_before` | The ids of flows that cannot start until this flow / flow set ends                    | optional | optional |
 | `starts_after`  | The ids of flows that this flow / flow set must wait for them to end before it starts | optional | optional |
 |   `flow_type`   | The type of the flow or flows of the flow set                                         | required | required |
+|   `priority`    | 802.1Q priority (0-7) assigned to packets of this flow / flow set                      | optional | optional |
 |  `flow_count`   | The number of flows in the flow set                                                   |    no    | required |
 |     `graph`     | The pair of the source host and the sink host of the flow                             | required |    no    |
 |     `path`      | The path of the flow                                                                  | optional |    no    |
@@ -411,6 +460,19 @@ The type of the flow or flows of the flow set.
 
   ```toml
   flow_type = "PacketDistribution"
+  ```
+
+#### priority
+
+The 802.1Q priority code point (PCP) assigned to packets of this flow or flow set.
+
+- **Valid value**: Integer in [0, 7]
+- **Required**: No
+- **Default**: 0 (best-effort)
+- **Example**:
+
+  ```toml
+  priority = 3
   ```
 
 #### flow_count
