@@ -49,6 +49,11 @@ use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
+#[cfg(feature = "l2_pfc")]
+type OutputStateMap = HashMap<usize, HashMap<usize, Arc<QueueState>>>;
+#[cfg(feature = "l2_pfc")]
+type OutputStates = Arc<RwLock<OutputStateMap>>;
+
 use crate::flows::app_source::AppDataSource;
 
 #[derive(Deserialize)]
@@ -206,7 +211,7 @@ pub struct Topology {
     #[cfg(feature = "l2_pfc")]
     fib_views: HashMap<usize, Arc<RwLock<HashMap<usize, usize>>>>,
     #[cfg(feature = "l2_pfc")]
-    output_states: Arc<RwLock<HashMap<usize, HashMap<usize, Arc<QueueState>>>>>,
+    output_states: OutputStates,
     /// the capacity of every mailbox
     mailbox_capacity: usize,
     /// the path to the configuration file
@@ -265,8 +270,7 @@ impl Topology {
             .map(|id| (*id, Arc::new(RwLock::new(HashMap::new()))))
             .collect();
         #[cfg(feature = "l2_pfc")]
-        let output_states: Arc<RwLock<HashMap<usize, HashMap<usize, Arc<QueueState>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let output_states: OutputStates = Arc::new(RwLock::new(HashMap::new()));
 
         let app_source_cfg = if let Some(app_src) = &config.app_source {
             AppBufferConfig {
@@ -473,7 +477,7 @@ impl Topology {
         let mut guard = self.output_states.write().unwrap();
         guard
             .entry(upstream_id)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(downstream_id, state);
     }
 
