@@ -1,15 +1,15 @@
 [project]
-name = "daytone"
+name = "days"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-name = "daytone"
+name = "days"
 version = "0.3.4"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]
-description = "Daytone: A Performant Discrete-Event Simulator for Network Simulations"
+description = "Days: A Performant Discrete-Event Simulator for Network Simulations"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",

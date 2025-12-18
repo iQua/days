@@ -8,7 +8,7 @@ pub struct TCPAck {
 
 #[derive(Debug, Clone)]
 pub struct Packet {
-    /// Packets in Daytone are typically created by packet sources, and run through
+    /// Packets in Days are typically created by packet sources, and run through
     /// a sequence of packet-forwarding switches. It may be entered into a queue
     /// at an output port on each of these switches.
     ///
@@ -19,7 +19,7 @@ pub struct Packet {
     ///
     /// # Example
     /// ```
-    /// use daytone::flows::packet::Packet;
+    /// use days::flows::packet::Packet;
     ///
     /// let mut packet = Packet::new(
     ///     1024, // packet size

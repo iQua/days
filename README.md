@@ -1,11 +1,11 @@
-# Daytone: A Performant Discrete-Event Simulator for Network Simulations
+# Days: A Performant Discrete-Event Simulator for Network Simulations
 
-Developed with the Rust programming language, **Daytone** has been designed as a performant discrete-event simulator for network simulations. It uses stackless coroutines in asynchronous Rust to implement the [actor model](https://en.wikipedia.org/wiki/Actor_model), where each actor can only interact with its counterparts using message passing. It excels at both small-scale and large-scale network simulations due to its ability to use either a single-threaded or a multi-threaded runtime; the single-threaded runtime minimizes overhead, while the multi-threaded runtime utilizes multiple CPU cores concurrently in the same simulation run.
+Developed with the Rust programming language, **Days** has been designed as a performant discrete-event simulator for network simulations. It uses stackless coroutines in asynchronous Rust to implement the [actor model](https://en.wikipedia.org/wiki/Actor_model), where each actor can only interact with its counterparts using message passing. It excels at both small-scale and large-scale network simulations due to its ability to use either a single-threaded or a multi-threaded runtime; the single-threaded runtime minimizes overhead, while the multi-threaded runtime utilizes multiple CPU cores concurrently in the same simulation run.
 
 To run a network simulation session using a configuration file, run:
 
 ```
-RUST_LOG=debug daytone configs/simple.toml
+RUST_LOG=debug days configs/simple.toml
 ```
 
 where `RUST_LOG` levels can be `error`, `warn`, `info`, `debug`, and `trace`.
@@ -26,7 +26,7 @@ cargo nextest run --all-features --no-capture
 
 ## Configuration Settings
 
-In **Daytone**, all configuration settings are read from a configuration file when a simulation session starts, and the configuration file follows the `TOML` format for the sake of simplicity and readability.
+In **Days**, all configuration settings are read from a configuration file when a simulation session starts, and the configuration file follows the `TOML` format for the sake of simplicity and readability.
 
 Here is an example configuration file `simple.toml`:
 
@@ -126,7 +126,7 @@ The `report_interval` parameter specifies the time interval to log reports from 
 
 #### ui_interval
 
-**Daytone** provides a user interface, which for now includes a progress bar to visualize the progression of a simulation session. This `ui_interval` element specifies the time interval to advance the position of the progress bar.
+**Days** provides a user interface, which for now includes a progress bar to visualize the progression of a simulation session. This `ui_interval` element specifies the time interval to advance the position of the progress bar.
 
 - **Valid value**: Floating point number
 - **Required**: No
@@ -143,7 +143,7 @@ The number of threads to be used in the simulation run. By setting this value to
 
 #### log_path
 
-**Daytone** generates three CSV files, `sources.csv`, `sinks.csv`, and `switches.csv`, containing statistics of a simulation session. `log_path` specifies the directory of the three CSV files.
+**Days** generates three CSV files, `sources.csv`, `sinks.csv`, and `switches.csv`, containing statistics of a simulation session. `log_path` specifies the directory of the three CSV files.
 
 - **Valid value**: String
 - **Required**: No
@@ -156,7 +156,7 @@ The number of threads to be used in the simulation run. By setting this value to
 
 #### topology
 
-**Daytone** supports arbitrary topologies. Besides widely-used topologies `FatTree` and `Torus`, any topology that can be specified as an undirected graph can be supported as well.
+**Days** supports arbitrary topologies. Besides widely-used topologies `FatTree` and `Torus`, any topology that can be specified as an undirected graph can be supported as well.
 
 - `FatTree`
 
@@ -204,7 +204,7 @@ The number of threads to be used in the simulation run. By setting this value to
 
 ### Switch
 
-In **Daytone**, all switches use the same setting which can be specified with the following attributes.
+In **Days**, all switches use the same setting which can be specified with the following attributes.
 
 #### port_rate
 
@@ -302,7 +302,7 @@ The scheduling discipline.
 
 ### Flow
 
-In **Daytone**, flows can be specified one by one:
+In **Days**, flows can be specified one by one:
 
 ```toml
 [[flow]]
@@ -514,7 +514,7 @@ For a flow set, it must specify the tcp characteristics of its flows under `[flo
 
 ### Collective
 
-In **Daytone**, collectives can be specified one by one:
+In **Days**, collectives can be specified one by one:
 
 ```toml
 [[collective]]

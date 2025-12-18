@@ -1,7 +1,9 @@
+#![cfg(feature = "test")]
+
 use petgraph::algo;
 use petgraph::graph::UnGraph;
 
-use daytone::topos::build::build_graph;
+use days::topos::build::build_graph;
 
 #[test]
 fn test_build_graph() {

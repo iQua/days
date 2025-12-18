@@ -2,11 +2,11 @@
 
 use log::info;
 
-use daytone::flows::collective::Collective;
-use daytone::flows::flow::Flow;
-use daytone::seed_from_config;
-use daytone::topos::build::build_graph;
-use daytone::topos::topo::Topology;
+use days::flows::collective::Collective;
+use days::flows::flow::Flow;
+use days::seed_from_config;
+use days::topos::build::build_graph;
+use days::topos::topo::Topology;
 
 #[test]
 fn test_local_time() {

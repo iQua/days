@@ -8,13 +8,13 @@ use nexosim::ports::EventSlot;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
-use daytone::flows::flow::FlowType;
-use daytone::flows::sink::PacketSink;
-use daytone::flows::source::PacketSource;
-use daytone::flows::{DistributionInfo, TrafficCharacteristics};
-use daytone::schedulers::drop::{CapacityUnit, DropStrategy};
-use daytone::schedulers::vc::VirtualClockServer;
-use daytone::utils::logger::CsvLogger;
+use days::flows::flow::FlowType;
+use days::flows::sink::PacketSink;
+use days::flows::source::PacketSource;
+use days::flows::{DistributionInfo, TrafficCharacteristics};
+use days::schedulers::drop::{CapacityUnit, DropStrategy};
+use days::schedulers::vc::VirtualClockServer;
+use days::utils::logger::CsvLogger;
 
 #[test]
 fn test_virtual_clock_scheduler() {
