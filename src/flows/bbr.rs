@@ -64,6 +64,8 @@ pub struct BBRState {
     pub probe_bw_phase: ProbeBWPhase,
     /// Timestamp when current ProbeBW phase began
     pub probe_bw_phase_start: f64,
+    /// Round count when current ProbeBW phase began
+    pub probe_bw_phase_start_round: usize,
     /// Max bandwidth at last full-bw check
     pub full_bw: f64,
     /// Number of rounds without sufficient bandwidth growth
@@ -149,6 +151,7 @@ impl BBRState {
             probe_bw_cycle: 0,
             probe_bw_phase: ProbeBWPhase::Down,
             probe_bw_phase_start: 0.0,
+            probe_bw_phase_start_round: 0,
             full_bw: 0.0,
             full_bw_count: 0,
             full_bw_reached: false,
@@ -288,7 +291,7 @@ impl BBRState {
         if new_round {
             self.update_full_bw();
             if self.mode == BBRMode::ProbeBW {
-                self.advance_probe_bw_phase(now);
+                self.maybe_advance_probe_bw_phase(now, event.rate_sample.prior_inflight);
             }
             if self.mode == BBRMode::ProbeRTT {
                 self.probe_rtt_round_done = true;
@@ -429,6 +432,7 @@ impl BBRState {
             if self.mode == BBRMode::ProbeBW && self.probe_bw_phase == ProbeBWPhase::Up {
                 self.probe_bw_phase = ProbeBWPhase::Down;
                 self.probe_bw_phase_start = now;
+                self.probe_bw_phase_start_round = self.round_count;
                 self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
                 self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
             }
@@ -460,29 +464,62 @@ impl BBRState {
         self.probe_bw_phase = ProbeBWPhase::Down;
         self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
         self.probe_bw_phase_start = now;
+        self.probe_bw_phase_start_round = self.round_count;
         self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
         self.cwnd_gain = Self::CWND_GAIN;
         self.inflight_shortterm = 0;
     }
 
-    fn advance_probe_bw_phase(&mut self, now: f64) {
-        self.probe_bw_phase = match self.probe_bw_phase {
-            ProbeBWPhase::Down => ProbeBWPhase::Cruise,
-            ProbeBWPhase::Cruise => ProbeBWPhase::Refill,
-            ProbeBWPhase::Refill => ProbeBWPhase::Up,
-            ProbeBWPhase::Up => ProbeBWPhase::Down,
+    fn maybe_advance_probe_bw_phase(&mut self, now: f64, prior_inflight: usize) {
+        let rounds_in_phase = self.round_count.saturating_sub(self.probe_bw_phase_start_round);
+        let target = self.target_inflight();
+
+        let next_phase = match self.probe_bw_phase {
+            ProbeBWPhase::Down => {
+                if prior_inflight <= target || rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Cruise)
+                } else {
+                    None
+                }
+            }
+            ProbeBWPhase::Cruise => {
+                if rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Refill)
+                } else {
+                    None
+                }
+            }
+            ProbeBWPhase::Refill => {
+                if rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Up)
+                } else {
+                    None
+                }
+            }
+            ProbeBWPhase::Up => {
+                if rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Down)
+                } else {
+                    None
+                }
+            }
         };
-        if self.probe_bw_phase == ProbeBWPhase::Down {
-            self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
-            self.inflight_shortterm = 0;
+
+        if let Some(next_phase) = next_phase {
+            self.probe_bw_phase = next_phase;
+            if self.probe_bw_phase == ProbeBWPhase::Down {
+                self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+                self.inflight_shortterm = 0;
+            }
+            self.probe_bw_phase_start = now;
+            self.probe_bw_phase_start_round = self.round_count;
+            self.pacing_gain = match self.probe_bw_phase {
+                ProbeBWPhase::Down => Self::PROBE_BW_PACING_GAIN_DOWN,
+                ProbeBWPhase::Cruise => Self::PROBE_BW_PACING_GAIN_CRUISE,
+                ProbeBWPhase::Refill => Self::PROBE_BW_PACING_GAIN_REFILL,
+                ProbeBWPhase::Up => Self::PROBE_BW_PACING_GAIN_UP,
+            };
         }
-        self.probe_bw_phase_start = now;
-        self.pacing_gain = match self.probe_bw_phase {
-            ProbeBWPhase::Down => Self::PROBE_BW_PACING_GAIN_DOWN,
-            ProbeBWPhase::Cruise => Self::PROBE_BW_PACING_GAIN_CRUISE,
-            ProbeBWPhase::Refill => Self::PROBE_BW_PACING_GAIN_REFILL,
-            ProbeBWPhase::Up => Self::PROBE_BW_PACING_GAIN_UP,
-        };
     }
 
     fn enter_probe_rtt(&mut self, now: f64) {
