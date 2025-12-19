@@ -38,7 +38,7 @@
 //!
 //! See individual field documentation for more details.
 
-use crate::flows::cc::CongestionControl;
+use crate::flows::cc::{AckEvent, CongestionControl};
 
 /// HyStart++ parameters for improved slow start exit detection.
 ///
@@ -378,7 +378,10 @@ impl CongestionControl for TCPCubic {
     /// * `current_time` - Current timestamp
     /// * `bytes_acked` - Number of new bytes acknowledged
     ///
-    fn ack_received(&mut self, _ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize) {
+    fn ack_received(&mut self, event: AckEvent) {
+        let rtt = event.rtt;
+        let current_time = event.now;
+        let bytes_acked = event.bytes_acked;
         // Track minimum RTT
         if self.d_min > 0.0 {
             self.d_min = self.d_min.min(rtt);
@@ -466,6 +469,10 @@ impl CongestionControl for TCPCubic {
 mod tests {
     use super::*;
 
+    fn ack(cubic: &mut TCPCubic, ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) {
+        cubic.ack_received(AckEvent::new_basic(ack_seq, rtt, now, bytes_acked));
+    }
+
     #[test]
     fn test_initial_state() {
         let cubic = TCPCubic::new();
@@ -483,7 +490,7 @@ mod tests {
 
         // Simulate ACKs to grow cwnd
         for _ in 0..10 {
-            cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+            ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
         }
 
         assert_eq!(cubic.cwnd, 512 + 10 * cubic.mss);
@@ -497,10 +504,10 @@ mod tests {
 
         // Send enough ACKs to exceed ssthresh
         while cubic.cwnd < cubic.ssthresh {
-            cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+            ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
         }
 
-        cubic.ack_received(0, 0.1, 1.0, cubic.mss); // This should transition to congestion avoidance
+        ack(&mut cubic, 0, 0.1, 1.0, cubic.mss); // This should transition to congestion avoidance
 
         let expected_cwnd = cwnd_behavior_after_transition(&cubic);
         assert_eq!(
@@ -522,7 +529,7 @@ mod tests {
 
         // Simulate ACKs in congestion avoidance
         for _ in 0..50 {
-            cubic.ack_received(0, 0.1, 2.0, cubic.mss);
+            ack(&mut cubic, 0, 0.1, 2.0, cubic.mss);
         }
 
         // Ensure cwnd has increased appropriately without exponential growth
@@ -570,7 +577,7 @@ mod tests {
         cubic.ssthresh = 2048;
 
         // Simulate ACK received
-        cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
 
         // cwnd should still be in slow start
         assert_eq!(cubic.cwnd, 1024 + cubic.mss);
@@ -583,7 +590,7 @@ mod tests {
         cubic.ssthresh = 2048;
 
         // Simulate ACK received
-        cubic.ack_received(0, 0.1, 2.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 2.0, cubic.mss);
 
         // cwnd should have increased in congestion avoidance
         assert!(cubic.cwnd > 2048);
@@ -600,11 +607,11 @@ mod tests {
         let increased_rtt = 0.4; // 200% increase
 
         for _ in 0..4 {
-            cubic.ack_received(0, initial_rtt, 1.0, cubic.mss);
+            ack(&mut cubic, 0, initial_rtt, 1.0, cubic.mss);
         }
 
         for _ in 0..4 {
-            cubic.ack_received(0, increased_rtt, 2.0, cubic.mss);
+            ack(&mut cubic, 0, increased_rtt, 2.0, cubic.mss);
         }
 
         assert!(
@@ -687,7 +694,7 @@ mod tests {
         cubic.mss = 512;
 
         // Simulate ACK received
-        cubic.ack_received(0, 0.1, 100.0, 512); // bytes_acked = 512
+        ack(&mut cubic, 0, 0.1, 100.0, 512); // bytes_acked = 512
 
         // Calculate absolute difference manually
         let diff = cubic.cwnd.abs_diff(2_000_000);
@@ -709,7 +716,7 @@ mod tests {
 
         // Simulate multiple ACKs to trigger TCP-friendly growth
         for _ in 0..20 {
-            cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+            ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
         }
 
         assert!(
@@ -731,7 +738,7 @@ mod tests {
 
         // Simulate multiple ACKs to trigger CUBIC growth without TCP friendliness
         for _ in 0..20 {
-            cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+            ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
         }
 
         assert!(
@@ -766,7 +773,7 @@ mod tests {
         cubic.consecutive_dupacks_received();
 
         // Simulate full ACK
-        cubic.ack_received(0, 0.1, 2.0, 3 * cubic.mss);
+        ack(&mut cubic, 0, 0.1, 2.0, 3 * cubic.mss);
 
         assert_eq!(
             cubic.cwnd, cubic.ssthresh,
@@ -785,7 +792,7 @@ mod tests {
         assert_eq!(cubic.cwnd, cubic.ssthresh + 3 * cubic.mss);
 
         // Simulate full ACK to exit recovery
-        cubic.ack_received(0, 0.1, 2.0, 3 * cubic.mss);
+        ack(&mut cubic, 0, 0.1, 2.0, 3 * cubic.mss);
         assert_eq!(cubic.cwnd, cubic.ssthresh);
 
         // Second loss recovery
@@ -802,7 +809,7 @@ mod tests {
         cubic.mss = 512;
 
         // Simulate ACK received that wraps around
-        cubic.ack_received(18_446_744_073_709_551_515, 0.1, 1.0, 512);
+        ack(&mut cubic, 18_446_744_073_709_551_515, 0.1, 1.0, 512);
 
         // Ensure cwnd does not exceed max_cwnd and prevent overflow
         assert!(
@@ -816,14 +823,14 @@ mod tests {
         let mut cubic = TCPCubic::new();
 
         // Very small RTT
-        cubic.ack_received(0, 0.000001, 1.0, cubic.mss);
+        ack(&mut cubic, 0, 0.000001, 1.0, cubic.mss);
         assert!(
             cubic.d_min <= 0.000001,
             "d_min did not update correctly for very small RTT."
         );
 
         // Very large RTT
-        cubic.ack_received(0, 100.0, 2.0, cubic.mss);
+        ack(&mut cubic, 0, 100.0, 2.0, cubic.mss);
         assert!(
             cubic.d_min <= 0.000001,
             "d_min should remain the smallest RTT."
@@ -839,7 +846,7 @@ mod tests {
         cubic.cwnd = 0; // Invalid state
 
         // ACK should restore to minimum
-        cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
         assert_eq!(
             cubic.cwnd, cubic.mss,
             "Cwnd was not reset to mss when set to zero."
@@ -853,8 +860,8 @@ mod tests {
         cubic.ssthresh = 2048;
 
         // Simulate reordered ACKs
-        cubic.ack_received(3000, 0.1, 1.0, 500);
-        cubic.ack_received(2500, 0.1, 1.0, 500); // Out-of-order ACK
+        ack(&mut cubic, 3000, 0.1, 1.0, 500);
+        ack(&mut cubic, 2500, 0.1, 1.0, 500); // Out-of-order ACK
 
         // cwnd should have increased appropriately
         assert!(
@@ -916,7 +923,7 @@ mod tests {
 
         // Simulate a series of ACKs
         for _ in 0..100 {
-            cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+            ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
         }
 
         assert!(cwnd_increment_behaves_as_expected(&cubic));
@@ -934,7 +941,7 @@ mod tests {
         cubic.ssthresh = 4096;
 
         // Simulate ACK without duplicates
-        cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
 
         assert_eq!(
             cubic.cwnd,
@@ -951,7 +958,7 @@ mod tests {
 
         // Simulate triple dupacks
         cubic.consecutive_dupacks_received();
-        cubic.ack_received(0, 0.1, 2.0, 3 * cubic.mss);
+        ack(&mut cubic, 0, 0.1, 2.0, 3 * cubic.mss);
 
         // After recovery, cwnd should be set to ssthresh
         assert_eq!(
@@ -967,7 +974,7 @@ mod tests {
         cubic.timer_expired();
 
         // Simulate ACK after timer expiry
-        cubic.ack_received(0, 0.1, 2.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 2.0, cubic.mss);
 
         assert_eq!(
             cubic.cwnd,
@@ -997,9 +1004,9 @@ mod tests {
         cubic.ssthresh = 4096;
 
         // Simulate ACKs with decreasing RTT
-        cubic.ack_received(0, 0.2, 1.0, cubic.mss);
-        cubic.ack_received(0, 0.15, 2.0, cubic.mss);
-        cubic.ack_received(0, 0.1, 3.0, cubic.mss);
+        ack(&mut cubic, 0, 0.2, 1.0, cubic.mss);
+        ack(&mut cubic, 0, 0.15, 2.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 3.0, cubic.mss);
 
         assert_eq!(
             cubic.d_min, 0.1,
@@ -1018,11 +1025,11 @@ mod tests {
         let increased_rtt = 0.4; // 100% increase
 
         for _ in 0..4 {
-            cubic.ack_received(0, initial_rtt, 1.0, cubic.mss);
+            ack(&mut cubic, 0, initial_rtt, 1.0, cubic.mss);
         }
 
         for _ in 0..4 {
-            cubic.ack_received(0, increased_rtt, 2.0, cubic.mss);
+            ack(&mut cubic, 0, increased_rtt, 2.0, cubic.mss);
         }
 
         assert!(
@@ -1038,7 +1045,7 @@ mod tests {
         cubic.cwnd = 0;
 
         // Simulate ACK
-        cubic.ack_received(0, 0.1, 1.0, cubic.mss);
+        ack(&mut cubic, 0, 0.1, 1.0, cubic.mss);
 
         assert_eq!(
             cubic.cwnd, cubic.mss,

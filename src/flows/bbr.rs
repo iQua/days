@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use crate::flows::cc::CongestionControl;
+use crate::flows::cc::{AckEvent, CongestionControl, RateSample};
 
 #[derive(Debug)]
 pub struct BBRState {
@@ -135,9 +135,13 @@ impl BBRState {
         4 * self.mss
     }
 
-    pub fn update_bandwidth(&mut self, bytes_acked: usize, rtt: f64) {
-        // Calculate sample bandwidth
-        let bw_sample = bytes_acked as f64 / rtt;
+    pub fn update_bandwidth(&mut self, bytes_acked: usize, rtt: f64, rate_sample: &RateSample) {
+        // Calculate sample bandwidth (prefer delivery-rate sample when available)
+        let bw_sample = if rate_sample.interval > 0.0 && rate_sample.delivered > 0 {
+            rate_sample.delivered as f64 / rate_sample.interval
+        } else {
+            bytes_acked as f64 / rtt
+        };
 
         // Add to bandwidth samples
         self.bw_samples.push_back(bw_sample);
@@ -200,19 +204,18 @@ impl BBRState {
         }
     }
 
-    pub fn on_ack_received(
-        &mut self,
-        ack_seq: usize,
-        bytes_acked: usize,
-        rtt: f64,
-        now: f64,
-        loss_occurred: bool,
-        ecn_marked: bool,
-    ) {
+    pub fn on_ack_received(&mut self, event: &AckEvent) {
+        let ack_seq = event.ack_seq;
+        let bytes_acked = event.bytes_acked;
+        let rtt = event.rtt;
+        let now = event.now;
+        let loss_occurred = event.rate_sample.lost > 0;
+        let ecn_marked = event.rate_sample.ecn_marked;
+
         self.total_data_delivered = ack_seq;
         self.last_rtt_sample_time = now;
         self.update_round(ack_seq);
-        self.update_bandwidth(bytes_acked, rtt);
+        self.update_bandwidth(bytes_acked, rtt, &event.rate_sample);
         self.update_min_rtt(rtt, now);
 
         if loss_occurred {
@@ -388,12 +391,8 @@ impl TCPBBR {
 }
 
 impl CongestionControl for TCPBBR {
-    fn ack_received(&mut self, ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) {
-        let loss_occurred = false; // Placeholder, should be detected from network layer
-        let ecn_marked = false; // Placeholder, should be detected from network layer
-
-        self.state
-            .on_ack_received(ack_seq, bytes_acked, rtt, now, loss_occurred, ecn_marked);
+    fn ack_received(&mut self, event: AckEvent) {
+        self.state.on_ack_received(&event);
     }
 
     fn timer_expired(&mut self) {
@@ -427,8 +426,23 @@ mod tests {
         loss_occurred: bool,
         ecn_marked: bool,
     ) {
-        bbr.state
-            .on_ack_received(ack_seq, bytes_acked, rtt, now, loss_occurred, ecn_marked);
+        let rate_sample = RateSample {
+            delivered: bytes_acked,
+            interval: rtt,
+            rtt,
+            acked: bytes_acked,
+            lost: if loss_occurred { bytes_acked } else { 0 },
+            ecn_marked,
+            ..RateSample::default()
+        };
+        let event = AckEvent {
+            ack_seq,
+            rtt,
+            now,
+            bytes_acked,
+            rate_sample,
+        };
+        bbr.state.on_ack_received(&event);
         // Increase inflight by bytes sent
         bbr.state.inflight += bytes_acked;
     }

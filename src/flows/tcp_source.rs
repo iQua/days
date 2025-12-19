@@ -13,7 +13,7 @@ use nexosim::ports::Output;
 
 use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::bbr::TCPBBR;
-use crate::flows::cc::{CCAlgorithm, CongestionControl};
+use crate::flows::cc::{AckEvent, CCAlgorithm, CongestionControl, RateSample};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::Packet;
@@ -29,6 +29,14 @@ pub struct PacketTimeout {
     pub packet_id: usize,
     pub rto: f64,
     pub timeout: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SentPacketMeta {
+    sent_time: f64,
+    delivered_at_send: usize,
+    prior_inflight: usize,
+    is_app_limited: bool,
 }
 
 pub struct SyntheticDataSource {
@@ -111,6 +119,7 @@ pub struct TCPPacketSource {
     pub rto: f64,
     /// the in-flight packets (segments)
     sent_packets: HashMap<usize, Packet>,
+    sent_packet_meta: HashMap<usize, SentPacketMeta>,
     /// min-heap of in-flight packets, where packets are sorted according to
     /// their timeout
     timeout_queue: BinaryHeap<PacketTimeout>,
@@ -142,6 +151,7 @@ pub struct TCPPacketSource {
     /// Maximum RTO value in seconds
     max_rto: f64,
     remaining_bytes: usize,
+    app_limited: bool,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -208,6 +218,7 @@ impl TCPPacketSource {
             smoothed_rtt: 0.0,
             rto: 1.0,
             sent_packets: HashMap::new(),
+            sent_packet_meta: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
             app_source,
             synthetic_source,
@@ -224,6 +235,7 @@ impl TCPPacketSource {
             clock_granularity: 0.001, // 1 ms granularity
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
+            app_limited: false,
         }
     }
 
@@ -235,8 +247,10 @@ impl TCPPacketSource {
     pub async fn pull_from_appsource(&mut self, now: f64) {
         // stop if all flow data has been sent
         if self.remaining_bytes == 0 {
+            self.app_limited = true;
             return;
         }
+        self.app_limited = false;
 
         // compute available sending window (cwnd - unacked data)
         let cwnd = self.congestion_control.get_cwnd();
@@ -295,6 +309,7 @@ impl TCPPacketSource {
         // if all bytes have been sent and acknowledged, complete the flow
         if self.remaining_bytes == 0 {
             self.traffic_exceeded = true;
+            self.app_limited = true;
         }
     }
 
@@ -314,6 +329,7 @@ impl TCPPacketSource {
 
         if self.sent_packets.contains_key(&ack_packet.packet_id) {
             self.sent_packets.remove(&ack_packet.packet_id);
+            self.sent_packet_meta.remove(&ack_packet.packet_id);
             self.timeout_queue
                 .retain(|packet| packet.packet_id != ack_packet.packet_id);
         }
@@ -418,13 +434,43 @@ impl TCPPacketSource {
                 );
             }
 
+            let prev_last_ack = self.last_ack;
+            let delivered = if ack.sequence_num > prev_last_ack {
+                ack.sequence_num - prev_last_ack
+            } else {
+                ack.acknowledged_size
+            };
+            let sample_packet_id = ack
+                .sequence_num
+                .saturating_sub(ack.acknowledged_size);
+            let mut rate_sample = RateSample {
+                delivered,
+                interval: sample_rtt,
+                rtt: sample_rtt,
+                acked: ack.acknowledged_size,
+                ..RateSample::default()
+            };
+            if let Some(meta) = self.sent_packet_meta.get(&sample_packet_id) {
+                let interval = now - meta.sent_time;
+                if interval > 0.0 {
+                    rate_sample.interval = interval;
+                }
+                if ack.sequence_num >= meta.delivered_at_send {
+                    rate_sample.delivered = ack.sequence_num - meta.delivered_at_send;
+                }
+                rate_sample.prior_inflight = meta.prior_inflight;
+                rate_sample.is_app_limited = meta.is_app_limited;
+            }
+
             self.last_ack = ack.sequence_num;
-            self.congestion_control.ack_received(
-                ack.sequence_num,
-                sample_rtt,
-                now,
-                ack.acknowledged_size,
-            );
+            self.congestion_control
+                .ack_received(AckEvent {
+                    ack_seq: ack.sequence_num,
+                    rtt: sample_rtt,
+                    now,
+                    bytes_acked: ack.acknowledged_size,
+                    rate_sample,
+                });
 
             debug!(
                 "TCPPacketSource {} received ack till sequence number {} at time {:.3}.",
@@ -442,6 +488,8 @@ impl TCPPacketSource {
             // segments sent between the lost packet and the receipt of the
             // first duplicate ACK, if any
             self.sent_packets
+                .retain(|&packet_id, _| packet_id >= ack.sequence_num);
+            self.sent_packet_meta
                 .retain(|&packet_id, _| packet_id >= ack.sequence_num);
             self.timeout_queue
                 .retain(|packet| packet.packet_id >= ack.sequence_num);
@@ -464,6 +512,18 @@ impl TCPPacketSource {
         self.packets_sent += 1;
         self.sent_size += packet.size;
         self.sent_size_in_period += packet.size;
+
+        let prior_inflight = self.next_seq.saturating_sub(self.last_ack);
+        let is_app_limited = self.app_limited || self.remaining_bytes == 0 || self.traffic_exceeded;
+        self.sent_packet_meta.insert(
+            packet.packet_id,
+            SentPacketMeta {
+                sent_time: now,
+                delivered_at_send: self.last_ack,
+                prior_inflight,
+                is_app_limited,
+            },
+        );
 
         debug!(
             "TCPPacketSource {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
