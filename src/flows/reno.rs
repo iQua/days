@@ -368,6 +368,13 @@ impl CongestionControl for TCPReno {
         }
     }
 
+    fn ecn_marked(&mut self) {
+        self.ssthresh = (self.cwnd / 2).max(2 * self.mss);
+        self.cwnd = self.ssthresh.max(self.min_cwnd);
+        self.state = TCPRenoState::CongestionAvoidance;
+        self.reset_recovery_state();
+    }
+
     fn get_cwnd(&self) -> usize {
         self.cwnd
     }

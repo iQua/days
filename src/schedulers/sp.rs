@@ -167,7 +167,17 @@ impl SPServer {
                 return;
             }
             DropAction::MarkEcn => {
-                packet.ecn_marked = true;
+                if !packet.mark_ce() {
+                    self.packets_dropped += 1;
+                    debug! {
+                        "SPServer {} dropped non-ECT packet {} from flow {} at time {:.3}",
+                        self.scheduler_id,
+                        packet.packet_id,
+                        packet.flow_id,
+                        packet.time
+                    }
+                    return;
+                }
             }
             DropAction::Enqueue => {}
         }

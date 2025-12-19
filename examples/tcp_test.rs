@@ -43,6 +43,7 @@ fn main() {
             },
             Some(TCPCharacteristics {
                 cc_algorithm: TCPReno,
+                ecn: false,
             }),
         ),
         0,

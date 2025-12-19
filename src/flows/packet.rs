@@ -4,7 +4,21 @@
 pub struct TCPAck {
     pub sequence_num: usize,
     pub acknowledged_size: usize,
-    pub ecn_marked: bool,
+    pub ece: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum EcnField {
+    NotEct,
+    Ect0,
+    Ect1,
+    Ce,
+}
+
+impl EcnField {
+    pub fn is_ect(self) -> bool {
+        matches!(self, EcnField::Ect0 | EcnField::Ect1)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +64,9 @@ pub struct Packet {
     /// used by TCPPacketSource and TCPPacketSink
     pub ack: Option<TCPAck>,
     /// Whether this packet was ECN-marked by the network.
-    pub ecn_marked: bool,
+    pub ecn: EcnField,
+    /// Whether this packet has the TCP CWR (Congestion Window Reduced) flag set.
+    pub cwr: bool,
 }
 
 impl Packet {
@@ -66,7 +82,8 @@ impl Packet {
             last_packet: false,
             priority: 0,
             ack: None,
-            ecn_marked: false,
+            ecn: EcnField::NotEct,
+            cwr: false,
         }
     }
 
@@ -89,20 +106,32 @@ impl Packet {
     pub fn departure_update(&mut self, time: f64) {
         self.time = time;
     }
+
+    /// Marks this packet as CE if it is ECN-capable. Returns true if the packet can be forwarded.
+    pub fn mark_ce(&mut self) -> bool {
+        if self.ecn == EcnField::NotEct {
+            return false;
+        }
+        if self.ecn.is_ect() {
+            self.ecn = EcnField::Ce;
+        }
+        true
+    }
 }
 
 impl std::fmt::Display for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}, priority: {}, ecn_marked: {}",
+            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}, priority: {}, ecn: {:?}, cwr: {}",
             self.packet_id,
             self.flow_id,
             self.creation_time,
             self.size,
             self.queueing_delay,
             self.priority,
-            self.ecn_marked
+            self.ecn,
+            self.cwr
         )
     }
 }

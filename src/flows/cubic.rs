@@ -460,6 +460,16 @@ impl CongestionControl for TCPCubic {
         self.cwnd = self.cwnd.saturating_add(self.mss).min(self.max_cwnd);
     }
 
+    fn ecn_marked(&mut self) {
+        self.last_decrease = self.cwnd;
+        self.last_reduction_time = self.epoch_start;
+        self.ssthresh = (2 * self.mss).max(self.cwnd / 2).min(self.max_cwnd);
+        self.cwnd = self.ssthresh;
+        self.cubic_reset();
+        self.hystart = HyStartState::new();
+        self.in_recovery = false;
+    }
+
     fn get_cwnd(&self) -> usize {
         self.cwnd
     }

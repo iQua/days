@@ -74,6 +74,7 @@ pub trait CongestionControl {
     fn dupack_over(&mut self);
     fn consecutive_dupacks_received(&mut self);
     fn more_dupacks_received(&mut self);
+    fn ecn_marked(&mut self) {}
     fn get_cwnd(&self) -> usize;
     fn get_pacing_rate(&self) -> f64 {
         0.0 // Default pacing rate for algorithms that do not utilize it
