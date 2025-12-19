@@ -34,4 +34,4 @@ tracing_interval = 0.01
     pkt_size_dist = { type = "Uniform", low = 1024, high = 1024 }
 
     [flow_set.traffic.tcp]
-    cc_algorithm = "CUBIC"
+    cc_algorithm = "TCPBBR"

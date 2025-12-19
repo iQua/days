@@ -171,6 +171,8 @@ impl fmt::Debug for TCPPacketSource {
 }
 
 impl TCPPacketSource {
+    const MIN_PACING_INTERVAL: f64 = 1e-9;
+
     pub fn synthetic_source_mut(&mut self) -> Option<&mut SyntheticDataSource> {
         self.synthetic_source.as_mut()
     }
@@ -664,7 +666,7 @@ impl TCPPacketSource {
             0.0
         };
 
-        if pacing_interval <= 0.0 {
+        if !pacing_interval.is_finite() || pacing_interval <= 0.0 {
             // No pacing rate yet; send as much as the window allows.
             while self.next_seq < self.send_buffer
                 && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit)
@@ -679,7 +681,8 @@ impl TCPPacketSource {
         }
 
         if now < self.busy_until {
-            return Some(self.busy_until - now);
+            let interval = (self.busy_until - now).max(Self::MIN_PACING_INTERVAL);
+            return Some(interval);
         }
 
         let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
@@ -688,6 +691,7 @@ impl TCPPacketSource {
         self.output.send(packet.clone()).await;
         self.packet_sent(&packet, now);
 
+        let pacing_interval = pacing_interval.max(Self::MIN_PACING_INTERVAL);
         self.busy_until = now + pacing_interval;
 
         let next_can_send = self.next_seq < self.send_buffer
