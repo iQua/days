@@ -10,8 +10,8 @@ The `time` command in UNIX can be used to measure the total running time of a ru
 time cargo run -- configs/simple.toml
 ```
 
-DCQCN example (requires the `dcqcn` feature):
+DCQCN example (requires the `dcqcn` and `l2_pfc` features):
 
 ```
-RUST_LOG=debug cargo run --features dcqcn -- configs/dcqcn_simple.toml
+RUST_LOG=debug cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml
 ```

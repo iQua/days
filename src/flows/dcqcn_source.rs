@@ -240,6 +240,10 @@ impl DcqcnPacketSource {
         self.output.send(packet.clone()).await;
         self.packet_sent(&packet, now);
 
+        if self.traffic_exceeded {
+            return None;
+        }
+
         Some(interval)
     }
 
