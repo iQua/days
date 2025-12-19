@@ -318,8 +318,11 @@ impl BBRState {
         // Mode transitions
         self.check_mode_transitions(now);
 
-        // Update inflight
-        self.inflight = self.inflight.saturating_sub(bytes_acked);
+        // Update inflight (acked + lost leave flight)
+        let lost_bytes = event.rate_sample.lost;
+        self.inflight = self
+            .inflight
+            .saturating_sub(bytes_acked.saturating_add(lost_bytes));
     }
 
     pub fn calculate_pacing_rate(&mut self) {
@@ -424,6 +427,11 @@ impl BBRState {
             / (self.round_lost + self.round_delivered).max(1) as f64;
 
         if loss_rate > Self::LOSS_THRESH {
+            if self.mode == BBRMode::Startup {
+                self.full_bw_reached = true;
+                self.enter_drain();
+            }
+
             let target = self.target_inflight() as f64;
             let candidate = (target * Self::BETA)
                 .max(prior_inflight as f64)
