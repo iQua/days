@@ -140,6 +140,7 @@ impl TCPPacketSink {
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
                 acknowledged_size: packet.size,
+                ecn_marked: false,
             }),
         };
 

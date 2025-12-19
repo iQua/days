@@ -152,6 +152,8 @@ pub struct TCPPacketSource {
     max_rto: f64,
     remaining_bytes: usize,
     app_limited: bool,
+    pending_lost_bytes: usize,
+    pending_ecn_marked: bool,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -236,6 +238,8 @@ impl TCPPacketSource {
             min_rto: 1.0,             // 1 second minimum as per RFC 6298
             max_rto: 60.0,            // 60 seconds maximum (commonly used value)
             app_limited: false,
+            pending_lost_bytes: 0,
+            pending_ecn_marked: false,
         }
     }
 
@@ -335,6 +339,9 @@ impl TCPPacketSource {
         }
 
         let ack = ack_packet.ack.unwrap();
+        if ack.ecn_marked {
+            self.pending_ecn_marked = true;
+        }
         if ack.sequence_num == self.last_ack {
             self.dupack += 1;
         } else {
@@ -347,6 +354,12 @@ impl TCPPacketSource {
 
         if self.dupack >= 3 {
             if self.dupack == 3 {
+                let loss_size = self
+                    .sent_packets
+                    .get(&ack.sequence_num)
+                    .map(|pkt| pkt.size)
+                    .unwrap_or(self.mss);
+                self.pending_lost_bytes = self.pending_lost_bytes.saturating_add(loss_size);
                 self.congestion_control.consecutive_dupacks_received();
             }
 
@@ -448,6 +461,8 @@ impl TCPPacketSource {
                 interval: sample_rtt,
                 rtt: sample_rtt,
                 acked: ack.acknowledged_size,
+                lost: self.pending_lost_bytes,
+                ecn_marked: self.pending_ecn_marked,
                 ..RateSample::default()
             };
             if let Some(meta) = self.sent_packet_meta.get(&sample_packet_id) {
@@ -471,6 +486,8 @@ impl TCPPacketSource {
                     bytes_acked: ack.acknowledged_size,
                     rate_sample,
                 });
+            self.pending_lost_bytes = 0;
+            self.pending_ecn_marked = false;
 
             debug!(
                 "TCPPacketSource {} received ack till sequence number {} at time {:.3}.",
@@ -563,6 +580,11 @@ impl TCPPacketSource {
                     packet_timeout.timeout,
                     packet_timeout.rto,
                 );
+
+                if let Some(lost_pkt) = self.sent_packets.get(&packet_timeout.packet_id) {
+                    self.pending_lost_bytes =
+                        self.pending_lost_bytes.saturating_add(lost_pkt.size);
+                }
 
                 self.congestion_control.timer_expired();
 
