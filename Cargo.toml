@@ -15,6 +15,7 @@ test = []
 l2 = []
 l2_pfc = ["l2"]
 dcqcn = []
+lean = []
 
 [dependencies]
 csv = "1.3"

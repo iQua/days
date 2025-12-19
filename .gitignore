@@ -3,6 +3,7 @@
 **/target/
 **/Cargo.lock
 **/uv.lock
+**/.lake/
 
 # These are files related to logged outputs
 **/*.csv
