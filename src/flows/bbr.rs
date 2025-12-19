@@ -111,6 +111,7 @@ impl BBRState {
     const PROBE_BW_PACING_GAIN_CRUISE: f64 = 1.0;
     const PROBE_BW_PACING_GAIN_REFILL: f64 = 1.0;
     const PROBE_BW_PACING_GAIN_UP: f64 = 1.25;
+    const PROBE_BW_CWND_GAIN_UP: f64 = 2.25;
     const CWND_GAIN: f64 = 2.0;
     const PROBE_RTT_CWND_GAIN: f64 = 0.5;
     const MIN_RTT_FILTER_SEC: f64 = 10.0;
@@ -434,6 +435,7 @@ impl BBRState {
                 self.probe_bw_phase_start = now;
                 self.probe_bw_phase_start_round = self.round_count;
                 self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
+                self.cwnd_gain = Self::CWND_GAIN;
                 self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
             }
         }
@@ -518,6 +520,10 @@ impl BBRState {
                 ProbeBWPhase::Cruise => Self::PROBE_BW_PACING_GAIN_CRUISE,
                 ProbeBWPhase::Refill => Self::PROBE_BW_PACING_GAIN_REFILL,
                 ProbeBWPhase::Up => Self::PROBE_BW_PACING_GAIN_UP,
+            };
+            self.cwnd_gain = match self.probe_bw_phase {
+                ProbeBWPhase::Up => Self::PROBE_BW_CWND_GAIN_UP,
+                _ => Self::CWND_GAIN,
             };
         }
     }
