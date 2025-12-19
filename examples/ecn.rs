@@ -34,7 +34,11 @@ impl EcnCounter {
         }
     }
 
-    async fn packet_received(&mut self, packet: days::flows::packet::Packet, _: &mut Context<Self>) {
+    async fn packet_received(
+        &mut self,
+        packet: days::flows::packet::Packet,
+        _: &mut Context<Self>,
+    ) {
         if self.count_data {
             if matches!(packet.ecn, EcnField::Ce) {
                 *self.ce_count.lock().unwrap() += 1;
@@ -69,7 +73,10 @@ fn main() {
                 low: 0.004,
                 high: 0.004,
             },
-            DistributionInfo::DiscreteUniform { low: 512, high: 512 },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
             Some(TCPCharacteristics {
                 cc_algorithm: TCPCubic,
                 ecn: true,
@@ -104,9 +111,12 @@ fn main() {
 
     source.output().connect(Port::packet_received, &port_mbox);
     port.output.connect(PacketSink::packet_received, &sink_mbox);
-    port.output.connect(EcnCounter::packet_received, &data_counter_mbox);
-    sink.output().connect(PacketSource::packet_received, &source_mbox);
-    sink.output().connect(EcnCounter::packet_received, &ack_counter_mbox);
+    port.output
+        .connect(EcnCounter::packet_received, &data_counter_mbox);
+    sink.output()
+        .connect(PacketSource::packet_received, &source_mbox);
+    sink.output()
+        .connect(EcnCounter::packet_received, &ack_counter_mbox);
 
     let mut sink_statistics = nexosim::ports::EventSlot::new();
     sink.statistics().connect_sink(&sink_statistics);

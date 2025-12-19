@@ -784,9 +784,9 @@ impl Model for TCPPacketSource {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::executor::block_on;
     use crate::flows::packet::TCPAck;
     use crate::flows::{DistributionInfo, TCPCharacteristics};
+    use futures::executor::block_on;
     use rand::SeedableRng;
 
     fn make_source(ecn: bool) -> TCPPacketSource {
@@ -794,8 +794,14 @@ mod tests {
             0.0,
             Some(1.0),
             None,
-            DistributionInfo::Uniform { low: 0.1, high: 0.1 },
-            DistributionInfo::DiscreteUniform { low: 512, high: 512 },
+            DistributionInfo::Uniform {
+                low: 0.1,
+                high: 0.1,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
             Some(TCPCharacteristics {
                 cc_algorithm: CCAlgorithm::TCPReno,
                 ecn,
