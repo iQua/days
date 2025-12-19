@@ -10,7 +10,7 @@ use nexosim::model::Model;
 use nexosim::ports::Output;
 
 use crate::flows::FlowFinishMsg;
-use crate::flows::packet::{Packet, TCPAck};
+use crate::flows::packet::{EcnField, Packet, TCPAck};
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
@@ -31,6 +31,8 @@ pub struct TCPPacketSink {
     recv_buffer: Vec<(usize, usize)>,
     /// the next sequence number expected to be received
     next_seq_expected: usize,
+    /// whether the receiver is echoing ECN congestion (ECE)
+    ecn_echo: bool,
     /// output: packet statistics
     pub statistics: Output<PacketStatistics>,
     /// output: outbound to packet switches
@@ -58,6 +60,7 @@ impl TCPPacketSink {
             packet_statistics: PacketStatistics::new(sink_name),
             recv_buffer: Vec::new(),
             next_seq_expected: 0,
+            ecn_echo: false,
             statistics: Output::default(),
             output: Output::default(),
             flow_finish_outputs: Vec::new(),
@@ -103,6 +106,16 @@ impl TCPPacketSink {
         self.received_packets = 0;
         self.received_sizes = 0;
     }
+
+    fn update_ecn_echo(&mut self, packet: &Packet) {
+        if packet.cwr {
+            self.ecn_echo = false;
+        }
+        if packet.ecn == EcnField::Ce {
+            self.ecn_echo = true;
+        }
+    }
+
     #[instrument(skip(self))]
     pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
@@ -140,9 +153,10 @@ impl TCPPacketSink {
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
                 acknowledged_size: packet.size,
-                ecn_marked: packet.ecn_marked,
+                ece: self.ecn_echo,
             }),
-            ecn_marked: false,
+            ecn: EcnField::NotEct,
+            cwr: false,
         };
 
         // sends the acknowledgment packet out to the TCPPacketSource now
@@ -170,6 +184,7 @@ impl TCPPacketSink {
         }
         self.time = now;
 
+        self.update_ecn_echo(&packet);
         self.packet_statistics.update(&packet, now);
         self.update_report_stats(&packet, now);
         self.produce_ack(packet, now).await;

@@ -145,7 +145,14 @@ impl Port {
                 return;
             }
             DropAction::MarkEcn => {
-                packet.ecn_marked = true;
+                if !packet.mark_ce() {
+                    self.packets_dropped += 1;
+                    debug!(
+                        "Port {} dropped non-ECT packet {} from flow {} at time {:.8e}",
+                        self.scheduler_id, packet.packet_id, packet.flow_id, packet.time
+                    );
+                    return;
+                }
             }
             DropAction::Enqueue => {}
         }

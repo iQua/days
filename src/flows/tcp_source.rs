@@ -16,7 +16,7 @@ use crate::flows::bbr::TCPBBR;
 use crate::flows::cc::{AckEvent, CCAlgorithm, CongestionControl, RateSample};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::dist_source::DistPacketSource;
-use crate::flows::packet::Packet;
+use crate::flows::packet::{EcnField, Packet};
 use crate::flows::reno::TCPReno;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
@@ -156,6 +156,9 @@ pub struct TCPPacketSource {
     app_limited: bool,
     pending_lost_bytes: usize,
     pending_ecn_marked: bool,
+    ecn_enabled: bool,
+    cwr_pending: bool,
+    ecn_reduction_in_flight: bool,
     delivered: usize,
     delivered_time: f64,
     first_sent_time: f64,
@@ -200,6 +203,7 @@ impl TCPPacketSource {
             CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
+        let ecn_enabled = traffic.tcp.as_ref().map(|tcp| tcp.ecn).unwrap_or(false);
         let synthetic_source = if app_source.is_some() {
             None
         } else {
@@ -247,6 +251,9 @@ impl TCPPacketSource {
             app_limited: false,
             pending_lost_bytes: 0,
             pending_ecn_marked: false,
+            ecn_enabled,
+            cwr_pending: false,
+            ecn_reduction_in_flight: false,
             delivered: 0,
             delivered_time: 0.0,
             first_sent_time: 0.0,
@@ -339,8 +346,15 @@ impl TCPPacketSource {
         }
 
         let ack = ack_packet.ack.unwrap();
-        if ack.ecn_marked {
+        if self.ecn_enabled && ack.ece {
             self.pending_ecn_marked = true;
+            if !self.ecn_reduction_in_flight {
+                self.congestion_control.ecn_marked();
+                self.ecn_reduction_in_flight = true;
+                self.cwr_pending = true;
+            }
+        } else if !ack.ece {
+            self.ecn_reduction_in_flight = false;
         }
         if ack.sequence_num == self.last_ack {
             self.dupack += 1;
@@ -365,6 +379,7 @@ impl TCPPacketSource {
 
             if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
                 resent_pkt.time = now;
+                Self::apply_ecn_on_retransmit(resent_pkt);
                 self.output.send(resent_pkt.clone()).await;
 
                 debug!(
@@ -391,6 +406,7 @@ impl TCPPacketSource {
 
                     let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
                     packet.set_priority(self.priority);
+                    self.apply_ecn_on_new_data(&mut packet);
                     self.output.send(packet.clone()).await;
                     self.packet_sent(&packet, now);
                 }
@@ -581,6 +597,21 @@ impl TCPPacketSource {
         );
     }
 
+    fn apply_ecn_on_new_data(&mut self, packet: &mut Packet) {
+        if self.ecn_enabled {
+            packet.ecn = EcnField::Ect0;
+        }
+        if self.cwr_pending {
+            packet.cwr = true;
+            self.cwr_pending = false;
+        }
+    }
+
+    fn apply_ecn_on_retransmit(packet: &mut Packet) {
+        packet.ecn = EcnField::NotEct;
+        packet.cwr = false;
+    }
+
     /// Checks if any sent packet reached timeout at regularly occurring intervals.
     pub async fn timer_tick(&mut self, now: f64) {
         while !self.timeout_queue.is_empty() {
@@ -609,6 +640,7 @@ impl TCPPacketSource {
                     .unwrap();
 
                 resent_pkt.departure_update(packet_timeout.timeout);
+                Self::apply_ecn_on_retransmit(resent_pkt);
 
                 self.output.send(resent_pkt.clone()).await;
 
@@ -669,6 +701,7 @@ impl TCPPacketSource {
             {
                 let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
                 packet.set_priority(self.priority);
+                self.apply_ecn_on_new_data(&mut packet);
 
                 self.output.send(packet.clone()).await;
                 self.packet_sent(&packet, now);
@@ -683,6 +716,7 @@ impl TCPPacketSource {
 
         let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
         packet.set_priority(self.priority);
+        self.apply_ecn_on_new_data(&mut packet);
 
         self.output.send(packet.clone()).await;
         self.packet_sent(&packet, now);

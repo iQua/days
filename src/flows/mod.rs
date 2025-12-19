@@ -127,4 +127,6 @@ pub struct FlowFinishMsg {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
+    #[serde(default)]
+    pub ecn: bool,
 }
