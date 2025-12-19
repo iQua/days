@@ -30,7 +30,7 @@ use crate::l2::link::Link;
 use crate::l2::pfc::{PfcEgressGate, PfcIngressPort};
 #[cfg(feature = "l2_pfc")]
 use crate::next_link_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, DEFAULT_ECN_THRESHOLD};
+use crate::schedulers::drop::{CapacityUnit, DEFAULT_ECN_THRESHOLD, DropStrategy};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::sp::SPServer;

@@ -199,11 +199,7 @@ impl DcqcnPacketSource {
 
         debug!(
             "DCQCN source {} of flow {} sent packet {} ({} bytes) at time {:.3}.",
-            self.endpoint_id,
-            self.flow_id,
-            packet.packet_id,
-            packet.size,
-            now
+            self.endpoint_id, self.flow_id, packet.packet_id, packet.size, now
         );
     }
 

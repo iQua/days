@@ -91,9 +91,13 @@ impl PacketSource {
                 rng,
             ))),
             #[cfg(feature = "dcqcn")]
-            FlowType::DCQCN => PacketSource::DcqcnPacketSource(Box::new(
-                DcqcnPacketSource::new(flow_id, flow_start_after, traffic, priority, rng),
-            )),
+            FlowType::DCQCN => PacketSource::DcqcnPacketSource(Box::new(DcqcnPacketSource::new(
+                flow_id,
+                flow_start_after,
+                traffic,
+                priority,
+                rng,
+            ))),
         }
     }
 

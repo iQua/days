@@ -21,8 +21,8 @@ use nexosim::time::MonotonicTime;
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
 use crate::schedulers::drop::{
-    CapacityUnit, DropAction, DropStrategy, EcnThreshold, PacketDrop, RED, TailDrop,
-    DEFAULT_ECN_THRESHOLD,
+    CapacityUnit, DEFAULT_ECN_THRESHOLD, DropAction, DropStrategy, EcnThreshold, PacketDrop, RED,
+    TailDrop,
 };
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
@@ -163,11 +163,9 @@ impl VirtualClockServer {
                 scheduler_id,
                 true,
             )),
-            DropStrategy::EcnThreshold => Box::new(EcnThreshold::new(
-                capacity,
-                capacity_unit,
-                ecn_threshold,
-            )),
+            DropStrategy::EcnThreshold => {
+                Box::new(EcnThreshold::new(capacity, capacity_unit, ecn_threshold))
+            }
         };
 
         VirtualClockServer {

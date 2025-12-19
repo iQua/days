@@ -2,8 +2,8 @@
 
 use futures::executor::block_on;
 use nexosim::ports::EventSlot;
-use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
 
 use days::flows::dcqcn_sink::DcqcnPacketSink;
 use days::flows::dcqcn_source::DcqcnPacketSource;
@@ -15,8 +15,14 @@ fn make_dcqcn_traffic() -> TrafficCharacteristics {
         0.0,
         None,
         Some(10_000),
-        DistributionInfo::Uniform { low: 1.0, high: 1.0 },
-        DistributionInfo::DiscreteUniform { low: 1000, high: 1000 },
+        DistributionInfo::Uniform {
+            low: 1.0,
+            high: 1.0,
+        },
+        DistributionInfo::DiscreteUniform {
+            low: 1000,
+            high: 1000,
+        },
         None,
     );
 

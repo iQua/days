@@ -119,8 +119,7 @@ impl PacketDrop for EcnThreshold {
 
         let threshold_exceeded = match self.capacity_unit {
             CapacityUnit::Bytes => {
-                byte_size + packet_size
-                    > (threshold * self.capacity as f64).floor() as usize
+                byte_size + packet_size > (threshold * self.capacity as f64).floor() as usize
             }
             CapacityUnit::Packets => {
                 queue_length + 1 > (threshold * self.capacity as f64).floor() as usize
