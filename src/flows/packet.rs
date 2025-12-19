@@ -49,6 +49,8 @@ pub struct Packet {
     pub last_packet: bool,
     /// used by TCPPacketSource and TCPPacketSink
     pub ack: Option<TCPAck>,
+    /// Whether this packet was ECN-marked by the network.
+    pub ecn_marked: bool,
 }
 
 impl Packet {
@@ -64,6 +66,7 @@ impl Packet {
             last_packet: false,
             priority: 0,
             ack: None,
+            ecn_marked: false,
         }
     }
 
@@ -92,13 +95,14 @@ impl std::fmt::Display for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}, priority: {}",
+            "id: {}, flow_id: {}, creation time: {}, size: {}, queueing delay: {}, priority: {}, ecn_marked: {}",
             self.packet_id,
             self.flow_id,
             self.creation_time,
             self.size,
             self.queueing_delay,
-            self.priority
+            self.priority,
+            self.ecn_marked
         )
     }
 }

@@ -13,7 +13,7 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy, PacketDrop, RED, TailDrop};
+use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategy, PacketDrop, RED, TailDrop};
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
@@ -72,6 +72,16 @@ impl Port {
                 0.9,
                 0.8,
                 scheduler_id,
+                false,
+            )),
+            DropStrategy::RedEcn => Box::new(RED::new(
+                capacity,
+                capacity_unit,
+                0.7,
+                0.9,
+                0.8,
+                scheduler_id,
+                true,
             )),
         };
 
@@ -120,19 +130,24 @@ impl Port {
             );
         }
 
-        // drops the packet if the buffer is full
-        let should_drop_packet =
+        let mut packet = packet;
+        let drop_action =
             self.drop_strategy
-                .should_drop(packet.size, self.queue_length, self.queue.len());
+                .action(packet.size, self.queue_length, self.queue.len());
 
-        // the case that this packet will be dropped
-        if should_drop_packet {
-            self.packets_dropped += 1;
-            debug!(
-                "Port {} dropped packet {} from flow {} at time {:.8e}",
-                self.scheduler_id, packet.packet_id, packet.flow_id, packet.time
-            );
-            return;
+        match drop_action {
+            DropAction::Drop => {
+                self.packets_dropped += 1;
+                debug!(
+                    "Port {} dropped packet {} from flow {} at time {:.8e}",
+                    self.scheduler_id, packet.packet_id, packet.flow_id, packet.time
+                );
+                return;
+            }
+            DropAction::MarkEcn => {
+                packet.ecn_marked = true;
+            }
+            DropAction::Enqueue => {}
         }
 
         // the case that this packet will not be dropped
