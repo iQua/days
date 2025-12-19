@@ -34,7 +34,9 @@ pub struct PacketTimeout {
 #[derive(Debug, Clone)]
 struct SentPacketMeta {
     sent_time: f64,
+    first_sent_time: f64,
     delivered_at_send: usize,
+    delivered_time_at_send: f64,
     prior_inflight: usize,
     is_app_limited: bool,
 }
@@ -154,6 +156,9 @@ pub struct TCPPacketSource {
     app_limited: bool,
     pending_lost_bytes: usize,
     pending_ecn_marked: bool,
+    delivered: usize,
+    delivered_time: f64,
+    first_sent_time: f64,
 }
 
 impl fmt::Debug for TCPPacketSource {
@@ -240,6 +245,9 @@ impl TCPPacketSource {
             app_limited: false,
             pending_lost_bytes: 0,
             pending_ecn_marked: false,
+            delivered: 0,
+            delivered_time: 0.0,
+            first_sent_time: 0.0,
         }
     }
 
@@ -437,18 +445,25 @@ impl TCPPacketSource {
                 );
             }
 
-            let prev_last_ack = self.last_ack;
-            let delivered = if ack.sequence_num > prev_last_ack {
-                ack.sequence_num - prev_last_ack
+            let prev_delivered = self.delivered;
+            let delivered_bytes = if ack.sequence_num > prev_delivered {
+                ack.sequence_num - prev_delivered
             } else {
                 ack.acknowledged_size
             };
+            if delivered_bytes > 0 {
+                self.delivered = ack.sequence_num;
+                self.delivered_time = now;
+            }
+
             let sample_packet_id = ack
                 .sequence_num
                 .saturating_sub(ack.acknowledged_size);
             let mut rate_sample = RateSample {
-                delivered,
+                delivered: delivered_bytes,
                 interval: sample_rtt,
+                ack_elapsed: sample_rtt,
+                send_elapsed: sample_rtt,
                 rtt: sample_rtt,
                 acked: ack.acknowledged_size,
                 lost: self.pending_lost_bytes,
@@ -456,12 +471,16 @@ impl TCPPacketSource {
                 ..RateSample::default()
             };
             if let Some(meta) = self.sent_packet_meta.get(&sample_packet_id) {
-                let interval = now - meta.sent_time;
+                let ack_elapsed = (now - meta.delivered_time_at_send).max(0.0);
+                let send_elapsed = (meta.sent_time - meta.first_sent_time).max(0.0);
+                let interval = ack_elapsed.max(send_elapsed);
                 if interval > 0.0 {
                     rate_sample.interval = interval;
+                    rate_sample.ack_elapsed = ack_elapsed;
+                    rate_sample.send_elapsed = send_elapsed;
                 }
-                if ack.sequence_num >= meta.delivered_at_send {
-                    rate_sample.delivered = ack.sequence_num - meta.delivered_at_send;
+                if self.delivered >= meta.delivered_at_send {
+                    rate_sample.delivered = self.delivered - meta.delivered_at_send;
                 }
                 rate_sample.prior_inflight = meta.prior_inflight;
                 rate_sample.is_app_limited = meta.is_app_limited;
@@ -521,12 +540,17 @@ impl TCPPacketSource {
         self.sent_size_in_period += packet.size;
 
         let prior_inflight = self.next_seq.saturating_sub(self.last_ack);
+        if prior_inflight == 0 {
+            self.first_sent_time = now;
+        }
         let is_app_limited = self.app_limited || self.remaining_bytes == 0 || self.traffic_exceeded;
         self.sent_packet_meta.insert(
             packet.packet_id,
             SentPacketMeta {
                 sent_time: now,
+                first_sent_time: self.first_sent_time,
                 delivered_at_send: self.last_ack,
+                delivered_time_at_send: self.delivered_time,
                 prior_inflight,
                 is_app_limited,
             },

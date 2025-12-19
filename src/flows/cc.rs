@@ -10,6 +10,10 @@ pub struct RateSample {
     pub delivered: usize,
     /// Duration of the sample interval in seconds.
     pub interval: f64,
+    /// Time between the last delivered packet and this ACK, in seconds.
+    pub ack_elapsed: f64,
+    /// Time between the first and last packet sent in the sample, in seconds.
+    pub send_elapsed: f64,
     /// RTT sample in seconds.
     pub rtt: f64,
     /// Bytes acknowledged by this ACK.
@@ -44,6 +48,8 @@ impl AckEvent {
             rate_sample: RateSample {
                 delivered: bytes_acked,
                 interval: rtt,
+                ack_elapsed: rtt,
+                send_elapsed: rtt,
                 rtt,
                 acked: bytes_acked,
                 ..RateSample::default()
