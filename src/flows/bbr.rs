@@ -494,31 +494,32 @@ impl BBRState {
     fn maybe_advance_probe_bw_phase(&mut self, now: f64, prior_inflight: usize) {
         let rounds_in_phase = self.round_count.saturating_sub(self.probe_bw_phase_start_round);
         let target = self.target_inflight();
+        let inflight = self.inflight.max(prior_inflight);
 
         let next_phase = match self.probe_bw_phase {
             ProbeBWPhase::Down => {
-                if prior_inflight <= target || rounds_in_phase >= 1 {
+                if inflight <= target || rounds_in_phase >= 1 {
                     Some(ProbeBWPhase::Cruise)
                 } else {
                     None
                 }
             }
             ProbeBWPhase::Cruise => {
-                if rounds_in_phase >= 1 {
+                if inflight >= target || rounds_in_phase >= 1 {
                     Some(ProbeBWPhase::Refill)
                 } else {
                     None
                 }
             }
             ProbeBWPhase::Refill => {
-                if rounds_in_phase >= 1 {
+                if inflight >= target || rounds_in_phase >= 1 {
                     Some(ProbeBWPhase::Up)
                 } else {
                     None
                 }
             }
             ProbeBWPhase::Up => {
-                if rounds_in_phase >= 1 {
+                if inflight >= target || rounds_in_phase >= 1 {
                     Some(ProbeBWPhase::Down)
                 } else {
                     None
