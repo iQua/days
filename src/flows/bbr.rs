@@ -105,8 +105,8 @@ pub enum ProbeBWPhase {
 }
 
 impl BBRState {
-    const STARTUP_PACING_GAIN: f64 = 2.885;
-    const DRAIN_PACING_GAIN: f64 = 1.0 / 2.885;
+    const STARTUP_PACING_GAIN: f64 = 2.77;
+    const DRAIN_PACING_GAIN: f64 = 0.35;
     const PROBE_BW_PACING_GAIN_DOWN: f64 = 0.90;
     const PROBE_BW_PACING_GAIN_CRUISE: f64 = 1.0;
     const PROBE_BW_PACING_GAIN_REFILL: f64 = 1.0;
