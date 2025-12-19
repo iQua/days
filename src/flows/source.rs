@@ -293,7 +293,14 @@ impl PacketSource {
                         .unwrap();
                 }
             }
-            PacketSource::TCPPacketSource(source) => source.send_packet(now).await,
+            PacketSource::TCPPacketSource(source) => {
+                if let Some(interval) = source.send_packet(now).await {
+                    if interval > 0.0 {
+                        cx.schedule_event(Duration::from_secs_f64(interval), Self::run, ())
+                            .unwrap();
+                    }
+                }
+            }
         }
     }
 
@@ -356,6 +363,12 @@ impl PacketSource {
                     }
                 };
 
+                now = global_time;
+            }
+
+            if let PacketSource::TCPPacketSource(source) = self {
+                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                source.time = global_time;
                 now = global_time;
             }
 

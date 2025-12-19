@@ -140,7 +140,9 @@ impl TCPPacketSink {
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
                 acknowledged_size: packet.size,
+                ecn_marked: packet.ecn_marked,
             }),
+            ecn_marked: false,
         };
 
         // sends the acknowledgment packet out to the TCPPacketSource now

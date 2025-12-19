@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use crate::flows::cc::CongestionControl;
+use crate::flows::cc::{AckEvent, CongestionControl, RateSample};
 
 #[derive(Debug)]
 pub struct BBRState {
@@ -17,7 +17,7 @@ pub struct BBRState {
     /// The amount of data in flight
     pub inflight: usize,
     /// Recent bandwidth samples
-    pub bw_samples: VecDeque<f64>,
+    pub bw_samples: VecDeque<(f64, u64)>,
     /// Recent RTT samples
     pub rtt_samples: VecDeque<(f64, f64)>, // (rtt_sample, timestamp)
     /// Pacing rate
@@ -32,6 +32,10 @@ pub struct BBRState {
     pub inflight_hi: usize,
     /// Inflight lower bound
     pub inflight_lo: usize,
+    /// Short-term inflight cap based on recent loss
+    pub inflight_shortterm: usize,
+    /// Long-term inflight cap based on persistent loss
+    pub inflight_longterm: usize,
     /// Loss event flag
     pub loss_in_round: bool,
     /// ECN event flag
@@ -46,28 +50,42 @@ pub struct BBRState {
     pub max_cwnd: usize,
     /// Timestamp of last RTT sample
     pub last_rtt_sample_time: f64,
+    /// Most recent RTT sample
+    pub last_rtt: f64,
     /// Start time of the current round
     pub round_start_time: f64,
     /// Total data delivered so far
     pub total_data_delivered: usize,
-    /// Number of rounds spent in ProbeUp
-    pub probe_up_rounds: usize,
-    /// Target number of rounds to stay in ProbeUp
-    pub target_probe_up_rounds: usize,
-    /// Number of rounds spent in ProbeCruise
-    pub cruise_rounds: usize,
-    /// Timestamp when entered ProbeCruise
-    pub cruise_start_time: f64,
-    /// Minimum time to stay in ProbeCruise before ProbeUp (seconds)
-    pub min_cruise_time: f64,
-    /// Maximum time to stay in ProbeCruise before ProbeUp (seconds)
-    pub max_cruise_time: f64,
-    /// Random cruise duration within min/max range
-    pub current_cruise_duration: f64,
-    /// Number of RTTs without loss/ECN needed before ProbeUp
-    pub stable_rounds_needed: usize,
-    /// Counter for rounds without loss/ECN
-    pub stable_rounds: usize,
+    /// Bytes delivered in the current round
+    pub round_delivered: usize,
+    /// Bytes lost in the current round
+    pub round_lost: usize,
+    /// Current ProbeBW cycle index
+    pub probe_bw_cycle: u64,
+    /// ProbeBW phase (only valid in ProbeBW mode)
+    pub probe_bw_phase: ProbeBWPhase,
+    /// Timestamp when current ProbeBW phase began
+    pub probe_bw_phase_start: f64,
+    /// Round count when current ProbeBW phase began
+    pub probe_bw_phase_start_round: usize,
+    /// Max bandwidth at last full-bw check
+    pub full_bw: f64,
+    /// Number of rounds without sufficient bandwidth growth
+    pub full_bw_count: usize,
+    /// Whether full bandwidth is reached
+    pub full_bw_reached: bool,
+    /// Timestamp of last min_rtt update
+    pub min_rtt_stamp: f64,
+    /// Estimated extra ACKed bytes (ACK aggregation)
+    pub extra_acked: f64,
+    /// Recent extra_acked samples
+    pub extra_acked_samples: VecDeque<(f64, f64)>, // (extra_acked, timestamp)
+    /// Timestamp when ProbeRTT started
+    pub probe_rtt_start: f64,
+    /// When ProbeRTT can exit (0 if not scheduled)
+    pub probe_rtt_done_stamp: f64,
+    /// Whether we've completed a ProbeRTT round
+    pub probe_rtt_round_done: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
@@ -75,78 +93,111 @@ pub enum BBRMode {
     #[default]
     Startup,
     Drain,
-    ProbeUp,
-    ProbeDown,
-    ProbeCruise,
+    ProbeBW,
     ProbeRTT,
-    Stall,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum ProbeBWPhase {
+    #[default]
+    Down,
+    Cruise,
+    Refill,
+    Up,
 }
 
 impl BBRState {
+    const STARTUP_PACING_GAIN: f64 = 2.77;
+    const DRAIN_PACING_GAIN: f64 = 0.35;
+    const PROBE_BW_PACING_GAIN_DOWN: f64 = 0.90;
+    const PROBE_BW_PACING_GAIN_CRUISE: f64 = 1.0;
+    const PROBE_BW_PACING_GAIN_REFILL: f64 = 1.0;
+    const PROBE_BW_PACING_GAIN_UP: f64 = 1.25;
+    const PROBE_BW_CWND_GAIN_UP: f64 = 2.25;
+    const CWND_GAIN: f64 = 2.0;
+    const PROBE_RTT_CWND_GAIN: f64 = 0.5;
+    const MIN_RTT_FILTER_SEC: f64 = 10.0;
+    const PROBE_RTT_INTERVAL_SEC: f64 = 5.0;
+    const PROBE_RTT_DURATION_SEC: f64 = 0.2;
+    const FULL_BW_THRESH: f64 = 1.25;
+    const FULL_BW_CNT: usize = 3;
+    const LOSS_THRESH: f64 = 0.02;
+    const BETA: f64 = 0.7;
+
     pub fn new(mss: usize) -> Self {
-        let mut state = BBRState {
+        BBRState {
             mode: BBRMode::Startup,
             max_bw: 0.0,
             min_rtt: f64::INFINITY,
             inflight: 0,
-            bw_samples: VecDeque::with_capacity(10),
+            bw_samples: VecDeque::with_capacity(32),
             rtt_samples: VecDeque::with_capacity(10),
             pacing_rate: 0.0,
-            cwnd: 10 * mss,   // Initial cwnd
-            pacing_gain: 2.0, // Initial pacing gain in Startup
-            cwnd_gain: 2.0,   // Initial cwnd gain in Startup
+            cwnd: 10 * mss, // Initial cwnd
+            pacing_gain: Self::STARTUP_PACING_GAIN,
+            cwnd_gain: Self::CWND_GAIN,
             inflight_hi: usize::MAX,
             inflight_lo: 0,
+            inflight_shortterm: 0,
+            inflight_longterm: 0,
             loss_in_round: false,
             ecn_in_round: false,
             round_count: 0,
             next_round_delivered: 0,
             round_start_time: 0.0,
             last_rtt_sample_time: 0.0,
+            last_rtt: 0.0,
             mss,
             max_cwnd: 2_000_000 * mss, // 2M segments
             total_data_delivered: 0,
-            probe_up_rounds: 0,
-            target_probe_up_rounds: 8, // As per BBRv3
-            cruise_rounds: 0,
-            cruise_start_time: 0.0,
-            min_cruise_time: 2.0,  // Minimum 2 seconds in cruise
-            max_cruise_time: 10.0, // Maximum 10 seconds in cruise
-            current_cruise_duration: 0.0,
-            stable_rounds_needed: 4, // Need 4 stable rounds before ProbeUp
-            stable_rounds: 0,
-        };
-
-        // Initialize random cruise duration
-        state.randomize_cruise_duration();
-
-        state
-    }
-
-    fn randomize_cruise_duration(&mut self) {
-        // Simple random duration between min and max cruise time
-        // In production, use a proper random number generator
-        let random_factor = 0.5; // 0.0 to 1.0
-        self.current_cruise_duration =
-            self.min_cruise_time + (self.max_cruise_time - self.min_cruise_time) * random_factor;
+            round_delivered: 0,
+            round_lost: 0,
+            probe_bw_cycle: 0,
+            probe_bw_phase: ProbeBWPhase::Down,
+            probe_bw_phase_start: 0.0,
+            probe_bw_phase_start_round: 0,
+            full_bw: 0.0,
+            full_bw_count: 0,
+            full_bw_reached: false,
+            min_rtt_stamp: 0.0,
+            extra_acked: 0.0,
+            extra_acked_samples: VecDeque::with_capacity(10),
+            probe_rtt_start: 0.0,
+            probe_rtt_done_stamp: 0.0,
+            probe_rtt_round_done: false,
+        }
     }
 
     pub fn min_cwnd(&self) -> usize {
         4 * self.mss
     }
 
-    pub fn update_bandwidth(&mut self, bytes_acked: usize, rtt: f64) {
-        // Calculate sample bandwidth
-        let bw_sample = bytes_acked as f64 / rtt;
+    pub fn update_bandwidth(&mut self, bytes_acked: usize, rtt: f64, rate_sample: &RateSample) {
+        // Calculate sample bandwidth (prefer delivery-rate sample when available)
+        let bw_sample = if rate_sample.interval > 0.0 && rate_sample.delivered > 0 {
+            rate_sample.delivered as f64 / rate_sample.interval
+        } else {
+            bytes_acked as f64 / rtt
+        };
 
-        // Add to bandwidth samples
-        self.bw_samples.push_back(bw_sample);
-        if self.bw_samples.len() > 10 {
-            self.bw_samples.pop_front();
+        // Skip app-limited samples unless they exceed current max
+        if rate_sample.is_app_limited && bw_sample <= self.max_bw {
+            return;
         }
 
+        // Add to bandwidth samples with cycle index
+        self.bw_samples.push_back((bw_sample, self.probe_bw_cycle));
+
+        // Keep samples from the last 2 ProbeBW cycles
+        let oldest_cycle = self.probe_bw_cycle.saturating_sub(1);
+        self.bw_samples.retain(|&(_, cycle)| cycle >= oldest_cycle);
+
         // Update max_bw as windowed maximum over bw_samples
-        self.max_bw = self.bw_samples.iter().cloned().fold(0.0, f64::max);
+        self.max_bw = self
+            .bw_samples
+            .iter()
+            .map(|&(bw, _)| bw)
+            .fold(0.0, f64::max);
     }
 
     pub fn update_min_rtt(&mut self, rtt: f64, now: f64) {
@@ -154,19 +205,49 @@ impl BBRState {
         self.rtt_samples.push_back((rtt, now));
 
         // Remove old samples outside the window
-        let window_duration = 10.0; // seconds
+        let window_duration = Self::MIN_RTT_FILTER_SEC;
         self.rtt_samples
             .retain(|&(_, t)| now - t <= window_duration);
 
         // Update min_rtt as windowed minimum over specified time
+        let prev_min_rtt = self.min_rtt;
         self.min_rtt = self
             .rtt_samples
             .iter()
             .map(|&(rtt_sample, _)| rtt_sample)
             .fold(f64::INFINITY, f64::min);
+
+        if self.min_rtt < prev_min_rtt {
+            self.min_rtt_stamp = now;
+        }
     }
 
-    pub fn update_round(&mut self, ack_seq: usize) {
+    pub fn update_extra_acked(&mut self, rate_sample: &RateSample, now: f64) {
+        if !self.min_rtt.is_finite() || self.max_bw == 0.0 || rate_sample.interval <= 0.0 {
+            return;
+        }
+
+        let expected = self.max_bw * rate_sample.interval;
+        let delivered = rate_sample.delivered as f64;
+        let extra = (delivered - expected).max(0.0);
+
+        self.extra_acked_samples.push_back((extra, now));
+        if self.extra_acked_samples.len() > 10 {
+            self.extra_acked_samples.pop_front();
+        }
+
+        // Keep extra_acked samples within the min RTT filter window
+        self.extra_acked_samples
+            .retain(|&(_, t)| now - t <= Self::MIN_RTT_FILTER_SEC);
+        self.extra_acked = self
+            .extra_acked_samples
+            .iter()
+            .map(|&(val, _)| val)
+            .fold(0.0, f64::max);
+    }
+
+    pub fn update_round(&mut self, ack_seq: usize) -> bool {
+        let mut new_round = false;
         // Initialize next_round_delivered if it's zero
         if self.next_round_delivered == 0 {
             self.next_round_delivered = self.total_data_delivered;
@@ -174,6 +255,7 @@ impl BBRState {
 
         // A new round trip has started if the ACKed sequence is beyond next_round_delivered
         if ack_seq >= self.next_round_delivered {
+            new_round = true;
             self.round_count += 1;
             self.next_round_delivered = self.total_data_delivered;
 
@@ -181,39 +263,42 @@ impl BBRState {
             self.loss_in_round = false;
             self.ecn_in_round = false;
             self.round_start_time = self.last_rtt_sample_time;
-
-            // Increment probe_up_rounds if in ProbeUp
-            if self.mode == BBRMode::ProbeUp {
-                self.probe_up_rounds += 1;
-            }
         }
 
-        if self.mode == BBRMode::ProbeCruise {
-            self.cruise_rounds += 1;
-
-            // Update stable rounds counter
-            if !self.loss_in_round && !self.ecn_in_round {
-                self.stable_rounds += 1;
-            } else {
-                self.stable_rounds = 0;
-            }
-        }
+        new_round
     }
 
-    pub fn on_ack_received(
-        &mut self,
-        ack_seq: usize,
-        bytes_acked: usize,
-        rtt: f64,
-        now: f64,
-        loss_occurred: bool,
-        ecn_marked: bool,
-    ) {
+    pub fn on_ack_received(&mut self, event: &AckEvent) {
+        let ack_seq = event.ack_seq;
+        let bytes_acked = event.bytes_acked;
+        let rtt = event.rtt;
+        let now = event.now;
+        let loss_occurred = event.rate_sample.lost > 0;
+        let ecn_marked = event.rate_sample.ecn_marked;
+
         self.total_data_delivered = ack_seq;
         self.last_rtt_sample_time = now;
-        self.update_round(ack_seq);
-        self.update_bandwidth(bytes_acked, rtt);
+        self.last_rtt = rtt;
+        let new_round = self.update_round(ack_seq);
+        if new_round {
+            self.handle_round_end(now, event.rate_sample.prior_inflight);
+        }
+        self.update_bandwidth(bytes_acked, rtt, &event.rate_sample);
         self.update_min_rtt(rtt, now);
+        self.update_extra_acked(&event.rate_sample, now);
+
+        self.round_delivered = self.round_delivered.saturating_add(bytes_acked);
+        self.round_lost = self.round_lost.saturating_add(event.rate_sample.lost);
+
+        if new_round {
+            self.update_full_bw();
+            if self.mode == BBRMode::ProbeBW {
+                self.maybe_advance_probe_bw_phase(now, event.rate_sample.prior_inflight);
+            }
+            if self.mode == BBRMode::ProbeRTT {
+                self.probe_rtt_round_done = true;
+            }
+        }
 
         if loss_occurred {
             self.loss_in_round = true;
@@ -223,48 +308,48 @@ impl BBRState {
             self.ecn_in_round = true;
         }
 
-        // Adjust inflight_hi if loss or ECN occurs
-        if self.loss_in_round || self.ecn_in_round {
-            let bdp = self.max_bw * self.min_rtt;
-            self.inflight_hi = (bdp * self.cwnd_gain) as usize;
-            self.inflight_hi = self.inflight_hi.min(self.cwnd);
-        }
-
         // Update pacing rate and cwnd
         self.calculate_pacing_rate();
         self.calculate_cwnd();
 
         // Mode transitions
-        self.check_mode_transitions();
+        self.check_mode_transitions(now);
 
-        // Update inflight
-        self.inflight = self.inflight.saturating_sub(bytes_acked);
-
-        // Reset stable rounds on loss/ECN
-        if loss_occurred || ecn_marked {
-            self.stable_rounds = 0;
-        }
-
-        // Update cruise start time when entering ProbeCruise
-        if self.mode == BBRMode::ProbeCruise
-            && (self.cruise_start_time == 0.0 || self.cruise_rounds == 0)
-        {
-            self.cruise_start_time = now;
-            self.cruise_rounds = 0;
-            self.stable_rounds = 0;
-        }
+        // Update inflight (acked + lost leave flight)
+        let lost_bytes = event.rate_sample.lost;
+        self.inflight = self
+            .inflight
+            .saturating_sub(bytes_acked.saturating_add(lost_bytes));
     }
 
     pub fn calculate_pacing_rate(&mut self) {
-        self.pacing_rate = self.max_bw * self.pacing_gain;
+        if self.pacing_rate == 0.0 && self.last_rtt > 0.0 && self.cwnd > 0 {
+            self.pacing_rate = self.cwnd as f64 / self.last_rtt;
+        }
+
+        let target_rate = self.max_bw * self.pacing_gain;
+        if target_rate > 0.0 && (self.full_bw_reached || target_rate > self.pacing_rate) {
+            self.pacing_rate = target_rate;
+        }
     }
 
     pub fn calculate_cwnd(&mut self) {
         let bdp = self.max_bw * self.min_rtt;
-        let target_cwnd = (bdp * self.cwnd_gain) as usize;
+        let target_cwnd = (bdp * self.cwnd_gain + self.extra_acked) as usize;
 
+        let mut inflight_cap = usize::MAX;
+        if self.inflight_longterm > 0 {
+            inflight_cap = inflight_cap.min(self.inflight_longterm);
+        }
+        if self.inflight_shortterm > 0 {
+            inflight_cap = inflight_cap.min(self.inflight_shortterm);
+        }
         if self.inflight_hi != usize::MAX {
-            self.cwnd = target_cwnd.min(self.inflight_hi);
+            inflight_cap = inflight_cap.min(self.inflight_hi);
+        }
+
+        if inflight_cap != usize::MAX {
+            self.cwnd = target_cwnd.min(inflight_cap);
         } else {
             self.cwnd = target_cwnd;
         }
@@ -273,76 +358,236 @@ impl BBRState {
         self.cwnd = self.cwnd.clamp(self.min_cwnd(), self.max_cwnd);
     }
 
-    pub fn check_mode_transitions(&mut self) {
+    pub fn check_mode_transitions(&mut self, now: f64) {
+        if self.mode != BBRMode::ProbeRTT
+            && self.min_rtt.is_finite()
+            && self.min_rtt_stamp > 0.0
+            && now - self.min_rtt_stamp > Self::PROBE_RTT_INTERVAL_SEC
+        {
+            self.enter_probe_rtt(now);
+            return;
+        }
+
         match self.mode {
             BBRMode::Startup => {
-                // Check if exiting Startup
-                if self.loss_in_round || self.ecn_in_round {
-                    self.mode = BBRMode::Drain;
-                    self.pacing_gain = 1.0; // Set to 1.0 in Drain
-                    self.cwnd_gain = 1.0;
+                if self.full_bw_reached {
+                    self.enter_drain();
                 }
             }
             BBRMode::Drain => {
-                // Transition to ProbeUp when inflight <= BDP
                 let bdp = self.max_bw * self.min_rtt;
                 if self.inflight <= (bdp as usize) {
-                    self.mode = BBRMode::ProbeUp;
-                    self.pacing_gain = 1.25;
-                    self.cwnd_gain = 1.25;
+                    self.enter_probe_bw(now);
                 }
             }
-            BBRMode::ProbeUp => {
-                // Transition to ProbeDown if loss or ECN occurs
-                if self.loss_in_round || self.ecn_in_round {
-                    self.mode = BBRMode::ProbeDown;
-                    self.pacing_gain = 0.75;
-                    self.cwnd_gain = 0.75;
-                }
-                // Otherwise, stay in ProbeUp
-            }
-            BBRMode::ProbeDown => {
-                let bdp = self.max_bw * self.min_rtt;
-                // Transition to ProbeCruise when inflight <= BDP
-                if self.inflight <= (bdp as usize) {
-                    self.mode = BBRMode::ProbeCruise;
-                    self.pacing_gain = 1.0;
-                    self.cwnd_gain = 1.0;
-                }
-            }
-            BBRMode::ProbeCruise => {
-                let time_in_cruise = self.last_rtt_sample_time - self.cruise_start_time;
-
-                // Check if we've been in cruise mode long enough
-                if time_in_cruise >= self.current_cruise_duration {
-                    // Check if network is stable enough for ProbeUp
-                    if self.stable_rounds >= self.stable_rounds_needed {
-                        // Transition to ProbeUp
-                        self.mode = BBRMode::ProbeUp;
-                        self.pacing_gain = 1.25;
-                        self.cwnd_gain = 1.25;
-                        self.probe_up_rounds = 0;
-                        self.randomize_cruise_duration(); // Prepare for next cruise
-                    }
-                }
-            }
+            BBRMode::ProbeBW => {}
             BBRMode::ProbeRTT => {
-                // Reduce inflight to minimal cwnd
-                self.cwnd = self.min_cwnd();
-                // Logic to exit ProbeRTT could be added here
-            }
-            BBRMode::Stall => {
-                // Logic for Stall mode if applicable
-                // For simplicity, transition back to Startup
-                self.mode = BBRMode::Startup;
-                self.pacing_gain = 2.0;
-                self.cwnd_gain = 2.0;
+                self.handle_probe_rtt(now);
             }
         }
     }
 
-    pub fn on_packet_sent(&mut self, _seq: usize, now: f64) {
+    fn update_full_bw(&mut self) {
+        if self.mode != BBRMode::Startup {
+            return;
+        }
+
+        if self.full_bw == 0.0 {
+            self.full_bw = self.max_bw;
+            self.full_bw_count = 0;
+            return;
+        }
+
+        if self.max_bw >= self.full_bw * Self::FULL_BW_THRESH {
+            self.full_bw = self.max_bw;
+            self.full_bw_count = 0;
+        } else {
+            self.full_bw_count += 1;
+            if self.full_bw_count >= Self::FULL_BW_CNT {
+                self.full_bw_reached = true;
+            }
+        }
+    }
+
+    fn target_inflight(&self) -> usize {
+        let bdp = self.max_bw * self.min_rtt;
+        let target = (bdp * self.cwnd_gain + self.extra_acked) as usize;
+        target.clamp(self.min_cwnd(), self.max_cwnd)
+    }
+
+    fn handle_round_end(&mut self, now: f64, prior_inflight: usize) {
+        if self.round_delivered == 0 && self.round_lost == 0 {
+            return;
+        }
+
+        let loss_rate =
+            self.round_lost as f64 / (self.round_lost + self.round_delivered).max(1) as f64;
+
+        if loss_rate > Self::LOSS_THRESH {
+            if self.mode == BBRMode::Startup {
+                self.full_bw_reached = true;
+                self.enter_drain();
+            }
+
+            let target = self.target_inflight() as f64;
+            let candidate = (target * Self::BETA)
+                .max(prior_inflight as f64)
+                .max(self.min_cwnd() as f64) as usize;
+
+            if self.inflight_longterm == 0 {
+                self.inflight_longterm = candidate;
+            } else {
+                self.inflight_longterm = self.inflight_longterm.min(candidate);
+            }
+
+            if self.inflight_shortterm == 0 {
+                self.inflight_shortterm = candidate;
+            } else {
+                self.inflight_shortterm = self.inflight_shortterm.min(candidate);
+            }
+
+            if self.mode == BBRMode::ProbeBW && self.probe_bw_phase == ProbeBWPhase::Up {
+                self.probe_bw_phase = ProbeBWPhase::Down;
+                self.probe_bw_phase_start = now;
+                self.probe_bw_phase_start_round = self.round_count;
+                self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
+                self.cwnd_gain = Self::CWND_GAIN;
+                self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+            }
+        }
+
+        self.round_delivered = 0;
+        self.round_lost = 0;
+    }
+
+    fn enter_startup(&mut self) {
+        self.mode = BBRMode::Startup;
+        self.pacing_gain = Self::STARTUP_PACING_GAIN;
+        self.cwnd_gain = Self::CWND_GAIN;
+        self.full_bw = 0.0;
+        self.full_bw_count = 0;
+        self.full_bw_reached = false;
+        self.inflight_shortterm = 0;
+        self.inflight_longterm = 0;
+    }
+
+    fn enter_drain(&mut self) {
+        self.mode = BBRMode::Drain;
+        self.pacing_gain = Self::DRAIN_PACING_GAIN;
+        self.cwnd_gain = Self::CWND_GAIN;
+    }
+
+    fn enter_probe_bw(&mut self, now: f64) {
+        self.mode = BBRMode::ProbeBW;
+        self.probe_bw_phase = ProbeBWPhase::Down;
+        self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+        self.probe_bw_phase_start = now;
+        self.probe_bw_phase_start_round = self.round_count;
+        self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
+        self.cwnd_gain = Self::CWND_GAIN;
+        self.inflight_shortterm = 0;
+    }
+
+    fn maybe_advance_probe_bw_phase(&mut self, now: f64, prior_inflight: usize) {
+        let rounds_in_phase = self
+            .round_count
+            .saturating_sub(self.probe_bw_phase_start_round);
+        let target = self.target_inflight();
+        let inflight = self.inflight.max(prior_inflight);
+
+        let next_phase = match self.probe_bw_phase {
+            ProbeBWPhase::Down => {
+                if inflight <= target || rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Cruise)
+                } else {
+                    None
+                }
+            }
+            ProbeBWPhase::Cruise => {
+                if inflight >= target || rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Refill)
+                } else {
+                    None
+                }
+            }
+            ProbeBWPhase::Refill => {
+                if inflight >= target || rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Up)
+                } else {
+                    None
+                }
+            }
+            ProbeBWPhase::Up => {
+                if inflight >= target || rounds_in_phase >= 1 {
+                    Some(ProbeBWPhase::Down)
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(next_phase) = next_phase {
+            self.probe_bw_phase = next_phase;
+            if self.probe_bw_phase == ProbeBWPhase::Down {
+                self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+                self.inflight_shortterm = 0;
+            }
+            self.probe_bw_phase_start = now;
+            self.probe_bw_phase_start_round = self.round_count;
+            self.pacing_gain = match self.probe_bw_phase {
+                ProbeBWPhase::Down => Self::PROBE_BW_PACING_GAIN_DOWN,
+                ProbeBWPhase::Cruise => Self::PROBE_BW_PACING_GAIN_CRUISE,
+                ProbeBWPhase::Refill => Self::PROBE_BW_PACING_GAIN_REFILL,
+                ProbeBWPhase::Up => Self::PROBE_BW_PACING_GAIN_UP,
+            };
+            self.cwnd_gain = match self.probe_bw_phase {
+                ProbeBWPhase::Up => Self::PROBE_BW_CWND_GAIN_UP,
+                _ => Self::CWND_GAIN,
+            };
+        }
+    }
+
+    fn enter_probe_rtt(&mut self, now: f64) {
+        self.mode = BBRMode::ProbeRTT;
+        self.pacing_gain = 1.0;
+        self.cwnd_gain = Self::PROBE_RTT_CWND_GAIN;
+        self.probe_rtt_start = now;
+        self.probe_rtt_done_stamp = 0.0;
+        self.probe_rtt_round_done = false;
+    }
+
+    fn handle_probe_rtt(&mut self, now: f64) {
+        let bdp = self.max_bw * self.min_rtt;
+        let target_inflight = self
+            .min_cwnd()
+            .max((bdp * Self::PROBE_RTT_CWND_GAIN) as usize);
+
+        if self.probe_rtt_done_stamp == 0.0 {
+            if self.inflight <= target_inflight {
+                self.probe_rtt_done_stamp = now + Self::PROBE_RTT_DURATION_SEC;
+            }
+            return;
+        }
+
+        if self.inflight > target_inflight {
+            self.probe_rtt_done_stamp = 0.0;
+            self.probe_rtt_round_done = false;
+            return;
+        }
+
+        if now >= self.probe_rtt_done_stamp && self.probe_rtt_round_done {
+            self.min_rtt_stamp = now;
+            if self.full_bw_reached {
+                self.enter_probe_bw(now);
+            } else {
+                self.enter_startup();
+            }
+        }
+    }
+
+    pub fn on_packet_sent(&mut self, bytes: usize, now: f64) {
         self.last_rtt_sample_time = now;
+        self.inflight = self.inflight.saturating_add(bytes);
     }
 
     pub fn on_loss_detected(&mut self) {
@@ -351,10 +596,10 @@ impl BBRState {
 
     pub fn on_timer_expired(&mut self) {
         // Handle RTO event
-        self.mode = BBRMode::Startup;
-        self.pacing_gain = 2.0;
-        self.cwnd_gain = 2.0;
+        self.enter_startup();
         self.inflight_hi = usize::MAX;
+        self.inflight_shortterm = 0;
+        self.inflight_longterm = 0;
     }
 
     pub fn get_cwnd(&self) -> usize {
@@ -388,12 +633,12 @@ impl TCPBBR {
 }
 
 impl CongestionControl for TCPBBR {
-    fn ack_received(&mut self, ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) {
-        let loss_occurred = false; // Placeholder, should be detected from network layer
-        let ecn_marked = false; // Placeholder, should be detected from network layer
+    fn ack_received(&mut self, event: AckEvent) {
+        self.state.on_ack_received(&event);
+    }
 
-        self.state
-            .on_ack_received(ack_seq, bytes_acked, rtt, now, loss_occurred, ecn_marked);
+    fn packet_sent(&mut self, bytes: usize, now: f64) {
+        self.state.on_packet_sent(bytes, now);
     }
 
     fn timer_expired(&mut self) {
@@ -427,8 +672,23 @@ mod tests {
         loss_occurred: bool,
         ecn_marked: bool,
     ) {
-        bbr.state
-            .on_ack_received(ack_seq, bytes_acked, rtt, now, loss_occurred, ecn_marked);
+        let rate_sample = RateSample {
+            delivered: bytes_acked,
+            interval: rtt,
+            rtt,
+            acked: bytes_acked,
+            lost: if loss_occurred { bytes_acked } else { 0 },
+            ecn_marked,
+            ..RateSample::default()
+        };
+        let event = AckEvent {
+            ack_seq,
+            rtt,
+            now,
+            bytes_acked,
+            rate_sample,
+        };
+        bbr.state.on_ack_received(&event);
         // Increase inflight by bytes sent
         bbr.state.inflight += bytes_acked;
     }
@@ -451,43 +711,34 @@ mod tests {
         let mut bbr = TCPBBR::new();
         bbr.state.min_rtt = 0.1;
 
-        // Simulate ACKs with loss occurring to trigger transitions
-        for i in 1..100 {
+        // Drive full_bw detection to exit Startup and enter ProbeBW
+        for i in 1..=5 {
             let now = i as f64 * 0.1;
             let rtt = 0.1;
             let bytes_acked = 1024;
-            let loss_occurred = i == 10; // Simulate loss at i == 10
-            let ecn_marked = false;
             let ack_seq = i * bytes_acked;
 
-            simulate_ack(
-                &mut bbr,
-                ack_seq,
-                rtt,
-                now,
-                bytes_acked,
-                loss_occurred,
-                ecn_marked,
-            );
-
-            // Check mode transitions
-            if i == 10 {
-                assert_eq!(
-                    bbr.state.mode,
-                    BBRMode::Drain,
-                    "At i==10: Expected Drain, got {:?}",
-                    bbr.state.mode
-                );
-            }
-            if i == 20 {
-                assert_eq!(
-                    bbr.state.mode,
-                    BBRMode::ProbeUp,
-                    "At i==20: Expected ProbeUp, got {:?}",
-                    bbr.state.mode
-                );
-            }
+            simulate_ack(&mut bbr, ack_seq, rtt, now, bytes_acked, false, false);
         }
+
+        assert_eq!(bbr.state.mode, BBRMode::ProbeBW);
+        assert_eq!(bbr.state.probe_bw_phase, ProbeBWPhase::Down);
+
+        // Next ACK should advance ProbeBW phase
+        simulate_ack(&mut bbr, 6 * 1024, 0.1, 0.6, 1024, false, false);
+        assert_eq!(bbr.state.probe_bw_phase, ProbeBWPhase::Cruise);
+    }
+
+    #[test]
+    fn test_probe_rtt_entry() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.min_rtt = 0.1;
+        bbr.state.min_rtt_stamp = 1.0;
+        bbr.state.mode = BBRMode::ProbeBW;
+
+        // Force min_rtt expiration
+        simulate_ack(&mut bbr, 1024, 0.1, 7.0, 1024, false, false);
+        assert_eq!(bbr.state.mode, BBRMode::ProbeRTT);
     }
 
     #[test]

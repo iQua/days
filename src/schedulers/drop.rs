@@ -20,11 +20,20 @@ pub enum CapacityUnit {
 pub enum DropStrategy {
     TailDrop,
     RED,
+    #[serde(rename = "RED_ECN")]
+    RedEcn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropAction {
+    Enqueue,
+    Drop,
+    MarkEcn,
 }
 
 /// Defines the interface for all packet drop strategies.
 pub trait PacketDrop {
-    fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool;
+    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction;
 }
 
 /// TailDrop is a packet drop strategy that drops packets when the buffer is full.
@@ -43,10 +52,16 @@ impl TailDrop {
 }
 
 impl PacketDrop for TailDrop {
-    fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool {
-        match self.capacity_unit {
+    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
+        let overflow = match self.capacity_unit {
             CapacityUnit::Bytes => self.capacity > 0 && byte_size + packet_size > self.capacity,
             CapacityUnit::Packets => self.capacity > 0 && queue_length + 1 > self.capacity,
+        };
+
+        if overflow {
+            DropAction::Drop
+        } else {
+            DropAction::Enqueue
         }
     }
 }
@@ -61,6 +76,7 @@ pub struct RED {
     weight_factor: u32,
     avg_queue_length: usize,
     rng: SmallRng,
+    ecn: bool,
 }
 
 impl RED {
@@ -71,6 +87,7 @@ impl RED {
         max_threshold: f64,
         max_probability: f64,
         seed: usize,
+        ecn: bool,
     ) -> RED {
         let global_seed = get_seed();
         let rng = match global_seed {
@@ -87,14 +104,15 @@ impl RED {
             weight_factor: 9,
             avg_queue_length: 0,
             rng,
+            ecn,
         }
     }
 }
 
 impl PacketDrop for RED {
-    fn should_drop(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> bool {
+    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
         if self.capacity == 0 {
-            return false; // unlimited
+            return DropAction::Enqueue; // unlimited
         }
 
         let alpha = 1 / usize::pow(2, self.weight_factor);
@@ -165,6 +183,16 @@ impl PacketDrop for RED {
             }
         };
 
-        queue_overflow || threshold_overflow || threshold_normal
+        if queue_overflow {
+            DropAction::Drop
+        } else if threshold_overflow || threshold_normal {
+            if self.ecn {
+                DropAction::MarkEcn
+            } else {
+                DropAction::Drop
+            }
+        } else {
+            DropAction::Enqueue
+        }
     }
 }

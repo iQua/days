@@ -3,7 +3,7 @@
 //!
 use std::collections::HashSet;
 
-use crate::flows::cc::CongestionControl;
+use crate::flows::cc::{AckEvent, CongestionControl};
 
 /// TCP Reno states
 #[derive(Debug, Default, PartialEq)]
@@ -286,7 +286,12 @@ impl TCPReno {
 }
 
 impl CongestionControl for TCPReno {
-    fn ack_received(&mut self, ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize) {
+    fn ack_received(&mut self, event: AckEvent) {
+        let ack_seq = event.ack_seq;
+        let rtt = event.rtt;
+        let current_time = event.now;
+        let bytes_acked = event.bytes_acked;
+
         self.update_rtt(rtt);
 
         let actual_bytes_acked = if ack_seq > self.highest_ack {
@@ -372,6 +377,10 @@ impl CongestionControl for TCPReno {
 mod tests {
     use super::*;
 
+    fn ack(bytes_acked: usize, reno: &mut TCPReno, ack_seq: usize, rtt: f64, now: f64) {
+        reno.ack_received(AckEvent::new_basic(ack_seq, rtt, now, bytes_acked));
+    }
+
     #[test]
     fn test_initial_state() {
         let reno = TCPReno::new();
@@ -385,14 +394,15 @@ mod tests {
     fn test_slow_start_growth() {
         let mut reno = TCPReno::new();
         let initial_cwnd = reno.cwnd;
+        let mss = reno.mss;
 
         // Simulate ACK for 1 MSS
-        reno.ack_received(reno.mss, 0.1, 0.1, reno.mss);
+        ack(mss, &mut reno, mss, 0.1, 0.1);
         assert_eq!(reno.cwnd, initial_cwnd + reno.mss);
         assert_eq!(reno.state, TCPRenoState::SlowStart);
 
         // Another ACK
-        reno.ack_received(reno.mss * 2, 0.1, 0.2, reno.mss);
+        ack(mss, &mut reno, mss * 2, 0.1, 0.2);
         assert_eq!(reno.cwnd, initial_cwnd + 2 * reno.mss);
     }
 
@@ -400,10 +410,12 @@ mod tests {
     fn test_slow_start_to_congestion_avoidance() {
         let mut reno = TCPReno::new();
         reno.ssthresh = 2048; // Set low ssthresh to force transition
+        let mss = reno.mss;
 
         // Send enough ACKs to exceed ssthresh
         while reno.cwnd < reno.ssthresh {
-            reno.ack_received(reno.cwnd, 0.1, 0.1, reno.mss);
+            let cwnd = reno.cwnd;
+            ack(mss, &mut reno, cwnd, 0.1, 0.1);
         }
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
@@ -470,7 +482,7 @@ mod tests {
 
         // Simulate partial ACK
         let partial_ack_seq = reno.highest_ack + 500;
-        reno.ack_received(partial_ack_seq, 0.1, 0.1, 500);
+        ack(500, &mut reno, partial_ack_seq, 0.1, 0.1);
 
         // Verify NewReno behavior on partial ACK
         assert_eq!(reno.state, TCPRenoState::FastRecovery);
@@ -491,11 +503,12 @@ mod tests {
         // Simulate full recovery ACK by acknowledging all outstanding packets
         let full_ack_seq = reno.snd_max;
         let bytes_acked = reno.snd_max - reno.highest_ack;
-        reno.ack_received(
+        ack(
+            bytes_acked, // bytes_acked: usize
+            &mut reno,
             full_ack_seq, // ack_seq: usize
             0.1,          // rtt: f64
             0.1,          // current_time: f64
-            bytes_acked,  // bytes_acked: usize
         );
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
@@ -510,7 +523,8 @@ mod tests {
         // First loss recovery
         reno.packets_in_flight = 10000;
         reno.consecutive_dupacks_received();
-        reno.ack_received(reno.snd_max, 0.1, 0.1, 15000);
+        let snd_max = reno.snd_max;
+        ack(15000, &mut reno, snd_max, 0.1, 0.1);
 
         let first_ssthresh = reno.ssthresh;
 
@@ -549,7 +563,9 @@ mod tests {
 
         // Test maximum bound
         reno.cwnd = reno.max_cwnd + 1000;
-        reno.ack_received(reno.snd_max, 0.1, 0.1, reno.mss);
+        let mss = reno.mss;
+        let snd_max = reno.snd_max;
+        ack(mss, &mut reno, snd_max, 0.1, 0.1);
         assert_eq!(reno.cwnd, reno.max_cwnd);
     }
 
@@ -593,7 +609,9 @@ mod tests {
         reno.cwnd = 0; // Invalid state
 
         // ACK should restore to minimum
-        reno.ack_received(reno.snd_max, 0.1, 0.1, reno.mss);
+        let mss = reno.mss;
+        let snd_max = reno.snd_max;
+        ack(mss, &mut reno, snd_max, 0.1, 0.1);
         assert_eq!(reno.cwnd, reno.min_cwnd);
     }
 
@@ -702,8 +720,9 @@ mod tests {
         // Multiple partial ACKs
         for _ in 0..5 {
             // Simulate ACKs acknowledging 500 bytes each time
-            reno.update_sequence_space(reno.highest_ack + 500, 0);
-            reno.ack_received(reno.highest_ack + 500, 0.1, 0.1, 500);
+            let ack_seq = reno.highest_ack + 500;
+            reno.update_sequence_space(ack_seq, 0);
+            ack(500, &mut reno, ack_seq, 0.1, 0.1);
         }
 
         // New losses during recovery
@@ -716,7 +735,9 @@ mod tests {
 
         // Full ACK that covers all sent data
         reno.update_sequence_space(reno.snd_max, 0);
-        reno.ack_received(reno.snd_max, 0.1, 0.1, reno.snd_max - reno.highest_ack);
+        let snd_max = reno.snd_max;
+        let bytes_acked = snd_max - reno.highest_ack;
+        ack(bytes_acked, &mut reno, snd_max, 0.1, 0.1);
 
         assert_eq!(reno.state, TCPRenoState::CongestionAvoidance);
         assert!(reno.lost_sequences.is_empty());
@@ -785,11 +806,12 @@ mod tests {
             // Simulate ACKs for the RTT
             for _ in 0..acks_per_rtt {
                 let ack_seq = reno.highest_ack + mss; // Increment the ack_seq appropriately
-                reno.ack_received(
+                ack(
+                    mss, // bytes_acked: usize
+                    &mut reno,
                     ack_seq,            // ack_seq: usize
                     0.1 * (rtt as f64), // rtt: f64
                     0.1 * (rtt as f64), // current_time: f64
-                    mss,                // bytes_acked: usize
                 );
             }
 

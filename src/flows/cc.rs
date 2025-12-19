@@ -3,6 +3,61 @@
 
 use serde::Deserialize;
 
+/// A delivery-rate sample for rate-based congestion control.
+#[derive(Clone, Debug, Default)]
+pub struct RateSample {
+    /// Bytes delivered in the sample interval.
+    pub delivered: usize,
+    /// Duration of the sample interval in seconds.
+    pub interval: f64,
+    /// Time between the last delivered packet and this ACK, in seconds.
+    pub ack_elapsed: f64,
+    /// Time between the first and last packet sent in the sample, in seconds.
+    pub send_elapsed: f64,
+    /// RTT sample in seconds.
+    pub rtt: f64,
+    /// Bytes acknowledged by this ACK.
+    pub acked: usize,
+    /// Whether sender was app-limited when the sample was taken.
+    pub is_app_limited: bool,
+    /// Inflight at the time of send for the sampled packet.
+    pub prior_inflight: usize,
+    /// Bytes considered lost in this sample.
+    pub lost: usize,
+    /// Whether this sample was ECN-marked.
+    pub ecn_marked: bool,
+}
+
+/// An ACK event used by congestion control algorithms.
+#[derive(Clone, Debug)]
+pub struct AckEvent {
+    pub ack_seq: usize,
+    pub rtt: f64,
+    pub now: f64,
+    pub bytes_acked: usize,
+    pub rate_sample: RateSample,
+}
+
+impl AckEvent {
+    pub fn new_basic(ack_seq: usize, rtt: f64, now: f64, bytes_acked: usize) -> Self {
+        AckEvent {
+            ack_seq,
+            rtt,
+            now,
+            bytes_acked,
+            rate_sample: RateSample {
+                delivered: bytes_acked,
+                interval: rtt,
+                ack_elapsed: rtt,
+                send_elapsed: rtt,
+                rtt,
+                acked: bytes_acked,
+                ..RateSample::default()
+            },
+        }
+    }
+}
+
 /// The congestion control algorithms.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub enum CCAlgorithm {
@@ -13,7 +68,8 @@ pub enum CCAlgorithm {
 
 /// Defines the interface for all congestion control algorithms.
 pub trait CongestionControl {
-    fn ack_received(&mut self, ack_seq: usize, rtt: f64, current_time: f64, bytes_acked: usize);
+    fn ack_received(&mut self, event: AckEvent);
+    fn packet_sent(&mut self, _bytes: usize, _now: f64) {}
     fn timer_expired(&mut self);
     fn dupack_over(&mut self);
     fn consecutive_dupacks_received(&mut self);
