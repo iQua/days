@@ -248,7 +248,7 @@ impl TCPPacketSource {
     /// This function is typically called:
     /// - after receiving new ACKs (to refill the window)
     /// - before sending packets (to populate the send buffer)
-    pub async fn pull_from_appsource(&mut self, now: f64) {
+    pub async fn pull_from_appsource(&mut self, _now: f64) {
         // stop if all flow data has been sent
         if self.remaining_bytes == 0 {
             self.app_limited = true;
@@ -260,11 +260,12 @@ impl TCPPacketSource {
         let cwnd = self.congestion_control.get_cwnd();
         let window_end = self.last_ack.saturating_add(cwnd);
 
-        if self.next_seq >= window_end {
+        let buffered_end = self.send_buffer.max(self.next_seq);
+        if buffered_end >= window_end {
             return;
         }
 
-        let win_left = window_end - self.next_seq;
+        let win_left = window_end - buffered_end;
 
         // window too small to send a full segment, wait for ACKs
         if win_left < self.mss {
@@ -278,14 +279,14 @@ impl TCPPacketSource {
             // Pull raw bytes from application layer
             let data = handle.pull(pull_size).await;
 
-            // TCP layer creates packets with proper metadata
+            // Buffer bytes for paced sending
             let mut offset = 0;
             while offset < data.len() {
                 let chunk_size = self.mss.min(data.len() - offset);
 
                 // ensure we do not exceed the current window
                 if self
-                    .next_seq
+                    .send_buffer
                     .checked_add(chunk_size)
                     .map(|next| next > window_end)
                     .unwrap_or(true)
@@ -293,19 +294,8 @@ impl TCPPacketSource {
                     break;
                 }
 
-                // Create packet with correct TCP metadata
-                let mut packet = Packet::new(
-                    chunk_size,
-                    self.next_seq, // Correct sequence number
-                    self.flow_id,  // Correct flow ID
-                    now,           // Correct timestamp
-                );
-                packet.set_priority(self.priority);
-
-                self.output.send(packet.clone()).await;
-                self.packet_sent(&packet, now);
-
-                self.remaining_bytes -= chunk_size;
+                self.send_buffer = self.send_buffer.saturating_add(chunk_size);
+                self.remaining_bytes = self.remaining_bytes.saturating_sub(chunk_size);
                 offset += chunk_size;
             }
         }
@@ -630,23 +620,57 @@ impl TCPPacketSource {
         }
     }
 
-    pub async fn send_packet(&mut self, now: f64) {
+    pub async fn send_packet(&mut self, now: f64) -> Option<f64> {
         // Attempt to pull fresh packets from the application layer before sending, to ensure there is data ready within the current congestion window.
         self.pull_from_appsource(now).await;
-        // the sender can transmit up to the size of the congestion window
-        while self.next_seq < self.send_buffer
-            && self.next_seq + self.mss
-                <= min(
-                    self.send_buffer,
-                    self.last_ack + self.congestion_control.get_cwnd(),
-                )
-        {
-            let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
-            packet.set_priority(self.priority);
 
-            self.output.send(packet.clone()).await;
-            self.packet_sent(&packet, now);
+        let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
+        let can_send = self.next_seq < self.send_buffer
+            && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit);
+        if !can_send {
+            return None;
         }
+
+        let pacing_rate = self.congestion_control.get_pacing_rate();
+        let pacing_interval = if pacing_rate > 0.0 {
+            self.mss as f64 / pacing_rate
+        } else {
+            0.0
+        };
+
+        if pacing_interval <= 0.0 {
+            // No pacing rate yet; send as much as the window allows.
+            while self.next_seq < self.send_buffer
+                && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit)
+            {
+                let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+                packet.set_priority(self.priority);
+
+                self.output.send(packet.clone()).await;
+                self.packet_sent(&packet, now);
+            }
+            return None;
+        }
+
+        if now < self.busy_until {
+            return Some(self.busy_until - now);
+        }
+
+        let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+        packet.set_priority(self.priority);
+
+        self.output.send(packet.clone()).await;
+        self.packet_sent(&packet, now);
+
+        self.busy_until = now + pacing_interval;
+
+        let next_can_send = self.next_seq < self.send_buffer
+            && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit);
+        if next_can_send {
+            return Some(pacing_interval);
+        }
+
+        None
     }
 
     pub fn log_report(&mut self, now: f64, timing: ReportTiming) {
