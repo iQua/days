@@ -565,6 +565,8 @@ impl TCPPacketSource {
 
         self.next_seq += packet.size;
 
+        self.congestion_control.packet_sent(packet.size, now);
+
         self.timeout_queue.push(PacketTimeout {
             packet_id: packet.packet_id,
             rto: self.rto,

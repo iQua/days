@@ -577,8 +577,9 @@ impl BBRState {
         }
     }
 
-    pub fn on_packet_sent(&mut self, _seq: usize, now: f64) {
+    pub fn on_packet_sent(&mut self, bytes: usize, now: f64) {
         self.last_rtt_sample_time = now;
+        self.inflight = self.inflight.saturating_add(bytes);
     }
 
     pub fn on_loss_detected(&mut self) {
@@ -626,6 +627,10 @@ impl TCPBBR {
 impl CongestionControl for TCPBBR {
     fn ack_received(&mut self, event: AckEvent) {
         self.state.on_ack_received(&event);
+    }
+
+    fn packet_sent(&mut self, bytes: usize, now: f64) {
+        self.state.on_packet_sent(bytes, now);
     }
 
     fn timer_expired(&mut self) {
