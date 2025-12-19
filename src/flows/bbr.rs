@@ -72,6 +72,8 @@ pub struct BBRState {
     pub probe_rtt_start: f64,
     /// When ProbeRTT can exit (0 if not scheduled)
     pub probe_rtt_done_stamp: f64,
+    /// Whether we've completed a ProbeRTT round
+    pub probe_rtt_round_done: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
@@ -102,6 +104,7 @@ impl BBRState {
     const CWND_GAIN: f64 = 2.0;
     const PROBE_RTT_CWND_GAIN: f64 = 0.5;
     const MIN_RTT_FILTER_SEC: f64 = 10.0;
+    const PROBE_RTT_INTERVAL_SEC: f64 = 5.0;
     const PROBE_RTT_DURATION_SEC: f64 = 0.2;
     const FULL_BW_THRESH: f64 = 1.25;
     const FULL_BW_CNT: usize = 3;
@@ -140,6 +143,7 @@ impl BBRState {
             extra_acked_samples: VecDeque::with_capacity(10),
             probe_rtt_start: 0.0,
             probe_rtt_done_stamp: 0.0,
+            probe_rtt_round_done: false,
         }
     }
 
@@ -264,6 +268,9 @@ impl BBRState {
             if self.mode == BBRMode::ProbeBW {
                 self.advance_probe_bw_phase(now);
             }
+            if self.mode == BBRMode::ProbeRTT {
+                self.probe_rtt_round_done = true;
+            }
         }
 
         if loss_occurred {
@@ -314,7 +321,7 @@ impl BBRState {
         if self.mode != BBRMode::ProbeRTT
             && self.min_rtt.is_finite()
             && self.min_rtt_stamp > 0.0
-            && now - self.min_rtt_stamp > Self::MIN_RTT_FILTER_SEC
+            && now - self.min_rtt_stamp > Self::PROBE_RTT_INTERVAL_SEC
         {
             self.enter_probe_rtt(now);
             return;
@@ -410,17 +417,29 @@ impl BBRState {
         self.cwnd_gain = Self::PROBE_RTT_CWND_GAIN;
         self.probe_rtt_start = now;
         self.probe_rtt_done_stamp = 0.0;
+        self.probe_rtt_round_done = false;
     }
 
     fn handle_probe_rtt(&mut self, now: f64) {
+        let bdp = self.max_bw * self.min_rtt;
+        let target_inflight = self
+            .min_cwnd()
+            .max((bdp * Self::PROBE_RTT_CWND_GAIN) as usize);
+
         if self.probe_rtt_done_stamp == 0.0 {
-            if self.inflight <= self.min_cwnd() {
+            if self.inflight <= target_inflight {
                 self.probe_rtt_done_stamp = now + Self::PROBE_RTT_DURATION_SEC;
             }
             return;
         }
 
-        if now >= self.probe_rtt_done_stamp {
+        if self.inflight > target_inflight {
+            self.probe_rtt_done_stamp = 0.0;
+            self.probe_rtt_round_done = false;
+            return;
+        }
+
+        if now >= self.probe_rtt_done_stamp && self.probe_rtt_round_done {
             self.min_rtt_stamp = now;
             if self.full_bw_reached {
                 self.enter_probe_bw(now);
@@ -571,11 +590,11 @@ mod tests {
     fn test_probe_rtt_entry() {
         let mut bbr = TCPBBR::new();
         bbr.state.min_rtt = 0.1;
-        bbr.state.min_rtt_stamp = 0.0;
+        bbr.state.min_rtt_stamp = 1.0;
         bbr.state.mode = BBRMode::ProbeBW;
 
         // Force min_rtt expiration
-        simulate_ack(&mut bbr, 1024, 0.1, 11.0, 1024, false, false);
+        simulate_ack(&mut bbr, 1024, 0.1, 7.0, 1024, false, false);
         assert_eq!(bbr.state.mode, BBRMode::ProbeRTT);
     }
 
