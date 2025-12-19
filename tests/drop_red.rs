@@ -59,6 +59,7 @@ fn test_drop_strategy_red_early_drop() {
         10,        // 10-packet capacity
         CapacityUnit::Packets,
         DropStrategy::RED,
+        0.0,
     );
 
     let mut sink = PacketSink::new(&source);

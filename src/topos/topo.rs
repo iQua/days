@@ -30,7 +30,7 @@ use crate::l2::link::Link;
 use crate::l2::pfc::{PfcEgressGate, PfcIngressPort};
 #[cfg(feature = "l2_pfc")]
 use crate::next_link_id;
-use crate::schedulers::drop::{CapacityUnit, DropStrategy};
+use crate::schedulers::drop::{CapacityUnit, DropStrategy, DEFAULT_ECN_THRESHOLD};
 use crate::schedulers::drr::DRRServer;
 use crate::schedulers::port::Port;
 use crate::schedulers::sp::SPServer;
@@ -80,6 +80,7 @@ pub struct SwitchConfig {
     capacity: usize,
     discipline: SchedulingDiscipline,
     drop: DropStrategy,
+    ecn_threshold: Option<f64>,
     weights: Option<Vec<usize>>,
     priorities: Option<Vec<usize>>,
     vticks: Option<Vec<f64>>,
@@ -624,6 +625,10 @@ impl Topology {
     /// Connects two adjacent switches in the network graph.
     fn connect_neighbours(mut self, upstream_id: usize, downstream_id: usize) -> Self {
         let drop_strategy = self.switch_config.drop.clone();
+        let ecn_threshold = self
+            .switch_config
+            .ecn_threshold
+            .unwrap_or(DEFAULT_ECN_THRESHOLD);
 
         match self.switch_config.discipline {
             SchedulingDiscipline::DRR => {
@@ -640,6 +645,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
                     drop_strategy.clone(),
+                    ecn_threshold,
                     weights.clone(),
                 );
                 #[cfg(feature = "l2_pfc")]
@@ -669,6 +675,7 @@ impl Topology {
                     self.switch_config.capacity,
                     CapacityUnit::Packets,
                     drop_strategy.clone(),
+                    ecn_threshold,
                 );
                 #[cfg(feature = "l2_pfc")]
                 {
@@ -705,6 +712,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % priorities_len),
                     drop_strategy.clone(),
+                    ecn_threshold,
                     priorities.clone(),
                 );
                 #[cfg(feature = "l2_pfc")]
@@ -740,6 +748,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % vticks_len),
                     drop_strategy.clone(),
+                    ecn_threshold,
                     vticks.clone(),
                 );
                 #[cfg(feature = "l2_pfc")]
@@ -780,6 +789,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
                     drop_strategy.clone(),
+                    ecn_threshold,
                     weights.clone(),
                 );
                 #[cfg(feature = "l2_pfc")]
@@ -817,6 +827,7 @@ impl Topology {
                     CapacityUnit::Packets,
                     Arc::new(move |flow_id| flow_id % weights_len),
                     drop_strategy,
+                    ecn_threshold,
                     weights.clone(),
                 );
                 #[cfg(feature = "l2_pfc")]
@@ -981,6 +992,10 @@ impl Topology {
                         sink.connect_flow_finish_output(flow_finish_output);
                     }
                     FlowType::TCP => {
+                        source.connect_flow_finish_output(flow_finish_output);
+                    }
+                    #[cfg(feature = "dcqcn")]
+                    FlowType::DCQCN => {
                         source.connect_flow_finish_output(flow_finish_output);
                     }
                 }
@@ -1355,6 +1370,7 @@ mod ring_allreduce_serialization_tests {
             discipline: SchedulingDiscipline::FIFO,
             // If your DropStrategy variant name differs, change it here
             drop: DropStrategy::TailDrop,
+            ecn_threshold: None,
             weights: None,
             priorities: None,
             vticks: None,

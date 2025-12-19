@@ -155,6 +155,7 @@ impl TCPPacketSink {
                 acknowledged_size: packet.size,
                 ece: self.ecn_echo,
             }),
+            control: None,
             ecn: EcnField::NotEct,
             cwr: false,
         };

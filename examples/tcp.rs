@@ -64,6 +64,7 @@ fn main() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
+        0.0,
         vec![1],
     );
 

@@ -81,6 +81,7 @@ fn test_virtual_clock_scheduler() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
+        0.0,
         vec![1.0, 0.5], // in vticks, equivalent to 1:2 in weights
     );
 

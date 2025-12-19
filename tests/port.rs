@@ -77,6 +77,7 @@ fn test_fifo_scheduling() {
         100,      // capacity
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
+        0.0,
     );
 
     let mut sink = PacketSink::new(&source_1);

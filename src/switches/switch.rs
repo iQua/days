@@ -86,7 +86,7 @@ impl PacketSwitch {
 
         self.time = packet.time;
 
-        if packet.ack.is_none() {
+        if packet.ack.is_none() && packet.control.is_none() {
             self.packets_received += 1;
 
             debug!(
@@ -108,7 +108,7 @@ impl PacketSwitch {
             }
         } else {
             debug!(
-                "PacketSwitch {} received ack of packet {} ({} bytes) from flow {} at time {:.3}.",
+                "PacketSwitch {} received control packet {} ({} bytes) from flow {} at time {:.3}.",
                 self.switch_id, packet.packet_id, packet.size, packet.flow_id, self.time,
             );
 

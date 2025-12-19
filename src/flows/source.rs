@@ -17,6 +17,8 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
 use crate::flows::app_source::AppSourceBufferHandle;
+#[cfg(feature = "dcqcn")]
+use crate::flows::dcqcn_source::DcqcnPacketSource;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::flow::FlowType;
 use crate::flows::packet::Packet;
@@ -45,6 +47,8 @@ pub struct PacketSourceReport {
 pub enum PacketSource {
     DistPacketSource(Box<DistPacketSource>),
     TCPPacketSource(Box<TCPPacketSource>),
+    #[cfg(feature = "dcqcn")]
+    DcqcnPacketSource(Box<DcqcnPacketSource>),
 }
 
 impl std::fmt::Display for PacketSource {
@@ -52,6 +56,8 @@ impl std::fmt::Display for PacketSource {
         match self {
             PacketSource::DistPacketSource(_) => write!(f, "DistPacketSource {}", self.id()),
             PacketSource::TCPPacketSource(_) => write!(f, "TCPPacketSource {}", self.id()),
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(_) => write!(f, "DCQCNPacketSource {}", self.id()),
         }
     }
 }
@@ -84,6 +90,10 @@ impl PacketSource {
                 app_source,
                 rng,
             ))),
+            #[cfg(feature = "dcqcn")]
+            FlowType::DCQCN => PacketSource::DcqcnPacketSource(Box::new(
+                DcqcnPacketSource::new(flow_id, flow_start_after, traffic, priority, rng),
+            )),
         }
     }
 
@@ -91,6 +101,8 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.output.borrow_mut(),
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => source.output.borrow_mut(),
         }
     }
 
@@ -100,6 +112,10 @@ impl PacketSource {
             PacketSource::TCPPacketSource(source) => {
                 source.flow_finish_outputs.push(flow_finish_output);
             }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                source.flow_finish_outputs.push(flow_finish_output);
+            }
         }
     }
 
@@ -107,6 +123,8 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.ui_output.borrow_mut(),
             PacketSource::TCPPacketSource(source) => source.ui_output.borrow_mut(),
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => source.ui_output.borrow_mut(),
         }
     }
 
@@ -114,6 +132,8 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.endpoint_id,
             PacketSource::TCPPacketSource(source) => source.endpoint_id,
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => source.endpoint_id,
         }
     }
 
@@ -121,6 +141,8 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.flow_id,
             PacketSource::TCPPacketSource(source) => source.flow_id,
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => source.flow_id,
         }
     }
 
@@ -133,6 +155,8 @@ impl PacketSource {
             let local_time = match self {
                 PacketSource::DistPacketSource(source) => source.time,
                 PacketSource::TCPPacketSource(source) => source.time,
+                #[cfg(feature = "dcqcn")]
+                PacketSource::DcqcnPacketSource(source) => source.time,
             };
 
             // makes sure that the current simulation time can be correctly retrieved from
@@ -156,6 +180,10 @@ impl PacketSource {
                 if source.ack_packet_received(packet, now).await {
                     self.run((), cx).await;
                 }
+            }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                source.packet_received(packet, now);
             }
         }
     }
@@ -213,6 +241,21 @@ impl PacketSource {
                     .unwrap();
                 }
             }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                source.report_start_time = now + initial_delay;
+                source.flow_start_time = now + initial_delay;
+                source.time = now + initial_delay;
+
+                let interval = source.timer_interval();
+                cx.schedule_periodic_event(
+                    Duration::from_secs_f64(initial_delay + interval),
+                    Duration::from_secs_f64(interval),
+                    Self::periodic_timer_event,
+                    (),
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -267,6 +310,10 @@ impl PacketSource {
                         self.run((), cx).await;
                     }
                 }
+                #[cfg(feature = "dcqcn")]
+                PacketSource::DcqcnPacketSource(source) => {
+                    source.time = current_time;
+                }
             }
         }
     }
@@ -277,6 +324,11 @@ impl PacketSource {
                 let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
                 source.time = now;
                 source.timer_tick(now).await;
+            }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                source.timer_tick(now);
             }
         }
     }
@@ -301,6 +353,15 @@ impl PacketSource {
                     }
                 }
             }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                if let Some(interval) = source.send_packet(now).await {
+                    if interval > 0.0 {
+                        cx.schedule_event(Duration::from_secs_f64(interval), Self::run, ())
+                            .unwrap();
+                    }
+                }
+            }
         }
     }
 
@@ -312,6 +373,10 @@ impl PacketSource {
                 source.log_report(now, ReportTiming::InProgress);
             }
             PacketSource::TCPPacketSource(source) => {
+                source.log_report(now, ReportTiming::InProgress);
+            }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
                 source.log_report(now, ReportTiming::InProgress);
             }
         };
@@ -326,6 +391,14 @@ impl PacketSource {
                     && source.next_seq + source.mss > source.send_buffer
                     && source.next_seq == source.last_ack
                 {
+                    source.wrap_up(now).await;
+                    return true;
+                }
+                false
+            }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                if source.traffic_exceeded(now) {
                     source.wrap_up(now).await;
                     return true;
                 }
@@ -348,6 +421,8 @@ impl PacketSource {
             let mut now = match self {
                 PacketSource::DistPacketSource(source) => source.time,
                 PacketSource::TCPPacketSource(source) => source.time,
+                #[cfg(feature = "dcqcn")]
+                PacketSource::DcqcnPacketSource(source) => source.time,
             };
 
             if now == 0.0 {
@@ -361,12 +436,22 @@ impl PacketSource {
                     PacketSource::TCPPacketSource(source) => {
                         source.time = global_time;
                     }
+                    #[cfg(feature = "dcqcn")]
+                    PacketSource::DcqcnPacketSource(source) => {
+                        source.time = global_time;
+                    }
                 };
 
                 now = global_time;
             }
 
             if let PacketSource::TCPPacketSource(source) = self {
+                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                source.time = global_time;
+                now = global_time;
+            }
+            #[cfg(feature = "dcqcn")]
+            if let PacketSource::DcqcnPacketSource(source) = self {
                 let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
                 source.time = global_time;
                 now = global_time;
@@ -391,6 +476,10 @@ impl PacketSource {
                         source.log_report(now, ReportTiming::Final);
                     }
                     PacketSource::TCPPacketSource(source) => {
+                        source.log_report(now, ReportTiming::Final);
+                    }
+                    #[cfg(feature = "dcqcn")]
+                    PacketSource::DcqcnPacketSource(source) => {
                         source.log_report(now, ReportTiming::Final);
                     }
                 };
@@ -458,6 +547,28 @@ impl PacketSource {
                     );
                 }
             }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                source.flow_start_after.remove(&flow_finish_msg.flow_id);
+                debug!(
+                    "Flow {} still waits for {} flow(s) before it can start.",
+                    source.flow_id,
+                    source.flow_start_after.len()
+                );
+
+                if source.flow_start_after.is_empty() {
+                    self.prepare_run(now, 0.0, cx).await;
+                    self.run((), cx).await;
+                    self.start_report_logger(0.0, cx);
+
+                    debug!(
+                        "{} of flow {} started sending packets at time {:.3}.",
+                        self,
+                        self.flow_id(),
+                        now
+                    );
+                }
+            }
         }
     }
 
@@ -465,6 +576,8 @@ impl PacketSource {
         let initial_delay = match &self {
             PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
             PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => source.traffic.initial_delay,
         };
 
         debug!(
@@ -486,6 +599,13 @@ impl PacketSource {
                 false
             }
             PacketSource::TCPPacketSource(source) => {
+                if source.flow_start_after.is_empty() {
+                    return true;
+                }
+                false
+            }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
                 if source.flow_start_after.is_empty() {
                     return true;
                 }

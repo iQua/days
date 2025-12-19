@@ -81,6 +81,7 @@ fn test_red_ecn_marks_ce_in_simulation() {
         5,         // small queue
         CapacityUnit::Packets,
         DropStrategy::RedEcn,
+        0.0,
     );
 
     let source_mbox = Mailbox::new();

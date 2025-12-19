@@ -23,6 +23,9 @@ pub enum FlowType {
     PacketDistribution,
     /// Represents a TCP flow.
     TCP,
+    /// Represents a DCQCN flow.
+    #[cfg(feature = "dcqcn")]
+    DCQCN,
 }
 
 #[derive(Deserialize, Debug)]

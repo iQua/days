@@ -22,6 +22,8 @@ pub enum DropStrategy {
     RED,
     #[serde(rename = "RED_ECN")]
     RedEcn,
+    #[serde(rename = "ECN_THRESHOLD")]
+    EcnThreshold,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub enum DropAction {
     Drop,
     MarkEcn,
 }
+
+pub const DEFAULT_ECN_THRESHOLD: f64 = 0.8;
 
 /// Defines the interface for all packet drop strategies.
 pub trait PacketDrop {
@@ -79,6 +83,57 @@ pub struct RED {
     ecn: bool,
 }
 
+/// ECN threshold marking. Marks CE when queue occupancy exceeds a threshold.
+pub struct EcnThreshold {
+    capacity: usize,
+    capacity_unit: CapacityUnit,
+    threshold: f64,
+}
+
+impl EcnThreshold {
+    pub fn new(capacity: usize, capacity_unit: CapacityUnit, threshold: f64) -> EcnThreshold {
+        EcnThreshold {
+            capacity,
+            capacity_unit,
+            threshold,
+        }
+    }
+}
+
+impl PacketDrop for EcnThreshold {
+    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
+        if self.capacity == 0 {
+            return DropAction::Enqueue; // unlimited
+        }
+
+        let threshold = self.threshold.clamp(0.0, 1.0);
+
+        let queue_overflow = match self.capacity_unit {
+            CapacityUnit::Bytes => self.capacity > 0 && byte_size + packet_size > self.capacity,
+            CapacityUnit::Packets => self.capacity > 0 && queue_length + 1 > self.capacity,
+        };
+
+        if queue_overflow {
+            return DropAction::Drop;
+        }
+
+        let threshold_exceeded = match self.capacity_unit {
+            CapacityUnit::Bytes => {
+                byte_size + packet_size
+                    > (threshold * self.capacity as f64).floor() as usize
+            }
+            CapacityUnit::Packets => {
+                queue_length + 1 > (threshold * self.capacity as f64).floor() as usize
+            }
+        };
+
+        if threshold_exceeded {
+            DropAction::MarkEcn
+        } else {
+            DropAction::Enqueue
+        }
+    }
+}
 impl RED {
     pub fn new(
         capacity: usize,
