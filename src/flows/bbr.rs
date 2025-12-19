@@ -32,6 +32,10 @@ pub struct BBRState {
     pub inflight_hi: usize,
     /// Inflight lower bound
     pub inflight_lo: usize,
+    /// Short-term inflight cap based on recent loss
+    pub inflight_shortterm: usize,
+    /// Long-term inflight cap based on persistent loss
+    pub inflight_longterm: usize,
     /// Loss event flag
     pub loss_in_round: bool,
     /// ECN event flag
@@ -50,6 +54,10 @@ pub struct BBRState {
     pub round_start_time: f64,
     /// Total data delivered so far
     pub total_data_delivered: usize,
+    /// Bytes delivered in the current round
+    pub round_delivered: usize,
+    /// Bytes lost in the current round
+    pub round_lost: usize,
     /// Current ProbeBW cycle index
     pub probe_bw_cycle: u64,
     /// ProbeBW phase (only valid in ProbeBW mode)
@@ -108,6 +116,8 @@ impl BBRState {
     const PROBE_RTT_DURATION_SEC: f64 = 0.2;
     const FULL_BW_THRESH: f64 = 1.25;
     const FULL_BW_CNT: usize = 3;
+    const LOSS_THRESH: f64 = 0.02;
+    const BETA: f64 = 0.7;
 
     pub fn new(mss: usize) -> Self {
         BBRState {
@@ -123,6 +133,8 @@ impl BBRState {
             cwnd_gain: Self::CWND_GAIN,
             inflight_hi: usize::MAX,
             inflight_lo: 0,
+            inflight_shortterm: 0,
+            inflight_longterm: 0,
             loss_in_round: false,
             ecn_in_round: false,
             round_count: 0,
@@ -132,6 +144,8 @@ impl BBRState {
             mss,
             max_cwnd: 2_000_000 * mss, // 2M segments
             total_data_delivered: 0,
+            round_delivered: 0,
+            round_lost: 0,
             probe_bw_cycle: 0,
             probe_bw_phase: ProbeBWPhase::Down,
             probe_bw_phase_start: 0.0,
@@ -259,9 +273,17 @@ impl BBRState {
         self.total_data_delivered = ack_seq;
         self.last_rtt_sample_time = now;
         let new_round = self.update_round(ack_seq);
+        if new_round {
+            self.handle_round_end(now, event.rate_sample.prior_inflight);
+        }
         self.update_bandwidth(bytes_acked, rtt, &event.rate_sample);
         self.update_min_rtt(rtt, now);
         self.update_extra_acked(&event.rate_sample, now);
+
+        self.round_delivered = self.round_delivered.saturating_add(bytes_acked);
+        self.round_lost = self
+            .round_lost
+            .saturating_add(event.rate_sample.lost);
 
         if new_round {
             self.update_full_bw();
@@ -279,13 +301,6 @@ impl BBRState {
 
         if ecn_marked {
             self.ecn_in_round = true;
-        }
-
-        // Adjust inflight_hi if loss or ECN occurs
-        if self.loss_in_round || self.ecn_in_round {
-            let bdp = self.max_bw * self.min_rtt;
-            self.inflight_hi = (bdp * self.cwnd_gain) as usize;
-            self.inflight_hi = self.inflight_hi.min(self.cwnd);
         }
 
         // Update pacing rate and cwnd
@@ -307,8 +322,19 @@ impl BBRState {
         let bdp = self.max_bw * self.min_rtt;
         let target_cwnd = (bdp * self.cwnd_gain + self.extra_acked) as usize;
 
+        let mut inflight_cap = usize::MAX;
+        if self.inflight_longterm > 0 {
+            inflight_cap = inflight_cap.min(self.inflight_longterm);
+        }
+        if self.inflight_shortterm > 0 {
+            inflight_cap = inflight_cap.min(self.inflight_shortterm);
+        }
         if self.inflight_hi != usize::MAX {
-            self.cwnd = target_cwnd.min(self.inflight_hi);
+            inflight_cap = inflight_cap.min(self.inflight_hi);
+        }
+
+        if inflight_cap != usize::MAX {
+            self.cwnd = target_cwnd.min(inflight_cap);
         } else {
             self.cwnd = target_cwnd;
         }
@@ -368,6 +394,50 @@ impl BBRState {
         }
     }
 
+    fn target_inflight(&self) -> usize {
+        let bdp = self.max_bw * self.min_rtt;
+        let target = (bdp * self.cwnd_gain + self.extra_acked) as usize;
+        target.clamp(self.min_cwnd(), self.max_cwnd)
+    }
+
+    fn handle_round_end(&mut self, now: f64, prior_inflight: usize) {
+        if self.round_delivered == 0 && self.round_lost == 0 {
+            return;
+        }
+
+        let loss_rate = self.round_lost as f64
+            / (self.round_lost + self.round_delivered).max(1) as f64;
+
+        if loss_rate > Self::LOSS_THRESH {
+            let target = self.target_inflight() as f64;
+            let candidate = (target * Self::BETA)
+                .max(prior_inflight as f64)
+                .max(self.min_cwnd() as f64) as usize;
+
+            if self.inflight_longterm == 0 {
+                self.inflight_longterm = candidate;
+            } else {
+                self.inflight_longterm = self.inflight_longterm.min(candidate);
+            }
+
+            if self.inflight_shortterm == 0 {
+                self.inflight_shortterm = candidate;
+            } else {
+                self.inflight_shortterm = self.inflight_shortterm.min(candidate);
+            }
+
+            if self.mode == BBRMode::ProbeBW && self.probe_bw_phase == ProbeBWPhase::Up {
+                self.probe_bw_phase = ProbeBWPhase::Down;
+                self.probe_bw_phase_start = now;
+                self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
+                self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+            }
+        }
+
+        self.round_delivered = 0;
+        self.round_lost = 0;
+    }
+
     fn enter_startup(&mut self) {
         self.mode = BBRMode::Startup;
         self.pacing_gain = Self::STARTUP_PACING_GAIN;
@@ -375,6 +445,8 @@ impl BBRState {
         self.full_bw = 0.0;
         self.full_bw_count = 0;
         self.full_bw_reached = false;
+        self.inflight_shortterm = 0;
+        self.inflight_longterm = 0;
     }
 
     fn enter_drain(&mut self) {
@@ -390,6 +462,7 @@ impl BBRState {
         self.probe_bw_phase_start = now;
         self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
         self.cwnd_gain = Self::CWND_GAIN;
+        self.inflight_shortterm = 0;
     }
 
     fn advance_probe_bw_phase(&mut self, now: f64) {
@@ -401,6 +474,7 @@ impl BBRState {
         };
         if self.probe_bw_phase == ProbeBWPhase::Down {
             self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+            self.inflight_shortterm = 0;
         }
         self.probe_bw_phase_start = now;
         self.pacing_gain = match self.probe_bw_phase {
@@ -461,6 +535,8 @@ impl BBRState {
         // Handle RTO event
         self.enter_startup();
         self.inflight_hi = usize::MAX;
+        self.inflight_shortterm = 0;
+        self.inflight_longterm = 0;
     }
 
     pub fn get_cwnd(&self) -> usize {
