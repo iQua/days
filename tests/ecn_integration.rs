@@ -1,0 +1,111 @@
+#![cfg(feature = "test")]
+
+use std::time::Duration;
+
+use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::ports::{EventSlot, Output};
+use nexosim::simulation::{Mailbox, SimInit};
+use nexosim::time::MonotonicTime;
+use tempfile::NamedTempFile;
+
+use days::flows::packet::{EcnField, Packet};
+use days::schedulers::drop::{CapacityUnit, DropStrategy};
+use days::schedulers::port::Port;
+use days::seed_from_config;
+
+struct EcnBurstSource {
+    time: f64,
+    next_id: usize,
+    remaining: usize,
+    size: usize,
+    flow_id: usize,
+    output: Output<Packet>,
+}
+
+impl EcnBurstSource {
+    fn new(flow_id: usize, size: usize, count: usize) -> Self {
+        Self {
+            time: 0.0,
+            next_id: 0,
+            remaining: count,
+            size,
+            flow_id,
+            output: Output::default(),
+        }
+    }
+
+    fn run<'a>(
+        &'a mut self,
+        _: (),
+        cx: &'a mut Context<Self>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        async move {
+            if self.remaining == 0 {
+                return;
+            }
+
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            self.time = now;
+
+            let mut packet = Packet::new(self.size, self.next_id, self.flow_id, now);
+            packet.ecn = EcnField::Ect0;
+            self.next_id += 1;
+            self.remaining -= 1;
+
+            self.output.send(packet).await;
+
+            if self.remaining > 0 {
+                cx.schedule_event(Duration::from_secs_f64(0.0005), Self::run, ())
+                    .unwrap();
+            }
+        }
+    }
+}
+
+impl Model for EcnBurstSource {
+    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        self.run((), cx).await;
+        self.into()
+    }
+}
+
+#[test]
+fn test_red_ecn_marks_ce_in_simulation() {
+    let seed_file = NamedTempFile::new().expect("Failed to create temp seed file");
+    std::fs::write(seed_file.path(), "seed = 1\n").expect("Failed to write seed file");
+    let _ = seed_from_config(seed_file.path().to_str().unwrap());
+
+    let mut source = EcnBurstSource::new(0, 512, 30);
+    let mut port = Port::new(
+        100_000.0, // 100 kbps to build queue
+        5,         // small queue
+        CapacityUnit::Packets,
+        DropStrategy::RedEcn,
+    );
+
+    let source_mbox = Mailbox::new();
+    let port_mbox = Mailbox::new();
+    let mut sink_slot = EventSlot::new();
+
+    source.output.connect(Port::packet_received, &port_mbox);
+    port.output.connect_sink(&sink_slot);
+
+    let t0 = MonotonicTime::EPOCH;
+    let (mut sim, _) = SimInit::new()
+        .add_model(source, source_mbox, "ECNSource")
+        .add_model(port, port_mbox, "ECNPort")
+        .init(t0)
+        .expect("Failed to initialize ECN integration simulation");
+
+    let _ = sim.step_until(Duration::from_secs_f64(1.0));
+
+    let mut saw_ce = false;
+    while let Some(pkt) = sink_slot.next() {
+        if pkt.ecn == EcnField::Ce {
+            saw_ce = true;
+            break;
+        }
+    }
+
+    assert!(saw_ce, "expected at least one CE-marked packet");
+}

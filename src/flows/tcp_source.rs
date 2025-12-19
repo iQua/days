@@ -780,3 +780,86 @@ impl TCPPacketSource {
 }
 
 impl Model for TCPPacketSource {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use crate::flows::packet::TCPAck;
+    use crate::flows::{DistributionInfo, TCPCharacteristics};
+    use rand::SeedableRng;
+
+    fn make_source(ecn: bool) -> TCPPacketSource {
+        let traffic = TrafficCharacteristics::new(
+            0.0,
+            Some(1.0),
+            None,
+            DistributionInfo::Uniform { low: 0.1, high: 0.1 },
+            DistributionInfo::DiscreteUniform { low: 512, high: 512 },
+            Some(TCPCharacteristics {
+                cc_algorithm: CCAlgorithm::TCPReno,
+                ecn,
+            }),
+        );
+        let rng = SmallRng::from_os_rng();
+        TCPPacketSource::new(0, Vec::new(), traffic, 0, None, rng)
+    }
+
+    fn make_ack(flow_id: usize, seq: usize, acked: usize, ece: bool, now: f64) -> Packet {
+        Packet {
+            time: now,
+            creation_time: 0.0,
+            size: 40,
+            packet_id: seq,
+            flow_id,
+            queueing_delay: 0.0,
+            priority: 0,
+            last_packet: false,
+            ack: Some(TCPAck {
+                sequence_num: seq,
+                acknowledged_size: acked,
+                ece,
+            }),
+            ecn: EcnField::NotEct,
+            cwr: false,
+        }
+    }
+
+    #[test]
+    fn test_ecn_sets_cwr_on_next_data() {
+        let mut source = make_source(true);
+        let ack = make_ack(source.flow_id, source.mss, source.mss, true, 1.0);
+
+        let _ = block_on(source.ack_packet_received(ack, 1.0));
+        assert!(source.cwr_pending);
+        assert!(source.ecn_reduction_in_flight);
+
+        let mut packet = Packet::new(source.mss, 0, source.flow_id, 1.0);
+        source.apply_ecn_on_new_data(&mut packet);
+        assert_eq!(packet.ecn, EcnField::Ect0);
+        assert!(packet.cwr);
+        assert!(!source.cwr_pending);
+    }
+
+    #[test]
+    fn test_ecn_reduction_clears_on_non_ece_ack() {
+        let mut source = make_source(true);
+        let ack_ece = make_ack(source.flow_id, source.mss, source.mss, true, 1.0);
+        let _ = block_on(source.ack_packet_received(ack_ece, 1.0));
+        assert!(source.ecn_reduction_in_flight);
+
+        let ack_no_ece = make_ack(source.flow_id, source.mss * 2, source.mss, false, 2.0);
+        let _ = block_on(source.ack_packet_received(ack_no_ece, 2.0));
+        assert!(!source.ecn_reduction_in_flight);
+    }
+
+    #[test]
+    fn test_retransmit_is_not_ect() {
+        let mut packet = Packet::new(512, 0, 0, 0.0);
+        packet.ecn = EcnField::Ect0;
+        packet.cwr = true;
+        TCPPacketSource::apply_ecn_on_retransmit(&mut packet);
+        assert_eq!(packet.ecn, EcnField::NotEct);
+        assert!(!packet.cwr);
+    }
+}
