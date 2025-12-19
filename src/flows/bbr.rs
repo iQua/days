@@ -133,7 +133,7 @@ impl BBRState {
             bw_samples: VecDeque::with_capacity(32),
             rtt_samples: VecDeque::with_capacity(10),
             pacing_rate: 0.0,
-            cwnd: 10 * mss,   // Initial cwnd
+            cwnd: 10 * mss, // Initial cwnd
             pacing_gain: Self::STARTUP_PACING_GAIN,
             cwnd_gain: Self::CWND_GAIN,
             inflight_hi: usize::MAX,
@@ -190,8 +190,7 @@ impl BBRState {
 
         // Keep samples from the last 2 ProbeBW cycles
         let oldest_cycle = self.probe_bw_cycle.saturating_sub(1);
-        self.bw_samples
-            .retain(|&(_, cycle)| cycle >= oldest_cycle);
+        self.bw_samples.retain(|&(_, cycle)| cycle >= oldest_cycle);
 
         // Update max_bw as windowed maximum over bw_samples
         self.max_bw = self
@@ -289,9 +288,7 @@ impl BBRState {
         self.update_extra_acked(&event.rate_sample, now);
 
         self.round_delivered = self.round_delivered.saturating_add(bytes_acked);
-        self.round_lost = self
-            .round_lost
-            .saturating_add(event.rate_sample.lost);
+        self.round_lost = self.round_lost.saturating_add(event.rate_sample.lost);
 
         if new_round {
             self.update_full_bw();
@@ -423,8 +420,8 @@ impl BBRState {
             return;
         }
 
-        let loss_rate = self.round_lost as f64
-            / (self.round_lost + self.round_delivered).max(1) as f64;
+        let loss_rate =
+            self.round_lost as f64 / (self.round_lost + self.round_delivered).max(1) as f64;
 
         if loss_rate > Self::LOSS_THRESH {
             if self.mode == BBRMode::Startup {
@@ -492,7 +489,9 @@ impl BBRState {
     }
 
     fn maybe_advance_probe_bw_phase(&mut self, now: f64, prior_inflight: usize) {
-        let rounds_in_phase = self.round_count.saturating_sub(self.probe_bw_phase_start_round);
+        let rounds_in_phase = self
+            .round_count
+            .saturating_sub(self.probe_bw_phase_start_round);
         let target = self.target_inflight();
         let inflight = self.inflight.max(prior_inflight);
 

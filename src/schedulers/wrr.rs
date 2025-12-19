@@ -161,9 +161,9 @@ impl WRRServer {
     pub fn on_packet_received(&mut self, packet: Packet) {
         let mut packet = packet;
         let queue_len = self.queues.iter().map(|q| q.len()).sum();
-        let drop_action = self
-            .drop_strategy
-            .action(packet.size, self.byte_sizes.iter().sum(), queue_len);
+        let drop_action =
+            self.drop_strategy
+                .action(packet.size, self.byte_sizes.iter().sum(), queue_len);
 
         match drop_action {
             DropAction::Drop => {

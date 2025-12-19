@@ -458,9 +458,7 @@ impl TCPPacketSource {
                 self.delivered_time = now;
             }
 
-            let sample_packet_id = ack
-                .sequence_num
-                .saturating_sub(ack.acknowledged_size);
+            let sample_packet_id = ack.sequence_num.saturating_sub(ack.acknowledged_size);
             let mut rate_sample = RateSample {
                 delivered: delivered_bytes,
                 interval: sample_rtt,
@@ -489,14 +487,13 @@ impl TCPPacketSource {
             }
 
             self.last_ack = ack.sequence_num;
-            self.congestion_control
-                .ack_received(AckEvent {
-                    ack_seq: ack.sequence_num,
-                    rtt: sample_rtt,
-                    now,
-                    bytes_acked: ack.acknowledged_size,
-                    rate_sample,
-                });
+            self.congestion_control.ack_received(AckEvent {
+                ack_seq: ack.sequence_num,
+                rtt: sample_rtt,
+                now,
+                bytes_acked: ack.acknowledged_size,
+                rate_sample,
+            });
             self.pending_lost_bytes = 0;
             self.pending_ecn_marked = false;
 
@@ -600,8 +597,7 @@ impl TCPPacketSource {
                 );
 
                 if let Some(lost_pkt) = self.sent_packets.get(&packet_timeout.packet_id) {
-                    self.pending_lost_bytes =
-                        self.pending_lost_bytes.saturating_add(lost_pkt.size);
+                    self.pending_lost_bytes = self.pending_lost_bytes.saturating_add(lost_pkt.size);
                 }
 
                 self.congestion_control.timer_expired();

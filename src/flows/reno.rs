@@ -504,7 +504,7 @@ mod tests {
         let full_ack_seq = reno.snd_max;
         let bytes_acked = reno.snd_max - reno.highest_ack;
         ack(
-            bytes_acked,  // bytes_acked: usize
+            bytes_acked, // bytes_acked: usize
             &mut reno,
             full_ack_seq, // ack_seq: usize
             0.1,          // rtt: f64
@@ -807,7 +807,7 @@ mod tests {
             for _ in 0..acks_per_rtt {
                 let ack_seq = reno.highest_ack + mss; // Increment the ack_seq appropriately
                 ack(
-                    mss,                // bytes_acked: usize
+                    mss, // bytes_acked: usize
                     &mut reno,
                     ack_seq,            // ack_seq: usize
                     0.1 * (rtt as f64), // rtt: f64

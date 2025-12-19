@@ -150,9 +150,9 @@ impl SPServer {
     pub fn on_packet_received(&mut self, packet: Packet) {
         let mut packet = packet;
         let queue_len = self.queues.values().map(|q| q.len()).sum();
-        let drop_action = self
-            .drop_strategy
-            .action(packet.size, self.total_queued_bytes, queue_len);
+        let drop_action =
+            self.drop_strategy
+                .action(packet.size, self.total_queued_bytes, queue_len);
 
         match drop_action {
             DropAction::Drop => {
