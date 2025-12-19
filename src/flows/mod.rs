@@ -4,6 +4,10 @@ pub mod bbr;
 pub mod cc;
 pub mod collective;
 pub mod cubic;
+#[cfg(feature = "dcqcn")]
+pub mod dcqcn_sink;
+#[cfg(feature = "dcqcn")]
+pub mod dcqcn_source;
 pub mod dist_source;
 pub mod flow;
 pub mod packet;
@@ -50,6 +54,8 @@ pub struct TomlTrafficCharacteristics {
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
     pub tcp: Option<TCPCharacteristics>,
+    #[cfg(feature = "dcqcn")]
+    pub dcqcn: Option<DcqcnCharacteristics>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +65,8 @@ pub struct TrafficCharacteristics {
     pub arr_dist: DistributionInfo,
     pub pkt_size_dist: DistributionInfo,
     pub tcp: Option<TCPCharacteristics>,
+    #[cfg(feature = "dcqcn")]
+    pub dcqcn: Option<DcqcnCharacteristics>,
 }
 
 impl TrafficCharacteristics {
@@ -83,6 +91,8 @@ impl TrafficCharacteristics {
             arr_dist,
             pkt_size_dist,
             tcp,
+            #[cfg(feature = "dcqcn")]
+            dcqcn: None,
         }
     }
 
@@ -99,6 +109,8 @@ impl TrafficCharacteristics {
             arr_dist: traffic.arr_dist.clone(),
             pkt_size_dist: traffic.pkt_size_dist.clone(),
             tcp: traffic.tcp.clone(),
+            #[cfg(feature = "dcqcn")]
+            dcqcn: traffic.dcqcn.clone(),
         }
     }
 }
@@ -129,4 +141,20 @@ pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
     #[serde(default)]
     pub ecn: bool,
+}
+
+#[cfg(feature = "dcqcn")]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct DcqcnCharacteristics {
+    pub rate_gbps: f64,
+    pub min_rate_gbps: f64,
+    pub max_rate_gbps: f64,
+    pub g: f64,
+    pub ai_rate_gbps: f64,
+    pub hai_rate_gbps: f64,
+    pub mi_factor: f64,
+    pub rtt_ns: Option<f64>,
+    pub cnp_interval_ns: Option<f64>,
+    pub pacing_interval_ns: Option<f64>,
+    pub cnp_priority: Option<u8>,
 }

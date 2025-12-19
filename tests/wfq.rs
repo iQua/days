@@ -79,6 +79,7 @@ fn test_weighted_fair_queueing() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id),
         DropStrategy::TailDrop,
+        0.0,
         vec![1, 2], // weights
     );
 

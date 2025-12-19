@@ -20,6 +20,8 @@ use serde::Serialize;
 
 use crate::flows::FlowFinishMsg;
 use crate::flows::basic_sink::BasicPacketSink;
+#[cfg(feature = "dcqcn")]
+use crate::flows::dcqcn_sink::DcqcnPacketSink;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
@@ -200,6 +202,8 @@ impl PacketStatistics {
 pub enum PacketSink {
     BasicPacketSink(BasicPacketSink),
     TCPPacketSink(TCPPacketSink),
+    #[cfg(feature = "dcqcn")]
+    DcqcnPacketSink(DcqcnPacketSink),
 }
 
 impl std::fmt::Display for PacketSink {
@@ -207,6 +211,8 @@ impl std::fmt::Display for PacketSink {
         match self {
             PacketSink::BasicPacketSink(_) => write!(f, "PacketSink {}", self.id()),
             PacketSink::TCPPacketSink(_) => write!(f, "TCPPacketSink {}", self.id()),
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(_) => write!(f, "DCQCNPacketSink {}", self.id()),
         }
     }
 }
@@ -220,6 +226,10 @@ impl PacketSink {
             PacketSource::TCPPacketSource(_) => {
                 PacketSink::TCPPacketSink(TCPPacketSink::new(source.flow_id()))
             }
+            #[cfg(feature = "dcqcn")]
+            PacketSource::DcqcnPacketSource(source) => {
+                PacketSink::DcqcnPacketSink(DcqcnPacketSink::new(source.flow_id, &source.traffic))
+            }
         }
     }
 
@@ -227,6 +237,8 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.endpoint_id,
             PacketSink::TCPPacketSink(sink) => sink.endpoint_id,
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => sink.endpoint_id,
         }
     }
 
@@ -234,6 +246,8 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.statistics.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.statistics.borrow_mut(),
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => sink.statistics.borrow_mut(),
         }
     }
 
@@ -241,6 +255,8 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.output.borrow_mut(),
             PacketSink::TCPPacketSink(sink) => sink.output.borrow_mut(),
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => sink.output.borrow_mut(),
         }
     }
 
@@ -250,6 +266,10 @@ impl PacketSink {
                 sink.flow_finish_outputs.push(flow_finish_output);
             }
             PacketSink::TCPPacketSink(_) => {}
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => {
+                sink.flow_finish_outputs.push(flow_finish_output);
+            }
         }
     }
 
@@ -268,6 +288,11 @@ impl PacketSink {
                 sink.log_report(now, ReportTiming::Final);
                 sink.statistics.send(sink.packet_statistics.clone()).await;
             }
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => {
+                sink.log_report(now, ReportTiming::Final);
+                sink.statistics.send(sink.packet_statistics.clone()).await;
+            }
         }
     }
 
@@ -282,6 +307,8 @@ impl PacketSink {
             let local_time = match self {
                 PacketSink::BasicPacketSink(sink) => sink.time,
                 PacketSink::TCPPacketSink(sink) => sink.time,
+                #[cfg(feature = "dcqcn")]
+                PacketSink::DcqcnPacketSink(sink) => sink.time,
             };
 
             // makes sure that the current simulation time can be correctly retrieved from
@@ -307,6 +334,8 @@ impl PacketSink {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.process(packet, now).await,
             PacketSink::TCPPacketSink(sink) => sink.process(packet, now).await,
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => sink.process(packet, now).await,
         }
     }
 
@@ -318,6 +347,10 @@ impl PacketSink {
                 sink.log_report(now, ReportTiming::InProgress);
             }
             PacketSink::TCPPacketSink(sink) => {
+                sink.log_report(now, ReportTiming::InProgress);
+            }
+            #[cfg(feature = "dcqcn")]
+            PacketSink::DcqcnPacketSink(sink) => {
                 sink.log_report(now, ReportTiming::InProgress);
             }
         }

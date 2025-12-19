@@ -56,6 +56,7 @@ fn test_drop_strategy_taildrop_small_buffer() {
         2,         // 2-packet capacity
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
+        0.0,
     );
 
     let mut sink = PacketSink::new(&source);

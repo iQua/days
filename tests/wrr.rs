@@ -90,6 +90,7 @@ fn test_weighted_round_robin() {
         CapacityUnit::Packets,
         Arc::new(|flow_id| flow_id), // each flow_id corresponds to a distinct class
         DropStrategy::TailDrop,
+        0.0,
         vec![1, 2], // weight of class 0 is 1, weight of class 1 is 2
     );
 

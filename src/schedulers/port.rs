@@ -13,7 +13,10 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategy, PacketDrop, RED, TailDrop};
+use crate::schedulers::drop::{
+    CapacityUnit, DropAction, DropStrategy, EcnThreshold, PacketDrop, RED, TailDrop,
+    DEFAULT_ECN_THRESHOLD,
+};
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
@@ -60,8 +63,14 @@ impl Port {
         capacity: usize,
         capacity_unit: CapacityUnit,
         drop_strategy: DropStrategy,
+        ecn_threshold: f64,
     ) -> Port {
         let scheduler_id = next_scheduler_id();
+        let ecn_threshold = if ecn_threshold > 0.0 {
+            ecn_threshold
+        } else {
+            DEFAULT_ECN_THRESHOLD
+        };
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
@@ -82,6 +91,11 @@ impl Port {
                 0.8,
                 scheduler_id,
                 true,
+            )),
+            DropStrategy::EcnThreshold => Box::new(EcnThreshold::new(
+                capacity,
+                capacity_unit,
+                ecn_threshold,
             )),
         };
 

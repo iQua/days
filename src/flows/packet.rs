@@ -8,6 +8,11 @@ pub struct TCPAck {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ControlPacket {
+    DcqcnCnp,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EcnField {
     NotEct,
     Ect0,
@@ -63,6 +68,8 @@ pub struct Packet {
     pub last_packet: bool,
     /// used by TCPPacketSource and TCPPacketSink
     pub ack: Option<TCPAck>,
+    /// Control plane marker for non-data packets (e.g., DCQCN CNP).
+    pub control: Option<ControlPacket>,
     /// Whether this packet was ECN-marked by the network.
     pub ecn: EcnField,
     /// Whether this packet has the TCP CWR (Congestion Window Reduced) flag set.
@@ -82,6 +89,7 @@ impl Packet {
             last_packet: false,
             priority: 0,
             ack: None,
+            control: None,
             ecn: EcnField::NotEct,
             cwr: false,
         }

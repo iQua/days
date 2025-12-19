@@ -22,7 +22,10 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_scheduler_id;
-use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategy, PacketDrop, RED, TailDrop};
+use crate::schedulers::drop::{
+    CapacityUnit, DropAction, DropStrategy, EcnThreshold, PacketDrop, RED, TailDrop,
+    DEFAULT_ECN_THRESHOLD,
+};
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
@@ -129,6 +132,7 @@ impl WFQServer {
         capacity_unit: CapacityUnit,
         flow_classes: Arc<dyn Fn(usize) -> usize + Send + Sync>,
         drop_strategy: DropStrategy,
+        ecn_threshold: f64,
         weights: Vec<usize>,
     ) -> WFQServer {
         let mut finish_times = HashMap::new();
@@ -138,6 +142,11 @@ impl WFQServer {
         }
 
         let scheduler_id = next_scheduler_id();
+        let ecn_threshold = if ecn_threshold > 0.0 {
+            ecn_threshold
+        } else {
+            DEFAULT_ECN_THRESHOLD
+        };
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
@@ -158,6 +167,11 @@ impl WFQServer {
                 0.8,
                 scheduler_id,
                 true,
+            )),
+            DropStrategy::EcnThreshold => Box::new(EcnThreshold::new(
+                capacity,
+                capacity_unit,
+                ecn_threshold,
             )),
         };
 
@@ -573,6 +587,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id), // flow_classes mapping
             DropStrategy::TailDrop,
+            0.0,
             vec![1], // weights for one class
         );
 
@@ -602,6 +617,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id), // maps flow ids to class ids directly
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 1, 1], // equal weights for three connections
         );
 
@@ -650,6 +666,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 1],
         );
 
@@ -678,6 +695,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1],
         );
 
@@ -698,6 +716,7 @@ mod tests {
             CapacityUnit::Bytes,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1],
         );
 
@@ -718,6 +737,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 1], // same weights
         );
 
@@ -750,6 +770,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1],
         );
 
@@ -777,6 +798,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::RED, // uses RED
+            0.0,
             vec![1],
         );
 
@@ -799,6 +821,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id % 3), // maps flow_ids to 3 classes
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 2, 3], // different weights
         );
 
@@ -839,6 +862,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 2], // weights 1:2
         );
 
@@ -870,6 +894,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 1], // Equal weights
         );
 
@@ -899,6 +924,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 1], // Equal weights
         );
 
@@ -936,6 +962,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 2, 4], // 1:2:4 weight ratio
         );
 
@@ -990,6 +1017,7 @@ mod tests {
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
             DropStrategy::TailDrop,
+            0.0,
             vec![1, 1], // Equal weights
         );
 
