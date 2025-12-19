@@ -50,6 +50,8 @@ pub struct BBRState {
     pub max_cwnd: usize,
     /// Timestamp of last RTT sample
     pub last_rtt_sample_time: f64,
+    /// Most recent RTT sample
+    pub last_rtt: f64,
     /// Start time of the current round
     pub round_start_time: f64,
     /// Total data delivered so far
@@ -144,6 +146,7 @@ impl BBRState {
             next_round_delivered: 0,
             round_start_time: 0.0,
             last_rtt_sample_time: 0.0,
+            last_rtt: 0.0,
             mss,
             max_cwnd: 2_000_000 * mss, // 2M segments
             total_data_delivered: 0,
@@ -276,6 +279,7 @@ impl BBRState {
 
         self.total_data_delivered = ack_seq;
         self.last_rtt_sample_time = now;
+        self.last_rtt = rtt;
         let new_round = self.update_round(ack_seq);
         if new_round {
             self.handle_round_end(now, event.rate_sample.prior_inflight);
@@ -319,7 +323,14 @@ impl BBRState {
     }
 
     pub fn calculate_pacing_rate(&mut self) {
-        self.pacing_rate = self.max_bw * self.pacing_gain;
+        if self.pacing_rate == 0.0 && self.last_rtt > 0.0 && self.cwnd > 0 {
+            self.pacing_rate = self.cwnd as f64 / self.last_rtt;
+        }
+
+        let target_rate = self.max_bw * self.pacing_gain;
+        if target_rate > 0.0 && (self.full_bw_reached || target_rate > self.pacing_rate) {
+            self.pacing_rate = target_rate;
+        }
     }
 
     pub fn calculate_cwnd(&mut self) {
