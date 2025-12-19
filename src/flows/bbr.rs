@@ -17,7 +17,7 @@ pub struct BBRState {
     /// The amount of data in flight
     pub inflight: usize,
     /// Recent bandwidth samples
-    pub bw_samples: VecDeque<f64>,
+    pub bw_samples: VecDeque<(f64, u64)>,
     /// Recent RTT samples
     pub rtt_samples: VecDeque<(f64, f64)>, // (rtt_sample, timestamp)
     /// Pacing rate
@@ -50,6 +50,8 @@ pub struct BBRState {
     pub round_start_time: f64,
     /// Total data delivered so far
     pub total_data_delivered: usize,
+    /// Current ProbeBW cycle index
+    pub probe_bw_cycle: u64,
     /// ProbeBW phase (only valid in ProbeBW mode)
     pub probe_bw_phase: ProbeBWPhase,
     /// Timestamp when current ProbeBW phase began
@@ -62,6 +64,10 @@ pub struct BBRState {
     pub full_bw_reached: bool,
     /// Timestamp of last min_rtt update
     pub min_rtt_stamp: f64,
+    /// Estimated extra ACKed bytes (ACK aggregation)
+    pub extra_acked: f64,
+    /// Recent extra_acked samples
+    pub extra_acked_samples: VecDeque<(f64, f64)>, // (extra_acked, timestamp)
     /// Timestamp when ProbeRTT started
     pub probe_rtt_start: f64,
     /// When ProbeRTT can exit (0 if not scheduled)
@@ -106,7 +112,7 @@ impl BBRState {
             max_bw: 0.0,
             min_rtt: f64::INFINITY,
             inflight: 0,
-            bw_samples: VecDeque::with_capacity(10),
+            bw_samples: VecDeque::with_capacity(32),
             rtt_samples: VecDeque::with_capacity(10),
             pacing_rate: 0.0,
             cwnd: 10 * mss,   // Initial cwnd
@@ -123,12 +129,15 @@ impl BBRState {
             mss,
             max_cwnd: 2_000_000 * mss, // 2M segments
             total_data_delivered: 0,
+            probe_bw_cycle: 0,
             probe_bw_phase: ProbeBWPhase::Down,
             probe_bw_phase_start: 0.0,
             full_bw: 0.0,
             full_bw_count: 0,
             full_bw_reached: false,
             min_rtt_stamp: 0.0,
+            extra_acked: 0.0,
+            extra_acked_samples: VecDeque::with_capacity(10),
             probe_rtt_start: 0.0,
             probe_rtt_done_stamp: 0.0,
         }
@@ -146,14 +155,25 @@ impl BBRState {
             bytes_acked as f64 / rtt
         };
 
-        // Add to bandwidth samples
-        self.bw_samples.push_back(bw_sample);
-        if self.bw_samples.len() > 10 {
-            self.bw_samples.pop_front();
+        // Skip app-limited samples unless they exceed current max
+        if rate_sample.is_app_limited && bw_sample <= self.max_bw {
+            return;
         }
 
+        // Add to bandwidth samples with cycle index
+        self.bw_samples.push_back((bw_sample, self.probe_bw_cycle));
+
+        // Keep samples from the last 2 ProbeBW cycles
+        let oldest_cycle = self.probe_bw_cycle.saturating_sub(1);
+        self.bw_samples
+            .retain(|&(_, cycle)| cycle >= oldest_cycle);
+
         // Update max_bw as windowed maximum over bw_samples
-        self.max_bw = self.bw_samples.iter().cloned().fold(0.0, f64::max);
+        self.max_bw = self
+            .bw_samples
+            .iter()
+            .map(|&(bw, _)| bw)
+            .fold(0.0, f64::max);
     }
 
     pub fn update_min_rtt(&mut self, rtt: f64, now: f64) {
@@ -176,6 +196,30 @@ impl BBRState {
         if self.min_rtt < prev_min_rtt {
             self.min_rtt_stamp = now;
         }
+    }
+
+    pub fn update_extra_acked(&mut self, rate_sample: &RateSample, now: f64) {
+        if !self.min_rtt.is_finite() || self.max_bw == 0.0 || rate_sample.interval <= 0.0 {
+            return;
+        }
+
+        let expected = self.max_bw * rate_sample.interval;
+        let delivered = rate_sample.delivered as f64;
+        let extra = (delivered - expected).max(0.0);
+
+        self.extra_acked_samples.push_back((extra, now));
+        if self.extra_acked_samples.len() > 10 {
+            self.extra_acked_samples.pop_front();
+        }
+
+        // Keep extra_acked samples within the min RTT filter window
+        self.extra_acked_samples
+            .retain(|&(_, t)| now - t <= Self::MIN_RTT_FILTER_SEC);
+        self.extra_acked = self
+            .extra_acked_samples
+            .iter()
+            .map(|&(val, _)| val)
+            .fold(0.0, f64::max);
     }
 
     pub fn update_round(&mut self, ack_seq: usize) -> bool {
@@ -213,6 +257,7 @@ impl BBRState {
         let new_round = self.update_round(ack_seq);
         self.update_bandwidth(bytes_acked, rtt, &event.rate_sample);
         self.update_min_rtt(rtt, now);
+        self.update_extra_acked(&event.rate_sample, now);
 
         if new_round {
             self.update_full_bw();
@@ -253,7 +298,7 @@ impl BBRState {
 
     pub fn calculate_cwnd(&mut self) {
         let bdp = self.max_bw * self.min_rtt;
-        let target_cwnd = (bdp * self.cwnd_gain) as usize;
+        let target_cwnd = (bdp * self.cwnd_gain + self.extra_acked) as usize;
 
         if self.inflight_hi != usize::MAX {
             self.cwnd = target_cwnd.min(self.inflight_hi);
@@ -334,6 +379,7 @@ impl BBRState {
     fn enter_probe_bw(&mut self, now: f64) {
         self.mode = BBRMode::ProbeBW;
         self.probe_bw_phase = ProbeBWPhase::Down;
+        self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
         self.probe_bw_phase_start = now;
         self.pacing_gain = Self::PROBE_BW_PACING_GAIN_DOWN;
         self.cwnd_gain = Self::CWND_GAIN;
@@ -346,6 +392,9 @@ impl BBRState {
             ProbeBWPhase::Refill => ProbeBWPhase::Up,
             ProbeBWPhase::Up => ProbeBWPhase::Down,
         };
+        if self.probe_bw_phase == ProbeBWPhase::Down {
+            self.probe_bw_cycle = self.probe_bw_cycle.saturating_add(1);
+        }
         self.probe_bw_phase_start = now;
         self.pacing_gain = match self.probe_bw_phase {
             ProbeBWPhase::Down => Self::PROBE_BW_PACING_GAIN_DOWN,
