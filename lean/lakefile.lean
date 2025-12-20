@@ -8,3 +8,6 @@ lean_lib DaysLean where
 @[default_target]
 lean_exe dcqcn_check where
   root := `DaysLean.Main
+
+lean_exe pfc_check where
+  root := `DaysLean.PfcMain

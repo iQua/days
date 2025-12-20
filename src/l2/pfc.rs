@@ -20,9 +20,17 @@ const NUM_PRIORITIES: usize = 8;
 const PAUSE_QUANTA_BITS: f64 = 512.0;
 const PFC_FRAME_SIZE_BYTES: usize = 64;
 
+#[cfg(feature = "lean")]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
 #[derive(Debug, Clone)]
 pub struct PfcFrame {
     pub time: f64,
+    pub sender_id: u64,
+    pub receiver_id: u64,
+    pub pfc_frame_id: u64,
     /// Bitmask of enabled priorities (bit i => priority i affected).
     pub class_enable: u8,
     /// Pause quanta per priority.
@@ -55,9 +63,19 @@ pub struct PfcPortReport {
 }
 
 impl PfcFrame {
-    pub fn new(time: f64, class_enable: u8, pause_quanta: [u16; NUM_PRIORITIES]) -> Self {
+    pub fn new(
+        time: f64,
+        sender_id: u64,
+        receiver_id: u64,
+        pfc_frame_id: u64,
+        class_enable: u8,
+        pause_quanta: [u16; NUM_PRIORITIES],
+    ) -> Self {
         Self {
             time,
+            sender_id,
+            receiver_id,
+            pfc_frame_id,
             class_enable,
             pause_quanta,
         }
@@ -82,6 +100,7 @@ impl PfcFrame {
 
 pub struct PfcIngressPort {
     port_id: usize,
+    peer_gate_id: usize,
     /// locally maintained simulation time
     pub time: f64,
     /// configuration parameters
@@ -113,11 +132,13 @@ pub struct PfcIngressPort {
 impl PfcIngressPort {
     pub fn new(
         port_id: usize,
+        peer_gate_id: usize,
         config: PfcConfig,
         can_forward: Arc<dyn Fn(&Packet) -> bool + Send + Sync>,
     ) -> Self {
         Self {
             port_id,
+            peer_gate_id,
             time: 0.0,
             config,
             occupancy: [0; NUM_PRIORITIES],
@@ -142,9 +163,51 @@ impl PfcIngressPort {
     }
 
     async fn send_pfc(&mut self, now: f64, priority: usize, pause_quanta: u16) {
+        #[cfg(feature = "lean")]
+        let pfc_frame_id = CsvLogger::next_pfc_frame_id();
+        #[cfg(not(feature = "lean"))]
+        let pfc_frame_id = 0;
+
         let mut quanta = [0u16; NUM_PRIORITIES];
         quanta[priority] = pause_quanta;
-        let frame = PfcFrame::new(now, 1 << priority, quanta);
+        let frame = PfcFrame::new(
+            now,
+            self.port_id as u64,
+            self.peer_gate_id as u64,
+            pfc_frame_id,
+            1 << priority,
+            quanta,
+        );
+
+        #[cfg(feature = "lean")]
+        {
+            let queue_occupancy_bytes = self.occupancy[priority] as u64;
+            let xoff_threshold_bytes = self.config.xoff[priority] as u64;
+            let xon_threshold_bytes = self.config.xon[priority] as u64;
+            let buffer_capacity_bytes = self.config.buffer_capacity[priority] as u64;
+            let refresh_interval_ns = self.config.refresh_interval.map(to_ns);
+            let drain_interval_ns = self.config.drain_interval.map(to_ns);
+
+            let event = crate::utils::logger::PfcEventRow {
+                time_ns: to_ns(now),
+                event_id: CsvLogger::next_pfc_event_id(),
+                kind: crate::utils::logger::PfcEventKind::PfcSent,
+                sender_id: frame.sender_id,
+                receiver_id: frame.receiver_id,
+                priority: priority as u8,
+                pfc_frame_id: frame.pfc_frame_id,
+                class_enable: frame.class_enable,
+                pause_quanta,
+                queue_occupancy_bytes: Some(queue_occupancy_bytes),
+                xoff_threshold_bytes: Some(xoff_threshold_bytes),
+                xon_threshold_bytes: Some(xon_threshold_bytes),
+                buffer_capacity_bytes: Some(buffer_capacity_bytes),
+                refresh_interval_ns,
+                drain_interval_ns,
+            };
+            CsvLogger::try_log_report(Report::PfcEventRow(event), ReportTiming::InProgress);
+        }
+
         if pause_quanta > 0 {
             self.pause_frames_sent += 1;
         } else {
@@ -518,6 +581,34 @@ impl PfcEgressGate {
             );
         }
 
+        #[cfg(feature = "lean")]
+        {
+            for priority in 0..NUM_PRIORITIES {
+                if !frame.enabled(priority) {
+                    continue;
+                }
+
+                let event = crate::utils::logger::PfcEventRow {
+                    time_ns: to_ns(frame.time),
+                    event_id: CsvLogger::next_pfc_event_id(),
+                    kind: crate::utils::logger::PfcEventKind::PfcRecv,
+                    sender_id: frame.sender_id,
+                    receiver_id: self.gate_id as u64,
+                    priority: priority as u8,
+                    pfc_frame_id: frame.pfc_frame_id,
+                    class_enable: frame.class_enable,
+                    pause_quanta: frame.pause_quanta[priority],
+                    queue_occupancy_bytes: None,
+                    xoff_threshold_bytes: None,
+                    xon_threshold_bytes: None,
+                    buffer_capacity_bytes: None,
+                    refresh_interval_ns: None,
+                    drain_interval_ns: None,
+                };
+                CsvLogger::try_log_report(Report::PfcEventRow(event), ReportTiming::InProgress);
+            }
+        }
+
         let now = frame.time;
         self.apply_pfc(&frame);
         self.drain_ready(now).await;
@@ -565,7 +656,7 @@ mod tests {
 
         let mut quanta = [0u16; NUM_PRIORITIES];
         quanta[3] = 10;
-        let pfc = PfcFrame::new(0.0, 1 << 3, quanta);
+        let pfc = PfcFrame::new(0.0, 0, 0, 0, 1 << 3, quanta);
 
         gate.test_apply_pfc(pfc.clone());
 
@@ -589,10 +680,10 @@ mod tests {
 
         let mut quanta = [0u16; NUM_PRIORITIES];
         quanta[2] = 100;
-        let pfc_pause = PfcFrame::new(0.0, 1 << 2, quanta);
+        let pfc_pause = PfcFrame::new(0.0, 0, 0, 0, 1 << 2, quanta);
         gate.test_apply_pfc(pfc_pause);
 
-        let pfc_resume = PfcFrame::new(0.5, 1 << 2, [0u16; NUM_PRIORITIES]);
+        let pfc_resume = PfcFrame::new(0.5, 0, 0, 0, 1 << 2, [0u16; NUM_PRIORITIES]);
         gate.test_apply_pfc(pfc_resume);
 
         let frame = gate

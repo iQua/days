@@ -81,7 +81,7 @@ fn test_pfc_pause_frames_emitted() {
     pfc_config.pause_quanta[0] = 10;
 
     let can_forward = Arc::new(|_packet: &Packet| false);
-    let ingress = PfcIngressPort::new(0, pfc_config, can_forward);
+    let ingress = PfcIngressPort::new(0, 0, pfc_config, can_forward);
 
     let source = FrameSource::new(4, 600);
     let pause = Arc::new(AtomicUsize::new(0));

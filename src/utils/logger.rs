@@ -6,7 +6,7 @@ use log::info;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs;
-#[cfg(all(feature = "lean", feature = "dcqcn"))]
+#[cfg(all(feature = "lean", any(feature = "dcqcn", feature = "l2_pfc")))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -24,6 +24,34 @@ use crate::flows::packet::EcnField;
 struct LogConfig {
     log_path: Option<String>,
     report_interval: Option<f64>,
+}
+
+#[cfg(all(feature = "lean", feature = "l2_pfc"))]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PfcEventKind {
+    PfcSent,
+    PfcRecv,
+}
+
+#[cfg(all(feature = "lean", feature = "l2_pfc"))]
+#[derive(Clone, Debug, Serialize)]
+pub struct PfcEventRow {
+    pub time_ns: u64,
+    pub event_id: u64,
+    pub kind: PfcEventKind,
+    pub sender_id: u64,
+    pub receiver_id: u64,
+    pub priority: u8,
+    pub pfc_frame_id: u64,
+    pub class_enable: u8,
+    pub pause_quanta: u16,
+    pub queue_occupancy_bytes: Option<u64>,
+    pub xoff_threshold_bytes: Option<u64>,
+    pub xon_threshold_bytes: Option<u64>,
+    pub buffer_capacity_bytes: Option<u64>,
+    pub refresh_interval_ns: Option<u64>,
+    pub drain_interval_ns: Option<u64>,
 }
 
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
@@ -89,6 +117,12 @@ pub struct DcqcnEventRow {
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
 static NEXT_DCQCN_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(feature = "lean", feature = "l2_pfc"))]
+static NEXT_PFC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(feature = "lean", feature = "l2_pfc"))]
+static NEXT_PFC_FRAME_ID: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Debug)]
 pub enum Report {
     PacketSourceReport(PacketSourceReport),
@@ -96,6 +130,8 @@ pub enum Report {
     PacketSinkReport(PacketSinkReport),
     #[cfg(feature = "l2_pfc")]
     PfcPortReport(PfcPortReport),
+    #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+    PfcEventRow(PfcEventRow),
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEventRow(DcqcnEventRow),
 }
@@ -114,6 +150,8 @@ struct SharedState {
     sink_reports: Vec<PacketSinkReport>,
     #[cfg(feature = "l2_pfc")]
     pfc_reports: Vec<PfcPortReport>,
+    #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+    pfc_events: Vec<PfcEventRow>,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     dcqcn_events: Vec<DcqcnEventRow>,
     total_delay: f64,
@@ -126,6 +164,8 @@ enum ElementType {
     Sink,
     #[cfg(feature = "l2_pfc")]
     Pfc,
+    #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+    PfcEvents,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEvents,
 }
@@ -221,6 +261,8 @@ impl CsvLogger {
         let mut elements = vec!["sources", "switches", "sinks"];
         #[cfg(feature = "l2_pfc")]
         elements.push("pfc");
+        #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+        elements.push("pfc_events");
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         elements.push("dcqcn_events");
         for element in elements {
@@ -249,6 +291,16 @@ impl CsvLogger {
         NEXT_DCQCN_EVENT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+    pub fn next_pfc_event_id() -> u64 {
+        NEXT_PFC_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+    pub fn next_pfc_frame_id() -> u64 {
+        NEXT_PFC_FRAME_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn log_report_inner(&self, report: Report, timing: ReportTiming) {
         // Acquire the lock to modify shared state
         let mut state = self.shared_state.write();
@@ -266,6 +318,10 @@ impl CsvLogger {
             #[cfg(feature = "l2_pfc")]
             Report::PfcPortReport(report) => {
                 state.pfc_reports.push(report);
+            }
+            #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+            Report::PfcEventRow(event) => {
+                state.pfc_events.push(event);
             }
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             Report::DcqcnEventRow(event) => {
@@ -310,6 +366,8 @@ impl CsvLogger {
             ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "l2_pfc")]
             ElementType::Pfc => format!("{}pfc.csv", self.log_path.get().unwrap()),
+            #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+            ElementType::PfcEvents => format!("{}pfc_events.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             ElementType::DcqcnEvents => {
                 format!("{}dcqcn_events.csv", self.log_path.get().unwrap())
@@ -414,6 +472,14 @@ impl CsvLogger {
             }
         }
 
+        #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+        if state.pfc_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.pfc_events);
+            if let Err(e) = self.write_to_csv(ElementType::PfcEvents, &events) {
+                eprintln!("Error writing PFC events to CSV: {}", e);
+            }
+        }
+
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         if state.dcqcn_events.len() >= self.max_log_len {
             let events = std::mem::take(&mut state.dcqcn_events);
@@ -458,6 +524,13 @@ impl CsvLogger {
             let reports = std::mem::take(&mut state.pfc_reports);
             self.write_to_csv(ElementType::Pfc, &reports)
                 .expect("Error writing PFC reports to CSV");
+        }
+
+        #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+        if !state.pfc_events.is_empty() {
+            let events = std::mem::take(&mut state.pfc_events);
+            self.write_to_csv(ElementType::PfcEvents, &events)
+                .expect("Error writing PFC events to CSV");
         }
 
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
