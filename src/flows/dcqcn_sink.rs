@@ -162,6 +162,7 @@ impl DcqcnPacketSink {
         {
             let event = DcqcnEventRow {
                 time_ns: to_ns(now),
+                event_id: CsvLogger::next_dcqcn_event_id(),
                 kind: DcqcnEventKind::CnpSent,
                 endpoint_id: self.endpoint_id as u64,
                 flow_id: self.flow_id as u64,

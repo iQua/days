@@ -163,6 +163,7 @@ impl DcqcnPacketSource {
             {
                 let event = DcqcnEventRow {
                     time_ns: to_ns(now),
+                    event_id: CsvLogger::next_dcqcn_event_id(),
                     kind: DcqcnEventKind::CnpRecv,
                     endpoint_id: self.endpoint_id as u64,
                     flow_id: self.flow_id as u64,
@@ -216,7 +217,7 @@ impl DcqcnPacketSource {
     pub fn timer_tick(&mut self, now: f64) {
         self.time = now;
         if !self.cnp_seen {
-            self.alpha = (1.0 - self.g) * self.alpha;
+            self.alpha *= 1.0 - self.g;
             let inc = if self.alpha < 0.1 {
                 self.hai_rate_bps
             } else {
@@ -230,6 +231,7 @@ impl DcqcnPacketSource {
         {
             let event = DcqcnEventRow {
                 time_ns: to_ns(now),
+                event_id: CsvLogger::next_dcqcn_event_id(),
                 kind: DcqcnEventKind::TimerTick,
                 endpoint_id: self.endpoint_id as u64,
                 flow_id: self.flow_id as u64,

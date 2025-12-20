@@ -20,6 +20,7 @@ deriving DecidableEq, Repr
 /-- 1:1 with a single row in `dcqcn_events.csv` emitted by Days under `--features dcqcn,lean`. -/
 structure Row where
   timeNs : Nat
+  eventId : Nat
   kind : Kind
   endpointId : Nat
   flowId : Nat
@@ -43,7 +44,14 @@ structure Row where
   rateBps : Option Nat
   cnpSeen : Option Bool
   lastCnpNs : Option Nat
-deriving Repr
+  srcLine : Nat
+deriving DecidableEq, Repr
+
+def key (r : Row) : Nat × Nat :=
+  (r.timeNs, r.eventId)
+
+def keyLt (a b : Nat × Nat) : Bool :=
+  decide (a.1 < b.1 ∨ (a.1 = b.1 ∧ a.2 < b.2))
 
 def stripCR (s : String) : String :=
   if s.endsWith "\r" then
@@ -107,6 +115,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
     Except String Row := do
   let res : Except String Row := do
     let timeNs ← parseNat (← getField idx fields "time_ns")
+    let eventId ← parseNat (← getField idx fields "event_id")
     let kind ← parseKind (← getField idx fields "kind")
     let endpointId ← parseNat (← getField idx fields "endpoint_id")
     let flowId ← parseNat (← getField idx fields "flow_id")
@@ -132,6 +141,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
     let lastCnpNs ← parseOpt parseNat (← getField idx fields "last_cnp_ns")
     pure
       { timeNs
+        eventId
         kind
         endpointId
         flowId
@@ -154,7 +164,8 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         alphaPpb
         rateBps
         cnpSeen
-        lastCnpNs }
+        lastCnpNs
+        srcLine := lineNo }
   match res with
   | .ok r => pure r
   | .error e => throw s!"line {lineNo}: {e}"
@@ -209,10 +220,16 @@ structure SinkState where
   lastTimeNs : Option Nat := none
 deriving Repr
 
+structure PendingInfo where
+  sentTimeNs : Nat
+  sentEventId : Nat
+  sentLine : Nat
+deriving Repr
+
 structure Global where
   src : Std.HashMap Nat SrcState := ∅
   sink : Std.HashMap Nat SinkState := ∅
-  pending : Std.HashMap (Nat × Nat) Unit := ∅
+  pending : Std.HashMap (Nat × Nat) PendingInfo := ∅
 deriving Repr
 
 def require (lineNo : Nat) (cond : Bool) (msg : String) : Except String Unit :=
@@ -346,11 +363,20 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
       pure
         { g with
           sink := g.sink.insert r.endpointId sinkSt'
-          pending := g.pending.insert (r.flowId, pktId) () }
+          pending :=
+            g.pending.insert (r.flowId, pktId)
+              { sentTimeNs := r.timeNs, sentEventId := r.eventId, sentLine := r.srcLine } }
 
   | Kind.cnpRecv => do
       let (_pktFlowId, pktId) ← checkCnpPacket lineNo r
-      require lineNo ((g.pending.get? (r.flowId, pktId)).isSome) "cnp_recv without prior cnp_sent"
+      let pendingKey := (r.flowId, pktId)
+      let pinfo ←
+        match g.pending.get? pendingKey with
+        | none => throw s!"line {lineNo}: cnp_recv without prior cnp_sent"
+        | some p => pure p
+
+      require lineNo (keyLt (pinfo.sentTimeNs, pinfo.sentEventId) (r.timeNs, r.eventId))
+        s!"cnp_recv precedes cnp_sent (sent at line {pinfo.sentLine})"
 
       let p := rowSrcParams r
       require lineNo (okParams p) "invalid source parameters"
@@ -387,7 +413,7 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
       pure
         { g with
           src := g.src.insert r.endpointId srcSt'
-          pending := g.pending.erase (r.flowId, pktId) }
+          pending := g.pending.erase pendingKey }
 
   | Kind.timerTick => do
       let p := rowSrcParams r
@@ -424,13 +450,73 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
       pure { g with src := g.src.insert r.endpointId srcSt' }
 
+def canonicalizeRows (rows : List Row) : Except String (List Row) := do
+  let rowsSorted :=
+    rows.toArray
+      |>.qsort (fun a b => keyLt (key a) (key b))
+      |>.toList
+
+  let rec checkKeys : List Row → Except String Unit
+    | [] => pure ()
+    | [_] => pure ()
+    | a :: b :: rest => do
+        if decide (key a = key b) then
+          throw
+            s!"duplicate key at lines {a.srcLine} and {b.srcLine}: (time_ns={a.timeNs}, event_id={a.eventId})"
+        require b.srcLine (keyLt (key a) (key b)) "canonical key order violated"
+        checkKeys (b :: rest)
+
+  checkKeys rowsSorted
+  pure rowsSorted
+
 def checkRows (rows : List Row) : Except String Unit := do
-  let rec go (lineNo : Nat) (g : Global) (rows : List Row) : Except String Unit := do
+  let rowsSorted ← canonicalizeRows rows
+
+  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
     match rows with
     | [] => pure ()
     | r :: rs => do
-        let g' ← step lineNo g r
-        go (lineNo + 1) g' rs
-  go 2 {} rows
+        match prevKey with
+        | none => pure ()
+        | some pk =>
+            require r.srcLine (keyLt pk (key r)) "global key went backwards"
+        let g' ← step r.srcLine g r
+        go g' (some (key r)) rs
+  go {} none rowsSorted
+
+def dummyRow (timeNs eventId srcLine : Nat) : Row :=
+  { timeNs
+    eventId
+    kind := Kind.timerTick
+    endpointId := 0
+    flowId := 0
+    pktId := none
+    pktFlowId := none
+    triggerEcn := none
+    cnpPriority := none
+    cnpSizeB := none
+    cnpEcn := none
+    cnpCwr := none
+    cnpLastPacket := none
+    cnpIntervalNs := 0
+    gPpb := 0
+    miPpb := 0
+    initRateBps := 0
+    minRateBps := 0
+    maxRateBps := 0
+    aiRateBps := 0
+    haiRateBps := 0
+    alphaPpb := none
+    rateBps := none
+    cnpSeen := none
+    lastCnpNs := none
+    srcLine }
+
+example :
+    (match canonicalizeRows [dummyRow 2 1 10, dummyRow 1 5 11, dummyRow 2 0 12] with
+      | .ok v => some v
+      | .error _ => none) =
+      some [dummyRow 1 5 11, dummyRow 2 0 12, dummyRow 2 1 10] := by
+  native_decide
 
 end DaysLean.DcqcnEventLog

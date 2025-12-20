@@ -6,6 +6,8 @@ use log::info;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -58,6 +60,7 @@ impl From<EcnField> for DcqcnLoggedEcnField {
 #[derive(Clone, Debug, Serialize)]
 pub struct DcqcnEventRow {
     pub time_ns: u64,
+    pub event_id: u64,
     pub kind: DcqcnEventKind,
     pub endpoint_id: u64,
     pub flow_id: u64,
@@ -82,6 +85,9 @@ pub struct DcqcnEventRow {
     pub cnp_seen: Option<bool>,
     pub last_cnp_ns: Option<u64>,
 }
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+static NEXT_DCQCN_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub enum Report {
@@ -236,6 +242,11 @@ impl CsvLogger {
     /// Retrieves the report interval.
     pub fn get_report_interval(&self) -> f64 {
         *self.report_interval.get().unwrap_or(&f64::MAX)
+    }
+
+    #[cfg(all(feature = "lean", feature = "dcqcn"))]
+    pub fn next_dcqcn_event_id() -> u64 {
+        NEXT_DCQCN_EVENT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     fn log_report_inner(&self, report: Report, timing: ReportTiming) {
