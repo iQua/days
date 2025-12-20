@@ -74,8 +74,3 @@ nav:
   - Testing: testing.md
   - Design Notes:
       - L2 Design Note: design-notes/l2.md
-      - DCQCN Plan: design-notes/dcqcn-plan.md
-      - Lean DCQCN Checker: design-notes/lean-dcqcn-checker.md
-      - Simulation Time: design-notes/simulation-time.md
-      - Total Event Ordering: design-notes/total-event-ordering.md
-      - Formal Verification: design-notes/formal-verification.md
