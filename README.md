@@ -5,29 +5,31 @@ Days is a discrete-event network simulator written in Rust. It models network co
 ## Quick start
 
 ```bash
-RUST_LOG=info cargo run -- configs/simple.toml
+cargo run --release configs/simple.toml
 ```
 
 Simulation outputs are written under `log_path` (default: `./output/`) as CSV files.
 
-## Documentation (MkDocs)
+## Documentation
 
-All design and configuration documentation lives under `docs/`, built with MkDocs Material.
+All design and configuration documentation lives under `docs/`:
 
 ```bash
 pip install -r docs/requirements.txt
 mkdocs serve -f docs/mkdocs.yml
+
+Alternatively, one can directly visit the [documentation website](https://days.sh/docs/).
 ```
 
 ## Examples
 
-- Config-driven runs: `cargo run -- configs/tcp_simple.toml`
-- Rust examples: `cargo run --example basic`
+- Config-driven runs: `cargo run --release configs/tcp_simple.toml`
+- Rust examples: `cargo run --release --example basic`
 
 ## Tests
 
 ```bash
-cargo test --features test -- --show-output
+cargo nextest run --all-features
 ```
 
 ## Feature flags
