@@ -49,13 +49,15 @@ nav:
   - Home: index.md
   - Install: install.md
   - Quickstart: quickstart.md
+  - Examples: examples/index.md
+  - Testing: testing.md
   - Configuration:
       - Overview: configuration/overview.md
       - Topology: configuration/topology.md
       - Switches & Queues: configuration/switches.md
       - Flows: configuration/flows.md
       - Collectives: configuration/collectives.md
-      - Link Layer (L2): configuration/l2.md
+      - Link Layer: configuration/l2.md
       - Logging & Tracing: configuration/logging.md
   - Architecture:
       - Overview: architecture/overview.md
@@ -68,9 +70,7 @@ nav:
       - Switch: components/switch.md
       - Schedulers: components/schedulers.md
       - Flows: components/flows.md
-      - L2 (PFC): components/l2.md
+      - L2: components/l2.md
       - Logging: components/logging.md
-  - Examples: examples/index.md
-  - Testing: testing.md
   - Design Notes:
-      - L2 Design Note: design-notes/l2.md
+      - Priority-based Flow Control: design-notes/pfc.md
