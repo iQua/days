@@ -15,8 +15,8 @@ Simulation outputs are written under `log_path` (default: `./output/`) as CSV fi
 All design and configuration documentation lives under `docs/`, built with MkDocs Material.
 
 ```bash
-pip install -r requirements.txt
-mkdocs serve
+pip install -r docs/requirements.txt
+mkdocs serve -f docs/mkdocs.yml
 ```
 
 ## Examples

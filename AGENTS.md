@@ -4,8 +4,8 @@
 - `src/` contains the Rust crate. Key modules live in `src/flows/`, `src/schedulers/`, `src/switches/`, `src/topos/`, `src/utils/`, and optional layer-2 protocol implementations in `src/l2/`.
 - `src/main.rs` is the CLI entry point; `src/lib.rs` exposes the library API.
 - `tests/` holds integration tests, with `.toml` fixtures alongside test files (for example `tests/wrr.rs` + `tests/wrr_seed.toml`).
-- `configs/` stores example simulation configs; `examples/` and `docs/examples/` show runnable scenarios.
-- `docs/` contains the MkDocs site content (see `docs/design-notes/l2.md`).
+- `configs/` stores example simulation configs; `examples/` and `docs/docs/examples/` show runnable scenarios.
+- `docs/` contains the MkDocs site (`docs/mkdocs.yml`, content under `docs/docs/`, e.g. `docs/docs/design-notes/l2.md`).
 - `logs/` and `target/` are generated artifacts and should stay uncommitted.
 
 ## Build, Test, and Development Commands
