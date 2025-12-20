@@ -1,0 +1,127 @@
+# Logging, UI, Tracing, and Runtime Configuration
+
+This page documents “general” configuration keys that are not specific to flows/topology.
+
+Implementation notes:
+
+- `CsvLogger` reads logging keys from `src/utils/logger.rs`.
+- Runtime/UI/tracing keys are read from small config structs in `src/topos/topo.rs` and `src/utils/`.
+
+## `seed` (required)
+
+Random seed used for reproducibility (flow-set endpoint selection, random distributions, RED randomness).
+
+```toml
+seed = 1000
+```
+
+## `duration` (optional)
+
+Total simulated time in seconds.
+
+- Default (topology): `1500.0`
+
+```toml
+duration = 20.0
+```
+
+Note: `duration` is parsed by multiple subsystems (topology, UI, tracing). For consistency, prefer setting it explicitly.
+
+## `num_threads` (optional)
+
+Number of worker threads used by the simulation runtime.
+
+```toml
+num_threads = 1
+```
+
+- If omitted, Days uses the `nexosim` default runtime configuration.
+
+## `mailbox_capacity` (optional)
+
+Mailbox capacity for most models (bounded message queues).
+
+- Default: `16`
+
+```toml
+mailbox_capacity = 32
+```
+
+## CSV reporting
+
+### `log_path` (optional)
+
+Output directory for CSV files.
+
+- Default: `./output`
+
+```toml
+log_path = "./logs/run1"
+```
+
+Days will create the directory if needed and will write:
+
+- `sources.csv`, `sinks.csv`, `switches.csv`
+- plus optional `pfc.csv` and `dcqcn_events.csv` depending on features.
+
+### `report_interval` (optional)
+
+Interval in seconds between periodic report rows.
+
+- Default: `f64::MAX` (effectively “no periodic reports”; data is flushed at the end)
+
+```toml
+report_interval = 1.0
+```
+
+## Progress UI
+
+### `ui_interval` (optional)
+
+UI refresh interval in seconds.
+
+- Default: `duration / 100`
+
+```toml
+ui_interval = 1.0
+```
+
+## Concurrency tracing (optional)
+
+Enable lightweight concurrency sampling:
+
+```toml
+tracing_active = true
+tracing_interval = 1.0
+```
+
+- `tracing_active` (default: `false`)
+- `tracing_interval` (default: `duration / 100`)
+
+When enabled, Days installs a tracing subscriber layer and runs a `ConcurrencyTracer` model that samples active tasks and logs max/average concurrency.
+
+## Application-level sources for TCP collectives (optional)
+
+For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with a shared, actor-managed byte buffer (`src/flows/app_source.rs`).
+
+Configure the actor under `[app_source]`:
+
+```toml
+[app_source]
+req_channel_capacity = 256
+chunk_size = 512
+initial_delay = 1
+run_interval = 50
+```
+
+Fields:
+
+- `req_channel_capacity` (optional): channel capacity for buffer requests
+- `chunk_size` (optional): preferred chunk size for requests (bytes)
+- `initial_delay` (optional): actor start delay (microseconds)
+- `run_interval` (optional): actor polling interval (microseconds)
+
+Defaults:
+
+- If `[app_source]` is omitted, Days uses `AppBufferConfig::default()`.
+- If `[app_source]` is present, each field falls back to a small default if omitted.

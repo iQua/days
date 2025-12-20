@@ -1,0 +1,135 @@
+# Flow Configuration
+
+Flow parsing is implemented in `src/flows/flow.rs`. Flows are end-to-end traffic generators that attach to host switches and send packets through the routed network.
+
+Days supports:
+
+- `[[flow]]`: explicitly declared flows with a specific `(src, dst)` pair
+- `[[flow_set]]`: a set of flows with endpoints chosen randomly from `hosts` using the config seed
+
+## `[[flow]]` schema
+
+Example:
+
+```toml
+[[flow]]
+flow_type = "PacketDistribution"
+priority = 0
+graph = [[0, 1]]
+routing = "ShortestPath" # optional
+path = [0, 2, 1]         # optional, overrides routing
+[flow.traffic]
+  initial_delay = 1.0
+  size = 10000
+  arr_dist = { type = "Exp", lambda = 1.0 }
+  pkt_size_dist = { type = "Uniform", low = 1000, high = 1500 }
+```
+
+Supported fields:
+
+- `flow_id` (optional): explicit flow ID. If omitted, Days auto-assigns IDs starting at 0.
+- `starts_before` / `starts_after` (optional): dependency lists (flow IDs).
+- `flow_type` (required): `PacketDistribution`, `TCP`, or `DCQCN` (DCQCN requires `--features dcqcn`).
+- `priority` (optional): 802.1Q PCP in `0..=7` (default `0`).
+- `graph` (required): `[[src, dst]]` (exactly one edge).
+- `routing` (optional): `ShortestPath` (default), `ECMP`, or `PathFromConfig`.
+- `path` (optional): explicit node list. Must start at `src` and end at `dst`. Overrides `routing`.
+- `traffic` (required): `[flow.traffic]` section (see below).
+
+## `[[flow_set]]` schema
+
+Flow sets generate many flows whose endpoints are chosen randomly from the `hosts` list, using the config seed.
+
+Example:
+
+```toml
+[[flow_set]]
+first_flow_id = 100
+flow_type = "PacketDistribution"
+flow_count = 10
+priority = 0
+[flow_set.traffic]
+  initial_delay = 0.0
+  duration = 10.0
+  arr_dist = { type = "Uniform", low = 0.001, high = 0.001 }
+  pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+```
+
+Supported fields:
+
+- `first_flow_id` (optional): base ID for the set. IDs are assigned consecutively.
+- `starts_before` / `starts_after` (optional): dependency lists (applied to every generated flow).
+- `flow_type` (required)
+- `flow_count` (required)
+- `priority` (optional, default 0)
+- `routing` (optional)
+- `traffic` (required): `[flow_set.traffic]`
+
+## Traffic schema (`[*.traffic]`)
+
+Traffic is parsed via `TomlTrafficCharacteristics` (`src/flows/mod.rs`).
+
+Required fields:
+
+- `arr_dist`
+- `pkt_size_dist`
+- either `size` or `duration`
+
+Optional fields:
+
+- `initial_delay` (defaults to `0.0` if omitted)
+
+### Termination: `size` vs `duration`
+
+- `size` (bytes): stop after sending at least this many bytes
+- `duration` (seconds): stop after this much simulated time has elapsed since the flow start
+
+### Distributions
+
+Distributions use a tagged form with `type = ...`:
+
+- Discrete uniform (integers, inclusive): `{ type = "DiscreteUniform", low = 1000, high = 1500 }`
+- Continuous uniform (floats): `{ type = "Uniform", low = 0.001, high = 0.002 }`
+- Exponential: `{ type = "Exp", lambda = 1.0 }`
+
+The distribution is used for:
+
+- packet inter-arrival times (`arr_dist`, in seconds),
+- packet sizes (`pkt_size_dist`, in bytes).
+
+## TCP configuration (`[*.traffic.tcp]`)
+
+TCP flows require a nested table:
+
+```toml
+[flow.traffic.tcp]
+cc_algorithm = "TCPReno"   # or "TCPCubic", "TCPBBR"
+ecn = true                # optional, default false
+```
+
+- `cc_algorithm` selects the congestion control implementation.
+- `ecn = true` makes the TCP source emit ECN-capable packets (`Ect0`) and react to ECN echo/CWR behavior.
+
+## DCQCN configuration (`[*.traffic.dcqcn]`)
+
+DCQCN flows require `--features dcqcn` and a nested table:
+
+```toml
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 10.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+mi_factor = 0.5
+rtt_ns = 100000.0            # optional
+cnp_interval_ns = 50000.0    # optional
+pacing_interval_ns = 1000.0  # optional
+cnp_priority = 0             # optional
+```
+
+Notes:
+
+- DCQCN sources always emit ECN-capable packets (`Ect0`).
+- To generate CNPs, the network must mark CE on packets (e.g., use `drop = "RED_ECN"` or `drop = "ECN_THRESHOLD"` and choose an appropriate threshold).

@@ -1,0 +1,30 @@
+# Testing
+
+Days uses a mix of unit tests and integration tests under `tests/`.
+
+## Run tests
+
+Recommended:
+
+```bash
+cargo test --features test -- --show-output
+```
+
+If you have `cargo-nextest` installed:
+
+```bash
+cargo nextest run --all-features --no-capture
+```
+
+## Feature-gated test suites
+
+Many tests use `#![cfg(feature = "test")]` to enable additional invariants and helpers (for example, verifying that local time tracking matches the simulation engine clock).
+
+Some tests also require protocol features:
+
+- PFC tests: `--features test,l2_pfc`
+- DCQCN tests: `--features test,dcqcn`
+
+## Test fixtures
+
+Integration tests may have adjacent TOML fixtures (for example `tests/build_graph.rs` + `tests/build_graph.toml`). Configuration examples for manual runs live under `configs/`.

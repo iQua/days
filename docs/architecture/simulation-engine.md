@@ -1,0 +1,56 @@
+# Simulation Engine (nexosim)
+
+Days builds on `nexosim`, which provides:
+
+- **Models**: stateful actors (`impl Model`) with async message handlers.
+- **Mailboxes**: bounded queues for messages delivered to a model.
+- **Ports**: typed outputs (`Output<T>`) that can be connected to a method on another model.
+- **Event scheduling**: models can schedule one-shot or periodic events in the future.
+
+## What a model looks like
+
+Most core components follow this pattern:
+
+- a method like `packet_received(...)` (or `frame_received(...)`) is connected to an upstream `Output`.
+- the handler updates local state and schedules future work using `cx.schedule_event(...)`.
+- output is sent via `self.output.send(msg).await`.
+
+Example kinds of models in this repo:
+
+- `PacketSwitch` (`src/switches/switch.rs`)
+- schedulers such as `Port`, `DRRServer`, `WFQServer` (`src/schedulers/`)
+- flow endpoints such as `DistPacketSource`, `TCPPacketSink` (`src/flows/`)
+
+## Time
+
+`nexosim` maintains an internal clock (exposed as `cx.time()` / `sim.time()`), represented as a `MonotonicTime`.
+
+Days typically works in **seconds as `f64`**:
+
+- handlers read “now” from `Packet.time` (or `LinkFrame.time()`),
+- handlers schedule future work with `Duration::from_secs_f64(delta)`,
+- some code converts from `cx.time()` to `f64` only when needed (often gated by the `test` feature).
+
+This “time-carrying message” design is central to performance; see `architecture/time-concurrency.md`.
+
+## Single-threaded vs multi-threaded runs
+
+Days chooses the runtime based on config:
+
+- `num_threads = 1` uses a single-threaded runtime (lower scheduling overhead).
+- `num_threads > 1` uses a multi-threaded runtime.
+
+The choice is made in `Topology::new` (`src/topos/topo.rs`) using `SimInit::with_num_threads(...)`.
+
+## Wiring models together
+
+Days constructs the full model graph in two stages:
+
+1. Create `Mailbox<T>` for every model and attach `Output<T>` ports.
+2. Register models into the simulation initializer (`SimInit`) and call `init(...)` to produce a `Simulation`.
+
+The entrypoint `Topology::run` (`src/topos/topo.rs`) performs this wiring and then runs:
+
+```text
+sim.step_until(Duration::from_secs_f64(duration))
+```

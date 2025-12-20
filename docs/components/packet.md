@@ -1,0 +1,42 @@
+# Packet Model
+
+The simulator’s primary message is `Packet` (`src/flows/packet.rs`). Packets are plain structs (no payload modeling) that carry:
+
+- **Timestamp**: `Packet.time` is the current simulation time associated with the packet.
+- **Creation time**: `Packet.creation_time` is the time the source first created the packet.
+- **Size**: `Packet.size` (bytes) determines serialization delay at schedulers/links.
+- **Identifiers**: `packet_id` is per-flow, `flow_id` identifies the flow globally.
+- **Accumulated queueing delay**: `queueing_delay` tracks time spent waiting in scheduler queues.
+- **Priority (PCP)**: `priority` is an 802.1Q priority code point (0–7).
+- **End-of-flow marker**: `last_packet` is used for dependency wiring and “flow finished” events.
+
+Packets also model minimal transport/control signals:
+
+- **TCP acks**: `ack: Option<TCPAck>` is used by the TCP source/sink pair.
+- **Control packets**: `control: Option<ControlPacket>` currently includes DCQCN’s CNP (`DcqcnCnp`).
+- **ECN**: `ecn: EcnField` can be `NotEct`, `Ect0`, `Ect1`, or `Ce`.
+- **TCP CWR**: `cwr: bool` is used for ECN-CWR signaling in TCP.
+
+## Time updates
+
+Two helper methods encode the intended invariants:
+
+- `queueing_delay_update(now)` adds `now - packet.time` to `queueing_delay`. Call this when a packet **leaves** a queue.
+- `departure_update(now)` sets `packet.time = now`. Call this when a packet **departs** a component and is scheduled for delivery downstream.
+
+Schedulers follow the pattern:
+
+1. Pop packet at time `now`
+2. `packet.queueing_delay_update(now)`
+3. Compute serialization delay `timeout = size_bits / rate_bps`
+4. `packet.departure_update(now + timeout)`
+5. Schedule downstream delivery after `timeout`
+
+## ECN marking
+
+Drop/mark policies can call `packet.mark_ce()`:
+
+- If `packet.ecn == NotEct`, `mark_ce()` returns `false` (cannot be ECN-marked).
+- If ECN-capable (`Ect0`/`Ect1`), `mark_ce()` sets `ecn = Ce` and returns `true`.
+
+Schedulers that “mark ECN” will drop packets that are not ECN-capable.

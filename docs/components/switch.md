@@ -1,0 +1,35 @@
+# Switch (`PacketSwitch`)
+
+`PacketSwitch` (`src/switches/switch.rs`) is a demultiplexing switch model:
+
+- It does **not** implement queueing or link serialization.
+- It forwards packets to the correct next hop using a per-flow forwarding table.
+
+## Forwarding tables
+
+Each switch maintains:
+
+- `fib: HashMap<flow_id, next_id>` for forward (data) traffic
+- `r_fib: HashMap<flow_id, prev_id>` for reverse traffic (TCP ACKs and control packets)
+
+These tables are installed after flow paths are computed in `Topology::route_flows` (`src/topos/topo.rs`).
+
+## Output ports
+
+`PacketSwitch.outputs` maps a destination ID to an `Output<Packet>`:
+
+- destination IDs can be **neighboring switch IDs** or **endpoint IDs** (source/sink actors),
+- the topology builder ensures IDs don’t collide by starting endpoint IDs after the switch ID range.
+
+## Packet classification
+
+`packet_received` distinguishes:
+
+- **Data packets**: `ack.is_none()` and `control.is_none()` → forward via `fib[flow_id]`
+- **Reverse/control traffic**: ACKs or control packets → forward via `r_fib[flow_id]`
+
+This split keeps “reverse-path” semantics explicit without building a second network.
+
+## Time handling
+
+Switches maintain a local `time: f64` and update it from `packet.time`. In test builds (`--features test`), switches also assert that `packet.time` matches the simulation engine clock (`cx.time()`).

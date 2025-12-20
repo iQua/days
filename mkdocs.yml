@@ -1,0 +1,76 @@
+site_name: Days
+repo_url: https://github.com/iqua/days
+repo_name: iqua/days
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: Google Sans Code
+  palette:
+    # Light mode
+    - scheme: astral-light
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: astral-dark
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.footer
+    - navigation.instant
+    - content.code.copy
+    - content.tooltips
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/iqua/days
+extra_javascript:
+  - javascripts/katex.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+extra_css:
+  - https://unpkg.com/katex@0/dist/katex.min.css
+  - stylesheets/extra.css
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Quickstart: quickstart.md
+  - Configuration:
+      - Overview: configuration/overview.md
+      - Topology: configuration/topology.md
+      - Switches & Queues: configuration/switches.md
+      - Flows: configuration/flows.md
+      - Collectives: configuration/collectives.md
+      - Link Layer (L2): configuration/l2.md
+      - Logging & Tracing: configuration/logging.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Simulation Engine: architecture/simulation-engine.md
+      - Topology Build: architecture/topology-build.md
+      - Code Tour: architecture/code-tour.md
+      - Time & Concurrency: architecture/time-concurrency.md
+  - Components:
+      - Packet: components/packet.md
+      - Switch: components/switch.md
+      - Schedulers: components/schedulers.md
+      - Flows: components/flows.md
+      - L2 (PFC): components/l2.md
+      - Logging: components/logging.md
+  - Examples: examples/index.md
+  - Testing: testing.md
+  - Design Notes:
+      - L2 Design Note: design-notes/l2.md
+      - DCQCN Plan: design-notes/dcqcn-plan.md
+      - Lean DCQCN Checker: design-notes/lean-dcqcn-checker.md
+      - Simulation Time: design-notes/simulation-time.md
+      - Total Event Ordering: design-notes/total-event-ordering.md
+      - Formal Verification: design-notes/formal-verification.md

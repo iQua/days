@@ -11,3 +11,6 @@ logs/**
 
 # RepoPrompt
 .repoprompt/**
+
+# MkDocs build output
+site/**
