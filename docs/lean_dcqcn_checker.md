@@ -6,7 +6,7 @@ Days can emit a per-transition DCQCN event log (`dcqcn_events.csv`) and a small 
 
 Build/run with both features enabled:
 
-`cargo run --features dcqcn,lean -- configs/dcqcn_simple.toml`
+`cargo run --features dcqcn,lean,l2_pfc -- configs/dcqcn_simple.toml`
 
 The output file is written under the config’s `log_path` as:
 
