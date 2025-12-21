@@ -109,6 +109,14 @@ ecn = true                # optional, default false
 
 - `cc_algorithm` selects the congestion control implementation.
 - `ecn = true` makes the TCP source emit ECN-capable packets (`Ect0`) and react to ECN echo/CWR behavior.
+- CUBIC behavior follows RFC 8312; you can override its parameters when `cc_algorithm = "TCPCubic"`:
+
+```toml
+[flow.traffic.tcp.cubic]
+beta = 0.7               # optional, default 0.7
+c = 0.4                  # optional, default 0.4
+fast_convergence = true  # optional, default true
+```
 
 ## DCQCN configuration (`[*.traffic.dcqcn]`)
 

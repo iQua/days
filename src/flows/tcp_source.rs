@@ -205,15 +205,22 @@ impl TCPPacketSource {
         app_source: Option<AppSourceBufferHandle>,
         rng: SmallRng,
     ) -> TCPPacketSource {
-        let cc_algorithm = traffic
+        let tcp_config = traffic
             .tcp
             .as_ref()
-            .expect("TCP traffic requires TCP characteristics")
-            .cc_algorithm;
+            .expect("TCP traffic requires TCP characteristics");
+        let cc_algorithm = tcp_config.cc_algorithm;
+        let cubic_config = tcp_config.cubic.as_ref();
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
             CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
-            CCAlgorithm::TCPCubic => Box::new(TCPCubic::new()),
+            CCAlgorithm::TCPCubic => {
+                let mut cubic = TCPCubic::new();
+                if let Some(config) = cubic_config {
+                    cubic.apply_config(config);
+                }
+                Box::new(cubic)
+            }
             CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
         };
         let ecn_enabled = traffic.tcp.as_ref().map(|tcp| tcp.ecn).unwrap_or(false);
@@ -365,6 +372,7 @@ impl TCPPacketSource {
                 self.congestion_control.ecn_marked();
                 self.ecn_reduction_in_flight = true;
                 self.cwr_pending = true;
+                self.note_cubic_congestion_time(now);
                 #[cfg(feature = "lean")]
                 self.log_cubic_event(CubicEventKind::Congestion, None, None, now);
             }
@@ -390,6 +398,7 @@ impl TCPPacketSource {
                     .unwrap_or(self.mss);
                 self.pending_lost_bytes = self.pending_lost_bytes.saturating_add(loss_size);
                 self.congestion_control.consecutive_dupacks_received();
+                self.note_cubic_congestion_time(now);
                 #[cfg(feature = "lean")]
                 self.log_cubic_event(CubicEventKind::Congestion, None, None, now);
             }
@@ -533,10 +542,12 @@ impl TCPPacketSource {
                 let acked_segs = acked_bytes
                     .saturating_add(self.mss.saturating_sub(1))
                     / self.mss;
+                let rtt_ns = to_ns(sample_rtt);
+                let rtt_s = (rtt_ns as f64) * 1e-9;
                 self.log_cubic_event(
                     CubicEventKind::Ack,
                     Some(acked_segs),
-                    Some(sample_rtt),
+                    Some(rtt_s),
                     now,
                 );
             }
@@ -579,9 +590,19 @@ impl TCPPacketSource {
         self.last_ack + self.congestion_control.get_cwnd()
     }
 
+    fn note_cubic_congestion_time(&mut self, now: f64) {
+        if let Some(cubic) = self
+            .congestion_control
+            .as_any_mut()
+            .downcast_mut::<TCPCubic>()
+        {
+            cubic.note_congestion_time(now);
+        }
+    }
+
     #[cfg(feature = "lean")]
     fn log_cubic_event(
-        &self,
+        &mut self,
         kind: CubicEventKind,
         acked_segs: Option<usize>,
         rtt_s: Option<f64>,
@@ -589,8 +610,8 @@ impl TCPPacketSource {
     ) {
         let cubic = match self
             .congestion_control
-            .as_any()
-            .downcast_ref::<TCPCubic>()
+            .as_any_mut()
+            .downcast_mut::<TCPCubic>()
         {
             Some(cubic) => cubic,
             None => return,
@@ -609,12 +630,12 @@ impl TCPPacketSource {
             c_ppb: to_ppb(snap.c),
             tcp_friendly: snap.tcp_friendliness,
             fast_convergence: snap.fast_convergence,
-            init_cwnd_bytes: snap.init_cwnd as u64,
-            init_ssthresh_bytes: snap.init_ssthresh as u64,
-            cwnd_bytes: snap.cwnd as u64,
-            ssthresh_bytes: snap.ssthresh as u64,
-            w_max_bytes: snap.w_max as u64,
-            w_last_max_bytes: snap.w_last_max as u64,
+            init_cwnd_bytes: snap.init_cwnd_bytes as u64,
+            init_ssthresh_bytes: snap.init_ssthresh_bytes as u64,
+            cwnd_bytes: snap.cwnd_bytes as u64,
+            ssthresh_bytes: snap.ssthresh_bytes as u64,
+            w_max_bytes: snap.w_max_bytes as u64,
+            w_last_max_bytes: snap.w_last_max_bytes as u64,
             epoch_start_ns: snap.epoch_start.map(to_ns),
         };
         CsvLogger::try_log_report(Report::CubicEventRow(event), ReportTiming::InProgress);
@@ -878,6 +899,7 @@ mod tests {
             Some(TCPCharacteristics {
                 cc_algorithm: CCAlgorithm::TCPReno,
                 ecn,
+                cubic: None,
             }),
         );
         let rng = SmallRng::from_os_rng();

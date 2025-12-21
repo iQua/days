@@ -166,10 +166,11 @@ deriving DecidableEq, Repr
 
 structure State where
   p : Params
-  cwndSegs : Nat
-  ssthreshSegs : Nat
-  wMaxSegs : Nat
-  wLastMaxSegs : Nat
+  cwndSegs : Float
+  ssthreshSegs : Float
+  wMaxSegs : Float
+  wLastMaxSegs : Float
+  srtt : Float := 0.0
   epochStartNs : Option Nat := none
   kZero : Bool := true
   lastTimeNs : Option Nat := none
@@ -216,110 +217,105 @@ def ppbToFloat (ppb : Nat) : Float :=
 def nsToSeconds (ns : Nat) : Float :=
   (Float.ofNat ns) / 1.0e9
 
+def updateSrtt (srtt rtt : Float) : Float :=
+  if srtt == 0.0 then
+    rtt
+  else
+    (1.0 - 0.125) * srtt + 0.125 * rtt
+
 def toNatFloor (v : Float) : Nat :=
   ((Float.floor (max0 v)).toUInt64).toNat
 
-def segsToBytes (segs mss : Nat) : Nat :=
-  segs * mss
+def bytesToSegs (bytes mss : Nat) : Float :=
+  (Float.ofNat bytes) / (Float.ofNat mss)
 
-def bytesToSegs (lineNo : Nat) (mss bytes : Nat) (name : String) : Except String Nat := do
-  require lineNo (mss > 0) "mss_bytes must be > 0"
-  require lineNo (bytes % mss = 0) s!"{name} must be a multiple of mss_bytes"
-  pure (bytes / mss)
+def encodeBytes (segs : Float) (mss : Nat) : Nat :=
+  toNatFloor (segs * Float.ofNat mss)
 
 def checkUnits (lineNo : Nat) (r : Row) : Except String Unit := do
-  let _ ← bytesToSegs lineNo r.mssBytes r.initCwndBytes "init_cwnd_bytes"
-  let _ ← bytesToSegs lineNo r.mssBytes r.initSsthreshBytes "init_ssthresh_bytes"
-  let _ ← bytesToSegs lineNo r.mssBytes r.cwndBytes "cwnd_bytes"
-  let _ ← bytesToSegs lineNo r.mssBytes r.ssthreshBytes "ssthresh_bytes"
-  let _ ← bytesToSegs lineNo r.mssBytes r.wMaxBytes "w_max_bytes"
-  let _ ← bytesToSegs lineNo r.mssBytes r.wLastMaxBytes "w_last_max_bytes"
-  pure ()
+  require lineNo (r.mssBytes > 0) "mss_bytes must be > 0"
 
-def ackOnce (st : State) (rttNs nowNs : Nat) : State :=
+def maxCwndSegs : Float := 2.0e6
+
+def cubicK (st : State) (beta c : Float) : Float :=
+  if st.kZero || decide (st.wMaxSegs <= 0.0) then
+    0.0
+  else
+    Float.cbrt (st.wMaxSegs * (1.0 - beta) / c)
+
+def cubicWindow (st : State) (beta c : Float) (t : Float) : Float :=
+  c * (Float.pow (t - cubicK st beta c) 3.0) + st.wMaxSegs
+
+def clampCwnd (cwnd : Float) : Float :=
+  let c := if cwnd < 1.0 then 1.0 else cwnd
+  if c > maxCwndSegs then maxCwndSegs else c
+
+def cubicUpdate (st : State) (nowNs rttNs : Nat) : State :=
   let p := st.p
   let beta := ppbToFloat p.betaPpb
   let c := ppbToFloat p.cPpb
-  let cwnd := st.cwndSegs
-  let ssthresh := st.ssthreshSegs
-  if cwnd ≤ ssthresh then
-    let cwnd' := cwnd + 1
-    let entering := cwnd' > ssthresh
-    let wMax' := if entering && st.wMaxSegs = 0 then cwnd' else st.wMaxSegs
-    let epochStart' := if entering then some nowNs else st.epochStartNs
-    let kZero' := if entering && st.wMaxSegs = 0 then true else st.kZero
-    { st with cwndSegs := cwnd', wMaxSegs := wMax', epochStartNs := epochStart', kZero := kZero' }
-  else
-    let epochStartNs := st.epochStartNs.getD nowNs
-    let wMaxSegs := if st.wMaxSegs = 0 then cwnd else st.wMaxSegs
-    let kZero := if st.wMaxSegs = 0 then true else st.kZero
-    let t := nsToSeconds (nowNs - epochStartNs)
-    let rtt := nsToSeconds rttNs
-    let wMaxF := Float.ofNat wMaxSegs
-    let k := if kZero then 0.0 else Float.cbrt (wMaxF * (1.0 - beta) / c)
-    let wCubic (x : Float) : Float :=
-      c * (Float.pow (x - k) 3.0) + wMaxF
-    let wCubicT := wCubic t
-    let wEst :=
-      wMaxF * beta + (3.0 * (1.0 - beta) / (1.0 + beta)) * (t / rtt)
-    let cwndF := Float.ofNat cwnd
-    let wTarget := wCubic (t + rtt)
-    let cwndNextF :=
-      if p.tcpFriendly && wCubicT < wEst then
-        wEst
-      else
-        cwndF + (wTarget - cwndF) / cwndF
-    let cwndNext := Nat.max 1 (toNatFloor cwndNextF)
-    { st with cwndSegs := cwndNext, wMaxSegs := wMaxSegs, epochStartNs := some epochStartNs, kZero := kZero }
-
-def ackMany (n : Nat) (st : State) (rttNs nowNs : Nat) : State :=
-  let rec go (n : Nat) (s : State) : State :=
-    match n with
-    | 0 => s
-    | n + 1 => go n (ackOnce s rttNs nowNs)
-  go n st
+  let rtt := nsToSeconds rttNs
+  let srtt := if st.srtt > 0.0 then st.srtt else rtt
+  let epochStartNs := st.epochStartNs.getD nowNs
+  let wMaxSegs := if st.wMaxSegs == 0.0 then st.cwndSegs else st.wMaxSegs
+  let kZero := if st.wMaxSegs == 0.0 then true else st.kZero
+  let t := nsToSeconds (nowNs - epochStartNs)
+  let st' := { st with wMaxSegs := wMaxSegs, kZero := kZero }
+  let wCubicT := cubicWindow st' beta c t
+  let wEst :=
+    wMaxSegs * beta + (3.0 * (1.0 - beta) / (1.0 + beta)) * (t / srtt)
+  let cwndNext :=
+    if p.tcpFriendly && wCubicT < wEst then
+      wEst
+    else
+      let wTarget := cubicWindow st' beta c (t + srtt)
+      let denom := if st.cwndSegs < 1.0 then 1.0 else st.cwndSegs
+      st.cwndSegs + (wTarget - st.cwndSegs) / denom
+  { st' with
+    cwndSegs := clampCwnd cwndNext
+    srtt := srtt
+    epochStartNs := some epochStartNs }
 
 def onCongestion (st : State) (nowNs : Nat) : State :=
   let p := st.p
   let beta := ppbToFloat p.betaPpb
-  let cwnd := st.cwndSegs
-  let wMaxCur := cwnd
-  let wLast := st.wLastMaxSegs
+  let wMaxCur := st.cwndSegs
   let (wMax', wLast') :=
-    if p.fastConvergence && wLast > 0 && wMaxCur < wLast then
-      let wMaxAdj :=
-        toNatFloor ((Float.ofNat wMaxCur) * (1.0 + beta) / 2.0)
-      (Nat.max 1 wMaxAdj, wMaxCur)
+    if p.fastConvergence && st.wLastMaxSegs > 0.0 && wMaxCur < st.wLastMaxSegs then
+      (wMaxCur * (1.0 + beta) / 2.0, wMaxCur)
     else
       (wMaxCur, wMaxCur)
-  let ssthresh := Nat.max 2 (toNatFloor ((Float.ofNat cwnd) * beta))
-  let cwnd' := Nat.max 1 (toNatFloor ((Float.ofNat cwnd) * beta))
+  let reduced := wMaxCur * beta
+  let ssthresh := if reduced < 2.0 then 2.0 else reduced
+  let cwnd' := clampCwnd reduced
   { st with
     cwndSegs := cwnd'
     ssthreshSegs := ssthresh
     wMaxSegs := wMax'
     wLastMaxSegs := wLast'
+    srtt := st.srtt
     epochStartNs := some nowNs
     kZero := false }
 
 def onTimeout (st : State) : State :=
   let p := st.p
   let beta := ppbToFloat p.betaPpb
-  let cwnd := st.cwndSegs
-  let ssthresh := Nat.max 2 (toNatFloor ((Float.ofNat cwnd) * beta))
+  let reduced := st.cwndSegs * beta
+  let ssthresh := if reduced < 2.0 then 2.0 else reduced
   { st with
-    cwndSegs := 1
+    cwndSegs := 1.0
     ssthreshSegs := ssthresh
-    wMaxSegs := 0
+    wMaxSegs := 0.0
+    wLastMaxSegs := 0.0
     epochStartNs := none
     kZero := true }
 
 def checkSnapshot (lineNo : Nat) (st : State) (r : Row) : Except String Unit := do
   let mss := st.p.mssBytes
-  let expCwndBytes := segsToBytes st.cwndSegs mss
-  let expSsthreshBytes := segsToBytes st.ssthreshSegs mss
-  let expWMaxBytes := segsToBytes st.wMaxSegs mss
-  let expWLastMaxBytes := segsToBytes st.wLastMaxSegs mss
+  let expCwndBytes := encodeBytes st.cwndSegs mss
+  let expSsthreshBytes := encodeBytes st.ssthreshSegs mss
+  let expWMaxBytes := encodeBytes st.wMaxSegs mss
+  let expWLastMaxBytes := encodeBytes st.wLastMaxSegs mss
   require lineNo (r.cwndBytes = expCwndBytes)
     s!"cwnd_bytes mismatch: got {r.cwndBytes}, expected {expCwndBytes}"
   require lineNo (r.ssthreshBytes = expSsthreshBytes)
@@ -335,8 +331,8 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
   require lineNo (okParams p) "invalid CUBIC parameters"
   checkUnits lineNo r
 
-  let initCwndSegs ← bytesToSegs lineNo p.mssBytes p.initCwndBytes "init_cwnd_bytes"
-  let initSsthreshSegs ← bytesToSegs lineNo p.mssBytes p.initSsthreshBytes "init_ssthresh_bytes"
+  let initCwndSegs := bytesToSegs p.initCwndBytes p.mssBytes
+  let initSsthreshSegs := bytesToSegs p.initSsthreshBytes p.mssBytes
 
   let st :=
     match g.flows.get? r.endpointId with
@@ -345,8 +341,9 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
         { p := p
           cwndSegs := initCwndSegs
           ssthreshSegs := initSsthreshSegs
-          wMaxSegs := 0
-          wLastMaxSegs := 0
+          wMaxSegs := 0.0
+          wLastMaxSegs := 0.0
+          srtt := 0.0
           epochStartNs := none
           kZero := true
           lastTimeNs := none }
@@ -355,7 +352,7 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
   match st.lastTimeNs with
   | none => pure ()
-  | some prev => require lineNo (prev ≤ r.timeNs) s!"time went backwards: {prev} > {r.timeNs}"
+  | some prev => require lineNo (prev <= r.timeNs) s!"time went backwards: {prev} > {r.timeNs}"
 
   let st' ←
     match r.kind with
@@ -365,10 +362,31 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
         require lineNo (ackedSegs > 0) "acked_segs must be > 0"
         require lineNo (rttNs > 0) "rtt_ns must be > 0"
         match st.epochStartNs with
-        | some t0 => require lineNo (t0 ≤ r.timeNs) "epoch_start_ns is in the future"
+        | some t0 => require lineNo (t0 <= r.timeNs) "epoch_start_ns is in the future"
         | none => pure ()
-        let st'' := ackMany ackedSegs st rttNs r.timeNs
-        pure { st'' with lastTimeNs := some r.timeNs }
+
+        let rtt := nsToSeconds rttNs
+        let srtt := updateSrtt st.srtt rtt
+        let cwnd' :=
+          if st.cwndSegs < st.ssthreshSegs then
+            let cwndNext := clampCwnd (st.cwndSegs + Float.ofNat ackedSegs)
+            let enterCa := decide (cwndNext >= st.ssthreshSegs)
+            let epochStartNs :=
+              if enterCa then some r.timeNs else st.epochStartNs
+            let wMaxSegs :=
+              if enterCa && st.wMaxSegs == 0.0 then cwndNext else st.wMaxSegs
+            let kZero :=
+              if enterCa && st.wMaxSegs == 0.0 then true else st.kZero
+            { st with
+              cwndSegs := cwndNext
+              srtt := srtt
+              epochStartNs := epochStartNs
+              wMaxSegs := wMaxSegs
+              kZero := kZero }
+          else
+            cubicUpdate { st with srtt := srtt } r.timeNs rttNs
+
+        pure { cwnd' with lastTimeNs := some r.timeNs }
     | Kind.congestion =>
         let st'' := onCongestion st r.timeNs
         pure { st'' with lastTimeNs := some r.timeNs }

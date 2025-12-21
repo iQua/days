@@ -137,10 +137,19 @@ pub struct FlowFinishMsg {
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct CubicConfig {
+    pub beta: Option<f64>,
+    pub c: Option<f64>,
+    pub fast_convergence: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
     #[serde(default)]
     pub ecn: bool,
+    #[serde(default)]
+    pub cubic: Option<CubicConfig>,
 }
 
 #[cfg(feature = "dcqcn")]
