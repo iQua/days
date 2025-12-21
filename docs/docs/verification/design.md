@@ -66,5 +66,3 @@ The recommended instantiation recipe is:
    - recomputes the post-state and compares it to the logged snapshot
 5. Add a `lean_exe` entry in `lean/lakefile.lean` and a CLI wrapper that prints `ACCEPT`/`REJECT`.
 
-The paper in `~/Playground/lean-paper` motivates the design choices and catalogs reusable obligation patterns (pairing, gates, accounting, bounded state) that show up across congestion control, link-layer flow control (PFC), and switch scheduling.
-
