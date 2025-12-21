@@ -38,7 +38,7 @@ The local time is updated from the incoming message (or from `cx.time()` only in
 Days supports two complementary mechanisms:
 
 1. **A tracing layer** (`ConcurrencyTrackerLayer`, `src/utils/tracing.rs`) increments/decrements a global `ACTIVE_TASKS` counter on span enter/exit.
-2. **A simulation model** (`ConcurrencyTracer`, `src/utils/tracing.rs`) samples the counter periodically and prints max/average concurrency.
+2. **A wall-clock sampler** (`start_wall_clock_concurrency_sampler`, `src/utils/tracing.rs`) samples `ACTIVE_TASKS` during `Simulation::step_until` and logs a wall-clock average concurrency (plus the peak observed by the layer).
 
 Enable it via config:
 

@@ -42,9 +42,9 @@ use crate::schedulers::wrr::WRRServer;
 use crate::switches::SchedulingDiscipline;
 use crate::switches::switch::PacketSwitch;
 use crate::utils::logger::CsvLogger;
-use crate::utils::tracing::ConcurrencyTracer;
+use crate::utils::tracing::start_wall_clock_concurrency_sampler;
 use crate::utils::ui::UserInterface;
-use crate::{num_switches, set_num_switches};
+use crate::{num_switches, peak_concurrency, reset_peak_concurrency, set_num_switches};
 use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Address, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
@@ -1088,18 +1088,6 @@ impl Topology {
         self
     }
 
-    /// Creates and activates a ConcurrencyTracer coroutine, which saves and prints the level
-    /// of coroutine (async task) concurrency during execution.
-    fn activate_concurrency_tracing(mut self) -> Self {
-        let tracer = ConcurrencyTracer::new(self.config_path.as_str());
-        let tracer_mbox = Mailbox::new();
-        self.sim_init = self
-            .sim_init
-            .add_model(tracer, tracer_mbox, "ConcurrencyTracer");
-
-        self
-    }
-
     /// Activates all the switches and initializes the simulation.
     fn init_sim(mut self) -> Simulation {
         info!(
@@ -1247,18 +1235,29 @@ impl Topology {
         // creates and activates a UserInterface coroutine
         self = self.activate_ui(ui_mbox);
         let duration = self.duration;
-
-        // creates and activates a ConcurrencyTracer coroutine
-        self = self.activate_concurrency_tracing();
+        let config_path = self.config_path.clone();
 
         // activates all the switches and initializes the simulation
         let mut sim = self.init_sim();
 
         // starts the performance measurement clock
+        let mut wall_sampler = start_wall_clock_concurrency_sampler(&config_path);
+        if wall_sampler.is_some() {
+            reset_peak_concurrency();
+        }
         let timer = std::time::Instant::now();
 
         // starts the simulation
         let _ = sim.step_until(Duration::from_secs_f64(duration));
+
+        if let Some(stats) = wall_sampler.as_mut().and_then(|s| s.stop()) {
+            info!(
+                "Concurrency: peak {}, average {:.3} (wall-clock, {:.3}s).",
+                peak_concurrency(),
+                stats.average,
+                stats.elapsed.as_secs_f64()
+            );
+        }
         sim = statistics.collect_statistics(sim);
 
         // logs the remaining reports

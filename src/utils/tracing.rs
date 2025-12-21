@@ -1,17 +1,19 @@
-//! Implements a concurrency tracer struct that periodically reports the number of coroutines (tasks)
-//! that are concurrently running.
+//! Implements lightweight concurrency tracing utilities.
+//!
+//! When enabled, Days installs a tracing layer (`ConcurrencyTrackerLayer`) that counts how many
+//! Nexosim model tasks are currently being polled. A separate wall-clock sampler can be used to
+//! compute an average concurrency during a simulation run.
 use std::fs;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use log::info;
 use tracing::Subscriber;
 use tracing_subscriber::{Layer, registry::LookupSpan};
 
-use nexosim::model::{Context, InitializedModel, Model};
-use nexosim::time::MonotonicTime;
-
 use crate::ACTIVE_TASKS;
+use crate::PEAK_ACTIVE_TASKS;
 use crate::topos::topo::TracingConfig;
 
 pub struct ConcurrencyTrackerLayer;
@@ -20,87 +22,128 @@ impl<S> Layer<S> for ConcurrencyTrackerLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_enter(&self, _id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+
+        // Only count Nexosim's per-model execution span (entered once per task poll).
+        // Counting every span would measure nesting rather than task concurrency.
+        let metadata = span.metadata();
+        if metadata.name() != "model" || metadata.target() != "nexosim" {
+            return;
+        }
+
+        let active = ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed) + 1;
+        PEAK_ACTIVE_TASKS.fetch_max(active, Ordering::Relaxed);
     }
 
-    fn on_exit(&self, _id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+
+        let metadata = span.metadata();
+        if metadata.name() != "model" || metadata.target() != "nexosim" {
+            return;
+        }
+
         ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-pub struct ConcurrencyTracer {
-    active: bool,
-    duration: f64,
-    interval: f64,
-    concurrency_stats: Vec<usize>,
+#[derive(Debug, Clone, Copy)]
+pub struct WallClockConcurrencyStats {
+    pub average: f64,
+    pub elapsed: Duration,
+}
+
+pub struct WallClockConcurrencySampler {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<WallClockConcurrencyStats>>,
+}
+
+impl WallClockConcurrencySampler {
+    pub fn start(interval: Duration) -> Self {
+        let interval = interval.max(Duration::from_micros(100));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = thread::spawn(move || {
+            let start = Instant::now();
+            let mut last_t = start;
+            let mut last_v = ACTIVE_TASKS.load(Ordering::Relaxed);
+            let mut area = 0.0f64;
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                thread::park_timeout(interval);
+
+                let now = Instant::now();
+                let dt = now.duration_since(last_t).as_secs_f64();
+                area += last_v as f64 * dt;
+                last_t = now;
+                last_v = ACTIVE_TASKS.load(Ordering::Relaxed);
+            }
+
+            let elapsed = start.elapsed();
+            let average = if elapsed.is_zero() {
+                0.0
+            } else {
+                area / elapsed.as_secs_f64()
+            };
+
+            WallClockConcurrencyStats { average, elapsed }
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn stop(&mut self) -> Option<WallClockConcurrencyStats> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            return Some(handle.join().expect("wall-clock sampler thread panicked"));
+        }
+        None
+    }
+}
+
+impl Drop for WallClockConcurrencySampler {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 pub fn is_tracing_active(config_path: &str) -> bool {
     let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
-    // Obtain the concurrency tracing interval from the configuration file
+    // Obtain the concurrency tracing interval from the configuration file.
     let tracing_config: TracingConfig = toml::from_str(&content)
         .expect("Failed to deserialize the configuration of concurrency tracing");
 
     tracing_config.tracing_active.unwrap_or(false)
 }
 
-impl ConcurrencyTracer {
-    pub fn new(config_path: &str) -> ConcurrencyTracer {
-        let content = fs::read_to_string(config_path).expect("The configuration is not valid");
+pub fn tracing_interval(config_path: &str) -> Option<Duration> {
+    let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
-        // Obtain the concurrency tracing interval from the configuration file
-        let tracing_config: TracingConfig = toml::from_str(&content)
-            .expect("Failed to deserialize the configuration of concurrency tracing");
-        let active = tracing_config.tracing_active.unwrap_or(false);
-        let duration = tracing_config.duration.unwrap_or(1500.);
-        let interval = tracing_config.tracing_interval.unwrap_or(duration / 100.);
+    // Obtain the concurrency tracing interval from the configuration file.
+    let tracing_config: TracingConfig = toml::from_str(&content)
+        .expect("Failed to deserialize the configuration of concurrency tracing");
 
-        ConcurrencyTracer {
-            active,
-            duration,
-            interval,
-            concurrency_stats: Vec::new(),
-        }
+    if !tracing_config.tracing_active.unwrap_or(false) {
+        return None;
     }
 
-    fn current_concurrency(&self) -> usize {
-        ACTIVE_TASKS.load(Ordering::Relaxed)
-    }
-
-    fn run(&mut self, _: (), cx: &mut Context<Self>) {
-        if !self.active {
-            return;
-        }
-
-        let concurrency = self.current_concurrency();
-        self.concurrency_stats.push(concurrency);
-
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-
-        if now < self.duration {
-            cx.schedule_event(Duration::from_secs_f64(self.interval), Self::run, ())
-                .unwrap();
-        } else {
-            let max = self.concurrency_stats.iter().max().cloned().unwrap_or(0);
-
-            // Calculate the sum
-            let sum: usize = self.concurrency_stats.iter().sum();
-            // Calculate the length of the vector
-            let count = self.concurrency_stats.len() as f64;
-
-            // Calculate average, avoid integer division by casting to f64
-            let average = if count > 0.0 { sum as f64 / count } else { 0.0 };
-
-            info!("Concurrency: max {}, average {}.", max, average)
-        }
-    }
+    let duration = tracing_config.duration.unwrap_or(1500.0);
+    let interval_s = tracing_config.tracing_interval.unwrap_or(duration / 100.0);
+    Some(Duration::from_secs_f64(interval_s))
 }
 
-impl Model for ConcurrencyTracer {
-    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        self.run((), cx);
-        self.into()
-    }
+pub fn start_wall_clock_concurrency_sampler(
+    config_path: &str,
+) -> Option<WallClockConcurrencySampler> {
+    tracing_interval(config_path).map(WallClockConcurrencySampler::start)
 }

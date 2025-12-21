@@ -102,7 +102,7 @@ tracing_interval = 1.0
 - `tracing_active` (default: `false`)
 - `tracing_interval` (default: `duration / 100`)
 
-When enabled, Days installs a tracing subscriber layer and runs a `ConcurrencyTracer` model that samples active tasks and logs max/average concurrency.
+When enabled, Days installs a tracing subscriber layer and computes a wall-clock average concurrency during `Simulation::step_until` (and logs the peak observed by the tracing layer).
 
 ## Application-level sources for TCP collectives (optional)
 

@@ -4,8 +4,8 @@
 //! current congestion-avoidance epoch. Window sizes are maintained in units
 //! of MSS-sized segments, with RFC 8312 default parameters (C=0.4, beta=0.7).
 
-use crate::flows::cc::{AckEvent, CongestionControl};
 use crate::flows::CubicConfig;
+use crate::flows::cc::{AckEvent, CongestionControl};
 use std::any::Any;
 
 /// TCP CUBIC congestion control implementation.
@@ -164,8 +164,8 @@ impl TCPCubic {
         let t = (now - epoch_start).max(0.0);
 
         let w_cubic_t = self.cubic_window(t);
-        let w_est = self.w_max * self.beta
-            + (3.0 * (1.0 - self.beta) / (1.0 + self.beta)) * (t / rtt);
+        let w_est =
+            self.w_max * self.beta + (3.0 * (1.0 - self.beta) / (1.0 + self.beta)) * (t / rtt);
 
         if self.tcp_friendliness && w_cubic_t < w_est {
             self.cwnd = w_est;
@@ -275,7 +275,10 @@ impl CongestionControl for TCPCubic {
         }
 
         // Congestion avoidance (RFC 8312 Section 4).
-        self.cubic_update(event.now.max(0.0), if srtt > 0.0 { srtt } else { rtt_sample });
+        self.cubic_update(
+            event.now.max(0.0),
+            if srtt > 0.0 { srtt } else { rtt_sample },
+        );
     }
 
     fn timer_expired(&mut self) {
@@ -383,7 +386,11 @@ mod tests {
         cubic.cwnd = 80.0;
         cubic.on_congestion();
 
-        assert!(approx_eq(cubic.w_max, 80.0 * (1.0 + cubic.beta) / 2.0, 1e-6));
+        assert!(approx_eq(
+            cubic.w_max,
+            80.0 * (1.0 + cubic.beta) / 2.0,
+            1e-6
+        ));
         assert!(approx_eq(cubic.w_last_max, 80.0, 1e-6));
     }
 

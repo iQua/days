@@ -539,17 +539,10 @@ impl TCPPacketSource {
             #[cfg(feature = "lean")]
             {
                 let acked_bytes = ack.acknowledged_size.max(1);
-                let acked_segs = acked_bytes
-                    .saturating_add(self.mss.saturating_sub(1))
-                    / self.mss;
+                let acked_segs = acked_bytes.saturating_add(self.mss.saturating_sub(1)) / self.mss;
                 let rtt_ns = to_ns(sample_rtt);
                 let rtt_s = (rtt_ns as f64) * 1e-9;
-                self.log_cubic_event(
-                    CubicEventKind::Ack,
-                    Some(acked_segs),
-                    Some(rtt_s),
-                    now,
-                );
+                self.log_cubic_event(CubicEventKind::Ack, Some(acked_segs), Some(rtt_s), now);
             }
             self.pending_lost_bytes = 0;
             self.pending_ecn_marked = false;

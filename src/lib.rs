@@ -18,6 +18,8 @@ pub struct SeedConfig {
 
 // for tracking the number of active async tasks (coroutines)
 static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+// tracks the peak number of concurrently active tasks
+static PEAK_ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 static SEED: AtomicUsize = AtomicUsize::new(0);
 static NUM_SWITCHES: AtomicUsize = AtomicUsize::new(0);
@@ -83,4 +85,12 @@ pub fn next_link_id() -> usize {
 
 pub fn current_concurrency() -> usize {
     ACTIVE_TASKS.load(Ordering::Relaxed)
+}
+
+pub fn peak_concurrency() -> usize {
+    PEAK_ACTIVE_TASKS.load(Ordering::Relaxed)
+}
+
+pub fn reset_peak_concurrency() {
+    PEAK_ACTIVE_TASKS.store(0, Ordering::Relaxed);
 }
