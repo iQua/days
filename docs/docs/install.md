@@ -26,7 +26,7 @@ Days uses Cargo features to keep the default build lean.
 - `l2`: enables the layer-2 module boundary (`src/l2/`)
 - `l2_pfc`: enables PFC components (implies `l2`)
 - `dcqcn`: enables the DCQCN flow type and related code
-- `lean`: enables additional DCQCN trace logging used by the Lean checker
+- `lean`: enables additional per-transition protocol trace logging used by LeanGuard
 - `test`: enables extra assertions and test-only helpers
 
 Examples:
@@ -41,6 +41,6 @@ RUST_LOG=info cargo run --features l2,l2_pfc -- configs/pfc.toml
 # Run DCQCN (typically paired with PFC in lossless fabrics)
 RUST_LOG=info cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml
 
-# Emit dcqcn_events.csv for the Lean checker
+# Emit dcqcn_events.csv for LeanGuard (conformance checking)
 RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc -- configs/dcqcn_simple.toml
 ```

@@ -51,6 +51,10 @@ nav:
   - Quickstart: quickstart.md
   - Examples: examples/index.md
   - Testing: testing.md
+  - Verification:
+      - Overview: verification/index.md
+      - LeanGuard (Use Guide): verification/leanguard.md
+      - LeanGuard (Design): verification/design.md
   - Configuration:
       - Overview: configuration/overview.md
       - Topology: configuration/topology.md

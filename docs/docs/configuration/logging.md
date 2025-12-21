@@ -62,7 +62,11 @@ log_path = "./logs/run1"
 Days will create the directory if needed and will write:
 
 - `sources.csv`, `sinks.csv`, `switches.csv`
-- plus optional `pfc.csv` and `dcqcn_events.csv` depending on features.
+- plus optional `pfc.csv` depending on features.
+- plus optional per-transition protocol traces for LeanGuard (`*_events.csv`) depending on features:
+  - `dcqcn_events.csv` (`--features dcqcn,lean`)
+  - `pfc_events.csv` (`--features l2_pfc,lean`)
+  - `cubic_events.csv` (`--features lean`)
 
 ### `report_interval` (optional)
 
