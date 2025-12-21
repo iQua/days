@@ -1,8 +1,15 @@
 import Std
 
+import LeanGuard.Shared.Check
+import LeanGuard.Shared.Csv
+import LeanGuard.Shared.Key
+import LeanGuard.Shared.Numeric
+import LeanGuard.Dcqcn.Semantics
+
 namespace LeanGuard.DcqcnEventLog
 
-def PPB : Nat := 1_000_000_000
+open LeanGuard.Shared
+open LeanGuard.Dcqcn.Semantics
 
 inductive Kind
   | cnpSent
@@ -50,35 +57,6 @@ deriving DecidableEq, Repr
 def key (r : Row) : Nat × Nat :=
   (r.timeNs, r.eventId)
 
-def keyLt (a b : Nat × Nat) : Bool :=
-  decide (a.1 < b.1 ∨ (a.1 = b.1 ∧ a.2 < b.2))
-
-def stripCR (s : String) : String :=
-  if s.endsWith "\r" then
-    s.dropRight 1
-  else
-    s
-
-/-- Simple CSV splitter that preserves empty fields. Assumes no quoted commas. -/
-def splitCsvLine (s : String) : List String :=
-  s.splitOn ","
-
-def mkIndex (cols : List String) : Std.HashMap String Nat :=
-  let rec go (i : Nat) (cols : List String) (m : Std.HashMap String Nat) : Std.HashMap String Nat :=
-    match cols with
-    | [] => m
-    | c :: cs => go (i + 1) cs (m.insert c i)
-  go 0 cols ∅
-
-def getField (idx : Std.HashMap String Nat) (fields : Array String) (name : String) :
-    Except String String := do
-  match idx.get? name with
-  | none => throw s!"missing required column: {name}"
-  | some i =>
-      match fields[i]? with
-      | none => throw s!"row has no column index {i} for {name}"
-      | some v => pure v.trim
-
 def parseKind (s : String) : Except String Kind :=
   match s with
   | "cnp_sent" => pure Kind.cnpSent
@@ -94,22 +72,6 @@ def parseEcn (s : String) : Except String Ecn :=
   | "Ce" => pure Ecn.Ce
   | other => throw s!"invalid ECN field: {other}"
 
-def parseNat (s : String) : Except String Nat :=
-  match s.toNat? with
-  | some n => pure n
-  | none => throw s!"invalid Nat: '{s}'"
-
-def parseBool (s : String) : Except String Bool :=
-  match s with
-  | "true" => pure true
-  | "false" => pure false
-  | other => throw s!"invalid Bool: '{other}'"
-
-def parseOpt {α : Type} (p : String → Except String α) (s : String) : Except String (Option α) :=
-  if s.isEmpty then
-    pure none
-  else
-    some <$> p s
 
 def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String Row := do
@@ -186,28 +148,6 @@ def parseCsv (content : String) : Except String (List Row) := do
             go (lineNo + 1) rest (row :: acc)
       go 2 data []
 
-/-- Parameters expected to remain constant for a given source endpoint. -/
-structure SrcParams where
-  flowId : Nat
-  cnpIntervalNs : Nat
-  gPpb : Nat
-  miPpb : Nat
-  initRateBps : Nat
-  minRateBps : Nat
-  maxRateBps : Nat
-  aiRateBps : Nat
-  haiRateBps : Nat
-deriving DecidableEq, Repr
-
-structure SrcState where
-  p : SrcParams
-  alpha : Float := 0.0
-  rateBps : Float
-  cnpSeen : Bool := false
-  lastCnpNs : Option Nat := none
-  lastTimeNs : Option Nat := none
-deriving Repr
-
 structure SinkParams where
   flowId : Nat
   cnpIntervalNs : Nat
@@ -231,73 +171,6 @@ structure Global where
   sink : Std.HashMap Nat SinkState := ∅
   pending : Std.HashMap (Nat × Nat) PendingInfo := ∅
 deriving Repr
-
-def require (lineNo : Nat) (cond : Bool) (msg : String) : Except String Unit :=
-  if cond then
-    pure ()
-  else
-    throw s!"line {lineNo}: {msg}"
-
-def requireSome {α : Type} (lineNo : Nat) (name : String) : Option α → Except String α
-  | none => throw s!"line {lineNo}: missing required field: {name}"
-  | some v => pure v
-
-def okParams (p : SrcParams) : Bool :=
-  p.gPpb ≤ PPB
-    && p.miPpb ≤ PPB
-    && p.minRateBps ≤ p.initRateBps
-    && p.initRateBps ≤ p.maxRateBps
-
-def ppbToFloat (ppb : Nat) : Float :=
-  (Float.ofNat ppb) / (Float.ofNat PPB)
-
-def fmax (a b : Float) : Float :=
-  if a < b then b else a
-
-def fmin (a b : Float) : Float :=
-  if a < b then a else b
-
-def max0 (a : Float) : Float :=
-  if a < 0.0 then 0.0 else a
-
-def toPpb (v : Float) : Nat :=
-  ((Float.round (max0 v * 1.0e9)).toUInt64).toNat
-
-def toBps (v : Float) : Nat :=
-  ((Float.round (max0 v)).toUInt64).toNat
-
-def srcAfterCnp (s : SrcState) (t : Nat) : SrcState :=
-  let p := s.p
-  let applied :=
-    match s.lastCnpNs with
-    | none => true
-    | some last => last + p.cnpIntervalNs ≤ t
-  if applied then
-    let g := ppbToFloat p.gPpb
-    let mi := ppbToFloat p.miPpb
-    let α := (1.0 - g) * s.alpha + g
-    let decrease := 1.0 - mi * α
-    let decreasedRate := s.rateBps * decrease
-    let r := fmax decreasedRate (Float.ofNat p.minRateBps)
-    { s with
-      alpha := α
-      rateBps := r
-      cnpSeen := true
-      lastCnpNs := some t
-      lastTimeNs := some t }
-  else
-    { s with lastTimeNs := some t }
-
-def srcAfterTimer (s : SrcState) (t : Nat) : SrcState :=
-  let p := s.p
-  let g := ppbToFloat p.gPpb
-  if s.cnpSeen then
-    { s with cnpSeen := false, lastTimeNs := some t }
-  else
-    let α := (1.0 - g) * s.alpha
-    let inc := if α < 0.1 then Float.ofNat p.haiRateBps else Float.ofNat p.aiRateBps
-    let r := fmin (s.rateBps + inc) (Float.ofNat p.maxRateBps)
-    { s with alpha := α, rateBps := r, cnpSeen := false, lastTimeNs := some t }
 
 def rowSrcParams (r : Row) : SrcParams :=
   { flowId := r.flowId
@@ -385,12 +258,7 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
         match g.src.get? r.endpointId with
         | some s => s
         | none =>
-            { p := p
-              alpha := 0.0
-              rateBps := Float.ofNat p.initRateBps
-              cnpSeen := false
-              lastCnpNs := none
-              lastTimeNs := none }
+            initialSrcState p
 
       require lineNo (srcSt.p = p) "source parameters changed for endpoint"
 
@@ -423,12 +291,7 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
         match g.src.get? r.endpointId with
         | some s => s
         | none =>
-            { p := p
-              alpha := 0.0
-              rateBps := Float.ofNat p.initRateBps
-              cnpSeen := false
-              lastCnpNs := none
-              lastTimeNs := none }
+            initialSrcState p
 
       require lineNo (srcSt.p = p) "source parameters changed for endpoint"
 
@@ -450,27 +313,8 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
       pure { g with src := g.src.insert r.endpointId srcSt' }
 
-def canonicalizeRows (rows : List Row) : Except String (List Row) := do
-  let rowsSorted :=
-    rows.toArray
-      |>.qsort (fun a b => keyLt (key a) (key b))
-      |>.toList
-
-  let rec checkKeys : List Row → Except String Unit
-    | [] => pure ()
-    | [_] => pure ()
-    | a :: b :: rest => do
-        if decide (key a = key b) then
-          throw
-            s!"duplicate key at lines {a.srcLine} and {b.srcLine}: (time_ns={a.timeNs}, event_id={a.eventId})"
-        require b.srcLine (keyLt (key a) (key b)) "canonical key order violated"
-        checkKeys (b :: rest)
-
-  checkKeys rowsSorted
-  pure rowsSorted
-
 def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows
+  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
 
   let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
     match rows with
@@ -513,7 +357,7 @@ def dummyRow (timeNs eventId srcLine : Nat) : Row :=
     srcLine }
 
 example :
-    (match canonicalizeRows [dummyRow 2 1 10, dummyRow 1 5 11, dummyRow 2 0 12] with
+    (match canonicalizeRows [dummyRow 2 1 10, dummyRow 1 5 11, dummyRow 2 0 12] key (fun r => r.srcLine) with
       | .ok v => some v
       | .error _ => none) =
       some [dummyRow 1 5 11, dummyRow 2 0 12, dummyRow 2 1 10] := by

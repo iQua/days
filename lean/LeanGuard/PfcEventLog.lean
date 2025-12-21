@@ -1,6 +1,12 @@
 import Std
 
+import LeanGuard.Shared.Check
+import LeanGuard.Shared.Csv
+import LeanGuard.Shared.Key
+
 namespace LeanGuard.PfcEventLog
+
+open LeanGuard.Shared
 
 inductive Kind
   | pfcSent
@@ -30,51 +36,11 @@ deriving DecidableEq, Repr
 def key (r : Row) : Nat × Nat :=
   (r.timeNs, r.eventId)
 
-def keyLt (a b : Nat × Nat) : Bool :=
-  decide (a.1 < b.1 ∨ (a.1 = b.1 ∧ a.2 < b.2))
-
-def stripCR (s : String) : String :=
-  if s.endsWith "\r" then
-    s.dropRight 1
-  else
-    s
-
-/-- Simple CSV splitter that preserves empty fields. Assumes no quoted commas. -/
-def splitCsvLine (s : String) : List String :=
-  s.splitOn ","
-
-def mkIndex (cols : List String) : Std.HashMap String Nat :=
-  let rec go (i : Nat) (cols : List String) (m : Std.HashMap String Nat) : Std.HashMap String Nat :=
-    match cols with
-    | [] => m
-    | c :: cs => go (i + 1) cs (m.insert c i)
-  go 0 cols ∅
-
-def getField (idx : Std.HashMap String Nat) (fields : Array String) (name : String) :
-    Except String String := do
-  match idx.get? name with
-  | none => throw s!"missing required column: {name}"
-  | some i =>
-      match fields[i]? with
-      | none => throw s!"row has no column index {i} for {name}"
-      | some v => pure v.trim
-
 def parseKind (s : String) : Except String Kind :=
   match s with
   | "pfc_sent" => pure Kind.pfcSent
   | "pfc_recv" => pure Kind.pfcRecv
   | other => throw s!"invalid kind: {other}"
-
-def parseNat (s : String) : Except String Nat :=
-  match s.toNat? with
-  | some n => pure n
-  | none => throw s!"invalid Nat: '{s}'"
-
-def parseOpt {α : Type} (p : String → Except String α) (s : String) : Except String (Option α) :=
-  if s.isEmpty then
-    pure none
-  else
-    some <$> p s
 
 def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String Row := do
@@ -130,16 +96,6 @@ def parseCsv (content : String) : Except String (List Row) := do
             let row ← parseRow lineNo idx fields
             go (lineNo + 1) rest (row :: acc)
       go 2 data []
-
-def require (lineNo : Nat) (cond : Bool) (msg : String) : Except String Unit :=
-  if cond then
-    pure ()
-  else
-    throw s!"line {lineNo}: {msg}"
-
-def requireSome {α : Type} (lineNo : Nat) (name : String) : Option α → Except String α
-  | none => throw s!"line {lineNo}: missing required field: {name}"
-  | some v => pure v
 
 def oneHot (prio : Nat) : Nat :=
   Nat.shiftLeft 1 prio
@@ -235,27 +191,8 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
       pure { g with pending := g.pending.erase pendingKey }
 
-def canonicalizeRows (rows : List Row) : Except String (List Row) := do
-  let rowsSorted :=
-    rows.toArray
-      |>.qsort (fun a b => keyLt (key a) (key b))
-      |>.toList
-
-  let rec checkKeys : List Row → Except String Unit
-    | [] => pure ()
-    | [_] => pure ()
-    | a :: b :: rest => do
-        if decide (key a = key b) then
-          throw
-            s!"duplicate key at lines {a.srcLine} and {b.srcLine}: (time_ns={a.timeNs}, event_id={a.eventId})"
-        require b.srcLine (keyLt (key a) (key b)) "canonical key order violated"
-        checkKeys (b :: rest)
-
-  checkKeys rowsSorted
-  pure rowsSorted
-
 def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows
+  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
 
   let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
     match rows with

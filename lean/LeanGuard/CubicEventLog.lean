@@ -1,8 +1,15 @@
 import Std
 
+import LeanGuard.Shared.Check
+import LeanGuard.Shared.Csv
+import LeanGuard.Shared.Key
+import LeanGuard.Shared.Numeric
+import LeanGuard.Cubic.Semantics
+
 namespace LeanGuard.CubicEventLog
 
-def PPB : Nat := 1_000_000_000
+open LeanGuard.Shared
+open LeanGuard.Cubic.Semantics
 
 inductive Kind
   | ack
@@ -37,58 +44,12 @@ deriving DecidableEq, Repr
 def key (r : Row) : Nat × Nat :=
   (r.timeNs, r.eventId)
 
-def keyLt (a b : Nat × Nat) : Bool :=
-  decide (a.1 < b.1 ∨ (a.1 = b.1 ∧ a.2 < b.2))
-
-def stripCR (s : String) : String :=
-  if s.endsWith "\r" then
-    s.dropRight 1
-  else
-    s
-
-/-- Simple CSV splitter that preserves empty fields. Assumes no quoted commas. -/
-def splitCsvLine (s : String) : List String :=
-  s.splitOn ","
-
-def mkIndex (cols : List String) : Std.HashMap String Nat :=
-  let rec go (i : Nat) (cols : List String) (m : Std.HashMap String Nat) : Std.HashMap String Nat :=
-    match cols with
-    | [] => m
-    | c :: cs => go (i + 1) cs (m.insert c i)
-  go 0 cols ∅
-
-def getField (idx : Std.HashMap String Nat) (fields : Array String) (name : String) :
-    Except String String := do
-  match idx.get? name with
-  | none => throw s!"missing required column: {name}"
-  | some i =>
-      match fields[i]? with
-      | none => throw s!"row has no column index {i} for {name}"
-      | some v => pure v.trim
-
 def parseKind (s : String) : Except String Kind :=
   match s with
   | "ack" => pure Kind.ack
   | "congestion" => pure Kind.congestion
   | "timeout" => pure Kind.timeout
   | other => throw s!"invalid kind: {other}"
-
-def parseNat (s : String) : Except String Nat :=
-  match s.toNat? with
-  | some n => pure n
-  | none => throw s!"invalid Nat: '{s}'"
-
-def parseBool (s : String) : Except String Bool :=
-  match s with
-  | "true" => pure true
-  | "false" => pure false
-  | other => throw s!"invalid Bool: '{other}'"
-
-def parseOpt {α : Type} (p : String → Except String α) (s : String) : Except String (Option α) :=
-  if s.isEmpty then
-    pure none
-  else
-    some <$> p s
 
 def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String Row := do
@@ -153,50 +114,9 @@ def parseCsv (content : String) : Except String (List Row) := do
             go (lineNo + 1) rest (row :: acc)
       go 2 data []
 
-structure Params where
-  flowId : Nat
-  mssBytes : Nat
-  betaPpb : Nat
-  cPpb : Nat
-  tcpFriendly : Bool
-  fastConvergence : Bool
-  initCwndBytes : Nat
-  initSsthreshBytes : Nat
-deriving DecidableEq, Repr
-
-structure State where
-  p : Params
-  cwndSegs : Float
-  ssthreshSegs : Float
-  wMaxSegs : Float
-  wLastMaxSegs : Float
-  srtt : Float := 0.0
-  epochStartNs : Option Nat := none
-  kZero : Bool := true
-  lastTimeNs : Option Nat := none
-deriving Repr
-
 structure Global where
   flows : Std.HashMap Nat State := ∅
 deriving Repr
-
-def require (lineNo : Nat) (cond : Bool) (msg : String) : Except String Unit :=
-  if cond then
-    pure ()
-  else
-    throw s!"line {lineNo}: {msg}"
-
-def requireSome {α : Type} (lineNo : Nat) (name : String) : Option α → Except String α
-  | none => throw s!"line {lineNo}: missing required field: {name}"
-  | some v => pure v
-
-def okParams (p : Params) : Bool :=
-  p.mssBytes > 0
-    && p.betaPpb > 0
-    && p.betaPpb < PPB
-    && p.cPpb > 0
-    && p.initCwndBytes > 0
-    && p.initSsthreshBytes > 0
 
 def rowParams (r : Row) : Params :=
   { flowId := r.flowId
@@ -208,107 +128,8 @@ def rowParams (r : Row) : Params :=
     initCwndBytes := r.initCwndBytes
     initSsthreshBytes := r.initSsthreshBytes }
 
-def max0 (a : Float) : Float :=
-  if a < 0.0 then 0.0 else a
-
-def ppbToFloat (ppb : Nat) : Float :=
-  (Float.ofNat ppb) / (Float.ofNat PPB)
-
-def nsToSeconds (ns : Nat) : Float :=
-  (Float.ofNat ns) / 1.0e9
-
-def updateSrtt (srtt rtt : Float) : Float :=
-  if srtt == 0.0 then
-    rtt
-  else
-    (1.0 - 0.125) * srtt + 0.125 * rtt
-
-def toNatFloor (v : Float) : Nat :=
-  ((Float.floor (max0 v)).toUInt64).toNat
-
-def bytesToSegs (bytes mss : Nat) : Float :=
-  (Float.ofNat bytes) / (Float.ofNat mss)
-
-def encodeBytes (segs : Float) (mss : Nat) : Nat :=
-  toNatFloor (segs * Float.ofNat mss)
-
 def checkUnits (lineNo : Nat) (r : Row) : Except String Unit := do
   require lineNo (r.mssBytes > 0) "mss_bytes must be > 0"
-
-def maxCwndSegs : Float := 2.0e6
-
-def cubicK (st : State) (beta c : Float) : Float :=
-  if st.kZero || decide (st.wMaxSegs <= 0.0) then
-    0.0
-  else
-    Float.cbrt (st.wMaxSegs * (1.0 - beta) / c)
-
-def cubicWindow (st : State) (beta c : Float) (t : Float) : Float :=
-  c * (Float.pow (t - cubicK st beta c) 3.0) + st.wMaxSegs
-
-def clampCwnd (cwnd : Float) : Float :=
-  let c := if cwnd < 1.0 then 1.0 else cwnd
-  if c > maxCwndSegs then maxCwndSegs else c
-
-def cubicUpdate (st : State) (nowNs rttNs : Nat) : State :=
-  let p := st.p
-  let beta := ppbToFloat p.betaPpb
-  let c := ppbToFloat p.cPpb
-  let rtt := nsToSeconds rttNs
-  let srtt := if st.srtt > 0.0 then st.srtt else rtt
-  let epochStartNs := st.epochStartNs.getD nowNs
-  let wMaxSegs := if st.wMaxSegs == 0.0 then st.cwndSegs else st.wMaxSegs
-  let kZero := if st.wMaxSegs == 0.0 then true else st.kZero
-  let t := nsToSeconds (nowNs - epochStartNs)
-  let st' := { st with wMaxSegs := wMaxSegs, kZero := kZero }
-  let wCubicT := cubicWindow st' beta c t
-  let wEst :=
-    wMaxSegs * beta + (3.0 * (1.0 - beta) / (1.0 + beta)) * (t / srtt)
-  let cwndNext :=
-    if p.tcpFriendly && wCubicT < wEst then
-      wEst
-    else
-      let wTarget := cubicWindow st' beta c (t + srtt)
-      let denom := if st.cwndSegs < 1.0 then 1.0 else st.cwndSegs
-      st.cwndSegs + (wTarget - st.cwndSegs) / denom
-  { st' with
-    cwndSegs := clampCwnd cwndNext
-    srtt := srtt
-    epochStartNs := some epochStartNs }
-
-def onCongestion (st : State) (nowNs : Nat) : State :=
-  let p := st.p
-  let beta := ppbToFloat p.betaPpb
-  let wMaxCur := st.cwndSegs
-  let (wMax', wLast') :=
-    if p.fastConvergence && st.wLastMaxSegs > 0.0 && wMaxCur < st.wLastMaxSegs then
-      (wMaxCur * (1.0 + beta) / 2.0, wMaxCur)
-    else
-      (wMaxCur, wMaxCur)
-  let reduced := wMaxCur * beta
-  let ssthresh := if reduced < 2.0 then 2.0 else reduced
-  let cwnd' := clampCwnd reduced
-  { st with
-    cwndSegs := cwnd'
-    ssthreshSegs := ssthresh
-    wMaxSegs := wMax'
-    wLastMaxSegs := wLast'
-    srtt := st.srtt
-    epochStartNs := some nowNs
-    kZero := false }
-
-def onTimeout (st : State) : State :=
-  let p := st.p
-  let beta := ppbToFloat p.betaPpb
-  let reduced := st.cwndSegs * beta
-  let ssthresh := if reduced < 2.0 then 2.0 else reduced
-  { st with
-    cwndSegs := 1.0
-    ssthreshSegs := ssthresh
-    wMaxSegs := 0.0
-    wLastMaxSegs := 0.0
-    epochStartNs := none
-    kZero := true }
 
 def checkSnapshot (lineNo : Nat) (st : State) (r : Row) : Except String Unit := do
   let mss := st.p.mssBytes
@@ -398,27 +219,8 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
   pure { g with flows := g.flows.insert r.endpointId st' }
 
-def canonicalizeRows (rows : List Row) : Except String (List Row) := do
-  let rowsSorted :=
-    rows.toArray
-      |>.qsort (fun a b => keyLt (key a) (key b))
-      |>.toList
-
-  let rec checkKeys : List Row → Except String Unit
-    | [] => pure ()
-    | [_] => pure ()
-    | a :: b :: rest => do
-        if decide (key a = key b) then
-          throw
-            s!"duplicate key at lines {a.srcLine} and {b.srcLine}: (time_ns={a.timeNs}, event_id={a.eventId})"
-        require b.srcLine (keyLt (key a) (key b)) "canonical key order violated"
-        checkKeys (b :: rest)
-
-  checkKeys rowsSorted
-  pure rowsSorted
-
 def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows
+  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
 
   let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
     match rows with
