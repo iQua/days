@@ -1,13 +1,13 @@
 import Lake
 open Lake DSL
 
-package daysLean where
+package leanGuard where
 
-lean_lib DaysLean where
+lean_lib LeanGuard where
 
 @[default_target]
 lean_exe dcqcn_check where
-  root := `DaysLean.Main
+  root := `LeanGuard.Main
 
 lean_exe pfc_check where
-  root := `DaysLean.PfcMain
+  root := `LeanGuard.PfcMain

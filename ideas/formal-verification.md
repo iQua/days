@@ -643,7 +643,7 @@ Now proceed to complete (b), (b) add a tiny Lean/CLI “parse CSV → List Row �
   real simulation output.
 ---
 
-- Added a self-contained Lean 4 “trace accepts” harness under lean/ (checker logic in lean/DaysLean/DcqcnEventLog.lean:1, CLI in lean/DaysLean/Main.lean:1) that parses dcqcn_events.csv and prints ACCEPT / REJECT: line ….
+- Added a self-contained Lean 4 “trace accepts” harness under lean/ (checker logic in lean/LeanGuard/DcqcnEventLog.lean:1, CLI in lean/LeanGuard/Main.lean:1) that parses dcqcn_events.csv and prints ACCEPT / REJECT: line ….
 
 - The checker simulates the same floating-point DCQCN update logic as src/flows/dcqcn_source.rs:1 and checks the logged *_ppb / *_bps snapshots using the same rounding as the Rust logger.
 

@@ -1,6 +1,6 @@
 import Std
 
-namespace DaysLean.DcqcnEventLog
+namespace LeanGuard.DcqcnEventLog
 
 def PPB : Nat := 1_000_000_000
 
@@ -519,4 +519,4 @@ example :
       some [dummyRow 1 5 11, dummyRow 2 0 12, dummyRow 2 1 10] := by
   native_decide
 
-end DaysLean.DcqcnEventLog
+end LeanGuard.DcqcnEventLog

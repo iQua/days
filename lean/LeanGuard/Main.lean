@@ -1,9 +1,9 @@
-import DaysLean.PfcEventLog
+import LeanGuard.DcqcnEventLog
 
-open DaysLean.PfcEventLog
+open LeanGuard.DcqcnEventLog
 
 def usage : String :=
-  "usage: pfc_check <path/to/pfc_events.csv>"
+  "usage: dcqcn_check <path/to/dcqcn_events.csv>"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -24,4 +24,3 @@ def main (args : List String) : IO UInt32 := do
   | _ =>
       IO.eprintln usage
       pure 2
-

@@ -1,6 +1,6 @@
 import Std
 
-namespace DaysLean.PfcEventLog
+namespace LeanGuard.PfcEventLog
 
 inductive Kind
   | pfcSent
@@ -269,5 +269,4 @@ def checkRows (rows : List Row) : Except String Unit := do
         go g' (some (key r)) rs
   go {} none rowsSorted
 
-end DaysLean.PfcEventLog
-
+end LeanGuard.PfcEventLog
