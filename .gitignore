@@ -3,6 +3,7 @@
 **/target/
 **/Cargo.lock
 **/uv.lock
+**/.lake/
 
 # These are files related to logged outputs
 **/*.csv
@@ -10,3 +11,7 @@ logs/**
 
 # RepoPrompt
 .repoprompt/**
+
+# MkDocs build output
+site/**
+docs/site/**

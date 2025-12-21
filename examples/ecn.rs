@@ -80,6 +80,7 @@ fn main() {
             Some(TCPCharacteristics {
                 cc_algorithm: TCPCubic,
                 ecn: true,
+                cubic: None,
             }),
         ),
         0,

@@ -17,6 +17,29 @@ use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
 
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+use crate::utils::logger::{DcqcnEventKind, DcqcnEventRow, DcqcnLoggedEcnField};
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_ppb(v: f64) -> u64 {
+    (v.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_bps(v: f64) -> u64 {
+    v.max(0.0).round() as u64
+}
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_last_ns(time_s: f64) -> Option<u64> {
+    time_s.is_finite().then(|| to_ns(time_s))
+}
+
 #[derive(Debug)]
 pub struct DcqcnPacketSource {
     /// the current simulation time, maintained locally. This is useful for reducing the competition
@@ -32,6 +55,7 @@ pub struct DcqcnPacketSource {
     pub traffic_exceeded: bool,
 
     rate_bps: f64,
+    init_rate_bps: f64,
     min_rate_bps: f64,
     max_rate_bps: f64,
     alpha: f64,
@@ -93,6 +117,7 @@ impl DcqcnPacketSource {
             traffic,
             traffic_exceeded: false,
             rate_bps,
+            init_rate_bps: rate_bps,
             min_rate_bps,
             max_rate_bps,
             alpha: 0.0,
@@ -133,6 +158,38 @@ impl DcqcnPacketSource {
         self.time = now;
         if packet.control == Some(ControlPacket::DcqcnCnp) {
             self.on_cnp(now);
+
+            #[cfg(all(feature = "lean", feature = "dcqcn"))]
+            {
+                let event = DcqcnEventRow {
+                    time_ns: to_ns(now),
+                    event_id: CsvLogger::next_dcqcn_event_id(),
+                    kind: DcqcnEventKind::CnpRecv,
+                    endpoint_id: self.endpoint_id as u64,
+                    flow_id: self.flow_id as u64,
+                    pkt_id: Some(packet.packet_id as u64),
+                    pkt_flow_id: Some(packet.flow_id as u64),
+                    trigger_ecn: None,
+                    cnp_priority: Some(packet.priority),
+                    cnp_size_b: Some(packet.size as u64),
+                    cnp_ecn: Some(DcqcnLoggedEcnField::from(packet.ecn)),
+                    cnp_cwr: Some(packet.cwr),
+                    cnp_last_packet: Some(packet.last_packet),
+                    cnp_interval_ns: to_ns(self.cnp_interval),
+                    g_ppb: to_ppb(self.g),
+                    mi_ppb: to_ppb(self.mi_factor),
+                    init_rate_bps: to_bps(self.init_rate_bps),
+                    min_rate_bps: to_bps(self.min_rate_bps),
+                    max_rate_bps: to_bps(self.max_rate_bps),
+                    ai_rate_bps: to_bps(self.ai_rate_bps),
+                    hai_rate_bps: to_bps(self.hai_rate_bps),
+                    alpha_ppb: Some(to_ppb(self.alpha)),
+                    rate_bps: Some(to_bps(self.rate_bps)),
+                    cnp_seen: Some(self.cnp_seen),
+                    last_cnp_ns: to_last_ns(self.last_cnp_time),
+                };
+                CsvLogger::try_log_report(Report::DcqcnEventRow(event), ReportTiming::InProgress);
+            }
         }
     }
 
@@ -160,7 +217,7 @@ impl DcqcnPacketSource {
     pub fn timer_tick(&mut self, now: f64) {
         self.time = now;
         if !self.cnp_seen {
-            self.alpha = (1.0 - self.g) * self.alpha;
+            self.alpha *= 1.0 - self.g;
             let inc = if self.alpha < 0.1 {
                 self.hai_rate_bps
             } else {
@@ -169,6 +226,38 @@ impl DcqcnPacketSource {
             self.rate_bps = (self.rate_bps + inc).min(self.max_rate_bps);
         }
         self.cnp_seen = false;
+
+        #[cfg(all(feature = "lean", feature = "dcqcn"))]
+        {
+            let event = DcqcnEventRow {
+                time_ns: to_ns(now),
+                event_id: CsvLogger::next_dcqcn_event_id(),
+                kind: DcqcnEventKind::TimerTick,
+                endpoint_id: self.endpoint_id as u64,
+                flow_id: self.flow_id as u64,
+                pkt_id: None,
+                pkt_flow_id: None,
+                trigger_ecn: None,
+                cnp_priority: None,
+                cnp_size_b: None,
+                cnp_ecn: None,
+                cnp_cwr: None,
+                cnp_last_packet: None,
+                cnp_interval_ns: to_ns(self.cnp_interval),
+                g_ppb: to_ppb(self.g),
+                mi_ppb: to_ppb(self.mi_factor),
+                init_rate_bps: to_bps(self.init_rate_bps),
+                min_rate_bps: to_bps(self.min_rate_bps),
+                max_rate_bps: to_bps(self.max_rate_bps),
+                ai_rate_bps: to_bps(self.ai_rate_bps),
+                hai_rate_bps: to_bps(self.hai_rate_bps),
+                alpha_ppb: Some(to_ppb(self.alpha)),
+                rate_bps: Some(to_bps(self.rate_bps)),
+                cnp_seen: Some(self.cnp_seen),
+                last_cnp_ns: to_last_ns(self.last_cnp_time),
+            };
+            CsvLogger::try_log_report(Report::DcqcnEventRow(event), ReportTiming::InProgress);
+        }
     }
 
     fn sample_packet_size(&mut self) -> usize {

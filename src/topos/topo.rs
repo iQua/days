@@ -404,7 +404,7 @@ impl Topology {
 
         let mut gate = PfcEgressGate::new(gate_id, self.switch_config.port_rate);
         let mut link = Link::new(link_id, self.switch_config.port_rate);
-        let mut ingress = PfcIngressPort::new(ingress_id, pfc_config, can_forward);
+        let mut ingress = PfcIngressPort::new(ingress_id, gate_id, pfc_config, can_forward);
 
         let gate_mbox: Mailbox<PfcEgressGate> = Mailbox::with_capacity(self.mailbox_capacity);
         let link_mbox: Mailbox<Link> = Mailbox::with_capacity(self.mailbox_capacity);

@@ -50,6 +50,7 @@ fn main() {
             Some(TCPCharacteristics {
                 cc_algorithm: TCPCubic,
                 ecn: false,
+                cubic: None,
             }),
         ),
         0,

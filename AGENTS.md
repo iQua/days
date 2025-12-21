@@ -1,11 +1,16 @@
+# Description
+
+In this project, a new discrete-event network simulator, called Days, has been implemented. It uses process-based simulation, and models each process to be simulated as a coroutine in Rust.
+
 # Repository Guidelines
 
 ## Project Structure & Module Organization
 - `src/` contains the Rust crate. Key modules live in `src/flows/`, `src/schedulers/`, `src/switches/`, `src/topos/`, `src/utils/`, and optional layer-2 protocol implementations in `src/l2/`.
+- `lean/` contains Lean code that checks several protocols, including DCQCN and PFC, for conformance to their protocol specifications.
 - `src/main.rs` is the CLI entry point; `src/lib.rs` exposes the library API.
 - `tests/` holds integration tests, with `.toml` fixtures alongside test files (for example `tests/wrr.rs` + `tests/wrr_seed.toml`).
-- `configs/` stores example simulation configs; `examples/` and `examples.md` show runnable scenarios.
-- `docs/` contains design/feature notes (see `docs/l2.md`).
+- `configs/` stores example simulation configs; `examples/` and `docs/docs/examples/` show runnable scenarios.
+- `docs/` contains the MkDocs site (`docs/mkdocs.yml`, content under `docs/docs/`, e.g. `docs/docs/design-notes/l2.md`).
 - `logs/` and `target/` are generated artifacts and should stay uncommitted.
 
 ## Build, Test, and Development Commands

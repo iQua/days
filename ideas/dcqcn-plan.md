@@ -148,7 +148,7 @@ Add one or two example configs in `configs/`:
 - `configs/dcqcn_simple.toml`
 - `configs/dcqcn_convergence.toml`
 
-Update `examples.md` with commands:
+Update `docs/examples/index.md` with commands:
 
 - `cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml`
 
@@ -179,4 +179,4 @@ Update `examples.md` with commands:
 - `src/utils/logger.rs` (DCQCN logging)
 - `tests/dcqcn.rs` + `tests/dcqcn.toml`
 - `configs/dcqcn_simple.toml`
-- `examples.md`
+- `docs/examples/index.md`

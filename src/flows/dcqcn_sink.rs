@@ -12,6 +12,24 @@ use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
 
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+use crate::utils::logger::{DcqcnEventKind, DcqcnEventRow, DcqcnLoggedEcnField};
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_ppb(v: f64) -> u64 {
+    (v.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(all(feature = "lean", feature = "dcqcn"))]
+fn to_bps(v: f64) -> u64 {
+    v.max(0.0).round() as u64
+}
+
 #[derive(Debug)]
 pub struct DcqcnPacketSink {
     /// the current simulation time, maintained locally. This is useful for reducing the competition
@@ -34,6 +52,15 @@ pub struct DcqcnPacketSink {
     last_cnp_time: f64,
     cnp_interval: f64,
     cnp_priority: u8,
+
+    // Stored for `dcqcn_events.csv` logging under the `lean` feature.
+    g: f64,
+    mi_factor: f64,
+    init_rate_bps: f64,
+    min_rate_bps: f64,
+    max_rate_bps: f64,
+    ai_rate_bps: f64,
+    hai_rate_bps: f64,
 }
 
 impl DcqcnPacketSink {
@@ -47,6 +74,12 @@ impl DcqcnPacketSink {
 
         let cnp_interval = dcqcn.cnp_interval_ns.unwrap_or(50_000.0) * 1e-9;
         let cnp_priority = dcqcn.cnp_priority.unwrap_or(0);
+
+        let init_rate_bps = dcqcn.rate_gbps * 1e9;
+        let min_rate_bps = dcqcn.min_rate_gbps * 1e9;
+        let max_rate_bps = dcqcn.max_rate_gbps * 1e9;
+        let ai_rate_bps = dcqcn.ai_rate_gbps * 1e9;
+        let hai_rate_bps = dcqcn.hai_rate_gbps * 1e9;
 
         DcqcnPacketSink {
             time: 0.0,
@@ -64,6 +97,13 @@ impl DcqcnPacketSink {
             last_cnp_time: f64::NEG_INFINITY,
             cnp_interval,
             cnp_priority,
+            g: dcqcn.g,
+            mi_factor: dcqcn.mi_factor,
+            init_rate_bps,
+            min_rate_bps,
+            max_rate_bps,
+            ai_rate_bps,
+            hai_rate_bps,
         }
     }
 
@@ -117,6 +157,38 @@ impl DcqcnPacketSink {
         cnp.cwr = false;
         cnp.last_packet = false;
         cnp.queueing_delay = packet.queueing_delay;
+
+        #[cfg(all(feature = "lean", feature = "dcqcn"))]
+        {
+            let event = DcqcnEventRow {
+                time_ns: to_ns(now),
+                event_id: CsvLogger::next_dcqcn_event_id(),
+                kind: DcqcnEventKind::CnpSent,
+                endpoint_id: self.endpoint_id as u64,
+                flow_id: self.flow_id as u64,
+                pkt_id: Some(packet.packet_id as u64),
+                pkt_flow_id: Some(packet.flow_id as u64),
+                trigger_ecn: Some(DcqcnLoggedEcnField::from(packet.ecn)),
+                cnp_priority: Some(cnp.priority),
+                cnp_size_b: Some(cnp.size as u64),
+                cnp_ecn: Some(DcqcnLoggedEcnField::from(cnp.ecn)),
+                cnp_cwr: Some(cnp.cwr),
+                cnp_last_packet: Some(cnp.last_packet),
+                cnp_interval_ns: to_ns(self.cnp_interval),
+                g_ppb: to_ppb(self.g),
+                mi_ppb: to_ppb(self.mi_factor),
+                init_rate_bps: to_bps(self.init_rate_bps),
+                min_rate_bps: to_bps(self.min_rate_bps),
+                max_rate_bps: to_bps(self.max_rate_bps),
+                ai_rate_bps: to_bps(self.ai_rate_bps),
+                hai_rate_bps: to_bps(self.hai_rate_bps),
+                alpha_ppb: None,
+                rate_bps: None,
+                cnp_seen: None,
+                last_cnp_ns: Some(to_ns(self.last_cnp_time)),
+            };
+            CsvLogger::try_log_report(Report::DcqcnEventRow(event), ReportTiming::InProgress);
+        }
 
         self.output.send(cnp).await;
 

@@ -1,0 +1,31 @@
+# Days
+
+Days is a performant discrete-event network simulator written in Rust. It models a network as a graph of **actors** (stackless coroutines) that communicate via **message passing** (packets and control messages). Simulations can run on a single-threaded runtime (minimal overhead) or a multi-threaded runtime (parallel execution).
+
+## What you get
+
+- **Config-driven experiments**: run a simulation from a single TOML file (topology, traffic, switch discipline, logging).
+- **Pluggable queueing/scheduling**: FIFO, DRR, WRR, WFQ, Static Priority, Virtual Clock.
+- **Transport and congestion control models**:
+  - Packet-distribution traffic sources (arrival + size distributions)
+  - TCP sources with Reno, CUBIC, and BBR congestion control
+  - Optional DCQCN (feature-gated)
+- **Optional link-layer models**: PFC/802.1Qbb (feature-gated and runtime-configured).
+- **Structured outputs**: CSV reports for sources/sinks/switches (and optional PFC/DCQCN traces).
+
+## Quick start
+
+From the repo root:
+
+```bash
+RUST_LOG=info cargo run -- configs/simple.toml
+```
+
+Output CSV files are written under the configured `log_path` (default: `./output/`).
+
+## Where to go next
+
+- Start running simulations: `quickstart.md`
+- Learn how configuration maps to code: `configuration/overview.md`
+- Understand the simulator architecture: `architecture/overview.md`
+- Dive into core components (packets, switches, schedulers, flows): `components/packet.md`

@@ -1,0 +1,80 @@
+site_name: Days 
+site_url: https://days.sh/docs/
+repo_url: https://github.com/iqua/days
+repo_name: iqua/days 
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: Google Sans Code 
+  palette:
+    # Light mode
+    - scheme: astral-light
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: astral-dark
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.footer
+    - navigation.instant
+    #- navigation.tabs
+    - content.code.copy
+    # - content.action.edit
+    # - content.action.view
+    - content.tooltips
+    - content.version # enables the version dropdown in the header
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/iqua/days
+extra_javascript:
+  - javascripts/katex.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+extra_css:
+  - https://unpkg.com/katex@0/dist/katex.min.css
+  - stylesheets/extra.css
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Quickstart: quickstart.md
+  - Examples: examples/index.md
+  - Testing: testing.md
+  - Verification:
+      - Overview: verification/index.md
+      - LeanGuard (Use Guide): verification/leanguard.md
+      - LeanGuard (Design): verification/design.md
+  - Configuration:
+      - Overview: configuration/overview.md
+      - Topology: configuration/topology.md
+      - Switches & Queues: configuration/switches.md
+      - Flows: configuration/flows.md
+      - Collectives: configuration/collectives.md
+      - Link Layer: configuration/l2.md
+      - Logging & Tracing: configuration/logging.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Simulation Engine: architecture/simulation-engine.md
+      - Topology Build: architecture/topology-build.md
+      - Code Tour: architecture/code-tour.md
+      - Time & Concurrency: architecture/time-concurrency.md
+  - Components:
+      - Packet: components/packet.md
+      - Switch: components/switch.md
+      - Schedulers: components/schedulers.md
+      - Flows: components/flows.md
+      - L2: components/l2.md
+      - Logging: components/logging.md
+  - Design Notes:
+      - Priority-based Flow Control: design-notes/pfc.md

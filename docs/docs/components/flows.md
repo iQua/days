@@ -1,0 +1,64 @@
+# Flows (Sources, Sinks, Routing)
+
+Flows are specified in TOML and expanded into source/sink actors attached to host switches.
+
+Core types:
+
+- `Flow` and `FlowType` (`src/flows/flow.rs`)
+- `TrafficCharacteristics` (`src/flows/mod.rs`)
+- `PacketSource` / `PacketSink` enums (`src/flows/source.rs`, `src/flows/sink.rs`)
+
+## Flow types
+
+`FlowType` determines which source/sink implementation is instantiated:
+
+- `PacketDistribution`: distribution-driven packet source + basic sink
+- `TCP`: TCP source + TCP sink (ACK-based, congestion control)
+- `DCQCN`: DCQCN source + DCQCN sink (feature `dcqcn`)
+
+## Traffic model
+
+Every flow has `TrafficCharacteristics`:
+
+- start delay: `initial_delay`
+- termination: either `size` (bytes) or `duration` (seconds)
+- packet arrival distribution: `arr_dist`
+- packet size distribution: `pkt_size_dist`
+
+Optional per-flow protocol config:
+
+- TCP: `tcp.cc_algorithm` (Reno/CUBIC/BBR) and `tcp.ecn` (send ECN-capable packets)
+- DCQCN: `dcqcn.*` parameters (rate bounds, alpha gain, pacing, CNP settings)
+
+## Routing
+
+Paths are computed in `Flow::compute_path(...)`:
+
+- `ShortestPath`: uses `petgraph` A* to find a shortest path
+- `ECMP`: finds all equal-cost paths and selects one deterministically per flow
+- `PathFromConfig`: uses an explicit `path = [...]` from TOML
+
+Computed paths include endpoints:
+
+```
+[source_endpoint_id] + [switch nodes...] + [sink_endpoint_id]
+```
+
+The topology builder then installs forwarding table entries (`fib` and `r_fib`) into each switch for each flow ID.
+
+## Dependencies
+
+Flows can declare ordering constraints:
+
+- `starts_after = [flow_id, ...]`
+- `starts_before = [flow_id, ...]`
+
+These are wired by sending `FlowFinishMsg` when a flow completes (either from the sink for distribution flows, or from the source for TCP/DCQCN flows).
+
+## Collectives
+
+Collectives (`src/flows/collective.rs`) generate sets of flows from higher-level patterns:
+
+- `Broadcast`, `Gather`, `AllReduce`, and `RingAllReduce`
+
+They are expanded into concrete flows inside `Topology::process_collectives` (`src/topos/topo.rs`) before routing happens.

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::flows::cc::{AckEvent, CongestionControl, RateSample};
+use std::any::Any;
 
 #[derive(Debug)]
 pub struct BBRState {
@@ -651,6 +652,14 @@ impl CongestionControl for TCPBBR {
 
     fn get_cwnd(&self) -> usize {
         self.state.get_cwnd()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn get_pacing_rate(&self) -> f64 {

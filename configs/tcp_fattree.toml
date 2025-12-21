@@ -35,3 +35,8 @@ tracing_interval = 0.01
 
     [flow_set.traffic.tcp]
     cc_algorithm = "CUBIC"
+
+    [flow_set.traffic.tcp.cubic]
+    beta = 0.7
+    c = 0.4
+    fast_convergence = true

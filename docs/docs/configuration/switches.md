@@ -1,0 +1,105 @@
+# Switch & Scheduler Configuration
+
+Switch configuration is global: it applies to **every scheduler instantiated per directed edge** in the topology graph (see `Topology::connect_neighbours` in `src/topos/topo.rs`).
+
+```toml
+[switch]
+port_rate = 1e9
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+```
+
+## `switch.port_rate`
+
+Bit rate of each egress port in bits per second.
+
+- Type: `f64`
+- Required: yes
+- Used by: all schedulers (serialization delay = `size_bits / port_rate`)
+
+## `switch.capacity`
+
+Queue capacity at each egress scheduler.
+
+- Type: `usize`
+- Required: yes
+- Semantics: currently interpreted as **packets**, not bytes (Days instantiates schedulers with `CapacityUnit::Packets`)
+- Special value: `0` means “unlimited” for built-in drop/ECN strategies
+
+## `switch.discipline`
+
+Selects the scheduling discipline (which scheduler model is instantiated).
+
+Supported values:
+
+| Discipline | Scheduler model | Extra required fields |
+|---|---|---|
+| `FIFO` | `Port` | none |
+| `DRR` | `DRRServer` | `weights` |
+| `WRR` | `WRRServer` | `weights` |
+| `WFQ` | `WFQServer` | `weights` |
+| `SP` | `SPServer` | `priorities` |
+| `VirtualClock` | `VirtualClockServer` | `vticks` |
+
+## `switch.drop`
+
+Selects the congestion policy applied on enqueue.
+
+Supported values:
+
+| Value | Behavior |
+|---|---|
+| `TailDrop` | drop only when capacity is exceeded |
+| `RED` | RFC 2309-style random early drop |
+| `RED_ECN` | RED, but tries to mark ECN instead of dropping |
+| `ECN_THRESHOLD` | marks ECN when occupancy exceeds `ecn_threshold` |
+
+Notes:
+
+- Marking ECN only works if the packet is ECN-capable (`Ect0`/`Ect1`). Otherwise the scheduler will drop the packet when asked to “mark”.
+- For TCP, enable ECN marking by setting `[flow.traffic.tcp] ecn = true` so the TCP source emits `Ect0` packets.
+- DCQCN sources always emit `Ect0` packets.
+
+## `switch.ecn_threshold` (optional)
+
+Occupancy fraction used by `drop = "ECN_THRESHOLD"`.
+
+- Type: `f64` (fraction in `[0, 1]`)
+- Default: `0.8`
+- Meaning (with packet capacity): if `queue_len + 1 > floor(ecn_threshold * capacity)`, the scheduler returns `MarkEcn`.
+
+## `switch.weights` (required for DRR/WRR/WFQ)
+
+Class weights.
+
+- Type: `Vec<usize>`
+- Required when `discipline` is `DRR`, `WRR`, or `WFQ`
+
+Class assignment:
+
+- Days uses a simple mapping `class_id = flow_id % weights.len()`.
+
+## `switch.priorities` (required for SP)
+
+Maps class IDs to strict priority levels.
+
+- Type: `Vec<usize>`
+- Required when `discipline = "SP"`
+- Interpretation: **larger numbers are served first** (the scheduler iterates priorities in descending order).
+
+Class assignment:
+
+- `class_id = flow_id % priorities.len()`
+
+## `switch.vticks` (required for VirtualClock)
+
+Virtual clock tick values per class.
+
+- Type: `Vec<f64>`
+- Required when `discipline = "VirtualClock"`
+- Interpretation: seconds per bit (i.e., inverse of target rate in bits/s)
+
+Class assignment:
+
+- `class_id = flow_id % vticks.len()`
