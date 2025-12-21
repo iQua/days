@@ -378,6 +378,11 @@ impl WFQServer {
         self.update_internal_states(&packet, self.time_packet_sent);
     }
 
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        self.send(packet).await;
+        self.run(self.time, cx);
+    }
+
     /// Schedules a packet by accepting a closure to handle packet sending based on context.
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
@@ -438,18 +443,13 @@ impl WFQServer {
             self.time = global_time;
         }
 
-        self.schedule_packet(|now, timeout, outbound| {
-            // schedules the send event
+        self.schedule_packet(|_now, timeout, outbound| {
             cx.schedule_event(
                 Duration::from_secs_f64(timeout),
-                Self::send,
+                Self::send_and_run,
                 outbound.packet,
             )
             .unwrap();
-
-            // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
-                .unwrap();
         });
     }
 

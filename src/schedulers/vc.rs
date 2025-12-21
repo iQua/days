@@ -329,6 +329,11 @@ impl VirtualClockServer {
         self.output.send(packet).await;
     }
 
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        self.send(packet).await;
+        self.run(self.time, cx);
+    }
+
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
         F: FnMut(f64, f64, TaggedPacket),
@@ -391,18 +396,13 @@ impl VirtualClockServer {
             self.time = global_time;
         }
 
-        self.schedule_packet(|now, timeout, outbound| {
-            // schedules the send event
+        self.schedule_packet(|_now, timeout, outbound| {
             cx.schedule_event(
                 Duration::from_secs_f64(timeout),
-                Self::send,
+                Self::send_and_run,
                 outbound.packet,
             )
             .unwrap();
-
-            // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
-                .unwrap();
         });
     }
 

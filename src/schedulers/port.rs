@@ -198,6 +198,11 @@ impl Port {
         self.output.send(packet).await;
     }
 
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        self.send(packet).await;
+        self.run(self.time, cx).await;
+    }
+
     fn packet_sent(&mut self, now: f64, packet: Packet) {
         self.busy_until = now;
 
@@ -244,11 +249,12 @@ impl Port {
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 packet.departure_update(now + timeout);
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, packet.clone())
-                    .unwrap();
-
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(timeout),
+                    Self::send_and_run,
+                    packet.clone(),
+                )
+                .unwrap();
 
                 self.packet_sent(now + timeout, packet);
             }

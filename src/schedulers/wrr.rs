@@ -260,6 +260,11 @@ impl WRRServer {
         self.output.send(packet).await;
     }
 
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        self.send(packet).await;
+        self.run(self.time, cx);
+    }
+
     fn schedule_packet<F>(&mut self, mut schedule_event: F)
     where
         F: FnMut(f64, f64, Packet),
@@ -332,14 +337,13 @@ impl WRRServer {
             self.time = global_time;
         }
 
-        self.schedule_packet(|now, timeout, outbound| {
-            // schedules the send event
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, outbound)
-                .unwrap();
-
-            // schedules the next run
-            cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
-                .unwrap();
+        self.schedule_packet(|_now, timeout, outbound| {
+            cx.schedule_event(
+                Duration::from_secs_f64(timeout),
+                Self::send_and_run,
+                outbound,
+            )
+            .unwrap();
         });
     }
 
