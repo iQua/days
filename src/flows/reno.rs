@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use crate::flows::cc::{AckEvent, CongestionControl};
+use std::any::Any;
 
 /// TCP Reno states
 #[derive(Debug, Default, PartialEq)]
@@ -377,6 +378,14 @@ impl CongestionControl for TCPReno {
 
     fn get_cwnd(&self) -> usize {
         self.cwnd
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

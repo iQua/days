@@ -24,6 +24,19 @@ use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
 
+#[cfg(feature = "lean")]
+use crate::utils::logger::{CubicEventKind, CubicEventRow};
+
+#[cfg(feature = "lean")]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(feature = "lean")]
+fn to_ppb(v: f64) -> u64 {
+    (v.max(0.0) * 1e9).round() as u64
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
     pub packet_id: usize,
@@ -352,6 +365,8 @@ impl TCPPacketSource {
                 self.congestion_control.ecn_marked();
                 self.ecn_reduction_in_flight = true;
                 self.cwr_pending = true;
+                #[cfg(feature = "lean")]
+                self.log_cubic_event(CubicEventKind::Congestion, None, None, now);
             }
         } else if !ack.ece {
             self.ecn_reduction_in_flight = false;
@@ -375,6 +390,8 @@ impl TCPPacketSource {
                     .unwrap_or(self.mss);
                 self.pending_lost_bytes = self.pending_lost_bytes.saturating_add(loss_size);
                 self.congestion_control.consecutive_dupacks_received();
+                #[cfg(feature = "lean")]
+                self.log_cubic_event(CubicEventKind::Congestion, None, None, now);
             }
 
             if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
@@ -510,6 +527,19 @@ impl TCPPacketSource {
                 bytes_acked: ack.acknowledged_size,
                 rate_sample,
             });
+            #[cfg(feature = "lean")]
+            {
+                let acked_bytes = ack.acknowledged_size.max(1);
+                let acked_segs = acked_bytes
+                    .saturating_add(self.mss.saturating_sub(1))
+                    / self.mss;
+                self.log_cubic_event(
+                    CubicEventKind::Ack,
+                    Some(acked_segs),
+                    Some(sample_rtt),
+                    now,
+                );
+            }
             self.pending_lost_bytes = 0;
             self.pending_ecn_marked = false;
 
@@ -547,6 +577,47 @@ impl TCPPacketSource {
 
     pub fn get_cwnd_limit(&self) -> usize {
         self.last_ack + self.congestion_control.get_cwnd()
+    }
+
+    #[cfg(feature = "lean")]
+    fn log_cubic_event(
+        &self,
+        kind: CubicEventKind,
+        acked_segs: Option<usize>,
+        rtt_s: Option<f64>,
+        now: f64,
+    ) {
+        let cubic = match self
+            .congestion_control
+            .as_any()
+            .downcast_ref::<TCPCubic>()
+        {
+            Some(cubic) => cubic,
+            None => return,
+        };
+        let snap = cubic.snapshot();
+        let event = CubicEventRow {
+            time_ns: to_ns(now),
+            event_id: CsvLogger::next_cubic_event_id(),
+            kind,
+            endpoint_id: self.endpoint_id as u64,
+            flow_id: self.flow_id as u64,
+            acked_segs: acked_segs.map(|v| v as u64),
+            rtt_ns: rtt_s.map(to_ns),
+            mss_bytes: snap.mss as u64,
+            beta_ppb: to_ppb(snap.beta),
+            c_ppb: to_ppb(snap.c),
+            tcp_friendly: snap.tcp_friendliness,
+            fast_convergence: snap.fast_convergence,
+            init_cwnd_bytes: snap.init_cwnd as u64,
+            init_ssthresh_bytes: snap.init_ssthresh as u64,
+            cwnd_bytes: snap.cwnd as u64,
+            ssthresh_bytes: snap.ssthresh as u64,
+            w_max_bytes: snap.w_max as u64,
+            w_last_max_bytes: snap.w_last_max as u64,
+            epoch_start_ns: snap.epoch_start.map(to_ns),
+        };
+        CsvLogger::try_log_report(Report::CubicEventRow(event), ReportTiming::InProgress);
     }
 
     pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
@@ -632,6 +703,8 @@ impl TCPPacketSource {
                 }
 
                 self.congestion_control.timer_expired();
+                #[cfg(feature = "lean")]
+                self.log_cubic_event(CubicEventKind::Timeout, None, None, packet_timeout.timeout);
 
                 // retransmits the segment
                 let resent_pkt = self

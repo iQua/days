@@ -2,6 +2,7 @@
 //! the TCPPacketSource struct with congestion control decisions.
 
 use serde::Deserialize;
+use std::any::Any;
 
 /// A delivery-rate sample for rate-based congestion control.
 #[derive(Clone, Debug, Default)]
@@ -61,8 +62,11 @@ impl AckEvent {
 /// The congestion control algorithms.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub enum CCAlgorithm {
+    #[serde(alias = "RENO", alias = "Reno", alias = "reno")]
     TCPReno,
+    #[serde(alias = "CUBIC", alias = "Cubic", alias = "cubic")]
     TCPCubic,
+    #[serde(alias = "BBR", alias = "Bbr", alias = "bbr")]
     TCPBBR,
 }
 
@@ -76,6 +80,8 @@ pub trait CongestionControl {
     fn more_dupacks_received(&mut self);
     fn ecn_marked(&mut self) {}
     fn get_cwnd(&self) -> usize;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
     fn get_pacing_rate(&self) -> f64 {
         0.0 // Default pacing rate for algorithms that do not utilize it
     }

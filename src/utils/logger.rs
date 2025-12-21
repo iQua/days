@@ -6,7 +6,7 @@ use log::info;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs;
-#[cfg(all(feature = "lean", any(feature = "dcqcn", feature = "l2_pfc")))]
+#[cfg(feature = "lean")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -52,6 +52,39 @@ pub struct PfcEventRow {
     pub buffer_capacity_bytes: Option<u64>,
     pub refresh_interval_ns: Option<u64>,
     pub drain_interval_ns: Option<u64>,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CubicEventKind {
+    Ack,
+    Congestion,
+    Timeout,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Debug, Serialize)]
+pub struct CubicEventRow {
+    pub time_ns: u64,
+    pub event_id: u64,
+    pub kind: CubicEventKind,
+    pub endpoint_id: u64,
+    pub flow_id: u64,
+    pub acked_segs: Option<u64>,
+    pub rtt_ns: Option<u64>,
+    pub mss_bytes: u64,
+    pub beta_ppb: u64,
+    pub c_ppb: u64,
+    pub tcp_friendly: bool,
+    pub fast_convergence: bool,
+    pub init_cwnd_bytes: u64,
+    pub init_ssthresh_bytes: u64,
+    pub cwnd_bytes: u64,
+    pub ssthresh_bytes: u64,
+    pub w_max_bytes: u64,
+    pub w_last_max_bytes: u64,
+    pub epoch_start_ns: Option<u64>,
 }
 
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
@@ -117,6 +150,9 @@ pub struct DcqcnEventRow {
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
 static NEXT_DCQCN_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "lean")]
+static NEXT_CUBIC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(all(feature = "lean", feature = "l2_pfc"))]
 static NEXT_PFC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -132,6 +168,8 @@ pub enum Report {
     PfcPortReport(PfcPortReport),
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
     PfcEventRow(PfcEventRow),
+    #[cfg(feature = "lean")]
+    CubicEventRow(CubicEventRow),
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEventRow(DcqcnEventRow),
 }
@@ -152,6 +190,8 @@ struct SharedState {
     pfc_reports: Vec<PfcPortReport>,
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
     pfc_events: Vec<PfcEventRow>,
+    #[cfg(feature = "lean")]
+    cubic_events: Vec<CubicEventRow>,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     dcqcn_events: Vec<DcqcnEventRow>,
     total_delay: f64,
@@ -166,6 +206,8 @@ enum ElementType {
     Pfc,
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
     PfcEvents,
+    #[cfg(feature = "lean")]
+    CubicEvents,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEvents,
 }
@@ -263,6 +305,8 @@ impl CsvLogger {
         elements.push("pfc");
         #[cfg(all(feature = "lean", feature = "l2_pfc"))]
         elements.push("pfc_events");
+        #[cfg(feature = "lean")]
+        elements.push("cubic_events");
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         elements.push("dcqcn_events");
         for element in elements {
@@ -289,6 +333,11 @@ impl CsvLogger {
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     pub fn next_dcqcn_event_id() -> u64 {
         NEXT_DCQCN_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "lean")]
+    pub fn next_cubic_event_id() -> u64 {
+        NEXT_CUBIC_EVENT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -322,6 +371,10 @@ impl CsvLogger {
             #[cfg(all(feature = "lean", feature = "l2_pfc"))]
             Report::PfcEventRow(event) => {
                 state.pfc_events.push(event);
+            }
+            #[cfg(feature = "lean")]
+            Report::CubicEventRow(event) => {
+                state.cubic_events.push(event);
             }
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             Report::DcqcnEventRow(event) => {
@@ -368,6 +421,8 @@ impl CsvLogger {
             ElementType::Pfc => format!("{}pfc.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "l2_pfc"))]
             ElementType::PfcEvents => format!("{}pfc_events.csv", self.log_path.get().unwrap()),
+            #[cfg(feature = "lean")]
+            ElementType::CubicEvents => format!("{}cubic_events.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             ElementType::DcqcnEvents => {
                 format!("{}dcqcn_events.csv", self.log_path.get().unwrap())
@@ -480,6 +535,14 @@ impl CsvLogger {
             }
         }
 
+        #[cfg(feature = "lean")]
+        if state.cubic_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.cubic_events);
+            if let Err(e) = self.write_to_csv(ElementType::CubicEvents, &events) {
+                eprintln!("Error writing CUBIC events to CSV: {}", e);
+            }
+        }
+
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         if state.dcqcn_events.len() >= self.max_log_len {
             let events = std::mem::take(&mut state.dcqcn_events);
@@ -531,6 +594,13 @@ impl CsvLogger {
             let events = std::mem::take(&mut state.pfc_events);
             self.write_to_csv(ElementType::PfcEvents, &events)
                 .expect("Error writing PFC events to CSV");
+        }
+
+        #[cfg(feature = "lean")]
+        if !state.cubic_events.is_empty() {
+            let events = std::mem::take(&mut state.cubic_events);
+            self.write_to_csv(ElementType::CubicEvents, &events)
+                .expect("Error writing CUBIC events to CSV");
         }
 
         #[cfg(all(feature = "lean", feature = "dcqcn"))]

@@ -39,6 +39,7 @@
 //! See individual field documentation for more details.
 
 use crate::flows::cc::{AckEvent, CongestionControl};
+use std::any::Any;
 
 /// HyStart++ parameters for improved slow start exit detection.
 ///
@@ -128,8 +129,12 @@ impl HyStartState {
 pub struct TCPCubic {
     /// Maximum segment size in bytes
     mss: usize,
+    /// Initial congestion window in bytes
+    init_cwnd: usize,
     /// Current congestion window size in bytes
     cwnd: usize,
+    /// Initial slow start threshold in bytes
+    init_ssthresh: usize,
     /// Slow start threshold in bytes
     ssthresh: usize,
     /// Window size before last reduction, used as target during window growth
@@ -169,13 +174,34 @@ pub struct TCPCubic {
     in_recovery: bool,
 }
 
+#[cfg(feature = "lean")]
+#[derive(Clone, Copy, Debug)]
+pub struct CubicSnapshot {
+    pub mss: usize,
+    pub beta: f64,
+    pub c: f64,
+    pub tcp_friendliness: bool,
+    pub fast_convergence: bool,
+    pub init_cwnd: usize,
+    pub init_ssthresh: usize,
+    pub cwnd: usize,
+    pub ssthresh: usize,
+    pub w_max: usize,
+    pub w_last_max: usize,
+    pub epoch_start: Option<f64>,
+}
+
 impl TCPCubic {
     /// Creates a new TCP CUBIC instance with default parameters.
     pub fn new() -> TCPCubic {
+        let init_cwnd = 512;
+        let init_ssthresh = 65535;
         TCPCubic {
             mss: 512,
-            cwnd: 512,
-            ssthresh: 65535,
+            init_cwnd,
+            cwnd: init_cwnd,
+            init_ssthresh,
+            ssthresh: init_ssthresh,
             w_last_max: 0,
             epoch_start: 0.0,
             origin_point: 0,
@@ -201,6 +227,30 @@ impl TCPCubic {
             round_count: 0,
             last_reduction_time: 0.0,
             in_recovery: false,
+        }
+    }
+
+    #[cfg(feature = "lean")]
+    pub fn snapshot(&self) -> CubicSnapshot {
+        let epoch_start = if self.epoch_start > 0.0 {
+            Some(self.epoch_start)
+        } else {
+            None
+        };
+        CubicSnapshot {
+            mss: self.mss,
+            beta: self.beta,
+            c: self.c,
+            tcp_friendliness: self.tcp_friendliness,
+            fast_convergence: self.fast_convergence,
+            init_cwnd: self.init_cwnd,
+            init_ssthresh: self.init_ssthresh,
+            cwnd: self.cwnd,
+            ssthresh: self.ssthresh,
+            // `w_last_max` is the target window for growth; `last_max_cwnd` tracks prior maxima.
+            w_max: self.w_last_max,
+            w_last_max: self.last_max_cwnd,
+            epoch_start,
         }
     }
 
@@ -472,6 +522,14 @@ impl CongestionControl for TCPCubic {
 
     fn get_cwnd(&self) -> usize {
         self.cwnd
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
