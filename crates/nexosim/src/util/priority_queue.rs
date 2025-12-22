@@ -55,6 +55,7 @@ where
     K: Ord,
 {
     heap: BinaryHeap<Item<K, V>>,
+    #[allow(dead_code)]
     next_epoch: u64,
 }
 
@@ -67,11 +68,22 @@ impl<K: Copy + Ord, V> PriorityQueue<K, V> {
         }
     }
 
+    /// Inserts a new key-value pair with a user-provided epoch.
+    ///
+    /// The epoch is used to break ties for equal keys and must be unique for a
+    /// given key if stable ordering is required.
+    pub(crate) fn insert_with_epoch(&mut self, key: K, value: V, epoch: u64) {
+        assert_ne!(epoch, u64::MAX);
+        let item = Item { key, value, epoch };
+        self.heap.push(item);
+    }
+
     /// Inserts a new key-value pair.
     ///
     /// This operation has *O*(log(*N*)) amortized worse-case theoretical
     /// complexity and *O*(1) amortized theoretical complexity for a
     /// sufficiently random heap.
+    #[allow(dead_code)]
     pub(crate) fn insert(&mut self, key: K, value: V) {
         // Build an element from the user-provided key-value and a unique epoch.
         let epoch = self.next_epoch;

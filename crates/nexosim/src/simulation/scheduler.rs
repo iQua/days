@@ -1,14 +1,16 @@
 //! Scheduling functions and types.
+use std::cell::UnsafeCell;
 use std::error::Error;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{fmt, ptr};
 
+use crossbeam_utils::CachePadded;
 use pin_project::pin_project;
 use recycle_box::{coerce_box, RecycleBox};
 
@@ -33,11 +35,11 @@ pub struct Scheduler(GlobalScheduler);
 
 impl Scheduler {
     pub(crate) fn new(
-        scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+        state: Arc<SchedulerState>,
         time: AtomicTimeReader,
         is_halted: Arc<AtomicBool>,
     ) -> Self {
-        Self(GlobalScheduler::new(scheduler_queue, time, is_halted))
+        Self(GlobalScheduler::new(state, time, is_halted))
     }
 
     /// Returns the current simulation time.
@@ -399,22 +401,107 @@ impl fmt::Debug for Action {
 /// futures, thus ensuring that they are not executed concurrently.
 pub(crate) type SchedulerQueue = PriorityQueue<(MonotonicTime, usize), Action>;
 
+/// Scheduler state shared by all scheduler handles and the simulation.
+pub(crate) struct SchedulerState {
+    pub(super) scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+    pub(super) local_buffers: LocalScheduleBuffers,
+    executor_id: usize,
+    origin_seqs: OnceLock<Box<[CachePadded<AtomicU64>]>>,
+}
+
+impl SchedulerState {
+    pub(crate) fn new(
+        scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+        executor_id: usize,
+        num_workers: usize,
+    ) -> Self {
+        let num_workers = num_workers.max(1);
+        let buffers = (0..num_workers)
+            .map(|_| CachePadded::new(UnsafeCell::new(Vec::new())))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Self {
+            scheduler_queue,
+            local_buffers: LocalScheduleBuffers { buffers },
+            executor_id,
+            origin_seqs: OnceLock::new(),
+        }
+    }
+
+    pub(super) fn flush_local(&self, scheduler_queue: &mut SchedulerQueue) {
+        for buf in self.local_buffers.buffers.iter() {
+            let buf = unsafe { &mut *buf.get() };
+            for item in buf.drain(..) {
+                scheduler_queue.insert_with_epoch((item.time, item.origin_id), item.action, item.seq);
+            }
+        }
+    }
+
+    pub(crate) fn init_origin_seqs(&self, origin_count: usize) {
+        let origin_count = origin_count.max(1);
+        let origin_seqs = (0..origin_count)
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        self.origin_seqs
+            .set(origin_seqs)
+            .expect("origin sequences already initialized");
+    }
+
+    pub(super) fn next_seq(&self, origin_id: usize) -> u64 {
+        let origin_seqs = self
+            .origin_seqs
+            .get()
+            .expect("origin sequences not initialized");
+
+        debug_assert!(origin_id < origin_seqs.len());
+        let seq = origin_seqs[origin_id].fetch_add(1, Ordering::Relaxed);
+        assert_ne!(seq, u64::MAX, "origin sequence counter overflow");
+        seq
+    }
+}
+
+pub(super) struct LocalScheduleBuffers {
+    pub(super) buffers: Box<[CachePadded<UnsafeCell<Vec<LocalScheduleItem>>>]>,
+}
+
+// Safety: each buffer is written to exclusively by its owning worker thread and
+// drained only when the executor is quiescent.
+unsafe impl Sync for LocalScheduleBuffers {}
+
+impl LocalScheduleBuffers {
+    fn push(&self, worker_id: usize, item: LocalScheduleItem) {
+        debug_assert!(worker_id < self.buffers.len());
+
+        unsafe { &mut *self.buffers[worker_id].get() }.push(item);
+    }
+}
+
+pub(super) struct LocalScheduleItem {
+    pub(super) time: MonotonicTime,
+    pub(super) origin_id: usize,
+    pub(super) seq: u64,
+    pub(super) action: Action,
+}
+
 /// Internal implementation of the global scheduler.
 #[derive(Clone)]
 pub(crate) struct GlobalScheduler {
-    scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+    state: Arc<SchedulerState>,
     time: AtomicTimeReader,
     is_halted: Arc<AtomicBool>,
 }
 
 impl GlobalScheduler {
     pub(crate) fn new(
-        scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+        state: Arc<SchedulerState>,
         time: AtomicTimeReader,
         is_halted: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            scheduler_queue,
+            state,
             time,
             is_halted,
         }
@@ -437,6 +524,31 @@ impl GlobalScheduler {
         action: Action,
         origin_id: usize,
     ) -> Result<(), SchedulingError> {
+        if let (Some(worker_id), Some(executor_id)) =
+            (crate::executor::worker_id(), crate::executor::executor_id())
+        {
+            if executor_id == self.state.executor_id {
+                let now = self.time();
+                let time = deadline.into_time(now);
+                if now >= time {
+                    return Err(SchedulingError::InvalidScheduledTime);
+                }
+
+                let seq = self.state.next_seq(origin_id);
+                self.state.local_buffers.push(
+                    worker_id,
+                    LocalScheduleItem {
+                        time,
+                        origin_id,
+                        seq,
+                        action,
+                    },
+                );
+
+                return Ok(());
+            }
+        }
+
         // The scheduler queue must always be locked when reading the time,
         // otherwise the following race could occur:
         // 1) this method reads the time and concludes that it is not too late
@@ -444,7 +556,7 @@ impl GlobalScheduler {
         // 2) the `Simulation` object takes the lock, increments simulation time
         //    and runs the simulation step,
         // 3) this method takes the lock and schedules the now-outdated action.
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
 
         let now = self.time();
         let time = deadline.into_time(now);
@@ -452,7 +564,8 @@ impl GlobalScheduler {
             return Err(SchedulingError::InvalidScheduledTime);
         }
 
-        scheduler_queue.insert((time, origin_id), action);
+        let seq = self.state.next_seq(origin_id);
+        scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
 
         Ok(())
     }
@@ -475,16 +588,42 @@ impl GlobalScheduler {
         let sender = address.into().0;
         let action = Action::new(OnceAction::new(process_event(func, arg, sender)));
 
+        if let (Some(worker_id), Some(executor_id)) =
+            (crate::executor::worker_id(), crate::executor::executor_id())
+        {
+            if executor_id == self.state.executor_id {
+                let now = self.time();
+                let time = deadline.into_time(now);
+                if now >= time {
+                    return Err(SchedulingError::InvalidScheduledTime);
+                }
+
+                let seq = self.state.next_seq(origin_id);
+                self.state.local_buffers.push(
+                    worker_id,
+                    LocalScheduleItem {
+                        time,
+                        origin_id,
+                        seq,
+                        action,
+                    },
+                );
+
+                return Ok(());
+            }
+        }
+
         // The scheduler queue must always be locked when reading the time (see
         // `schedule_from`).
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
         let now = self.time();
         let time = deadline.into_time(now);
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
 
-        scheduler_queue.insert((time, origin_id), action);
+        let seq = self.state.next_seq(origin_id);
+        scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
 
         Ok(())
     }
@@ -513,9 +652,46 @@ impl GlobalScheduler {
 
         let sender = address.into().0;
 
+        if let (Some(worker_id), Some(executor_id)) =
+            (crate::executor::worker_id(), crate::executor::executor_id())
+        {
+            if executor_id == self.state.executor_id {
+                let now = self.time();
+
+                for (deadline, _) in &deadlines_and_args {
+                    let time = (*deadline).into_time(now);
+                    if now >= time {
+                        return Err(SchedulingError::InvalidScheduledTime);
+                    }
+                }
+
+                for (deadline, arg) in deadlines_and_args {
+                    let time = deadline.into_time(now);
+                    let action = Action::new(OnceAction::new(process_event(
+                        func.clone(),
+                        arg,
+                        sender.clone(),
+                    )));
+
+                    let seq = self.state.next_seq(origin_id);
+                    self.state.local_buffers.push(
+                        worker_id,
+                        LocalScheduleItem {
+                            time,
+                            origin_id,
+                            seq,
+                            action,
+                        },
+                    );
+                }
+
+                return Ok(());
+            }
+        }
+
         // The scheduler queue must always be locked when reading the time (see
         // `schedule_from`).
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
         let now = self.time();
 
         for (deadline, _) in &deadlines_and_args {
@@ -532,7 +708,8 @@ impl GlobalScheduler {
                 arg,
                 sender.clone(),
             )));
-            scheduler_queue.insert((time, origin_id), action);
+            let seq = self.state.next_seq(origin_id);
+            scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
         }
 
         Ok(())
@@ -561,16 +738,42 @@ impl GlobalScheduler {
             event_key.clone(),
         ));
 
+        if let (Some(worker_id), Some(executor_id)) =
+            (crate::executor::worker_id(), crate::executor::executor_id())
+        {
+            if executor_id == self.state.executor_id {
+                let now = self.time();
+                let time = deadline.into_time(now);
+                if now >= time {
+                    return Err(SchedulingError::InvalidScheduledTime);
+                }
+
+                let seq = self.state.next_seq(origin_id);
+                self.state.local_buffers.push(
+                    worker_id,
+                    LocalScheduleItem {
+                        time,
+                        origin_id,
+                        seq,
+                        action,
+                    },
+                );
+
+                return Ok(event_key);
+            }
+        }
+
         // The scheduler queue must always be locked when reading the time (see
         // `schedule_from`).
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
         let now = self.time();
         let time = deadline.into_time(now);
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
 
-        scheduler_queue.insert((time, origin_id), action);
+        let seq = self.state.next_seq(origin_id);
+        scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
 
         Ok(event_key)
     }
@@ -601,16 +804,42 @@ impl GlobalScheduler {
             period,
         ));
 
+        if let (Some(worker_id), Some(executor_id)) =
+            (crate::executor::worker_id(), crate::executor::executor_id())
+        {
+            if executor_id == self.state.executor_id {
+                let now = self.time();
+                let time = deadline.into_time(now);
+                if now >= time {
+                    return Err(SchedulingError::InvalidScheduledTime);
+                }
+
+                let seq = self.state.next_seq(origin_id);
+                self.state.local_buffers.push(
+                    worker_id,
+                    LocalScheduleItem {
+                        time,
+                        origin_id,
+                        seq,
+                        action,
+                    },
+                );
+
+                return Ok(());
+            }
+        }
+
         // The scheduler queue must always be locked when reading the time (see
         // `schedule_from`).
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
         let now = self.time();
         let time = deadline.into_time(now);
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
 
-        scheduler_queue.insert((time, origin_id), action);
+        let seq = self.state.next_seq(origin_id);
+        scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
 
         Ok(())
     }
@@ -643,16 +872,42 @@ impl GlobalScheduler {
             event_key.clone(),
         ));
 
+        if let (Some(worker_id), Some(executor_id)) =
+            (crate::executor::worker_id(), crate::executor::executor_id())
+        {
+            if executor_id == self.state.executor_id {
+                let now = self.time();
+                let time = deadline.into_time(now);
+                if now >= time {
+                    return Err(SchedulingError::InvalidScheduledTime);
+                }
+
+                let seq = self.state.next_seq(origin_id);
+                self.state.local_buffers.push(
+                    worker_id,
+                    LocalScheduleItem {
+                        time,
+                        origin_id,
+                        seq,
+                        action,
+                    },
+                );
+
+                return Ok(event_key);
+            }
+        }
+
         // The scheduler queue must always be locked when reading the time (see
         // `schedule_from`).
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
         let now = self.time();
         let time = deadline.into_time(now);
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
 
-        scheduler_queue.insert((time, origin_id), action);
+        let seq = self.state.next_seq(origin_id);
+        scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
 
         Ok(event_key)
     }
@@ -944,8 +1199,10 @@ impl GlobalScheduler {
     /// Creates a dummy scheduler for testing purposes.
     pub(crate) fn new_dummy() -> Self {
         let dummy_priority_queue = Arc::new(Mutex::new(PriorityQueue::new()));
+        let dummy_state = Arc::new(SchedulerState::new(dummy_priority_queue, usize::MAX, 1));
+        dummy_state.init_origin_seqs(2);
         let dummy_time = SyncCell::new(TearableAtomicTime::new(MonotonicTime::EPOCH)).reader();
         let dummy_running = Arc::new(AtomicBool::new(false));
-        GlobalScheduler::new(dummy_priority_queue, dummy_time, dummy_running)
+        GlobalScheduler::new(dummy_state, dummy_time, dummy_running)
     }
 }

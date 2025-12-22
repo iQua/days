@@ -61,7 +61,8 @@ use slab::Slab;
 use crate::channel;
 use crate::executor::task::{self, CancelToken, Promise, Runnable};
 use crate::executor::{
-    ExecutorError, Signal, SimulationContext, NEXT_EXECUTOR_ID, SIMULATION_CONTEXT,
+    ExecutorError, Signal, SimulationContext, EXECUTOR_ID, NEXT_EXECUTOR_ID, SIMULATION_CONTEXT,
+    WORKER_ID,
 };
 use crate::macros::scoped_thread_local::scoped_thread_local;
 use crate::simulation::CURRENT_MODEL_ID;
@@ -156,11 +157,22 @@ impl Executor {
                         let abort_signal = abort_signal.clone();
 
                         move || {
+                            let worker_id = id;
+                            let executor_id = context.executor_id;
                             let worker = Worker::new(local_queue, context);
-                            SIMULATION_CONTEXT.set(&simulation_context, || {
-                                ACTIVE_TASKS.set(&active_tasks, || {
-                                    LOCAL_WORKER.set(&worker, || {
-                                        run_local_worker(&worker, id, worker_parker, abort_signal)
+                            EXECUTOR_ID.set(&executor_id, || {
+                                WORKER_ID.set(&worker_id, || {
+                                    SIMULATION_CONTEXT.set(&simulation_context, || {
+                                        ACTIVE_TASKS.set(&active_tasks, || {
+                                            LOCAL_WORKER.set(&worker, || {
+                                                run_local_worker(
+                                                    &worker,
+                                                    worker_id,
+                                                    worker_parker,
+                                                    abort_signal,
+                                                )
+                                            })
+                                        })
                                     })
                                 })
                             });
@@ -270,6 +282,10 @@ impl Executor {
             }
         }
     }
+
+    pub(super) fn executor_id(&self) -> usize {
+        self.context.executor_id
+    }
 }
 
 impl Drop for Executor {
@@ -310,6 +326,7 @@ impl Drop for Executor {
             });
         });
     }
+
 }
 
 impl fmt::Debug for Executor {

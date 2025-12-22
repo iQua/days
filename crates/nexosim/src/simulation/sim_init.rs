@@ -6,19 +6,19 @@ use std::time::Duration;
 use crate::channel::ChannelObserver;
 use crate::executor::{Executor, SimulationContext};
 use crate::model::ProtoModel;
-use crate::time::{AtomicTime, Clock, MonotonicTime, NoClock, SyncStatus, TearableAtomicTime};
+use crate::time::{AtomicTime, Clock, MonotonicTime, NoClock, TearableAtomicTime};
 use crate::util::priority_queue::PriorityQueue;
 use crate::util::sync_cell::SyncCell;
 
 use super::{
-    add_model, ExecutionError, GlobalScheduler, Mailbox, Scheduler, SchedulerQueue, Signal,
+    add_model, ExecutionError, GlobalScheduler, Mailbox, Scheduler, SchedulerState, Signal,
     Simulation,
 };
 
 /// Builder for a multi-threaded, discrete-event simulation.
 pub struct SimInit {
     executor: Executor,
-    scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+    scheduler_state: Arc<SchedulerState>,
     time: AtomicTime,
     is_halted: Arc<AtomicBool>,
     clock: Box<dyn Clock + 'static>,
@@ -61,9 +61,16 @@ impl SimInit {
             Executor::new_multi_threaded(num_threads, simulation_context, abort_signal.clone())
         };
 
+        let scheduler_queue = Arc::new(Mutex::new(PriorityQueue::new()));
+        let scheduler_state = Arc::new(SchedulerState::new(
+            scheduler_queue,
+            executor.executor_id(),
+            num_threads,
+        ));
+
         Self {
             executor,
-            scheduler_queue: Arc::new(Mutex::new(PriorityQueue::new())),
+            scheduler_state,
             time,
             is_halted: Arc::new(AtomicBool::new(false)),
             clock: Box::new(NoClock::new()),
@@ -94,7 +101,7 @@ impl SimInit {
         self.observers
             .push((name.clone(), Box::new(mailbox.0.observer())));
         let scheduler = GlobalScheduler::new(
-            self.scheduler_queue.clone(),
+            self.scheduler_state.clone(),
             self.time.reader(),
             self.is_halted.clone(),
         );
@@ -157,26 +164,22 @@ impl SimInit {
     /// The simulation object and its associated scheduler are returned upon
     /// success.
     pub fn init(
-        mut self,
+        self,
         start_time: MonotonicTime,
     ) -> Result<(Simulation, Scheduler), ExecutionError> {
+        self.scheduler_state
+            .init_origin_seqs(self.model_names.len().checked_add(1).unwrap());
+
         self.time.write(start_time);
-        if let SyncStatus::OutOfSync(lag) = self.clock.synchronize(start_time) {
-            if let Some(tolerance) = &self.clock_tolerance {
-                if &lag > tolerance {
-                    return Err(ExecutionError::OutOfSync(lag));
-                }
-            }
-        }
 
         let scheduler = Scheduler::new(
-            self.scheduler_queue.clone(),
+            self.scheduler_state.clone(),
             self.time.reader(),
             self.is_halted.clone(),
         );
         let mut simulation = Simulation::new(
             self.executor,
-            self.scheduler_queue,
+            self.scheduler_state,
             self.time,
             self.clock,
             self.clock_tolerance,
@@ -185,6 +188,7 @@ impl SimInit {
             self.model_names,
             self.is_halted,
         );
+        simulation.synchronize_clock(start_time)?;
         simulation.run()?;
 
         Ok((simulation, scheduler))

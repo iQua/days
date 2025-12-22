@@ -2,7 +2,7 @@
 seed = 100
 mailbox_capacity = 16
 duration = 2.0 
-num_threads = 10
+num_threads = 1
 tracing_active = false 
 tracing_interval = 0.002
 log_path = "logs/exp/tcp_fattree/t10_m1000"

@@ -148,6 +148,10 @@ impl Executor {
 
         res
     }
+
+    pub(super) fn executor_id(&self) -> usize {
+        self.inner.as_ref().unwrap().context.executor_id
+    }
 }
 
 /// Inner state of the executor.

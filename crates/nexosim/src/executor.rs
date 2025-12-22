@@ -41,6 +41,22 @@ pub(crate) struct SimulationContext {
 
 scoped_thread_local!(pub(crate) static SIMULATION_CONTEXT: SimulationContext);
 
+// Executor instance identifier for the currently executing executor task, if any.
+// This is set by both single- and multi-threaded executors while polling tasks.
+scoped_thread_local!(pub(crate) static EXECUTOR_ID: usize);
+
+// Worker thread identifier for the currently executing executor task, if any.
+// This is set by both single- and multi-threaded executors while polling tasks.
+scoped_thread_local!(pub(crate) static WORKER_ID: usize);
+
+pub(crate) fn executor_id() -> Option<usize> {
+    EXECUTOR_ID.map(|id| *id)
+}
+
+pub(crate) fn worker_id() -> Option<usize> {
+    WORKER_ID.map(|id| *id)
+}
+
 /// A single-threaded or multi-threaded `async` executor.
 #[derive(Debug)]
 pub(crate) enum Executor {
@@ -114,6 +130,13 @@ impl Executor {
         match self {
             Self::StExecutor(executor) => executor.run(timeout),
             Self::MtExecutor(executor) => executor.run(timeout),
+        }
+    }
+
+    pub(crate) fn executor_id(&self) -> usize {
+        match self {
+            Self::StExecutor(executor) => executor.executor_id(),
+            Self::MtExecutor(executor) => executor.executor_id(),
         }
     }
 }
