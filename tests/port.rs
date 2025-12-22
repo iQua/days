@@ -14,7 +14,6 @@ use days::flows::{DistributionInfo, TrafficCharacteristics};
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::port::Port;
 use days::utils::logger::CsvLogger;
-use days::utils::time_quant::TimeQuant;
 
 #[test]
 fn test_fifo_scheduling() {
@@ -79,7 +78,6 @@ fn test_fifo_scheduling() {
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
         0.0,
-        TimeQuant::default(),
     );
 
     let mut sink = PacketSink::new(&source_1);

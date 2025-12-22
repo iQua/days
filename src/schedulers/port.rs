@@ -30,10 +30,9 @@ pub struct Port {
     /// the current simulation time in integer nanoseconds
     time_ns: u64,
 
-    /// the bit rate of the port in bps (0 for unlimited)
-    rate_bps: u64,
-    /// a closure that determines whether an inbound packet should be dropped or
-    /// not
+    /// the bit rate of the port (0 for unlimited)
+    rate: f64,
+    /// a closure that determines whether an inbound packet should be dropped or not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
     /// the number of packets received
     packets_received: usize,
@@ -44,7 +43,7 @@ pub struct Port {
     /// the packet queue of the port
     queue: VecDeque<Packet>,
     /// the server is considered busy sending the current packet until this time
-    busy_until_ns: u64,
+    busy_until: u64,
 
     /// number of packets which have been dequeued for transmission but have not yet been forwarded
     /// (includes the packet currently being transmitted)
@@ -61,16 +60,6 @@ pub struct Port {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
-}
-
-#[inline]
-fn s_to_ns_round(t_s: f64) -> u64 {
-    (t_s * 1e9).round().max(0.0) as u64
-}
-
-#[inline]
-fn ns_to_s(t_ns: u64) -> f64 {
-    (t_ns as f64) * 1e-9
 }
 
 impl Port {
@@ -115,23 +104,16 @@ impl Port {
             }
         };
 
-        let rate_bps = if rate > 0.0 {
-            rate.round() as u64
-        } else {
-            0
-        };
-
         Port {
             scheduler_id,
             time: 0.0,
-            time_ns: 0,
-            rate_bps,
+            rate,
             drop_strategy: packet_drop,
             packets_received: 0,
             packets_dropped: 0,
             packets_forwarded: 0,
             queue: VecDeque::new(),
-            busy_until_ns: 0,
+            busy_until: 0.0,
             in_flight: 0,
             output: Output::default(),
             queue_state: None,
@@ -211,10 +193,9 @@ impl Port {
         );
 
         let packet_time = packet.time;
-        let packet_time_ns = s_to_ns_round(packet_time);
         self.queue.push_back(packet);
 
-        if packet_time_ns >= self.busy_until_ns && self.in_flight == 0 {
+        if packet_time >= self.busy_until && self.in_flight == 0 {
             self.run(packet_time, cx).await;
         }
     }
@@ -222,7 +203,6 @@ impl Port {
     #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
-        self.time_ns = s_to_ns_round(packet.time);
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
@@ -240,8 +220,8 @@ impl Port {
         }
     }
 
-    fn packet_sent(&mut self, now_ns: u64, now_s: f64, packet: &Packet) {
-        self.busy_until_ns = now_ns;
+    fn packet_sent(&mut self, now: u64, packet: &Packet) {
+        self.busy_until = now;
 
         debug!(
             "Port {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -250,7 +230,7 @@ impl Port {
             packet.packet_id,
             packet.size,
             packet.flow_id,
-            now_s,
+            now,
             self.queue.len()
         );
     }
@@ -275,16 +255,10 @@ impl Port {
             }
 
             self.time = now;
-            let mut now_ns = s_to_ns_round(now);
 
             if self.time == 0.0 {
                 let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
                 self.time = global_time;
-                now_ns = s_to_ns_round(global_time);
-            }
-
-            if self.time_ns == 0 || self.time_ns < now_ns {
-                self.time_ns = now_ns;
             }
 
             if self.in_flight != 0 {
@@ -299,24 +273,12 @@ impl Port {
                     break;
                 };
 
-                let start_s = ns_to_s(depart_ns);
-                packet.queueing_delay_update(start_s);
+                packet.queueing_delay_update(start_time);
+                let timeout = packet.size as f64 * 8.0 / self.rate;
+                start_time += timeout;
+                packet.departure_update(start_time);
 
-                let tx_ns = if self.rate_bps == 0 {
-                    0
-                } else {
-                    let bits = (packet.size as u128) * 8u128;
-                    let numerator = bits.saturating_mul(1_000_000_000u128);
-                    let tx_ns = (numerator + (self.rate_bps as u128) / 2)
-                        / (self.rate_bps as u128);
-                    tx_ns as u64
-                };
-
-                depart_ns = depart_ns.saturating_add(tx_ns);
-                let depart_s = ns_to_s(depart_ns);
-                packet.departure_update(depart_s);
-
-                self.packet_sent(depart_ns, depart_s, &packet);
+                self.packet_sent(depart_ns, &packet);
 
                 let delay_ns = depart_ns.saturating_sub(self.time_ns);
                 schedule.push((Duration::from_nanos(delay_ns), packet));

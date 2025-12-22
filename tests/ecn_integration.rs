@@ -12,7 +12,6 @@ use days::flows::packet::{EcnField, Packet};
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::port::Port;
 use days::seed_from_config;
-use days::utils::time_quant::TimeQuant;
 
 struct EcnBurstSource {
     time: f64,
@@ -83,7 +82,6 @@ fn test_red_ecn_marks_ce_in_simulation() {
         CapacityUnit::Packets,
         DropStrategy::RedEcn,
         0.0,
-        TimeQuant::default(),
     );
 
     let source_mbox = Mailbox::new();

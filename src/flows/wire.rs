@@ -26,16 +26,6 @@ pub struct Wire {
     pub output: Output<Packet>,
 }
 
-#[inline]
-fn s_to_ns_round(t_s: f64) -> u64 {
-    (t_s * 1e9).round().max(0.0) as u64
-}
-
-#[inline]
-fn ns_to_s(t_ns: u64) -> f64 {
-    (t_ns as f64) * 1e-9
-}
-
 impl Wire {
     pub fn new(wire_id: usize, delay_dist: DistributionInfo) -> Wire {
         let seed = get_seed();
@@ -70,8 +60,7 @@ impl Wire {
             );
         }
 
-        let now_ns = s_to_ns_round(packet.time);
-        let now = ns_to_s(now_ns);
+        let now = packet.time;
 
         debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -93,18 +82,13 @@ impl Wire {
             }
         };
 
-        let delay_ns = s_to_ns_round(delay);
-        let arrival_ns = now_ns.saturating_add(delay_ns);
-        let arrival_s = ns_to_s(arrival_ns);
-
         // updates the packet's time and advances the simulation to that time
         // before sending the packet, whose queueing delay remains unchanged
-        packet.time = arrival_s;
+        packet.time += delay;
 
-        let delta_ns = arrival_ns.saturating_sub(now_ns);
-        if delta_ns > 0 {
+        if packet.time > now {
             cx.schedule_event(
-                Duration::from_nanos(delta_ns),
+                Duration::from_secs_f64(packet.time - now),
                 Self::forward_packet,
                 packet,
             )
