@@ -71,6 +71,7 @@ use pool_manager::PoolManager;
 
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
+const MAIN_THREAD_SPIN_DURATION: Duration = Duration::from_micros(2);
 
 type Bucket = injector::Bucket<Runnable, BUCKET_SIZE>;
 type Injector = injector::Injector<Runnable, BUCKET_SIZE>;
@@ -293,7 +294,21 @@ impl Executor {
             }
 
             if timeout.is_zero() {
-                self.parker.park();
+                if !self.context.pool_manager.pool_is_idle()
+                    && !self.context.main_spin.is_zero()
+                {
+                    let start = Instant::now();
+                    while (Instant::now() - start) < self.context.main_spin {
+                        if self.context.pool_manager.pool_is_idle() {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+
+                if !self.context.pool_manager.pool_is_idle() {
+                    self.parker.park();
+                }
             } else if !self.parker.park_timeout(timeout) {
                 // A timeout occurred: request all worker threads to return
                 // as soon as possible.
@@ -375,6 +390,9 @@ struct ExecutorContext {
     /// This counter is only updated by worker threads before they park and is
     /// therefore only consistent once all workers are parked.
     msg_count: AtomicIsize,
+    /// How long the main thread should spin before parking when waiting for
+    /// the worker pool to become idle.
+    main_spin: Duration,
 }
 
 impl ExecutorContext {
@@ -398,6 +416,7 @@ impl ExecutorContext {
                 worker_unparkers,
             ),
             msg_count: AtomicIsize::new(0),
+            main_spin: MAIN_THREAD_SPIN_DURATION,
         }
     }
 }
