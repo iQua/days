@@ -151,7 +151,10 @@ impl Clock for SystemClock {
     fn synchronize(&mut self, deadline: MonotonicTime) -> SyncStatus {
         let now = self.0.now();
         if now <= deadline {
-            spin_sleep::sleep(deadline.duration_since(now));
+            const NATIVE_SLEEP_ACCURACY_NS: u32 = 5_000_000;
+            let sleeper = spin_sleep::SpinSleeper::new(NATIVE_SLEEP_ACCURACY_NS)
+                .with_spin_strategy(spin_sleep::SpinStrategy::SpinLoopHint);
+            sleeper.sleep(deadline.duration_since(now));
 
             return SyncStatus::Synchronized;
         }

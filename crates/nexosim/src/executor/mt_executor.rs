@@ -61,7 +61,8 @@ use slab::Slab;
 use crate::channel;
 use crate::executor::task::{self, CancelToken, Promise, Runnable};
 use crate::executor::{
-    ExecutorError, Signal, SimulationContext, NEXT_EXECUTOR_ID, SIMULATION_CONTEXT,
+    ExecutorError, Signal, SimulationContext, EXECUTOR_ID, NEXT_EXECUTOR_ID, SIMULATION_CONTEXT,
+    WORKER_ID,
 };
 use crate::macros::scoped_thread_local::scoped_thread_local;
 use crate::simulation::CURRENT_MODEL_ID;
@@ -156,11 +157,22 @@ impl Executor {
                         let abort_signal = abort_signal.clone();
 
                         move || {
+                            let worker_id = id;
+                            let executor_id = context.executor_id;
                             let worker = Worker::new(local_queue, context);
-                            SIMULATION_CONTEXT.set(&simulation_context, || {
-                                ACTIVE_TASKS.set(&active_tasks, || {
-                                    LOCAL_WORKER.set(&worker, || {
-                                        run_local_worker(&worker, id, worker_parker, abort_signal)
+                            EXECUTOR_ID.set(&executor_id, || {
+                                WORKER_ID.set(&worker_id, || {
+                                    SIMULATION_CONTEXT.set(&simulation_context, || {
+                                        ACTIVE_TASKS.set(&active_tasks, || {
+                                            LOCAL_WORKER.set(&worker, || {
+                                                run_local_worker(
+                                                    &worker,
+                                                    worker_id,
+                                                    worker_parker,
+                                                    abort_signal,
+                                                )
+                                            })
+                                        })
                                     })
                                 })
                             });
@@ -237,6 +249,28 @@ impl Executor {
         self.context.injector.insert_task(runnable);
     }
 
+    /// Spawns many tasks, amortizing internal mutex overhead.
+    pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        // Book slots for all tasks while holding the lock once.
+        let mut active_tasks = self.active_tasks.lock().unwrap();
+        let executor_id = self.context.executor_id;
+
+        self.context.injector.insert_tasks(futures.into_iter().map(|future| {
+            let task_entry = active_tasks.vacant_entry();
+            let future = CancellableFuture::new(future, task_entry.key());
+
+            let (runnable, cancel_token) = task::spawn_and_forget(future, schedule_task, executor_id);
+
+            task_entry.insert(cancel_token);
+            runnable
+        }));
+    }
+
     /// Execute spawned tasks, blocking until all futures have completed or an
     /// error is encountered.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
@@ -269,6 +303,10 @@ impl Executor {
                 return Err(ExecutorError::Timeout);
             }
         }
+    }
+
+    pub(super) fn executor_id(&self) -> usize {
+        self.context.executor_id
     }
 }
 
@@ -310,6 +348,7 @@ impl Drop for Executor {
             });
         });
     }
+
 }
 
 impl fmt::Debug for Executor {

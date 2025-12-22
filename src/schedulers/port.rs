@@ -44,6 +44,10 @@ pub struct Port {
     /// the server is considered busy sending the current packet until this time
     busy_until: f64,
 
+    /// number of packets which have been dequeued for transmission but have not yet been forwarded
+    /// (includes the packet currently being transmitted)
+    in_flight: usize,
+
     pub output: Output<Packet>,
 
     queue_state: Option<std::sync::Arc<QueueState>>,
@@ -58,6 +62,8 @@ pub struct Port {
 }
 
 impl Port {
+    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+
     pub fn new(
         rate: f64,
         capacity: usize,
@@ -107,6 +113,7 @@ impl Port {
             packets_forwarded: 0,
             queue: VecDeque::new(),
             busy_until: 0.0,
+            in_flight: 0,
             output: Output::default(),
             queue_state: None,
             report_start_time: 0.0,
@@ -143,9 +150,10 @@ impl Port {
         }
 
         let mut packet = packet;
+        let queue_length_for_drop = self.queue.len() + self.in_flight.saturating_sub(1);
         let drop_action =
             self.drop_strategy
-                .action(packet.size, self.queue_length, self.queue.len());
+                .action(packet.size, self.queue_length, queue_length_for_drop);
 
         match drop_action {
             DropAction::Drop => {
@@ -186,7 +194,7 @@ impl Port {
         let packet_time = packet.time;
         self.queue.push_back(packet);
 
-        if packet_time >= self.busy_until {
+        if packet_time >= self.busy_until && self.in_flight == 0 {
             self.run(packet_time, cx).await;
         }
     }
@@ -199,11 +207,19 @@ impl Port {
     }
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
-        self.send(packet).await;
-        self.run(self.time, cx).await;
+        self.send_scheduled(packet, cx).await;
     }
 
-    fn packet_sent(&mut self, now: f64, packet: Packet) {
+    async fn send_scheduled(&mut self, packet: Packet, cx: &mut Context<Self>) {
+        self.send(packet).await;
+
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0 {
+            self.run(self.time, cx).await;
+        }
+    }
+
+    fn packet_sent(&mut self, now: f64, packet: &Packet) {
         self.busy_until = now;
 
         debug!(
@@ -244,19 +260,33 @@ impl Port {
                 self.time = global_time;
             }
 
-            if let Some(mut packet) = self.queue.pop_front() {
-                packet.queueing_delay_update(now);
+            if self.in_flight != 0 {
+                return;
+            }
+
+            let mut schedule = Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE);
+            let mut start_time = self.time;
+
+            for _ in 0..Self::DEFAULT_RUN_BATCH_SIZE {
+                let Some(mut packet) = self.queue.pop_front() else {
+                    break;
+                };
+
+                packet.queueing_delay_update(start_time);
                 let timeout = packet.size as f64 * 8.0 / self.rate;
-                packet.departure_update(now + timeout);
+                start_time += timeout;
+                packet.departure_update(start_time);
 
-                cx.schedule_event(
-                    Duration::from_secs_f64(timeout),
-                    Self::send_and_run,
-                    packet.clone(),
-                )
-                .unwrap();
+                self.packet_sent(start_time, &packet);
 
-                self.packet_sent(now + timeout, packet);
+                schedule.push((Duration::from_secs_f64(start_time - self.time), packet));
+
+                self.in_flight += 1;
+            }
+
+            if !schedule.is_empty() {
+                cx.schedule_event_batch(schedule, Self::send_scheduled)
+                    .unwrap();
             }
         }
     }

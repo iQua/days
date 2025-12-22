@@ -83,6 +83,49 @@ impl<T, const BUCKET_CAPACITY: usize> Injector<T, BUCKET_CAPACITY> {
         self.is_empty.store(false, Ordering::Relaxed);
     }
 
+    /// Inserts multiple tasks while taking the injector lock only once.
+    ///
+    /// This amortizes mutex overhead in workloads that spawn many tiny tasks.
+    pub(crate) fn insert_tasks<I>(&self, tasks: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        let mut inserted_any = false;
+
+        for task in tasks {
+            inserted_any = true;
+
+            // Try to push the task onto the first bucket if it has enough capacity left.
+            if let Some(bucket) = inner.first_mut() {
+                if let Err(task) = bucket.push(task) {
+                    // The bucket is full: move it to the back of the vector and
+                    // replace it with a newly created bucket that contains the
+                    // task.
+                    let mut new_bucket = Bucket::new();
+                    let _ = new_bucket.push(task); // capacity is >= 1
+
+                    let full_bucket = mem::replace(bucket, new_bucket);
+                    inner.push(full_bucket);
+                }
+
+                continue;
+            }
+
+            // The queue is empty: create a new bucket.
+            let mut new_bucket = Bucket::new();
+            let _ = new_bucket.push(task); // capacity is >= 1
+
+            inner.push(new_bucket);
+        }
+
+        if inserted_any {
+            // Ordering: this flag is only used as a hint so Relaxed ordering is
+            // sufficient.
+            self.is_empty.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// Appends a bucket to the back of the queue.
     pub(crate) fn push_bucket(&self, bucket: Bucket<T, BUCKET_CAPACITY>) {
         let mut inner = self.inner.lock().unwrap();

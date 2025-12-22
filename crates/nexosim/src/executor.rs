@@ -41,6 +41,22 @@ pub(crate) struct SimulationContext {
 
 scoped_thread_local!(pub(crate) static SIMULATION_CONTEXT: SimulationContext);
 
+// Executor instance identifier for the currently executing executor task, if any.
+// This is set by both single- and multi-threaded executors while polling tasks.
+scoped_thread_local!(pub(crate) static EXECUTOR_ID: usize);
+
+// Worker thread identifier for the currently executing executor task, if any.
+// This is set by both single- and multi-threaded executors while polling tasks.
+scoped_thread_local!(pub(crate) static WORKER_ID: usize);
+
+pub(crate) fn executor_id() -> Option<usize> {
+    EXECUTOR_ID.map(|id| *id)
+}
+
+pub(crate) fn worker_id() -> Option<usize> {
+    WORKER_ID.map(|id| *id)
+}
+
 /// A single-threaded or multi-threaded `async` executor.
 #[derive(Debug)]
 pub(crate) enum Executor {
@@ -108,12 +124,32 @@ impl Executor {
         }
     }
 
+    /// Spawns many tasks which output will never be retrieved.
+    pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        match self {
+            Self::StExecutor(executor) => executor.spawn_and_forget_batch(futures),
+            Self::MtExecutor(executor) => executor.spawn_and_forget_batch(futures),
+        }
+    }
+
     /// Execute spawned tasks, blocking until all futures have completed or
     /// until the executor reaches a deadlock.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         match self {
             Self::StExecutor(executor) => executor.run(timeout),
             Self::MtExecutor(executor) => executor.run(timeout),
+        }
+    }
+
+    pub(crate) fn executor_id(&self) -> usize {
+        match self {
+            Self::StExecutor(executor) => executor.executor_id(),
+            Self::MtExecutor(executor) => executor.executor_id(),
         }
     }
 }

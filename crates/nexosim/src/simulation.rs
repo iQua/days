@@ -81,6 +81,7 @@ mod sim_init;
 
 pub(crate) use scheduler::{
     GlobalScheduler, KeyedOnceAction, KeyedPeriodicAction, OnceAction, PeriodicAction,
+    SchedulerState,
 };
 
 pub use mailbox::{Address, Mailbox};
@@ -94,7 +95,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, MutexGuard};
 use std::task::Poll;
 use std::time::Duration;
 use std::{panic, task};
@@ -153,7 +154,7 @@ thread_local! { pub(crate) static CURRENT_MODEL_ID: Cell<ModelId> = const { Cell
 /// iterates until the target simulation time has been reached.
 pub struct Simulation {
     executor: Executor,
-    scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+    scheduler_state: Arc<SchedulerState>,
     time: AtomicTime,
     clock: Box<dyn Clock>,
     clock_tolerance: Option<Duration>,
@@ -169,7 +170,7 @@ impl Simulation {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         executor: Executor,
-        scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+        scheduler_state: Arc<SchedulerState>,
         time: AtomicTime,
         clock: Box<dyn Clock + 'static>,
         clock_tolerance: Option<Duration>,
@@ -180,7 +181,7 @@ impl Simulation {
     ) -> Self {
         Self {
             executor,
-            scheduler_queue,
+            scheduler_state,
             time,
             clock,
             clock_tolerance,
@@ -399,6 +400,20 @@ impl Simulation {
         })
     }
 
+    fn synchronize_clock(&mut self, time: MonotonicTime) -> Result<(), ExecutionError> {
+        if let SyncStatus::OutOfSync(lag) = self.clock.synchronize(time) {
+            if let Some(tolerance) = &self.clock_tolerance {
+                if &lag > tolerance {
+                    self.is_terminated = true;
+
+                    return Err(ExecutionError::OutOfSync(lag));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Advances simulation time to that of the next scheduled action if its
     /// scheduling time does not exceed the specified bound, processing that
     /// action as well as all other actions scheduled for the same time.
@@ -415,10 +430,14 @@ impl Simulation {
         }
         // Function pulling the next action. If the action is periodic, it is
         // immediately re-scheduled.
-        fn pull_next_action(scheduler_queue: &mut MutexGuard<SchedulerQueue>) -> Action {
-            let ((time, channel_id), action) = scheduler_queue.pull().unwrap();
+        fn pull_next_action(
+            scheduler_state: &SchedulerState,
+            scheduler_queue: &mut MutexGuard<SchedulerQueue>,
+        ) -> Action {
+            let ((time, origin_id), action) = scheduler_queue.pull().unwrap();
             if let Some((action_clone, period)) = action.next() {
-                scheduler_queue.insert((time + period, channel_id), action_clone);
+                let seq = scheduler_state.next_seq(origin_id);
+                scheduler_queue.insert_with_epoch((time + period, origin_id), action_clone, seq);
             }
 
             action
@@ -444,20 +463,24 @@ impl Simulation {
         };
 
         // Move to the next scheduled time.
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.scheduler_state.scheduler_queue.lock().unwrap();
+        self.scheduler_state.flush_local(&mut scheduler_queue);
         let mut current_key = match peek_next_key(&mut scheduler_queue) {
             Some(key) => key,
             None => return Ok(None),
         };
         self.time.write(current_key.0);
 
+        let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
+            Vec::with_capacity(64);
+
         loop {
-            let action = pull_next_action(&mut scheduler_queue);
+            let action = pull_next_action(self.scheduler_state.as_ref(), &mut scheduler_queue);
             let mut next_key = peek_next_key(&mut scheduler_queue);
             if next_key != Some(current_key) {
                 // Since there are no other actions with the same origin and the
                 // same time, the action is spawned immediately.
-                action.spawn_and_forget(&self.executor);
+                spawn_futs.push(action.into_future());
             } else {
                 // To ensure that their relative order of execution is
                 // preserved, all actions with the same origin are executed
@@ -465,7 +488,8 @@ impl Simulation {
                 let mut action_sequence = SeqFuture::new();
                 action_sequence.push(action.into_future());
                 loop {
-                    let action = pull_next_action(&mut scheduler_queue);
+                    let action =
+                        pull_next_action(self.scheduler_state.as_ref(), &mut scheduler_queue);
                     action_sequence.push(action.into_future());
                     next_key = peek_next_key(&mut scheduler_queue);
                     if next_key != Some(current_key) {
@@ -475,7 +499,7 @@ impl Simulation {
 
                 // Spawn a compound future that sequentially polls all actions
                 // targeting the same mailbox.
-                self.executor.spawn_and_forget(action_sequence);
+                spawn_futs.push(Box::pin(action_sequence));
             }
 
             current_key = match next_key {
@@ -487,15 +511,8 @@ impl Simulation {
                     drop(scheduler_queue); // make sure the queue's mutex is released.
 
                     let current_time = current_key.0;
-                    if let SyncStatus::OutOfSync(lag) = self.clock.synchronize(current_time) {
-                        if let Some(tolerance) = &self.clock_tolerance {
-                            if &lag > tolerance {
-                                self.is_terminated = true;
-
-                                return Err(ExecutionError::OutOfSync(lag));
-                            }
-                        }
-                    }
+                    self.synchronize_clock(current_time)?;
+                    self.executor.spawn_and_forget_batch(spawn_futs);
                     self.run()?;
 
                     return Ok(Some(current_time));
@@ -520,21 +537,15 @@ impl Simulation {
         loop {
             match self.step_to_next(target_time) {
                 // The target time was reached exactly.
-                Ok(time) if time == target_time => return Ok(()),
+                Ok(time) if time == target_time => {
+                    return Ok(());
+                }
                 // No actions are scheduled before or at the target time.
                 Ok(None) => {
                     if let Some(target_time) = target_time {
                         // Update the simulation time.
                         self.time.write(target_time);
-                        if let SyncStatus::OutOfSync(lag) = self.clock.synchronize(target_time) {
-                            if let Some(tolerance) = &self.clock_tolerance {
-                                if &lag > tolerance {
-                                    self.is_terminated = true;
-
-                                    return Err(ExecutionError::OutOfSync(lag));
-                                }
-                            }
-                        }
+                        self.synchronize_clock(target_time)?;
                     }
                     return Ok(());
                 }
@@ -561,7 +572,7 @@ impl Simulation {
     #[cfg(feature = "server")]
     pub(crate) fn scheduler(&self) -> Scheduler {
         Scheduler::new(
-            self.scheduler_queue.clone(),
+            self.scheduler_state.clone(),
             self.time.reader(),
             self.is_halted.clone(),
         )
