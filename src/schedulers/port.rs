@@ -62,7 +62,7 @@ pub struct Port {
 }
 
 impl Port {
-    const DEFAULT_RUN_BATCH_SIZE: usize = 1024;
+    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
 
     pub fn new(
         rate: f64,
