@@ -27,12 +27,11 @@ pub struct Port {
     /// the current simulation time, maintained locally. This is useful for reducing the competition
     /// for access the global simulation clock, which will only be accessed when absolutely necessary
     pub time: f64,
-    /// the current simulation time in integer nanoseconds
-    time_ns: u64,
 
     /// the bit rate of the port (0 for unlimited)
     rate: f64,
-    /// a closure that determines whether an inbound packet should be dropped or not
+    /// a closure that determines whether an inbound packet should be dropped or
+    /// not
     drop_strategy: Box<dyn PacketDrop + Send + Sync>,
     /// the number of packets received
     packets_received: usize,
@@ -43,7 +42,7 @@ pub struct Port {
     /// the packet queue of the port
     queue: VecDeque<Packet>,
     /// the server is considered busy sending the current packet until this time
-    busy_until: u64,
+    busy_until: f64,
 
     /// number of packets which have been dequeued for transmission but have not yet been forwarded
     /// (includes the packet currently being transmitted)
@@ -220,7 +219,7 @@ impl Port {
         }
     }
 
-    fn packet_sent(&mut self, now: u64, packet: &Packet) {
+    fn packet_sent(&mut self, now: f64, packet: &Packet) {
         self.busy_until = now;
 
         debug!(
@@ -266,7 +265,7 @@ impl Port {
             }
 
             let mut schedule = Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE);
-            let mut depart_ns = self.time_ns;
+            let mut start_time = self.time;
 
             for _ in 0..Self::DEFAULT_RUN_BATCH_SIZE {
                 let Some(mut packet) = self.queue.pop_front() else {
@@ -278,10 +277,9 @@ impl Port {
                 start_time += timeout;
                 packet.departure_update(start_time);
 
-                self.packet_sent(depart_ns, &packet);
+                self.packet_sent(start_time, &packet);
 
-                let delay_ns = depart_ns.saturating_sub(self.time_ns);
-                schedule.push((Duration::from_nanos(delay_ns), packet));
+                schedule.push((Duration::from_secs_f64(start_time - self.time), packet));
 
                 self.in_flight += 1;
             }
