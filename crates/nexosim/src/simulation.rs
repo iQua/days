@@ -507,6 +507,7 @@ impl Simulation {
 
         // Move to the next scheduled time.
         let mut scheduler_queue = self.scheduler_state.scheduler_queue.lock().unwrap();
+        debug_assert!(self.executor.is_quiescent());
         self.scheduler_state.flush_local(&mut scheduler_queue);
         let mut current_key = match peek_next_key(&mut scheduler_queue) {
             Some(key) => key,

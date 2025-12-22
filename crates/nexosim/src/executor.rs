@@ -152,6 +152,13 @@ impl Executor {
             Self::MtExecutor(executor) => executor.executor_id(),
         }
     }
+
+    pub(crate) fn is_quiescent(&self) -> bool {
+        match self {
+            Self::StExecutor(executor) => executor.is_quiescent(),
+            Self::MtExecutor(executor) => executor.is_quiescent(),
+        }
+    }
 }
 
 /// A single-use shared boolean signal.

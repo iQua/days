@@ -72,7 +72,7 @@ use pool_manager::PoolManager;
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
 const MAIN_THREAD_SPIN_DURATION: Duration = Duration::from_micros(10);
-const WORKER_LINGER_DURATION: Duration = Duration::from_micros(10);
+const WORKER_LINGER_DURATION: Duration = Duration::from_micros(50);
 const HOT_WORKER_ID: usize = 0;
 
 type Bucket = injector::Bucket<Runnable, BUCKET_SIZE>;
@@ -281,7 +281,13 @@ impl Executor {
     /// error is encountered.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         self.context.run_epoch.fetch_add(1, Ordering::Relaxed);
-        self.context.pool_manager.activate_worker();
+        if !self
+            .context
+            .pool_manager
+            .try_activate_worker(self.context.hot_worker_id)
+        {
+            self.context.pool_manager.activate_worker();
+        }
 
         loop {
             if let Some((model_id, payload)) = self.context.pool_manager.take_panic() {
@@ -326,6 +332,10 @@ impl Executor {
 
     pub(super) fn executor_id(&self) -> usize {
         self.context.executor_id
+    }
+
+    pub(crate) fn is_quiescent(&self) -> bool {
+        self.context.pool_manager.pool_is_idle()
     }
 }
 
@@ -599,8 +609,7 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
                 {
                     parker.park();
                 } else {
-                    let start_epoch =
-                        worker.executor_context.run_epoch.load(Ordering::Relaxed);
+                    let start_epoch = worker.executor_context.run_epoch.load(Ordering::Relaxed);
                     let start = Instant::now();
 
                     loop {

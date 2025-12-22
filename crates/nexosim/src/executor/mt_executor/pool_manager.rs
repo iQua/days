@@ -116,6 +116,24 @@ impl PoolManager {
         }
     }
 
+    /// Unparks the specified worker if it is idle and marks it as active.
+    /// Returns `true` if the worker was activated.
+    pub(super) fn try_activate_worker(&self, worker_id: usize) -> bool {
+        if worker_id >= self.pool_size {
+            return false;
+        }
+
+        let mask = 1usize << worker_id;
+        let active_workers = self.active_workers.fetch_or(mask, Ordering::Relaxed);
+        if active_workers & mask == 0 {
+            self.begin_worker_search();
+            self.worker_unparkers[worker_id].unpark();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Marks the specified worker as inactive unless it is the last active
     /// worker.
     ///

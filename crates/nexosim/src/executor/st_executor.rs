@@ -164,6 +164,10 @@ impl Executor {
     pub(super) fn executor_id(&self) -> usize {
         self.inner.as_ref().unwrap().context.executor_id
     }
+
+    pub(crate) fn is_quiescent(&self) -> bool {
+        true
+    }
 }
 
 /// Inner state of the executor.
