@@ -48,7 +48,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -61,7 +61,7 @@ use slab::Slab;
 use crate::channel;
 use crate::executor::task::{self, CancelToken, Promise, Runnable};
 use crate::executor::{
-    ExecutorError, Signal, SimulationContext, EXECUTOR_ID, NEXT_EXECUTOR_ID, SIMULATION_CONTEXT,
+    EXECUTOR_ID, ExecutorError, NEXT_EXECUTOR_ID, SIMULATION_CONTEXT, Signal, SimulationContext,
     WORKER_ID,
 };
 use crate::macros::scoped_thread_local::scoped_thread_local;
@@ -71,7 +71,9 @@ use pool_manager::PoolManager;
 
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
-const MAIN_THREAD_SPIN_DURATION: Duration = Duration::from_micros(2);
+const MAIN_THREAD_SPIN_DURATION: Duration = Duration::from_micros(10);
+const WORKER_LINGER_DURATION: Duration = Duration::from_micros(10);
+const HOT_WORKER_ID: usize = 0;
 
 type Bucket = injector::Bucket<Runnable, BUCKET_SIZE>;
 type Injector = injector::Injector<Runnable, BUCKET_SIZE>;
@@ -261,20 +263,24 @@ impl Executor {
         let mut active_tasks = self.active_tasks.lock().unwrap();
         let executor_id = self.context.executor_id;
 
-        self.context.injector.insert_tasks(futures.into_iter().map(|future| {
-            let task_entry = active_tasks.vacant_entry();
-            let future = CancellableFuture::new(future, task_entry.key());
+        self.context
+            .injector
+            .insert_tasks(futures.into_iter().map(|future| {
+                let task_entry = active_tasks.vacant_entry();
+                let future = CancellableFuture::new(future, task_entry.key());
 
-            let (runnable, cancel_token) = task::spawn_and_forget(future, schedule_task, executor_id);
+                let (runnable, cancel_token) =
+                    task::spawn_and_forget(future, schedule_task, executor_id);
 
-            task_entry.insert(cancel_token);
-            runnable
-        }));
+                task_entry.insert(cancel_token);
+                runnable
+            }));
     }
 
     /// Execute spawned tasks, blocking until all futures have completed or an
     /// error is encountered.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
+        self.context.run_epoch.fetch_add(1, Ordering::Relaxed);
         self.context.pool_manager.activate_worker();
 
         loop {
@@ -294,9 +300,7 @@ impl Executor {
             }
 
             if timeout.is_zero() {
-                if !self.context.pool_manager.pool_is_idle()
-                    && !self.context.main_spin.is_zero()
-                {
+                if !self.context.pool_manager.pool_is_idle() && !self.context.main_spin.is_zero() {
                     let start = Instant::now();
                     while (Instant::now() - start) < self.context.main_spin {
                         if self.context.pool_manager.pool_is_idle() {
@@ -363,7 +367,6 @@ impl Drop for Executor {
             });
         });
     }
-
 }
 
 impl fmt::Debug for Executor {
@@ -393,6 +396,12 @@ struct ExecutorContext {
     /// How long the main thread should spin before parking when waiting for
     /// the worker pool to become idle.
     main_spin: Duration,
+    /// How long the hot standby worker should linger before parking.
+    worker_linger: Duration,
+    /// Run epoch counter incremented at the start of each executor run.
+    run_epoch: AtomicU64,
+    /// Worker ID selected for hot standby.
+    hot_worker_id: usize,
 }
 
 impl ExecutorContext {
@@ -417,6 +426,9 @@ impl ExecutorContext {
             ),
             msg_count: AtomicIsize::new(0),
             main_spin: MAIN_THREAD_SPIN_DURATION,
+            worker_linger: WORKER_LINGER_DURATION,
+            run_epoch: AtomicU64::new(0),
+            hot_worker_id: HOT_WORKER_ID,
         }
     }
 }
@@ -582,7 +594,34 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
             if pool_manager.try_set_worker_inactive(id) {
                 // No need to call `begin_worker_search()`: this was done by the
                 // thread that unparked the worker.
-                parker.park();
+                if worker.executor_context.worker_linger.is_zero()
+                    || id != worker.executor_context.hot_worker_id
+                {
+                    parker.park();
+                } else {
+                    let start_epoch =
+                        worker.executor_context.run_epoch.load(Ordering::Relaxed);
+                    let start = Instant::now();
+
+                    loop {
+                        if abort_signal.is_set() {
+                            return;
+                        }
+
+                        if worker.executor_context.run_epoch.load(Ordering::Relaxed) != start_epoch
+                        {
+                            break;
+                        }
+
+                        if (Instant::now() - start) >= worker.executor_context.worker_linger {
+                            break;
+                        }
+
+                        std::hint::spin_loop();
+                    }
+
+                    parker.park();
+                }
             } else if injector.is_empty() {
                 // This worker could not be deactivated because it was the last
                 // active worker. In such case, the call to
