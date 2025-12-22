@@ -116,6 +116,18 @@ impl Executor {
         queue.push(runnable);
     }
 
+    /// Spawns many tasks, amortizing external call overhead.
+    pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        for future in futures {
+            self.spawn_and_forget(future);
+        }
+    }
+
     /// Execute spawned tasks, blocking until all futures have completed or an
     /// error is encountered.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {

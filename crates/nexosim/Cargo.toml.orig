@@ -43,6 +43,9 @@ server = [
 ]
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
 
+# Perf counters for timestamp alignment diagnostics.
+perf_stats = []
+
 # DEVELOPMENT ONLY: API-unstable public exports meant for external test/benchmarking.
 dev-hooks = []
 

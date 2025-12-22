@@ -124,6 +124,19 @@ impl Executor {
         }
     }
 
+    /// Spawns many tasks which output will never be retrieved.
+    pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        match self {
+            Self::StExecutor(executor) => executor.spawn_and_forget_batch(futures),
+            Self::MtExecutor(executor) => executor.spawn_and_forget_batch(futures),
+        }
+    }
+
     /// Execute spawned tasks, blocking until all futures have completed or
     /// until the executor reaches a deadlock.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
