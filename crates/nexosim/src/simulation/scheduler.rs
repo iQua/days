@@ -407,6 +407,7 @@ pub(crate) struct SchedulerState {
     pub(super) local_buffers: LocalScheduleBuffers,
     executor_id: usize,
     origin_seqs: OnceLock<Box<[CachePadded<AtomicU64>]>>,
+    time_quantum_ns: AtomicU64,
 }
 
 impl SchedulerState {
@@ -426,6 +427,7 @@ impl SchedulerState {
             local_buffers: LocalScheduleBuffers { buffers },
             executor_id,
             origin_seqs: OnceLock::new(),
+            time_quantum_ns: AtomicU64::new(0),
         }
     }
 
@@ -460,6 +462,27 @@ impl SchedulerState {
         let seq = origin_seqs[origin_id].fetch_add(1, Ordering::Relaxed);
         assert_ne!(seq, u64::MAX, "origin sequence counter overflow");
         seq
+    }
+
+    pub(crate) fn set_time_quantum_ns(&self, quantum_ns: u64) {
+        self.time_quantum_ns
+            .store(quantum_ns, Ordering::Relaxed);
+    }
+
+    pub(super) fn quantize_time(&self, time: MonotonicTime) -> MonotonicTime {
+        let quantum_ns = self.time_quantum_ns.load(Ordering::Relaxed);
+        if quantum_ns == 0 {
+            return time;
+        }
+
+        let since_epoch = time.duration_since(MonotonicTime::EPOCH);
+        let q = quantum_ns as u128;
+        let rem = (since_epoch.as_nanos() % q) as u64;
+        if rem == 0 {
+            return time;
+        }
+
+        time + Duration::from_nanos(quantum_ns - rem)
     }
 }
 
@@ -533,6 +556,7 @@ impl GlobalScheduler {
                 if now >= time {
                     return Err(SchedulingError::InvalidScheduledTime);
                 }
+                let time = self.state.quantize_time(time);
 
                 let seq = self.state.next_seq(origin_id);
                 self.state.local_buffers.push(
@@ -563,6 +587,7 @@ impl GlobalScheduler {
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
+        let time = self.state.quantize_time(time);
 
         let seq = self.state.next_seq(origin_id);
         scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
@@ -597,6 +622,7 @@ impl GlobalScheduler {
                 if now >= time {
                     return Err(SchedulingError::InvalidScheduledTime);
                 }
+                let time = self.state.quantize_time(time);
 
                 let seq = self.state.next_seq(origin_id);
                 self.state.local_buffers.push(
@@ -621,6 +647,7 @@ impl GlobalScheduler {
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
+        let time = self.state.quantize_time(time);
 
         let seq = self.state.next_seq(origin_id);
         scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
@@ -667,6 +694,7 @@ impl GlobalScheduler {
 
                 for (deadline, arg) in deadlines_and_args {
                     let time = deadline.into_time(now);
+                    let time = self.state.quantize_time(time);
                     let action = Action::new(OnceAction::new(process_event(
                         func.clone(),
                         arg,
@@ -703,6 +731,7 @@ impl GlobalScheduler {
 
         for (deadline, arg) in deadlines_and_args {
             let time = deadline.into_time(now);
+            let time = self.state.quantize_time(time);
             let action = Action::new(OnceAction::new(process_event(
                 func.clone(),
                 arg,
@@ -747,6 +776,7 @@ impl GlobalScheduler {
                 if now >= time {
                     return Err(SchedulingError::InvalidScheduledTime);
                 }
+                let time = self.state.quantize_time(time);
 
                 let seq = self.state.next_seq(origin_id);
                 self.state.local_buffers.push(
@@ -771,6 +801,7 @@ impl GlobalScheduler {
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
+        let time = self.state.quantize_time(time);
 
         let seq = self.state.next_seq(origin_id);
         scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
@@ -813,6 +844,7 @@ impl GlobalScheduler {
                 if now >= time {
                     return Err(SchedulingError::InvalidScheduledTime);
                 }
+                let time = self.state.quantize_time(time);
 
                 let seq = self.state.next_seq(origin_id);
                 self.state.local_buffers.push(
@@ -837,6 +869,7 @@ impl GlobalScheduler {
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
+        let time = self.state.quantize_time(time);
 
         let seq = self.state.next_seq(origin_id);
         scheduler_queue.insert_with_epoch((time, origin_id), action, seq);
@@ -881,6 +914,7 @@ impl GlobalScheduler {
                 if now >= time {
                     return Err(SchedulingError::InvalidScheduledTime);
                 }
+                let time = self.state.quantize_time(time);
 
                 let seq = self.state.next_seq(origin_id);
                 self.state.local_buffers.push(
@@ -905,6 +939,7 @@ impl GlobalScheduler {
         if now >= time {
             return Err(SchedulingError::InvalidScheduledTime);
         }
+        let time = self.state.quantize_time(time);
 
         let seq = self.state.next_seq(origin_id);
         scheduler_queue.insert_with_epoch((time, origin_id), action, seq);

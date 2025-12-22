@@ -14,6 +14,7 @@ use days::flows::{DistributionInfo, TrafficCharacteristics};
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::port::Port;
 use days::utils::logger::CsvLogger;
+use days::utils::time_quant::TimeQuant;
 
 /// In this test, we force TailDrop to discard packets by
 /// using a very small buffer and a high packet rate.
@@ -57,6 +58,7 @@ fn test_drop_strategy_taildrop_small_buffer() {
         CapacityUnit::Packets,
         DropStrategy::TailDrop,
         0.0,
+        TimeQuant::default(),
     );
 
     let mut sink = PacketSink::new(&source);

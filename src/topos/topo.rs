@@ -147,6 +147,7 @@ pub struct Config {
     pub topology: Option<TopoConfig>,
     pub app_source: Option<AppSourceConfig>,
     pub link: Option<LinkConfig>,
+    pub time_quantum_ns: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -253,7 +254,7 @@ impl Topology {
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
 
-        let sim_init;
+        let mut sim_init;
 
         if let Some(num_threads) = concurrency_config.num_threads {
             sim_init = SimInit::with_num_threads(num_threads);
@@ -261,6 +262,10 @@ impl Topology {
         } else {
             sim_init = SimInit::new();
             info!("Starting simulation with the default number of thread(s).",);
+        }
+
+        if let Some(quantum_ns) = config.time_quantum_ns {
+            sim_init = sim_init.set_time_quantum_ns(quantum_ns);
         }
 
         set_num_switches(graph.node_count());
@@ -290,7 +295,6 @@ impl Topology {
                 panic!("link.mode = \"Pfc\" requires building with --features l2_pfc");
             }
         }
-
         Topology {
             sim_init,
             graph: graph.clone(),

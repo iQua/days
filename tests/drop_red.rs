@@ -14,6 +14,7 @@ use days::flows::{DistributionInfo, TrafficCharacteristics};
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::port::Port;
 use days::utils::logger::CsvLogger;
+use days::utils::time_quant::TimeQuant;
 
 /// In this test, RED (Random Early Detection) is configured so that
 /// it can begin dropping packets at certain average queue sizes —— even
@@ -60,6 +61,7 @@ fn test_drop_strategy_red_early_drop() {
         CapacityUnit::Packets,
         DropStrategy::RED,
         0.0,
+        TimeQuant::default(),
     );
 
     let mut sink = PacketSink::new(&source);

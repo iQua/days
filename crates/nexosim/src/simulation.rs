@@ -95,6 +95,8 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "perf_stats")]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, MutexGuard};
 use std::task::Poll;
 use std::time::Duration;
@@ -114,6 +116,46 @@ use crate::util::seq_futures::SeqFuture;
 use crate::util::slot;
 
 thread_local! { pub(crate) static CURRENT_MODEL_ID: Cell<ModelId> = const { Cell::new(ModelId::none()) }; }
+
+#[cfg(feature = "perf_stats")]
+static STEPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static ACTIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static ORIGIN_GROUPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static MAX_ACTIONS_PER_STEP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static MAX_GROUPS_PER_STEP: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "perf_stats")]
+fn bump_max(dst: &AtomicU64, v: u64) {
+    let mut cur = dst.load(AtomicOrdering::Relaxed);
+    while v > cur {
+        match dst.compare_exchange_weak(cur, v, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+#[cfg(feature = "perf_stats")]
+fn report_perf_stats() {
+    let steps = STEPS.load(AtomicOrdering::Relaxed).max(1);
+    let actions = ACTIONS.load(AtomicOrdering::Relaxed);
+    let groups = ORIGIN_GROUPS.load(AtomicOrdering::Relaxed);
+    eprintln!(
+        "[perf_stats] steps={} actions={} groups={} avg_actions/step={:.2} avg_groups/step={:.2} max_actions/step={} max_groups/step={}",
+        steps,
+        actions,
+        groups,
+        actions as f64 / steps as f64,
+        groups as f64 / steps as f64,
+        MAX_ACTIONS_PER_STEP.load(AtomicOrdering::Relaxed),
+        MAX_GROUPS_PER_STEP.load(AtomicOrdering::Relaxed),
+    );
+}
 
 /// Simulation environment.
 ///
@@ -437,7 +479,8 @@ impl Simulation {
             let ((time, origin_id), action) = scheduler_queue.pull().unwrap();
             if let Some((action_clone, period)) = action.next() {
                 let seq = scheduler_state.next_seq(origin_id);
-                scheduler_queue.insert_with_epoch((time + period, origin_id), action_clone, seq);
+                let next_time = scheduler_state.quantize_time(time + period);
+                scheduler_queue.insert_with_epoch((next_time, origin_id), action_clone, seq);
             }
 
             action
@@ -471,16 +514,29 @@ impl Simulation {
         };
         self.time.write(current_key.0);
 
+        #[cfg(feature = "perf_stats")]
+        let mut actions_this_step: u64 = 0;
+        #[cfg(feature = "perf_stats")]
+        let mut groups_this_step: u64 = 0;
+
         let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
             Vec::with_capacity(64);
 
         loop {
             let action = pull_next_action(self.scheduler_state.as_ref(), &mut scheduler_queue);
+            #[cfg(feature = "perf_stats")]
+            {
+                actions_this_step += 1;
+            }
             let mut next_key = peek_next_key(&mut scheduler_queue);
             if next_key != Some(current_key) {
                 // Since there are no other actions with the same origin and the
                 // same time, the action is spawned immediately.
                 spawn_futs.push(action.into_future());
+                #[cfg(feature = "perf_stats")]
+                {
+                    groups_this_step += 1;
+                }
             } else {
                 // To ensure that their relative order of execution is
                 // preserved, all actions with the same origin are executed
@@ -490,6 +546,10 @@ impl Simulation {
                 loop {
                     let action =
                         pull_next_action(self.scheduler_state.as_ref(), &mut scheduler_queue);
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        actions_this_step += 1;
+                    }
                     action_sequence.push(action.into_future());
                     next_key = peek_next_key(&mut scheduler_queue);
                     if next_key != Some(current_key) {
@@ -500,6 +560,10 @@ impl Simulation {
                 // Spawn a compound future that sequentially polls all actions
                 // targeting the same mailbox.
                 spawn_futs.push(Box::pin(action_sequence));
+                #[cfg(feature = "perf_stats")]
+                {
+                    groups_this_step += 1;
+                }
             }
 
             current_key = match next_key {
@@ -514,6 +578,15 @@ impl Simulation {
                     self.synchronize_clock(current_time)?;
                     self.executor.spawn_and_forget_batch(spawn_futs);
                     self.run()?;
+
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        STEPS.fetch_add(1, AtomicOrdering::Relaxed);
+                        ACTIONS.fetch_add(actions_this_step, AtomicOrdering::Relaxed);
+                        ORIGIN_GROUPS.fetch_add(groups_this_step, AtomicOrdering::Relaxed);
+                        bump_max(&MAX_ACTIONS_PER_STEP, actions_this_step);
+                        bump_max(&MAX_GROUPS_PER_STEP, groups_this_step);
+                    }
 
                     return Ok(Some(current_time));
                 }
@@ -538,6 +611,8 @@ impl Simulation {
             match self.step_to_next(target_time) {
                 // The target time was reached exactly.
                 Ok(time) if time == target_time => {
+                    #[cfg(feature = "perf_stats")]
+                    report_perf_stats();
                     return Ok(());
                 }
                 // No actions are scheduled before or at the target time.
@@ -547,6 +622,8 @@ impl Simulation {
                         self.time.write(target_time);
                         self.synchronize_clock(target_time)?;
                     }
+                    #[cfg(feature = "perf_stats")]
+                    report_perf_stats();
                     return Ok(());
                 }
                 Err(e) => return Err(e),

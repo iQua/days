@@ -18,6 +18,7 @@ use days::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::port::Port;
 use days::utils::logger::CsvLogger;
+use days::utils::time_quant::TimeQuant;
 
 struct EcnCounter {
     ce_count: Arc<Mutex<usize>>,
@@ -94,6 +95,7 @@ fn main() {
         CapacityUnit::Packets,
         DropStrategy::RedEcn,
         0.0,
+        TimeQuant::default(),
     );
 
     let mut sink = PacketSink::new(&source);

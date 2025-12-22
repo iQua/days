@@ -15,6 +15,7 @@ use days::flows::source::PacketSource;
 use days::flows::wire::Wire;
 use days::flows::{DistributionInfo, TrafficCharacteristics};
 use days::utils::logger::CsvLogger;
+use days::utils::time_quant::TimeQuant;
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
@@ -55,6 +56,7 @@ fn main() {
             low: 0.2,
             high: 0.2,
         },
+        TimeQuant::default(),
     );
 
     let mut sink = PacketSink::new(&source);
