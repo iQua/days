@@ -1,12 +1,11 @@
 # An example configuration file for using TCP in a FatTree topology.
 seed = 100
-mailbox_capacity = 1000
-duration = 0.2
-num_threads = 1
-tracing_active = false 
+mailbox_capacity = 16 
+duration = 2.0 
+num_threads = 10
+tracing_active = false
 tracing_interval = 0.002
 log_path = "logs/exp/tcp_fattree/t10_m1000"
-report_interval = 1e9
 ui_interval = 1e9
 
 [topology]
@@ -16,20 +15,20 @@ ui_interval = 1e9
     k = 96
 
 [switch]
-    port_rate = 100000000 # 100 Mbps
-    capacity = 1000
+    port_rate = 10000000 # 10 Mbps
+    capacity = 1024
     weights = [1]
     discipline = "FIFO"
     drop = "RED"
 
 [[flow_set]]
     flow_type = "TCP"
-    flow_count = 500
+    flow_count = 1000
     routing = "ShortestPath"
 
     [flow_set.traffic]
     initial_delay = 0.0
-    duration = 0.2
+    duration = 2.0 
     arr_dist = { type = "Uniform", low = 0.0008, high = 0.0008 }
     pkt_size_dist = { type = "Uniform", low = 1024, high = 1024 }
 
