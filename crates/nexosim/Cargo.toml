@@ -49,7 +49,6 @@ rustdoc-args = [
 
 [features]
 dev-hooks = []
-perf_stats = []
 server = [
     "dep:bytes",
     "dep:ciborium",
