@@ -2,7 +2,6 @@
 seed = 1000
 num_threads = 1
 log_path = "logs/fattree"
-concurrency_level = "default"
 
 [topology]
     category = "FatTree"

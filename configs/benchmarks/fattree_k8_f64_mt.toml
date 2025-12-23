@@ -3,12 +3,13 @@ seed = 1000
 num_threads = 10
 log_path = "logs/fattree"
 concurrency_level = "accelerated"
+hot_workers = 2
 
 [topology]
     category = "FatTree"
 
 [topology.fat_tree]
-    k = 16
+    k = 8
 
 [switch]
     port_rate = 320000 # process 40 packets (1000 bytes) per second
@@ -20,7 +21,7 @@ concurrency_level = "accelerated"
 
 [[flow_set]]
     flow_type = "PacketDistribution"
-    flow_count = 512
+    flow_count = 64
     [flow_set.traffic]
         initial_delay = 1.0
         duration = 1500
