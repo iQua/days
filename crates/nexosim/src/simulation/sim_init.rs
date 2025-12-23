@@ -24,6 +24,7 @@ pub struct SimInit {
     clock: Box<dyn Clock + 'static>,
     clock_tolerance: Option<Duration>,
     timeout: Duration,
+    max_groups_per_step_task: usize,
     observers: Vec<(String, Box<dyn ChannelObserver>)>,
     abort_signal: Signal,
     model_names: Vec<String>,
@@ -76,6 +77,7 @@ impl SimInit {
             clock: Box::new(NoClock::new()),
             clock_tolerance: None,
             timeout: Duration::ZERO,
+            max_groups_per_step_task: num_threads,
             observers: Vec::new(),
             abort_signal,
             model_names: Vec::new(),
@@ -87,6 +89,15 @@ impl SimInit {
     /// A value of 0 disables quantization.
     pub fn set_time_quantum_ns(self, quantum_ns: u64) -> Self {
         self.scheduler_state.set_time_quantum_ns(quantum_ns);
+        self
+    }
+
+    /// Sets the maximum number of action groups bundled into a single executor
+    /// task per step.
+    ///
+    /// A value of 1 preserves the default behavior (one task per group).
+    pub fn set_max_groups_per_step_task(mut self, max_groups: usize) -> Self {
+        self.max_groups_per_step_task = max_groups.max(1);
         self
     }
 
@@ -192,6 +203,7 @@ impl SimInit {
             self.clock,
             self.clock_tolerance,
             self.timeout,
+            self.max_groups_per_step_task,
             self.observers,
             self.model_names,
             self.is_halted,

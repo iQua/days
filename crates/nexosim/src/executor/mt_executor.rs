@@ -71,7 +71,7 @@ use pool_manager::PoolManager;
 
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
-const WORKER_LINGER_DURATION: Duration = Duration::from_micros(100);
+const WORKER_LINGER_DURATION: Duration = Duration::from_micros(80);
 const WORKER_LINGER_SPIN_PHASE: Duration = Duration::from_micros(10);
 const HOT_WORKER_COUNT: usize = 2;
 
