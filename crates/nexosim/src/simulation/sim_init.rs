@@ -11,8 +11,8 @@ use crate::util::priority_queue::PriorityQueue;
 use crate::util::sync_cell::SyncCell;
 
 use super::{
-    add_model, ExecutionError, GlobalScheduler, Mailbox, Scheduler, SchedulerState, Signal,
-    Simulation,
+    ExecutionError, GlobalScheduler, Mailbox, Scheduler, SchedulerState, Signal, Simulation,
+    add_model,
 };
 
 /// Builder for a multi-threaded, discrete-event simulation.
@@ -80,6 +80,14 @@ impl SimInit {
             abort_signal,
             model_names: Vec::new(),
         }
+    }
+
+    /// Sets the simulation time quantization quantum in nanoseconds.
+    ///
+    /// A value of 0 disables quantization.
+    pub fn set_time_quantum_ns(self, quantum_ns: u64) -> Self {
+        self.scheduler_state.set_time_quantum_ns(quantum_ns);
+        self
     }
 
     /// Adds a model and its mailbox to the simulation bench.

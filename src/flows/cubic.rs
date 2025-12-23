@@ -252,7 +252,7 @@ impl CongestionControl for TCPCubic {
     fn ack_received(&mut self, event: AckEvent) {
         let rtt_sample = event.rtt;
         let srtt = self.update_srtt(rtt_sample);
-        let acked_segs = ((event.bytes_acked + self.mss - 1) / self.mss) as f64;
+        let acked_segs = event.bytes_acked.div_ceil(self.mss) as f64;
 
         if acked_segs <= 0.0 {
             return;

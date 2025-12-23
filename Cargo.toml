@@ -16,6 +16,7 @@ l2 = []
 l2_pfc = ["l2"]
 dcqcn = []
 lean = []
+perf_stats = ["nexosim/perf_stats"]
 
 [dependencies]
 csv = "1.3"

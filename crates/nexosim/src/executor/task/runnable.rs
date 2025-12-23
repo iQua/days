@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use std::alloc::{dealloc, Layout};
+use std::alloc::{Layout, dealloc};
 use std::future::Future;
 use std::mem::{self, ManuallyDrop};
 use std::panic::{RefUnwindSafe, UnwindSafe};
@@ -11,8 +11,8 @@ use crate::loom_exports::debug_or_loom_assert;
 use crate::loom_exports::sync::atomic::{self, AtomicU64, Ordering};
 
 use super::util::RunOnDrop;
-use super::{raw_waker_vtable, Task};
 use super::{CLOSED, POLLING, REF_MASK, WAKE_MASK};
+use super::{Task, raw_waker_vtable};
 
 /// Virtual table for a `Runnable`.
 #[derive(Debug)]

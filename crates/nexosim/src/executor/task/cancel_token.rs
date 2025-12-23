@@ -1,15 +1,15 @@
 extern crate alloc;
 
-use std::alloc::{dealloc, Layout};
+use std::alloc::{Layout, dealloc};
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use crate::loom_exports::sync::atomic::{self, Ordering};
 
-use super::runnable::Runnable;
-use super::util::{runnable_exists, RunOnDrop};
 use super::Task;
+use super::runnable::Runnable;
+use super::util::{RunOnDrop, runnable_exists};
 use super::{CLOSED, POLLING, REF_INC, REF_MASK};
 
 /// Virtual table for a `CancelToken`.

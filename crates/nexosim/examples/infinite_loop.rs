@@ -20,7 +20,7 @@
 //!                              ┗━━━━━━━━━━━━━━━━━━━━━━━━┛
 //! ```
 
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread::{self, sleep};
 use std::time::Duration;
 

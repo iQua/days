@@ -653,8 +653,8 @@ mod tests {
     use super::*;
 
     use loom::model::Builder;
-    use loom::sync::atomic::AtomicUsize;
     use loom::sync::Arc;
+    use loom::sync::atomic::AtomicUsize;
     use loom::thread;
 
     fn loom_queue_push_pop(

@@ -155,9 +155,10 @@ fn dropped_address(num_threads: usize) {
         .unwrap()
         .0;
 
-    assert!(simu
-        .process_event(TestModel::activate_output, (), addr_a)
-        .is_ok());
+    assert!(
+        simu.process_event(TestModel::activate_output, (), addr_a)
+            .is_ok()
+    );
 }
 
 #[test]

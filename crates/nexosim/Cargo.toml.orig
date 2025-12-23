@@ -29,6 +29,7 @@ keywords = [
 ]
 
 [features]
+perf_stats = []
 server = [
     "dep:bytes",
     "dep:ciborium",
