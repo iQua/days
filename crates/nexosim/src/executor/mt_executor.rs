@@ -115,6 +115,14 @@ pub(super) fn report_perf_stats() {
 scoped_thread_local!(static LOCAL_WORKER: Worker);
 scoped_thread_local!(static ACTIVE_TASKS: Mutex<Slab<CancelToken>>);
 
+fn hot_worker_mask(hot_worker_count: usize) -> usize {
+    if hot_worker_count >= usize::BITS as usize {
+        !0
+    } else {
+        (1usize << hot_worker_count) - 1
+    }
+}
+
 /// A multi-threaded `async` executor.
 pub(crate) struct Executor {
     /// Shared executor data.
@@ -314,10 +322,9 @@ impl Executor {
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         self.context.run_epoch.fetch_add(1, Ordering::Relaxed);
         let mut activated = false;
-        for worker_id in 0..self.context.hot_worker_count {
-            if self.context.pool_manager.try_activate_worker(worker_id) {
-                activated = true;
-            }
+        let hot_mask = hot_worker_mask(self.context.hot_worker_count);
+        while self.context.pool_manager.try_activate_from_mask(hot_mask) {
+            activated = true;
         }
         if !activated {
             self.context.pool_manager.activate_worker();
@@ -585,7 +592,10 @@ fn schedule_task(task: Runnable, executor_id: usize) {
             // activate another worker if no worker is currently searching for a
             // task.
             if pool_manager.searching_worker_count() == 0 {
-                pool_manager.activate_worker_relaxed();
+                let hot_mask = hot_worker_mask(worker.executor_context.hot_worker_count);
+                if !pool_manager.try_activate_from_mask(hot_mask) {
+                    pool_manager.activate_worker_relaxed();
+                }
             }
         })
         .expect("Tasks may not be awaken outside executor threads");
