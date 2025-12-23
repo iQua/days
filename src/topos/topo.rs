@@ -284,7 +284,7 @@ impl Topology {
             match level {
                 ConcurrencyLevel::Default => {
                     sim_init = sim_init.set_max_groups_per_step_task(1);
-                    info!("Using default concurrency level (max_groups_per_step_task=1).");
+                    info!("Using default concurrency level.");
                 }
                 ConcurrencyLevel::Accelerated => {
                     let effective_threads = if cfg!(target_family = "wasm") {
@@ -295,9 +295,7 @@ impl Topology {
                             .clamp(1, usize::BITS as usize)
                     };
                     sim_init = sim_init.set_max_groups_per_step_task(effective_threads);
-                    info!(
-                        "Using accelerated concurrency level (max_groups_per_step_task={effective_threads})."
-                    );
+                    info!("Using accelerated concurrency level.");
                 }
             }
         }
