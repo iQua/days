@@ -1,0 +1,29 @@
+# This is a configuration file for the FatTree topology.
+seed = 1000
+num_threads = 24
+log_path = "logs/fattree"
+concurrency_level = "accelerated"
+hot_workers = 2
+
+[topology]
+    category = "FatTree"
+
+[topology.fat_tree]
+    k = 32 
+
+[switch]
+    port_rate = 320000 # process 40 packets (1000 bytes) per second
+    capacity = 100
+    weights = [1]
+    discipline = "FIFO"
+    drop = "TailDrop"
+
+
+[[flow_set]]
+    flow_type = "PacketDistribution"
+    flow_count = 4096 
+    [flow_set.traffic]
+        initial_delay = 1.0
+        duration = 1500
+        arr_dist = {type = "Uniform", low = 1, high = 1}
+        pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
