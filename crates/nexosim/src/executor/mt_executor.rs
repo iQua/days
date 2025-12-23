@@ -48,7 +48,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -73,7 +73,7 @@ const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
 const WORKER_LINGER_DURATION: Duration = Duration::from_micros(80);
 const WORKER_LINGER_SPIN_PHASE: Duration = Duration::from_micros(10);
-const HOT_WORKER_COUNT: usize = 2;
+const HOT_WORKER_COUNT: usize = 1;
 
 type Bucket = injector::Bucket<Runnable, BUCKET_SIZE>;
 type Injector = injector::Injector<Runnable, BUCKET_SIZE>;
@@ -322,7 +322,8 @@ impl Executor {
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         self.context.run_epoch.fetch_add(1, Ordering::Relaxed);
         let mut activated = false;
-        let hot_mask = hot_worker_mask(self.context.hot_worker_count);
+        let hot_count = self.context.hot_worker_count.load(Ordering::Relaxed);
+        let hot_mask = hot_worker_mask(hot_count);
         while self.context.pool_manager.try_activate_from_mask(hot_mask) {
             activated = true;
         }
@@ -370,6 +371,13 @@ impl Executor {
 
     pub(super) fn executor_id(&self) -> usize {
         self.context.executor_id
+    }
+
+    pub(crate) fn set_hot_worker_count(&self, hot_worker_count: usize) {
+        let clamped = hot_worker_count.min(self.context.pool_manager.pool_size());
+        self.context
+            .hot_worker_count
+            .store(clamped, Ordering::Relaxed);
     }
 
     pub(crate) fn is_quiescent(&self) -> bool {
@@ -446,7 +454,7 @@ struct ExecutorContext {
     /// Run epoch counter incremented at the start of each executor run.
     run_epoch: AtomicU64,
     /// Number of workers selected for hot standby.
-    hot_worker_count: usize,
+    hot_worker_count: AtomicUsize,
 }
 
 impl ExecutorContext {
@@ -472,7 +480,7 @@ impl ExecutorContext {
             msg_count: AtomicIsize::new(0),
             worker_linger: WORKER_LINGER_DURATION,
             run_epoch: AtomicU64::new(0),
-            hot_worker_count: HOT_WORKER_COUNT,
+            hot_worker_count: AtomicUsize::new(HOT_WORKER_COUNT),
         }
     }
 }
@@ -592,7 +600,11 @@ fn schedule_task(task: Runnable, executor_id: usize) {
             // activate another worker if no worker is currently searching for a
             // task.
             if pool_manager.searching_worker_count() == 0 {
-                let hot_mask = hot_worker_mask(worker.executor_context.hot_worker_count);
+                let hot_count = worker
+                    .executor_context
+                    .hot_worker_count
+                    .load(Ordering::Relaxed);
+                let hot_mask = hot_worker_mask(hot_count);
                 if !pool_manager.try_activate_from_mask(hot_mask) {
                     pool_manager.activate_worker_relaxed();
                 }
@@ -641,8 +653,11 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
             if pool_manager.try_set_worker_inactive(id) {
                 // No need to call `begin_worker_search()`: this was done by the
                 // thread that unparked the worker.
-                if worker.executor_context.worker_linger.is_zero()
-                    || id >= worker.executor_context.hot_worker_count
+                let hot_count = worker
+                    .executor_context
+                    .hot_worker_count
+                    .load(Ordering::Relaxed);
+                if worker.executor_context.worker_linger.is_zero() || id >= hot_count
                 {
                     #[cfg(feature = "perf_stats")]
                     WORKER_PARKS.fetch_add(1, Ordering::Relaxed);

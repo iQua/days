@@ -218,6 +218,10 @@ impl PoolManager {
         }
     }
 
+    pub(super) fn pool_size(&self) -> usize {
+        self.pool_size
+    }
+
     /// Check if the pool is idle, i.e. if no worker is currently active.
     ///
     /// If `true` is returned, it is guaranteed that all operations performed by

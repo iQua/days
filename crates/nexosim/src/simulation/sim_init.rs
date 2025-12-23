@@ -92,6 +92,12 @@ impl SimInit {
         self
     }
 
+    /// Sets the number of hot standby workers.
+    pub fn set_hot_worker_count(mut self, hot_worker_count: usize) -> Self {
+        self.executor.set_hot_worker_count(hot_worker_count);
+        self
+    }
+
     /// Sets the maximum number of action groups bundled into a single executor
     /// task per step.
     ///

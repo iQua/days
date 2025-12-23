@@ -158,6 +158,12 @@ impl Executor {
         }
     }
 
+    pub(crate) fn set_hot_worker_count(&mut self, hot_worker_count: usize) {
+        if let Self::MtExecutor(executor) = self {
+            executor.set_hot_worker_count(hot_worker_count);
+        }
+    }
+
     pub(crate) fn is_quiescent(&self) -> bool {
         match self {
             Self::StExecutor(executor) => executor.is_quiescent(),

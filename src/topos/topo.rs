@@ -72,6 +72,7 @@ pub struct TracingConfig {
 #[derive(Deserialize)]
 struct ConcurrencyConfig {
     num_threads: Option<usize>,
+    hot_workers: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +264,11 @@ impl Topology {
         } else {
             sim_init = SimInit::new();
             info!("Starting simulation with the default number of thread(s).",);
+        }
+
+        if let Some(hot_workers) = concurrency_config.hot_workers {
+            sim_init = sim_init.set_hot_worker_count(hot_workers);
+            info!("Using {hot_workers} hot standby worker(s).",);
         }
 
         if let Some(quantum_ns) = config.time_quantum_ns {
@@ -1295,6 +1301,7 @@ mod tests {
             ui_interval = 1.0
             duration = 1000.0
             num_threads = 4
+            hot_workers = 2
             mailbox_capacity = 32
 
             [switch]
