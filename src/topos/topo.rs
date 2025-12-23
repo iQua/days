@@ -258,6 +258,7 @@ impl Topology {
 
         if let Some(num_threads) = concurrency_config.num_threads {
             sim_init = SimInit::with_num_threads(num_threads);
+
             info!("Starting simulation with {num_threads} thread(s).",);
         } else {
             sim_init = SimInit::new();

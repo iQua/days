@@ -94,12 +94,12 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(feature = "perf_stats")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "perf_stats")]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, MutexGuard};
-#[cfg(feature = "perf_stats")]
-use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Duration;
 #[cfg(feature = "perf_stats")]
@@ -233,6 +233,7 @@ pub struct Simulation {
     clock: Box<dyn Clock>,
     clock_tolerance: Option<Duration>,
     timeout: Duration,
+    max_groups_per_step_task: usize,
     observers: Vec<(String, Box<dyn ChannelObserver>)>,
     model_names: Vec<String>,
     is_halted: Arc<AtomicBool>,
@@ -251,6 +252,7 @@ impl Simulation {
         clock: Box<dyn Clock + 'static>,
         clock_tolerance: Option<Duration>,
         timeout: Duration,
+        max_groups_per_step_task: usize,
         observers: Vec<(String, Box<dyn ChannelObserver>)>,
         model_names: Vec<String>,
         is_halted: Arc<AtomicBool>,
@@ -262,6 +264,7 @@ impl Simulation {
             clock,
             clock_tolerance,
             timeout,
+            max_groups_per_step_task: max_groups_per_step_task.max(1),
             observers,
             model_names,
             is_halted,
@@ -283,6 +286,14 @@ impl Simulation {
     #[cfg(not(target_family = "wasm"))]
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+
+    /// Sets the maximum number of action groups bundled into a single executor
+    /// task per step.
+    ///
+    /// A value of 1 preserves the default behavior (one task per group).
+    pub fn set_max_groups_per_step_task(&mut self, max_groups: usize) {
+        self.max_groups_per_step_task = max_groups.max(1);
     }
 
     /// Returns the current simulation time.
@@ -631,7 +642,34 @@ impl Simulation {
 
                     let current_time = current_key.0;
                     self.synchronize_clock(current_time)?;
-                    self.executor.spawn_and_forget_batch(spawn_futs);
+                    if self.max_groups_per_step_task <= 1 {
+                        self.executor.spawn_and_forget_batch(spawn_futs);
+                    } else {
+                        let mut bundled = Vec::with_capacity(
+                            spawn_futs.len() / self.max_groups_per_step_task + 1,
+                        );
+                        let mut iter = spawn_futs.into_iter();
+
+                        loop {
+                            let mut seq = SeqFuture::new();
+                            let mut added = 0;
+                            for _ in 0..self.max_groups_per_step_task {
+                                match iter.next() {
+                                    Some(fut) => {
+                                        seq.push(fut);
+                                        added += 1;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            if added == 0 {
+                                break;
+                            }
+                            bundled.push(Box::pin(seq));
+                        }
+
+                        self.executor.spawn_and_forget_batch(bundled);
+                    }
                     self.run()?;
 
                     #[cfg(feature = "perf_stats")]

@@ -116,21 +116,29 @@ impl PoolManager {
         }
     }
 
-    /// Unparks the specified worker if it is idle and marks it as active.
-    /// Returns `true` if the worker was activated.
-    pub(super) fn try_activate_worker(&self, worker_id: usize) -> bool {
-        if worker_id >= self.pool_size {
+    /// Unparks an idle worker selected from the provided mask and marks it as
+    /// active. Returns `true` if a worker was activated.
+    pub(super) fn try_activate_from_mask(&self, mask: usize) -> bool {
+        let mask = mask & self.all_workers_mask();
+        if mask == 0 {
             return false;
         }
 
-        let mask = 1usize << worker_id;
-        let active_workers = self.active_workers.fetch_or(mask, Ordering::Relaxed);
-        if active_workers & mask == 0 {
-            self.begin_worker_search();
-            self.worker_unparkers[worker_id].unpark();
-            true
-        } else {
-            false
+        loop {
+            let active_workers = self.active_workers.load(Ordering::Relaxed);
+            let idle_mask = (!active_workers) & mask;
+            if idle_mask == 0 {
+                return false;
+            }
+
+            let worker_id = idle_mask.trailing_zeros() as usize;
+            let worker_mask = 1usize << worker_id;
+            let prev_active = self.active_workers.fetch_or(worker_mask, Ordering::Relaxed);
+            if prev_active & worker_mask == 0 {
+                self.begin_worker_search();
+                self.worker_unparkers[worker_id].unpark();
+                return true;
+            }
         }
     }
 
@@ -200,6 +208,14 @@ impl PoolManager {
         // Ordering: this Release store synchronizes with the Acquire load in
         // `is_idle`.
         self.active_workers.store(0, Ordering::Release);
+    }
+
+    fn all_workers_mask(&self) -> usize {
+        if self.pool_size == usize::BITS as usize {
+            !0
+        } else {
+            (1usize << self.pool_size) - 1
+        }
     }
 
     /// Check if the pool is idle, i.e. if no worker is currently active.
