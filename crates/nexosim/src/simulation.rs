@@ -98,8 +98,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "perf_stats")]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, MutexGuard};
+#[cfg(feature = "perf_stats")]
+use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Duration;
+#[cfg(feature = "perf_stats")]
+use std::time::Instant;
 use std::{panic, task};
 
 use pin_project::pin_project;
@@ -127,6 +131,8 @@ static ORIGIN_GROUPS: AtomicU64 = AtomicU64::new(0);
 static MAX_ACTIONS_PER_STEP: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "perf_stats")]
 static MAX_GROUPS_PER_STEP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static INTER_RUN_GAPS_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 #[cfg(feature = "perf_stats")]
 fn bump_max(dst: &AtomicU64, v: u64) {
@@ -154,6 +160,33 @@ fn report_perf_stats() {
         MAX_ACTIONS_PER_STEP.load(AtomicOrdering::Relaxed),
         MAX_GROUPS_PER_STEP.load(AtomicOrdering::Relaxed),
     );
+    if let Ok(gaps) = INTER_RUN_GAPS_NS.lock() {
+        if !gaps.is_empty() {
+            let mut samples = gaps.clone();
+            drop(gaps);
+            samples.sort_unstable();
+            let p50 = percentile(&samples, 0.50);
+            let p90 = percentile(&samples, 0.90);
+            let p99 = percentile(&samples, 0.99);
+            eprintln!(
+                "[perf_stats] inter_run_gap_ns p50={} p90={} p99={} samples={}",
+                p50,
+                p90,
+                p99,
+                samples.len()
+            );
+        }
+    }
+    crate::executor::report_executor_perf_stats();
+}
+
+#[cfg(feature = "perf_stats")]
+fn percentile(samples: &[u64], percentile: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let idx = ((samples.len() - 1) as f64 * percentile).round() as usize;
+    samples[idx]
 }
 
 /// Simulation environment.
@@ -204,6 +237,8 @@ pub struct Simulation {
     model_names: Vec<String>,
     is_halted: Arc<AtomicBool>,
     is_terminated: bool,
+    #[cfg(feature = "perf_stats")]
+    last_run_end: Option<Instant>,
 }
 
 impl Simulation {
@@ -231,6 +266,8 @@ impl Simulation {
             model_names,
             is_halted,
             is_terminated: false,
+            #[cfg(feature = "perf_stats")]
+            last_run_end: None,
         }
     }
 
@@ -397,7 +434,26 @@ impl Simulation {
             return Err(ExecutionError::Terminated);
         }
 
-        self.executor.run(self.timeout).map_err(|e| {
+        #[cfg(feature = "perf_stats")]
+        {
+            let now = Instant::now();
+            if let Some(last_end) = self.last_run_end {
+                let gap = now.duration_since(last_end);
+                let nanos = gap.as_nanos().min(u128::from(u64::MAX)) as u64;
+                if let Ok(mut gaps) = INTER_RUN_GAPS_NS.lock() {
+                    gaps.push(nanos);
+                }
+            }
+        }
+
+        let res = self.executor.run(self.timeout);
+
+        #[cfg(feature = "perf_stats")]
+        {
+            self.last_run_end = Some(Instant::now());
+        }
+
+        res.map_err(|e| {
             self.is_terminated = true;
 
             match e {

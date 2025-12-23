@@ -71,14 +71,46 @@ use pool_manager::PoolManager;
 
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
-const MAIN_THREAD_SPIN_DURATION: Duration = Duration::from_micros(10);
-const WORKER_LINGER_DURATION: Duration = Duration::from_micros(50);
-const HOT_WORKER_ID: usize = 0;
+const WORKER_LINGER_DURATION: Duration = Duration::from_micros(100);
+const WORKER_LINGER_SPIN_PHASE: Duration = Duration::from_micros(10);
+const HOT_WORKER_COUNT: usize = 2;
 
 type Bucket = injector::Bucket<Runnable, BUCKET_SIZE>;
 type Injector = injector::Injector<Runnable, BUCKET_SIZE>;
 type LocalQueue = st3::fifo::Worker<Runnable>;
 type Stealer = st3::fifo::Stealer<Runnable>;
+
+#[cfg(feature = "perf_stats")]
+static MAIN_WAIT_PARKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static MAIN_WAIT_PARK_TIME_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static WORKER_PARKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static WORKER_LINGER_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static WORKER_LINGER_SUCCESS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static WORKER_LINGER_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "perf_stats")]
+fn add_duration_ns(counter: &AtomicU64, duration: Duration) {
+    let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+    counter.fetch_add(nanos, Ordering::Relaxed);
+}
+
+#[cfg(feature = "perf_stats")]
+pub(super) fn report_perf_stats() {
+    eprintln!(
+        "[perf_stats] main_wait_parks={} main_wait_park_time_ns={} worker_parks={} worker_linger_hits={} worker_linger_success={} worker_linger_timeout={}",
+        MAIN_WAIT_PARKS.load(Ordering::Relaxed),
+        MAIN_WAIT_PARK_TIME_NS.load(Ordering::Relaxed),
+        WORKER_PARKS.load(Ordering::Relaxed),
+        WORKER_LINGER_HITS.load(Ordering::Relaxed),
+        WORKER_LINGER_SUCCESS.load(Ordering::Relaxed),
+        WORKER_LINGER_TIMEOUT.load(Ordering::Relaxed),
+    );
+}
 
 scoped_thread_local!(static LOCAL_WORKER: Worker);
 scoped_thread_local!(static ACTIVE_TASKS: Mutex<Slab<CancelToken>>);
@@ -281,11 +313,13 @@ impl Executor {
     /// error is encountered.
     pub(crate) fn run(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         self.context.run_epoch.fetch_add(1, Ordering::Relaxed);
-        if !self
-            .context
-            .pool_manager
-            .try_activate_worker(self.context.hot_worker_id)
-        {
+        let mut activated = false;
+        for worker_id in 0..self.context.hot_worker_count {
+            if self.context.pool_manager.try_activate_worker(worker_id) {
+                activated = true;
+            }
+        }
+        if !activated {
             self.context.pool_manager.activate_worker();
         }
 
@@ -306,18 +340,15 @@ impl Executor {
             }
 
             if timeout.is_zero() {
-                if !self.context.pool_manager.pool_is_idle() && !self.context.main_spin.is_zero() {
-                    let start = Instant::now();
-                    while (Instant::now() - start) < self.context.main_spin {
-                        if self.context.pool_manager.pool_is_idle() {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-
                 if !self.context.pool_manager.pool_is_idle() {
+                    #[cfg(feature = "perf_stats")]
+                    let park_start = Instant::now();
                     self.parker.park();
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        MAIN_WAIT_PARKS.fetch_add(1, Ordering::Relaxed);
+                        add_duration_ns(&MAIN_WAIT_PARK_TIME_NS, park_start.elapsed());
+                    }
                 }
             } else if !self.parker.park_timeout(timeout) {
                 // A timeout occurred: request all worker threads to return
@@ -403,15 +434,12 @@ struct ExecutorContext {
     /// This counter is only updated by worker threads before they park and is
     /// therefore only consistent once all workers are parked.
     msg_count: AtomicIsize,
-    /// How long the main thread should spin before parking when waiting for
-    /// the worker pool to become idle.
-    main_spin: Duration,
     /// How long the hot standby worker should linger before parking.
     worker_linger: Duration,
     /// Run epoch counter incremented at the start of each executor run.
     run_epoch: AtomicU64,
-    /// Worker ID selected for hot standby.
-    hot_worker_id: usize,
+    /// Number of workers selected for hot standby.
+    hot_worker_count: usize,
 }
 
 impl ExecutorContext {
@@ -435,10 +463,9 @@ impl ExecutorContext {
                 worker_unparkers,
             ),
             msg_count: AtomicIsize::new(0),
-            main_spin: MAIN_THREAD_SPIN_DURATION,
             worker_linger: WORKER_LINGER_DURATION,
             run_epoch: AtomicU64::new(0),
-            hot_worker_id: HOT_WORKER_ID,
+            hot_worker_count: HOT_WORKER_COUNT,
         }
     }
 }
@@ -605,30 +632,75 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
                 // No need to call `begin_worker_search()`: this was done by the
                 // thread that unparked the worker.
                 if worker.executor_context.worker_linger.is_zero()
-                    || id != worker.executor_context.hot_worker_id
+                    || id >= worker.executor_context.hot_worker_count
                 {
+                    #[cfg(feature = "perf_stats")]
+                    WORKER_PARKS.fetch_add(1, Ordering::Relaxed);
                     parker.park();
                 } else {
+                    #[cfg(feature = "perf_stats")]
+                    WORKER_LINGER_HITS.fetch_add(1, Ordering::Relaxed);
                     let start_epoch = worker.executor_context.run_epoch.load(Ordering::Relaxed);
+                    let total_linger = worker.executor_context.worker_linger;
+                    let spin_phase = if total_linger < WORKER_LINGER_SPIN_PHASE {
+                        total_linger
+                    } else {
+                        WORKER_LINGER_SPIN_PHASE
+                    };
                     let start = Instant::now();
+                    #[cfg(feature = "perf_stats")]
+                    let mut linger_success = false;
+                    let mut linger_done = false;
 
-                    loop {
+                    while (Instant::now() - start) < spin_phase {
                         if abort_signal.is_set() {
                             return;
                         }
 
                         if worker.executor_context.run_epoch.load(Ordering::Relaxed) != start_epoch
                         {
-                            break;
-                        }
-
-                        if (Instant::now() - start) >= worker.executor_context.worker_linger {
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                linger_success = true;
+                            }
+                            linger_done = true;
                             break;
                         }
 
                         std::hint::spin_loop();
                     }
 
+                    if !linger_done {
+                        while (Instant::now() - start) < total_linger {
+                            if abort_signal.is_set() {
+                                return;
+                            }
+
+                            if worker.executor_context.run_epoch.load(Ordering::Relaxed)
+                                != start_epoch
+                            {
+                                #[cfg(feature = "perf_stats")]
+                                {
+                                    linger_success = true;
+                                }
+                                break;
+                            }
+
+                            std::thread::yield_now();
+                        }
+                    }
+
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        if linger_success {
+                            WORKER_LINGER_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            WORKER_LINGER_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    #[cfg(feature = "perf_stats")]
+                    WORKER_PARKS.fetch_add(1, Ordering::Relaxed);
                     parker.park();
                 }
             } else if injector.is_empty() {
@@ -640,6 +712,8 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
                 // visible in the injector queue.
                 pool_manager.set_all_workers_inactive();
                 executor_unparker.unpark();
+                #[cfg(feature = "perf_stats")]
+                WORKER_PARKS.fetch_add(1, Ordering::Relaxed);
                 parker.park();
                 // No need to call `begin_worker_search()`: this was done by the
                 // thread that unparked the worker.
