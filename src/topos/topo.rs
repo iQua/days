@@ -73,6 +73,14 @@ pub struct TracingConfig {
 struct ConcurrencyConfig {
     num_threads: Option<usize>,
     hot_workers: Option<usize>,
+    concurrency_level: Option<ConcurrencyLevel>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConcurrencyLevel {
+    Default,
+    Accelerated,
 }
 
 #[derive(Deserialize)]
@@ -256,8 +264,9 @@ impl Topology {
             .expect("Failed to deserialize the configuration of concurrency");
 
         let mut sim_init;
+        let num_threads = concurrency_config.num_threads;
 
-        if let Some(num_threads) = concurrency_config.num_threads {
+        if let Some(num_threads) = num_threads {
             sim_init = SimInit::with_num_threads(num_threads);
 
             info!("Starting simulation with {num_threads} thread(s).",);
@@ -269,6 +278,28 @@ impl Topology {
         if let Some(hot_workers) = concurrency_config.hot_workers {
             sim_init = sim_init.set_hot_worker_count(hot_workers);
             info!("Using {hot_workers} hot standby worker(s).",);
+        }
+
+        if let Some(level) = concurrency_config.concurrency_level {
+            match level {
+                ConcurrencyLevel::Default => {
+                    sim_init = sim_init.set_max_groups_per_step_task(1);
+                    info!("Using default concurrency level (max_groups_per_step_task=1).");
+                }
+                ConcurrencyLevel::Accelerated => {
+                    let effective_threads = if cfg!(target_family = "wasm") {
+                        1
+                    } else {
+                        num_threads
+                            .unwrap_or_else(num_cpus::get)
+                            .clamp(1, usize::BITS as usize)
+                    };
+                    sim_init = sim_init.set_max_groups_per_step_task(effective_threads);
+                    info!(
+                        "Using accelerated concurrency level (max_groups_per_step_task={effective_threads})."
+                    );
+                }
+            }
         }
 
         if let Some(quantum_ns) = config.time_quantum_ns {
@@ -1302,6 +1333,7 @@ mod tests {
             duration = 1000.0
             num_threads = 4
             hot_workers = 2
+            concurrency_level = "accelerated"
             mailbox_capacity = 32
 
             [switch]

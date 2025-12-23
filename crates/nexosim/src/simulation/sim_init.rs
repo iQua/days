@@ -77,7 +77,7 @@ impl SimInit {
             clock: Box::new(NoClock::new()),
             clock_tolerance: None,
             timeout: Duration::ZERO,
-            max_groups_per_step_task: num_threads,
+            max_groups_per_step_task: 1,
             observers: Vec::new(),
             abort_signal,
             model_names: Vec::new(),
