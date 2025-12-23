@@ -133,9 +133,7 @@ impl PoolManager {
 
             let worker_id = idle_mask.trailing_zeros() as usize;
             let worker_mask = 1usize << worker_id;
-            let prev_active = self
-                .active_workers
-                .fetch_or(worker_mask, Ordering::Relaxed);
+            let prev_active = self.active_workers.fetch_or(worker_mask, Ordering::Relaxed);
             if prev_active & worker_mask == 0 {
                 self.begin_worker_search();
                 self.worker_unparkers[worker_id].unpark();
@@ -143,7 +141,6 @@ impl PoolManager {
             }
         }
     }
-
 
     /// Marks the specified worker as inactive unless it is the last active
     /// worker.
