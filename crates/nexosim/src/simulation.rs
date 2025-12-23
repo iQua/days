@@ -103,7 +103,7 @@ use std::time::Duration;
 use std::{panic, task};
 
 use pin_project::pin_project;
-use recycle_box::{coerce_box, RecycleBox};
+use recycle_box::{RecycleBox, coerce_box};
 
 use scheduler::SchedulerQueue;
 
@@ -132,8 +132,7 @@ static MAX_GROUPS_PER_STEP: AtomicU64 = AtomicU64::new(0);
 fn bump_max(dst: &AtomicU64, v: u64) {
     let mut cur = dst.load(AtomicOrdering::Relaxed);
     while v > cur {
-        match dst.compare_exchange_weak(cur, v, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
-        {
+        match dst.compare_exchange_weak(cur, v, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed) {
             Ok(_) => break,
             Err(next) => cur = next,
         }
@@ -520,8 +519,7 @@ impl Simulation {
         #[cfg(feature = "perf_stats")]
         let mut groups_this_step: u64 = 0;
 
-        let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
-            Vec::with_capacity(64);
+        let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::with_capacity(64);
 
         loop {
             let action = pull_next_action(self.scheduler_state.as_ref(), &mut scheduler_queue);

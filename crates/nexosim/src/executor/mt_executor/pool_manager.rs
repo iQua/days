@@ -1,6 +1,6 @@
 use std::any::Any;
-use std::sync::atomic::{self, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{self, AtomicUsize, Ordering};
 
 use parking::Unparker;
 

@@ -272,15 +272,15 @@ mod source;
 pub use input::markers;
 pub use input::{InputFn, ReplierFn};
 pub use output::{Output, Requestor, UniRequestor};
-#[allow(deprecated)]
 pub use sink::{
-    blocking_event_queue::{BlockingEventQueue, BlockingEventQueueReader},
-    event_buffer::EventBuffer,
-    EventSinkStream,
-};
-pub use sink::{
+    EventSink, EventSinkReader, EventSinkWriter,
     event_queue::{EventQueue, EventQueueReader},
     event_slot::EventSlot,
-    EventSink, EventSinkReader, EventSinkWriter,
+};
+#[allow(deprecated)]
+pub use sink::{
+    EventSinkStream,
+    blocking_event_queue::{BlockingEventQueue, BlockingEventQueueReader},
+    event_buffer::EventBuffer,
 };
 pub use source::{EventSource, QuerySource, ReplyReceiver};

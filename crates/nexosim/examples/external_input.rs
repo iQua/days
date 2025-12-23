@@ -19,9 +19,9 @@
 
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, UdpSocket};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, sleep, JoinHandle};
+use std::thread::{self, JoinHandle, sleep};
 use std::time::Duration;
 
 use nexosim::model::{BuildContext, Context, InitializedModel, Model, ProtoModel};
@@ -167,8 +167,8 @@ impl WaitBarrier {
     fn wait(self) {
         let _unused = self
             .0
-             .1
-            .wait_while(self.0 .0.lock().unwrap(), |pending| *pending)
+            .1
+            .wait_while(self.0.0.lock().unwrap(), |pending| *pending)
             .unwrap();
     }
 }
@@ -178,8 +178,8 @@ struct Notifier(Arc<(Mutex<bool>, Condvar)>);
 
 impl Notifier {
     fn notify(self) {
-        *self.0 .0.lock().unwrap() = false;
-        self.0 .1.notify_one();
+        *self.0.0.lock().unwrap() = false;
+        self.0.1.notify_one();
     }
 }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 
 use serde::de::DeserializeOwned;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 use crate::registry::EndpointRegistry;
 use crate::simulation::{Simulation, SimulationError};

@@ -12,7 +12,7 @@ use std::{fmt, ptr};
 
 use crossbeam_utils::CachePadded;
 use pin_project::pin_project;
-use recycle_box::{coerce_box, RecycleBox};
+use recycle_box::{RecycleBox, coerce_box};
 
 use crate::channel::Sender;
 use crate::executor::Executor;
@@ -435,7 +435,11 @@ impl SchedulerState {
         for buf in self.local_buffers.buffers.iter() {
             let buf = unsafe { &mut *buf.get() };
             for item in buf.drain(..) {
-                scheduler_queue.insert_with_epoch((item.time, item.origin_id), item.action, item.seq);
+                scheduler_queue.insert_with_epoch(
+                    (item.time, item.origin_id),
+                    item.action,
+                    item.seq,
+                );
             }
         }
     }
@@ -465,8 +469,7 @@ impl SchedulerState {
     }
 
     pub(crate) fn set_time_quantum_ns(&self, quantum_ns: u64) {
-        self.time_quantum_ns
-            .store(quantum_ns, Ordering::Relaxed);
+        self.time_quantum_ns.store(quantum_ns, Ordering::Relaxed);
     }
 
     pub(super) fn quantize_time(&self, time: MonotonicTime) -> MonotonicTime {

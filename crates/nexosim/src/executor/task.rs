@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::future::Future;
 use std::mem::{self, ManuallyDrop};
 use std::task::{RawWaker, RawWakerVTable};
@@ -20,7 +20,7 @@ pub(crate) use cancel_token::CancelToken;
 pub(crate) use promise::Promise;
 pub(crate) use runnable::Runnable;
 
-use self::util::{runnable_exists, RunOnDrop};
+use self::util::{RunOnDrop, runnable_exists};
 
 /// Flag indicating that the future has not been polled to completion yet.
 const POLLING: u64 = 1 << 0;
