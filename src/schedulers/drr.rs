@@ -372,13 +372,9 @@ impl DRRServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
-        self.schedule_packet(|_now, timeout, outbound| {
-            cx.schedule_event(
-                Duration::from_secs_f64(timeout),
-                Self::send_and_run,
-                outbound,
-            )
-            .unwrap();
+        self.schedule_packet(|_now, delay, outbound| {
+            cx.schedule_event(Duration::from_secs_f64(delay), Self::send_and_run, outbound)
+                .unwrap();
         });
     }
 

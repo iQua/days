@@ -117,7 +117,7 @@ impl Link {
                     "Link {} will send frame ({} bytes) at time {:.3}. {} frames in queue.",
                     self.link_id,
                     bytes,
-                    self.time + timeout,
+                    departure_time,
                     self.queue.len()
                 );
             }

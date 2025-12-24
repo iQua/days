@@ -304,7 +304,7 @@ impl WRRServer {
                         outbound.packet_id,
                         outbound.size,
                         outbound.flow_id,
-                        self.time + timeout,
+                        departure_time,
                         self.queues[self.current_queue].len(),
                     );
                     return;
@@ -336,13 +336,9 @@ impl WRRServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
-        self.schedule_packet(|_now, timeout, outbound| {
-            cx.schedule_event(
-                Duration::from_secs_f64(timeout),
-                Self::send_and_run,
-                outbound,
-            )
-            .unwrap();
+        self.schedule_packet(|_now, delay, outbound| {
+            cx.schedule_event(Duration::from_secs_f64(delay), Self::send_and_run, outbound)
+                .unwrap();
         });
     }
 

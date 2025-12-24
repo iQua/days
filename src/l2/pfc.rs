@@ -15,6 +15,7 @@ use nexosim::time::MonotonicTime;
 use crate::flows::packet::Packet;
 use crate::l2::frame::LinkFrame;
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+use crate::utils::time::{quantize_after, quantize_time};
 
 const NUM_PRIORITIES: usize = 8;
 const PAUSE_QUANTA_BITS: f64 = 512.0;
@@ -218,7 +219,7 @@ impl PfcIngressPort {
 
     fn schedule_refresh(&mut self, now: f64, priority: usize, cx: &mut Context<Self>) {
         if let Some(interval) = self.config.refresh_interval {
-            let refresh_at = now + interval;
+            let refresh_at = quantize_after(now, interval);
             let should_schedule = match self.refresh_scheduled_at[priority] {
                 Some(existing) => refresh_at < existing - f64::EPSILON,
                 None => true,
@@ -226,7 +227,7 @@ impl PfcIngressPort {
             if should_schedule {
                 self.refresh_scheduled_at[priority] = Some(refresh_at);
                 cx.schedule_event(
-                    Duration::from_secs_f64(refresh_at - now),
+                    Duration::from_secs_f64((refresh_at - now).max(0.0)),
                     Self::refresh,
                     priority,
                 )
@@ -236,6 +237,7 @@ impl PfcIngressPort {
     }
 
     async fn assert_pause(&mut self, now: f64, priority: usize, cx: &mut Context<Self>) {
+        let now = quantize_time(now);
         if !self.pause_active[priority] {
             self.pause_active[priority] = true;
         }
@@ -247,6 +249,7 @@ impl PfcIngressPort {
     }
 
     async fn clear_pause(&mut self, now: f64, priority: usize) {
+        let now = quantize_time(now);
         if self.pause_active[priority] {
             self.pause_active[priority] = false;
             self.refresh_scheduled_at[priority] = None;
@@ -255,6 +258,7 @@ impl PfcIngressPort {
     }
 
     async fn handle_packet(&mut self, packet: Packet, now: f64, cx: &mut Context<Self>) {
+        let now = quantize_time(now);
         let priority = packet.priority as usize;
         let cap = self.config.buffer_capacity[priority];
         if cap > 0 && self.occupancy[priority] + packet.size > cap {
@@ -285,6 +289,7 @@ impl PfcIngressPort {
     }
 
     async fn drain(&mut self, now: f64, cx: &mut Context<Self>) {
+        let now = quantize_time(now);
         self.time = now;
         let mut needs_retry = false;
         for priority in 0..NUM_PRIORITIES {
@@ -307,8 +312,9 @@ impl PfcIngressPort {
     }
 
     fn schedule_drain_retry(&mut self, now: f64, cx: &mut Context<Self>) {
+        let now = quantize_time(now);
         let interval = self.config.drain_interval.unwrap_or(1e-6);
-        let retry_at = now + interval;
+        let retry_at = quantize_after(now, interval);
         let should_schedule = match self.drain_scheduled_at {
             Some(existing) => retry_at < existing - f64::EPSILON,
             None => true,
@@ -316,7 +322,7 @@ impl PfcIngressPort {
         if should_schedule {
             self.drain_scheduled_at = Some(retry_at);
             cx.schedule_event(
-                Duration::from_secs_f64(retry_at - now),
+                Duration::from_secs_f64((retry_at - now).max(0.0)),
                 Self::drain_retry,
                 retry_at,
             )
@@ -337,7 +343,7 @@ impl PfcIngressPort {
             );
         }
 
-        let now = frame.time();
+        let now = quantize_time(frame.time());
         match frame {
             LinkFrame::Data(packet) => self.handle_packet(packet, now, cx).await,
             #[cfg(feature = "l2_pfc")]
@@ -357,7 +363,7 @@ impl PfcIngressPort {
 
     #[instrument(skip(self, cx))]
     async fn refresh(&mut self, priority: usize, cx: &mut Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
         self.refresh_scheduled_at[priority] = None;
         if self.pause_active[priority] {
             self.assert_pause(now, priority, cx).await;
@@ -503,7 +509,7 @@ impl PfcEgressGate {
     }
 
     fn apply_pfc(&mut self, frame: &PfcFrame) {
-        let now = frame.time;
+        let now = quantize_time(frame.time);
         for prio in 0..NUM_PRIORITIES {
             if frame.enabled(prio) {
                 let pause_quanta = frame.pause_quanta[prio];
@@ -511,13 +517,15 @@ impl PfcEgressGate {
                     self.paused_until[prio] = now;
                 } else {
                     let pause = frame.pause_duration(prio, self.rate);
-                    self.paused_until[prio] = self.paused_until[prio].max(now + pause);
+                    let pause_until = quantize_after(now, pause);
+                    self.paused_until[prio] = self.paused_until[prio].max(pause_until);
                 }
             }
         }
     }
 
     async fn drain_ready(&mut self, now: f64) {
+        let now = quantize_time(now);
         self.time = now;
         while let Some(frame) = self.pop_ready(now) {
             self.output.send(frame).await;
@@ -525,7 +533,9 @@ impl PfcEgressGate {
     }
 
     fn schedule_resume(&mut self, now: f64, cx: &mut Context<Self>) {
-        if let Some(resume_at) = self.next_resume_time(now) {
+        let now = quantize_time(now);
+        if let Some(resume_at_raw) = self.next_resume_time(now) {
+            let resume_at = quantize_time(resume_at_raw);
             let should_schedule = match self.resume_scheduled_at {
                 Some(existing) => resume_at < existing - f64::EPSILON,
                 None => true,
@@ -533,7 +543,7 @@ impl PfcEgressGate {
             if should_schedule {
                 self.resume_scheduled_at = Some(resume_at);
                 cx.schedule_event(
-                    Duration::from_secs_f64(resume_at - now),
+                    Duration::from_secs_f64((resume_at - now).max(0.0)),
                     Self::resume,
                     resume_at,
                 )
@@ -609,7 +619,7 @@ impl PfcEgressGate {
             }
         }
 
-        let now = frame.time;
+        let now = quantize_time(frame.time);
         self.apply_pfc(&frame);
         self.drain_ready(now).await;
         self.schedule_resume(now, cx);
@@ -617,6 +627,7 @@ impl PfcEgressGate {
 
     #[instrument(skip(self, cx))]
     async fn resume(&mut self, now: f64, cx: &mut Context<Self>) {
+        let now = quantize_time(now);
         self.resume_scheduled_at = None;
         self.drain_ready(now).await;
         self.schedule_resume(now, cx);
