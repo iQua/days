@@ -1,13 +1,12 @@
-# This is a configuration file for the FatTree topology.
 seed = 1000
-num_threads = 1 
+num_threads = 1
 log_path = "logs/fattree"
 
 [topology]
     category = "FatTree"
 
 [topology.fat_tree]
-    k = 32 
+    k = 32
 
 [switch]
     port_rate = 320000 # process 40 packets (1000 bytes) per second
@@ -16,10 +15,9 @@ log_path = "logs/fattree"
     discipline = "FIFO"
     drop = "TailDrop"
 
-
 [[flow_set]]
     flow_type = "PacketDistribution"
-    flow_count = 4096 
+    flow_count = 4096
     [flow_set.traffic]
         initial_delay = 1.0
         duration = 1500
