@@ -16,6 +16,7 @@ use nexosim::ports::Output;
 use crate::flows::DistributionInfo;
 use crate::flows::packet::Packet;
 use crate::get_seed;
+use crate::utils::time::{quantize_after, quantize_time};
 
 #[derive(Debug)]
 pub struct Wire {
@@ -60,12 +61,15 @@ impl Wire {
             );
         }
 
-        let now = packet.time;
+        let mut now = packet.time;
 
         debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.wire_id, packet.packet_id, packet.size, packet.flow_id, now,
         );
+
+        now = quantize_time(now);
+        packet.departure_update(now);
 
         let delay = match self.delay_dist {
             DistributionInfo::DiscreteUniform { low, high } => {
@@ -82,13 +86,12 @@ impl Wire {
             }
         };
 
-        // updates the packet's time and advances the simulation to that time
-        // before sending the packet, whose queueing delay remains unchanged
-        packet.time += delay;
+        let arrival_time = quantize_after(now, delay);
+        packet.departure_update(arrival_time);
 
-        if packet.time > now {
+        if arrival_time > now {
             cx.schedule_event(
-                Duration::from_secs_f64(packet.time - now),
+                Duration::from_secs_f64(arrival_time - now),
                 Self::forward_packet,
                 packet,
             )

@@ -20,6 +20,7 @@ use crate::schedulers::drop::{
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+use crate::utils::time::{quantize_after, quantize_time};
 
 pub struct Port {
     scheduler_id: usize,
@@ -253,35 +254,33 @@ impl Port {
                 );
             }
 
-            self.time = now;
-
-            if self.time == 0.0 {
-                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-                self.time = global_time;
-            }
+            let run_time = quantize_time(now);
+            self.time = run_time;
 
             if self.in_flight != 0 {
                 return;
             }
 
             let mut schedule = Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE);
-            let mut start_time = self.time;
+            let mut service_start = run_time;
 
             for _ in 0..Self::DEFAULT_RUN_BATCH_SIZE {
                 let Some(mut packet) = self.queue.pop_front() else {
                     break;
                 };
 
-                packet.queueing_delay_update(start_time);
+                packet.queueing_delay_update(service_start);
                 let timeout = packet.size as f64 * 8.0 / self.rate;
-                start_time += timeout;
-                packet.departure_update(start_time);
+                let departure_time = quantize_after(service_start, timeout);
+                packet.departure_update(departure_time);
 
-                self.packet_sent(start_time, &packet);
+                self.packet_sent(departure_time, &packet);
 
-                schedule.push((Duration::from_secs_f64(start_time - self.time), packet));
+                let delay = (departure_time - run_time).max(0.0);
+                schedule.push((Duration::from_secs_f64(delay), packet));
 
                 self.in_flight += 1;
+                service_start = departure_time;
             }
 
             if !schedule.is_empty() {

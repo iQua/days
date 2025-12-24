@@ -3,7 +3,7 @@ duration = 10.0
 num_threads = 24
 log_path = "logs/fattree"
 ui_interval = 1e9
-time_quantum_ns = 20000
+time_quantum_ns = 5000
 hot_workers = 2
 mailbox_capacity = 16
 concurrency_level = "accelerated"
@@ -15,7 +15,7 @@ concurrency_level = "accelerated"
     k = 8
 
 [switch]
-    port_rate = 1000000000 # 1 Gbps
+    port_rate = 100000000 # 100 Mbps
     capacity = 100
     weights = [1]
     discipline = "FIFO"

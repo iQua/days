@@ -27,6 +27,7 @@ use crate::schedulers::drop::{
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+use crate::utils::time::{quantize_after, quantize_time};
 
 #[derive(Clone, Debug)]
 pub struct TaggedPacket {
@@ -352,13 +353,15 @@ impl VirtualClockServer {
 
             // sends the packet out to the next element after a timeout
             let timeout = outbound.size as f64 * 8.0 / self.rate;
-            tagged_outbound.packet.departure_update(self.time + timeout);
-            self.time_packet_sent = self.time + timeout;
+            let departure_time = quantize_after(self.time, timeout);
+            tagged_outbound.packet.departure_update(departure_time);
+            self.time_packet_sent = departure_time;
 
             // schedules the future send event with TaggedPacket to facilitate testing
-            schedule_event(self.time, timeout, tagged_outbound);
+            let delay = (departure_time - self.time).max(0.0);
+            schedule_event(self.time, delay, tagged_outbound);
 
-            self.busy_until = self.time + timeout;
+            self.busy_until = departure_time;
 
             debug!(
                 "VirtualClockServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
@@ -389,12 +392,8 @@ impl VirtualClockServer {
             );
         }
 
-        self.time = now;
-
-        if self.time == 0.0 {
-            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            self.time = global_time;
-        }
+        let run_time = quantize_time(now);
+        self.time = run_time;
 
         self.schedule_packet(|_now, timeout, outbound| {
             cx.schedule_event(

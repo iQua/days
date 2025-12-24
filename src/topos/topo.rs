@@ -42,6 +42,7 @@ use crate::schedulers::wrr::WRRServer;
 use crate::switches::SchedulingDiscipline;
 use crate::switches::switch::PacketSwitch;
 use crate::utils::logger::CsvLogger;
+use crate::utils::time::set_time_quantum_ns;
 use crate::utils::tracing::start_wall_clock_concurrency_sampler;
 use crate::utils::ui::UserInterface;
 use crate::{num_switches, peak_concurrency, reset_peak_concurrency, set_num_switches};
@@ -300,7 +301,9 @@ impl Topology {
             }
         }
 
-        if let Some(quantum_ns) = config.time_quantum_ns {
+        let time_quantum_ns = config.time_quantum_ns;
+        set_time_quantum_ns(time_quantum_ns);
+        if let Some(quantum_ns) = time_quantum_ns {
             sim_init = sim_init.set_time_quantum_ns(quantum_ns);
         }
 

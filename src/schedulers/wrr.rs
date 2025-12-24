@@ -21,6 +21,7 @@ use crate::schedulers::drop::{
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+use crate::utils::time::{quantize_after, quantize_time};
 
 pub struct WRRServer {
     scheduler_id: usize,
@@ -289,10 +290,12 @@ impl WRRServer {
 
                     // calculate send timeout
                     let timeout = outbound.size as f64 * 8.0 / self.rate;
-                    outbound.departure_update(self.time + timeout);
+                    let departure_time = quantize_after(self.time, timeout);
+                    outbound.departure_update(departure_time);
 
-                    schedule_event(self.time, timeout, outbound.clone());
-                    self.busy_until = self.time + timeout;
+                    let delay = (departure_time - self.time).max(0.0);
+                    schedule_event(self.time, delay, outbound.clone());
+                    self.busy_until = departure_time;
 
                     debug!(
                         "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
@@ -330,12 +333,8 @@ impl WRRServer {
             );
         }
 
-        self.time = now;
-
-        if self.time == 0.0 {
-            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            self.time = global_time;
-        }
+        let run_time = quantize_time(now);
+        self.time = run_time;
 
         self.schedule_packet(|_now, timeout, outbound| {
             cx.schedule_event(

@@ -12,6 +12,7 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
 use crate::l2::frame::LinkFrame;
+use crate::utils::time::{quantize_after, quantize_time};
 
 pub struct Link {
     link_id: usize,
@@ -56,7 +57,8 @@ impl Link {
             );
         }
 
-        let frame_time = frame.time();
+        let frame_time = quantize_time(frame.time());
+        frame.set_time(frame_time);
         self.queue.push_back(frame);
 
         if frame_time >= self.busy_until {
@@ -88,12 +90,8 @@ impl Link {
                 );
             }
 
-            self.time = now;
-
-            if self.time == 0.0 {
-                let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-                self.time = global_time;
-            }
+            let run_time = quantize_time(now);
+            self.time = run_time;
 
             if let Some(mut frame) = self.queue.pop_front() {
                 let bytes = frame.size_bytes();
@@ -103,14 +101,17 @@ impl Link {
                     0.0
                 };
 
-                frame.set_time(self.time + timeout);
+                let departure_time = quantize_after(self.time, timeout);
+                frame.set_time(departure_time);
 
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::send, frame.clone())
+                let delay = (departure_time - self.time).max(0.0);
+
+                cx.schedule_event(Duration::from_secs_f64(delay), Self::send, frame.clone())
                     .unwrap();
-                cx.schedule_event(Duration::from_secs_f64(timeout), Self::run, now + timeout)
+                cx.schedule_event(Duration::from_secs_f64(delay), Self::run, departure_time)
                     .unwrap();
 
-                self.busy_until = self.time + timeout;
+                self.busy_until = departure_time;
 
                 debug!(
                     "Link {} will send frame ({} bytes) at time {:.3}. {} frames in queue.",
