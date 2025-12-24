@@ -777,9 +777,14 @@ impl Topology {
             }
 
             SchedulingDiscipline::VirtualClock => {
-                let vticks = self.switch_config.vticks.as_ref().unwrap_or_else(|| {
-                    panic!("`vticks` must be provided for VirtualClock scheduling discipline.")
-                });
+                let mut vticks = self
+                    .switch_config
+                    .vticks
+                    .clone()
+                    .unwrap_or_else(|| vec![1.0]);
+                if vticks.is_empty() {
+                    vticks.push(1.0);
+                }
                 let vticks_len = vticks.len();
 
                 let mut virtual_clock_server = VirtualClockServer::new(
@@ -789,7 +794,7 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % vticks_len),
                     drop_strategy.clone(),
                     ecn_threshold,
-                    vticks.clone(),
+                    vticks,
                 );
                 #[cfg(feature = "l2_pfc")]
                 {
