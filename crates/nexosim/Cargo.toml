@@ -181,7 +181,6 @@ optional = true
 version = "0.14"
 features = [
     "codegen",
-    "prost",
     "server",
 ]
 optional = true
