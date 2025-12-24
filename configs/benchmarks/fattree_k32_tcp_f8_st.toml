@@ -1,12 +1,8 @@
 seed = 1000
 duration = 10.0
-num_threads = 24
+num_threads = 1
 log_path = "logs/fattree"
 ui_interval = 1e9
-time_quantum_ns = 102400
-hot_workers = 2
-mailbox_capacity = 1024 
-concurrency_level = "accelerated"
 
 [topology]
     category = "FatTree"
@@ -23,7 +19,7 @@ concurrency_level = "accelerated"
 
 [[flow_set]]
     flow_type = "TCP"
-    flow_count = 64 
+    flow_count = 8
     routing = "ShortestPath"
 
     [flow_set.traffic]

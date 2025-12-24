@@ -19,7 +19,7 @@ ui_interval = 1e9
 
 [[flow_set]]
     flow_type = "TCP"
-    flow_count = 64 
+    flow_count = 1024
     routing = "ShortestPath"
 
     [flow_set.traffic]

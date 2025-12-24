@@ -1,0 +1,41 @@
+seed = 1000
+duration = 10.0
+num_threads = 24
+log_path = "logs/fattree"
+ui_interval = 1e9
+time_quantum_ns = 20000
+hot_workers = 2
+mailbox_capacity = 512
+concurrency_level = "accelerated"
+
+[topology]
+    category = "FatTree"
+
+[topology.fat_tree]
+    k = 32
+
+[switch]
+    port_rate = 100000000 # 100 Mbps
+    capacity = 100
+    weights = [1]
+    discipline = "FIFO"
+    drop = "TailDrop"
+
+[[flow_set]]
+    flow_type = "TCP"
+    flow_count = 64
+    routing = "ShortestPath"
+
+    [flow_set.traffic]
+    initial_delay = 0.0
+    duration = 10.0
+    arr_dist = { type = "Uniform", low = 0.0008, high = 0.0008 }
+    pkt_size_dist = { type = "Uniform", low = 1024, high = 1024 }
+
+    [flow_set.traffic.tcp]
+    cc_algorithm = "CUBIC"
+
+    [flow_set.traffic.tcp.cubic]
+    beta = 0.7
+    c = 0.4
+    fast_convergence = true
