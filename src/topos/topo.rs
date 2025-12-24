@@ -739,11 +739,14 @@ impl Topology {
             }
 
             SchedulingDiscipline::SP => {
-                let priorities = self.switch_config.priorities.as_ref().unwrap_or_else(|| {
-                    panic!(
-                        "`priorities` must be provided for Static Priority scheduling discipline."
-                    )
-                });
+                let mut priorities = self
+                    .switch_config
+                    .priorities
+                    .clone()
+                    .unwrap_or_else(|| vec![1]);
+                if priorities.is_empty() {
+                    priorities.push(1);
+                }
                 let priorities_len = priorities.len();
 
                 let mut sp_server = SPServer::new(
@@ -753,7 +756,7 @@ impl Topology {
                     Arc::new(move |flow_id| flow_id % priorities_len),
                     drop_strategy.clone(),
                     ecn_threshold,
-                    priorities.clone(),
+                    priorities,
                 );
                 #[cfg(feature = "l2_pfc")]
                 {
