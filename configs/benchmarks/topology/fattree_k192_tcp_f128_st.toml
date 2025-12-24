@@ -1,18 +1,14 @@
 seed = 1000
 duration = 10.0
-num_threads = 24
+num_threads = 1
 log_path = "logs/fattree"
 ui_interval = 1e9
-time_quantum_ns = 20000
-hot_workers = 2
-mailbox_capacity = 16
-concurrency_level = "accelerated"
 
 [topology]
     category = "FatTree"
 
 [topology.fat_tree]
-    k = 16
+    k = 192
 
 [switch]
     port_rate = 1000000000 # 1 Gbps

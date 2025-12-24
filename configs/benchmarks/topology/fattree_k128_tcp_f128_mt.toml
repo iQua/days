@@ -5,7 +5,7 @@ log_path = "logs/fattree"
 ui_interval = 1e9
 time_quantum_ns = 20000
 hot_workers = 2
-mailbox_capacity = 512
+mailbox_capacity = 16
 concurrency_level = "accelerated"
 
 [topology]
