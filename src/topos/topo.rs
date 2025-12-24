@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use log::{debug, info};
+use log::{debug, error, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
@@ -1288,7 +1288,12 @@ impl Topology {
         let timer = std::time::Instant::now();
 
         // starts the simulation
-        let _ = sim.step_until(Duration::from_secs_f64(duration));
+        match sim.step_until(Duration::from_secs_f64(duration)) {
+            Ok(()) => {}
+            Err(err) => {
+                error!("Simulation stopped early: {err}");
+            }
+        }
 
         if let Some(stats) = wall_sampler.as_mut().and_then(|s| s.stop()) {
             info!(
