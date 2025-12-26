@@ -11,6 +11,7 @@ log_path = "logs/simple"
     weights = [1]
     discipline = "FIFO"
     drop = "RED"
+    run_batch_size = 64
 
 [[flow]]
     flow_type = "PacketDistribution"

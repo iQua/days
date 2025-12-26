@@ -16,6 +16,7 @@ ui_interval = 1e9
     weights = [1]
     discipline = "FIFO"
     drop = "TailDrop"
+    run_batch_size = 64
 
 [[flow_set]]
     flow_type = "TCP"

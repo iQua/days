@@ -76,6 +76,8 @@ pub struct WRRServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+    run_batch_size: usize,
+    in_flight: usize,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -83,6 +85,8 @@ pub struct WRRServer {
 }
 
 impl WRRServer {
+    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+
     pub fn new(
         rate: f64,
         capacity: usize,
@@ -158,9 +162,17 @@ impl WRRServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
+            in_flight: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
+    }
+
+    pub fn set_run_batch_size(&mut self, run_batch_size: Option<usize>) {
+        self.run_batch_size = run_batch_size
+            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
+            .max(1);
     }
 
     pub fn id(&self) -> usize {
@@ -263,57 +275,65 @@ impl WRRServer {
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
         self.send(packet).await;
-        self.run(self.time, cx);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0 {
+            self.run(self.time, cx);
+        }
     }
 
-    fn schedule_packet<F>(&mut self, mut schedule_event: F)
-    where
-        F: FnMut(f64, f64, Packet),
-    {
+    fn next_departure(
+        &mut self,
+        visit_class: Option<usize>,
+        service_start: f64,
+    ) -> Option<(usize, Packet, f64)> {
         loop {
-            // Return if no packets are waiting
             if self.packets_waiting == 0 {
-                return;
+                return None;
             }
 
-            // sends a single packet from the current queue according to its weight, which is an
-            // integer indicating the number of packets to be sent in this round
-            if !self.queues[self.current_queue].is_empty()
-                && self.packets_sent_in_round[self.current_queue] < self.weights[self.current_queue]
-            {
-                if let Some(mut outbound) = self.queues[self.current_queue].pop_front() {
-                    self.byte_sizes[self.current_queue] -= outbound.size;
-                    outbound.queueing_delay_update(self.time);
+            let current = self.current_queue;
 
-                    self.packets_waiting -= 1;
-                    self.packets_sent_in_round[self.current_queue] += 1;
-
-                    // calculate send timeout
-                    let timeout = outbound.size as f64 * 8.0 / self.rate;
-                    let departure_time = quantize_after(self.time, timeout);
-                    outbound.departure_update(departure_time);
-
-                    let delay = (departure_time - self.time).max(0.0);
-                    schedule_event(self.time, delay, outbound.clone());
-                    self.busy_until = departure_time;
-
-                    debug!(
-                        "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
-                        {} packets in the class queue.",
-                        self.scheduler_id,
-                        outbound.packet_id,
-                        outbound.size,
-                        outbound.flow_id,
-                        departure_time,
-                        self.queues[self.current_queue].len(),
-                    );
-                    return;
+            if let Some(expected) = visit_class {
+                if current != expected {
+                    return None;
                 }
             }
 
-            // moves to the next queue
-            self.packets_sent_in_round[self.current_queue] = 0;
-            self.current_queue = (self.current_queue + 1) % self.queues.len();
+            if !self.queues[current].is_empty()
+                && self.packets_sent_in_round[current] < self.weights[current]
+            {
+                let mut outbound = self.queues[current].pop_front().unwrap();
+                self.byte_sizes[current] -= outbound.size;
+                outbound.queueing_delay_update(service_start);
+
+                self.packets_waiting -= 1;
+                self.packets_sent_in_round[current] += 1;
+
+                let timeout = outbound.size as f64 * 8.0 / self.rate;
+                let departure_time = quantize_after(service_start, timeout);
+                outbound.departure_update(departure_time);
+                self.busy_until = departure_time;
+
+                debug!(
+                    "WRRServer {} will send packet {} ({} bytes) from flow {} at time {:.3}. \
+                    {} packets in the class queue.",
+                    self.scheduler_id,
+                    outbound.packet_id,
+                    outbound.size,
+                    outbound.flow_id,
+                    departure_time,
+                    self.queues[current].len(),
+                );
+
+                return Some((current, outbound, departure_time));
+            }
+
+            self.packets_sent_in_round[current] = 0;
+            self.current_queue = (current + 1) % self.queues.len();
+
+            if visit_class.is_some() {
+                return None;
+            }
         }
     }
 
@@ -336,39 +356,47 @@ impl WRRServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
-        self.schedule_packet(|_now, delay, outbound| {
-            cx.schedule_event(Duration::from_secs_f64(delay), Self::send_and_run, outbound)
+        if self.in_flight != 0 {
+            return;
+        }
+
+        let mut schedule = Vec::with_capacity(self.run_batch_size);
+        let mut service_start = run_time;
+        let mut visit_class = None;
+
+        for _ in 0..self.run_batch_size {
+            let Some((class_id, packet, departure_time)) =
+                self.next_departure(visit_class, service_start)
+            else {
+                break;
+            };
+
+            if visit_class.is_none() {
+                visit_class = Some(class_id);
+            }
+
+            let delay = (departure_time - run_time).max(0.0);
+            schedule.push((Duration::from_secs_f64(delay), packet));
+            self.in_flight += 1;
+            service_start = departure_time;
+        }
+
+        if !schedule.is_empty() {
+            cx.schedule_event_batch(schedule, Self::send_and_run)
                 .unwrap();
-        });
+        }
     }
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // creates a vector to collect events inside the closure
-        let mut events = Vec::new();
-
-        // calls schedule_packets() without borrowing self inside the closure
-        self.schedule_packet(|now, transmission_time, mut outbound| {
-            // simulates sending the packet
-            outbound.departure_update(now + transmission_time);
-
-            // collects the outbound packet and transmission_time
-            events.push((transmission_time, outbound));
-        });
-
-        // processes collected events after schedule_packets returns
-        for (timeout, outbound) in events {
-            // updates the sent_packets vector
-            self.sent_packets.push(outbound.clone());
-
-            // updates statistics
-            self.update_stats_on_packet_forwarded(&outbound);
-
-            // updates busy_until
-            self.busy_until = now + timeout;
-
-            // schedules the next run by calling test_run recursively
-            self.test_run(now + timeout);
+        let mut service_start = quantize_time(now);
+        self.time = service_start;
+        while let Some((_class_id, packet, departure_time)) =
+            self.next_departure(None, service_start)
+        {
+            self.sent_packets.push(packet.clone());
+            self.update_stats_on_packet_forwarded(&packet);
+            service_start = departure_time;
         }
     }
 

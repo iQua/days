@@ -75,6 +75,8 @@ pub struct DRRServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+    run_batch_size: usize,
+    in_flight: usize,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -88,6 +90,8 @@ pub struct DRRServer {
 /// - all queue IDs are consecutive starting from 0
 /// - the rate must be positive
 impl DRRServer {
+    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+
     pub fn new(
         rate: f64,
         capacity: usize,
@@ -119,7 +123,6 @@ impl DRRServer {
         } else {
             DEFAULT_ECN_THRESHOLD
         };
-
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
             DropStrategy::RED => Box::new(RED::new(
@@ -169,9 +172,17 @@ impl DRRServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
+            in_flight: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
+    }
+
+    pub fn set_run_batch_size(&mut self, run_batch_size: Option<usize>) {
+        self.run_batch_size = run_batch_size
+            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
+            .max(1);
     }
 
     pub fn id(&self) -> usize {
@@ -275,7 +286,10 @@ impl DRRServer {
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
         self.send(packet).await;
-        self.run(self.time, cx);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0 {
+            self.run(self.time, cx);
+        }
     }
 
     /// Moves on to the next queue if the current queue is empty.
@@ -297,40 +311,39 @@ impl DRRServer {
         }
     }
 
-    /// Schedules a packet by accepting a closure to handle packet sending based on context.
-    fn schedule_packet<F>(&mut self, mut schedule_event: F)
-    where
-        F: FnMut(f64, f64, Packet),
-    {
-        // main scheduling logic
+    /// Retrieves the next packet to transmit along with its class and departure time.
+    fn next_departure(
+        &mut self,
+        class_limit: Option<usize>,
+        service_start: f64,
+    ) -> Option<(usize, Packet, f64)> {
         loop {
             if self.packets_waiting == 0 {
-                // all packets in the queues have been processed
-                return;
+                return None;
             }
 
-            if !self.queues[self.current_queue].is_empty() {
-                let packet = self.queues[self.current_queue].front().unwrap().clone();
+            if let Some(limit) = class_limit {
+                if self.current_queue != limit {
+                    return None;
+                }
+            }
 
+            if let Some(packet) = self.queues[self.current_queue].front().cloned() {
                 if self.deficit[self.current_queue] > 0
                     && packet.size <= self.deficit[self.current_queue]
                 {
                     self.byte_sizes[self.current_queue] -= packet.size;
                     let mut outbound = self.queues[self.current_queue].pop_front().unwrap();
-                    outbound.queueing_delay_update(self.time);
+                    outbound.queueing_delay_update(service_start);
 
                     self.packets_waiting -= 1;
                     self.deficit[self.current_queue] -= packet.size;
+                    let class_id = self.current_queue;
 
-                    // sends the packet out to the next element after a timeout
                     let timeout = packet.size as f64 * 8.0 / self.rate;
-                    let departure_time = quantize_after(self.time, timeout);
+                    let departure_time = quantize_after(service_start, timeout);
                     outbound.departure_update(departure_time);
                     self.busy_until = departure_time;
-
-                    // schedules two future events: sending the packet and the next run
-                    let delay = (departure_time - self.time).max(0.0);
-                    schedule_event(self.time, delay, outbound);
 
                     debug!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
@@ -343,10 +356,16 @@ impl DRRServer {
                         self.queues[self.current_queue].len(),
                     );
 
-                    return;
+                    return Some((class_id, outbound, departure_time));
+                }
+
+                if class_limit.is_some() {
+                    return None;
                 } else {
                     self.next_queue();
                 }
+            } else if class_limit.is_some() {
+                return None;
             } else {
                 self.next_queue();
             }
@@ -372,39 +391,48 @@ impl DRRServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
-        self.schedule_packet(|_now, delay, outbound| {
-            cx.schedule_event(Duration::from_secs_f64(delay), Self::send_and_run, outbound)
+        if self.packets_waiting == 0 || self.in_flight != 0 {
+            return;
+        }
+
+        let mut schedule = Vec::with_capacity(self.run_batch_size);
+        let mut service_start = run_time;
+        let mut visit_class: Option<usize> = None;
+
+        for _ in 0..self.run_batch_size {
+            let Some((class_id, packet, departure_time)) =
+                self.next_departure(visit_class, service_start)
+            else {
+                break;
+            };
+
+            if visit_class.is_none() {
+                visit_class = Some(class_id);
+            }
+
+            let delay = (departure_time - run_time).max(0.0);
+            schedule.push((Duration::from_secs_f64(delay), packet));
+            self.in_flight += 1;
+            service_start = departure_time;
+        }
+
+        if !schedule.is_empty() {
+            cx.schedule_event_batch(schedule, Self::send_and_run)
                 .unwrap();
-        });
+        }
     }
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        // creates a vector to collect events inside the closure
-        let mut events = Vec::new();
+        let run_time = quantize_time(now);
+        self.time = run_time;
 
-        // calls schedule_packets() without borrowing self inside the closure
-        self.schedule_packet(|now, timeout, mut outbound| {
-            // simulates sending the packet
-            outbound.departure_update(now + timeout);
-
-            // collects the outbound packet and timeout
-            events.push((timeout, outbound));
-        });
-
-        // processes collected events after schedule_packets returns
-        for (timeout, outbound) in events {
-            // updates the sent_packets vector
+        let mut service_start = run_time;
+        while let Some((_, packet, departure_time)) = self.next_departure(None, service_start) {
+            let outbound = packet;
             self.sent_packets.push(outbound.clone());
-
-            // updates statistics
             self.update_stats_on_packet_forwarded(&outbound);
-
-            // updates busy_until
-            self.busy_until = now + timeout;
-
-            // schedules the next run by calling test_run recursively
-            self.test_run(now + timeout);
+            service_start = departure_time;
         }
     }
 

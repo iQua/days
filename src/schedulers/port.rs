@@ -60,6 +60,7 @@ pub struct Port {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+    run_batch_size: usize,
 }
 
 impl Port {
@@ -71,6 +72,7 @@ impl Port {
         capacity_unit: CapacityUnit,
         drop_strategy: DropStrategy,
         ecn_threshold: f64,
+        run_batch_size: Option<usize>,
     ) -> Port {
         let scheduler_id = next_scheduler_id();
         let ecn_threshold = if ecn_threshold > 0.0 {
@@ -78,6 +80,9 @@ impl Port {
         } else {
             DEFAULT_ECN_THRESHOLD
         };
+        let run_batch_size = run_batch_size
+            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
+            .max(1);
 
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
@@ -123,6 +128,7 @@ impl Port {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            run_batch_size,
         }
     }
 
@@ -261,10 +267,10 @@ impl Port {
                 return;
             }
 
-            let mut schedule = Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE);
+            let mut schedule = Vec::with_capacity(self.run_batch_size);
             let mut service_start = run_time;
 
-            for _ in 0..Self::DEFAULT_RUN_BATCH_SIZE {
+            for _ in 0..self.run_batch_size {
                 let Some(mut packet) = self.queue.pop_front() else {
                     break;
                 };

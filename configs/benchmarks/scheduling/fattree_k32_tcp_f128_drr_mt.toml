@@ -20,6 +20,7 @@ concurrency_level = "accelerated"
     weights = [1]
     discipline = "DRR"
     drop = "TailDrop"
+    run_batch_size = 64
 
 [[flow_set]]
     flow_type = "TCP"
