@@ -1,5 +1,6 @@
 //! Implements a wire element that adds a propagation delay to packets.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use log::debug;
@@ -12,6 +13,8 @@ use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
+#[cfg(feature = "test")]
+use nexosim::time::MonotonicTime;
 
 use crate::flows::DistributionInfo;
 use crate::flows::packet::Packet;
@@ -25,9 +28,13 @@ pub struct Wire {
     rng: SmallRng,
 
     pub output: Output<Packet>,
+    pending_departures: VecDeque<Packet>,
+    run_batch_size: usize,
 }
 
 impl Wire {
+    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+
     pub fn new(wire_id: usize, delay_dist: DistributionInfo) -> Wire {
         let seed = get_seed();
         let rng = match seed {
@@ -40,15 +47,21 @@ impl Wire {
             delay_dist,
             rng,
             output: Output::default(),
+            pending_departures: VecDeque::new(),
+            run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
         }
+    }
+
+    pub fn set_run_batch_size(&mut self, run_batch_size: Option<usize>) {
+        self.run_batch_size = run_batch_size
+            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
+            .max(1);
     }
 
     #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
         #[cfg(feature = "test")]
         {
-            use nexosim::time::MonotonicTime;
-
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
             // makes sure that the current simulation time can be correctly retrieved from
@@ -90,14 +103,33 @@ impl Wire {
         packet.departure_update(arrival_time);
 
         if arrival_time > now {
-            cx.schedule_event(
-                Duration::from_secs_f64(arrival_time - now),
-                Self::forward_packet,
-                packet,
-            )
-            .unwrap();
+            self.pending_departures.push_back(packet);
+            self.schedule_departures(now, cx);
         } else {
             self.forward_packet(packet).await;
+        }
+    }
+
+    fn schedule_departures(&mut self, now: f64, cx: &mut Context<Self>) {
+        if self.pending_departures.is_empty() {
+            return;
+        }
+
+        let mut schedule = Vec::with_capacity(self.run_batch_size);
+        while let Some(packet) = self.pending_departures.pop_front() {
+            let delay = (packet.time - now).max(0.0);
+            schedule.push((Duration::from_secs_f64(delay), packet));
+
+            if schedule.len() == self.run_batch_size {
+                cx.schedule_event_batch(schedule, Self::forward_scheduled)
+                    .unwrap();
+                schedule = Vec::with_capacity(self.run_batch_size);
+            }
+        }
+
+        if !schedule.is_empty() {
+            cx.schedule_event_batch(schedule, Self::forward_scheduled)
+                .unwrap();
         }
     }
 
@@ -109,6 +141,10 @@ impl Wire {
         );
 
         self.output.send(packet).await;
+    }
+
+    async fn forward_scheduled(&mut self, packet: Packet, _: &mut Context<Self>) {
+        self.forward_packet(packet).await;
     }
 }
 
