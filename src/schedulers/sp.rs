@@ -562,27 +562,40 @@ mod tests {
     }
 
     #[test]
-    fn test_red_drop_strategy() {
+    fn test_ecn_threshold_marks_and_drops() {
         let priorities = vec![1];
 
         let mut sp = SPServer::new(
             1e6,
-            10, // capacity
+            10,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
-            DropStrategy::RED,
-            0.0,
+            DropStrategy::EcnThreshold,
+            0.8,
             priorities,
         );
 
-        // sends multiple packets to fill the queue
-        for i in 0..20 {
-            let packet = Packet::new(1024, i, 0, 0.0);
+        for i in 0..8 {
+            let packet = Packet::new(100, i, 0, 0.0);
             sp.on_packet_received(packet);
         }
 
-        // verifies RED dropped some packets before reaching capacity
-        assert!(sp.packets_dropped > 0);
+        let mut ect_packet = Packet::new(100, 100, 0, 0.0);
+        ect_packet.ecn = crate::flows::packet::EcnField::Ect0;
+        sp.on_packet_received(ect_packet);
+
+        assert_eq!(sp.queues[&1].len(), 9);
+        let marked = sp.queues[&1]
+            .iter()
+            .find(|packet| packet.packet_id == 100)
+            .expect("ECT packet should be enqueued");
+        assert_eq!(marked.ecn, crate::flows::packet::EcnField::Ce);
+
+        let non_ect_packet = Packet::new(100, 101, 0, 0.0);
+        sp.on_packet_received(non_ect_packet);
+
+        assert_eq!(sp.packets_dropped, 1);
+        assert_eq!(sp.queues[&1].len(), 9);
     }
 
     #[test]

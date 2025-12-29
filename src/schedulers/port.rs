@@ -61,6 +61,10 @@ pub struct Port {
     throughput_mean: f64,
     queueing_delay_mean: f64,
     run_batch_size: usize,
+
+    /// a vector of packets that have been sent out, only used for unit testing
+    #[cfg(test)]
+    sent_packets: Vec<Packet>,
 }
 
 impl Port {
@@ -129,6 +133,8 @@ impl Port {
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
             run_batch_size,
+            #[cfg(test)]
+            sent_packets: Vec::new(),
         }
     }
 
@@ -138,6 +144,32 @@ impl Port {
 
     pub fn set_queue_state(&mut self, state: std::sync::Arc<QueueState>) {
         self.queue_state = Some(state);
+    }
+
+    #[cfg(test)]
+    pub fn on_packet_received(&mut self, packet: Packet) {
+        let mut packet = packet;
+        let queue_length_for_drop = self.queue.len() + self.in_flight.saturating_sub(1);
+        let drop_action =
+            self.drop_strategy
+                .action(packet.size, self.queue_length, queue_length_for_drop);
+
+        match drop_action {
+            DropAction::Drop => {
+                self.packets_dropped += 1;
+                return;
+            }
+            DropAction::MarkEcn => {
+                if !packet.mark_ce() {
+                    self.packets_dropped += 1;
+                    return;
+                }
+            }
+            DropAction::Enqueue => {}
+        }
+
+        self.update_stats_on_packet_received(&packet);
+        self.queue.push_back(packet);
     }
 
     #[instrument(skip(self, cx))]
@@ -296,6 +328,25 @@ impl Port {
         }
     }
 
+    #[cfg(test)]
+    pub fn test_run(&mut self, now: f64) {
+        let run_time = quantize_time(now);
+        self.time = run_time;
+
+        let mut service_start = run_time;
+        while let Some(mut packet) = self.queue.pop_front() {
+            packet.queueing_delay_update(service_start);
+            let timeout = packet.size as f64 * 8.0 / self.rate;
+            let departure_time = quantize_after(service_start, timeout);
+            packet.departure_update(departure_time);
+
+            self.busy_until = departure_time;
+            self.sent_packets.push(packet.clone());
+            self.update_stats_on_packet_forwarded(&packet);
+            service_start = departure_time;
+        }
+    }
+
     async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
@@ -377,5 +428,88 @@ impl Model for Port {
         }
 
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flows::packet::EcnField;
+
+    #[test]
+    fn test_fifo_ordering() {
+        let mut port = Port::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            DropStrategy::TailDrop,
+            0.0,
+            None,
+        );
+
+        for i in 0..3 {
+            let packet = Packet::new(100, i, 0, 0.0);
+            port.on_packet_received(packet);
+        }
+
+        port.test_run(0.0);
+
+        let sent_ids: Vec<usize> = port.sent_packets.iter().map(|p| p.packet_id).collect();
+        assert_eq!(sent_ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_queue_overflow() {
+        let mut port = Port::new(
+            1e6,
+            2,
+            CapacityUnit::Packets,
+            DropStrategy::TailDrop,
+            0.0,
+            None,
+        );
+
+        for i in 0..3 {
+            let packet = Packet::new(100, i, 0, 0.0);
+            port.on_packet_received(packet);
+        }
+
+        assert_eq!(port.queue.len(), 2);
+        assert_eq!(port.packets_dropped, 1);
+    }
+
+    #[test]
+    fn test_ecn_threshold_marks_and_drops() {
+        let mut port = Port::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            DropStrategy::EcnThreshold,
+            0.8,
+            None,
+        );
+
+        for i in 0..8 {
+            let packet = Packet::new(100, i, 0, 0.0);
+            port.on_packet_received(packet);
+        }
+
+        let mut ect_packet = Packet::new(100, 100, 0, 0.0);
+        ect_packet.ecn = EcnField::Ect0;
+        port.on_packet_received(ect_packet);
+
+        assert_eq!(port.queue.len(), 9);
+        let marked = port
+            .queue
+            .iter()
+            .find(|packet| packet.packet_id == 100)
+            .expect("ECT packet should be enqueued");
+        assert_eq!(marked.ecn, EcnField::Ce);
+
+        let non_ect_packet = Packet::new(100, 101, 0, 0.0);
+        port.on_packet_received(non_ect_packet);
+
+        assert_eq!(port.packets_dropped, 1);
+        assert_eq!(port.queue.len(), 9);
     }
 }

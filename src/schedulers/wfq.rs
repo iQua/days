@@ -788,26 +788,39 @@ mod tests {
     }
 
     #[test]
-    fn test_red_drop_strategy() {
-        // tests using the RED packet drop strategy.
+    fn test_ecn_threshold_marks_and_drops() {
         let mut wfq = WFQServer::new(
             1e6,
-            10, // capacity
+            10,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
-            DropStrategy::RED, // uses RED
-            0.0,
+            DropStrategy::EcnThreshold,
+            0.8,
             vec![1],
         );
 
-        // sends multiple packets to fill the queue
-        for i in 0..20 {
-            let packet = Packet::new(1024, i, 0, 0.0);
-            wfq.on_packet_received(packet.clone());
+        for i in 0..8 {
+            let packet = Packet::new(100, i, 0, 0.0);
+            wfq.on_packet_received(packet);
         }
 
-        // verifies with RED, some packets should be randomly dropped before reaching capacity
-        assert!(wfq.packets_dropped >= 10);
+        let mut ect_packet = Packet::new(100, 100, 0, 0.0);
+        ect_packet.ecn = crate::flows::packet::EcnField::Ect0;
+        wfq.on_packet_received(ect_packet);
+
+        assert_eq!(wfq.scheduler_queue.len(), 9);
+        let marked = wfq
+            .scheduler_queue
+            .iter()
+            .find(|packet| packet.packet.packet_id == 100)
+            .expect("ECT packet should be enqueued");
+        assert_eq!(marked.packet.ecn, crate::flows::packet::EcnField::Ce);
+
+        let non_ect_packet = Packet::new(100, 101, 0, 0.0);
+        wfq.on_packet_received(non_ect_packet);
+
+        assert_eq!(wfq.packets_dropped, 1);
+        assert_eq!(wfq.scheduler_queue.len(), 9);
     }
 
     #[test]

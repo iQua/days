@@ -724,26 +724,62 @@ mod tests {
     }
 
     #[test]
-    fn test_red_drop_strategy() {
-        // tests using RED drop strategy.
+    fn test_ecn_threshold_marks_and_drops() {
         let mut drr = DRRServer::new(
             1e6,
-            10, // capacity
+            10,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
-            DropStrategy::RED, // uses RED
-            0.0,
+            DropStrategy::EcnThreshold,
+            0.8,
             vec![1],
         );
 
-        // sends multiple packets to fill the queue
-        for i in 0..20 {
-            let packet = Packet::new(1024, i, 0, 0.0);
-            drr.on_packet_received(packet.clone());
+        for i in 0..8 {
+            let packet = Packet::new(100, i, 0, 0.0);
+            drr.on_packet_received(packet);
         }
 
-        // verifies with RED, some packets should be randomly dropped before reaching capacity
-        assert!(drr.packets_dropped >= 10);
+        let mut ect_packet = Packet::new(100, 100, 0, 0.0);
+        ect_packet.ecn = crate::flows::packet::EcnField::Ect0;
+        drr.on_packet_received(ect_packet);
+
+        assert_eq!(drr.queues[0].len(), 9);
+        let marked = drr.queues[0]
+            .iter()
+            .find(|packet| packet.packet_id == 100)
+            .expect("ECT packet should be enqueued");
+        assert_eq!(marked.ecn, crate::flows::packet::EcnField::Ce);
+
+        let non_ect_packet = Packet::new(100, 101, 0, 0.0);
+        drr.on_packet_received(non_ect_packet);
+
+        assert_eq!(drr.packets_dropped, 1);
+        assert_eq!(drr.queues[0].len(), 9);
+    }
+
+    #[test]
+    fn test_deficit_accumulates_for_large_packet() {
+        let mut drr = DRRServer::new(
+            1e6,
+            10,
+            CapacityUnit::Packets,
+            Arc::new(|flow_id| flow_id),
+            DropStrategy::TailDrop,
+            0.0,
+            vec![1, 1],
+        );
+
+        let large_packet = Packet::new(2000, 1, 0, 0.0);
+        let small_packet = Packet::new(500, 2, 1, 0.0);
+
+        drr.on_packet_received(large_packet);
+        drr.on_packet_received(small_packet);
+
+        drr.test_run(0.0);
+
+        let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
+        assert_eq!(sent_packet_ids, vec![2, 1]);
     }
 
     #[test]

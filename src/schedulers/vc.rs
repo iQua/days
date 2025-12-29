@@ -688,24 +688,40 @@ mod tests {
     }
 
     #[test]
-    fn test_red_drop_strategy() {
+    fn test_ecn_threshold_marks_and_drops() {
         let flow_classes = Arc::new(|flow_id| flow_id);
         let mut vc = VirtualClockServer::new(
             1e6,
             10,
             CapacityUnit::Packets,
             flow_classes,
-            DropStrategy::RED,
-            0.0,
+            DropStrategy::EcnThreshold,
+            0.8,
             vec![1.0],
         );
 
-        for i in 0..20 {
-            let packet = Packet::new(1024, i, 0, 0.0);
+        for i in 0..8 {
+            let packet = Packet::new(100, i, 0, 0.0);
             vc.on_packet_received(packet);
         }
 
-        assert!(vc.packets_dropped >= 10);
+        let mut ect_packet = Packet::new(100, 100, 0, 0.0);
+        ect_packet.ecn = crate::flows::packet::EcnField::Ect0;
+        vc.on_packet_received(ect_packet);
+
+        assert_eq!(vc.scheduler_queue.len(), 9);
+        let marked = vc
+            .scheduler_queue
+            .iter()
+            .find(|packet| packet.packet.packet_id == 100)
+            .expect("ECT packet should be enqueued");
+        assert_eq!(marked.packet.ecn, crate::flows::packet::EcnField::Ce);
+
+        let non_ect_packet = Packet::new(100, 101, 0, 0.0);
+        vc.on_packet_received(non_ect_packet);
+
+        assert_eq!(vc.packets_dropped, 1);
+        assert_eq!(vc.scheduler_queue.len(), 9);
     }
 
     #[test]

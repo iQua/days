@@ -629,25 +629,38 @@ mod tests {
     }
 
     #[test]
-    fn test_red_drop_strategy() {
+    fn test_ecn_threshold_marks_and_drops() {
         let mut wrr = WRRServer::new(
             1e6,
             10,
             CapacityUnit::Packets,
             Arc::new(|flow_id| flow_id),
-            DropStrategy::RED,
-            0.0,
+            DropStrategy::EcnThreshold,
+            0.8,
             vec![1],
         );
 
-        // Send many packets to trigger RED dropping
-        for i in 0..20 {
-            let packet = Packet::new(1024, i, 0, 0.0);
+        for i in 0..8 {
+            let packet = Packet::new(100, i, 0, 0.0);
             wrr.on_packet_received(packet);
         }
 
-        assert!(wrr.packets_dropped > 0);
-        assert!(wrr.queues.iter().map(|q| q.len()).sum::<usize>() < 20);
+        let mut ect_packet = Packet::new(100, 100, 0, 0.0);
+        ect_packet.ecn = crate::flows::packet::EcnField::Ect0;
+        wrr.on_packet_received(ect_packet);
+
+        assert_eq!(wrr.queues[0].len(), 9);
+        let marked = wrr.queues[0]
+            .iter()
+            .find(|packet| packet.packet_id == 100)
+            .expect("ECT packet should be enqueued");
+        assert_eq!(marked.ecn, crate::flows::packet::EcnField::Ce);
+
+        let non_ect_packet = Packet::new(100, 101, 0, 0.0);
+        wrr.on_packet_received(non_ect_packet);
+
+        assert_eq!(wrr.packets_dropped, 1);
+        assert_eq!(wrr.queues[0].len(), 9);
     }
 
     #[test]
