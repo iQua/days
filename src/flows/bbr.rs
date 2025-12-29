@@ -793,4 +793,39 @@ mod tests {
 
         assert!(bbr.state.get_pacing_rate() > initial_pacing_rate);
     }
+
+    #[test]
+    fn test_probe_rtt_exit_to_probe_bw() {
+        let mut bbr = TCPBBR::new();
+        let state = &mut bbr.state;
+
+        state.mode = BBRMode::ProbeRTT;
+        state.full_bw_reached = true;
+        state.min_rtt = 0.1;
+        state.max_bw = 10_000.0;
+        state.inflight = 0;
+
+        state.probe_rtt_round_done = false;
+        state.probe_rtt_done_stamp = 0.0;
+        state.handle_probe_rtt(1.0);
+        assert!(state.probe_rtt_done_stamp > 1.0);
+        assert_eq!(state.mode, BBRMode::ProbeRTT);
+
+        state.probe_rtt_round_done = true;
+        let done_stamp = state.probe_rtt_done_stamp;
+        state.handle_probe_rtt(done_stamp + 0.01);
+
+        assert_eq!(state.mode, BBRMode::ProbeBW);
+    }
+
+    #[test]
+    fn test_loss_and_ecn_mark_round_flags() {
+        let mut bbr = TCPBBR::new();
+        bbr.state.min_rtt = 0.1;
+
+        simulate_ack(&mut bbr, 1024, 0.1, 1.0, 1024, true, true);
+
+        assert!(bbr.state.loss_in_round);
+        assert!(bbr.state.ecn_in_round);
+    }
 }

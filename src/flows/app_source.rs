@@ -284,571 +284,87 @@ impl AppDataSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use futures::join;
+    use tachyonix::TryRecvError;
 
-    /// Test basic byte-range extraction logic
+    async fn respond_once(actor: &mut AppSourceBuffer) {
+        let req = actor.rx.recv().await.expect("expected request");
+        let start = req.start.min(actor.buffer.len());
+        let end = (req.start + req.size).min(actor.buffer.len());
+        let data = actor.buffer[start..end].to_vec();
+        let _ = req.respond_to.send(data).await;
+    }
+
     #[test]
-    fn test_app_actor_basic_byte_extraction() {
+    fn test_handle_pull_respects_offset_and_length() {
         let config = AppBufferConfig::default();
+        let buffer: Vec<u8> = (0..20u8).collect();
+        let mut handle = AppSourceBufferHandle::from_buffer(buffer, &config);
+        let mut actor = handle.take_actor().expect("missing actor");
 
-        // Create a buffer with known data: [0, 1, 2, 3, ..., 99]
-        let buffer: Vec<u8> = (0..100u8).collect();
-        let (_actor, _tx) = AppSourceBuffer::new(buffer.clone(), &config);
+        let mut handle = handle.with_offset(5, Some(10));
+        let data = block_on(async {
+            let pull = handle.pull(6);
+            let respond = respond_once(&mut actor);
+            let (data, _) = join!(pull, respond);
+            data
+        });
+        assert_eq!(data, vec![5u8, 6, 7, 8, 9, 10]);
+        assert_eq!(handle.get_cursor(), 6);
 
-        // Test the byte slicing logic directly
-        let start = 10usize;
-        let size = 10usize;
-        let buffer_len = buffer.len();
-
-        let slice_start = start.min(buffer_len);
-        let slice_end = (start + size).min(buffer_len);
-        let data = buffer[slice_start..slice_end].to_vec();
-
-        assert_eq!(slice_start, 10);
-        assert_eq!(slice_end, 20);
-        assert_eq!(data.len(), 10);
-        assert_eq!(data[0], 10);
-        assert_eq!(data[9], 19);
+        let data = block_on(async {
+            let pull = handle.pull(10);
+            let respond = respond_once(&mut actor);
+            let (data, _) = join!(pull, respond);
+            data
+        });
+        assert_eq!(data, vec![11u8, 12, 13, 14]);
+        assert_eq!(handle.get_cursor(), 10);
     }
 
-    /// Test boundary conditions for byte extraction
     #[test]
-    fn test_app_actor_boundary_conditions() {
-        let buffer_size = 100;
-
-        // Test 1: Request at exact buffer start
-        let start = 0usize.min(buffer_size);
-        let end = 10usize.min(buffer_size);
-        assert_eq!(start, 0);
-        assert_eq!(end, 10);
-
-        // Test 2: Request at exact buffer end
-        let start = 90usize.min(buffer_size);
-        let end = (90 + 10).min(buffer_size);
-        assert_eq!(start, 90);
-        assert_eq!(end, 100);
-
-        // Test 3: Request beyond buffer (should be clamped)
-        let start = 90usize.min(buffer_size);
-        let end = (90 + 20).min(buffer_size); // Request 20 bytes but only 10 available
-        assert_eq!(start, 90);
-        assert_eq!(end, 100);
-
-        // Test 4: Request completely beyond buffer
-        let start = 150usize.min(buffer_size);
-        let end = (150 + 10).min(buffer_size);
-        assert_eq!(start, 100);
-        assert_eq!(end, 100); // Empty range
-
-        // Test 5: Zero-size request
-        let start = 50usize.min(buffer_size);
-        let end = 50usize.min(buffer_size);
-        assert_eq!(start, 50);
-        assert_eq!(end, 50); // Empty range
-    }
-
-    /// Test AppSourceBufferHandle cursor management
-    #[test]
-    fn test_handle_cursor_tracking() {
-        // Simulate cursor advancement
-        let mut cursor = 0usize;
-        let length = Some(100usize);
-
-        // First pull: 30 bytes
-        let requested = 30;
-        let allowed = length
-            .map(|len| len.saturating_sub(cursor))
-            .unwrap_or(requested);
-        let actual_size = requested.min(allowed);
-        assert_eq!(actual_size, 30);
-        cursor += actual_size;
-        assert_eq!(cursor, 30);
-
-        // Second pull: 50 bytes
-        let requested = 50;
-        let allowed = length
-            .map(|len| len.saturating_sub(cursor))
-            .unwrap_or(requested);
-        let actual_size = requested.min(allowed);
-        assert_eq!(actual_size, 50);
-        cursor += actual_size;
-        assert_eq!(cursor, 80);
-
-        // Third pull: 50 bytes (but only 20 remaining)
-        let requested = 50;
-        let allowed = length
-            .map(|len| len.saturating_sub(cursor))
-            .unwrap_or(requested);
-        let actual_size = requested.min(allowed);
-        assert_eq!(actual_size, 20);
-        cursor += actual_size;
-        assert_eq!(cursor, 100);
-
-        // Fourth pull: should return 0 (exhausted)
-        let requested = 10;
-        let allowed = length
-            .map(|len| len.saturating_sub(cursor))
-            .unwrap_or(requested);
-        let actual_size = requested.min(allowed);
-        assert_eq!(actual_size, 0);
-    }
-
-    /// Test offset-based handles for RingAllReduce
-    #[test]
-    fn test_handle_with_offset() {
-        // Simulate RingAllReduce with 4 nodes, 1000 bytes total
-        let total_size = 1000;
-        let num_chunks = 4;
-        let chunk_size = total_size / num_chunks; // 250 bytes per chunk
-
-        // Chunk 0: bytes 0-249
-        let offset_0 = 0;
-        let length_0 = chunk_size;
-        assert_eq!(offset_0, 0);
-        assert_eq!(length_0, 250);
-
-        // Chunk 1: bytes 250-499
-        let offset_1 = chunk_size;
-        let length_1 = chunk_size;
-        assert_eq!(offset_1, 250);
-        assert_eq!(length_1, 250);
-
-        // Chunk 2: bytes 500-749
-        let offset_2 = 2 * chunk_size;
-        let length_2 = chunk_size;
-        assert_eq!(offset_2, 500);
-        assert_eq!(length_2, 250);
-
-        // Chunk 3: bytes 750-999 (last chunk might be different if not evenly divisible)
-        let offset_3 = 3 * chunk_size;
-        let length_3 = total_size - offset_3;
-        assert_eq!(offset_3, 750);
-        assert_eq!(length_3, 250);
-    }
-
-    /// Test offset calculations for non-evenly divisible buffers
-    #[test]
-    fn test_handle_with_offset_uneven() {
-        // 1000 bytes divided by 3 chunks
-        let total_size = 1000;
-        let num_chunks = 3;
-        let chunk_size = total_size / num_chunks; // 333 bytes
-
-        // Chunk 0: bytes 0-332
-        let offset_0 = 0;
-        let length_0 = chunk_size;
-        assert_eq!(offset_0, 0);
-        assert_eq!(length_0, 333);
-
-        // Chunk 1: bytes 333-665
-        let offset_1 = chunk_size;
-        let length_1 = chunk_size;
-        assert_eq!(offset_1, 333);
-        assert_eq!(length_1, 333);
-
-        // Chunk 2: bytes 666-999 (last chunk gets the remainder)
-        let offset_2 = 2 * chunk_size;
-        let length_2 = total_size - offset_2; // Should be 334 to cover remaining bytes
-        assert_eq!(offset_2, 666);
-        assert_eq!(length_2, 334);
-
-        // Verify all bytes are covered
-        assert_eq!(length_0 + length_1 + length_2, total_size);
-    }
-
-    /// Test absolute offset calculation for nested offsets
-    #[test]
-    fn test_nested_offset_calculation() {
-        // Base handle at offset 100
-        let base_offset: usize = 100;
-        let base_length: Option<usize> = Some(200); // bytes 100-299
-
-        // Create a sub-handle at offset 50 within the base
-        let sub_offset: usize = 50;
-        let absolute_offset = base_offset.saturating_add(sub_offset);
-        let effective_length = base_length.map(|len| len.saturating_sub(sub_offset));
-
-        assert_eq!(absolute_offset, 150); // 100 + 50
-        assert_eq!(effective_length, Some(150)); // 200 - 50
-
-        // The sub-handle should access bytes 150-299 of the original buffer
-    }
-
-    /// Test that zero-length handles work correctly
-    #[test]
-    fn test_zero_length_handle() {
-        let cursor = 0usize;
-        let length = Some(0usize);
-
-        let requested = 100;
-        let allowed = length
-            .map(|len| len.saturating_sub(cursor))
-            .unwrap_or(requested);
-        let actual_size = requested.min(allowed);
-
-        assert_eq!(actual_size, 0);
-    }
-
-    /// Test AppDataSource create_source_buffer constructor
-    #[test]
-    fn test_create_source_buffer_creation() {
+    fn test_handle_pull_zero_size_no_request() {
         let config = AppBufferConfig::default();
-        let total_size = 1024;
+        let buffer: Vec<u8> = (0..10u8).collect();
+        let mut handle = AppSourceBufferHandle::from_buffer(buffer, &config);
+        let mut actor = handle.take_actor().expect("missing actor");
 
-        let mut data_src = AppDataSource::create_source_buffer(total_size, config);
-        let actor = data_src
-            .take_actor()
-            .expect("actor should be available after creation");
+        let data = block_on(handle.pull(0));
+        assert!(data.is_empty());
+        assert_eq!(handle.get_cursor(), 0);
+        assert!(matches!(actor.rx.try_recv(), Err(TryRecvError::Empty)));
+    }
 
-        // Verify actor has correct buffer size
-        assert_eq!(actor.buffer.len(), total_size);
+    #[test]
+    fn test_handle_with_offset_infers_length() {
+        let config = AppBufferConfig::default();
+        let data_src = AppDataSource::create_source_buffer(1000, config);
+        let handle = data_src.handle_with_offset(250, None);
 
-        // Verify handle has correct total size
-        let handle = data_src.handle();
-        assert_eq!(handle.get_total_size(), Some(total_size));
-        assert_eq!(handle.get_offset(), 0);
+        assert_eq!(handle.get_offset(), 250);
+        assert_eq!(handle.get_length(), Some(750));
         assert_eq!(handle.get_cursor(), 0);
     }
 
-    /// Test that multiple handles can be created from the same datasource
     #[test]
-    fn test_multiple_handles_from_same_source() {
+    fn test_handle_clone_resets_cursor() {
         let config = AppBufferConfig::default();
-        let total_size = 1000;
-
-        let data_src = AppDataSource::create_source_buffer(total_size, config);
-
-        // Create multiple handles with different offsets (simulating Broadcast)
-        let handle1 = data_src.handle(); // Full buffer
-        let handle2 = data_src.handle(); // Full buffer again
-
-        assert_eq!(handle1.get_offset(), 0);
-        assert_eq!(handle1.get_length(), Some(total_size));
-        assert_eq!(handle2.get_offset(), 0);
-        assert_eq!(handle2.get_length(), Some(total_size));
-
-        // Both handles should be independent (different cursors)
-        assert_eq!(handle1.get_cursor(), 0);
-        assert_eq!(handle2.get_cursor(), 0);
-    }
-
-    /// Test chunk offset handles for RingAllReduce
-    #[test]
-    fn test_ring_allreduce_chunk_handles() {
-        let config = AppBufferConfig::default();
-        let total_size = 512;
-        let num_nodes = 4;
-        let chunk_size = total_size / num_nodes; // 128 bytes per chunk
-
-        let data_src = AppDataSource::create_source_buffer(total_size, config);
-
-        // Create handles for each chunk
-        let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
-        let chunk1 = data_src.handle_with_offset(chunk_size, Some(chunk_size));
-        let chunk2 = data_src.handle_with_offset(2 * chunk_size, Some(chunk_size));
-        let chunk3 = data_src.handle_with_offset(3 * chunk_size, Some(chunk_size));
-
-        // Verify offsets
-        assert_eq!(chunk0.get_offset(), 0);
-        assert_eq!(chunk1.get_offset(), 128);
-        assert_eq!(chunk2.get_offset(), 256);
-        assert_eq!(chunk3.get_offset(), 384);
-
-        // Verify lengths
-        assert_eq!(chunk0.get_length(), Some(128));
-        assert_eq!(chunk1.get_length(), Some(128));
-        assert_eq!(chunk2.get_length(), Some(128));
-        assert_eq!(chunk3.get_length(), Some(128));
-
-        // Verify cursors are independent
-        assert_eq!(chunk0.get_cursor(), 0);
-        assert_eq!(chunk1.get_cursor(), 0);
-        assert_eq!(chunk2.get_cursor(), 0);
-        assert_eq!(chunk3.get_cursor(), 0);
-    }
-
-    /// Test that TCP packetization creates packets with correct sequence numbers
-    #[test]
-    fn test_tcp_packetization_sequence_numbers() {
-        use crate::flows::packet::Packet;
-
-        let config = AppBufferConfig::default();
-        let total_size = 1536; // 3 MSS worth of data (512 * 3)
-        let mss = 512;
-
-        let data_src = AppDataSource::create_source_buffer(total_size, config);
-        let _handle = data_src.handle();
-
-        // Simulate TCP packetization logic
-        let mut packets = Vec::new();
-        let mut next_seq = 0;
-        let flow_id = 42;
-
-        // Simulate pulling data and creating packets (what TCPPacketSource does)
-        let data: Vec<u8> = vec![0u8; total_size]; // Simulated pull result
-        let mut offset = 0;
-
-        while offset < data.len() {
-            let chunk_size = mss.min(data.len() - offset);
-            let packet = Packet::new(chunk_size, next_seq, flow_id, 0.0);
-
-            packets.push(packet.clone());
-            next_seq += chunk_size;
-            offset += chunk_size;
-        }
-
-        // Verify we created exactly 3 packets
-        assert_eq!(packets.len(), 3);
-
-        // Verify sequence numbers are correct
-        assert_eq!(packets[0].packet_id, 0);
-        assert_eq!(packets[0].size, 512);
-
-        assert_eq!(packets[1].packet_id, 512);
-        assert_eq!(packets[1].size, 512);
-
-        assert_eq!(packets[2].packet_id, 1024);
-        assert_eq!(packets[2].size, 512);
-
-        // Verify flow IDs
-        assert!(packets.iter().all(|p| p.flow_id == flow_id));
-    }
-
-    /// Test TCP packetization with non-MSS-aligned data
-    #[test]
-    fn test_tcp_packetization_non_aligned() {
-        use crate::flows::packet::Packet;
-
-        let total_size = 1300; // Not evenly divisible by 512
-        let mss = 512;
-
-        let data: Vec<u8> = vec![0u8; total_size];
-        let mut packets = Vec::new();
-        let mut next_seq = 0;
-        let mut offset = 0;
-
-        while offset < data.len() {
-            let chunk_size = mss.min(data.len() - offset);
-            let packet = Packet::new(chunk_size, next_seq, 0, 0.0);
-
-            packets.push(packet.clone());
-            next_seq += chunk_size;
-            offset += chunk_size;
-        }
-
-        // Should create 3 packets: 512 + 512 + 276
-        assert_eq!(packets.len(), 3);
-        assert_eq!(packets[0].size, 512);
-        assert_eq!(packets[1].size, 512);
-        assert_eq!(packets[2].size, 276); // Remainder
-
-        // Verify sequence numbers
-        assert_eq!(packets[0].packet_id, 0);
-        assert_eq!(packets[1].packet_id, 512);
-        assert_eq!(packets[2].packet_id, 1024);
-
-        // Verify total coverage
-        let total_bytes: usize = packets.iter().map(|p| p.size).sum();
-        assert_eq!(total_bytes, total_size);
-    }
-
-    /// Test that small data (< MSS) creates a single packet
-    #[test]
-    fn test_tcp_packetization_small_data() {
-        use crate::flows::packet::Packet;
-
-        let total_size = 100; // Much smaller than MSS
-        let mss = 512;
-
-        let data: Vec<u8> = vec![0u8; total_size];
-        let mut packets = Vec::new();
-        let mut offset = 0;
-        let mut next_seq = 0;
-
-        while offset < data.len() {
-            let chunk_size = mss.min(data.len() - offset);
-            let packet = Packet::new(chunk_size, next_seq, 0, 0.0);
-
-            packets.push(packet);
-            next_seq += chunk_size;
-            offset += chunk_size;
-        }
-
-        // Should create exactly 1 packet
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].size, 100);
-        assert_eq!(packets[0].packet_id, 0);
-    }
-
-    /// Test Broadcast scenario: multiple flows share the same data
-    #[test]
-    fn test_broadcast_multiple_flows_same_data() {
-        let config = AppBufferConfig::default();
-        let total_size = 1024;
-
-        let data_src = AppDataSource::create_source_buffer(total_size, config);
-
-        // Create handles for 4 different flows (simulating broadcast to 4 destinations)
-        let handle1 = data_src.handle();
-        let handle2 = data_src.handle();
-        let handle3 = data_src.handle();
-        let handle4 = data_src.handle();
-
-        // All handles should access the same data range
-        assert_eq!(handle1.get_offset(), 0);
-        assert_eq!(handle2.get_offset(), 0);
-        assert_eq!(handle3.get_offset(), 0);
-        assert_eq!(handle4.get_offset(), 0);
-
-        assert_eq!(handle1.get_length(), Some(total_size));
-        assert_eq!(handle2.get_length(), Some(total_size));
-        assert_eq!(handle3.get_length(), Some(total_size));
-        assert_eq!(handle4.get_length(), Some(total_size));
-
-        // But cursors are independent (each flow tracks its own progress)
-        assert_eq!(handle1.get_cursor(), 0);
-        assert_eq!(handle2.get_cursor(), 0);
-        assert_eq!(handle3.get_cursor(), 0);
-        assert_eq!(handle4.get_cursor(), 0);
-    }
-
-    /// Test RingAllReduce scenario: different flows access different chunks
-    #[test]
-    fn test_ring_allreduce_chunk_partitioning() {
-        let config = AppBufferConfig::default();
-        let total_size = 2048;
-        let num_nodes = 4;
-        let chunk_size = total_size / num_nodes; // 512 bytes per chunk
-
-        let data_src = AppDataSource::create_source_buffer(total_size, config);
-
-        // Create handles for each chunk (each flow in RingAllReduce sends one chunk)
-        let mut handles = Vec::new();
-        for i in 0..num_nodes {
-            let offset = i * chunk_size;
-            let length = if i == num_nodes - 1 {
-                total_size - offset // Last chunk gets remainder
-            } else {
-                chunk_size
-            };
-            let handle = data_src.handle_with_offset(offset, Some(length));
-            handles.push(handle);
-        }
-
-        // Verify each handle accesses a different chunk
-        assert_eq!(handles[0].get_offset(), 0);
-        assert_eq!(handles[0].get_length(), Some(512));
-
-        assert_eq!(handles[1].get_offset(), 512);
-        assert_eq!(handles[1].get_length(), Some(512));
-
-        assert_eq!(handles[2].get_offset(), 1024);
-        assert_eq!(handles[2].get_length(), Some(512));
-
-        assert_eq!(handles[3].get_offset(), 1536);
-        assert_eq!(handles[3].get_length(), Some(512));
-
-        // Verify no overlaps
-        for i in 0..num_nodes {
-            for j in (i + 1)..num_nodes {
-                let end_i = handles[i].get_offset() + handles[i].get_length().unwrap();
-                let start_j = handles[j].get_offset();
-                assert!(end_i <= start_j, "Chunks {} and {} overlap!", i, j);
-            }
-        }
-
-        // Verify full coverage
-        let total_coverage: usize = handles.iter().map(|h| h.get_length().unwrap()).sum();
-        assert_eq!(total_coverage, total_size);
-    }
-
-    /// Test cursor advancement after simulated pulls
-    #[test]
-    fn test_cursor_advancement_simulation() {
-        // Simulate multiple pull operations
-        let mut cursor = 0;
-        let length = Some(1000usize);
-
-        // Pull 1: 300 bytes
-        let req1 = 300;
-        let allowed1 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req1);
-        let actual1 = req1.min(allowed1);
-        cursor += actual1;
-        assert_eq!(cursor, 300);
-
-        // Pull 2: 500 bytes
-        let req2 = 500;
-        let allowed2 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req2);
-        let actual2 = req2.min(allowed2);
-        cursor += actual2;
-        assert_eq!(cursor, 800);
-
-        // Pull 3: 300 bytes (but only 200 left)
-        let req3 = 300;
-        let allowed3 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req3);
-        let actual3 = req3.min(allowed3);
-        cursor += actual3;
-        assert_eq!(cursor, 1000);
-        assert_eq!(actual3, 200); // Only 200 bytes were available
-
-        // Pull 4: should return 0 (exhausted)
-        let req4 = 100;
-        let allowed4 = length.map(|l| l.saturating_sub(cursor)).unwrap_or(req4);
-        let actual4 = req4.min(allowed4);
-        assert_eq!(actual4, 0);
-    }
-
-    /// Test packet metadata is created correctly (not cloned from wrong source)
-    #[test]
-    fn test_packet_metadata_correctness() {
-        use crate::flows::packet::Packet;
-
-        let flow_id = 123;
-        let start_seq = 5000;
-        let timestamp = 42.5;
-        let size = 256;
-
-        // Create a packet with specific metadata
-        let packet = Packet::new(size, start_seq, flow_id, timestamp);
-
-        // Verify all metadata is correct
-        assert_eq!(packet.size, size);
-        assert_eq!(packet.packet_id, start_seq);
-        assert_eq!(packet.flow_id, flow_id);
-        assert_eq!(packet.time, timestamp);
-
-        // This verifies that we're creating fresh packets with correct metadata,
-        // not cloning and modifying existing packets (which was the old buggy approach)
-    }
-
-    /// Test RingAllReduce with uneven chunk sizes
-    #[test]
-    fn test_ring_allreduce_uneven_chunks() {
-        let config = AppBufferConfig::default();
-        let total_size = 1000; // Not evenly divisible by 3
-        let num_nodes = 3;
-        let chunk_size = total_size / num_nodes; // 333
-
-        let data_src = AppDataSource::create_source_buffer(total_size, config);
-
-        let chunk0 = data_src.handle_with_offset(0, Some(chunk_size));
-        let chunk1 = data_src.handle_with_offset(chunk_size, Some(chunk_size));
-        let chunk2_offset = 2 * chunk_size;
-        let chunk2_len = total_size - chunk2_offset; // Remainder
-        let chunk2 = data_src.handle_with_offset(chunk2_offset, Some(chunk2_len));
-
-        assert_eq!(chunk0.get_offset(), 0);
-        assert_eq!(chunk0.get_length(), Some(333));
-
-        assert_eq!(chunk1.get_offset(), 333);
-        assert_eq!(chunk1.get_length(), Some(333));
-
-        assert_eq!(chunk2.get_offset(), 666);
-        assert_eq!(chunk2.get_length(), Some(334)); // Gets the extra byte
-
-        // Verify complete coverage
-        let total = chunk0.get_length().unwrap()
-            + chunk1.get_length().unwrap()
-            + chunk2.get_length().unwrap();
-        assert_eq!(total, total_size);
+        let buffer: Vec<u8> = (0..10u8).collect();
+        let mut handle = AppSourceBufferHandle::from_buffer(buffer, &config);
+        let mut actor = handle.take_actor().expect("missing actor");
+
+        let _ = block_on(async {
+            let pull = handle.pull(4);
+            let respond = respond_once(&mut actor);
+            let (data, _) = join!(pull, respond);
+            data
+        });
+        assert_eq!(handle.get_cursor(), 4);
+
+        let clone = handle.clone();
+        assert_eq!(clone.get_cursor(), 0);
+        assert_eq!(clone.get_offset(), handle.get_offset());
+        assert_eq!(clone.get_length(), handle.get_length());
     }
 }

@@ -1,7 +1,7 @@
 #![cfg(all(feature = "test", feature = "l2_pfc"))]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nexosim::model::{Context, InitializedModel, Model};
@@ -68,6 +68,60 @@ impl PfcSink {
 
 impl Model for PfcSink {}
 
+struct DelayedFrameSource {
+    delay: Duration,
+    size: usize,
+    output: Output<LinkFrame>,
+}
+
+impl DelayedFrameSource {
+    fn new(delay: Duration, size: usize) -> Self {
+        Self {
+            delay,
+            size,
+            output: Output::default(),
+        }
+    }
+
+    async fn send_once(&mut self, _: (), cx: &mut Context<Self>) {
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let mut packet = Packet::new(self.size, 0, 0, now);
+        packet.set_priority(0);
+        self.output.send(LinkFrame::Data(packet)).await;
+    }
+}
+
+impl Model for DelayedFrameSource {
+    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        cx.schedule_event(self.delay, Self::send_once, ())
+            .unwrap();
+        self.into()
+    }
+}
+
+struct GateToggle {
+    open: Arc<AtomicBool>,
+    delay: Duration,
+}
+
+impl GateToggle {
+    fn new(open: Arc<AtomicBool>, delay: Duration) -> Self {
+        Self { open, delay }
+    }
+
+    async fn open_gate(&mut self, _: (), _: &mut Context<Self>) {
+        self.open.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Model for GateToggle {
+    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+        cx.schedule_event(self.delay, Self::open_gate, ())
+            .unwrap();
+        self.into()
+    }
+}
+
 #[test]
 fn test_pfc_pause_frames_emitted() {
     let mut pfc_config = PfcConfig {
@@ -114,5 +168,75 @@ fn test_pfc_pause_frames_emitted() {
     assert!(
         pause.load(Ordering::Relaxed) > 0,
         "expected pause frames to be emitted"
+    );
+}
+
+#[test]
+fn test_pfc_resume_frames_emitted_after_drain() {
+    let mut pfc_config = PfcConfig {
+        xoff: [500; 8],
+        xon: [100; 8],
+        pause_quanta: [10; 8],
+        buffer_capacity: [0; 8],
+        refresh_interval: None,
+        drain_interval: Some(0.0005),
+    };
+    pfc_config.pause_quanta[0] = 10;
+
+    let open = Arc::new(AtomicBool::new(false));
+    let can_forward = {
+        let open = open.clone();
+        Arc::new(move |_packet: &Packet| open.load(Ordering::Relaxed))
+    };
+    let ingress = PfcIngressPort::new(0, 0, pfc_config, can_forward);
+
+    let source = FrameSource::new(2, 600);
+    let late_source = DelayedFrameSource::new(Duration::from_secs_f64(0.003), 600);
+    let pause = Arc::new(AtomicUsize::new(0));
+    let resume = Arc::new(AtomicUsize::new(0));
+    let sink = PfcSink::new(pause.clone(), resume.clone());
+    let toggle = GateToggle::new(open.clone(), Duration::from_secs_f64(0.002));
+
+    let source_mbox = Mailbox::new();
+    let late_source_mbox = Mailbox::new();
+    let ingress_mbox = Mailbox::new();
+    let sink_mbox = Mailbox::new();
+    let toggle_mbox = Mailbox::new();
+
+    let mut ingress = ingress;
+    let mut source = source;
+    let mut late_source = late_source;
+    let sink = sink;
+    let toggle = toggle;
+
+    source
+        .output
+        .connect(PfcIngressPort::frame_received, &ingress_mbox);
+    late_source
+        .output
+        .connect(PfcIngressPort::frame_received, &ingress_mbox);
+    ingress
+        .pfc_output
+        .connect(PfcSink::frame_received, &sink_mbox);
+
+    let t0 = MonotonicTime::EPOCH;
+    let (mut sim, _) = SimInit::new()
+        .add_model(source, source_mbox, "FrameSource")
+        .add_model(late_source, late_source_mbox, "LateFrameSource")
+        .add_model(ingress, ingress_mbox, "PfcIngress")
+        .add_model(toggle, toggle_mbox, "GateToggle")
+        .add_model(sink, sink_mbox, "PfcSink")
+        .init(t0)
+        .expect("failed to init simulation");
+
+    let _ = sim.step_until(Duration::from_secs_f64(0.01));
+
+    assert!(
+        pause.load(Ordering::Relaxed) > 0,
+        "expected pause frames to be emitted"
+    );
+    assert!(
+        resume.load(Ordering::Relaxed) > 0,
+        "expected resume frames to be emitted"
     );
 }

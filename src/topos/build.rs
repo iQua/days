@@ -340,24 +340,6 @@ mod tests {
         config.build().unwrap()
     }
 
-    #[test]
-    fn test_validate_fattree_params() {
-        assert!(validate_fattree_params(2).is_ok());
-        assert!(validate_fattree_params(4).is_ok());
-        assert!(validate_fattree_params(0).is_err());
-        assert!(validate_fattree_params(3).is_err());
-    }
-
-    #[test]
-    fn test_validate_torus_params() {
-        assert!(validate_torus_params(1, 2).is_ok());
-        assert!(validate_torus_params(2, 2).is_ok());
-        assert!(validate_torus_params(3, 2).is_ok());
-        assert!(validate_torus_params(0, 2).is_err());
-        assert!(validate_torus_params(4, 2).is_err());
-        assert!(validate_torus_params(1, 0).is_err());
-    }
-
     // FatTree Tests
     mod fattree_tests {
         use super::*;
@@ -540,5 +522,132 @@ mod tests {
             let expected: HashSet<_> = vec![4, 6, 1, 9].into_iter().collect();
             assert_eq!(neighbors, expected);
         }
+    }
+
+    #[test]
+    fn test_build_graph_missing_torus_config() {
+        let toml_content = r#"
+            [topology]
+            category = "Torus"
+
+            [switch]
+            port_rate = 8000
+            capacity = 100
+            weights = [1]
+            discipline = "FIFO"
+            drop = "RED"
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let result = build_graph(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "missing torus config should error");
+    }
+
+    #[test]
+    fn test_build_graph_custom_empty_edges_errors() {
+        let toml_content = r#"
+            edges = []
+            hosts = [0, 1]
+
+            [switch]
+            port_rate = 8000
+            capacity = 100
+            weights = [1]
+            discipline = "FIFO"
+            drop = "RED"
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let result = build_graph(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "empty edge list should error");
+    }
+
+    #[test]
+    fn test_build_graph_custom_empty_hosts_errors() {
+        let toml_content = r#"
+            edges = [[0, 1]]
+            hosts = []
+
+            [switch]
+            port_rate = 8000
+            capacity = 100
+            weights = [1]
+            discipline = "FIFO"
+            drop = "RED"
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let result = build_graph(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "empty host list should error");
+    }
+
+    #[test]
+    fn test_build_graph_fattree_invalid_k() {
+        let toml_content = r#"
+            [topology]
+            category = "FatTree"
+
+            [topology.fat_tree]
+            k = 3
+
+            [switch]
+            port_rate = 8000
+            capacity = 100
+            weights = [1]
+            discipline = "FIFO"
+            drop = "RED"
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let result = build_graph(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "odd k should error");
+    }
+
+    #[test]
+    fn test_build_graph_torus_invalid_dimension() {
+        let toml_content = r#"
+            [topology]
+            category = "Torus"
+
+            [topology.torus]
+            dim = 4
+            n = 2
+
+            [switch]
+            port_rate = 8000
+            capacity = 100
+            weights = [1]
+            discipline = "FIFO"
+            drop = "RED"
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let result = build_graph(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "unsupported torus dimension should error");
     }
 }

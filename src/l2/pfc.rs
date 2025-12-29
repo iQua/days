@@ -702,4 +702,70 @@ mod tests {
             .expect("frame should be released after resume");
         assert!((frame.time() - 0.5).abs() <= 1e-9);
     }
+
+    #[test]
+    fn test_pause_duration_zero_rate() {
+        let mut quanta = [0u16; NUM_PRIORITIES];
+        quanta[1] = 5;
+        let pfc = PfcFrame::new(0.0, 0, 0, 0, 1 << 1, quanta);
+
+        assert_eq!(pfc.pause_duration(1, 0.0), 0.0);
+        assert_eq!(pfc.pause_duration(1, -10.0), 0.0);
+    }
+
+    #[test]
+    fn test_pfc_pause_is_priority_scoped() {
+        let rate_bps = 1e9;
+        let mut gate = PfcEgressGate::new(0, rate_bps);
+
+        let mut p3 = Packet::new(1500, 1, 0, 0.0);
+        p3.set_priority(3);
+        gate.test_enqueue(LinkFrame::Data(p3));
+
+        let mut p5 = Packet::new(1500, 2, 0, 0.0);
+        p5.set_priority(5);
+        gate.test_enqueue(LinkFrame::Data(p5));
+
+        let mut quanta = [0u16; NUM_PRIORITIES];
+        quanta[3] = 10;
+        let pfc = PfcFrame::new(0.0, 0, 0, 0, 1 << 3, quanta);
+        gate.test_apply_pfc(pfc);
+
+        let frame = gate
+            .test_pop_ready(0.0)
+            .expect("unpaused priority should pass");
+        match frame {
+            LinkFrame::Data(packet) => assert_eq!(packet.priority, 5),
+            _ => panic!("expected data frame"),
+        }
+    }
+
+    #[test]
+    fn test_pfc_pause_extends_on_longer_quanta() {
+        let rate_bps = 1e9;
+        let mut gate = PfcEgressGate::new(0, rate_bps);
+
+        let mut packet = Packet::new(1500, 1, 0, 0.0);
+        packet.set_priority(1);
+        gate.test_enqueue(LinkFrame::Data(packet));
+
+        let mut quanta = [0u16; NUM_PRIORITIES];
+        quanta[1] = 10;
+        let pfc_short = PfcFrame::new(0.0, 0, 0, 0, 1 << 1, quanta);
+        gate.test_apply_pfc(pfc_short.clone());
+
+        let mut quanta = [0u16; NUM_PRIORITIES];
+        quanta[1] = 20;
+        let pfc_long = PfcFrame::new(0.1, 0, 0, 1, 1 << 1, quanta);
+        gate.test_apply_pfc(pfc_long.clone());
+
+        let resume_short = pfc_short.pause_duration(1, rate_bps);
+        assert!(gate.test_pop_ready(resume_short).is_none());
+
+        let resume_long = pfc_long.pause_duration(1, rate_bps) + 0.1;
+        let frame = gate
+            .test_pop_ready(resume_long)
+            .expect("frame should be ready after extended pause");
+        assert!((frame.time() - resume_long).abs() <= 1e-9);
+    }
 }

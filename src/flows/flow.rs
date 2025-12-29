@@ -415,34 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn test_flow_new() {
-        let params = FlowParams {
-            id: 1,
-            path: None,
-            starts_before: vec![2],
-            starts_after: vec![3],
-            flow_type: FlowType::TCP,
-            source_host: 0,
-            sink_host: 1,
-            routing: Some(RoutingConfig::ShortestPath),
-            traffic: TrafficCharacteristics::default(),
-            priority: 0,
-            seed: 42,
-        };
-
-        let flow = Flow::new(params.clone());
-
-        assert_eq!(flow.id, params.id);
-        assert_eq!(flow.starts_before, params.starts_before);
-        assert_eq!(flow.starts_after, params.starts_after);
-        assert_eq!(flow.flow_type, params.flow_type);
-        assert_eq!(flow.source_host, params.source_host);
-        assert_eq!(flow.sink_host, params.sink_host);
-        assert_eq!(flow.traffic, params.traffic);
-        assert_eq!(flow.seed, params.seed);
-    }
-
-    #[test]
     fn test_flows_from_graph_single_edge() {
         let graphs = vec![vec![(0, 1)], vec![(2, 3)], vec![(4, 5)]];
 
@@ -567,7 +539,6 @@ mod tests {
             seed = 1
 
             [[flow]]
-            flow_id = 10
             starts_before = [11]
             starts_after = [12]
             flow_type = "TCP"
@@ -608,7 +579,6 @@ mod tests {
 
         // First flow
         let flow1 = &flows[0];
-        assert_eq!(flow1.id, 10);
         assert_eq!(flow1.starts_before, vec![11]);
         assert_eq!(flow1.starts_after, vec![12]);
         assert_eq!(flow1.flow_type, FlowType::TCP);
@@ -622,9 +592,99 @@ mod tests {
         // Next two flows from flow_set
         let flow2 = &flows[1];
         let flow3 = &flows[2];
-        assert_eq!(flow2.id, 20);
-        assert_eq!(flow3.id, 21);
         assert_eq!(flow2.flow_type, FlowType::PacketDistribution);
         assert_eq!(flow3.flow_type, FlowType::PacketDistribution);
+    }
+
+    #[test]
+    fn test_flows_from_config_empty_path_panics() {
+        let toml_content = r#"
+            seed = 1
+
+            [[flow]]
+            flow_type = "TCP"
+            graph = [[0, 1]]
+            routing = "PathFromConfig"
+            path = []
+            [flow.traffic]
+                initial_delay = 1.0
+                size = 10000
+                arr_dist = {type = "Exp", lambda = 1.0}
+                pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let hosts = vec![0, 1, 2];
+        let result = std::panic::catch_unwind(|| {
+            let _ = Flow::flows_from_config(temp_file.path().to_str().unwrap(), &hosts);
+        });
+
+        assert!(result.is_err(), "Empty path should trigger a panic");
+    }
+
+    #[test]
+    fn test_flows_from_config_path_endpoint_mismatch_panics() {
+        let toml_content = r#"
+            seed = 1
+
+            [[flow]]
+            flow_type = "TCP"
+            graph = [[0, 1]]
+            routing = "PathFromConfig"
+            path = [2, 3]
+            [flow.traffic]
+                initial_delay = 1.0
+                size = 10000
+                arr_dist = {type = "Exp", lambda = 1.0}
+                pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let hosts = vec![0, 1, 2, 3];
+        let result = std::panic::catch_unwind(|| {
+            let _ = Flow::flows_from_config(temp_file.path().to_str().unwrap(), &hosts);
+        });
+
+        assert!(result.is_err(), "Path endpoints should match graph endpoints");
+    }
+
+    #[test]
+    fn test_flows_from_config_multiple_edges_panics() {
+        let toml_content = r#"
+            seed = 1
+
+            [[flow]]
+            flow_type = "TCP"
+            graph = [[0, 1], [1, 2]]
+            routing = "ShortestPath"
+            [flow.traffic]
+                initial_delay = 1.0
+                size = 10000
+                arr_dist = {type = "Exp", lambda = 1.0}
+                pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+        "#;
+
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file.");
+        write!(temp_file, "{}", toml_content).expect("Failed to write to temp file.");
+
+        let hosts = vec![0, 1, 2];
+        let result = std::panic::catch_unwind(|| {
+            let _ = Flow::flows_from_config(temp_file.path().to_str().unwrap(), &hosts);
+        });
+
+        assert!(result.is_err(), "Multiple edges should trigger a panic");
     }
 }

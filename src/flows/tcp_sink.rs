@@ -212,4 +212,29 @@ mod tests {
         sink.update_ecn_echo(&cwr_packet);
         assert!(!sink.ecn_echo);
     }
+
+    #[test]
+    fn test_ece_echo_ignores_not_ect_and_latches_until_cwr() {
+        let mut sink = TCPPacketSink::new(0);
+
+        let mut not_ect = Packet::new(512, 0, 0, 0.0);
+        not_ect.ecn = EcnField::NotEct;
+        sink.update_ecn_echo(&not_ect);
+        assert!(!sink.ecn_echo);
+
+        let mut ce_packet = Packet::new(512, 1, 0, 0.0);
+        ce_packet.ecn = EcnField::Ce;
+        sink.update_ecn_echo(&ce_packet);
+        assert!(sink.ecn_echo);
+
+        let mut ect_packet = Packet::new(512, 2, 0, 0.0);
+        ect_packet.ecn = EcnField::Ect0;
+        sink.update_ecn_echo(&ect_packet);
+        assert!(sink.ecn_echo);
+
+        let mut cwr_packet = Packet::new(512, 3, 0, 0.0);
+        cwr_packet.cwr = true;
+        sink.update_ecn_echo(&cwr_packet);
+        assert!(!sink.ecn_echo);
+    }
 }

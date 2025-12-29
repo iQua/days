@@ -957,4 +957,36 @@ mod tests {
         assert_eq!(packet.ecn, EcnField::NotEct);
         assert!(!packet.cwr);
     }
+
+    #[test]
+    fn test_dupack_counter_increments_and_resets() {
+        let mut source = make_source(false);
+        source.last_ack = 100;
+        source.dupack = 2;
+
+        let ack_dup = make_ack(source.flow_id, 100, source.mss, false, 1.0);
+        let _ = block_on(source.ack_packet_received(ack_dup, 1.0));
+        assert_eq!(source.dupack, 3);
+
+        let ack_new = make_ack(source.flow_id, 200, source.mss, false, 2.0);
+        let _ = block_on(source.ack_packet_received(ack_new, 2.0));
+        assert_eq!(source.dupack, 0);
+    }
+
+    #[test]
+    fn test_dupack_retransmit_marks_pending_lost_bytes() {
+        let mut source = make_source(false);
+        source.last_ack = 100;
+        source.dupack = 2;
+
+        let mut packet = Packet::new(100, 100, source.flow_id, 0.0);
+        packet.time = 0.5;
+        source.sent_packets.insert(100, packet);
+
+        let ack_dup = make_ack(source.flow_id, 100, source.mss, false, 1.0);
+        let _ = block_on(source.ack_packet_received(ack_dup, 1.0));
+
+        assert_eq!(source.dupack, 3);
+        assert_eq!(source.pending_lost_bytes, source.mss);
+    }
 }

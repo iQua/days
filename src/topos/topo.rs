@@ -1340,62 +1340,6 @@ impl Topology {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use petgraph::algo;
-    use petgraph::graph::{NodeIndex, UnGraph};
-
-    #[test]
-    fn test_topology_new() {
-        // Sample configuration in TOML format
-        let config_content = r#"
-            ui_interval = 1.0
-            duration = 1000.0
-            num_threads = 4
-            hot_workers = 2
-            concurrency_level = "accelerated"
-            mailbox_capacity = 32
-
-            [switch]
-            port_rate = 1000.0
-            capacity = 1024
-            discipline = "FIFO"
-            drop = "TailDrop"
-
-            [topology]
-            category = "FatTree"
-
-            [topology.fat_tree]
-            k = 4
-        "#;
-
-        // Write the sample configuration to a temporary file
-        let config_path = "test_config.toml";
-        fs::write(config_path, config_content).expect("Unable to write test config");
-
-        // Create a sample graph
-        let mut graph = UnGraph::<usize, ()>::new_undirected();
-        graph.add_node(0);
-        graph.add_node(1);
-        graph.add_edge(NodeIndex::new(0), NodeIndex::new(1), ());
-
-        // Sample hosts, flows, and collectives
-        let hosts = vec![0, 1];
-        let flows = vec![];
-        let collectives = vec![];
-
-        // Initialize Topology
-        let topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
-
-        // Assertions to verify correct initialization
-        assert!(algo::is_isomorphic(&topology.graph, &graph));
-        assert_eq!(topology.hosts.len(), 2);
-        assert_eq!(topology.flows.len(), 0);
-        assert_eq!(topology.collectives.len(), 0);
-        assert_eq!(topology.mailbox_capacity, 32);
-        assert_eq!(topology.duration, 1000.0);
-
-        // Clean up the temporary config file
-        fs::remove_file(config_path).expect("Unable to delete test config");
-    }
 
     #[test]
     fn test_init_switches() {

@@ -621,3 +621,35 @@ impl CsvLogger {
         info!("Average one-way delay: {:.6} seconds", avg_delay);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_sink_statistics_empty() {
+        let (packets, delay) = CsvLogger::compute_sink_statistics(&[]);
+        assert_eq!(packets, 0);
+        assert_eq!(delay, 0.0);
+    }
+
+    #[test]
+    fn test_compute_sink_statistics_weighted_delay() {
+        let reports = vec![
+            PacketSinkReport {
+                received_packets: 2,
+                one_way_delay_mean: 1.5,
+                ..PacketSinkReport::default()
+            },
+            PacketSinkReport {
+                received_packets: 3,
+                one_way_delay_mean: 2.0,
+                ..PacketSinkReport::default()
+            },
+        ];
+
+        let (packets, delay) = CsvLogger::compute_sink_statistics(&reports);
+        assert_eq!(packets, 5);
+        assert!((delay - 9.0).abs() <= 1e-12);
+    }
+}

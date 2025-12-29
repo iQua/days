@@ -410,4 +410,20 @@ mod tests {
         cubic.clamp_cwnd();
         assert!(approx_eq(cubic.cwnd, cubic.max_cwnd, 1e-9));
     }
+
+    #[test]
+    fn test_epoch_initializes_w_max_and_k_zero() {
+        let mut cubic = TCPCubic::new();
+        cubic.w_max = 0.0;
+        cubic.k_zero = false;
+        cubic.epoch_start = None;
+        cubic.cwnd = 12.0;
+
+        cubic.ensure_epoch(1.0);
+
+        assert!(cubic.epoch_start.is_some());
+        assert!(approx_eq(cubic.w_max, 12.0, 1e-9));
+        assert!(cubic.k_zero);
+        assert!(approx_eq(cubic.cubic_k(), 0.0, 1e-9));
+    }
 }
