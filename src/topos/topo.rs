@@ -1067,8 +1067,10 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(sink, sink_mbox, "Sink");
         }
 
-        // activates all packet sources
-        for (flow_id, source) in sources.into_iter() {
+        // activates all packet sources in deterministic flow_id order
+        let mut sources_vec: Vec<(usize, PacketSource)> = sources.into_iter().collect();
+        sources_vec.sort_by_key(|(flow_id, _)| *flow_id);
+        for (flow_id, source) in sources_vec {
             let source_mbox = source_mboxes.remove(&flow_id).unwrap_or_default();
             self.sim_init = self.sim_init.add_model(source, source_mbox, "Source");
         }
