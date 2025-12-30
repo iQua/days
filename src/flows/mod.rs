@@ -1,3 +1,5 @@
+//! Flow models, packet types, and traffic generation utilities.
+
 pub mod app_source;
 pub mod basic_sink;
 pub mod bbr;

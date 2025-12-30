@@ -1,3 +1,5 @@
+//! Shared queue state accounting for scheduler capacity checks.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -1,3 +1,5 @@
+//! Switch configuration types and scheduling discipline selection.
+
 pub mod switch;
 
 use serde::Deserialize;

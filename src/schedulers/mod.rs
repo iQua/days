@@ -1,3 +1,5 @@
+//! Packet scheduler implementations and reporting primitives.
+
 pub mod drop;
 pub mod drr;
 pub mod port;

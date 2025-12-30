@@ -1,3 +1,5 @@
+//! Topology builders that convert TOML configs into graph structures.
+
 use std::fs;
 
 use log::{debug, info};

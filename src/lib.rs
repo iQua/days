@@ -1,3 +1,5 @@
+//! Core library APIs and global state for the Days simulator.
+
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
