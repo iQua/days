@@ -37,6 +37,32 @@ num_threads = 1
 
 - If omitted, Days uses the `nexosim` default runtime configuration.
 
+## `hot_workers` (optional)
+
+Number of hot standby worker threads. Hot workers remain active and ready to pick up tasks, reducing latency for bursty workloads.
+
+```toml
+hot_workers = 2
+```
+
+## `concurrency_level` (optional)
+
+Concurrency acceleration mode for the simulation runtime.
+
+- Allowed values: `default`, `accelerated`
+
+```toml
+concurrency_level = "accelerated"
+```
+
+## `time_quantum_ns` (optional)
+
+Simulation time quantum in nanoseconds. Controls the granularity of time-based scheduling in the simulation engine.
+
+```toml
+time_quantum_ns = 1000
+```
+
 ## `mailbox_capacity` (optional)
 
 Mailbox capacity for most models (bounded message queues).
@@ -118,14 +144,13 @@ initial_delay = 1
 run_interval = 50
 ```
 
-Fields:
+Fields and defaults:
 
-- `req_channel_capacity` (optional): channel capacity for buffer requests
-- `chunk_size` (optional): preferred chunk size for requests (bytes)
-- `initial_delay` (optional): actor start delay (microseconds)
-- `run_interval` (optional): actor polling interval (microseconds)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `req_channel_capacity` | `usize` | `256` | Channel capacity for buffer requests |
+| `chunk_size` | `usize` | `512` | Preferred chunk size for requests (bytes) |
+| `initial_delay` | `u64` | `1` | Actor start delay (microseconds) |
+| `run_interval` | `u64` | `50` | Actor polling interval (microseconds) |
 
-Defaults:
-
-- If `[app_source]` is omitted, Days uses `AppBufferConfig::default()`.
-- If `[app_source]` is present, each field falls back to a small default if omitted.
+If `[app_source]` is omitted entirely, Days uses `AppBufferConfig::default()` with the defaults above.

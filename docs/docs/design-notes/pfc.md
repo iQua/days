@@ -44,12 +44,12 @@ All links carry `Packet` only, and only existing schedulers generate transmissio
 
 Build a different per-edge pipeline that inserts L2 models **only when L2 is enabled**:
 
-`Packet -> L2EgressAdapter -> LinkFrame -> LinkSerializer/Wire -> LinkFrame -> L2IngressAdapter -> Packet`
+`Packet -> PfcEgressGate -> LinkFrame -> Link (serializer) -> LinkFrame -> PfcIngressPort -> Packet`
 
 Additionally, for PFC:
 
-- `L2IngressAdapter` (receiver side) generates `PfcFrame` control frames upstream.
-- `L2EgressAdapter` (sender side) enforces per-priority pause gating.
+- `PfcIngressPort` (receiver side) generates `PfcFrame` control frames upstream.
+- `PfcEgressGate` (sender side) enforces per-priority pause gating.
 
 When L2 is off, **none of these models exist**, so no extra messages or events are generated.
 
@@ -93,7 +93,7 @@ To eliminate *any* L2 code footprint in baseline builds, gate L2 behind features
 Behavior:
 
 - Default build: `cargo build` → no L2 code compiled.
-- L2-capable build: `cargo build --features l2,l2_pfc` → L2 is available, but still only instantiated when `link.mode="Pfc"`.
+- L2-capable build: `cargo build --features l2_pfc` → L2 is available, but still only instantiated when `link.mode="Pfc"`. (Note: `l2_pfc` implies `l2`, so specifying both is redundant.)
 
 This gives two levels of opt-in:
 

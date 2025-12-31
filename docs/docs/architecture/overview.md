@@ -54,4 +54,7 @@ Days periodically emits CSV reports (configurable by `report_interval`) for:
 - sinks (`sinks.csv`)
 - schedulers (`switches.csv`)
 - optional PFC ports (`pfc.csv`)
-- optional per-event DCQCN traces for the Lean checker (`dcqcn_events.csv`)
+- optional per-event protocol traces for the Lean checker:
+  - `dcqcn_events.csv` (with `--features dcqcn,lean`)
+  - `pfc_events.csv` (with `--features l2_pfc,lean`)
+  - `cubic_events.csv` (with `--features lean`)

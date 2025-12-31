@@ -20,6 +20,8 @@ All files are written under `log_path` (default: `./output/`):
 - `switches.csv`: scheduler reports (`SchedulerReport`)
 - `pfc.csv`: PFC ingress port reports (`PfcPortReport`, only with `l2_pfc`)
 - `dcqcn_events.csv`: per-event DCQCN trace rows (only with `dcqcn` + `lean`)
+- `pfc_events.csv`: per-event PFC trace rows (only with `l2_pfc` + `lean`)
+- `cubic_events.csv`: per-event TCP CUBIC trace rows (only with `lean`)
 
 ## Report interval
 

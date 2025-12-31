@@ -16,10 +16,10 @@ Supported topology modes:
 
 `Topology::new` (`src/topos/topo.rs`) reads the config multiple times into smaller structs:
 
-- `Config` (switch config, optional topology config, optional L2/app-source config)
+- `Config` (switch config, optional topology config, optional L2/app-source config, `time_quantum_ns`)
 - `MailboxConfig` (`mailbox_capacity`)
 - `UIConfig` (`duration`, `ui_interval`)
-- `ConcurrencyConfig` (`num_threads`)
+- `ConcurrencyConfig` (`num_threads`, `hot_workers`, `concurrency_level`)
 
 It also sets global ID ranges so that switch IDs and endpoint IDs do not collide:
 

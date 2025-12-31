@@ -59,4 +59,8 @@ Some config values are only valid when the binary is built with the right Cargo 
 
 - `link.mode = "Pfc"` requires `--features l2_pfc`
 - `flow_type = "DCQCN"` and `[traffic.dcqcn]` require `--features dcqcn`
-- `dcqcn_events.csv` emission (for the Lean checker) requires `--features dcqcn,lean`
+- Protocol event traces for the Lean checker:
+  - `dcqcn_events.csv` requires `--features dcqcn,lean`
+  - `pfc_events.csv` requires `--features l2_pfc,lean`
+  - `cubic_events.csv` requires `--features lean`
+- `--features perf_stats` enables internal performance statistics from the `nexosim` simulation engine
