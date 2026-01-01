@@ -298,10 +298,6 @@ impl DRRServer {
             class_id
         );
 
-        // pushes the packet to the back of its class queue
-        self.queues[class_id].push_back(packet);
-        self.byte_sizes[class_id] += packet_size;
-
         #[cfg(feature = "lean")]
         self.log_drr_event(
             DrrEventKind::Enqueue,
@@ -312,6 +308,10 @@ impl DRRServer {
             0,
             None,
         );
+
+        // pushes the packet to the back of its class queue
+        self.queues[class_id].push_back(packet);
+        self.byte_sizes[class_id] += packet_size;
     }
 
     #[instrument(skip(self, cx))]

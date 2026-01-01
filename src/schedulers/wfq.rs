@@ -583,6 +583,22 @@ impl WFQServer {
             self.update_stats_on_packet_forwarded(&outbound.packet);
             self.update_internal_states(&outbound.packet, self.time_packet_sent);
 
+            #[cfg(feature = "lean")]
+            {
+                let pending = self
+                    .pending_log
+                    .take()
+                    .expect("WFQ pending log missing for test depart event");
+                self.log_wfq_event(
+                    WfqEventKind::Depart,
+                    outbound.packet.time,
+                    &outbound.packet,
+                    pending.class_id,
+                    pending.finish_time,
+                    Some(outbound.packet.time),
+                );
+            }
+
             // updates busy_until
             self.busy_until = now + timeout;
 
