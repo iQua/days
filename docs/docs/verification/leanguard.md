@@ -86,6 +86,13 @@ Then run one of:
 ./.lake/build/bin/cubic_check  <path/to/cubic_events.csv>
 ./.lake/build/bin/drr_check    <path/to/drr_events.csv>
 ./.lake/build/bin/wfq_check    <path/to/wfq_events.csv>
+./.lake/build/bin/aqm_check    <path/to/aqm_events.csv>
+```
+
+Cross-layer (AQM → DCQCN causality):
+
+```bash
+./.lake/build/bin/aqm_dcqcn_check <path/to/aqm_events.csv> <path/to/dcqcn_events.csv>
 ```
 
 Exit codes:

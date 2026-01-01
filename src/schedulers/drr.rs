@@ -30,6 +30,17 @@ use crate::utils::logger::{
 };
 
 #[cfg(feature = "lean")]
+struct DrrLogContext<'a> {
+    kind: DrrEventKind,
+    event_time: f64,
+    packet: &'a Packet,
+    class_id: usize,
+    batch_id: Option<u64>,
+    scan_steps: u64,
+    departure_time: Option<f64>,
+}
+
+#[cfg(feature = "lean")]
 fn to_ns(time_s: f64) -> u64 {
     (time_s.max(0.0) * 1e9).round() as u64
 }
@@ -216,33 +227,24 @@ impl DRRServer {
     }
 
     #[cfg(feature = "lean")]
-    fn log_drr_event(
-        &self,
-        kind: DrrEventKind,
-        event_time: f64,
-        packet: &Packet,
-        class_id: usize,
-        batch_id: Option<u64>,
-        scan_steps: u64,
-        departure_time: Option<f64>,
-    ) {
+    fn log_drr_event(&self, ctx: DrrLogContext<'_>) {
         let event = DrrEventRow {
-            time_ns: to_ns(event_time),
+            time_ns: to_ns(ctx.event_time),
             event_id: CsvLogger::next_drr_event_id(),
-            kind,
+            kind: ctx.kind,
             scheduler_id: self.scheduler_id as u64,
             class_count: self.queues.len() as u64,
-            batch_id,
-            packet_id: packet.packet_id as u64,
-            flow_id: packet.flow_id as u64,
-            class_id: class_id as u64,
-            size_bytes: packet.size as u64,
-            quantum_bytes: self.quantum[class_id] as u64,
-            deficit_bytes: self.deficit[class_id] as u64,
+            batch_id: ctx.batch_id,
+            packet_id: ctx.packet.packet_id as u64,
+            flow_id: ctx.packet.flow_id as u64,
+            class_id: ctx.class_id as u64,
+            size_bytes: ctx.packet.size as u64,
+            quantum_bytes: self.quantum[ctx.class_id] as u64,
+            deficit_bytes: self.deficit[ctx.class_id] as u64,
             rate_bps: to_bps(self.rate),
             current_queue: self.current_queue as u64,
-            scan_steps,
-            departure_time_ns: departure_time.map(to_ns),
+            scan_steps: ctx.scan_steps,
+            departure_time_ns: ctx.departure_time.map(to_ns),
         };
         CsvLogger::try_log_report(Report::DrrEventRow(event), ReportTiming::InProgress);
     }
@@ -381,15 +383,15 @@ impl DRRServer {
         );
 
         #[cfg(feature = "lean")]
-        self.log_drr_event(
-            DrrEventKind::Enqueue,
-            packet.time,
-            &packet,
+        self.log_drr_event(DrrLogContext {
+            kind: DrrEventKind::Enqueue,
+            event_time: packet.time,
+            packet: &packet,
             class_id,
-            None,
-            0,
-            None,
-        );
+            batch_id: None,
+            scan_steps: 0,
+            departure_time: None,
+        });
 
         // pushes the packet to the back of its class queue
         self.queues[class_id].push_back(packet);
@@ -495,15 +497,15 @@ impl DRRServer {
                     self.busy_until = departure_time;
 
                     #[cfg(feature = "lean")]
-                    self.log_drr_event(
-                        DrrEventKind::Schedule,
-                        service_start,
-                        &outbound,
+                    self.log_drr_event(DrrLogContext {
+                        kind: DrrEventKind::Schedule,
+                        event_time: service_start,
+                        packet: &outbound,
                         class_id,
                         batch_id,
                         scan_steps,
-                        Some(departure_time),
-                    );
+                        departure_time: Some(departure_time),
+                    });
 
                     debug!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
