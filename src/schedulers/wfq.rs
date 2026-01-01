@@ -32,9 +32,11 @@ use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 use crate::utils::time::{quantize_after, quantize_time};
 
 #[cfg(feature = "lean")]
-use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField, WfqEventKind, WfqEventRow};
-#[cfg(feature = "lean")]
 use crate::schedulers::drop::DropDecision;
+#[cfg(feature = "lean")]
+use crate::utils::logger::{
+    AqmEventKind, AqmEventRow, AqmLoggedEcnField, WfqEventKind, WfqEventRow,
+};
 
 #[cfg(feature = "lean")]
 fn to_ns(time_s: f64) -> u64 {
@@ -317,13 +319,21 @@ impl WFQServer {
             .drop_strategy
             .decision(packet.size, byte_len, queue_len);
         let class_id = (self.flow_classes)(packet.flow_id);
+        #[cfg(feature = "lean")]
         let ecn_before = packet.ecn;
-        let mut drop_action = decision.action;
+        let drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
                 #[cfg(feature = "lean")]
-                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+                self.log_aqm_event(
+                    packet.time,
+                    class_id,
+                    &packet,
+                    drop_action,
+                    &decision,
+                    ecn_before,
+                );
                 self.packets_dropped += 1;
                 debug! {
                     "WFQServer {} dropped packet {} from flow {} at time {:.3}",
@@ -336,13 +346,12 @@ impl WFQServer {
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
-                    drop_action = DropAction::Drop;
                     #[cfg(feature = "lean")]
                     self.log_aqm_event(
                         packet.time,
                         class_id,
                         &packet,
-                        drop_action,
+                        DropAction::Drop,
                         &decision,
                         ecn_before,
                     );
@@ -357,11 +366,25 @@ impl WFQServer {
                     return;
                 }
                 #[cfg(feature = "lean")]
-                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+                self.log_aqm_event(
+                    packet.time,
+                    class_id,
+                    &packet,
+                    drop_action,
+                    &decision,
+                    ecn_before,
+                );
             }
             DropAction::Enqueue => {
                 #[cfg(feature = "lean")]
-                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+                self.log_aqm_event(
+                    packet.time,
+                    class_id,
+                    &packet,
+                    drop_action,
+                    &decision,
+                    ecn_before,
+                );
             }
         }
 
@@ -1205,11 +1228,7 @@ mod tests {
         for (idx, weight) in weights.iter().enumerate() {
             let expected =
                 (total_bytes as f64 * (*weight as f64) / (weight_sum as f64)).round() as usize;
-            let delta = if bytes[idx] > expected {
-                bytes[idx] - expected
-            } else {
-                expected - bytes[idx]
-            };
+            let delta = bytes[idx].abs_diff(expected);
             assert!(
                 delta <= tolerance_bytes,
                 "flow {} expected ~{} bytes, got {}",

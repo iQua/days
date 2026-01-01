@@ -23,9 +23,11 @@ use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 use crate::utils::time::{quantize_after, quantize_time};
 
 #[cfg(feature = "lean")]
-use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField, DrrEventKind, DrrEventRow};
-#[cfg(feature = "lean")]
 use crate::schedulers::drop::DropDecision;
+#[cfg(feature = "lean")]
+use crate::utils::logger::{
+    AqmEventKind, AqmEventRow, AqmLoggedEcnField, DrrEventKind, DrrEventRow,
+};
 
 #[cfg(feature = "lean")]
 fn to_ns(time_s: f64) -> u64 {
@@ -291,13 +293,21 @@ impl DRRServer {
             .drop_strategy
             .decision(packet.size, byte_len, queue_len);
         let class_id = (self.flow_classes)(packet.flow_id);
+        #[cfg(feature = "lean")]
         let ecn_before = packet.ecn;
-        let mut drop_action = decision.action;
+        let drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
                 #[cfg(feature = "lean")]
-                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+                self.log_aqm_event(
+                    packet.time,
+                    class_id,
+                    &packet,
+                    drop_action,
+                    &decision,
+                    ecn_before,
+                );
                 self.packets_dropped += 1;
                 debug! {
                     "DRRServer {} dropped packet {} from flow {} at time {:.3}",
@@ -310,13 +320,12 @@ impl DRRServer {
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
-                    drop_action = DropAction::Drop;
                     #[cfg(feature = "lean")]
                     self.log_aqm_event(
                         packet.time,
                         class_id,
                         &packet,
-                        drop_action,
+                        DropAction::Drop,
                         &decision,
                         ecn_before,
                     );
@@ -331,11 +340,25 @@ impl DRRServer {
                     return;
                 }
                 #[cfg(feature = "lean")]
-                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+                self.log_aqm_event(
+                    packet.time,
+                    class_id,
+                    &packet,
+                    drop_action,
+                    &decision,
+                    ecn_before,
+                );
             }
             DropAction::Enqueue => {
                 #[cfg(feature = "lean")]
-                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+                self.log_aqm_event(
+                    packet.time,
+                    class_id,
+                    &packet,
+                    drop_action,
+                    &decision,
+                    ecn_before,
+                );
             }
         }
 
@@ -580,8 +603,7 @@ impl DRRServer {
         self.time = run_time;
 
         let mut service_start = run_time;
-        while let Some((_, packet, departure_time)) =
-            self.next_departure(None, service_start, None)
+        while let Some((_, packet, departure_time)) = self.next_departure(None, service_start, None)
         {
             let outbound = packet;
             self.sent_packets.push(outbound.clone());

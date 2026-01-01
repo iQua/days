@@ -93,8 +93,7 @@ impl DelayedFrameSource {
 
 impl Model for DelayedFrameSource {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, Self::send_once, ())
-            .unwrap();
+        cx.schedule_event(self.delay, Self::send_once, ()).unwrap();
         self.into()
     }
 }
@@ -116,8 +115,7 @@ impl GateToggle {
 
 impl Model for GateToggle {
     async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, Self::open_gate, ())
-            .unwrap();
+        cx.schedule_event(self.delay, Self::open_gate, ()).unwrap();
         self.into()
     }
 }

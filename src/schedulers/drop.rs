@@ -70,8 +70,12 @@ pub const DEFAULT_ECN_THRESHOLD: f64 = 0.8;
 
 /// Defines the interface for all packet drop strategies.
 pub trait PacketDrop {
-    fn decision(&mut self, packet_size: usize, byte_size: usize, queue_length: usize)
-        -> DropDecision;
+    fn decision(
+        &mut self,
+        packet_size: usize,
+        byte_size: usize,
+        queue_length: usize,
+    ) -> DropDecision;
 
     fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
         self.decision(packet_size, byte_size, queue_length).action
@@ -421,5 +425,5 @@ impl PacketDrop for RED {
 }
 
 fn to_ppb(v: f64) -> u64 {
-    (v.max(0.0).min(1.0) * 1e9).round() as u64
+    (v.clamp(0.0, 1.0) * 1e9).round() as u64
 }

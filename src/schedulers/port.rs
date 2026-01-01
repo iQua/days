@@ -22,9 +22,9 @@ use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 #[cfg(feature = "lean")]
-use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField};
-#[cfg(feature = "lean")]
 use crate::schedulers::drop::DropDecision;
+#[cfg(feature = "lean")]
+use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField};
 use crate::utils::time::{quantize_after, quantize_time};
 
 #[cfg(feature = "lean")]
@@ -197,11 +197,12 @@ impl Port {
     pub fn on_packet_received(&mut self, packet: Packet) {
         let mut packet = packet;
         let queue_length_for_drop = self.queue.len() + self.in_flight.saturating_sub(1);
-        let decision = self
-            .drop_strategy
-            .decision(packet.size, self.queue_length, queue_length_for_drop);
+        let decision =
+            self.drop_strategy
+                .decision(packet.size, self.queue_length, queue_length_for_drop);
+        #[cfg(feature = "lean")]
         let ecn_before = packet.ecn;
-        let mut drop_action = decision.action;
+        let drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
@@ -212,9 +213,14 @@ impl Port {
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
-                    drop_action = DropAction::Drop;
                     #[cfg(feature = "lean")]
-                    self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
+                    self.log_aqm_event(
+                        packet.time,
+                        &packet,
+                        DropAction::Drop,
+                        &decision,
+                        ecn_before,
+                    );
                     self.packets_dropped += 1;
                     return;
                 }
@@ -249,11 +255,12 @@ impl Port {
 
         let mut packet = packet;
         let queue_length_for_drop = self.queue.len() + self.in_flight.saturating_sub(1);
-        let decision = self
-            .drop_strategy
-            .decision(packet.size, self.queue_length, queue_length_for_drop);
+        let decision =
+            self.drop_strategy
+                .decision(packet.size, self.queue_length, queue_length_for_drop);
+        #[cfg(feature = "lean")]
         let ecn_before = packet.ecn;
-        let mut drop_action = decision.action;
+        let drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
@@ -268,9 +275,14 @@ impl Port {
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
-                    drop_action = DropAction::Drop;
                     #[cfg(feature = "lean")]
-                    self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
+                    self.log_aqm_event(
+                        packet.time,
+                        &packet,
+                        DropAction::Drop,
+                        &decision,
+                        ecn_before,
+                    );
                     self.packets_dropped += 1;
                     debug!(
                         "Port {} dropped non-ECT packet {} from flow {} at time {:.8e}",

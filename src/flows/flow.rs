@@ -655,7 +655,10 @@ mod tests {
             let _ = Flow::flows_from_config(temp_file.path().to_str().unwrap(), &hosts);
         });
 
-        assert!(result.is_err(), "Path endpoints should match graph endpoints");
+        assert!(
+            result.is_err(),
+            "Path endpoints should match graph endpoints"
+        );
     }
 
     #[test]

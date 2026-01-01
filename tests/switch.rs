@@ -144,7 +144,10 @@ fn control_packets_forward_to_r_fib_output() {
 
     sim.step_until(t0 + Duration::from_millis(5)).unwrap();
 
-    assert!(reader_a.next().is_none(), "control packet sent to fib output");
+    assert!(
+        reader_a.next().is_none(),
+        "control packet sent to fib output"
+    );
     let received = reader_b.next().expect("no control packet forwarded");
     assert_eq!(received.flow_id, 1);
     assert_eq!(received.packet_id, 2);

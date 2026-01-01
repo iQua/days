@@ -9,7 +9,6 @@ use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
 
 use crate::l2::frame::LinkFrame;
 use crate::utils::time::{quantize_after, quantize_time};
