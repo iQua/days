@@ -249,7 +249,8 @@ impl VirtualClockServer {
             red_max_threshold_ppb: decision.witness.red_max_threshold_ppb,
             red_max_probability_ppb: decision.witness.red_max_probability_ppb,
             red_avg_queue_length: decision.witness.red_avg_queue_length.map(|v| v as u64),
-            red_rand_ppb: decision.witness.red_rand_ppb,
+            red_rand_max_ppb: decision.witness.red_rand_max_ppb,
+            red_rand_min_ppb: decision.witness.red_rand_min_ppb,
         };
         CsvLogger::try_log_report(Report::AqmEventRow(event), ReportTiming::InProgress);
     }

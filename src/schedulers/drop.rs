@@ -56,7 +56,8 @@ pub struct DropWitness {
     pub red_max_threshold_ppb: Option<u64>,
     pub red_max_probability_ppb: Option<u64>,
     pub red_avg_queue_length: Option<usize>,
-    pub red_rand_ppb: Option<u64>,
+    pub red_rand_max_ppb: Option<u64>,
+    pub red_rand_min_ppb: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,7 +124,8 @@ impl PacketDrop for TailDrop {
                 red_max_threshold_ppb: None,
                 red_max_probability_ppb: None,
                 red_avg_queue_length: None,
-                red_rand_ppb: None,
+                red_rand_max_ppb: None,
+                red_rand_min_ppb: None,
             },
         }
     }
@@ -180,7 +182,8 @@ impl PacketDrop for EcnThreshold {
                     red_max_threshold_ppb: None,
                     red_max_probability_ppb: None,
                     red_avg_queue_length: None,
-                    red_rand_ppb: None,
+                    red_rand_max_ppb: None,
+                    red_rand_min_ppb: None,
                 },
             };
         }
@@ -206,7 +209,8 @@ impl PacketDrop for EcnThreshold {
                     red_max_threshold_ppb: None,
                     red_max_probability_ppb: None,
                     red_avg_queue_length: None,
-                    red_rand_ppb: None,
+                    red_rand_max_ppb: None,
+                    red_rand_min_ppb: None,
                 },
             };
         }
@@ -239,7 +243,8 @@ impl PacketDrop for EcnThreshold {
                 red_max_threshold_ppb: None,
                 red_max_probability_ppb: None,
                 red_avg_queue_length: None,
-                red_rand_ppb: None,
+                red_rand_max_ppb: None,
+                red_rand_min_ppb: None,
             },
         }
     }
@@ -299,7 +304,8 @@ impl PacketDrop for RED {
                     red_max_threshold_ppb: Some(to_ppb(self.max_threshold)),
                     red_max_probability_ppb: Some(to_ppb(self.max_probability)),
                     red_avg_queue_length: Some(self.avg_queue_length),
-                    red_rand_ppb: None,
+                    red_rand_max_ppb: None,
+                    red_rand_min_ppb: None,
                 },
             };
         }
@@ -314,14 +320,15 @@ impl PacketDrop for RED {
         };
 
         // drops the packet if the average queue length exceeds the max_threshold
-        let mut red_rand_ppb = None;
+        let mut red_rand_max_ppb = None;
+        let mut red_rand_min_ppb = None;
         let threshold_overflow = match self.capacity_unit {
             CapacityUnit::Bytes => {
                 if byte_size + packet_size
                     > (self.max_threshold * self.capacity as f64).floor() as usize
                 {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    red_rand_ppb = Some(to_ppb(drop_probability));
+                    red_rand_max_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= self.max_probability
                 } else {
@@ -331,7 +338,7 @@ impl PacketDrop for RED {
             CapacityUnit::Packets => {
                 if queue_length + 1 > (self.max_threshold * self.capacity as f64).floor() as usize {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    red_rand_ppb = Some(to_ppb(drop_probability));
+                    red_rand_max_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= self.max_probability
                 } else {
@@ -352,7 +359,7 @@ impl PacketDrop for RED {
                         * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    red_rand_ppb = Some(to_ppb(drop_probability));
+                    red_rand_min_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= probability
                 } else {
@@ -368,7 +375,7 @@ impl PacketDrop for RED {
                         * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
-                    red_rand_ppb = Some(to_ppb(drop_probability));
+                    red_rand_min_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= probability
                 } else {
@@ -406,7 +413,8 @@ impl PacketDrop for RED {
                 red_max_threshold_ppb: Some(to_ppb(self.max_threshold)),
                 red_max_probability_ppb: Some(to_ppb(self.max_probability)),
                 red_avg_queue_length: Some(self.avg_queue_length),
-                red_rand_ppb,
+                red_rand_max_ppb,
+                red_rand_min_ppb,
             },
         }
     }

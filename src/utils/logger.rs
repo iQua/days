@@ -202,7 +202,8 @@ pub struct AqmEventRow {
     pub red_max_threshold_ppb: Option<u64>,
     pub red_max_probability_ppb: Option<u64>,
     pub red_avg_queue_length: Option<u64>,
-    pub red_rand_ppb: Option<u64>,
+    pub red_rand_max_ppb: Option<u64>,
+    pub red_rand_min_ppb: Option<u64>,
 }
 
 #[cfg(feature = "lean")]

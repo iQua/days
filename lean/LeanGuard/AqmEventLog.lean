@@ -37,7 +37,8 @@ structure Row where
   redMaxThresholdPpb : Option Nat
   redMaxProbabilityPpb : Option Nat
   redAvgQueueLength : Option Nat
-  redRandPpb : Option Nat
+  redRandMaxPpb : Option Nat
+  redRandMinPpb : Option Nat
   srcLine : Nat
   deriving DecidableEq, Repr
 
@@ -94,7 +95,8 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
     let redMaxThresholdPpb ← parseOpt parseNat (← getField idx fields "red_max_threshold_ppb")
     let redMaxProbabilityPpb ← parseOpt parseNat (← getField idx fields "red_max_probability_ppb")
     let redAvgQueueLength ← parseOpt parseNat (← getField idx fields "red_avg_queue_length")
-    let redRandPpb ← parseOpt parseNat (← getField idx fields "red_rand_ppb")
+    let redRandMaxPpb ← parseOpt parseNat (← getField idx fields "red_rand_max_ppb")
+    let redRandMinPpb ← parseOpt parseNat (← getField idx fields "red_rand_min_ppb")
     pure
       { timeNs
         eventId
@@ -117,7 +119,8 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         redMaxThresholdPpb
         redMaxProbabilityPpb
         redAvgQueueLength
-        redRandPpb
+        redRandMaxPpb
+        redRandMinPpb
         srcLine := lineNo }
   match res with
   | .ok r => pure r
@@ -160,7 +163,8 @@ def toEvent (r : Row) : Event :=
     redMaxThresholdPpb := r.redMaxThresholdPpb
     redMaxProbabilityPpb := r.redMaxProbabilityPpb
     redAvgQueueLength := r.redAvgQueueLength
-    redRandPpb := r.redRandPpb }
+    redRandMaxPpb := r.redRandMaxPpb
+    redRandMinPpb := r.redRandMinPpb }
 
 def checkRows (rows : List Row) : Except String Unit := do
   let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
