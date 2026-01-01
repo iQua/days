@@ -50,10 +50,7 @@ struct WfqPendingLog {
     packet_id: usize,
     flow_id: usize,
     class_id: usize,
-    size_bytes: usize,
     finish_time: f64,
-    schedule_time: f64,
-    departure_time: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -515,10 +512,7 @@ impl WFQServer {
                     packet_id: tagged_outbound.packet.packet_id,
                     flow_id: tagged_outbound.packet.flow_id,
                     class_id,
-                    size_bytes: tagged_outbound.packet.size,
                     finish_time: tagged_outbound.tag,
-                    schedule_time: self.time,
-                    departure_time,
                 });
             }
 
