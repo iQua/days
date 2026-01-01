@@ -20,7 +20,17 @@ use crate::schedulers::drop::{
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+
+#[cfg(feature = "lean")]
+use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField};
+#[cfg(feature = "lean")]
+use crate::schedulers::drop::DropDecision;
 use crate::utils::time::{quantize_after, quantize_time};
+
+#[cfg(feature = "lean")]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
 
 pub struct Port {
     scheduler_id: usize,
@@ -146,26 +156,74 @@ impl Port {
         self.queue_state = Some(state);
     }
 
+    #[cfg(feature = "lean")]
+    fn log_aqm_event(
+        &self,
+        event_time: f64,
+        packet: &Packet,
+        action: DropAction,
+        decision: &DropDecision,
+        ecn_before: crate::flows::packet::EcnField,
+    ) {
+        let event = AqmEventRow {
+            time_ns: to_ns(event_time),
+            event_id: CsvLogger::next_aqm_event_id(),
+            kind: AqmEventKind::Decision,
+            scheduler_id: self.scheduler_id as u64,
+            queue_id: 0,
+            packet_id: packet.packet_id as u64,
+            flow_id: packet.flow_id as u64,
+            size_bytes: packet.size as u64,
+            action,
+            capacity: decision.witness.capacity as u64,
+            capacity_unit: decision.witness.capacity_unit,
+            queue_length: decision.witness.queue_length as u64,
+            byte_length: decision.witness.byte_length as u64,
+            ecn_before: AqmLoggedEcnField::from(ecn_before),
+            ecn_after: AqmLoggedEcnField::from(packet.ecn),
+            drop_strategy: decision.witness.strategy,
+            ecn_threshold_ppb: decision.witness.ecn_threshold_ppb,
+            red_min_threshold_ppb: decision.witness.red_min_threshold_ppb,
+            red_max_threshold_ppb: decision.witness.red_max_threshold_ppb,
+            red_max_probability_ppb: decision.witness.red_max_probability_ppb,
+            red_avg_queue_length: decision.witness.red_avg_queue_length.map(|v| v as u64),
+            red_rand_ppb: decision.witness.red_rand_ppb,
+        };
+        CsvLogger::try_log_report(Report::AqmEventRow(event), ReportTiming::InProgress);
+    }
+
     #[cfg(test)]
     pub fn on_packet_received(&mut self, packet: Packet) {
         let mut packet = packet;
         let queue_length_for_drop = self.queue.len() + self.in_flight.saturating_sub(1);
-        let drop_action =
-            self.drop_strategy
-                .action(packet.size, self.queue_length, queue_length_for_drop);
+        let decision = self
+            .drop_strategy
+            .decision(packet.size, self.queue_length, queue_length_for_drop);
+        let ecn_before = packet.ecn;
+        let mut drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
                 self.packets_dropped += 1;
                 return;
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
+                    drop_action = DropAction::Drop;
+                    #[cfg(feature = "lean")]
+                    self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
                     self.packets_dropped += 1;
                     return;
                 }
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
             }
-            DropAction::Enqueue => {}
+            DropAction::Enqueue => {
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
+            }
         }
 
         self.update_stats_on_packet_received(&packet);
@@ -190,12 +248,16 @@ impl Port {
 
         let mut packet = packet;
         let queue_length_for_drop = self.queue.len() + self.in_flight.saturating_sub(1);
-        let drop_action =
-            self.drop_strategy
-                .action(packet.size, self.queue_length, queue_length_for_drop);
+        let decision = self
+            .drop_strategy
+            .decision(packet.size, self.queue_length, queue_length_for_drop);
+        let ecn_before = packet.ecn;
+        let mut drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
                 self.packets_dropped += 1;
                 debug!(
                     "Port {} dropped packet {} from flow {} at time {:.8e}",
@@ -205,6 +267,9 @@ impl Port {
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
+                    drop_action = DropAction::Drop;
+                    #[cfg(feature = "lean")]
+                    self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
                     self.packets_dropped += 1;
                     debug!(
                         "Port {} dropped non-ECT packet {} from flow {} at time {:.8e}",
@@ -212,8 +277,13 @@ impl Port {
                     );
                     return;
                 }
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
             }
-            DropAction::Enqueue => {}
+            DropAction::Enqueue => {
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
+            }
         }
 
         // the case that this packet will not be dropped

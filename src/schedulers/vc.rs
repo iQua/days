@@ -27,7 +27,17 @@ use crate::schedulers::drop::{
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+
+#[cfg(feature = "lean")]
+use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField};
+#[cfg(feature = "lean")]
+use crate::schedulers::drop::DropDecision;
 use crate::utils::time::{quantize_after, quantize_time};
+
+#[cfg(feature = "lean")]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
 
 #[derive(Clone, Debug)]
 pub struct TaggedPacket {
@@ -207,16 +217,58 @@ impl VirtualClockServer {
         self.queue_state = Some(state);
     }
 
+    #[cfg(feature = "lean")]
+    fn log_aqm_event(
+        &self,
+        event_time: f64,
+        queue_id: usize,
+        packet: &Packet,
+        action: DropAction,
+        decision: &DropDecision,
+        ecn_before: crate::flows::packet::EcnField,
+    ) {
+        let event = AqmEventRow {
+            time_ns: to_ns(event_time),
+            event_id: CsvLogger::next_aqm_event_id(),
+            kind: AqmEventKind::Decision,
+            scheduler_id: self.scheduler_id as u64,
+            queue_id: queue_id as u64,
+            packet_id: packet.packet_id as u64,
+            flow_id: packet.flow_id as u64,
+            size_bytes: packet.size as u64,
+            action,
+            capacity: decision.witness.capacity as u64,
+            capacity_unit: decision.witness.capacity_unit,
+            queue_length: decision.witness.queue_length as u64,
+            byte_length: decision.witness.byte_length as u64,
+            ecn_before: AqmLoggedEcnField::from(ecn_before),
+            ecn_after: AqmLoggedEcnField::from(packet.ecn),
+            drop_strategy: decision.witness.strategy,
+            ecn_threshold_ppb: decision.witness.ecn_threshold_ppb,
+            red_min_threshold_ppb: decision.witness.red_min_threshold_ppb,
+            red_max_threshold_ppb: decision.witness.red_max_threshold_ppb,
+            red_max_probability_ppb: decision.witness.red_max_probability_ppb,
+            red_avg_queue_length: decision.witness.red_avg_queue_length.map(|v| v as u64),
+            red_rand_ppb: decision.witness.red_rand_ppb,
+        };
+        CsvLogger::try_log_report(Report::AqmEventRow(event), ReportTiming::InProgress);
+    }
+
     pub fn on_packet_received(&mut self, packet: Packet) {
         let mut packet = packet;
-        let drop_action = self.drop_strategy.action(
-            packet.size,
-            self.byte_sizes.values().sum(),
-            self.scheduler_queue.len(),
-        );
+        let queue_len = self.scheduler_queue.len();
+        let byte_len: usize = self.byte_sizes.values().sum();
+        let decision = self
+            .drop_strategy
+            .decision(packet.size, byte_len, queue_len);
+        let class_id = (self.flow_classes)(packet.flow_id);
+        let ecn_before = packet.ecn;
+        let mut drop_action = decision.action;
 
         match drop_action {
             DropAction::Drop => {
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
                 self.packets_dropped += 1;
                 debug! {
                     "VirtualClockServer {} dropped packet {} from flow {} at time {:.3}",
@@ -229,6 +281,16 @@ impl VirtualClockServer {
             }
             DropAction::MarkEcn => {
                 if !packet.mark_ce() {
+                    drop_action = DropAction::Drop;
+                    #[cfg(feature = "lean")]
+                    self.log_aqm_event(
+                        packet.time,
+                        class_id,
+                        &packet,
+                        drop_action,
+                        &decision,
+                        ecn_before,
+                    );
                     self.packets_dropped += 1;
                     debug! {
                         "VirtualClockServer {} dropped non-ECT packet {} from flow {} at time {:.3}",
@@ -239,8 +301,13 @@ impl VirtualClockServer {
                     }
                     return;
                 }
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
             }
-            DropAction::Enqueue => {}
+            DropAction::Enqueue => {
+                #[cfg(feature = "lean")]
+                self.log_aqm_event(packet.time, class_id, &packet, drop_action, &decision, ecn_before);
+            }
         }
 
         // the case that this packet will not be dropped
@@ -255,7 +322,6 @@ impl VirtualClockServer {
         // clock finish time
         self.scheduler_queue.push(tagged_packet);
 
-        let class_id = (self.flow_classes)(packet.flow_id);
         let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
         *byte_size += packet.size;
         let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);

@@ -17,8 +17,10 @@ use crate::flows::source::PacketSourceReport;
 use crate::l2::pfc::PfcPortReport;
 use crate::schedulers::SchedulerReport;
 
-#[cfg(all(feature = "lean", feature = "dcqcn"))]
+#[cfg(feature = "lean")]
 use crate::flows::packet::EcnField;
+#[cfg(feature = "lean")]
+use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategyKind};
 
 #[derive(Deserialize)]
 struct LogConfig {
@@ -150,6 +152,62 @@ pub struct DcqcnEventRow {
 #[cfg(feature = "lean")]
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AqmEventKind {
+    Decision,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AqmLoggedEcnField {
+    NotEct,
+    Ect0,
+    Ect1,
+    Ce,
+}
+
+#[cfg(feature = "lean")]
+impl From<EcnField> for AqmLoggedEcnField {
+    fn from(field: EcnField) -> Self {
+        match field {
+            EcnField::NotEct => AqmLoggedEcnField::NotEct,
+            EcnField::Ect0 => AqmLoggedEcnField::Ect0,
+            EcnField::Ect1 => AqmLoggedEcnField::Ect1,
+            EcnField::Ce => AqmLoggedEcnField::Ce,
+        }
+    }
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Debug, Serialize)]
+pub struct AqmEventRow {
+    pub time_ns: u64,
+    pub event_id: u64,
+    pub kind: AqmEventKind,
+    pub scheduler_id: u64,
+    pub queue_id: u64,
+    pub packet_id: u64,
+    pub flow_id: u64,
+    pub size_bytes: u64,
+    pub action: DropAction,
+    pub capacity: u64,
+    pub capacity_unit: CapacityUnit,
+    pub queue_length: u64,
+    pub byte_length: u64,
+    pub ecn_before: AqmLoggedEcnField,
+    pub ecn_after: AqmLoggedEcnField,
+    pub drop_strategy: DropStrategyKind,
+    pub ecn_threshold_ppb: Option<u64>,
+    pub red_min_threshold_ppb: Option<u64>,
+    pub red_max_threshold_ppb: Option<u64>,
+    pub red_max_probability_ppb: Option<u64>,
+    pub red_avg_queue_length: Option<u64>,
+    pub red_rand_ppb: Option<u64>,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DrrEventKind {
     Enqueue,
     Schedule,
@@ -215,6 +273,9 @@ static NEXT_DRR_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "lean")]
 static NEXT_WFQ_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "lean")]
+static NEXT_AQM_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(all(feature = "lean", feature = "l2_pfc"))]
 static NEXT_PFC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -238,6 +299,8 @@ pub enum Report {
     WfqEventRow(WfqEventRow),
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEventRow(DcqcnEventRow),
+    #[cfg(feature = "lean")]
+    AqmEventRow(AqmEventRow),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -264,6 +327,8 @@ struct SharedState {
     wfq_events: Vec<WfqEventRow>,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     dcqcn_events: Vec<DcqcnEventRow>,
+    #[cfg(feature = "lean")]
+    aqm_events: Vec<AqmEventRow>,
     total_delay: f64,
 }
 
@@ -284,6 +349,8 @@ enum ElementType {
     WfqEvents,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEvents,
+    #[cfg(feature = "lean")]
+    AqmEvents,
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +452,8 @@ impl CsvLogger {
         elements.push("drr_events");
         #[cfg(feature = "lean")]
         elements.push("wfq_events");
+        #[cfg(feature = "lean")]
+        elements.push("aqm_events");
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         elements.push("dcqcn_events");
         for element in elements {
@@ -426,6 +495,11 @@ impl CsvLogger {
     #[cfg(feature = "lean")]
     pub fn next_wfq_event_id() -> u64 {
         NEXT_WFQ_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "lean")]
+    pub fn next_aqm_event_id() -> u64 {
+        NEXT_AQM_EVENT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -476,6 +550,10 @@ impl CsvLogger {
             Report::DcqcnEventRow(event) => {
                 state.dcqcn_events.push(event);
             }
+            #[cfg(feature = "lean")]
+            Report::AqmEventRow(event) => {
+                state.aqm_events.push(event);
+            }
         }
 
         // Release the lock before potentially writing to disk.
@@ -523,6 +601,8 @@ impl CsvLogger {
             ElementType::DrrEvents => format!("{}drr_events.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "lean")]
             ElementType::WfqEvents => format!("{}wfq_events.csv", self.log_path.get().unwrap()),
+            #[cfg(feature = "lean")]
+            ElementType::AqmEvents => format!("{}aqm_events.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             ElementType::DcqcnEvents => {
                 format!("{}dcqcn_events.csv", self.log_path.get().unwrap())
@@ -659,6 +739,14 @@ impl CsvLogger {
             }
         }
 
+        #[cfg(feature = "lean")]
+        if state.aqm_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.aqm_events);
+            if let Err(e) = self.write_to_csv(ElementType::AqmEvents, &events) {
+                eprintln!("Error writing AQM events to CSV: {}", e);
+            }
+        }
+
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         if state.dcqcn_events.len() >= self.max_log_len {
             let events = std::mem::take(&mut state.dcqcn_events);
@@ -731,6 +819,13 @@ impl CsvLogger {
             let events = std::mem::take(&mut state.wfq_events);
             self.write_to_csv(ElementType::WfqEvents, &events)
                 .expect("Error writing WFQ events to CSV");
+        }
+
+        #[cfg(feature = "lean")]
+        if !state.aqm_events.is_empty() {
+            let events = std::mem::take(&mut state.aqm_events);
+            self.write_to_csv(ElementType::AqmEvents, &events)
+                .expect("Error writing AQM events to CSV");
         }
 
         #[cfg(all(feature = "lean", feature = "dcqcn"))]

@@ -20,3 +20,6 @@ lean_exe drr_check where
 
 lean_exe wfq_check where
   root := `LeanGuard.WfqMain
+
+lean_exe aqm_check where
+  root := `LeanGuard.AqmMain

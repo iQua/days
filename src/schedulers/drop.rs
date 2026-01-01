@@ -4,12 +4,13 @@ use rand::SeedableRng;
 use rand::distr::Distribution;
 use rand::distr::Uniform;
 use rand::rngs::SmallRng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::get_seed;
 
 /// Capacity unit for the packet drop strategy.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CapacityUnit {
     Bytes,
     Packets,
@@ -26,18 +27,54 @@ pub enum DropStrategy {
     EcnThreshold,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DropAction {
     Enqueue,
     Drop,
     MarkEcn,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropStrategyKind {
+    TailDrop,
+    Red,
+    RedEcn,
+    EcnThreshold,
+}
+
+#[derive(Clone, Debug)]
+pub struct DropWitness {
+    pub strategy: DropStrategyKind,
+    pub capacity: usize,
+    pub capacity_unit: CapacityUnit,
+    pub queue_length: usize,
+    pub byte_length: usize,
+    pub ecn_threshold_ppb: Option<u64>,
+    pub red_min_threshold_ppb: Option<u64>,
+    pub red_max_threshold_ppb: Option<u64>,
+    pub red_max_probability_ppb: Option<u64>,
+    pub red_avg_queue_length: Option<usize>,
+    pub red_rand_ppb: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DropDecision {
+    pub action: DropAction,
+    pub witness: DropWitness,
+}
+
 pub const DEFAULT_ECN_THRESHOLD: f64 = 0.8;
 
 /// Defines the interface for all packet drop strategies.
 pub trait PacketDrop {
-    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction;
+    fn decision(&mut self, packet_size: usize, byte_size: usize, queue_length: usize)
+        -> DropDecision;
+
+    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
+        self.decision(packet_size, byte_size, queue_length).action
+    }
 }
 
 /// TailDrop is a packet drop strategy that drops packets when the buffer is full.
@@ -56,16 +93,38 @@ impl TailDrop {
 }
 
 impl PacketDrop for TailDrop {
-    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
+    fn decision(
+        &mut self,
+        packet_size: usize,
+        byte_size: usize,
+        queue_length: usize,
+    ) -> DropDecision {
         let overflow = match self.capacity_unit {
             CapacityUnit::Bytes => self.capacity > 0 && byte_size + packet_size > self.capacity,
             CapacityUnit::Packets => self.capacity > 0 && queue_length + 1 > self.capacity,
         };
 
-        if overflow {
+        let action = if overflow {
             DropAction::Drop
         } else {
             DropAction::Enqueue
+        };
+
+        DropDecision {
+            action,
+            witness: DropWitness {
+                strategy: DropStrategyKind::TailDrop,
+                capacity: self.capacity,
+                capacity_unit: self.capacity_unit,
+                queue_length,
+                byte_length: byte_size,
+                ecn_threshold_ppb: None,
+                red_min_threshold_ppb: None,
+                red_max_threshold_ppb: None,
+                red_max_probability_ppb: None,
+                red_avg_queue_length: None,
+                red_rand_ppb: None,
+            },
         }
     }
 }
@@ -101,9 +160,29 @@ impl EcnThreshold {
 }
 
 impl PacketDrop for EcnThreshold {
-    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
+    fn decision(
+        &mut self,
+        packet_size: usize,
+        byte_size: usize,
+        queue_length: usize,
+    ) -> DropDecision {
         if self.capacity == 0 {
-            return DropAction::Enqueue; // unlimited
+            return DropDecision {
+                action: DropAction::Enqueue,
+                witness: DropWitness {
+                    strategy: DropStrategyKind::EcnThreshold,
+                    capacity: self.capacity,
+                    capacity_unit: self.capacity_unit,
+                    queue_length,
+                    byte_length: byte_size,
+                    ecn_threshold_ppb: Some(to_ppb(self.threshold)),
+                    red_min_threshold_ppb: None,
+                    red_max_threshold_ppb: None,
+                    red_max_probability_ppb: None,
+                    red_avg_queue_length: None,
+                    red_rand_ppb: None,
+                },
+            };
         }
 
         let threshold = self.threshold.clamp(0.0, 1.0);
@@ -114,7 +193,22 @@ impl PacketDrop for EcnThreshold {
         };
 
         if queue_overflow {
-            return DropAction::Drop;
+            return DropDecision {
+                action: DropAction::Drop,
+                witness: DropWitness {
+                    strategy: DropStrategyKind::EcnThreshold,
+                    capacity: self.capacity,
+                    capacity_unit: self.capacity_unit,
+                    queue_length,
+                    byte_length: byte_size,
+                    ecn_threshold_ppb: Some(to_ppb(threshold)),
+                    red_min_threshold_ppb: None,
+                    red_max_threshold_ppb: None,
+                    red_max_probability_ppb: None,
+                    red_avg_queue_length: None,
+                    red_rand_ppb: None,
+                },
+            };
         }
 
         let threshold_exceeded = match self.capacity_unit {
@@ -126,10 +220,27 @@ impl PacketDrop for EcnThreshold {
             }
         };
 
-        if threshold_exceeded {
+        let action = if threshold_exceeded {
             DropAction::MarkEcn
         } else {
             DropAction::Enqueue
+        };
+
+        DropDecision {
+            action,
+            witness: DropWitness {
+                strategy: DropStrategyKind::EcnThreshold,
+                capacity: self.capacity,
+                capacity_unit: self.capacity_unit,
+                queue_length,
+                byte_length: byte_size,
+                ecn_threshold_ppb: Some(to_ppb(threshold)),
+                red_min_threshold_ppb: None,
+                red_max_threshold_ppb: None,
+                red_max_probability_ppb: None,
+                red_avg_queue_length: None,
+                red_rand_ppb: None,
+            },
         }
     }
 }
@@ -164,9 +275,33 @@ impl RED {
 }
 
 impl PacketDrop for RED {
-    fn action(&mut self, packet_size: usize, byte_size: usize, queue_length: usize) -> DropAction {
+    fn decision(
+        &mut self,
+        packet_size: usize,
+        byte_size: usize,
+        queue_length: usize,
+    ) -> DropDecision {
         if self.capacity == 0 {
-            return DropAction::Enqueue; // unlimited
+            return DropDecision {
+                action: DropAction::Enqueue,
+                witness: DropWitness {
+                    strategy: if self.ecn {
+                        DropStrategyKind::RedEcn
+                    } else {
+                        DropStrategyKind::Red
+                    },
+                    capacity: self.capacity,
+                    capacity_unit: self.capacity_unit,
+                    queue_length,
+                    byte_length: byte_size,
+                    ecn_threshold_ppb: None,
+                    red_min_threshold_ppb: Some(to_ppb(self.min_threshold)),
+                    red_max_threshold_ppb: Some(to_ppb(self.max_threshold)),
+                    red_max_probability_ppb: Some(to_ppb(self.max_probability)),
+                    red_avg_queue_length: Some(self.avg_queue_length),
+                    red_rand_ppb: None,
+                },
+            };
         }
 
         let alpha = 1 / usize::pow(2, self.weight_factor);
@@ -179,12 +314,14 @@ impl PacketDrop for RED {
         };
 
         // drops the packet if the average queue length exceeds the max_threshold
+        let mut red_rand_ppb = None;
         let threshold_overflow = match self.capacity_unit {
             CapacityUnit::Bytes => {
                 if byte_size + packet_size
                     > (self.max_threshold * self.capacity as f64).floor() as usize
                 {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    red_rand_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= self.max_probability
                 } else {
@@ -194,6 +331,7 @@ impl PacketDrop for RED {
             CapacityUnit::Packets => {
                 if queue_length + 1 > (self.max_threshold * self.capacity as f64).floor() as usize {
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    red_rand_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= self.max_probability
                 } else {
@@ -214,6 +352,7 @@ impl PacketDrop for RED {
                         * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    red_rand_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= probability
                 } else {
@@ -229,6 +368,7 @@ impl PacketDrop for RED {
                         * self.capacity as f64
                         * self.max_probability;
                     let drop_probability = Uniform::new(0.0, 1.0).unwrap().sample(&mut self.rng);
+                    red_rand_ppb = Some(to_ppb(drop_probability));
 
                     drop_probability <= probability
                 } else {
@@ -237,7 +377,7 @@ impl PacketDrop for RED {
             }
         };
 
-        if queue_overflow {
+        let action = if queue_overflow {
             DropAction::Drop
         } else if threshold_overflow || threshold_normal {
             if self.ecn {
@@ -247,6 +387,31 @@ impl PacketDrop for RED {
             }
         } else {
             DropAction::Enqueue
+        };
+
+        DropDecision {
+            action,
+            witness: DropWitness {
+                strategy: if self.ecn {
+                    DropStrategyKind::RedEcn
+                } else {
+                    DropStrategyKind::Red
+                },
+                capacity: self.capacity,
+                capacity_unit: self.capacity_unit,
+                queue_length,
+                byte_length: byte_size,
+                ecn_threshold_ppb: None,
+                red_min_threshold_ppb: Some(to_ppb(self.min_threshold)),
+                red_max_threshold_ppb: Some(to_ppb(self.max_threshold)),
+                red_max_probability_ppb: Some(to_ppb(self.max_probability)),
+                red_avg_queue_length: Some(self.avg_queue_length),
+                red_rand_ppb,
+            },
         }
     }
+}
+
+fn to_ppb(v: f64) -> u64 {
+    (v.max(0.0).min(1.0) * 1e9).round() as u64
 }
