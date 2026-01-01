@@ -49,6 +49,16 @@ RUST_LOG=info cargo run --features lean -- configs/simple.toml
 
 If your scenario includes TCP flows using CUBIC, Days writes `cubic_events.csv` under `log_path`.
 
+### DRR (`drr_events.csv`)
+
+DRR event tracing is enabled by the `lean` feature:
+
+```bash
+RUST_LOG=info cargo run --features lean -- configs/simple.toml
+```
+
+If your scenario includes a DRR scheduler, Days writes `drr_events.csv` under `log_path`.
+
 ### WFQ (`wfq_events.csv`)
 
 WFQ event tracing is enabled by the `lean` feature:
@@ -74,6 +84,7 @@ Then run one of:
 ./.lake/build/bin/dcqcn_check  <path/to/dcqcn_events.csv>
 ./.lake/build/bin/pfc_check    <path/to/pfc_events.csv>
 ./.lake/build/bin/cubic_check  <path/to/cubic_events.csv>
+./.lake/build/bin/drr_check    <path/to/drr_events.csv>
 ./.lake/build/bin/wfq_check    <path/to/wfq_events.csv>
 ```
 

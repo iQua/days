@@ -30,6 +30,7 @@ By default, Days writes periodic reports to CSV files under `log_path` (see `con
 - `pfc.csv`: PFC port statistics (only with `--features l2_pfc`)
 - `dcqcn_events.csv`: DCQCN event trace (only with `--features dcqcn,lean`)
 - `cubic_events.csv`: TCP CUBIC event trace (only with `--features lean`)
+- `drr_events.csv`: DRR event trace (only with `--features lean`)
 - `wfq_events.csv`: WFQ event trace (only with `--features lean`)
 
 ## Debugging

@@ -45,6 +45,7 @@ The current executables are defined in `lean/lakefile.lean`:
 - `dcqcn_check` (DCQCN trace replay)
 - `pfc_check` (PFC trace replay)
 - `cubic_check` (TCP CUBIC trace replay)
+- `drr_check` (DRR trace replay)
 - `wfq_check` (WFQ trace replay)
 
 On the simulator side, Days emits:
@@ -52,6 +53,7 @@ On the simulator side, Days emits:
 - `dcqcn_events.csv` when built with `--features dcqcn,lean`
 - `pfc_events.csv` when built with `--features l2_pfc,lean`
 - `cubic_events.csv` when built with `--features lean`
+- `drr_events.csv` when built with `--features lean`
 - `wfq_events.csv` when built with `--features lean`
 
 ## Extending LeanGuard to a new protocol

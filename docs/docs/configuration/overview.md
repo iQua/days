@@ -63,5 +63,6 @@ Some config values are only valid when the binary is built with the right Cargo 
   - `dcqcn_events.csv` requires `--features dcqcn,lean`
   - `pfc_events.csv` requires `--features l2_pfc,lean`
   - `cubic_events.csv` requires `--features lean`
+  - `drr_events.csv` requires `--features lean`
   - `wfq_events.csv` requires `--features lean`
 - `--features perf_stats` enables internal performance statistics from the `nexosim` simulation engine

@@ -22,6 +22,19 @@ use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 use crate::utils::time::{quantize_after, quantize_time};
 
+#[cfg(feature = "lean")]
+use crate::utils::logger::{DrrEventKind, DrrEventRow};
+
+#[cfg(feature = "lean")]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(feature = "lean")]
+fn to_bps(rate_bps: f64) -> u64 {
+    rate_bps.max(0.0).round() as u64
+}
+
 pub struct DRRServer {
     scheduler_id: usize,
 
@@ -81,6 +94,9 @@ pub struct DRRServer {
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
     sent_packets: Vec<Packet>,
+
+    #[cfg(feature = "lean")]
+    next_batch_id: u64,
 }
 
 /// A Deficit Round Robin (DRR) packet scheduler
@@ -176,6 +192,8 @@ impl DRRServer {
             in_flight: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
+            #[cfg(feature = "lean")]
+            next_batch_id: 0,
         }
     }
 
@@ -191,6 +209,38 @@ impl DRRServer {
 
     pub fn set_queue_state(&mut self, state: std::sync::Arc<QueueState>) {
         self.queue_state = Some(state);
+    }
+
+    #[cfg(feature = "lean")]
+    fn log_drr_event(
+        &self,
+        kind: DrrEventKind,
+        event_time: f64,
+        packet: &Packet,
+        class_id: usize,
+        batch_id: Option<u64>,
+        scan_steps: u64,
+        departure_time: Option<f64>,
+    ) {
+        let event = DrrEventRow {
+            time_ns: to_ns(event_time),
+            event_id: CsvLogger::next_drr_event_id(),
+            kind,
+            scheduler_id: self.scheduler_id as u64,
+            class_count: self.queues.len() as u64,
+            batch_id,
+            packet_id: packet.packet_id as u64,
+            flow_id: packet.flow_id as u64,
+            class_id: class_id as u64,
+            size_bytes: packet.size as u64,
+            quantum_bytes: self.quantum[class_id] as u64,
+            deficit_bytes: self.deficit[class_id] as u64,
+            rate_bps: to_bps(self.rate),
+            current_queue: self.current_queue as u64,
+            scan_steps,
+            departure_time_ns: departure_time.map(to_ns),
+        };
+        CsvLogger::try_log_report(Report::DrrEventRow(event), ReportTiming::InProgress);
     }
 
     pub fn on_packet_received(&mut self, packet: Packet) {
@@ -251,6 +301,17 @@ impl DRRServer {
         // pushes the packet to the back of its class queue
         self.queues[class_id].push_back(packet);
         self.byte_sizes[class_id] += packet_size;
+
+        #[cfg(feature = "lean")]
+        self.log_drr_event(
+            DrrEventKind::Enqueue,
+            packet.time,
+            &packet,
+            class_id,
+            None,
+            0,
+            None,
+        );
     }
 
     #[instrument(skip(self, cx))]
@@ -316,7 +377,13 @@ impl DRRServer {
         &mut self,
         class_limit: Option<usize>,
         service_start: f64,
+        batch_id: Option<u64>,
     ) -> Option<(usize, Packet, f64)> {
+        #[cfg(not(feature = "lean"))]
+        let _ = batch_id;
+
+        #[cfg(feature = "lean")]
+        let mut scan_steps: u64 = 0;
         loop {
             if self.packets_waiting == 0 {
                 return None;
@@ -345,6 +412,17 @@ impl DRRServer {
                     outbound.departure_update(departure_time);
                     self.busy_until = departure_time;
 
+                    #[cfg(feature = "lean")]
+                    self.log_drr_event(
+                        DrrEventKind::Schedule,
+                        service_start,
+                        &outbound,
+                        class_id,
+                        batch_id,
+                        scan_steps,
+                        Some(departure_time),
+                    );
+
                     debug!(
                         "DRRServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                            {} packets in the class queue.",
@@ -362,11 +440,19 @@ impl DRRServer {
                 if class_limit.is_some() {
                     return None;
                 } else {
+                    #[cfg(feature = "lean")]
+                    {
+                        scan_steps += 1;
+                    }
                     self.next_queue();
                 }
             } else if class_limit.is_some() {
                 return None;
             } else {
+                #[cfg(feature = "lean")]
+                {
+                    scan_steps += 1;
+                }
                 self.next_queue();
             }
         }
@@ -398,10 +484,17 @@ impl DRRServer {
         let mut schedule = Vec::with_capacity(self.run_batch_size);
         let mut service_start = run_time;
         let mut visit_class: Option<usize> = None;
+        #[cfg(feature = "lean")]
+        let batch_id = {
+            self.next_batch_id += 1;
+            Some(self.next_batch_id)
+        };
+        #[cfg(not(feature = "lean"))]
+        let batch_id: Option<u64> = None;
 
         for _ in 0..self.run_batch_size {
             let Some((class_id, packet, departure_time)) =
-                self.next_departure(visit_class, service_start)
+                self.next_departure(visit_class, service_start, batch_id)
             else {
                 break;
             };
@@ -428,7 +521,9 @@ impl DRRServer {
         self.time = run_time;
 
         let mut service_start = run_time;
-        while let Some((_, packet, departure_time)) = self.next_departure(None, service_start) {
+        while let Some((_, packet, departure_time)) =
+            self.next_departure(None, service_start, None)
+        {
             let outbound = packet;
             self.sent_packets.push(outbound.clone());
             self.update_stats_on_packet_forwarded(&outbound);

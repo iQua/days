@@ -150,6 +150,35 @@ pub struct DcqcnEventRow {
 #[cfg(feature = "lean")]
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DrrEventKind {
+    Enqueue,
+    Schedule,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Debug, Serialize)]
+pub struct DrrEventRow {
+    pub time_ns: u64,
+    pub event_id: u64,
+    pub kind: DrrEventKind,
+    pub scheduler_id: u64,
+    pub class_count: u64,
+    pub batch_id: Option<u64>,
+    pub packet_id: u64,
+    pub flow_id: u64,
+    pub class_id: u64,
+    pub size_bytes: u64,
+    pub quantum_bytes: u64,
+    pub deficit_bytes: u64,
+    pub rate_bps: u64,
+    pub current_queue: u64,
+    pub scan_steps: u64,
+    pub departure_time_ns: Option<u64>,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WfqEventKind {
     Enqueue,
     Schedule,
@@ -181,6 +210,9 @@ static NEXT_DCQCN_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_CUBIC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "lean")]
+static NEXT_DRR_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "lean")]
 static NEXT_WFQ_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -200,6 +232,8 @@ pub enum Report {
     PfcEventRow(PfcEventRow),
     #[cfg(feature = "lean")]
     CubicEventRow(CubicEventRow),
+    #[cfg(feature = "lean")]
+    DrrEventRow(DrrEventRow),
     #[cfg(feature = "lean")]
     WfqEventRow(WfqEventRow),
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
@@ -225,6 +259,8 @@ struct SharedState {
     #[cfg(feature = "lean")]
     cubic_events: Vec<CubicEventRow>,
     #[cfg(feature = "lean")]
+    drr_events: Vec<DrrEventRow>,
+    #[cfg(feature = "lean")]
     wfq_events: Vec<WfqEventRow>,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     dcqcn_events: Vec<DcqcnEventRow>,
@@ -242,6 +278,8 @@ enum ElementType {
     PfcEvents,
     #[cfg(feature = "lean")]
     CubicEvents,
+    #[cfg(feature = "lean")]
+    DrrEvents,
     #[cfg(feature = "lean")]
     WfqEvents,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
@@ -344,6 +382,8 @@ impl CsvLogger {
         #[cfg(feature = "lean")]
         elements.push("cubic_events");
         #[cfg(feature = "lean")]
+        elements.push("drr_events");
+        #[cfg(feature = "lean")]
         elements.push("wfq_events");
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         elements.push("dcqcn_events");
@@ -376,6 +416,11 @@ impl CsvLogger {
     #[cfg(feature = "lean")]
     pub fn next_cubic_event_id() -> u64 {
         NEXT_CUBIC_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "lean")]
+    pub fn next_drr_event_id() -> u64 {
+        NEXT_DRR_EVENT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     #[cfg(feature = "lean")]
@@ -418,6 +463,10 @@ impl CsvLogger {
             #[cfg(feature = "lean")]
             Report::CubicEventRow(event) => {
                 state.cubic_events.push(event);
+            }
+            #[cfg(feature = "lean")]
+            Report::DrrEventRow(event) => {
+                state.drr_events.push(event);
             }
             #[cfg(feature = "lean")]
             Report::WfqEventRow(event) => {
@@ -470,6 +519,8 @@ impl CsvLogger {
             ElementType::PfcEvents => format!("{}pfc_events.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "lean")]
             ElementType::CubicEvents => format!("{}cubic_events.csv", self.log_path.get().unwrap()),
+            #[cfg(feature = "lean")]
+            ElementType::DrrEvents => format!("{}drr_events.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "lean")]
             ElementType::WfqEvents => format!("{}wfq_events.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
@@ -593,6 +644,14 @@ impl CsvLogger {
         }
 
         #[cfg(feature = "lean")]
+        if state.drr_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.drr_events);
+            if let Err(e) = self.write_to_csv(ElementType::DrrEvents, &events) {
+                eprintln!("Error writing DRR events to CSV: {}", e);
+            }
+        }
+
+        #[cfg(feature = "lean")]
         if state.wfq_events.len() >= self.max_log_len {
             let events = std::mem::take(&mut state.wfq_events);
             if let Err(e) = self.write_to_csv(ElementType::WfqEvents, &events) {
@@ -658,6 +717,13 @@ impl CsvLogger {
             let events = std::mem::take(&mut state.cubic_events);
             self.write_to_csv(ElementType::CubicEvents, &events)
                 .expect("Error writing CUBIC events to CSV");
+        }
+
+        #[cfg(feature = "lean")]
+        if !state.drr_events.is_empty() {
+            let events = std::mem::take(&mut state.drr_events);
+            self.write_to_csv(ElementType::DrrEvents, &events)
+                .expect("Error writing DRR events to CSV");
         }
 
         #[cfg(feature = "lean")]
