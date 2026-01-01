@@ -22,6 +22,7 @@ All files are written under `log_path` (default: `./output/`):
 - `dcqcn_events.csv`: per-event DCQCN trace rows (only with `dcqcn` + `lean`)
 - `pfc_events.csv`: per-event PFC trace rows (only with `l2_pfc` + `lean`)
 - `cubic_events.csv`: per-event TCP CUBIC trace rows (only with `lean`)
+- `wfq_events.csv`: per-event WFQ trace rows (only with `lean`)
 
 ## Report interval
 

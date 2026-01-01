@@ -31,6 +31,31 @@ use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 use crate::utils::time::{quantize_after, quantize_time};
 
+#[cfg(feature = "lean")]
+use crate::utils::logger::{WfqEventKind, WfqEventRow};
+
+#[cfg(feature = "lean")]
+fn to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(feature = "lean")]
+fn to_bps(rate_bps: f64) -> u64 {
+    rate_bps.max(0.0).round() as u64
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Debug)]
+struct WfqPendingLog {
+    packet_id: usize,
+    flow_id: usize,
+    class_id: usize,
+    size_bytes: usize,
+    finish_time: f64,
+    schedule_time: f64,
+    departure_time: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct TaggedPacket {
     pub packet: Packet,
@@ -112,6 +137,9 @@ pub struct WFQServer {
     pub output: Output<Packet>,
 
     queue_state: Option<std::sync::Arc<QueueState>>,
+
+    #[cfg(feature = "lean")]
+    pending_log: Option<WfqPendingLog>,
 
     /// the statistics of a periodic report
     report_start_time: f64,
@@ -195,6 +223,8 @@ impl WFQServer {
             busy_until: 0.0,
             output: Output::default(),
             queue_state: None,
+            #[cfg(feature = "lean")]
+            pending_log: None,
             report_start_time: 0.0,
             queue_length: 0,
             received_sizes: 0,
@@ -212,6 +242,34 @@ impl WFQServer {
 
     pub fn set_queue_state(&mut self, state: std::sync::Arc<QueueState>) {
         self.queue_state = Some(state);
+    }
+
+    #[cfg(feature = "lean")]
+    fn log_wfq_event(
+        &self,
+        kind: WfqEventKind,
+        event_time: f64,
+        packet: &Packet,
+        class_id: usize,
+        finish_time: f64,
+        departure_time: Option<f64>,
+    ) {
+        let event = WfqEventRow {
+            time_ns: to_ns(event_time),
+            event_id: CsvLogger::next_wfq_event_id(),
+            kind,
+            scheduler_id: self.scheduler_id as u64,
+            packet_id: packet.packet_id as u64,
+            flow_id: packet.flow_id as u64,
+            class_id: class_id as u64,
+            size_bytes: packet.size as u64,
+            weight: self.weights[class_id] as u64,
+            rate_bps: to_bps(self.rate),
+            vtime_ns: to_ns(self.vtime),
+            finish_time_ns: to_ns(finish_time),
+            departure_time_ns: departure_time.map(to_ns),
+        };
+        CsvLogger::try_log_report(Report::WfqEventRow(event), ReportTiming::InProgress);
     }
 
     pub fn on_packet_received(&mut self, packet: Packet) {
@@ -268,6 +326,16 @@ impl WFQServer {
         self.active_set.insert(class_id);
         self.last_updated = packet.time;
 
+        #[cfg(feature = "lean")]
+        self.log_wfq_event(
+            WfqEventKind::Enqueue,
+            packet.time,
+            &packet,
+            class_id,
+            finish_time,
+            None,
+        );
+
         debug!(
             "WFQServer {} received packet {} ({} bytes with finish time {:.3}) from flow {} at time {:.3}. \
             {} packet(s) in queue.",
@@ -306,7 +374,7 @@ impl WFQServer {
     }
 
     fn tag(&mut self, packet: Packet, arrival_time: f64) -> TaggedPacket {
-        let mut finish_time = 0.0;
+        let class_id = (self.flow_classes)(packet.flow_id);
 
         // updates the virtual time and the finish time for each flow class
         if self.active_set.is_empty() {
@@ -321,21 +389,18 @@ impl WFQServer {
                 .sum();
 
             self.vtime += (arrival_time - self.last_updated) / weight_sum;
-
-            let flow_id = packet.flow_id;
-            let class_id = (self.flow_classes)(flow_id);
-
-            // gets previous finish time for this flow class, defaulting to 0
-            let prev_finish = *self.finish_times.get(&class_id).unwrap_or(&0.0);
-
-            // calculates virtual start time as max(vtime, prev_finish)
-            let virtual_start = self.vtime.max(prev_finish);
-
-            finish_time = virtual_start
-                + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
-
-            self.finish_times.insert(class_id, finish_time);
         }
+
+        // gets previous finish time for this flow class, defaulting to 0
+        let prev_finish = *self.finish_times.get(&class_id).unwrap_or(&0.0);
+
+        // calculates virtual start time as max(vtime, prev_finish)
+        let virtual_start = self.vtime.max(prev_finish);
+
+        let finish_time =
+            virtual_start + packet.size as f64 * 8.0 / (self.rate * self.weights[class_id] as f64);
+
+        self.finish_times.insert(class_id, finish_time);
 
         TaggedPacket {
             packet,
@@ -377,6 +442,27 @@ impl WFQServer {
         self.output.send(packet.clone()).await;
         self.update_stats_on_packet_forwarded(&packet);
         self.update_internal_states(&packet, self.time_packet_sent);
+
+        #[cfg(feature = "lean")]
+        {
+            let pending = self
+                .pending_log
+                .take()
+                .expect("WFQ pending log missing for depart event");
+            debug_assert!(
+                pending.packet_id == packet.packet_id && pending.flow_id == packet.flow_id,
+                "WFQ pending log mismatch for scheduler {}",
+                self.scheduler_id
+            );
+            self.log_wfq_event(
+                WfqEventKind::Depart,
+                packet.time,
+                &packet,
+                pending.class_id,
+                pending.finish_time,
+                Some(packet.time),
+            );
+        }
     }
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
@@ -408,6 +494,33 @@ impl WFQServer {
             self.time_packet_sent = departure_time;
             let delay = (departure_time - self.time).max(0.0);
             schedule_event(self.time, delay, tagged_outbound.clone());
+
+            #[cfg(feature = "lean")]
+            {
+                let class_id = (self.flow_classes)(outbound.flow_id);
+                debug_assert!(
+                    self.pending_log.is_none(),
+                    "WFQ pending log already set for scheduler {}",
+                    self.scheduler_id
+                );
+                self.log_wfq_event(
+                    WfqEventKind::Schedule,
+                    self.time,
+                    &tagged_outbound.packet,
+                    class_id,
+                    tagged_outbound.tag,
+                    Some(departure_time),
+                );
+                self.pending_log = Some(WfqPendingLog {
+                    packet_id: tagged_outbound.packet.packet_id,
+                    flow_id: tagged_outbound.packet.flow_id,
+                    class_id,
+                    size_bytes: tagged_outbound.packet.size,
+                    finish_time: tagged_outbound.tag,
+                    schedule_time: self.time,
+                    departure_time,
+                });
+            }
 
             self.busy_until = departure_time;
 
@@ -920,11 +1033,11 @@ mod tests {
         let mut packets: Vec<_> = wfq.scheduler_queue.clone().into_sorted_vec();
         packets.reverse();
 
-        // first packet: start = 0.0, finish = 0.0
-        assert!((packets[0].tag - 0.0).abs() < 1e-6);
+        // first packet: start = 0.0, finish = 0.8
+        assert!((packets[0].tag - 0.8).abs() < 1e-6);
 
-        // second packet: start = 0.0, finish = 0.8
-        assert!((packets[1].tag - 0.8).abs() < 1e-6);
+        // second packet: start = 0.8, finish = 1.6
+        assert!((packets[1].tag - 1.6).abs() < 1e-6);
     }
 
     #[test]
@@ -1015,9 +1128,27 @@ mod tests {
         println!("Ratio flow 1/flow 0: {}", bytes[1] as f64 / bytes[0] as f64);
         println!("Ratio flow 2/flow 0: {}", bytes[2] as f64 / bytes[0] as f64);
 
-        // Check ratios between flows match weights (within 20% tolerance)
-        assert!((bytes[1] as f64 / bytes[0] as f64 - 2.0).abs() < 0.2);
-        assert!((bytes[2] as f64 / bytes[0] as f64 - 4.0).abs() < 0.2);
+        // Check each flow's share matches weights (within 2 packets).
+        let total_bytes: usize = bytes.iter().sum();
+        let weights = [1usize, 2, 4];
+        let weight_sum: usize = weights.iter().sum();
+        let tolerance_bytes = 20usize;
+        for (idx, weight) in weights.iter().enumerate() {
+            let expected =
+                (total_bytes as f64 * (*weight as f64) / (weight_sum as f64)).round() as usize;
+            let delta = if bytes[idx] > expected {
+                bytes[idx] - expected
+            } else {
+                expected - bytes[idx]
+            };
+            assert!(
+                delta <= tolerance_bytes,
+                "flow {} expected ~{} bytes, got {}",
+                idx,
+                expected,
+                bytes[idx]
+            );
+        }
     }
 
     #[test]

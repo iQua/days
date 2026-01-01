@@ -93,6 +93,7 @@ Days will create the directory if needed and will write:
   - `dcqcn_events.csv` (`--features dcqcn,lean`)
   - `pfc_events.csv` (`--features l2_pfc,lean`)
   - `cubic_events.csv` (`--features lean`)
+  - `wfq_events.csv` (`--features lean`)
 
 ### `report_interval` (optional)
 

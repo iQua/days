@@ -14,3 +14,6 @@ lean_exe pfc_check where
 
 lean_exe cubic_check where
   root := `LeanGuard.CubicMain
+
+lean_exe wfq_check where
+  root := `LeanGuard.WfqMain

@@ -58,3 +58,4 @@ Days periodically emits CSV reports (configurable by `report_interval`) for:
   - `dcqcn_events.csv` (with `--features dcqcn,lean`)
   - `pfc_events.csv` (with `--features l2_pfc,lean`)
   - `cubic_events.csv` (with `--features lean`)
+  - `wfq_events.csv` (with `--features lean`)

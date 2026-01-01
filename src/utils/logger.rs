@@ -147,11 +147,41 @@ pub struct DcqcnEventRow {
     pub last_cnp_ns: Option<u64>,
 }
 
+#[cfg(feature = "lean")]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WfqEventKind {
+    Enqueue,
+    Schedule,
+    Depart,
+}
+
+#[cfg(feature = "lean")]
+#[derive(Clone, Debug, Serialize)]
+pub struct WfqEventRow {
+    pub time_ns: u64,
+    pub event_id: u64,
+    pub kind: WfqEventKind,
+    pub scheduler_id: u64,
+    pub packet_id: u64,
+    pub flow_id: u64,
+    pub class_id: u64,
+    pub size_bytes: u64,
+    pub weight: u64,
+    pub rate_bps: u64,
+    pub vtime_ns: u64,
+    pub finish_time_ns: u64,
+    pub departure_time_ns: Option<u64>,
+}
+
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
 static NEXT_DCQCN_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "lean")]
 static NEXT_CUBIC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "lean")]
+static NEXT_WFQ_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(feature = "lean", feature = "l2_pfc"))]
 static NEXT_PFC_EVENT_ID: AtomicU64 = AtomicU64::new(0);
@@ -170,6 +200,8 @@ pub enum Report {
     PfcEventRow(PfcEventRow),
     #[cfg(feature = "lean")]
     CubicEventRow(CubicEventRow),
+    #[cfg(feature = "lean")]
+    WfqEventRow(WfqEventRow),
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEventRow(DcqcnEventRow),
 }
@@ -192,6 +224,8 @@ struct SharedState {
     pfc_events: Vec<PfcEventRow>,
     #[cfg(feature = "lean")]
     cubic_events: Vec<CubicEventRow>,
+    #[cfg(feature = "lean")]
+    wfq_events: Vec<WfqEventRow>,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     dcqcn_events: Vec<DcqcnEventRow>,
     total_delay: f64,
@@ -208,6 +242,8 @@ enum ElementType {
     PfcEvents,
     #[cfg(feature = "lean")]
     CubicEvents,
+    #[cfg(feature = "lean")]
+    WfqEvents,
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
     DcqcnEvents,
 }
@@ -307,6 +343,8 @@ impl CsvLogger {
         elements.push("pfc_events");
         #[cfg(feature = "lean")]
         elements.push("cubic_events");
+        #[cfg(feature = "lean")]
+        elements.push("wfq_events");
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         elements.push("dcqcn_events");
         for element in elements {
@@ -338,6 +376,11 @@ impl CsvLogger {
     #[cfg(feature = "lean")]
     pub fn next_cubic_event_id() -> u64 {
         NEXT_CUBIC_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "lean")]
+    pub fn next_wfq_event_id() -> u64 {
+        NEXT_WFQ_EVENT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -375,6 +418,10 @@ impl CsvLogger {
             #[cfg(feature = "lean")]
             Report::CubicEventRow(event) => {
                 state.cubic_events.push(event);
+            }
+            #[cfg(feature = "lean")]
+            Report::WfqEventRow(event) => {
+                state.wfq_events.push(event);
             }
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             Report::DcqcnEventRow(event) => {
@@ -423,6 +470,8 @@ impl CsvLogger {
             ElementType::PfcEvents => format!("{}pfc_events.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "lean")]
             ElementType::CubicEvents => format!("{}cubic_events.csv", self.log_path.get().unwrap()),
+            #[cfg(feature = "lean")]
+            ElementType::WfqEvents => format!("{}wfq_events.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "dcqcn"))]
             ElementType::DcqcnEvents => {
                 format!("{}dcqcn_events.csv", self.log_path.get().unwrap())
@@ -543,6 +592,14 @@ impl CsvLogger {
             }
         }
 
+        #[cfg(feature = "lean")]
+        if state.wfq_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.wfq_events);
+            if let Err(e) = self.write_to_csv(ElementType::WfqEvents, &events) {
+                eprintln!("Error writing WFQ events to CSV: {}", e);
+            }
+        }
+
         #[cfg(all(feature = "lean", feature = "dcqcn"))]
         if state.dcqcn_events.len() >= self.max_log_len {
             let events = std::mem::take(&mut state.dcqcn_events);
@@ -601,6 +658,13 @@ impl CsvLogger {
             let events = std::mem::take(&mut state.cubic_events);
             self.write_to_csv(ElementType::CubicEvents, &events)
                 .expect("Error writing CUBIC events to CSV");
+        }
+
+        #[cfg(feature = "lean")]
+        if !state.wfq_events.is_empty() {
+            let events = std::mem::take(&mut state.wfq_events);
+            self.write_to_csv(ElementType::WfqEvents, &events)
+                .expect("Error writing WFQ events to CSV");
         }
 
         #[cfg(all(feature = "lean", feature = "dcqcn"))]

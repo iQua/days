@@ -45,12 +45,14 @@ The current executables are defined in `lean/lakefile.lean`:
 - `dcqcn_check` (DCQCN trace replay)
 - `pfc_check` (PFC trace replay)
 - `cubic_check` (TCP CUBIC trace replay)
+- `wfq_check` (WFQ trace replay)
 
 On the simulator side, Days emits:
 
 - `dcqcn_events.csv` when built with `--features dcqcn,lean`
 - `pfc_events.csv` when built with `--features l2_pfc,lean`
 - `cubic_events.csv` when built with `--features lean`
+- `wfq_events.csv` when built with `--features lean`
 
 ## Extending LeanGuard to a new protocol
 
@@ -65,4 +67,3 @@ The recommended instantiation recipe is:
    - checks pairing rules and gates (cooldowns / eligibility windows)
    - recomputes the post-state and compares it to the logged snapshot
 5. Add a `lean_exe` entry in `lean/lakefile.lean` and a CLI wrapper that prints `ACCEPT`/`REJECT`.
-

@@ -49,6 +49,16 @@ RUST_LOG=info cargo run --features lean -- configs/simple.toml
 
 If your scenario includes TCP flows using CUBIC, Days writes `cubic_events.csv` under `log_path`.
 
+### WFQ (`wfq_events.csv`)
+
+WFQ event tracing is enabled by the `lean` feature:
+
+```bash
+RUST_LOG=info cargo run --features lean -- configs/simple.toml
+```
+
+If your scenario includes a WFQ scheduler, Days writes `wfq_events.csv` under `log_path`.
+
 ## Build and run the Lean checkers
 
 All checkers live under `lean/` and are built with `lake`.
@@ -64,6 +74,7 @@ Then run one of:
 ./.lake/build/bin/dcqcn_check  <path/to/dcqcn_events.csv>
 ./.lake/build/bin/pfc_check    <path/to/pfc_events.csv>
 ./.lake/build/bin/cubic_check  <path/to/cubic_events.csv>
+./.lake/build/bin/wfq_check    <path/to/wfq_events.csv>
 ```
 
 Exit codes:
@@ -89,4 +100,3 @@ Typical causes:
 - violated protocol gates (cooldowns / refresh intervals)
 - mismatched send/receive pairing (e.g., `*_recv` without prior `*_sent`)
 - post-state snapshot not equal to the state computed by the Lean update equations
-
