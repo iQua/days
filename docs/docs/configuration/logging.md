@@ -37,8 +37,17 @@ threading = "single"
 
 - Allowed values: `single`, `multiple`
 - `single` uses a single-threaded runtime.
-- `multiple` uses one worker per CPU core.
+- `multiple` uses one worker per CPU core by default.
 - If omitted, Days uses the `nexosim` default runtime configuration.
+
+## `num_threads` (optional)
+
+Overrides the number of runtime worker threads when `threading = "multiple"`.
+
+```toml
+threading = "multiple"
+num_threads = 4
+```
 
 ## `hot_workers` (optional)
 

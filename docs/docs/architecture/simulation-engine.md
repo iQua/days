@@ -38,7 +38,7 @@ This “time-carrying message” design is central to performance; see `architec
 Days chooses the runtime based on config:
 
 - `threading = "single"` uses a single-threaded runtime (lower scheduling overhead).
-- `threading = "multiple"` uses a multi-threaded runtime sized to CPU cores.
+- `threading = "multiple"` uses a multi-threaded runtime sized to CPU cores by default (override with `num_threads`).
 
 The choice is made in `Topology::new` (`src/topos/topo.rs`) using `SimInit::with_num_threads(...)`.
 

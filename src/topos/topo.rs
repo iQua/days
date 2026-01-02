@@ -73,6 +73,7 @@ pub struct TracingConfig {
 #[derive(Deserialize)]
 struct ConcurrencyConfig {
     threading: Option<ThreadingModel>,
+    num_threads: Option<usize>,
     hot_workers: Option<usize>,
     concurrency_level: Option<ConcurrencyLevel>,
 }
@@ -212,6 +213,7 @@ impl SinkStatistics {
 pub struct Topology {
     /// the simulation engine
     sim_init: SimInit,
+    runtime_num_threads: usize,
     /// undirected graph of the topology
     graph: UnGraph<usize, ()>,
     /// a hash map of switch ids that connects to endpoints
@@ -273,9 +275,37 @@ impl Topology {
             .expect("Failed to deserialize the configuration of concurrency");
 
         let threading = concurrency_config.threading;
+        let config_num_threads = concurrency_config.num_threads;
+        if threading.is_none() && config_num_threads.is_some() {
+            panic!("num_threads requires threading to be set (e.g., threading = \"multiple\").");
+        }
+
+        fn normalize_num_threads(num_threads: usize) -> usize {
+            if cfg!(target_family = "wasm") {
+                1
+            } else {
+                num_threads.clamp(1, usize::BITS as usize)
+            }
+        }
+
         let num_threads = threading.map(|model| match model {
-            ThreadingModel::Single => 1,
-            ThreadingModel::Multiple => num_cpus::get(),
+            ThreadingModel::Single => {
+                if let Some(n) = config_num_threads {
+                    if n != 1 {
+                        panic!(
+                            "num_threads={n} is incompatible with threading=\"single\" (expected 1)."
+                        );
+                    }
+                }
+                1
+            }
+            ThreadingModel::Multiple => {
+                let n = config_num_threads.unwrap_or_else(num_cpus::get);
+                if n == 0 {
+                    panic!("num_threads must be >= 1.");
+                }
+                normalize_num_threads(n)
+            }
         });
 
         let mut sim_init = if let Some(model) = threading {
@@ -290,6 +320,7 @@ impl Topology {
             info!("Starting simulation with the default threading model.");
             SimInit::new()
         };
+        let runtime_num_threads = num_threads.unwrap_or_else(|| normalize_num_threads(num_cpus::get()));
 
         if let Some(hot_workers) = concurrency_config.hot_workers {
             sim_init = sim_init.set_hot_worker_count(hot_workers);
@@ -303,14 +334,7 @@ impl Topology {
                     info!("Using default concurrency level.");
                 }
                 ConcurrencyLevel::Accelerated => {
-                    let effective_threads = if cfg!(target_family = "wasm") {
-                        1
-                    } else {
-                        num_threads
-                            .unwrap_or_else(num_cpus::get)
-                            .clamp(1, usize::BITS as usize)
-                    };
-                    sim_init = sim_init.set_max_groups_per_step_task(effective_threads);
+                    sim_init = sim_init.set_max_groups_per_step_task(runtime_num_threads);
                     info!("Using accelerated concurrency level.");
                 }
             }
@@ -351,6 +375,7 @@ impl Topology {
         }
         Topology {
             sim_init,
+            runtime_num_threads,
             graph: graph.clone(),
             hosts,
             switches,
@@ -368,6 +393,10 @@ impl Topology {
             duration,
             app_source_cfg,
         }
+    }
+
+    pub fn num_threads(&self) -> usize {
+        self.runtime_num_threads
     }
 
     fn init_logger(config_path: &str) {
@@ -1436,6 +1465,7 @@ mod ring_allreduce_serialization_tests {
         // Build a minimal Topology that lets us call process_collectives() only.
         let mut topo = Topology {
             sim_init: SimInit::new(),
+            runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
             hosts: sources.clone(),
             switches: HashMap::new(),
