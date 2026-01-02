@@ -1,5 +1,5 @@
 seed = 1000
-num_threads = 1
+threading = "single"
 log_path = "logs/fattree"
 
 [topology]

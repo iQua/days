@@ -2,12 +2,12 @@
 seed = 100
 mailbox_capacity = 16 
 duration = 1.0 
-num_threads = 24
-time_quantum_ns = 100000
 log_path = "logs/exp/tcp_fattree/t10_m1000"
 ui_interval = 1e9
+threading = "multiple"
 hot_workers = 2
 concurrency_level = "accelerated"
+time_quantum_ns = 100000
 
 [topology]
     category = "FatTree"

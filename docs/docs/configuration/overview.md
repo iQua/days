@@ -22,7 +22,7 @@ This is a minimal, custom-topology run: one link, one packet-distribution flow.
 ```toml
 seed = 1
 duration = 2.0
-num_threads = 1
+threading = "single"
 log_path = "./output/minimal"
 
 edges = [[0, 1]]

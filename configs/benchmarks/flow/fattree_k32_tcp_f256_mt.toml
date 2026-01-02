@@ -1,6 +1,6 @@
 seed = 1000
 duration = 10.0
-num_threads = 24
+threading = "multiple"
 log_path = "logs/fattree"
 ui_interval = 1e9
 time_quantum_ns = 10000

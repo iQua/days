@@ -27,14 +27,17 @@ duration = 20.0
 
 Note: `duration` is parsed by multiple subsystems (topology, UI, tracing). For consistency, prefer setting it explicitly.
 
-## `num_threads` (optional)
+## `threading` (optional)
 
-Number of worker threads used by the simulation runtime.
+Threading model for the simulation runtime.
 
 ```toml
-num_threads = 1
+threading = "single"
 ```
 
+- Allowed values: `single`, `multiple`
+- `single` uses a single-threaded runtime.
+- `multiple` uses one worker per CPU core.
 - If omitted, Days uses the `nexosim` default runtime configuration.
 
 ## `hot_workers` (optional)

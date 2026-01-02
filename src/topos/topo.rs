@@ -72,9 +72,16 @@ pub struct TracingConfig {
 
 #[derive(Deserialize)]
 struct ConcurrencyConfig {
-    num_threads: Option<usize>,
+    threading: Option<ThreadingModel>,
     hot_workers: Option<usize>,
     concurrency_level: Option<ConcurrencyLevel>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadingModel {
+    Single,
+    Multiple,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -265,17 +272,24 @@ impl Topology {
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
 
-        let mut sim_init;
-        let num_threads = concurrency_config.num_threads;
+        let threading = concurrency_config.threading;
+        let num_threads = threading.map(|model| match model {
+            ThreadingModel::Single => 1,
+            ThreadingModel::Multiple => num_cpus::get(),
+        });
 
-        if let Some(num_threads) = num_threads {
-            sim_init = SimInit::with_num_threads(num_threads);
-
-            info!("Starting simulation with {num_threads} thread(s).",);
+        let mut sim_init = if let Some(model) = threading {
+            let num_threads = num_threads.expect("threading implies a thread count");
+            let mode = match model {
+                ThreadingModel::Single => "single",
+                ThreadingModel::Multiple => "multiple",
+            };
+            info!("Starting simulation with {mode} threading ({num_threads} thread(s)).");
+            SimInit::with_num_threads(num_threads)
         } else {
-            sim_init = SimInit::new();
-            info!("Starting simulation with the default number of thread(s).",);
-        }
+            info!("Starting simulation with the default threading model.");
+            SimInit::new()
+        };
 
         if let Some(hot_workers) = concurrency_config.hot_workers {
             sim_init = sim_init.set_hot_worker_count(hot_workers);

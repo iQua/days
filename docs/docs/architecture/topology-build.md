@@ -19,7 +19,7 @@ Supported topology modes:
 - `Config` (switch config, optional topology config, optional L2/app-source config, `time_quantum_ns`)
 - `MailboxConfig` (`mailbox_capacity`)
 - `UIConfig` (`duration`, `ui_interval`)
-- `ConcurrencyConfig` (`num_threads`, `hot_workers`, `concurrency_level`)
+- `ConcurrencyConfig` (`threading`, `hot_workers`, `concurrency_level`)
 
 It also sets global ID ranges so that switch IDs and endpoint IDs do not collide:
 

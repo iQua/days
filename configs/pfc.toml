@@ -4,7 +4,7 @@ hosts = [0, 1]
 duration = 5.0
 report_interval = 1.0
 ui_interval = 0.5
-num_threads = 1
+threading = "single"
 log_path = "./logs/pfc"
 
 [switch]
