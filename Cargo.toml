@@ -19,7 +19,7 @@ lean = []
 perf_stats = ["nexosim/perf_stats"]
 
 [dependencies]
-csv = "1.3"
+csv = "1.4"
 env_logger = "0.11"
 indicatif = "0.18"
 indicatif-log-bridge = "0.2"
