@@ -3,6 +3,7 @@ import Std
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
+import LeanGuard.Shared.Coverage
 import LeanGuard.Drr.Semantics
 
 namespace LeanGuard.DrrEventLog
@@ -115,20 +116,80 @@ def toEvent (r : Row) : Event :=
     scanSteps := r.scanSteps
     departureTimeNs := r.departureTimeNs }
 
-def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
+def listAny (xs : List Nat) (p : Nat → Bool) : Bool :=
+  match xs with
+  | [] => false
+  | x :: rest => if p x then true else listAny rest p
 
-  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) :
-      Except String Unit := do
+def recordCover (cov : CoverageState) (g : Global) (r : Row) : CoverageState :=
+  let cov :=
+    if r.classCount >= 2 then
+      covHit cov "class_count_ge_2"
+    else
+      cov
+  match r.kind with
+  | Kind.enqueue => cov
+  | Kind.schedule =>
+      let cov :=
+        if r.scanSteps > 0 then
+          covHit cov "scanSteps_gt_0"
+        else
+          cov
+      let st := g.schedulers.getD r.schedulerId {}
+      let classCount := r.classCount
+      let cov :=
+        if r.scanSteps > 0 && classCount > 0 &&
+            (st.currentQueue + r.scanSteps >= classCount) then
+          covHit cov "wraparound_updates_deficits"
+        else
+          cov
+      let cov :=
+        if r.scanSteps > 0 && classCount > 0 &&
+            (st.currentQueue + r.scanSteps >= classCount) then
+          let needsReset := listAny (classIds classCount)
+            (fun cid => queueEmpty st cid && getDeficit st cid > 0)
+          if needsReset then
+            covHit cov "deficit_reset_on_empty"
+          else
+            cov
+        else
+          cov
+      let cov :=
+        if r.deficitBytes = 0 then
+          covHit cov "size_eq_deficit"
+        else
+          covHit cov "size_lt_deficit"
+      cov
+
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
+  let rowsSorted ←
+    match canonicalizeRows rows key (fun r => r.srcLine) with
+    | .ok rs => pure rs
+    | .error e => throw (e, {})
+
+  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
+      (cov : CoverageState) : CheckOutcome := do
       match rows with
-      | [] => pure ()
+      | [] => pure cov
       | r :: rs => do
+          let cov := covTick cov
+          let cov := recordCover cov g r
           match prevKey with
           | none => pure ()
           | some pk =>
-              require r.srcLine (keyLt pk (key r)) "global key went backwards"
-          let g' ← step r.srcLine g (toEvent r)
-          go g' (some (key r)) rs
-  go {} none rowsSorted
+              match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
+              | .ok _ => pure ()
+              | .error e => throw (e, cov)
+          let g' ←
+            match step r.srcLine g (toEvent r) with
+            | .ok g' => pure g'
+            | .error e => throw (e, cov)
+          go g' (some (key r)) rs cov
+  go {} none rowsSorted {}
+
+def checkRows (rows : List Row) : Except String Unit := do
+  match checkRowsWithCoverage rows with
+  | .ok _ => pure ()
+  | .error (e, _) => throw e
 
 end LeanGuard.DrrEventLog

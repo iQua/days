@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
 use std::io::Write;
@@ -49,7 +49,7 @@ fn leanguard_run_check_only_uses_manifest_and_runs_checkers() {
         }
     }
 
-    let mut cmd = Command::cargo_bin("leanguard-run").expect("binary exists");
+    let mut cmd = cargo_bin_cmd!("leanguard-run");
     cmd.args([
         "--config",
         config_path.to_str().unwrap(),

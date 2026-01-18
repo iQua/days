@@ -3,6 +3,7 @@ import Std
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
+import LeanGuard.Shared.Coverage
 import LeanGuard.Pfc.Semantics
 
 namespace LeanGuard.PfcEventLog
@@ -110,19 +111,80 @@ def toEvent (r : Row) : Event :=
     bufferCapacityBytes := r.bufferCapacityBytes
     srcLine := r.srcLine }
 
-def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
+def recordCover (cov : CoverageState) (g : Global) (r : Row) : CoverageState :=
+  let cov :=
+    match r.priority with
+    | 0 => covHit cov "prio_0_seen"
+    | 1 => covHit cov "prio_1_seen"
+    | 2 => covHit cov "prio_2_seen"
+    | 3 => covHit cov "prio_3_seen"
+    | 4 => covHit cov "prio_4_seen"
+    | 5 => covHit cov "prio_5_seen"
+    | 6 => covHit cov "prio_6_seen"
+    | 7 => covHit cov "prio_7_seen"
+    | _ => cov
+  let cov :=
+    match r.kind with
+    | Kind.pfcSent =>
+        let wasPaused := isPaused g r.senderId r.priority
+        let cov :=
+          if r.pauseQuanta = 0 then
+            covHit cov "resume"
+          else if wasPaused then
+            covHit cov "pause_refresh"
+          else
+            covHit cov "pause_assert"
+        let cov :=
+          match r.queueOccupancyBytes, r.xoffThresholdBytes with
+          | some occ, some xoff =>
+              if occ = xoff then
+                covHit cov "occ_eq_xoff"
+              else if occ > xoff then
+                covHit cov "occ_gt_xoff"
+              else
+                cov
+          | _, _ => cov
+        match r.queueOccupancyBytes, r.xonThresholdBytes with
+        | some occ, some xon =>
+            if occ = xon then
+              covHit cov "occ_eq_xon"
+            else if occ < xon then
+              covHit cov "occ_lt_xon"
+            else
+              cov
+        | _, _ => cov
+    | Kind.pfcRecv => cov
+  cov
 
-  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
+  let rowsSorted ←
+    match canonicalizeRows rows key (fun r => r.srcLine) with
+    | .ok rs => pure rs
+    | .error e => throw (e, {})
+
+  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
+      (cov : CoverageState) : CheckOutcome := do
     match rows with
-    | [] => pure ()
+    | [] => pure cov
     | r :: rs => do
+        let cov := covTick cov
+        let cov := recordCover cov g r
         match prevKey with
         | none => pure ()
         | some pk =>
-            require r.srcLine (keyLt pk (key r)) "global key went backwards"
-        let g' ← step r.srcLine g (toEvent r)
-        go g' (some (key r)) rs
-  go {} none rowsSorted
+            match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
+            | .ok _ => pure ()
+            | .error e => throw (e, cov)
+        let g' ←
+          match step r.srcLine g (toEvent r) with
+          | .ok g' => pure g'
+          | .error e => throw (e, cov)
+        go g' (some (key r)) rs cov
+  go {} none rowsSorted {}
+
+def checkRows (rows : List Row) : Except String Unit := do
+  match checkRowsWithCoverage rows with
+  | .ok _ => pure ()
+  | .error (e, _) => throw e
 
 end LeanGuard.PfcEventLog
