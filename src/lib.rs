@@ -96,3 +96,20 @@ pub fn peak_concurrency() -> usize {
 pub fn reset_peak_concurrency() {
     PEAK_ACTIVE_TASKS.store(0, Ordering::Relaxed);
 }
+
+pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
+    use crate::flows::collective::Collective;
+    use crate::flows::flow::Flow;
+    use crate::topos::build::build_graph;
+    use crate::topos::topo::Topology;
+
+    let _ = seed_from_config(config_path);
+
+    let (graph, hosts) = build_graph(config_path).map_err(|e| e.to_string())?;
+    let flows = Flow::flows_from_config(config_path, &hosts);
+    let collectives = Collective::collectives_from_config(config_path, &hosts);
+
+    let topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
+    topology.run(graph);
+    Ok(())
+}

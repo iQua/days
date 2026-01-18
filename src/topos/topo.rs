@@ -320,7 +320,8 @@ impl Topology {
             info!("Starting simulation with the default threading model.");
             SimInit::new()
         };
-        let runtime_num_threads = num_threads.unwrap_or_else(|| normalize_num_threads(num_cpus::get()));
+        let runtime_num_threads =
+            num_threads.unwrap_or_else(|| normalize_num_threads(num_cpus::get()));
 
         if let Some(hot_workers) = concurrency_config.hot_workers {
             sim_init = sim_init.set_hot_worker_count(hot_workers);

@@ -2,5 +2,6 @@
 
 pub mod logger;
 pub mod time;
+pub mod trace_manifest;
 pub mod tracing;
 pub mod ui;
