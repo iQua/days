@@ -159,6 +159,8 @@ fn main() {
     summary.log_path = log_path.to_string();
     let log_path = PathBuf::from(log_path);
 
+    let required_features_hint = required_features_hint(&config_toml);
+
     if matches!(cli.mode, Mode::SimulateAndCheck) {
         let run_result =
             std::panic::catch_unwind(|| days::run_simulation_from_config(&summary.config_path));
@@ -179,8 +181,25 @@ fn main() {
         summary.days = DaysStatus::Skipped;
     }
 
-    let trace_discovery = discover_traces(&log_path);
-    summary.trace_discovery = trace_discovery;
+    if matches!(cli.mode, Mode::SimulateAndCheck) && summary.days != DaysStatus::Ok {
+        if summary.days_error.is_some() && !required_features_hint.is_empty() {
+            summary.days_error = Some(format!(
+                "{}\nHint: you may need to build Days with {}",
+                summary.days_error.take().unwrap(),
+                required_features_hint
+            ));
+        }
+
+        summary.trace_discovery = TraceDiscoverySummary {
+            mode: TraceDiscoveryMode::ScanFallback,
+            traces: Vec::new(),
+        };
+        summary.checker_results = Vec::new();
+        summary.accept = false;
+        emit_and_exit(summary, 1);
+    }
+
+    summary.trace_discovery = discover_traces(&log_path);
 
     let invocations = select_checkers(&log_path, &summary.trace_discovery.traces);
     for inv in invocations {
@@ -365,4 +384,40 @@ fn run_checker(checker_dir: &Path, inv: CheckerInvocation) -> CheckerResult {
             stderr: format!("Failed to execute checker: {e}"),
         },
     }
+}
+
+fn required_features_hint(config: &toml::Value) -> String {
+    let mut features = Vec::new();
+
+    if config
+        .get("flow")
+        .and_then(|v| v.as_array())
+        .is_some_and(|flows| {
+            flows.iter().any(|flow| {
+                flow.get("flow_type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t.eq_ignore_ascii_case("dcqcn"))
+            })
+        })
+    {
+        features.push("dcqcn");
+    }
+
+    if config
+        .get("link")
+        .and_then(|v| v.get("mode"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.eq_ignore_ascii_case("pfc"))
+    {
+        features.push("l2_pfc");
+    }
+
+    if features.is_empty() {
+        return String::new();
+    }
+
+    features.sort();
+    features.dedup();
+
+    format!("`--features {}`", features.join(","))
 }
