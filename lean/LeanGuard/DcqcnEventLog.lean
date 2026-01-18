@@ -4,6 +4,7 @@ import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
 import LeanGuard.Shared.Numeric
+import LeanGuard.Shared.Coverage
 import LeanGuard.Dcqcn.Semantics
 
 namespace LeanGuard.DcqcnEventLog
@@ -183,6 +184,80 @@ def rowSrcParams (r : Row) : SrcParams :=
     aiRateBps := r.aiRateBps
     haiRateBps := r.haiRateBps }
 
+def getSrcState (g : Global) (r : Row) : SrcState :=
+  match g.src.get? r.endpointId with
+  | some s => s
+  | none => initialSrcState (rowSrcParams r)
+
+def recordCover (cov : CoverageState) (g : Global) (r : Row) : CoverageState :=
+  match r.kind with
+  | Kind.cnpSent => cov
+  | Kind.cnpRecv =>
+      let srcSt := getSrcState g r
+      let p := srcSt.p
+      let applied :=
+        match srcSt.lastCnpNs with
+        | none => true
+        | some last => last + p.cnpIntervalNs <= r.timeNs
+      let cov :=
+        if applied then
+          covHit cov "cnp_apply"
+        else
+          covHit cov "cnp_ignored_due_to_interval"
+      if applied then
+        let gFloat := ppbToFloat p.gPpb
+        let mi := ppbToFloat p.miPpb
+        let α := (1.0 - gFloat) * srcSt.alpha + gFloat
+        let decreasedRate := srcSt.rateBps * (1.0 - mi * α)
+        let minRate := Float.ofNat p.minRateBps
+        let cov :=
+          if decreasedRate < minRate then
+            covHit cov "rate_clamped_min"
+          else
+            cov
+        let cov :=
+          if toPpb α != toPpb srcSt.alpha then
+            covHit cov "alpha_updated_nontrivial"
+          else
+            cov
+        cov
+      else
+        cov
+  | Kind.timerTick =>
+      let srcSt := getSrcState g r
+      let cov :=
+        if srcSt.cnpSeen then
+          covHit cov "timer_with_cnp_seen"
+        else
+          covHit cov "timer_without_cnp_seen"
+      if srcSt.cnpSeen then
+        cov
+      else
+        let gFloat := ppbToFloat srcSt.p.gPpb
+        let α := (1.0 - gFloat) * srcSt.alpha
+        let cov :=
+          if α < 0.1 then
+            covHit cov "alpha_below_0p1"
+          else
+            covHit cov "alpha_above_0p1"
+        let inc :=
+          if α < 0.1 then
+            Float.ofNat srcSt.p.haiRateBps
+          else
+            Float.ofNat srcSt.p.aiRateBps
+        let maxRate := Float.ofNat srcSt.p.maxRateBps
+        let cov :=
+          if srcSt.rateBps + inc > maxRate then
+            covHit cov "rate_clamped_max"
+          else
+            cov
+        let cov :=
+          if toPpb α != toPpb srcSt.alpha then
+            covHit cov "alpha_updated_nontrivial"
+          else
+            cov
+        cov
+
 def checkCnpPacket (lineNo : Nat) (r : Row) : Except String (Nat × Nat) := do
   let pktId ← requireSome lineNo "pkt_id" r.pktId
   let pktFlowId ← requireSome lineNo "pkt_flow_id" r.pktFlowId
@@ -313,20 +388,36 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
       pure { g with src := g.src.insert r.endpointId srcSt' }
 
-def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
+  let rowsSorted ←
+    match canonicalizeRows rows key (fun r => r.srcLine) with
+    | .ok rs => pure rs
+    | .error e => throw (e, {})
 
-  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
+  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
+      (cov : CoverageState) : CheckOutcome := do
     match rows with
-    | [] => pure ()
+    | [] => pure cov
     | r :: rs => do
+        let cov := covTick cov
+        let cov := recordCover cov g r
         match prevKey with
         | none => pure ()
         | some pk =>
-            require r.srcLine (keyLt pk (key r)) "global key went backwards"
-        let g' ← step r.srcLine g r
-        go g' (some (key r)) rs
-  go {} none rowsSorted
+            match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
+            | .ok _ => pure ()
+            | .error e => throw (e, cov)
+        let g' ←
+          match step r.srcLine g r with
+          | .ok g' => pure g'
+          | .error e => throw (e, cov)
+        go g' (some (key r)) rs cov
+  go {} none rowsSorted {}
+
+def checkRows (rows : List Row) : Except String Unit := do
+  match checkRowsWithCoverage rows with
+  | .ok _ => pure ()
+  | .error (e, _) => throw e
 
 def dummyRow (timeNs eventId srcLine : Nat) : Row :=
   { timeNs

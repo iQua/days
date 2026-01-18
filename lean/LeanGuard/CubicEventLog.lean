@@ -4,6 +4,7 @@ import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
 import LeanGuard.Shared.Numeric
+import LeanGuard.Shared.Coverage
 import LeanGuard.Cubic.Semantics
 
 namespace LeanGuard.CubicEventLog
@@ -219,19 +220,41 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
   pure { g with flows := g.flows.insert r.endpointId st' }
 
-def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
+def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
+  match r.kind with
+  | Kind.ack => covHit cov "saw_ack"
+  | Kind.congestion => covHit cov "saw_congestion"
+  | Kind.timeout => covHit cov "saw_timeout"
 
-  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) : Except String Unit := do
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
+  let rowsSorted ←
+    match canonicalizeRows rows key (fun r => r.srcLine) with
+    | .ok rs => pure rs
+    | .error e => throw (e, {})
+
+  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
+      (cov : CoverageState) : CheckOutcome := do
     match rows with
-    | [] => pure ()
+    | [] => pure cov
     | r :: rs => do
+        let cov := covTick cov
+        let cov := recordCover cov r
         match prevKey with
         | none => pure ()
         | some pk =>
-            require r.srcLine (keyLt pk (key r)) "global key went backwards"
-        let g' ← step r.srcLine g r
-        go g' (some (key r)) rs
-  go {} none rowsSorted
+            match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
+            | .ok _ => pure ()
+            | .error e => throw (e, cov)
+        let g' ←
+          match step r.srcLine g r with
+          | .ok g' => pure g'
+          | .error e => throw (e, cov)
+        go g' (some (key r)) rs cov
+  go {} none rowsSorted {}
+
+def checkRows (rows : List Row) : Except String Unit := do
+  match checkRowsWithCoverage rows with
+  | .ok _ => pure ()
+  | .error (e, _) => throw e
 
 end LeanGuard.CubicEventLog

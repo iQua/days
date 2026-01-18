@@ -3,6 +3,7 @@ import Std
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
+import LeanGuard.Shared.Coverage
 import LeanGuard.Wfq.Semantics
 
 namespace LeanGuard.WfqEventLog
@@ -105,20 +106,103 @@ def toEvent (r : Row) : Event :=
       finishTimeNs := r.finishTimeNs
       departureTimeNs := r.departureTimeNs }
 
-def checkRows (rows : List Row) : Except String Unit := do
-    let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
+def listContains (xs : List Nat) (x : Nat) : Bool :=
+    match xs with
+    | [] => false
+    | y :: ys => if x = y then true else listContains ys x
 
-    let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) :
-        Except String Unit := do
+def recordCover (cov : CoverageState) (g : Global) (r : Row)
+    (seenClasses : List Nat) : CoverageState × List Nat :=
+    let st := g.schedulers.getD r.schedulerId {}
+    let seenClasses :=
+        if listContains seenClasses r.classId then
+            seenClasses
+        else
+            r.classId :: seenClasses
+    let cov :=
+        if seenClasses.length >= 2 then
+            covHit cov "class_count_ge_2"
+        else
+            cov
+    let cov :=
+        match r.kind with
+        | Kind.enqueue =>
+            if !hasActive st then
+                covHit cov "enqueue_when_empty"
+            else
+                cov
+        | Kind.schedule =>
+            let queueList := st.queue.toList
+            let cov :=
+                match queueList with
+                | [] => cov
+                | _ => covHit cov "schedule_nonempty"
+            let cov :=
+                match queueList with
+                | [] => cov
+                | (_, first) :: rest =>
+                    let rec minFinish (best : Nat) (xs : List ((Nat × Nat) × QueuedPacket)) : Nat :=
+                        match xs with
+                        | [] => best
+                        | (_, q) :: xs' =>
+                            let best' := if q.finishTimeNs < best then q.finishTimeNs else best
+                            minFinish best' xs'
+                    let minVal := minFinish first.finishTimeNs rest
+                    let rec countMin (target : Nat) (count : Nat)
+                        (xs : List ((Nat × Nat) × QueuedPacket)) : Nat :=
+                        match xs with
+                        | [] => count
+                        | (_, q) :: xs' =>
+                            let count' := if q.finishTimeNs = target then count + 1 else count
+                            countMin target count' xs'
+                    let count := countMin minVal 0 queueList
+                    if count >= 2 then
+                        covHit cov "finish_time_tie_observed"
+                    else
+                        cov
+            cov
+        | Kind.depart =>
+            let count := st.flowCounts.get? r.classId |>.getD 0
+            if count = 0 then
+                cov
+            else
+                let flowCounts := st.flowCounts.insert r.classId (count - 1)
+                let stTemp := { st with flowCounts := flowCounts }
+                if !hasActive stTemp then
+                    covHit cov "queue_becomes_empty_after_depart"
+                else
+                    cov
+    (cov, seenClasses)
+
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
+    let rowsSorted ←
+        match canonicalizeRows rows key (fun r => r.srcLine) with
+        | .ok rs => pure rs
+        | .error e => throw (e, {})
+
+    let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
+        (cov : CoverageState) (seenClasses : List Nat) : CheckOutcome := do
         match rows with
-        | [] => pure ()
+        | [] => pure cov
         | r :: rs => do
+            let cov := covTick cov
+            let (cov, seenClasses) := recordCover cov g r seenClasses
             match prevKey with
             | none => pure ()
             | some pk =>
-                require r.srcLine (keyLt pk (key r)) "global key went backwards"
-            let g' ← step r.srcLine g (toEvent r)
-            go g' (some (key r)) rs
-    go {} none rowsSorted
+                match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
+                | .ok _ => pure ()
+                | .error e => throw (e, cov)
+            let g' ←
+                match step r.srcLine g (toEvent r) with
+                | .ok g' => pure g'
+                | .error e => throw (e, cov)
+            go g' (some (key r)) rs cov seenClasses
+    go {} none rowsSorted {} []
+
+def checkRows (rows : List Row) : Except String Unit := do
+    match checkRowsWithCoverage rows with
+    | .ok _ => pure ()
+    | .error (e, _) => throw e
 
 end LeanGuard.WfqEventLog

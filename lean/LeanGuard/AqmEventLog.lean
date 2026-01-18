@@ -3,6 +3,7 @@ import Std
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
+import LeanGuard.Shared.Coverage
 import LeanGuard.Aqm.Semantics
 
 namespace LeanGuard.AqmEventLog
@@ -166,20 +167,135 @@ def toEvent (r : Row) : Event :=
     redRandMaxPpb := r.redRandMaxPpb
     redRandMinPpb := r.redRandMinPpb }
 
-def checkRows (rows : List Row) : Except String Unit := do
-  let rowsSorted ← canonicalizeRows rows key (fun r => r.srcLine)
+def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
+  let e := toEvent r
+  match e.strategy with
+  | Strategy.tailDrop =>
+      let overflow := queueOverflow e
+      if overflow then
+        covHit cov "taildrop_overflow_drop"
+      else
+        covHit cov "taildrop_enqueue"
+  | Strategy.ecnThreshold =>
+      match e.ecnThresholdPpb with
+      | none => cov
+      | some t =>
+          let overflow := queueOverflow e
+          let thresh := exceedsThreshold e t
+          let cov :=
+            if overflow then
+              covHit cov "ecn_threshold_drop_overflow"
+            else if thresh then
+              covHit cov "ecn_threshold_mark"
+            else
+              covHit cov "ecn_threshold_pass"
+          if (!overflow) && thresh && e.action = Action.drop && e.ecnBefore == "not_ect" then
+            covHit cov "mark_non_ecn_packet_drop"
+          else
+            cov
+  | Strategy.red =>
+      let cov :=
+        match e.redMinThresholdPpb, e.redMaxThresholdPpb with
+        | some minPpb, some maxPpb =>
+            let overMax := exceedsThreshold e maxPpb
+            let overMin := exceedsThreshold e minPpb
+            if overMax then
+              covHit cov "red_over_max"
+            else if overMin then
+              covHit cov "red_between"
+            else
+              covHit cov "red_under_min"
+        | _, _ => cov
+      let cov :=
+        match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
+        | some minPpb, some maxPpb, some maxProbPpb, some avg =>
+            let overMax := exceedsThreshold e maxPpb
+            let overMin := exceedsThreshold e minPpb
+            let maxHit :=
+              match e.redRandMaxPpb with
+              | some r => r <= maxProbPpb
+              | none => false
+            let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
+            let minHit :=
+              match e.redRandMinPpb with
+              | some r => r <= minProbPpb
+              | none => false
+            let shouldMark := (overMax && maxHit) || (overMin && minHit)
+            if shouldMark then
+              covHit cov "red_should_drop"
+            else
+              cov
+        | _, _, _, _ => cov
+      cov
+  | Strategy.redEcn =>
+      let cov :=
+        match e.redMinThresholdPpb, e.redMaxThresholdPpb with
+        | some minPpb, some maxPpb =>
+            let overMax := exceedsThreshold e maxPpb
+            let overMin := exceedsThreshold e minPpb
+            if overMax then
+              covHit cov "red_over_max"
+            else if overMin then
+              covHit cov "red_between"
+            else
+              covHit cov "red_under_min"
+        | _, _ => cov
+      let cov :=
+        match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
+        | some minPpb, some maxPpb, some maxProbPpb, some avg =>
+            let overMax := exceedsThreshold e maxPpb
+            let overMin := exceedsThreshold e minPpb
+            let maxHit :=
+              match e.redRandMaxPpb with
+              | some r => r <= maxProbPpb
+              | none => false
+            let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
+            let minHit :=
+              match e.redRandMinPpb with
+              | some r => r <= minProbPpb
+              | none => false
+            let shouldMark := (overMax && maxHit) || (overMin && minHit)
+            let cov :=
+              if shouldMark then
+                covHit cov "red_should_mark"
+              else
+                cov
+            if shouldMark && e.action = Action.drop && e.ecnBefore == "not_ect" then
+              covHit cov "mark_non_ecn_packet_drop"
+            else
+              cov
+        | _, _, _, _ => cov
+      cov
 
-  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row) :
-      Except String Unit := do
-      match rows with
-      | [] => pure ()
-      | r :: rs => do
-          match prevKey with
-          | none => pure ()
-          | some pk =>
-              require r.srcLine (keyLt pk (key r)) "global key went backwards"
-          let g' ← step r.srcLine g (toEvent r)
-          go g' (some (key r)) rs
-  go {} none rowsSorted
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
+  let rowsSorted ←
+    match canonicalizeRows rows key (fun r => r.srcLine) with
+    | .ok rs => pure rs
+    | .error e => throw (e, {})
+
+  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
+      (cov : CoverageState) : CheckOutcome := do
+    match rows with
+    | [] => pure cov
+    | r :: rs => do
+        let cov := covTick cov
+        let cov := recordCover cov r
+        match prevKey with
+        | none => pure ()
+        | some pk =>
+            match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
+            | .ok _ => pure ()
+            | .error e => throw (e, cov)
+        let g' ←
+          match step r.srcLine g (toEvent r) with
+          | .ok g' => pure g'
+          | .error e => throw (e, cov)
+        go g' (some (key r)) rs cov
+  go {} none rowsSorted {}
+
+def checkRows (rows : List Row) : Except String Unit := do
+  match checkRowsWithCoverage rows with
+  | .ok _ => pure ()
+  | .error (e, _) => throw e
 
 end LeanGuard.AqmEventLog
