@@ -19,6 +19,8 @@ Days pins Lean via `lean/lean-toolchain`.
 Traces are written to your configured `log_path` (default: `./output/`).
 See `docs/docs/configuration/logging.md` for `log_path`.
 
+Days also writes a trace manifest at `log_path/traces.json` listing which `*_events.csv` traces are non-empty.
+
 ### DCQCN (`dcqcn_events.csv`)
 
 Build and run with DCQCN + trace logging enabled:
@@ -68,6 +70,23 @@ RUST_LOG=info cargo run --features lean -- configs/simple.toml
 ```
 
 If your scenario includes a WFQ scheduler, Days writes `wfq_events.csv` under `log_path`.
+
+## Run everything with `leanguard-run`
+
+To run Days and then the appropriate Lean checkers based on `log_path/traces.json`:
+
+```bash
+cd lean
+lake build
+cd ..
+cargo run --bin leanguard-run -- --config configs/dcqcn_simple.toml --checker-dir lean/.lake/build/bin
+```
+
+To re-check an existing run directory without rerunning the simulator:
+
+```bash
+cargo run --bin leanguard-run -- --config configs/dcqcn_simple.toml --mode check-only --checker-dir lean/.lake/build/bin
+```
 
 ## Build and run the Lean checkers
 

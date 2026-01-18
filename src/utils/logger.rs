@@ -6,6 +6,7 @@ use log::info;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
 #[cfg(feature = "lean")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +22,7 @@ use crate::schedulers::SchedulerReport;
 use crate::flows::packet::EcnField;
 #[cfg(feature = "lean")]
 use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategyKind};
+use crate::utils::trace_manifest;
 
 #[derive(Deserialize)]
 struct LogConfig {
@@ -845,6 +847,51 @@ impl CsvLogger {
 
         info!("Total packets processed: {}", total_packets);
         info!("Average one-way delay: {:.6} seconds", avg_delay);
+
+        drop(state);
+
+        if let Err(e) = self.write_trace_manifest_v1() {
+            log::warn!("{e}");
+        }
+    }
+
+    fn write_trace_manifest_v1(&self) -> Result<(), String> {
+        let log_path = self
+            .log_path
+            .get()
+            .ok_or_else(|| "CsvLogger not initialized (log_path missing)".to_string())?;
+
+        let log_path = Path::new(log_path);
+        let mut traces = Vec::new();
+
+        for filename in Self::trace_manifest_candidates() {
+            let path = log_path.join(filename);
+            let len = fs::metadata(&path)
+                .map_err(|e| format!("Failed to stat {}: {e}", path.display()))?
+                .len();
+            if len > 0 {
+                traces.push(filename.to_string());
+            }
+        }
+
+        trace_manifest::write_manifest_v1(log_path, traces)
+    }
+
+    fn trace_manifest_candidates() -> &'static [&'static str] {
+        &[
+            #[cfg(feature = "lean")]
+            "aqm_events.csv",
+            #[cfg(feature = "lean")]
+            "cubic_events.csv",
+            #[cfg(feature = "lean")]
+            "drr_events.csv",
+            #[cfg(feature = "lean")]
+            "wfq_events.csv",
+            #[cfg(all(feature = "lean", feature = "dcqcn"))]
+            "dcqcn_events.csv",
+            #[cfg(all(feature = "lean", feature = "l2_pfc"))]
+            "pfc_events.csv",
+        ]
     }
 }
 

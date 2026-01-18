@@ -102,11 +102,13 @@ Days will create the directory if needed and will write:
 - `sources.csv`, `sinks.csv`, `switches.csv`
 - plus optional `pfc.csv` depending on features.
 - plus optional per-transition protocol traces for LeanGuard (`*_events.csv`) depending on features:
+  - `aqm_events.csv` (`--features lean`)
   - `dcqcn_events.csv` (`--features dcqcn,lean`)
   - `pfc_events.csv` (`--features l2_pfc,lean`)
   - `cubic_events.csv` (`--features lean`)
   - `drr_events.csv` (`--features lean`)
   - `wfq_events.csv` (`--features lean`)
+ - `traces.json`: a manifest listing which `*_events.csv` traces are non-empty (written at the end of a run).
 
 ### `report_interval` (optional)
 
