@@ -136,20 +136,24 @@ fn main() {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    match threading.as_deref() {
-        Some("multiple") if !cli.allow_nondeterministic => {
-            summary.determinism = DeterminismStatus::RefusedMultipleThreading;
-            summary.days = DaysStatus::Error;
-            summary.days_error = Some(
-                "Refused to run with threading=\"multiple\" without --allow-nondeterministic"
-                    .to_string(),
-            );
-            emit_and_exit(summary, 2);
+    if matches!(cli.mode, Mode::SimulateAndCheck) {
+        match threading.as_deref() {
+            Some("multiple") if !cli.allow_nondeterministic => {
+                summary.determinism = DeterminismStatus::RefusedMultipleThreading;
+                summary.days = DaysStatus::Error;
+                summary.days_error = Some(
+                    "Refused to run with threading=\"multiple\" without --allow-nondeterministic"
+                        .to_string(),
+                );
+                emit_and_exit(summary, 2);
+            }
+            None => {
+                summary.determinism = DeterminismStatus::UnknownMissingThreading;
+            }
+            _ => {}
         }
-        None => {
-            summary.determinism = DeterminismStatus::UnknownMissingThreading;
-        }
-        _ => {}
+    } else if threading.is_none() {
+        summary.determinism = DeterminismStatus::UnknownMissingThreading;
     }
 
     let log_path = config_toml
@@ -200,6 +204,16 @@ fn main() {
     }
 
     summary.trace_discovery = discover_traces(&log_path);
+    if matches!(cli.mode, Mode::CheckOnly) && summary.trace_discovery.traces.is_empty() {
+        summary.days = DaysStatus::Error;
+        summary.days_error = Some(format!(
+            "No trace CSVs found under {}",
+            log_path.display()
+        ));
+        summary.checker_results = Vec::new();
+        summary.accept = false;
+        emit_and_exit(summary, 2);
+    }
 
     let invocations = select_checkers(&log_path, &summary.trace_discovery.traces);
     for inv in invocations {
@@ -391,6 +405,20 @@ fn required_features_hint(config: &toml::Value) -> String {
 
     if config
         .get("flow")
+        .and_then(|v| v.as_array())
+        .is_some_and(|flows| {
+            flows.iter().any(|flow| {
+                flow.get("flow_type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t.eq_ignore_ascii_case("dcqcn"))
+            })
+        })
+    {
+        features.push("dcqcn");
+    }
+
+    if config
+        .get("flow_set")
         .and_then(|v| v.as_array())
         .is_some_and(|flows| {
             flows.iter().any(|flow| {

@@ -137,13 +137,13 @@ def main (args : List String) : IO UInt32 := do
                   error := some e }
               match parsed.coverageOut with
               | none =>
-                  IO.eprintln s!"REJECT: {e}"
-                  pure 1
+                  IO.eprintln e
+                  pure 2
               | some out =>
                   match (← writeCoverageFile out report) with
                   | .ok _ =>
-                      IO.eprintln s!"REJECT: {e}"
-                      pure 1
+                      IO.eprintln e
+                      pure 2
                   | .error we =>
                       IO.eprintln we
                       pure 2
@@ -157,13 +157,13 @@ def main (args : List String) : IO UInt32 := do
                   error := some e }
               match parsed.coverageOut with
               | none =>
-                  IO.eprintln s!"REJECT: {e}"
-                  pure 1
+                  IO.eprintln e
+                  pure 2
               | some out =>
                   match (← writeCoverageFile out report) with
                   | .ok _ =>
-                      IO.eprintln s!"REJECT: {e}"
-                      pure 1
+                      IO.eprintln e
+                      pure 2
                   | .error we =>
                       IO.eprintln we
                       pure 2
