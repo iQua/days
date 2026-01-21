@@ -206,10 +206,7 @@ fn main() {
     summary.trace_discovery = discover_traces(&log_path);
     if matches!(cli.mode, Mode::CheckOnly) && summary.trace_discovery.traces.is_empty() {
         summary.days = DaysStatus::Error;
-        summary.days_error = Some(format!(
-            "No trace CSVs found under {}",
-            log_path.display()
-        ));
+        summary.days_error = Some(format!("No trace CSVs found under {}", log_path.display()));
         summary.checker_results = Vec::new();
         summary.accept = false;
         emit_and_exit(summary, 2);
