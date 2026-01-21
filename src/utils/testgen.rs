@@ -285,7 +285,7 @@ pub fn fuzz(
 
         let (accept, run_summary, parsed) = match run {
             Ok(output) => {
-                let json = extract_json(&output.stdout).unwrap_or_else(|_| output.stdout);
+                let json = extract_json(&output.stdout).unwrap_or(output.stdout);
                 let parsed = parse_run_summary(&json);
                 let accept = parsed.as_ref().map(|p| p.accept).unwrap_or(false);
                 (accept, json, parsed)
@@ -353,16 +353,16 @@ pub fn fuzz(
                 .to_string(),
             path: seed_path.display().to_string(),
         };
-        let metadata = build_case_metadata(
-            &case_id,
+        let metadata = build_case_metadata(BuildCaseMetadataArgs {
+            case_id: &case_id,
             parent,
-            &final_dir,
-            &final_config_path,
-            &final_log_dir,
-            &final_run_summary_path,
+            case_dir: &final_dir,
+            config_path: &final_config_path,
+            log_dir: &final_log_dir,
+            run_summary_path: &final_run_summary_path,
             mutations,
-            parsed.ok(),
-        );
+            parsed: parsed.ok(),
+        });
         write_json(&metadata_path, &metadata)?;
 
         fs::remove_dir_all(&work_dir).ok();
@@ -401,7 +401,7 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         opts.allow_nondeterministic,
     )?;
 
-    let json = extract_json(&output.stdout).unwrap_or_else(|_| output.stdout);
+    let json = extract_json(&output.stdout).unwrap_or(output.stdout);
     let parsed = parse_run_summary(&json);
     let accept = parsed.as_ref().map(|p| p.accept).unwrap_or(false);
 
@@ -428,20 +428,20 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         .unwrap_or("unknown")
         .to_string();
     let metadata_path = corpus.metadata_dir.join(format!("{case_id}.json"));
-    let metadata = build_case_metadata(
-        &case_id,
-        CaseParent {
+    let metadata = build_case_metadata(BuildCaseMetadataArgs {
+        case_id: &case_id,
+        parent: CaseParent {
             kind: "case".to_string(),
             id: case_id.clone(),
             path: case_dir.display().to_string(),
         },
         case_dir,
-        &config_path,
-        &log_dir,
-        &run_summary_path,
-        Vec::new(),
-        parsed.ok(),
-    );
+        config_path: &config_path,
+        log_dir: &log_dir,
+        run_summary_path: &run_summary_path,
+        mutations: Vec::new(),
+        parsed: parsed.ok(),
+    });
     write_json(&metadata_path, &metadata)?;
 
     Ok(ReplaySummary {
@@ -478,7 +478,7 @@ pub fn minimize(
             &config_path,
             opts.allow_nondeterministic,
         )?;
-        let json = extract_json(&output.stdout).unwrap_or_else(|_| output.stdout);
+        let json = extract_json(&output.stdout).unwrap_or(output.stdout);
         parse_run_summary(&json).map(|p| p.accept).unwrap_or(false)
     };
 
@@ -490,7 +490,8 @@ pub fn minimize(
     let mut kept_changes = 0;
     let mut iterations = 0;
 
-    let shrinkers: Vec<fn(&toml::Value) -> Option<(toml::Value, Mutation)>> = vec![
+    type ShrinkerFn = fn(&toml::Value) -> Option<(toml::Value, Mutation)>;
+    let shrinkers: Vec<ShrinkerFn> = vec![
         shrink_duration,
         shrink_flow_count,
         shrink_traffic_size_or_duration,
@@ -502,7 +503,7 @@ pub fn minimize(
             break;
         }
 
-        if let Some((mut candidate, mutation)) = shrinker(&current) {
+        if let Some((mut candidate, _mutation)) = shrinker(&current) {
             iterations += 1;
             let log_dir = work_dir.join(format!("logs_{iterations}"));
             apply_log_path(&mut candidate, &log_dir);
@@ -517,7 +518,7 @@ pub fn minimize(
                 opts.allow_nondeterministic,
             );
             if let Ok(output) = output {
-                let json = extract_json(&output.stdout).unwrap_or_else(|_| output.stdout);
+                let json = extract_json(&output.stdout).unwrap_or(output.stdout);
                 if let Ok(parsed) = parse_run_summary(&json) {
                     if !parsed.accept {
                         current = candidate;
@@ -596,18 +597,20 @@ fn parse_run_summary(json: &str) -> Result<ParsedRunSummary, String> {
     })
 }
 
-fn build_case_metadata(
-    case_id: &str,
+struct BuildCaseMetadataArgs<'a> {
+    case_id: &'a str,
     parent: CaseParent,
-    case_dir: &Path,
-    config_path: &Path,
-    log_dir: &Path,
-    run_summary_path: &Path,
+    case_dir: &'a Path,
+    config_path: &'a Path,
+    log_dir: &'a Path,
+    run_summary_path: &'a Path,
     mutations: Vec<Mutation>,
     parsed: Option<ParsedRunSummary>,
-) -> CaseMetadataV1 {
+}
+
+fn build_case_metadata(args: BuildCaseMetadataArgs<'_>) -> CaseMetadataV1 {
     let now = unix_seconds();
-    let result = parsed.map_or_else(
+    let result = args.parsed.map_or_else(
         || CaseResult {
             accept: false,
             days_status: "unknown".to_string(),
@@ -626,16 +629,16 @@ fn build_case_metadata(
 
     CaseMetadataV1 {
         version: 1,
-        case_id: case_id.to_string(),
+        case_id: args.case_id.to_string(),
         created_at_unix_s: now,
-        parent,
+        parent: args.parent,
         paths: CasePaths {
-            case_dir: case_dir.display().to_string(),
-            config: config_path.display().to_string(),
-            log_dir: log_dir.display().to_string(),
-            run_summary: run_summary_path.display().to_string(),
+            case_dir: args.case_dir.display().to_string(),
+            config: args.config_path.display().to_string(),
+            log_dir: args.log_dir.display().to_string(),
+            run_summary: args.run_summary_path.display().to_string(),
         },
-        mutations,
+        mutations: args.mutations,
         result,
         coverage: CoverageInfo {
             mode: "stub".to_string(),
@@ -696,10 +699,10 @@ fn apply_random_mutations(config: &mut toml::Value, rng: &mut StdRng) -> Vec<Mut
         mutate_shuffle_edges,
     ];
 
-    let target = rng.gen_range(1..=3);
+    let target = rng.random_range(1..=3);
     let mut attempts = 0;
     while mutations.len() < target && attempts < mutators.len() * 3 {
-        let idx = rng.gen_range(0..mutators.len());
+        let idx = rng.random_range(0..mutators.len());
         if let Some(mutation) = mutators[idx](config, rng) {
             mutations.push(mutation);
         }
@@ -753,7 +756,7 @@ fn mutate_initial_delay(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mu
     } else {
         current.abs() * 0.2
     };
-    let new_value = (current + if rng.gen_bool(0.5) { delta } else { -delta }).max(0.0);
+    let new_value = (current + if rng.random_bool(0.5) { delta } else { -delta }).max(0.0);
     traffic.insert("initial_delay".to_string(), toml::Value::Float(new_value));
     Some(Mutation::TweakInitialDelay {
         from: current,
@@ -841,7 +844,7 @@ fn mutate_distribution(
 }
 
 fn mutate_switch_port_rate(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
-    let mut table = config.as_table_mut()?;
+    let table = config.as_table_mut()?;
     let switch = table.get_mut("switch")?.as_table_mut()?;
     let current = switch.get("port_rate").and_then(value_to_f64)?;
     let factors = [0.5, 0.75, 1.25, 1.5, 2.0];
@@ -855,7 +858,7 @@ fn mutate_switch_port_rate(config: &mut toml::Value, rng: &mut StdRng) -> Option
 }
 
 fn mutate_switch_capacity(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
-    let mut table = config.as_table_mut()?;
+    let table = config.as_table_mut()?;
     let switch = table.get_mut("switch")?.as_table_mut()?;
     let current = switch.get("capacity").and_then(value_to_i64)?;
     let factors = [0.5, 0.75, 1.5, 2.0];
@@ -1132,7 +1135,6 @@ fn resolve_leanguard_run(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
 struct RunOutput {
     stdout: String,
-    stderr: String,
 }
 
 fn run_leanguard(
@@ -1152,9 +1154,13 @@ fn run_leanguard(
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run leanguard-run: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("leanguard-run failed: {stderr}"));
+    }
+
     Ok(RunOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
 }
 
