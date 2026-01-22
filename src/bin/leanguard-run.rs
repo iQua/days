@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +27,12 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     allow_nondeterministic: bool,
+
+    #[arg(long, default_value_t = false)]
+    coverage: bool,
+
+    #[arg(long)]
+    coverage_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +52,10 @@ struct CheckerResult {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -88,7 +99,15 @@ struct RunSummaryV1 {
     days_error: Option<String>,
     trace_discovery: TraceDiscoverySummary,
     checker_results: Vec<CheckerResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<CoverageSummary>,
     accept: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CoverageSummary {
+    union: Vec<String>,
+    per_checker: BTreeMap<String, Vec<String>>,
 }
 
 fn main() {
@@ -110,6 +129,7 @@ fn main() {
             traces: Vec::new(),
         },
         checker_results: Vec::new(),
+        coverage: None,
         accept: false,
     };
 
@@ -162,6 +182,21 @@ fn main() {
         .unwrap_or("./output");
     summary.log_path = log_path.to_string();
     let log_path = PathBuf::from(log_path);
+    let coverage_enabled = cli.coverage || cli.coverage_dir.is_some();
+    let coverage_dir = if coverage_enabled {
+        let dir = cli
+            .coverage_dir
+            .clone()
+            .unwrap_or_else(|| log_path.join("coverage"));
+        if let Err(e) = fs::create_dir_all(&dir) {
+            summary.days = DaysStatus::Error;
+            summary.days_error = Some(format!("Failed to create coverage dir: {e}"));
+            emit_and_exit(summary, 2);
+        }
+        Some(dir)
+    } else {
+        None
+    };
 
     let required_features_hint = required_features_hint(&config_toml);
 
@@ -216,8 +251,10 @@ fn main() {
     for inv in invocations {
         summary
             .checker_results
-            .push(run_checker(&cli.checker_dir, inv));
+            .push(run_checker(&cli.checker_dir, inv, coverage_dir.as_deref()));
     }
+
+    summary.coverage = aggregate_coverage(&summary.checker_results);
 
     summary.accept = summary.days == DaysStatus::Ok || summary.days == DaysStatus::Skipped;
     if summary.accept {
@@ -344,15 +381,25 @@ fn select_checkers(log_path: &Path, traces: &[String]) -> Vec<CheckerInvocation>
     invocations
 }
 
-fn run_checker(checker_dir: &Path, inv: CheckerInvocation) -> CheckerResult {
+fn run_checker(
+    checker_dir: &Path,
+    inv: CheckerInvocation,
+    coverage_dir: Option<&Path>,
+) -> CheckerResult {
     let (exe, args) = match inv {
         CheckerInvocation::One { exe, args } => (exe, args),
     };
 
     let exe_path = checker_dir.join(exe);
-    let argv = std::iter::once(exe_path.display().to_string())
+    let mut argv = std::iter::once(exe_path.display().to_string())
         .chain(args.iter().map(|p| p.display().to_string()))
         .collect::<Vec<_>>();
+    let coverage_path = coverage_dir.map(|dir| dir.join(format!("{exe}_coverage.json")));
+    if let Some(path) = &coverage_path {
+        argv.push("--coverage-out".to_string());
+        argv.push(path.display().to_string());
+    }
+    let coverage_path_str = coverage_path.as_ref().map(|p| p.display().to_string());
 
     if !exe_path.exists() {
         return CheckerResult {
@@ -362,10 +409,17 @@ fn run_checker(checker_dir: &Path, inv: CheckerInvocation) -> CheckerResult {
             exit_code: None,
             stdout: String::new(),
             stderr: format!("Missing checker binary: {}", exe_path.display()),
+            coverage_path: coverage_path_str,
+            coverage: None,
         };
     }
 
-    let output = Command::new(&exe_path).args(&args).output();
+    let mut cmd = Command::new(&exe_path);
+    cmd.args(&args);
+    if let Some(path) = &coverage_path {
+        cmd.arg("--coverage-out").arg(path);
+    }
+    let output = cmd.output();
     match output {
         Ok(output) => {
             let exit_code = output.status.code();
@@ -384,6 +438,10 @@ fn run_checker(checker_dir: &Path, inv: CheckerInvocation) -> CheckerResult {
                 exit_code,
                 stdout,
                 stderr,
+                coverage_path: coverage_path_str,
+                coverage: coverage_path
+                    .as_ref()
+                    .and_then(|path| read_coverage_points(path.as_path())),
             }
         }
         Err(e) => CheckerResult {
@@ -393,8 +451,60 @@ fn run_checker(checker_dir: &Path, inv: CheckerInvocation) -> CheckerResult {
             exit_code: None,
             stdout: String::new(),
             stderr: format!("Failed to execute checker: {e}"),
+            coverage_path: coverage_path_str,
+            coverage: None,
         },
     }
+}
+
+fn read_coverage_points(path: &Path) -> Option<Vec<String>> {
+    let content = fs::read_to_string(path).ok()?;
+    if let Ok(mut points) = serde_json::from_str::<Vec<String>>(&content) {
+        points.sort();
+        points.dedup();
+        return Some(points);
+    }
+    let mut points = content
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        return None;
+    }
+    points.sort();
+    points.dedup();
+    Some(points)
+}
+
+fn aggregate_coverage(results: &[CheckerResult]) -> Option<CoverageSummary> {
+    let mut union = BTreeSet::new();
+    let mut per_checker = BTreeMap::new();
+
+    for result in results {
+        if let Some(coverage) = &result.coverage {
+            if coverage.is_empty() {
+                continue;
+            }
+            let mut points = coverage.clone();
+            points.sort();
+            points.dedup();
+            for point in &points {
+                union.insert(point.clone());
+            }
+            per_checker.insert(result.checker.clone(), points);
+        }
+    }
+
+    if union.is_empty() {
+        return None;
+    }
+
+    Some(CoverageSummary {
+        union: union.into_iter().collect(),
+        per_checker,
+    })
 }
 
 fn required_features_hint(config: &toml::Value) -> String {

@@ -1,9 +1,11 @@
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,22 +53,118 @@ pub struct MinimizeSummary {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CampaignSummary {
+    pub protocol: String,
+    pub budget: usize,
+    pub attempted: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub errors: usize,
+    pub corpus_root: String,
+    pub dry_run: bool,
+    pub planned: Vec<CampaignPlannedCase>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CampaignPlannedCase {
+    pub case_id: String,
+    pub seed_id: String,
+    pub seed_path: String,
+    pub mutations: Vec<Mutation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetProtocol {
+    Dcqcn,
+    Aqm,
+    Pfc,
+    Wfq,
+    Drr,
+    Cubic,
+}
+
+impl TargetProtocol {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dcqcn" => Some(TargetProtocol::Dcqcn),
+            "aqm" => Some(TargetProtocol::Aqm),
+            "pfc" => Some(TargetProtocol::Pfc),
+            "wfq" => Some(TargetProtocol::Wfq),
+            "drr" => Some(TargetProtocol::Drr),
+            "cubic" => Some(TargetProtocol::Cubic),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            TargetProtocol::Dcqcn => "dcqcn",
+            TargetProtocol::Aqm => "aqm",
+            TargetProtocol::Pfc => "pfc",
+            TargetProtocol::Wfq => "wfq",
+            TargetProtocol::Drr => "drr",
+            TargetProtocol::Cubic => "cubic",
+        }
+    }
+
+    fn seed_tags(&self) -> Vec<&'static str> {
+        match self {
+            TargetProtocol::Dcqcn => vec!["has_dcqcn_flows"],
+            TargetProtocol::Aqm => vec![
+                "switch_drop_red",
+                "switch_drop_ecn_threshold",
+                "switch_drop_taildrop",
+            ],
+            TargetProtocol::Pfc => vec!["link_mode_pfc"],
+            TargetProtocol::Wfq => vec!["switch_discipline_wfq"],
+            TargetProtocol::Drr => vec!["switch_discipline_drr"],
+            TargetProtocol::Cubic => vec!["has_tcp_flows"],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CampaignOptions {
+    pub protocol: TargetProtocol,
+    pub budget: usize,
+    pub rng_seed: Option<u64>,
+    pub goal_coverpoints: Vec<String>,
+    pub max_calibration_iters: usize,
+    pub seed_filter: Vec<String>,
+    pub dry_run: bool,
+    pub use_trace_signature: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CampaignArgs {
+    pub protocol: String,
+    pub budget: usize,
+    pub rng_seed: Option<u64>,
+    pub goal: Option<String>,
+    pub max_calibration_iters: Option<usize>,
+    pub seed_filter: Option<String>,
+    pub dry_run: bool,
+    pub use_trace_signature: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct SeedIndexV1 {
     version: u32,
     seeds: Vec<SeedIndexEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SeedIndexEntry {
     seed_id: String,
     source_path: String,
     seed_path: String,
     required_features: Vec<String>,
+    protocol_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum Mutation {
+pub enum Mutation {
     SetLogPath {
         value: String,
     },
@@ -113,6 +211,7 @@ struct CaseMetadataV1 {
     mutations: Vec<Mutation>,
     result: CaseResult,
     coverage: CoverageInfo,
+    campaign: Option<CampaignMetadataV1>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +243,22 @@ struct CoverageInfo {
     mode: String,
     observed: Vec<String>,
     novelty: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CampaignMetadataV1 {
+    protocol: String,
+    goal_coverpoints: Vec<String>,
+    max_calibration_iters: usize,
+    seed_filter: Vec<String>,
+    rng_seed: u64,
+    use_trace_signature: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GlobalCoverageV1 {
+    version: u32,
+    observed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,12 +326,15 @@ pub fn seed_index(opts: &TestGenOptions, seeds_src: &Path) -> Result<SeedIndexSu
         fs::copy(&seed_path, &dest_path)
             .map_err(|e| format!("Failed to copy seed {}: {e}", seed_path.display()))?;
 
-        let required_features = detect_required_features(&seed_path)?;
+        let seed_value = read_toml(&seed_path)?;
+        let required_features = detect_required_features_from_value(&seed_value);
+        let protocol_tags = detect_protocol_tags_from_value(&seed_value);
         entries.push(SeedIndexEntry {
             seed_id,
             source_path: seed_path.display().to_string(),
             seed_path: dest_path.display().to_string(),
             required_features,
+            protocol_tags,
         });
     }
 
@@ -253,6 +371,8 @@ pub fn fuzz(
     let mut rng = StdRng::seed_from_u64(seed);
 
     let leanguard_run = resolve_leanguard_run(opts.leanguard_run.as_deref())?;
+    let global_coverage_path = corpus.metadata_dir.join("global_coverage.json");
+    let mut global_coverage = load_global_coverage_set(&global_coverage_path)?;
 
     let mut attempted = 0;
     let mut accepted = 0;
@@ -285,10 +405,35 @@ pub fn fuzz(
 
         let (accept, run_summary, parsed) = match run {
             Ok(output) => {
-                let json = extract_json(&output.stdout).unwrap_or(output.stdout);
-                let parsed = parse_run_summary(&json);
-                let accept = parsed.as_ref().map(|p| p.accept).unwrap_or(false);
-                (accept, json, parsed)
+                if output.stdout.trim().is_empty() {
+                    errors += 1;
+                    let json_value = serde_json::json!({
+                        "version": 1,
+                        "accept": false,
+                        "days": "error",
+                        "days_error": "leanguard-run produced no output"
+                    });
+                    let json = serde_json::to_string_pretty(&json_value)
+                        .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                    (false, json, None)
+                } else {
+                    let json = extract_json(&output.stdout).unwrap_or(output.stdout);
+                    match parse_run_summary(&json) {
+                        Ok(parsed) => (parsed.accept, json, Some(parsed)),
+                        Err(e) => {
+                            errors += 1;
+                            let json_value = serde_json::json!({
+                                "version": 1,
+                                "accept": false,
+                                "days": "error",
+                                "days_error": format!("Invalid run summary JSON: {e}")
+                            });
+                            let json = serde_json::to_string_pretty(&json_value)
+                                .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                            (false, json, None)
+                        }
+                    }
+                }
             }
             Err(e) => {
                 errors += 1;
@@ -296,7 +441,7 @@ pub fn fuzz(
                     serde_json::json!({"version":1,"accept":false,"days":"error","days_error":e});
                 let json = serde_json::to_string_pretty(&json_value)
                     .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
-                (false, json, Err(e))
+                (false, json, None)
             }
         };
 
@@ -343,6 +488,17 @@ pub fn fuzz(
         let mutations_path = final_dir.join("mutations.json");
         write_json(&mutations_path, &mutations)?;
 
+        let coverage_info = build_coverage_info(
+            parsed.as_ref(),
+            &final_log_dir,
+            accept,
+            Some(&mut global_coverage),
+            false,
+        );
+        if accept && coverage_info.novelty == "new" {
+            save_global_coverage_set(&global_coverage_path, &global_coverage)?;
+        }
+
         let metadata_path = corpus.metadata_dir.join(format!("{case_id}.json"));
         let parent = CaseParent {
             kind: "seed".to_string(),
@@ -361,7 +517,9 @@ pub fn fuzz(
             log_dir: &final_log_dir,
             run_summary_path: &final_run_summary_path,
             mutations,
-            parsed: parsed.ok(),
+            parsed,
+            coverage: Some(coverage_info),
+            campaign: None,
         });
         write_json(&metadata_path, &metadata)?;
 
@@ -375,6 +533,261 @@ pub fn fuzz(
         rejected,
         errors,
         corpus_root: corpus.root.display().to_string(),
+    })
+}
+
+pub fn campaign(opts: &TestGenOptions, args: CampaignArgs) -> Result<CampaignSummary, String> {
+    let protocol = TargetProtocol::parse(&args.protocol)
+        .ok_or_else(|| format!("Unknown protocol '{}'", args.protocol))?;
+    let goal_coverpoints = parse_list(args.goal);
+    let seed_filter = parse_list(args.seed_filter);
+    let campaign_opts = CampaignOptions {
+        protocol,
+        budget: args.budget,
+        rng_seed: args.rng_seed,
+        goal_coverpoints,
+        max_calibration_iters: args.max_calibration_iters.unwrap_or(0),
+        seed_filter,
+        dry_run: args.dry_run,
+        use_trace_signature: args.use_trace_signature,
+    };
+    campaign_with_options(opts, campaign_opts)
+}
+
+fn campaign_with_options(
+    opts: &TestGenOptions,
+    campaign_opts: CampaignOptions,
+) -> Result<CampaignSummary, String> {
+    let corpus = CorpusPaths::new(&opts.corpus_root);
+    corpus.ensure()?;
+
+    let mut seeds = load_seed_entries(&corpus)?;
+    if seeds.is_empty() {
+        return Err("No seeds found; run `leanguard-testgen seed-index` first.".to_string());
+    }
+
+    seeds.retain(|entry| seed_matches_filters(entry, &campaign_opts.seed_filter));
+    if seeds.is_empty() {
+        return Err("No seeds matched seed-filter criteria.".to_string());
+    }
+
+    let protocol_candidates: Vec<SeedIndexEntry> = seeds
+        .into_iter()
+        .filter(|entry| seed_matches_protocol(entry, campaign_opts.protocol))
+        .collect();
+    if protocol_candidates.is_empty() {
+        return Err(format!(
+            "No seeds matched protocol {} (tags: {}).",
+            campaign_opts.protocol.as_str(),
+            campaign_opts.protocol.seed_tags().join(", ")
+        ));
+    }
+
+    let seed = campaign_opts.rng_seed.unwrap_or_else(default_rng_seed);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut planned = Vec::new();
+
+    if campaign_opts.dry_run {
+        for i in 0..campaign_opts.budget {
+            let entry = protocol_candidates.choose(&mut rng).unwrap().clone();
+            let seed_path = PathBuf::from(&entry.seed_path);
+            let mut config = read_toml(&seed_path)?;
+            let case_id = format!("{}_{}", unix_nanos(), i);
+            let log_dir = corpus.work_dir.join(&case_id).join("logs");
+            let mut mutations = apply_base_overrides(&mut config, &log_dir, rng.next_u64(), true);
+            mutations.extend(apply_random_mutations(&mut config, &mut rng));
+            planned.push(CampaignPlannedCase {
+                case_id,
+                seed_id: entry.seed_id,
+                seed_path: entry.seed_path,
+                mutations,
+            });
+        }
+
+        return Ok(CampaignSummary {
+            protocol: campaign_opts.protocol.as_str().to_string(),
+            budget: campaign_opts.budget,
+            attempted: campaign_opts.budget,
+            accepted: 0,
+            rejected: 0,
+            errors: 0,
+            corpus_root: corpus.root.display().to_string(),
+            dry_run: true,
+            planned,
+        });
+    }
+
+    let leanguard_run = resolve_leanguard_run(opts.leanguard_run.as_deref())?;
+    let global_coverage_path = corpus.metadata_dir.join("global_coverage.json");
+    let mut global_coverage = load_global_coverage_set(&global_coverage_path)?;
+
+    let mut attempted = 0;
+    let mut accepted = 0;
+    let mut rejected = 0;
+    let mut errors = 0;
+
+    for i in 0..campaign_opts.budget {
+        attempted += 1;
+        let entry = protocol_candidates.choose(&mut rng).unwrap().clone();
+        let seed_path = PathBuf::from(&entry.seed_path);
+        let seed_config = read_toml(&seed_path)?;
+
+        let case_id = format!("{}_{}", unix_nanos(), i);
+        let work_dir = corpus.work_dir.join(&case_id);
+        fs::create_dir_all(&work_dir).map_err(|e| format!("Failed to create case dir: {e}"))?;
+
+        let log_dir = work_dir.join("logs");
+        let mut config = seed_config;
+        let mut mutations = apply_base_overrides(&mut config, &log_dir, rng.next_u64(), true);
+        mutations.extend(apply_random_mutations(&mut config, &mut rng));
+
+        let config_path = work_dir.join("config.toml");
+        write_toml(&config_path, &config)?;
+
+        let run = run_leanguard(
+            &leanguard_run,
+            &opts.checker_dir,
+            &config_path,
+            opts.allow_nondeterministic,
+        );
+
+        let (accept, run_summary, parsed) = match run {
+            Ok(output) => {
+                if output.stdout.trim().is_empty() {
+                    errors += 1;
+                    let json_value = serde_json::json!({
+                        "version": 1,
+                        "accept": false,
+                        "days": "error",
+                        "days_error": "leanguard-run produced no output"
+                    });
+                    let json = serde_json::to_string_pretty(&json_value)
+                        .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                    (false, json, None)
+                } else {
+                    let json = extract_json(&output.stdout).unwrap_or(output.stdout);
+                    match parse_run_summary(&json) {
+                        Ok(parsed) => (parsed.accept, json, Some(parsed)),
+                        Err(e) => {
+                            errors += 1;
+                            let json_value = serde_json::json!({
+                                "version": 1,
+                                "accept": false,
+                                "days": "error",
+                                "days_error": format!("Invalid run summary JSON: {e}")
+                            });
+                            let json = serde_json::to_string_pretty(&json_value)
+                                .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                            (false, json, None)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                let json_value =
+                    serde_json::json!({"version":1,"accept":false,"days":"error","days_error":e});
+                let json = serde_json::to_string_pretty(&json_value)
+                    .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                (false, json, None)
+            }
+        };
+
+        let final_dir = if accept {
+            accepted += 1;
+            corpus.accepted_dir.join(&case_id)
+        } else {
+            rejected += 1;
+            corpus.rejected_dir.join(&case_id)
+        };
+        fs::create_dir_all(&final_dir)
+            .map_err(|e| format!("Failed to create final case dir: {e}"))?;
+
+        let final_config_path = final_dir.join("config.toml");
+        let final_log_dir = final_dir.join("logs");
+        let final_run_summary_path = final_dir.join("run_summary.json");
+
+        if log_dir.exists() {
+            fs::rename(&log_dir, &final_log_dir)
+                .map_err(|e| format!("Failed to move logs: {e}"))?;
+        } else {
+            fs::create_dir_all(&final_log_dir)
+                .map_err(|e| format!("Failed to create log dir: {e}"))?;
+        }
+
+        let mut final_config = read_toml(&config_path)?;
+        apply_log_path(&mut final_config, &final_log_dir);
+        write_toml(&final_config_path, &final_config)?;
+
+        let mut run_summary_value = serde_json::from_str::<serde_json::Value>(&run_summary)
+            .unwrap_or_else(|_| serde_json::json!({"version":1,"accept":false}));
+        if let Some(obj) = run_summary_value.as_object_mut() {
+            obj.insert(
+                "config_path".to_string(),
+                serde_json::Value::String(final_config_path.display().to_string()),
+            );
+            obj.insert(
+                "log_path".to_string(),
+                serde_json::Value::String(final_log_dir.display().to_string()),
+            );
+        }
+        write_json(&final_run_summary_path, &run_summary_value)?;
+
+        let mutations_path = final_dir.join("mutations.json");
+        write_json(&mutations_path, &mutations)?;
+
+        let coverage_info = build_coverage_info(
+            parsed.as_ref(),
+            &final_log_dir,
+            accept,
+            Some(&mut global_coverage),
+            campaign_opts.use_trace_signature,
+        );
+        if accept && coverage_info.novelty == "new" {
+            save_global_coverage_set(&global_coverage_path, &global_coverage)?;
+        }
+
+        let metadata_path = corpus.metadata_dir.join(format!("{case_id}.json"));
+        let parent = CaseParent {
+            kind: "seed".to_string(),
+            id: entry.seed_id.clone(),
+            path: entry.seed_path.clone(),
+        };
+        let campaign_metadata = CampaignMetadataV1 {
+            protocol: campaign_opts.protocol.as_str().to_string(),
+            goal_coverpoints: campaign_opts.goal_coverpoints.clone(),
+            max_calibration_iters: campaign_opts.max_calibration_iters,
+            seed_filter: campaign_opts.seed_filter.clone(),
+            rng_seed: seed,
+            use_trace_signature: campaign_opts.use_trace_signature,
+        };
+        let metadata = build_case_metadata(BuildCaseMetadataArgs {
+            case_id: &case_id,
+            parent,
+            case_dir: &final_dir,
+            config_path: &final_config_path,
+            log_dir: &final_log_dir,
+            run_summary_path: &final_run_summary_path,
+            mutations,
+            parsed,
+            coverage: Some(coverage_info),
+            campaign: Some(campaign_metadata),
+        });
+        write_json(&metadata_path, &metadata)?;
+
+        fs::remove_dir_all(&work_dir).ok();
+    }
+
+    Ok(CampaignSummary {
+        protocol: campaign_opts.protocol.as_str().to_string(),
+        budget: campaign_opts.budget,
+        attempted,
+        accepted,
+        rejected,
+        errors,
+        corpus_root: corpus.root.display().to_string(),
+        dry_run: false,
+        planned,
     })
 }
 
@@ -400,16 +813,12 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         &config_path,
         opts.allow_nondeterministic,
     )?;
-
-    let json = extract_json(&output.stdout).unwrap_or(output.stdout);
-    let parsed = parse_run_summary(&json);
-    let accept = parsed.as_ref().map(|p| p.accept).unwrap_or(false);
+    let (json, parsed) = parse_run_output(&output)?;
+    let accept = parsed.accept;
 
     let run_summary_path = case_dir.join("run_summary.json");
-    let mut run_summary_value =
-        serde_json::from_str::<serde_json::Value>(&json).unwrap_or_else(|_| {
-            serde_json::json!({"version":1,"accept":false,"days":"error","days_error":"invalid JSON"})
-        });
+    let mut run_summary_value = serde_json::from_str::<serde_json::Value>(&json)
+        .unwrap_or_else(|_| serde_json::json!({"version":1,"accept":false}));
     if let Some(obj) = run_summary_value.as_object_mut() {
         obj.insert(
             "config_path".to_string(),
@@ -428,6 +837,7 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         .unwrap_or("unknown")
         .to_string();
     let metadata_path = corpus.metadata_dir.join(format!("{case_id}.json"));
+    let coverage_info = build_coverage_info(Some(&parsed), &log_dir, accept, None, false);
     let metadata = build_case_metadata(BuildCaseMetadataArgs {
         case_id: &case_id,
         parent: CaseParent {
@@ -440,7 +850,9 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         log_dir: &log_dir,
         run_summary_path: &run_summary_path,
         mutations: Vec::new(),
-        parsed: parsed.ok(),
+        parsed: Some(parsed),
+        coverage: Some(coverage_info),
+        campaign: None,
     });
     write_json(&metadata_path, &metadata)?;
 
@@ -468,9 +880,7 @@ pub fn minimize(
 
     let baseline_accept = if let Ok(content) = fs::read_to_string(case_dir.join("run_summary.json"))
     {
-        parse_run_summary(&content)
-            .map(|p| p.accept)
-            .unwrap_or(false)
+        parse_run_summary(&content)?.accept
     } else {
         let output = run_leanguard(
             &leanguard_run,
@@ -478,8 +888,8 @@ pub fn minimize(
             &config_path,
             opts.allow_nondeterministic,
         )?;
-        let json = extract_json(&output.stdout).unwrap_or(output.stdout);
-        parse_run_summary(&json).map(|p| p.accept).unwrap_or(false)
+        let (_, parsed) = parse_run_output(&output)?;
+        parsed.accept
     };
 
     if baseline_accept {
@@ -517,14 +927,11 @@ pub fn minimize(
                 &candidate_path,
                 opts.allow_nondeterministic,
             );
-            if let Ok(output) = output {
-                let json = extract_json(&output.stdout).unwrap_or(output.stdout);
-                if let Ok(parsed) = parse_run_summary(&json) {
-                    if !parsed.accept {
-                        current = candidate;
-                        kept_changes += 1;
-                    }
-                }
+            let output = output?;
+            let (_, parsed) = parse_run_output(&output)?;
+            if !parsed.accept {
+                current = candidate;
+                kept_changes += 1;
             }
         }
     }
@@ -555,6 +962,7 @@ struct ParsedRunSummary {
     days_error: Option<String>,
     trace_mode: Option<String>,
     traces: Vec<String>,
+    coverage_union: Vec<String>,
 }
 
 fn parse_run_summary(json: &str) -> Result<ParsedRunSummary, String> {
@@ -588,13 +996,179 @@ fn parse_run_summary(json: &str) -> Result<ParsedRunSummary, String> {
         })
         .unwrap_or_default();
 
+    let coverage_union = parse_coverage(&value);
+
     Ok(ParsedRunSummary {
         accept,
         days_status,
         days_error,
         trace_mode,
         traces,
+        coverage_union,
     })
+}
+
+fn parse_coverage(value: &serde_json::Value) -> Vec<String> {
+    let mut union_set: BTreeSet<String> = BTreeSet::new();
+
+    if let Some(checkers) = value.get("checker_results").and_then(|v| v.as_array()) {
+        for checker in checkers {
+            let name = checker
+                .get("checker")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let coverage = checker
+                .get("coverage")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                });
+            if let (Some(_name), Some(mut coverage)) = (name, coverage) {
+                coverage.sort();
+                coverage.dedup();
+                for item in &coverage {
+                    union_set.insert(item.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(coverage) = value.get("coverage") {
+        if let Some(union) = coverage.get("union").and_then(|v| v.as_array()) {
+            for item in union.iter().filter_map(|v| v.as_str()) {
+                union_set.insert(item.to_string());
+            }
+        }
+        if let Some(map) = coverage.get("per_checker").and_then(|v| v.as_object()) {
+            for (_checker, points) in map {
+                let points = points
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !points.is_empty() {
+                    for item in points {
+                        union_set.insert(item);
+                    }
+                }
+            }
+        }
+    }
+
+    union_set.into_iter().collect()
+}
+
+fn build_coverage_info(
+    parsed: Option<&ParsedRunSummary>,
+    log_dir: &Path,
+    accept: bool,
+    global: Option<&mut HashSet<String>>,
+    prefer_trace_signature: bool,
+) -> CoverageInfo {
+    let Some(parsed) = parsed else {
+        return CoverageInfo {
+            mode: "stub".to_string(),
+            observed: Vec::new(),
+            novelty: "unknown".to_string(),
+        };
+    };
+
+    let (mode, mut observed) = if prefer_trace_signature {
+        let signatures = trace_signature_entries(log_dir, &parsed.traces);
+        if !signatures.is_empty() {
+            ("trace_signature", signatures)
+        } else if !parsed.coverage_union.is_empty() {
+            ("checker_coverpoints", parsed.coverage_union.clone())
+        } else {
+            ("stub", Vec::new())
+        }
+    } else if !parsed.coverage_union.is_empty() {
+        ("checker_coverpoints", parsed.coverage_union.clone())
+    } else {
+        let signatures = trace_signature_entries(log_dir, &parsed.traces);
+        if signatures.is_empty() {
+            ("stub", Vec::new())
+        } else {
+            ("trace_signature", signatures)
+        }
+    };
+
+    observed.sort();
+    observed.dedup();
+
+    let novelty = if observed.is_empty() || !accept {
+        "unknown".to_string()
+    } else if let Some(global) = global {
+        let mut is_new = false;
+        for item in &observed {
+            if global.insert(item.clone()) {
+                is_new = true;
+            }
+        }
+        if is_new {
+            "new".to_string()
+        } else {
+            "redundant".to_string()
+        }
+    } else {
+        "unknown".to_string()
+    };
+
+    CoverageInfo {
+        mode: mode.to_string(),
+        observed,
+        novelty,
+    }
+}
+
+fn trace_signature_entries(log_dir: &Path, traces: &[String]) -> Vec<String> {
+    let mut entries = Vec::new();
+    for trace in traces {
+        let path = log_dir.join(trace);
+        match hash_trace_kind_sequence(&path) {
+            Ok(hash) => entries.push(format!("trace_kind_hash:{trace}:{hash}")),
+            Err(_) => entries.push(format!("trace_file:{trace}")),
+        }
+    }
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
+fn hash_trace_kind_sequence(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path)
+        .map_err(|e| format!("Failed to open trace {}: {e}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| format!("Missing CSV header in {}", path.display()))?
+        .map_err(|e| format!("Failed to read header {}: {e}", path.display()))?;
+    let headers: Vec<&str> = header.split(',').collect();
+    let kind_idx = headers
+        .iter()
+        .position(|h| h.trim() == "kind")
+        .ok_or_else(|| format!("Missing kind column in {}", path.display()))?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in lines {
+        let line = line.map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let kind = line
+            .split(',')
+            .nth(kind_idx)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        kind.hash(&mut hasher);
+    }
+    Ok(format!("{:016x}", hasher.finish()))
 }
 
 struct BuildCaseMetadataArgs<'a> {
@@ -606,6 +1180,8 @@ struct BuildCaseMetadataArgs<'a> {
     run_summary_path: &'a Path,
     mutations: Vec<Mutation>,
     parsed: Option<ParsedRunSummary>,
+    coverage: Option<CoverageInfo>,
+    campaign: Option<CampaignMetadataV1>,
 }
 
 fn build_case_metadata(args: BuildCaseMetadataArgs<'_>) -> CaseMetadataV1 {
@@ -627,6 +1203,12 @@ fn build_case_metadata(args: BuildCaseMetadataArgs<'_>) -> CaseMetadataV1 {
         },
     );
 
+    let coverage = args.coverage.unwrap_or(CoverageInfo {
+        mode: "stub".to_string(),
+        observed: Vec::new(),
+        novelty: "unknown".to_string(),
+    });
+
     CaseMetadataV1 {
         version: 1,
         case_id: args.case_id.to_string(),
@@ -640,11 +1222,8 @@ fn build_case_metadata(args: BuildCaseMetadataArgs<'_>) -> CaseMetadataV1 {
         },
         mutations: args.mutations,
         result,
-        coverage: CoverageInfo {
-            mode: "stub".to_string(),
-            observed: Vec::new(),
-            novelty: "unknown".to_string(),
-        },
+        coverage,
+        campaign: args.campaign,
     }
 }
 
@@ -1054,6 +1633,110 @@ fn collect_toml_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String>
     Ok(())
 }
 
+fn parse_list(value: Option<String>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    value
+        .split(',')
+        .flat_map(|part| part.split_whitespace())
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn load_seed_entries(corpus: &CorpusPaths) -> Result<Vec<SeedIndexEntry>, String> {
+    let index_path = corpus.metadata_dir.join("seeds_index.json");
+    if index_path.exists() {
+        let content = fs::read_to_string(&index_path)
+            .map_err(|e| format!("Failed to read {}: {e}", index_path.display()))?;
+        let index: SeedIndexV1 = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", index_path.display()))?;
+        if index.version != 1 {
+            return Err(format!(
+                "Unsupported seed index version {} in {}",
+                index.version,
+                index_path.display()
+            ));
+        }
+        return Ok(index.seeds);
+    }
+
+    let mut seeds = Vec::new();
+    collect_toml_files(&corpus.seeds_dir, &mut seeds)?;
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for seed_path in seeds {
+        let seed_value = read_toml(&seed_path)?;
+        let required_features = detect_required_features_from_value(&seed_value);
+        let protocol_tags = detect_protocol_tags_from_value(&seed_value);
+        let seed_id = seed_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| sanitize_id(&seed_path));
+        entries.push(SeedIndexEntry {
+            seed_id,
+            source_path: seed_path.display().to_string(),
+            seed_path: seed_path.display().to_string(),
+            required_features,
+            protocol_tags,
+        });
+    }
+    Ok(entries)
+}
+
+fn seed_matches_filters(entry: &SeedIndexEntry, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let mut fields = Vec::new();
+    fields.push(entry.seed_id.to_ascii_lowercase());
+    fields.push(entry.source_path.to_ascii_lowercase());
+    fields.push(entry.seed_path.to_ascii_lowercase());
+    fields.extend(
+        entry
+            .required_features
+            .iter()
+            .map(|v| v.to_ascii_lowercase()),
+    );
+    fields.extend(entry.protocol_tags.iter().map(|v| v.to_ascii_lowercase()));
+
+    for filter in filters {
+        let needle = filter.to_ascii_lowercase();
+        let mut matched = false;
+        for field in &fields {
+            if field.contains(&needle) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+fn seed_matches_protocol(entry: &SeedIndexEntry, protocol: TargetProtocol) -> bool {
+    let matches_tag = protocol
+        .seed_tags()
+        .iter()
+        .any(|tag| entry.protocol_tags.iter().any(|t| t == tag));
+    let matches_feature = match protocol {
+        TargetProtocol::Dcqcn => entry.required_features.iter().any(|f| f == "dcqcn"),
+        TargetProtocol::Pfc => entry.required_features.iter().any(|f| f == "l2_pfc"),
+        _ => false,
+    };
+
+    matches_tag || matches_feature
+}
+
 fn sanitize_id(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut out = String::new();
@@ -1067,11 +1750,10 @@ fn sanitize_id(path: &Path) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn detect_required_features(path: &Path) -> Result<Vec<String>, String> {
-    let value = read_toml(path)?;
+fn detect_required_features_from_value(value: &toml::Value) -> Vec<String> {
     let mut features = Vec::new();
 
-    if has_flow_type(&value, "dcqcn") {
+    if has_flow_type(value, "dcqcn") {
         features.push("dcqcn".to_string());
     }
     if value
@@ -1085,7 +1767,57 @@ fn detect_required_features(path: &Path) -> Result<Vec<String>, String> {
 
     features.sort();
     features.dedup();
-    Ok(features)
+    features
+}
+
+fn detect_protocol_tags_from_value(value: &toml::Value) -> Vec<String> {
+    let mut tags = Vec::new();
+
+    if has_flow_type(value, "dcqcn") {
+        tags.push("has_dcqcn_flows".to_string());
+    }
+    if has_flow_type(value, "tcp") {
+        tags.push("has_tcp_flows".to_string());
+    }
+    if value
+        .get("link")
+        .and_then(|v| v.get("mode"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.eq_ignore_ascii_case("pfc"))
+    {
+        tags.push("link_mode_pfc".to_string());
+    }
+    if let Some(discipline) = value
+        .get("switch")
+        .and_then(|v| v.get("discipline"))
+        .and_then(|v| v.as_str())
+    {
+        match discipline.to_ascii_lowercase().as_str() {
+            "wfq" => tags.push("switch_discipline_wfq".to_string()),
+            "drr" => tags.push("switch_discipline_drr".to_string()),
+            _ => {}
+        }
+    }
+    if let Some(drop) = value
+        .get("switch")
+        .and_then(|v| v.get("drop"))
+        .and_then(|v| v.as_str())
+    {
+        let drop = drop.to_ascii_lowercase();
+        if drop.contains("red") {
+            tags.push("switch_drop_red".to_string());
+        }
+        if drop == "ecn_threshold" {
+            tags.push("switch_drop_ecn_threshold".to_string());
+        }
+        if drop == "taildrop" || drop == "tail_drop" {
+            tags.push("switch_drop_taildrop".to_string());
+        }
+    }
+
+    tags.sort();
+    tags.dedup();
+    tags
 }
 
 fn has_flow_type(value: &toml::Value, flow_type: &str) -> bool {
@@ -1154,14 +1886,39 @@ fn run_leanguard(
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run leanguard-run: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("leanguard-run failed: {stderr}"));
+    let exit_code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    match exit_code {
+        Some(2) => {
+            return Err(format!(
+                "leanguard-run failed with exit code 2: {}",
+                stderr.trim()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "leanguard-run terminated without exit code: {}",
+                stderr.trim()
+            ));
+        }
+        _ => {}
+    }
+    if stdout.trim().is_empty() {
+        return Err(format!(
+            "leanguard-run produced no output: {}",
+            stderr.trim()
+        ));
     }
 
-    Ok(RunOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-    })
+    Ok(RunOutput { stdout })
+}
+
+fn parse_run_output(output: &RunOutput) -> Result<(String, ParsedRunSummary), String> {
+    let json = extract_json(&output.stdout)
+        .map_err(|e| format!("Invalid JSON from leanguard-run: {e}"))?;
+    let parsed = parse_run_summary(&json)?;
+    Ok((json, parsed))
 }
 
 fn extract_json(stdout: &str) -> Result<String, String> {
@@ -1181,6 +1938,34 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let content = serde_json::to_string_pretty(value)
         .map_err(|e| format!("Failed to serialize JSON: {e}"))?;
     fs::write(path, content).map_err(|e| format!("Failed to write JSON: {e}"))
+}
+
+fn load_global_coverage_set(path: &Path) -> Result<HashSet<String>, String> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let parsed: GlobalCoverageV1 = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    if parsed.version != 1 {
+        return Err(format!(
+            "Unsupported global coverage version {} in {}",
+            parsed.version,
+            path.display()
+        ));
+    }
+    Ok(parsed.observed.into_iter().collect())
+}
+
+fn save_global_coverage_set(path: &Path, observed: &HashSet<String>) -> Result<(), String> {
+    let mut observed = observed.iter().cloned().collect::<Vec<_>>();
+    observed.sort();
+    let value = GlobalCoverageV1 {
+        version: 1,
+        observed,
+    };
+    write_json(path, &value)
 }
 
 fn unix_seconds() -> u64 {

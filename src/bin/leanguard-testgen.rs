@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use days::utils::testgen::{TestGenOptions, fuzz, minimize, replay, seed_index};
+use days::utils::testgen::{
+    CampaignArgs, TestGenOptions, campaign, fuzz, minimize, replay, seed_index,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "leanguard-testgen")]
@@ -41,6 +43,24 @@ enum Command {
         #[arg(long, default_value_t = 25)]
         max_iters: usize,
     },
+    Campaign {
+        #[arg(long)]
+        protocol: String,
+        #[arg(long)]
+        budget: usize,
+        #[arg(long)]
+        rng_seed: Option<u64>,
+        #[arg(long)]
+        goal: Option<String>,
+        #[arg(long)]
+        max_calibration_iters: Option<usize>,
+        #[arg(long)]
+        seed_filter: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        use_trace_signature: bool,
+    },
 }
 
 fn main() {
@@ -67,6 +87,29 @@ fn main() {
             max_iters,
         } => minimize(&opts, &case_dir, max_iters)
             .map(|summary| serde_json::to_string_pretty(&summary)),
+        Command::Campaign {
+            protocol,
+            budget,
+            rng_seed,
+            goal,
+            max_calibration_iters,
+            seed_filter,
+            dry_run,
+            use_trace_signature,
+        } => campaign(
+            &opts,
+            CampaignArgs {
+                protocol,
+                budget,
+                rng_seed,
+                goal,
+                max_calibration_iters,
+                seed_filter,
+                dry_run,
+                use_trace_signature,
+            },
+        )
+        .map(|summary| serde_json::to_string_pretty(&summary)),
     };
 
     match result {
