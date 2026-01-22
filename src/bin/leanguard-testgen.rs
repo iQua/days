@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use days::utils::testgen::{TestGenOptions, campaign, fuzz, minimize, replay, seed_index};
+use days::utils::testgen::{
+    CampaignArgs, TestGenOptions, campaign, fuzz, minimize, replay, seed_index,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "leanguard-testgen")]
@@ -96,14 +98,16 @@ fn main() {
             use_trace_signature,
         } => campaign(
             &opts,
-            protocol,
-            budget,
-            rng_seed,
-            goal,
-            max_calibration_iters,
-            seed_filter,
-            dry_run,
-            use_trace_signature,
+            CampaignArgs {
+                protocol,
+                budget,
+                rng_seed,
+                goal,
+                max_calibration_iters,
+                seed_filter,
+                dry_run,
+                use_trace_signature,
+            },
         )
         .map(|summary| serde_json::to_string_pretty(&summary)),
     };

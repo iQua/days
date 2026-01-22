@@ -135,6 +135,18 @@ pub struct CampaignOptions {
     pub use_trace_signature: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CampaignArgs {
+    pub protocol: String,
+    pub budget: usize,
+    pub rng_seed: Option<u64>,
+    pub goal: Option<String>,
+    pub max_calibration_iters: Option<usize>,
+    pub seed_filter: Option<String>,
+    pub dry_run: bool,
+    pub use_trace_signature: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SeedIndexV1 {
     version: u32,
@@ -524,30 +536,20 @@ pub fn fuzz(
     })
 }
 
-pub fn campaign(
-    opts: &TestGenOptions,
-    protocol: String,
-    budget: usize,
-    rng_seed: Option<u64>,
-    goal: Option<String>,
-    max_calibration_iters: Option<usize>,
-    seed_filter: Option<String>,
-    dry_run: bool,
-    use_trace_signature: bool,
-) -> Result<CampaignSummary, String> {
-    let protocol =
-        TargetProtocol::parse(&protocol).ok_or_else(|| format!("Unknown protocol '{protocol}'"))?;
-    let goal_coverpoints = parse_list(goal);
-    let seed_filter = parse_list(seed_filter);
+pub fn campaign(opts: &TestGenOptions, args: CampaignArgs) -> Result<CampaignSummary, String> {
+    let protocol = TargetProtocol::parse(&args.protocol)
+        .ok_or_else(|| format!("Unknown protocol '{}'", args.protocol))?;
+    let goal_coverpoints = parse_list(args.goal);
+    let seed_filter = parse_list(args.seed_filter);
     let campaign_opts = CampaignOptions {
         protocol,
-        budget,
-        rng_seed,
+        budget: args.budget,
+        rng_seed: args.rng_seed,
         goal_coverpoints,
-        max_calibration_iters: max_calibration_iters.unwrap_or(0),
+        max_calibration_iters: args.max_calibration_iters.unwrap_or(0),
         seed_filter,
-        dry_run,
-        use_trace_signature,
+        dry_run: args.dry_run,
+        use_trace_signature: args.use_trace_signature,
     };
     campaign_with_options(opts, campaign_opts)
 }
