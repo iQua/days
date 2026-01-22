@@ -15,3 +15,6 @@ logs/**
 # MkDocs build output
 site/**
 docs/site/**
+
+# Leanguard
+leanguard_corpus/**
