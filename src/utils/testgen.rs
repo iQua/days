@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod dcqcn;
+mod trace;
+
+use self::dcqcn::{DcqcnTraceSummary, analyze_dcqcn_trace};
+
 #[derive(Debug, Clone)]
 pub struct TestGenOptions {
     pub corpus_root: PathBuf,
@@ -198,7 +203,50 @@ pub enum Mutation {
         from: i64,
         to: i64,
     },
+    TweakSwitchEcnThreshold {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnRateGbps {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnMinRateGbps {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnMaxRateGbps {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnG {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnMiFactor {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnAiRateGbps {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnHaiRateGbps {
+        from: f64,
+        to: f64,
+    },
+    TweakDcqcnCnpIntervalNs {
+        from: f64,
+        to: f64,
+    },
     ShuffleEdges,
+    CalibrationStep {
+        iter: usize,
+        knob: String,
+        from: String,
+        to: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -595,7 +643,12 @@ fn campaign_with_options(
             let case_id = format!("{}_{}", unix_nanos(), i);
             let log_dir = corpus.work_dir.join(&case_id).join("logs");
             let mut mutations = apply_base_overrides(&mut config, &log_dir, rng.next_u64(), true);
-            mutations.extend(apply_random_mutations(&mut config, &mut rng));
+            mutations.extend(apply_campaign_mutations(
+                &mut config,
+                &mut rng,
+                campaign_opts.protocol,
+                &campaign_opts.goal_coverpoints,
+            ));
             planned.push(CampaignPlannedCase {
                 case_id,
                 seed_id: entry.seed_id,
@@ -639,59 +692,130 @@ fn campaign_with_options(
         let log_dir = work_dir.join("logs");
         let mut config = seed_config;
         let mut mutations = apply_base_overrides(&mut config, &log_dir, rng.next_u64(), true);
-        mutations.extend(apply_random_mutations(&mut config, &mut rng));
+        mutations.extend(apply_campaign_mutations(
+            &mut config,
+            &mut rng,
+            campaign_opts.protocol,
+            &campaign_opts.goal_coverpoints,
+        ));
 
         let config_path = work_dir.join("config.toml");
-        write_toml(&config_path, &config)?;
+        let mut accept;
+        let mut run_summary;
+        let mut parsed: Option<ParsedRunSummary>;
+        let mut dcqcn_summary: Option<DcqcnTraceSummary>;
 
-        let run = run_leanguard(
-            &leanguard_run,
-            &opts.checker_dir,
-            &config_path,
-            opts.allow_nondeterministic,
-        );
+        let max_iters = campaign_opts.max_calibration_iters;
+        let mut iter = 0;
+        loop {
+            if log_dir.exists() {
+                fs::remove_dir_all(&log_dir).ok();
+            }
+            fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log dir: {e}"))?;
+            apply_log_path(&mut config, &log_dir);
+            write_toml(&config_path, &config)?;
 
-        let (accept, run_summary, parsed) = match run {
-            Ok(output) => {
-                if output.stdout.trim().is_empty() {
-                    errors += 1;
-                    let json_value = serde_json::json!({
-                        "version": 1,
-                        "accept": false,
-                        "days": "error",
-                        "days_error": "leanguard-run produced no output"
-                    });
-                    let json = serde_json::to_string_pretty(&json_value)
-                        .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
-                    (false, json, None)
-                } else {
-                    let json = extract_json(&output.stdout).unwrap_or(output.stdout);
-                    match parse_run_summary(&json) {
-                        Ok(parsed) => (parsed.accept, json, Some(parsed)),
-                        Err(e) => {
-                            errors += 1;
-                            let json_value = serde_json::json!({
-                                "version": 1,
-                                "accept": false,
-                                "days": "error",
-                                "days_error": format!("Invalid run summary JSON: {e}")
-                            });
-                            let json = serde_json::to_string_pretty(&json_value)
-                                .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
-                            (false, json, None)
+            let run = run_leanguard(
+                &leanguard_run,
+                &opts.checker_dir,
+                &config_path,
+                opts.allow_nondeterministic,
+            );
+
+            let (run_accept, run_json, run_parsed) = match run {
+                Ok(output) => {
+                    if output.stdout.trim().is_empty() {
+                        errors += 1;
+                        let json_value = serde_json::json!({
+                            "version": 1,
+                            "accept": false,
+                            "days": "error",
+                            "days_error": "leanguard-run produced no output"
+                        });
+                        let json = serde_json::to_string_pretty(&json_value)
+                            .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                        (false, json, None)
+                    } else {
+                        let json = extract_json(&output.stdout).unwrap_or(output.stdout);
+                        match parse_run_summary(&json) {
+                            Ok(parsed) => (parsed.accept, json, Some(parsed)),
+                            Err(e) => {
+                                errors += 1;
+                                let json_value = serde_json::json!({
+                                    "version": 1,
+                                    "accept": false,
+                                    "days": "error",
+                                    "days_error": format!("Invalid run summary JSON: {e}")
+                                });
+                                let json = serde_json::to_string_pretty(&json_value)
+                                    .unwrap_or_else(|_| {
+                                        "{\"version\":1,\"accept\":false}".to_string()
+                                    });
+                                (false, json, None)
+                            }
                         }
                     }
                 }
+                Err(e) => {
+                    errors += 1;
+                    let json_value = serde_json::json!({"version":1,"accept":false,"days":"error","days_error":e});
+                    let json = serde_json::to_string_pretty(&json_value)
+                        .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
+                    (false, json, None)
+                }
+            };
+
+            accept = run_accept;
+            run_summary = run_json;
+            parsed = run_parsed;
+            dcqcn_summary = None;
+
+            if accept && campaign_opts.protocol == TargetProtocol::Dcqcn {
+                let trace_path = log_dir.join("dcqcn_events.csv");
+                if trace_path.exists() {
+                    if let Ok(summary) = analyze_dcqcn_trace(&trace_path) {
+                        dcqcn_summary = Some(summary);
+                    }
+                }
             }
-            Err(e) => {
-                errors += 1;
-                let json_value =
-                    serde_json::json!({"version":1,"accept":false,"days":"error","days_error":e});
-                let json = serde_json::to_string_pretty(&json_value)
-                    .unwrap_or_else(|_| "{\"version\":1,\"accept\":false}".to_string());
-                (false, json, None)
+
+            let goal_met = goals_satisfied(
+                &campaign_opts.goal_coverpoints,
+                parsed.as_ref(),
+                dcqcn_summary.as_ref(),
+            );
+
+            if !accept
+                || goal_met
+                || iter >= max_iters
+                || campaign_opts.protocol != TargetProtocol::Dcqcn
+            {
+                break;
             }
-        };
+
+            if let Some(change) = calibrate_dcqcn(
+                &mut config,
+                dcqcn_summary.as_ref(),
+                &campaign_opts.goal_coverpoints,
+                &mut rng,
+            ) {
+                let calibration_step = Mutation::CalibrationStep {
+                    iter,
+                    knob: change.reason.knob.to_string(),
+                    from: change.reason.from,
+                    to: change.reason.to,
+                    reason: change.reason.reason,
+                };
+                for mutation in change.mutations {
+                    mutations.push(mutation);
+                }
+                mutations.push(calibration_step);
+                iter += 1;
+                continue;
+            }
+
+            break;
+        }
 
         let final_dir = if accept {
             accepted += 1;
@@ -1126,6 +1250,39 @@ fn build_coverage_info(
     }
 }
 
+fn goals_satisfied(
+    goal: &[String],
+    parsed: Option<&ParsedRunSummary>,
+    dcqcn_summary: Option<&DcqcnTraceSummary>,
+) -> bool {
+    if goal.is_empty() {
+        return true;
+    }
+
+    let mut observed = HashSet::new();
+    if let Some(parsed) = parsed {
+        if !parsed.coverage_union.is_empty() {
+            for item in &parsed.coverage_union {
+                observed.insert(item.to_ascii_lowercase());
+            }
+        }
+    }
+    if observed.is_empty() {
+        if let Some(summary) = dcqcn_summary {
+            for item in summary.coverpoints() {
+                observed.insert(item.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if observed.is_empty() {
+        return false;
+    }
+
+    goal.iter()
+        .all(|g| observed.contains(&g.to_ascii_lowercase()))
+}
+
 fn trace_signature_entries(log_dir: &Path, traces: &[String]) -> Vec<String> {
     let mut entries = Vec::new();
     for trace in traces {
@@ -1288,6 +1445,29 @@ fn apply_random_mutations(config: &mut toml::Value, rng: &mut StdRng) -> Vec<Mut
         attempts += 1;
     }
     mutations
+}
+
+fn apply_campaign_mutations(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    protocol: TargetProtocol,
+    goal: &[String],
+) -> Vec<Mutation> {
+    let mut mutations = apply_random_mutations(config, rng);
+    mutations.extend(apply_targeted_mutations(config, rng, protocol, goal));
+    mutations
+}
+
+fn apply_targeted_mutations(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    protocol: TargetProtocol,
+    goal: &[String],
+) -> Vec<Mutation> {
+    match protocol {
+        TargetProtocol::Dcqcn => mutate_dcqcn_targeted(config, rng, goal),
+        _ => Vec::new(),
+    }
 }
 
 fn mutate_duration(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
@@ -1463,6 +1643,81 @@ fn mutate_shuffle_edges(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mu
     Some(Mutation::ShuffleEdges)
 }
 
+#[derive(Debug)]
+struct CalibrationReason {
+    knob: &'static str,
+    from: String,
+    to: String,
+    reason: String,
+}
+
+struct CalibrationChange {
+    mutations: Vec<Mutation>,
+    reason: CalibrationReason,
+}
+
+fn mutate_dcqcn_targeted(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    goal: &[String],
+) -> Vec<Mutation> {
+    // DCQCN config surface (from configs/*dcqcn*.toml):
+    // - flow.traffic.dcqcn: rate_gbps, min_rate_gbps, max_rate_gbps, g, ai_rate_gbps,
+    //   hai_rate_gbps, mi_factor, rtt_ns, cnp_interval_ns, pacing_interval_ns, cnp_priority
+    // - switch: drop="ECN_THRESHOLD", ecn_threshold
+    let mut mutations = Vec::new();
+    let mutators: Vec<fn(&mut toml::Value, &mut StdRng) -> Option<Mutation>> = vec![
+        mutate_dcqcn_cnp_interval,
+        mutate_dcqcn_g,
+        mutate_dcqcn_mi_factor,
+        mutate_dcqcn_rate,
+        mutate_dcqcn_rate_bounds,
+        mutate_dcqcn_ai_hai,
+        mutate_switch_ecn_threshold,
+    ];
+
+    let mut targeted: Vec<fn(&mut toml::Value, &mut StdRng) -> Option<Mutation>> = Vec::new();
+    if goal.iter().any(|g| g.contains("cnp_ignored")) {
+        targeted.push(mutate_dcqcn_cnp_interval);
+    }
+    if goal.iter().any(|g| g.contains("alpha")) {
+        targeted.push(mutate_dcqcn_g);
+        targeted.push(mutate_dcqcn_mi_factor);
+    }
+    if goal.iter().any(|g| g.contains("rate_clamped_min")) {
+        targeted.push(mutate_dcqcn_rate_bounds);
+    }
+    if goal.iter().any(|g| g.contains("rate_clamped_max")) {
+        targeted.push(mutate_dcqcn_rate_bounds);
+        targeted.push(mutate_dcqcn_ai_hai);
+    }
+
+    let picks = if targeted.is_empty() {
+        1
+    } else {
+        (1 + rng.random_range(0..=1)).min(targeted.len())
+    };
+
+    if targeted.is_empty() {
+        for _ in 0..picks {
+            let mutator = *mutators.choose(rng).unwrap();
+            if let Some(mutation) = mutator(config, rng) {
+                mutations.push(mutation);
+            }
+        }
+        return mutations;
+    }
+
+    targeted.shuffle(rng);
+    for mutator in targeted.into_iter().take(picks) {
+        if let Some(mutation) = mutator(config, rng) {
+            mutations.push(mutation);
+        }
+    }
+
+    mutations
+}
+
 #[derive(Clone, Copy)]
 enum TrafficContainer {
     Flow,
@@ -1532,6 +1787,451 @@ fn get_traffic_table_mut<'a>(
         .as_table_mut()?
         .get_mut("traffic")?
         .as_table_mut()
+}
+
+fn collect_dcqcn_paths(config: &toml::Value) -> Vec<TrafficPath> {
+    let mut paths = Vec::new();
+    collect_dcqcn_paths_for(config, "flow", TrafficContainer::Flow, &mut paths);
+    collect_dcqcn_paths_for(config, "flow_set", TrafficContainer::FlowSet, &mut paths);
+    paths
+}
+
+fn collect_dcqcn_paths_for(
+    config: &toml::Value,
+    key: &str,
+    container: TrafficContainer,
+    out: &mut Vec<TrafficPath>,
+) {
+    if let Some(arr) = config.get(key).and_then(|v| v.as_array()) {
+        for (idx, entry) in arr.iter().enumerate() {
+            let flow_type = entry
+                .get("flow_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !flow_type.eq_ignore_ascii_case("dcqcn") {
+                continue;
+            }
+            let has_dcqcn = entry
+                .get("traffic")
+                .and_then(|v| v.get("dcqcn"))
+                .and_then(|v| v.as_table())
+                .is_some();
+            if has_dcqcn {
+                out.push(TrafficPath {
+                    container,
+                    index: idx,
+                });
+            }
+        }
+    }
+}
+
+fn get_dcqcn_table_mut<'a>(
+    config: &'a mut toml::Value,
+    path: &TrafficPath,
+) -> Option<&'a mut toml::value::Table> {
+    let traffic = get_traffic_table_mut(config, path)?;
+    traffic.get_mut("dcqcn")?.as_table_mut()
+}
+
+fn pick_dcqcn_path(config: &toml::Value, rng: &mut StdRng) -> Option<TrafficPath> {
+    let paths = collect_dcqcn_paths(config);
+    paths.choose(rng).cloned()
+}
+
+fn update_dcqcn_value(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    key: &str,
+    new_value: f64,
+) -> Option<f64> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let current = table.get(key).and_then(value_to_f64)?;
+    table.insert(key.to_string(), toml::Value::Float(new_value));
+    Some(current)
+}
+
+fn update_switch_value(config: &mut toml::Value, key: &str, new_value: f64) -> Option<f64> {
+    let switch = config.as_table_mut()?.get_mut("switch")?.as_table_mut()?;
+    let current = switch.get(key).and_then(value_to_f64)?;
+    switch.insert(key.to_string(), toml::Value::Float(new_value));
+    Some(current)
+}
+
+fn mutate_dcqcn_cnp_interval(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let candidates = [0.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0];
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let current = table.get("cnp_interval_ns").and_then(value_to_f64)?;
+    let choices: Vec<f64> = candidates
+        .iter()
+        .copied()
+        .filter(|v| (*v - current).abs() > f64::EPSILON)
+        .collect();
+    if choices.is_empty() {
+        return None;
+    }
+    let new_value = *choices.choose(rng)?;
+    table.insert("cnp_interval_ns".to_string(), toml::Value::Float(new_value));
+    Some(Mutation::TweakDcqcnCnpIntervalNs {
+        from: current,
+        to: new_value,
+    })
+}
+
+fn mutate_dcqcn_g(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let candidates = [0.05, 0.1, 0.2, 0.5, 0.9];
+    let new_value = *candidates.choose(rng)?;
+    let current = update_dcqcn_value(config, rng, "g", new_value)?;
+    if (new_value - current).abs() < f64::EPSILON {
+        return None;
+    }
+    Some(Mutation::TweakDcqcnG {
+        from: current,
+        to: new_value,
+    })
+}
+
+fn mutate_dcqcn_mi_factor(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let candidates = [0.1, 0.2, 0.5, 0.8];
+    let new_value = *candidates.choose(rng)?;
+    let current = update_dcqcn_value(config, rng, "mi_factor", new_value)?;
+    if (new_value - current).abs() < f64::EPSILON {
+        return None;
+    }
+    Some(Mutation::TweakDcqcnMiFactor {
+        from: current,
+        to: new_value,
+    })
+}
+
+fn mutate_dcqcn_rate(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let factor = if rng.random_bool(0.5) { 0.5 } else { 2.0 };
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let current = table.get("rate_gbps").and_then(value_to_f64)?;
+    let new_value = (current * factor).max(0.01);
+    table.insert("rate_gbps".to_string(), toml::Value::Float(new_value));
+    Some(Mutation::TweakDcqcnRateGbps {
+        from: current,
+        to: new_value,
+    })
+}
+
+fn mutate_dcqcn_rate_bounds(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let rate = table.get("rate_gbps").and_then(value_to_f64)?;
+    if rng.random_bool(0.5) {
+        let current = table.get("min_rate_gbps").and_then(value_to_f64)?;
+        let mut new_value = (rate * 0.8).max(0.01);
+        if new_value > rate {
+            new_value = rate;
+        }
+        table.insert("min_rate_gbps".to_string(), toml::Value::Float(new_value));
+        Some(Mutation::TweakDcqcnMinRateGbps {
+            from: current,
+            to: new_value,
+        })
+    } else {
+        let current = table.get("max_rate_gbps").and_then(value_to_f64)?;
+        let mut new_value = (rate * 1.1).max(rate);
+        if new_value <= rate {
+            new_value = rate * 1.2;
+        }
+        table.insert("max_rate_gbps".to_string(), toml::Value::Float(new_value));
+        Some(Mutation::TweakDcqcnMaxRateGbps {
+            from: current,
+            to: new_value,
+        })
+    }
+}
+
+fn mutate_dcqcn_ai_hai(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    if rng.random_bool(0.5) {
+        let current = table.get("ai_rate_gbps").and_then(value_to_f64)?;
+        let factor = if rng.random_bool(0.5) { 0.5 } else { 2.0 };
+        let new_value = (current * factor).max(0.01);
+        table.insert("ai_rate_gbps".to_string(), toml::Value::Float(new_value));
+        Some(Mutation::TweakDcqcnAiRateGbps {
+            from: current,
+            to: new_value,
+        })
+    } else {
+        let current = table.get("hai_rate_gbps").and_then(value_to_f64)?;
+        let factor = if rng.random_bool(0.5) { 0.5 } else { 2.0 };
+        let new_value = (current * factor).max(0.01);
+        table.insert("hai_rate_gbps".to_string(), toml::Value::Float(new_value));
+        Some(Mutation::TweakDcqcnHaiRateGbps {
+            from: current,
+            to: new_value,
+        })
+    }
+}
+
+fn mutate_switch_ecn_threshold(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let current = config
+        .get("switch")
+        .and_then(|v| v.get("ecn_threshold"))
+        .and_then(value_to_f64)?;
+    let factor = if rng.random_bool(0.5) { 0.5 } else { 1.5 };
+    let mut new_value = (current * factor).clamp(0.01, 0.99);
+    if (new_value - current).abs() < f64::EPSILON {
+        new_value = (current + 0.05).clamp(0.01, 0.99);
+    }
+    let from = update_switch_value(config, "ecn_threshold", new_value)?;
+    Some(Mutation::TweakSwitchEcnThreshold {
+        from,
+        to: new_value,
+    })
+}
+
+fn calibrate_dcqcn(
+    config: &mut toml::Value,
+    summary: Option<&DcqcnTraceSummary>,
+    goal: &[String],
+    rng: &mut StdRng,
+) -> Option<CalibrationChange> {
+    let summary = summary?;
+    let cover = summary.coverpoints();
+
+    let missing = |name: &str| {
+        !goal.is_empty()
+            && goal.iter().any(|g| g.eq_ignore_ascii_case(name))
+            && !cover.iter().any(|c| c.eq_ignore_ascii_case(name))
+    };
+
+    if summary.cnp_sent == 0 || summary.cnp_recv == 0 {
+        if let Some(change) = adjust_switch_ecn_threshold(config, 0.5) {
+            return Some(change);
+        }
+        return adjust_dcqcn_rate(config, rng, 1.5, "increase CNP activity");
+    }
+
+    if missing("cnp_ignored_due_to_interval") {
+        if let Some(change) = adjust_cnp_interval(config, rng, 2.0) {
+            return Some(change);
+        }
+        return adjust_dcqcn_rate(config, rng, 1.5, "encourage back-to-back CNPs");
+    }
+
+    if missing("alpha_above_0p1") {
+        if let Some(change) = set_dcqcn_g(config, rng, 0.5, "raise alpha with larger g") {
+            return Some(change);
+        }
+        return adjust_dcqcn_rate(config, rng, 1.5, "increase congestion for alpha");
+    }
+
+    if missing("alpha_below_0p1") {
+        if let Some(change) = set_dcqcn_g(config, rng, 0.05, "lower alpha with smaller g") {
+            return Some(change);
+        }
+        return adjust_dcqcn_rate(config, rng, 0.5, "reduce congestion for alpha");
+    }
+
+    if missing("rate_clamped_min") {
+        return set_dcqcn_min_rate(config, rng, 0.8, "force min-rate clamp");
+    }
+
+    if missing("rate_clamped_max") {
+        return set_dcqcn_max_rate(config, rng, 1.05, "force max-rate clamp");
+    }
+
+    if missing("timer_with_cnp_seen") {
+        return adjust_dcqcn_rate(config, rng, 1.5, "increase CNP frequency");
+    }
+
+    if missing("timer_without_cnp_seen") {
+        if let Some(change) = adjust_switch_ecn_threshold(config, 1.5) {
+            return Some(change);
+        }
+        return adjust_dcqcn_rate(config, rng, 0.5, "reduce CNP frequency");
+    }
+
+    None
+}
+
+fn adjust_cnp_interval(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    factor: f64,
+) -> Option<CalibrationChange> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let current = table.get("cnp_interval_ns").and_then(value_to_f64)?;
+    let mut new_value = (current * factor).max(0.0);
+    if (new_value - current).abs() < f64::EPSILON {
+        new_value = current + 1_000.0;
+    }
+    table.insert("cnp_interval_ns".to_string(), toml::Value::Float(new_value));
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakDcqcnCnpIntervalNs {
+            from: current,
+            to: new_value,
+        }],
+        reason: CalibrationReason {
+            knob: "cnp_interval_ns",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: "adjust CNP interval".to_string(),
+        },
+    })
+}
+
+fn adjust_dcqcn_rate(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    factor: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let current = table.get("rate_gbps").and_then(value_to_f64)?;
+    let mut new_value = (current * factor).max(0.01);
+    if (new_value - current).abs() < f64::EPSILON {
+        new_value = (current + 0.1).max(0.01);
+    }
+    table.insert("rate_gbps".to_string(), toml::Value::Float(new_value));
+
+    let mut mutations = vec![Mutation::TweakDcqcnRateGbps {
+        from: current,
+        to: new_value,
+    }];
+
+    if let Some(max_rate) = table.get("max_rate_gbps").and_then(value_to_f64) {
+        if new_value > max_rate {
+            table.insert("max_rate_gbps".to_string(), toml::Value::Float(new_value));
+            mutations.push(Mutation::TweakDcqcnMaxRateGbps {
+                from: max_rate,
+                to: new_value,
+            });
+        }
+    }
+    if let Some(min_rate) = table.get("min_rate_gbps").and_then(value_to_f64) {
+        if new_value < min_rate {
+            table.insert("min_rate_gbps".to_string(), toml::Value::Float(new_value));
+            mutations.push(Mutation::TweakDcqcnMinRateGbps {
+                from: min_rate,
+                to: new_value,
+            });
+        }
+    }
+
+    Some(CalibrationChange {
+        mutations,
+        reason: CalibrationReason {
+            knob: "rate_gbps",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+fn set_dcqcn_g(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    target: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
+    let current = update_dcqcn_value(config, rng, "g", target)?;
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakDcqcnG {
+            from: current,
+            to: target,
+        }],
+        reason: CalibrationReason {
+            knob: "g",
+            from: format!("{current}"),
+            to: format!("{target}"),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+fn set_dcqcn_min_rate(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    ratio: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let rate = table.get("rate_gbps").and_then(value_to_f64)?;
+    let current = table.get("min_rate_gbps").and_then(value_to_f64)?;
+    let mut new_value = (rate * ratio).max(0.01);
+    if new_value > rate {
+        new_value = rate;
+    }
+    table.insert("min_rate_gbps".to_string(), toml::Value::Float(new_value));
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakDcqcnMinRateGbps {
+            from: current,
+            to: new_value,
+        }],
+        reason: CalibrationReason {
+            knob: "min_rate_gbps",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+fn set_dcqcn_max_rate(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    ratio: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
+    let path = pick_dcqcn_path(config, rng)?;
+    let table = get_dcqcn_table_mut(config, &path)?;
+    let rate = table.get("rate_gbps").and_then(value_to_f64)?;
+    let current = table.get("max_rate_gbps").and_then(value_to_f64)?;
+    let mut new_value = (rate * ratio).max(rate);
+    if new_value <= rate {
+        new_value = rate * 1.05;
+    }
+    table.insert("max_rate_gbps".to_string(), toml::Value::Float(new_value));
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakDcqcnMaxRateGbps {
+            from: current,
+            to: new_value,
+        }],
+        reason: CalibrationReason {
+            knob: "max_rate_gbps",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+fn adjust_switch_ecn_threshold(config: &mut toml::Value, factor: f64) -> Option<CalibrationChange> {
+    let current = config
+        .get("switch")
+        .and_then(|v| v.get("ecn_threshold"))
+        .and_then(value_to_f64)?;
+    let mut new_value = (current * factor).clamp(0.01, 0.99);
+    if (new_value - current).abs() < f64::EPSILON {
+        new_value = (current + 0.05).clamp(0.01, 0.99);
+    }
+    update_switch_value(config, "ecn_threshold", new_value)?;
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakSwitchEcnThreshold {
+            from: current,
+            to: new_value,
+        }],
+        reason: CalibrationReason {
+            knob: "switch.ecn_threshold",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: "adjust ECN threshold".to_string(),
+        },
+    })
 }
 
 fn collect_indices(config: &toml::Value, array_key: &str, field: &str) -> Vec<usize> {

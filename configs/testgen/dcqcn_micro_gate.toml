@@ -1,0 +1,70 @@
+# Micro DCQCN seed targeting high CNP density and interval-gate hits.
+
+seed = 12345
+edges = [[0, 1]]
+hosts = [0, 1]
+duration = 0.05
+log_path = "logs/dcqcn_micro_gate"
+
+[switch]
+port_rate = 1000000000
+capacity = 128
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+# Very low threshold to mark early and often.
+ecn_threshold = 0.05
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+# 0 disables drops at the PFC ingress buffer (lossless L2).
+buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "DCQCN"
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 300000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 500, high = 1000 }
+
+[flow.traffic.dcqcn]
+# High offered rate on a 1 Gbps link to drive marking.
+rate_gbps = 10.0
+min_rate_gbps = 0.5
+max_rate_gbps = 12.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+mi_factor = 0.5
+rtt_ns = 100000
+# Keep interval moderate so calibration can move it in either direction.
+cnp_interval_ns = 50000
+pacing_interval_ns = 500
+cnp_priority = 0
+
+[[flow]]
+flow_type = "DCQCN"
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 300000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 500, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 0.5
+max_rate_gbps = 12.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+mi_factor = 0.5
+rtt_ns = 100000
+cnp_interval_ns = 50000
+pacing_interval_ns = 500
+cnp_priority = 0
