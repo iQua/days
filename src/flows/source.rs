@@ -26,6 +26,7 @@ use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
 use crate::utils::logger::{CsvLogger, ReportTiming};
+use crate::utils::collective_tracker::CollectiveTracker;
 use crate::utils::time::{quantize_after, quantize_time};
 
 #[derive(Clone, Default, Debug, Serialize)]
@@ -197,6 +198,10 @@ impl PacketSource {
     async fn prepare_run(&mut self, now: f64, initial_delay: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         let start_time = quantize_after(now, initial_delay);
+
+        // Minimal collective instrumentation: record flow start time (only if this flow is tracked).
+        CollectiveTracker::on_flow_start(self.flow_id(), start_time);
+
         match self {
             PacketSource::DistPacketSource(source) => {
                 source.report_start_time = start_time;
@@ -415,6 +420,9 @@ impl PacketSource {
                     && source.next_seq == source.last_ack
                 {
                     source.wrap_up(now).await;
+                    // Minimal collective instrumentation: treat flow end as the moment the source
+                    // has sent and fully acknowledged all bytes.
+                    CollectiveTracker::on_flow_end(source.flow_id, now);
                     return true;
                 }
                 false
@@ -423,6 +431,7 @@ impl PacketSource {
             PacketSource::DcqcnPacketSource(source) => {
                 if source.traffic_exceeded(now) {
                     source.wrap_up(now).await;
+                    CollectiveTracker::on_flow_end(source.flow_id, now);
                     return true;
                 }
                 false

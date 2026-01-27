@@ -12,6 +12,7 @@ use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
+use crate::utils::collective_tracker::CollectiveTracker;
 
 #[derive(Debug)]
 pub struct BasicPacketSink {
@@ -102,6 +103,8 @@ impl BasicPacketSink {
         self.update_report_stats(&packet, now);
 
         if packet.last_packet {
+            // Strict PacketDistribution completion: sink receives last_packet.
+            CollectiveTracker::on_flow_end(self.flow_id, now);
             self.notify_pending_sources(now).await;
         }
     }
