@@ -18,6 +18,25 @@ use crate::flows::source::PacketSourceReport;
 use crate::l2::pfc::PfcPortReport;
 use crate::schedulers::SchedulerReport;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CollectiveEventRow {
+    pub collective_id: u64,
+    pub collective_type: String,
+    pub size_bytes: u64,
+    pub start_time_s: f64,
+    pub end_time_s: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FlowEventRow {
+    pub flow_id: u64,
+    pub collective_id: u64,
+    pub collective_type: String,
+    pub size_bytes: u64,
+    pub start_time_s: f64,
+    pub end_time_s: f64,
+}
+
 #[cfg(feature = "lean")]
 use crate::flows::packet::EcnField;
 #[cfg(feature = "lean")]
@@ -290,6 +309,8 @@ pub enum Report {
     PacketSourceReport(PacketSourceReport),
     SchedulerReport(SchedulerReport),
     PacketSinkReport(PacketSinkReport),
+    CollectiveEventRow(CollectiveEventRow),
+    FlowEventRow(FlowEventRow),
     #[cfg(feature = "l2_pfc")]
     PfcPortReport(PfcPortReport),
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -318,6 +339,8 @@ struct SharedState {
     source_reports: Vec<PacketSourceReport>,
     scheduler_reports: Vec<SchedulerReport>,
     sink_reports: Vec<PacketSinkReport>,
+    collective_events: Vec<CollectiveEventRow>,
+    flow_events: Vec<FlowEventRow>,
     #[cfg(feature = "l2_pfc")]
     pfc_reports: Vec<PfcPortReport>,
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -340,6 +363,8 @@ enum ElementType {
     Source,
     Scheduler,
     Sink,
+    CollectiveEvents,
+    FlowEvents,
     #[cfg(feature = "l2_pfc")]
     Pfc,
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -444,7 +469,7 @@ impl CsvLogger {
 
         // Create output files
         #[allow(unused_mut)]
-        let mut elements = vec!["sources", "switches", "sinks"];
+        let mut elements = vec!["sources", "switches", "sinks", "collective_events", "flow_events"];
         #[cfg(feature = "l2_pfc")]
         elements.push("pfc");
         #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -529,6 +554,12 @@ impl CsvLogger {
             Report::PacketSinkReport(report) => {
                 state.sink_reports.push(report);
             }
+            Report::CollectiveEventRow(event) => {
+                state.collective_events.push(event);
+            }
+            Report::FlowEventRow(event) => {
+                state.flow_events.push(event);
+            }
             #[cfg(feature = "l2_pfc")]
             Report::PfcPortReport(report) => {
                 state.pfc_reports.push(report);
@@ -594,6 +625,10 @@ impl CsvLogger {
             ElementType::Source => format!("{}sources.csv", self.log_path.get().unwrap()),
             ElementType::Scheduler => format!("{}switches.csv", self.log_path.get().unwrap()),
             ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap()),
+            ElementType::CollectiveEvents => {
+                format!("{}collective_events.csv", self.log_path.get().unwrap())
+            }
+            ElementType::FlowEvents => format!("{}flow_events.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "l2_pfc")]
             ElementType::Pfc => format!("{}pfc.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -702,6 +737,20 @@ impl CsvLogger {
             state.total_delay += new_delay;
         }
 
+        if state.collective_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.collective_events);
+            if let Err(e) = self.write_to_csv(ElementType::CollectiveEvents, &events) {
+                eprintln!("Error writing collective events to CSV: {}", e);
+            }
+        }
+
+        if state.flow_events.len() >= self.max_log_len {
+            let events = std::mem::take(&mut state.flow_events);
+            if let Err(e) = self.write_to_csv(ElementType::FlowEvents, &events) {
+                eprintln!("Error writing flow events to CSV: {}", e);
+            }
+        }
+
         #[cfg(feature = "l2_pfc")]
         if state.pfc_reports.len() >= self.max_log_len {
             let reports = std::mem::take(&mut state.pfc_reports);
@@ -787,6 +836,18 @@ impl CsvLogger {
             self.total_packets
                 .fetch_add(final_packets, Ordering::SeqCst);
             state.total_delay += final_delay;
+        }
+
+        if !state.collective_events.is_empty() {
+            let events = std::mem::take(&mut state.collective_events);
+            self.write_to_csv(ElementType::CollectiveEvents, &events)
+                .expect("Error writing collective events to CSV");
+        }
+
+        if !state.flow_events.is_empty() {
+            let events = std::mem::take(&mut state.flow_events);
+            self.write_to_csv(ElementType::FlowEvents, &events)
+                .expect("Error writing flow events to CSV");
         }
 
         #[cfg(feature = "l2_pfc")]
@@ -879,6 +940,8 @@ impl CsvLogger {
 
     fn trace_manifest_candidates() -> &'static [&'static str] {
         &[
+            "collective_events.csv",
+            "flow_events.csv",
             #[cfg(feature = "lean")]
             "aqm_events.csv",
             #[cfg(feature = "lean")]
