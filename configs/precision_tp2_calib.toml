@@ -1,0 +1,40 @@
+seed = 1
+
+# Topology: 2 hosts (0,1) connected via one switch (2)
+edges = [[0, 2], [1, 2]]
+hosts = [0, 1]
+
+# Keep the sim long enough; workload finishes earlier, but we log end_time.
+duration = 30.0
+
+# All outputs go here (script will override per-size).
+log_path = "logs/precision_tp2"
+
+[app_source]
+req_channel_capacity = 256
+chunk_size = 512
+initial_delay = 1
+run_interval = 50
+
+[switch]
+# Bit rate (bps)
+port_rate = 2.169521e+10
+# Capacity is in packets (see docs). Use 0 for unlimited (lossless) to avoid TCP RTO dominating CCT.
+capacity = 0
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "PacketDistribution"
+flow_count = 2
+sources = [0, 1]
+sinks = [1, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+# Bytes. Script will sweep this field.
+size = 8388608
+arr_dist = { type = "Uniform", low = 1e-9, high = 1e-9 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+
