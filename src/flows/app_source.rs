@@ -74,8 +74,23 @@ impl AppSourceBufferHandle {
     /// Builds a handle (and actor) around the provided buffer.
     pub fn from_buffer(buffer: Vec<u8>, config: &AppBufferConfig) -> Self {
         let total_size = buffer.len();
-        let (actor, tx) = AppSourceBuffer::new(buffer, config);
+        let (actor, tx) = AppSourceBuffer::new(Some(buffer), total_size, config);
 
+        Self {
+            tx,
+            offset: 0,
+            cursor: 0,
+            length: Some(total_size),
+            actor: Some(actor),
+        }
+    }
+
+    /// Builds a handle (and actor) around a virtual buffer of `total_size` bytes.
+    ///
+    /// The actor will respond with zero-filled payloads and the handle can be
+    /// consumed via `pull_len()` without allocating large buffers.
+    pub fn from_size(total_size: usize, config: &AppBufferConfig) -> Self {
+        let (actor, tx) = AppSourceBuffer::new(None, total_size, config);
         Self {
             tx,
             offset: 0,
@@ -155,6 +170,20 @@ impl AppSourceBufferHandle {
         data
     }
 
+    /// Advances the cursor by up to `size` bytes and returns how many bytes were granted.
+    ///
+    /// This is a non-blocking alternative to `pull()` for simulation workloads where
+    /// payload contents are irrelevant (only byte counts matter).
+    pub async fn pull_len(&mut self, size: usize) -> usize {
+        let allowed = self
+            .length
+            .map(|len| len.saturating_sub(self.cursor))
+            .unwrap_or(size);
+        let grant = size.min(allowed);
+        self.cursor += grant;
+        grant
+    }
+
     // sends a shutdown signal by sending a request with size = 0 (not actually handled yet)
     pub async fn shutdown(&self) {
         let (resp_tx, _resp_rx) = channel(1);
@@ -174,8 +203,10 @@ impl AppSourceBufferHandle {
 pub struct AppSourceBuffer {
     /// Receives pull requests from every handle.
     rx: Receiver<AppSourceRequest>,
-    /// Byte buffer that backs all responses.
-    buffer: Vec<u8>,
+    /// Optional byte buffer that backs all responses (None => virtual zero buffer).
+    buffer: Option<Vec<u8>>,
+    /// Total size of the virtual buffer, in bytes.
+    total_size: usize,
     /// Simulation output port exposed to other actors.
     pub out: Output<Packet>,
     /// Interval before first scheduling (µs)
@@ -185,12 +216,17 @@ pub struct AppSourceBuffer {
 }
 
 impl AppSourceBuffer {
-    pub fn new(buffer: Vec<u8>, config: &AppBufferConfig) -> (Self, Sender<AppSourceRequest>) {
+    pub fn new(
+        buffer: Option<Vec<u8>>,
+        total_size: usize,
+        config: &AppBufferConfig,
+    ) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.req_channel_capacity);
 
         let actor = AppSourceBuffer {
             rx,
             buffer,
+            total_size,
             out: Output::default(),
             initial_delay: config.initial_delay,
             run_interval: config.run_interval,
@@ -231,10 +267,14 @@ impl AppSourceBuffer {
                     return;
                 }
 
-                // simple byte-range extraction from the buffer
-                let start = req.start.min(self.buffer.len());
-                let end = (req.start + req.size).min(self.buffer.len());
-                let data = self.buffer[start..end].to_vec();
+                // byte-range extraction from either the real buffer, or a virtual zero buffer
+                let start = req.start.min(self.total_size);
+                let end = (req.start + req.size).min(self.total_size);
+                let len = end.saturating_sub(start);
+                let data = match &self.buffer {
+                    Some(buf) => buf[start..end].to_vec(),
+                    None => vec![0u8; len],
+                };
 
                 if let Err(e) = req.respond_to.try_send(data) {
                     log::warn!("[AppSourceBuffer] Failed to send response: {:?}", e);
@@ -254,8 +294,7 @@ pub struct AppDataSource {
 impl AppDataSource {
     /// Builds a data source backed by a byte buffer of the specified size.
     pub fn create_source_buffer(total_size: usize, config: AppBufferConfig) -> Self {
-        let buffer = vec![0u8; total_size];
-        let handle = AppSourceBufferHandle::from_buffer(buffer, &config);
+        let handle = AppSourceBufferHandle::from_size(total_size, &config);
         Self { handle }
     }
 
@@ -290,9 +329,10 @@ mod tests {
 
     async fn respond_once(actor: &mut AppSourceBuffer) {
         let req = actor.rx.recv().await.expect("expected request");
-        let start = req.start.min(actor.buffer.len());
-        let end = (req.start + req.size).min(actor.buffer.len());
-        let data = actor.buffer[start..end].to_vec();
+        let buf = actor.buffer.as_ref().expect("expected real buffer");
+        let start = req.start.min(buf.len());
+        let end = (req.start + req.size).min(buf.len());
+        let data = buf[start..end].to_vec();
         let _ = req.respond_to.send(data).await;
     }
 

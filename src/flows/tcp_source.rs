@@ -313,13 +313,13 @@ impl TCPPacketSource {
         let pull_size = win_left.min(self.remaining_bytes);
 
         if let Some(ref mut handle) = self.app_source {
-            // Pull raw bytes from application layer
-            let data = handle.pull(pull_size).await;
+            // Pull only byte-count from application layer (payload contents are irrelevant).
+            let granted = handle.pull_len(pull_size).await;
 
             // Buffer bytes for paced sending
             let mut offset = 0;
-            while offset < data.len() {
-                let chunk_size = self.mss.min(data.len() - offset);
+            while offset < granted {
+                let chunk_size = self.mss.min(granted - offset);
 
                 // ensure we do not exceed the current window
                 if self
