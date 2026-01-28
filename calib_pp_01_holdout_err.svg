@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460">
+  <rect x="0" y="0" width="820" height="460" fill="white"/>
+  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">P2P 0→1 (TP3) holdout |rel_err|</text>
+
+  <!-- axes -->
+  <line x1="70" y1="40" x2="70" y2="405" stroke="#222" stroke-width="1"/>
+  <line x1="70" y1="405" x2="800" y2="405" stroke="#222" stroke-width="1"/>
+  <text x="410.0" y="442" text-anchor="middle" font-family="sans-serif" font-size="13">log2(size_bytes)</text>
+  <text x="18" y="230.0" text-anchor="middle" font-family="sans-serif" font-size="13" transform="rotate(-90 18 230.0)">|rel_err|</text>
+
+  <polyline fill="none" stroke="#d62728" stroke-width="2" points="70.00,357.27 155.88,401.89 241.76,367.32 327.65,397.85 413.53,223.48 499.41,227.99 542.35,322.72 585.29,298.00 628.24,280.05 671.18,274.63 714.12,351.52 757.06,289.81 800.00,40.00"/>
+</svg>

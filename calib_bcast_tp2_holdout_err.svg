@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460">
+  <rect x="0" y="0" width="820" height="460" fill="white"/>
+  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">Broadcast TP2 holdout |rel_err|</text>
+
+  <!-- axes -->
+  <line x1="70" y1="40" x2="70" y2="405" stroke="#222" stroke-width="1"/>
+  <line x1="70" y1="405" x2="800" y2="405" stroke="#222" stroke-width="1"/>
+  <text x="410.0" y="442" text-anchor="middle" font-family="sans-serif" font-size="13">log2(size_bytes)</text>
+  <text x="18" y="230.0" text-anchor="middle" font-family="sans-serif" font-size="13" transform="rotate(-90 18 230.0)">|rel_err|</text>
+
+  <polyline fill="none" stroke="#d62728" stroke-width="2" points="70.00,390.09 155.88,395.11 241.76,382.95 327.65,144.49 413.53,226.99 499.41,40.00 542.35,354.90 585.29,320.42 628.24,261.40 671.18,196.56 714.12,159.99 757.06,191.85 800.00,268.11"/>
+</svg>

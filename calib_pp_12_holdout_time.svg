@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460">
+  <rect x="0" y="0" width="820" height="460" fill="white"/>
+  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">P2P 1→2 (TP3) holdout (scale=1.920, L=17.7us)</text>
+
+  <!-- axes -->
+  <line x1="70" y1="40" x2="70" y2="405" stroke="#222" stroke-width="1"/>
+  <line x1="70" y1="405" x2="800" y2="405" stroke="#222" stroke-width="1"/>
+  <text x="410.0" y="442" text-anchor="middle" font-family="sans-serif" font-size="13">log2(size_bytes)</text>
+  <text x="18" y="230.0" text-anchor="middle" font-family="sans-serif" font-size="13" transform="rotate(-90 18 230.0)">log10(time_s)</text>
+
+  <!-- lines -->
+  <polyline fill="none" stroke="#1f77b4" stroke-width="2" points="70.00,405.00 155.88,396.06 241.76,374.26 327.65,337.71 413.53,289.23 499.41,234.18 542.35,214.56 585.29,186.48 628.24,157.67 671.18,128.49 714.12,99.08 757.06,69.65 800.00,40.18"/>
+  <polyline fill="none" stroke="#ff7f0e" stroke-width="2" points="70.00,397.69 155.88,393.53 241.76,380.07 327.65,348.81 413.53,300.93 499.41,245.25 542.35,216.34 585.29,187.15 628.24,157.81 671.18,128.39 714.12,98.94 757.06,69.48 800.00,40.00"/>
+
+  <!-- legend -->
+  <rect x="540" y="40" width="260" height="56" fill="white" stroke="#ccc"/>
+  <line x1="555" y1="58" x2="585" y2="58" stroke="#1f77b4" stroke-width="2"/>
+  <text x="595" y="62" font-family="sans-serif" font-size="12">real (time_us_mean)</text>
+  <line x1="555" y1="78" x2="585" y2="78" stroke="#ff7f0e" stroke-width="2"/>
+  <text x="595" y="82" font-family="sans-serif" font-size="12">pred (holdout)</text>
+</svg>

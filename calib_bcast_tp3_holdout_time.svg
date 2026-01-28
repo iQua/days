@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460">
+  <rect x="0" y="0" width="820" height="460" fill="white"/>
+  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">Broadcast TP3 holdout (scale=0.991, L=55.6us)</text>
+
+  <!-- axes -->
+  <line x1="70" y1="40" x2="70" y2="405" stroke="#222" stroke-width="1"/>
+  <line x1="70" y1="405" x2="800" y2="405" stroke="#222" stroke-width="1"/>
+  <text x="410.0" y="442" text-anchor="middle" font-family="sans-serif" font-size="13">log2(size_bytes)</text>
+  <text x="18" y="230.0" text-anchor="middle" font-family="sans-serif" font-size="13" transform="rotate(-90 18 230.0)">log10(time_s)</text>
+
+  <!-- lines -->
+  <polyline fill="none" stroke="#1f77b4" stroke-width="2" points="70.00,404.19 155.88,403.42 241.76,397.64 327.65,383.19 413.53,323.53 499.41,273.55 542.35,232.18 585.29,211.73 628.24,178.00 671.18,143.84 714.12,109.05 757.06,74.77 800.00,40.21"/>
+  <polyline fill="none" stroke="#ff7f0e" stroke-width="2" points="70.00,405.00 155.88,403.30 241.76,397.04 327.65,377.76 413.53,336.61 499.41,277.89 542.35,245.30 585.29,211.76 628.24,177.72 671.18,143.43 714.12,109.01 757.06,74.52 800.00,40.00"/>
+
+  <!-- legend -->
+  <rect x="540" y="40" width="260" height="56" fill="white" stroke="#ccc"/>
+  <line x1="555" y1="58" x2="585" y2="58" stroke="#1f77b4" stroke-width="2"/>
+  <text x="595" y="62" font-family="sans-serif" font-size="12">real (time_us_mean)</text>
+  <line x1="555" y1="78" x2="585" y2="78" stroke="#ff7f0e" stroke-width="2"/>
+  <text x="595" y="82" font-family="sans-serif" font-size="12">pred (holdout)</text>
+</svg>
