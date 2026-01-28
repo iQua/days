@@ -13,7 +13,7 @@ RE_SIZE = re.compile(r"(?m)^(size\s*=\s*)\d+\s*$")
 RE_LOG_PATH = re.compile(r'(?m)^(log_path\s*=\s*)"(.*)"\s*$')
 
 
-def load_collective_cct(log_path: Path, size_bytes: int) -> float:
+def load_collective_cct(log_path: Path, collective_type: str, size_bytes: int) -> float:
     events = log_path / "collective_events.csv"
     if not events.exists():
         raise FileNotFoundError(f"missing {events}")
@@ -21,7 +21,7 @@ def load_collective_cct(log_path: Path, size_bytes: int) -> float:
     with events.open("r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("collective_type") != "RingAllReduce":
+            if row.get("collective_type") != collective_type:
                 continue
             if int(row["size_bytes"]) != int(size_bytes):
                 continue
@@ -31,7 +31,9 @@ def load_collective_cct(log_path: Path, size_bytes: int) -> float:
                 raise ValueError(f"bad times: start={start} end={end} in {events}")
             return end - start
 
-    raise RuntimeError(f"no matching RingAllReduce row for size_bytes={size_bytes} in {events}")
+    raise RuntimeError(
+        f"no matching {collective_type} row for size_bytes={size_bytes} in {events}"
+    )
 
 
 def render_config(template_path: Path, size_bytes: int, log_path: str) -> str:
@@ -60,10 +62,18 @@ def run_one(binary: Path, config_text: str) -> None:
             pass
 
 
-def sweep(tp: int, sizes: list[int]) -> None:
+def sweep(tp: int, sizes: list[int], collective_type: str) -> None:
     repo = Path(__file__).resolve().parents[1]
-    template = repo / "configs" / f"precision_tp{tp}.toml"
-    out_csv = repo / f"sim_tp{tp}.csv"
+    if collective_type == "RingAllReduce":
+        template = repo / "configs" / f"precision_tp{tp}.toml"
+        out_csv = repo / f"sim_tp{tp}.csv"
+        log_root = f"logs/precision_tp{tp}"
+    elif collective_type == "Broadcast":
+        template = repo / "configs" / f"bcast_tp{tp}.toml"
+        out_csv = repo / f"sim_bcast_tp{tp}.csv"
+        log_root = f"logs/bcast_tp{tp}"
+    else:
+        raise ValueError(f"unsupported collective_type: {collective_type}")
 
     subprocess.run(["cargo", "build", "--release", "--bin", "days"], cwd=repo, check=True)
     binary = repo / "target" / "release" / "days"
@@ -72,10 +82,10 @@ def sweep(tp: int, sizes: list[int]) -> None:
 
     rows = []
     for size_bytes in sizes:
-        log_path = f"logs/precision_tp{tp}/size_{size_bytes}"
+        log_path = f"{log_root}/size_{size_bytes}"
         cfg = render_config(template, size_bytes, log_path)
         run_one(binary, cfg)
-        cct = load_collective_cct(repo / log_path, size_bytes)
+        cct = load_collective_cct(repo / log_path, collective_type, size_bytes)
         rows.append((size_bytes, cct))
 
     with out_csv.open("w", newline="") as f:
@@ -97,16 +107,29 @@ def main() -> int:
         help="tensor parallel degree (2 or 3 hosts)",
     )
     ap.add_argument(
+        "--collective-type",
+        type=str,
+        choices=["RingAllReduce", "Broadcast"],
+        default="RingAllReduce",
+        help="collective type to sweep (default: RingAllReduce)",
+    )
+    ap.add_argument(
         "--template",
         type=str,
         default="",
-        help="optional TOML template path (defaults to configs/precision_tp{tp}.toml)",
+        help="optional TOML template path (defaults depend on --collective-type)",
     )
     ap.add_argument(
         "--out",
         type=str,
         default="",
-        help="optional output CSV path (defaults to ./sim_tp{tp}.csv)",
+        help="optional output CSV path (defaults depend on --collective-type)",
+    )
+    ap.add_argument(
+        "--log-root",
+        type=str,
+        default="",
+        help="optional log root directory (defaults depend on --collective-type)",
     )
     ap.add_argument(
         "--sizes",
@@ -143,19 +166,40 @@ def main() -> int:
 
     # Allow overriding template/output without changing default sweep behavior.
     repo = Path(__file__).resolve().parents[1]
+    collective_type = args.collective_type
     if args.template:
         template_path = Path(args.template)
         if not template_path.is_absolute():
             template_path = (repo / template_path).resolve()
     else:
-        template_path = repo / "configs" / f"precision_tp{args.tp}.toml"
+        if collective_type == "RingAllReduce":
+            template_path = repo / "configs" / f"precision_tp{args.tp}.toml"
+        elif collective_type == "Broadcast":
+            template_path = repo / "configs" / f"bcast_tp{args.tp}.toml"
+        else:
+            raise ValueError(f"unsupported collective_type: {collective_type}")
 
     if args.out:
         out_path = Path(args.out)
         if not out_path.is_absolute():
             out_path = (repo / out_path).resolve()
     else:
-        out_path = repo / f"sim_tp{args.tp}.csv"
+        if collective_type == "RingAllReduce":
+            out_path = repo / f"sim_tp{args.tp}.csv"
+        elif collective_type == "Broadcast":
+            out_path = repo / f"sim_bcast_tp{args.tp}.csv"
+        else:
+            raise ValueError(f"unsupported collective_type: {collective_type}")
+
+    if args.log_root:
+        log_root = args.log_root
+    else:
+        if collective_type == "RingAllReduce":
+            log_root = f"logs/precision_tp{args.tp}"
+        elif collective_type == "Broadcast":
+            log_root = f"logs/bcast_tp{args.tp}"
+        else:
+            raise ValueError(f"unsupported collective_type: {collective_type}")
 
     # Inline sweep implementation to use overrides.
     subprocess.run(["cargo", "build", "--release", "--bin", "days"], cwd=repo, check=True)
@@ -165,10 +209,10 @@ def main() -> int:
 
     rows = []
     for size_bytes in sizes:
-        log_path = f"logs/precision_tp{args.tp}/size_{size_bytes}"
+        log_path = f"{log_root}/size_{size_bytes}"
         cfg = render_config(template_path, size_bytes, log_path)
         run_one(binary, cfg)
-        cct = load_collective_cct(repo / log_path, size_bytes)
+        cct = load_collective_cct(repo / log_path, collective_type, size_bytes)
         rows.append((size_bytes, cct))
 
     with out_path.open("w", newline="") as f:
