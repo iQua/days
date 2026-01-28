@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460">
   <rect x="0" y="0" width="820" height="460" fill="white"/>
-  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">TP2 calibration (scale=4.609, L=117.7us)</text>
+  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">TP2 calibration (scale=2.305, L=117.6us)</text>
 
   <!-- axes -->
   <line x1="70" y1="40" x2="70" y2="405" stroke="#222" stroke-width="1"/>
@@ -10,8 +10,8 @@
   <text x="18" y="230.0" text-anchor="middle" font-family="sans-serif" font-size="13" transform="rotate(-90 18 230.0)">log10(time_s)</text>
 
   <!-- lines -->
-  <polyline fill="none" stroke="#1f77b4" stroke-width="2" points="70.00,375.19 155.88,401.80 241.76,396.51 327.65,383.13 413.53,342.21 499.41,276.17 542.35,244.62 585.29,212.03 628.24,178.56 671.18,145.10 714.12,111.37 757.06,76.21 800.00,40.00"/>
-  <polyline fill="none" stroke="#ff7f0e" stroke-width="2" points="70.00,405.00 155.88,403.18 241.76,396.51 327.65,376.37 413.53,334.61 499.41,276.33 542.35,244.24 585.29,211.30 628.24,177.91 671.18,144.29 714.12,110.56 757.06,76.78 800.00,42.96"/>
+  <polyline fill="none" stroke="#1f77b4" stroke-width="2" points="70.00,375.19 155.88,401.79 241.76,396.51 327.65,383.13 413.53,342.21 499.41,276.16 542.35,244.61 585.29,212.03 628.24,178.56 671.18,145.10 714.12,111.37 757.06,76.21 800.00,40.00"/>
+  <polyline fill="none" stroke="#ff7f0e" stroke-width="2" points="70.00,405.00 155.88,403.18 241.76,396.51 327.65,376.36 413.53,334.60 499.41,276.30 542.35,244.23 585.29,211.29 628.24,177.91 671.18,144.30 714.12,110.57 757.06,76.78 800.00,42.96"/>
 
   <!-- legend -->
   <rect x="540" y="40" width="260" height="56" fill="white" stroke="#ccc"/>

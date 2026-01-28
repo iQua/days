@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460">
   <rect x="0" y="0" width="820" height="460" fill="white"/>
-  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">TP3 calibration (scale=3.948, L=129.5us)</text>
+  <text x="410.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="16">TP3 calibration (scale=0.987, L=129.5us)</text>
 
   <!-- axes -->
   <line x1="70" y1="40" x2="70" y2="405" stroke="#222" stroke-width="1"/>
@@ -11,7 +11,7 @@
 
   <!-- lines -->
   <polyline fill="none" stroke="#1f77b4" stroke-width="2" points="70.00,405.00 155.88,403.15 241.76,397.52 327.65,360.01 413.53,331.35 499.41,275.97 542.35,244.63 585.29,212.35 628.24,179.98 671.18,146.72 714.12,112.98 757.06,76.42 800.00,40.00"/>
-  <polyline fill="none" stroke="#ff7f0e" stroke-width="2" points="70.00,405.00 155.88,403.14 241.76,396.33 327.65,375.94 413.53,334.12 499.41,276.26 542.35,244.50 585.29,211.93 628.24,178.94 671.18,145.72 714.12,112.40 757.06,79.02 800.00,45.61"/>
+  <polyline fill="none" stroke="#ff7f0e" stroke-width="2" points="70.00,405.00 155.88,403.14 241.76,396.33 327.65,375.92 413.53,334.10 499.41,276.23 542.35,244.49 585.29,211.93 628.24,178.94 671.18,145.72 714.12,112.40 757.06,79.02 800.00,45.61"/>
 
   <!-- legend -->
   <rect x="540" y="40" width="260" height="56" fill="white" stroke="#ccc"/>
