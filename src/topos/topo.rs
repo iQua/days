@@ -131,6 +131,12 @@ pub struct LinkConfig {
     pfc: Option<PfcLinkConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Scatter,
+    Gather,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum TopoCategory {
     FatTree,
@@ -593,16 +599,13 @@ impl Topology {
             let collective_type = collective.collective_type.clone();
             match collective_type {
                 CollectiveType::RingAllReduce => {
-                    // Precision-mode RingAllReduce:
-                    // model as one unidirectional flow per rank (around the ring), where each rank sends
-                    // \(2*(n-1)/n\) of the allreduce buffer (matching NCCL ring byte volume per rank).
-                    //
-                    // We keep `collective.traffic.size` as the NCCL-aligned `size_bytes` (per-rank buffer).
-                    // - TCP: actual bytes sent per rank are controlled via app-source handle length in `run()`.
-                    // - PacketDistribution: actual bytes sent per rank are modeled by overriding flow traffic size.
+                    // RingAllReduce expands into reduce-scatter (scatter) + all-gather (gather).
+                    // We additionally model the NCCL ring "receive-before-forward" semantics by
+                    // requiring each step (after the first) to wait for the left neighbor's
+                    // previous step to complete.
                     let n = collective.sources.len();
-                    assert!(
-                        n == collective.flow_count,
+                    assert_eq!(
+                        collective.flow_count, n,
                         "RingAllReduce requires flow_count == number of hosts"
                     );
 
@@ -611,39 +614,121 @@ impl Topology {
                         _ => panic!("RingAllReduce requires byte-based traffic.size"),
                     };
 
-                    // Each rank sends 2*(n-1)/n of the allreduce buffer in the NCCL ring algorithm.
-                    let numerator = size_bytes_usize.saturating_mul(2).saturating_mul(n - 1);
-                    let effective_size = (numerator + (n - 1)) / n; // ceil(numerator / n)
+                    let steps = n.saturating_sub(1);
+                    let scatter_base = collective.first_flow_id;
+                    let gather_base = scatter_base + n * steps;
 
-                    for index in 0..collective.flow_count {
-                        let flow_id = collective.first_flow_id + index;
-                        let src = collective.sources[index];
-                        let dst = collective.sinks[index];
+                    // NCCL per-rank transmitted byte volume is 2*(n-1)/n of the buffer.
+                    let numerator = size_bytes_usize.saturating_mul(2).saturating_mul(steps);
+                    let effective_size = (numerator + (n - 1)) / n; // ceil
 
-                        let mut traffic = collective.traffic.clone();
-                        if collective.flow_type == FlowType::PacketDistribution {
-                            traffic.size = FlowSize::Bytes(effective_size);
+                    let mut flow_id = collective.first_flow_id;
+
+                    let mut last_scatter: Vec<Option<usize>> = vec![None; n];
+                    let mut last_gather: Vec<Option<usize>> = vec![None; n];
+
+                    for (rank, &src) in collective.sources.iter().enumerate() {
+                        let dst = collective.sources[(rank + 1) % n];
+                        let left = (rank + n - 1) % n;
+
+                        for step in 1..n {
+                            let mut starts_after = Vec::new();
+
+                            // Serialize within the rank.
+                            if let Some(prev_flow_id) = last_scatter[rank] {
+                                starts_after.push(prev_flow_id);
+                            }
+
+                            // NCCL ring dependency: must receive from left neighbor before forwarding.
+                            if step > 1 {
+                                let left_prev = scatter_base + left * steps + (step - 2);
+                                starts_after.push(left_prev);
+                            }
+
+                            let mut traffic = collective.traffic.clone();
+                            if collective.flow_type == FlowType::PacketDistribution {
+                                traffic.size = FlowSize::Bytes(effective_size);
+                            }
+
+                            let flow = Flow::new(FlowParams {
+                                id: flow_id,
+                                path: None,
+                                starts_before: Vec::new(),
+                                starts_after,
+                                flow_type: collective.flow_type.clone(),
+                                source_host: src,
+                                sink_host: dst,
+                                routing: collective.routing.clone(),
+                                traffic,
+                                priority: 0,
+                                seed: collective.id,
+                            });
+
+                            self.flows.push(flow);
+                            last_scatter[rank] = Some(flow_id);
+                            flow_id += 1;
                         }
-
-                        self.flows.push(Flow::new(FlowParams {
-                            id: flow_id,
-                            path: None,
-                            starts_before: Vec::new(),
-                            starts_after: Vec::new(),
-                            flow_type: collective.flow_type.clone(),
-                            source_host: src,
-                            sink_host: dst,
-                            routing: collective.routing.clone(),
-                            traffic,
-                            priority: 0,
-                            seed: collective.id,
-                        }));
                     }
 
-                    let size_bytes = size_bytes_usize as u64;
+                    for (rank, &src) in collective.sources.iter().enumerate() {
+                        let dst = collective.sources[(rank + 1) % n];
+                        let left = (rank + n - 1) % n;
 
-                    let start_flow_ids: Vec<usize> = (0..n).map(|i| collective.first_flow_id + i).collect();
-                    let terminal_flow_ids = start_flow_ids.clone();
+                        for step in 1..n {
+                            let mut starts_after = Vec::new();
+
+                            // Serialize within the rank.
+                            if let Some(prev_flow_id) = last_gather[rank] {
+                                starts_after.push(prev_flow_id);
+                            }
+
+                            if step == 1 {
+                                // Gather starts after reduce-scatter completes and the last chunk
+                                // from the left neighbor has arrived.
+                                if let Some(scatter_flow_id) = last_scatter[rank] {
+                                    starts_after.push(scatter_flow_id);
+                                }
+                                let left_scatter_last = scatter_base + left * steps + (steps - 1);
+                                starts_after.push(left_scatter_last);
+                            } else {
+                                // NCCL ring dependency: must receive from left neighbor before forwarding.
+                                let left_prev = gather_base + left * steps + (step - 2);
+                                starts_after.push(left_prev);
+                            }
+
+                            let mut traffic = collective.traffic.clone();
+                            if collective.flow_type == FlowType::PacketDistribution {
+                                traffic.size = FlowSize::Bytes(effective_size);
+                            }
+
+                            let flow = Flow::new(FlowParams {
+                                id: flow_id,
+                                path: None,
+                                starts_before: Vec::new(),
+                                starts_after,
+                                flow_type: collective.flow_type.clone(),
+                                source_host: src,
+                                sink_host: dst,
+                                routing: collective.routing.clone(),
+                                traffic,
+                                priority: 0,
+                                seed: collective.id,
+                            });
+
+                            self.flows.push(flow);
+                            last_gather[rank] = Some(flow_id);
+                            flow_id += 1;
+                        }
+                    }
+
+                    collective.flow_count = flow_id - collective.first_flow_id;
+
+                    // Instrumentation: first scatter hop as start, last gather hop as completion.
+                    let size_bytes = size_bytes_usize as u64;
+                    let start_flow_ids: Vec<usize> =
+                        (0..n).map(|rank| scatter_base + rank * steps).collect();
+                    let terminal_flow_ids: Vec<usize> =
+                        last_gather.iter().copied().flatten().collect();
 
                     CollectiveTracker::register_collective(
                         collective.id,
@@ -1233,27 +1318,42 @@ impl Topology {
                     _ => panic!("RingAllReduce only supports byte-based flows."),
                 };
                 let n = collective.sources.len();
-                assert_eq!(
-                    collective.flow_count, n,
-                    "Precision-mode RingAllReduce expects flow_count == hosts.len()"
+                let steps = n.saturating_sub(1);
+                assert!(
+                    collective.flow_count == 2 * n * steps,
+                    "RingAllReduce (TCP) expects expanded flow_count = 2*n*(n-1)"
                 );
 
-                // Each rank sends 2*(n-1)/n of the allreduce buffer in the NCCL ring algorithm.
-                // Use a per-flow virtual app buffer of that effective size.
-                let numerator = total_size.saturating_mul(2).saturating_mul(n - 1);
-                let effective_size = (numerator + (n - 1)) / n; // ceil(numerator / n)
+                let chunk_size = total_size / n;
 
-                for index in 0..n {
-                    let flow_id = collective.first_flow_id + index;
-                    let src_host = collective.sources[index];
-                    let dst_host = collective.sinks[index];
+                let mut flow_id = collective.first_flow_id;
 
-                    let data_src = conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                        AppDataSource::create_source_buffer(effective_size, self.app_source_cfg)
-                    });
+                for phase in [Phase::Scatter, Phase::Gather] {
+                    for rank in 0..n {
+                        let src_host = collective.sources[rank];
+                        let dst_host = collective.sources[(rank + 1) % n];
 
-                    let handle = data_src.handle_with_offset(0, Some(effective_size));
-                    flow_id_to_source_handle.insert(flow_id, handle);
+                        for step in 1..n {
+                            let chunk_owner = match phase {
+                                Phase::Scatter => (rank + n - step + 1) % n,
+                                Phase::Gather => (rank + n - step) % n,
+                            };
+                            let chunk_offset = chunk_owner * chunk_size;
+                            let chunk_len = if chunk_owner == n - 1 {
+                                total_size - chunk_offset
+                            } else {
+                                chunk_size
+                            };
+
+                            let data_src = conn_map.entry((src_host, dst_host)).or_insert_with(|| {
+                                AppDataSource::create_source_buffer(total_size, self.app_source_cfg)
+                            });
+                            let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
+                            flow_id_to_source_handle.insert(flow_id, handle);
+
+                            flow_id += 1;
+                        }
+                    }
                 }
             }
         }
