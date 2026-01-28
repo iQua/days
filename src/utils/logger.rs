@@ -469,7 +469,13 @@ impl CsvLogger {
 
         // Create output files
         #[allow(unused_mut)]
-        let mut elements = vec!["sources", "switches", "sinks", "collective_events", "flow_events"];
+        let mut elements = vec![
+            "sources",
+            "switches",
+            "sinks",
+            "collective_events",
+            "flow_events",
+        ];
         #[cfg(feature = "l2_pfc")]
         elements.push("pfc");
         #[cfg(all(feature = "lean", feature = "l2_pfc"))]

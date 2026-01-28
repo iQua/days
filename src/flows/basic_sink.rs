@@ -10,9 +10,9 @@ use crate::flows::FlowFinishMsg;
 use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
+use crate::utils::collective_tracker::CollectiveTracker;
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
-use crate::utils::collective_tracker::CollectiveTracker;
 
 #[derive(Debug)]
 pub struct BasicPacketSink {

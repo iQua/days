@@ -168,4 +168,3 @@ impl CollectiveTracker {
         st.emitted = true;
     }
 }
-

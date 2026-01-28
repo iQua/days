@@ -25,8 +25,8 @@ use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
-use crate::utils::logger::{CsvLogger, ReportTiming};
 use crate::utils::collective_tracker::CollectiveTracker;
+use crate::utils::logger::{CsvLogger, ReportTiming};
 use crate::utils::time::{quantize_after, quantize_time};
 
 #[derive(Clone, Default, Debug, Serialize)]

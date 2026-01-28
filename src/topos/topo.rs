@@ -769,6 +769,26 @@ impl Topology {
                             flow_id, collective_type, collective.id
                         );
                     }
+
+                    // Minimal instrumentation for strict completion time:
+                    // For Broadcast, define collective start as the earliest start among its flows,
+                    // and collective end as the latest end among its flows.
+                    if let CollectiveType::Broadcast = collective_type {
+                        let size_bytes = match collective.traffic.size {
+                            FlowSize::Bytes(b) => b as u64,
+                            _ => panic!("Broadcast requires byte-based traffic.size"),
+                        };
+                        let flow_ids: Vec<usize> = (0..collective.flow_count)
+                            .map(|i| collective.first_flow_id + i)
+                            .collect();
+                        CollectiveTracker::register_collective(
+                            collective.id,
+                            "Broadcast".to_string(),
+                            size_bytes,
+                            flow_ids.clone(),
+                            flow_ids,
+                        );
+                    }
                 }
             }
         }
@@ -1345,9 +1365,13 @@ impl Topology {
                                 chunk_size
                             };
 
-                            let data_src = conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                AppDataSource::create_source_buffer(total_size, self.app_source_cfg)
-                            });
+                            let data_src =
+                                conn_map.entry((src_host, dst_host)).or_insert_with(|| {
+                                    AppDataSource::create_source_buffer(
+                                        total_size,
+                                        self.app_source_cfg,
+                                    )
+                                });
                             let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
                             flow_id_to_source_handle.insert(flow_id, handle);
 
