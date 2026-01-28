@@ -1,0 +1,41 @@
+seed = 1
+
+# Topology: 2 hosts (0,1) connected via one switch (2)
+edges = [[0, 2], [1, 2]]
+hosts = [0, 1]
+
+# Keep the sim long enough; workload finishes earlier, but we log end_time.
+duration = 30.0
+
+# All outputs go here (script will override per-size).
+log_path = "logs/bcast_tp2"
+
+[app_source]
+req_channel_capacity = 256
+chunk_size = 512
+initial_delay = 1
+run_interval = 50
+
+[switch]
+# Bit rate (bps)
+port_rate = 1e11
+# Capacity is in packets (see docs). Use 0 for unlimited (lossless) to avoid TCP RTO dominating CCT.
+capacity = 0
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[collective]]
+collective_type = "Broadcast"
+flow_type = "PacketDistribution"
+# TP=2: 1 source -> 1 sink (one flow).
+flow_count = 1
+sources = [0]
+sinks = [1]
+
+[collective.traffic]
+initial_delay = 0.0
+# Bytes. Script will sweep this field.
+size = 8388608
+arr_dist = { type = "Uniform", low = 1e-9, high = 1e-9 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+
