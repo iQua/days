@@ -14,7 +14,7 @@ initial_delay = 1
 run_interval = 50
 
 [switch]
-port_rate = 2.533153e+10
+port_rate = 1.013301e+11
 # Capacity is in packets (see docs). Use 0 for unlimited (lossless) to avoid TCP RTO dominating CCT.
 capacity = 0
 discipline = "FIFO"
