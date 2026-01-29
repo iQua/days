@@ -3,7 +3,7 @@
 //! Reference:
 //!
 //! L. Zhang, "Virtual Clock: A New Traffic Control Algorithm for Packet
-//! Switching Networks," in ACM SIGCOMM Computer Communication Review, vol. 20,
+//! Switching Networks," in ACM Computer Communication Review, vol. 20,
 //! pp. 19, 1990.
 
 use std::cmp::Ordering;

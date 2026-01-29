@@ -1,6 +1,6 @@
 # DCQCN Simulation Plan
 
-This document lays out a concrete, repo-specific plan to add DCQCN (SIGCOMM 2015, Zhu et al.) to Days.
+This document lays out a concrete, repo-specific plan to add DCQCN (Zhu et al., 2015) to Days.
 
 ## Goals
 
