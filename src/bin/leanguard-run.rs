@@ -6,6 +6,10 @@ use std::fs::{self, File};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::time::Instant;
 
 use days::utils::trace_export;
@@ -63,6 +67,12 @@ struct Cli {
     /// Disable the DFS state queue optimization recommended for trace validation.
     #[arg(long, default_value_t = false)]
     tlc_no_dfs: bool,
+
+    /// Sample peak RSS (KB) for checker and TLC subprocesses.
+    ///
+    /// This adds overhead (polling `ps`), so keep it off for performance benchmarks.
+    #[arg(long, default_value_t = false)]
+    measure_rss: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +124,8 @@ struct TlcResult {
     matched_prefix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_failure: Option<TlcFirstFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_rss_kb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +138,8 @@ struct CheckerResult {
     stderr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_rss_kb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coverage_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,9 +343,12 @@ fn main() {
 
     let invocations = select_checkers(&log_path, &summary.trace_discovery.traces);
     for inv in invocations {
-        summary
-            .checker_results
-            .push(run_checker(&cli.checker_dir, inv, coverage_dir.as_deref()));
+        summary.checker_results.push(run_checker(
+            &cli.checker_dir,
+            inv,
+            coverage_dir.as_deref(),
+            cli.measure_rss,
+        ));
     }
 
     if cli.tlc_check {
@@ -543,6 +560,7 @@ fn run_checker(
     checker_dir: &Path,
     inv: CheckerInvocation,
     coverage_dir: Option<&Path>,
+    measure_rss: bool,
 ) -> CheckerResult {
     let (exe, args) = match inv {
         CheckerInvocation::One { exe, args } => (exe, args),
@@ -568,6 +586,7 @@ fn run_checker(
             stdout: String::new(),
             stderr: format!("Missing checker binary: {}", exe_path.display()),
             runtime_ms: None,
+            peak_rss_kb: None,
             coverage_path: coverage_path_str,
             coverage: None,
         };
@@ -579,10 +598,10 @@ fn run_checker(
         cmd.arg("--coverage-out").arg(path);
     }
     let start = Instant::now();
-    let output = cmd.output();
+    let output = run_command_with_peak_rss(&mut cmd, measure_rss);
     let runtime_ms = start.elapsed().as_millis();
     match output {
-        Ok(output) => {
+        Ok((output, peak_rss_kb)) => {
             let exit_code = output.status.code();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -600,6 +619,7 @@ fn run_checker(
                 stdout,
                 stderr,
                 runtime_ms: Some(runtime_ms),
+                peak_rss_kb,
                 coverage_path: coverage_path_str,
                 coverage: coverage_path
                     .as_ref()
@@ -614,6 +634,7 @@ fn run_checker(
             stdout: String::new(),
             stderr: format!("Failed to execute checker: {e}"),
             runtime_ms: Some(runtime_ms),
+            peak_rss_kb: None,
             coverage_path: coverage_path_str,
             coverage: None,
         },
@@ -646,6 +667,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
             diameter: None,
             matched_prefix: None,
             first_failure: None,
+            peak_rss_kb: None,
         };
     }
 
@@ -693,6 +715,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
             diameter: None,
             matched_prefix: None,
             first_failure: None,
+            peak_rss_kb: None,
         };
     }
     if let Err(e) = fs::copy(&inv.cfg, &cfg_file) {
@@ -712,6 +735,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
             diameter: None,
             matched_prefix: None,
             first_failure: None,
+            peak_rss_kb: None,
         };
     }
     if let Err(e) =
@@ -733,6 +757,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
             diameter: None,
             matched_prefix: None,
             first_failure: None,
+            peak_rss_kb: None,
         };
     }
 
@@ -761,6 +786,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
                 diameter: None,
                 matched_prefix: None,
                 first_failure: None,
+                peak_rss_kb: None,
             };
         };
 
@@ -787,11 +813,11 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
         .collect::<Vec<_>>();
 
     let start = Instant::now();
-    let output = cmd.output();
+    let output = run_command_with_peak_rss(&mut cmd, cli.measure_rss);
     let runtime_ms = start.elapsed().as_millis();
 
     match output {
-        Ok(output) => {
+        Ok((output, peak_rss_kb)) => {
             let exit_code = output.status.code();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -855,6 +881,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
                 diameter,
                 matched_prefix,
                 first_failure,
+                peak_rss_kb,
             }
         }
         Err(e) => TlcResult {
@@ -873,6 +900,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
             diameter: None,
             matched_prefix: None,
             first_failure: None,
+            peak_rss_kb: None,
         },
     }
 }
@@ -969,6 +997,59 @@ fn tlc_output_indicates_reject(text: &str) -> bool {
         return true;
     }
     false
+}
+
+fn run_command_with_peak_rss(
+    cmd: &mut Command,
+    measure_rss: bool,
+) -> std::io::Result<(std::process::Output, Option<u64>)> {
+    if !measure_rss {
+        return cmd.output().map(|out| (out, None));
+    }
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_reader = Arc::clone(&stop);
+
+    let sampler = std::thread::spawn(move || {
+        let mut max_rss = 0u64;
+        while !stop_reader.load(Ordering::Relaxed) {
+            if let Some(rss_kb) = get_rss_kb(pid) {
+                max_rss = max_rss.max(rss_kb);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        max_rss
+    });
+
+    let output = child.wait_with_output();
+    stop.store(true, Ordering::Relaxed);
+    let peak_rss_kb = sampler.join().ok();
+
+    output.map(|out| {
+        let peak = peak_rss_kb.and_then(|v| if v == 0 { None } else { Some(v) });
+        (out, peak)
+    })
+}
+
+fn get_rss_kb(pid: u32) -> Option<u64> {
+    // `ps` rss is KB on macOS and Linux.
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.split_whitespace().next()?.parse::<u64>().ok()
 }
 
 fn count_nonempty_lines(path: &Path) -> Result<u64, String> {

@@ -37,18 +37,18 @@ Build a **TLA+/TLC trace-validation baseline** that consumes the **same Days tra
     - `tla/CubicTrace.tla` (TCP CUBIC; congestion-avoidance ACK growth via fixed-point approximation + small `cwnd_bytes` tolerance)
 - Integrated TLC baseline runs into `src/bin/leanguard-run.rs`:
   - Flags: `--tlc-check`, `--tlc-spec-dir`, `--tlc-bin`, `--tlc-jar`, `--tlc-no-dfs`.
+  - Added optional memory sampling: `--measure-rss` records `peak_rss_kb` for each checker and TLC run (polls `ps`, so keep off for timing benchmarks).
   - Output: optional `tlc_results` and `tlc_accept` fields in the JSON summary.
   - Diagnostics: parses TLC output (`Diameter:` / “depth of the complete state graph search”) to estimate the longest matched prefix, and reports the next failing NDJSON row (by `(time_ns,event_id,kind)` when present).
   - Made TLC “reject” less heuristic: each baseline `.cfg` checks `INVARIANT ProgressOk` (“before end-of-trace, `Next` must be enabled”), so trace mismatch produces an explicit TLC counterexample/invariant violation (classified as `reject`).
   - End-to-end verified: `configs/dcqcn_simple.toml` + TLC 2.19 (`/tmp/leanguard_refs/tla2tools_v1.7.4.jar`) produces `tlc_results[0].status = accept` and `matched_prefix == trace_len` on the shipped trace.
+- Added a minimal fault-injection agreement suite: `python3 utils/fault_injection_agreement.py` (generates small corruptions per protocol and compares Lean vs TLC REJECT + first-failure key).
 
 ### In progress
 
-- Agreement/fault-injection experiments:
-  - multiple seeds/configs (not just `dcqcn_simple.toml`),
-  - injected faults where both checkers should reject, and compare “first failing row” quality.
-- Memory reporting:
-  - extend `leanguard-run` to capture JVM max heap / peak RSS for TLC runs (for paper plots).
+- Broaden memory reporting:
+  - aggregate `peak_rss_kb` across protocols/configs for plots,
+  - optionally add JVM heap/GC telemetry (beyond RSS) if reviewers ask for it.
 
 ### Next (implementation work)
 
@@ -141,3 +141,35 @@ Notes:
 | `wfq` | `configs/wfq_simple.toml` | 1,200 | 26.8 ± 27.5 | 1,634.0 ± 34.9 | 1,570.6 ± 37.5 | 95.0× |
 | `drr` | `configs/drr_simple.toml` | 800 | 15.6 ± 9.7 | 4,532.4 ± 85.2 | 4,470.0 ± 83.4 | 351.6× |
 | `cubic` | `configs/cubic_simple.toml` | 6 | 21.4 ± 27.7 | 710.2 ± 16.5 | 703.6 ± 15.9 | 65.7× |
+
+## Fault-injection agreement (Lean vs. TLC)
+
+Timestamp: 2026-01-30 (local)
+
+We ran a small corruption suite across all 6 protocols using `python3 utils/fault_injection_agreement.py` (raw output: `logs/fault_injection_agreement_2026-01-30.json`).
+
+Results:
+
+- ACCEPT smoke tests: 6/6 agree on ACCEPT.
+- Injected faults: 7/7 agree on REJECT, and the first-failure key `(time_ns,event_id)` matches for all cases.
+
+| Protocol | Case | Lean | TLC | First-failure key |
+|---|---|---|---|---|
+| `aqm` | invalid ECN mark | reject | reject | `(0,0)` |
+| `pfc` | recv sender mismatch | reject | reject | `(256000000,2)` |
+| `dcqcn` | alpha mismatch (first row) | reject | reject | `(100000,0)` |
+| `dcqcn` | CNP size mismatch | reject | reject | `(952000,9)` |
+| `wfq` | finish-time mismatch | reject | reject | `(0,1)` |
+| `drr` | deficit mismatch | reject | reject | `(0,1)` |
+| `cubic` | cwnd mismatch | reject | reject | `(1000000000,0)` |
+
+## Memory snapshots (peak RSS)
+
+These are sampled via `leanguard-run --measure-rss` (polls `ps`, so it adds overhead; treat as approximate).
+
+- `configs/dcqcn_simple.toml`:
+  - `dcqcn_check` peak RSS ≈ 10,624 KB
+  - `DcqcnTrace.tla` peak RSS ≈ 339,248 KB
+- `configs/dcqcn_10s.toml`:
+  - `dcqcn_check` peak RSS ≈ 56,416 KB
+  - `DcqcnTrace.tla` peak RSS ≈ 3,142,112 KB
