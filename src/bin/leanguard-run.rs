@@ -1,10 +1,14 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::env;
+use std::fs::{self, File};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
+use days::utils::trace_export;
 use days::utils::trace_manifest::{self, TraceManifestV1};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -33,6 +37,28 @@ struct Cli {
 
     #[arg(long)]
     coverage_dir: Option<PathBuf>,
+
+    /// Run the TLA+/TLC trace-validation baseline (in addition to LeanGuard checkers).
+    #[arg(long, default_value_t = false)]
+    tlc_check: bool,
+
+    /// Directory containing baseline `.tla` modules and `.cfg` model configs.
+    #[arg(long, default_value = "tla")]
+    tlc_spec_dir: PathBuf,
+
+    /// Optional TLC runner executable. If provided, this binary is executed directly.
+    ///
+    /// If omitted, `leanguard-run` runs TLC via `java -cp <tlc_jar> tlc2.TLC ...`.
+    #[arg(long)]
+    tlc_bin: Option<PathBuf>,
+
+    /// Path to `tla2tools.jar` (required unless `--tlc-bin` is provided).
+    #[arg(long)]
+    tlc_jar: Option<PathBuf>,
+
+    /// Disable the DFS state queue optimization recommended for trace validation.
+    #[arg(long, default_value_t = false)]
+    tlc_no_dfs: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +71,48 @@ enum CheckerStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TlcStatus {
+    Accept,
+    Reject,
+    Error,
+    MissingRunner,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TlcFirstFailure {
+    trace_file: String,
+    index: u64,
+    time_ns: Option<u64>,
+    event_id: Option<u64>,
+    kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TlcResult {
+    module: String,
+    cfg: String,
+    trace_csv: String,
+    trace_ndjson: String,
+    trace_tla: String,
+    argv: Vec<String>,
+    status: TlcStatus,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_runtime_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diameter: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_prefix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_failure: Option<TlcFirstFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CheckerResult {
     checker: String,
     argv: Vec<String>,
@@ -52,6 +120,8 @@ struct CheckerResult {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coverage_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +170,10 @@ struct RunSummaryV1 {
     trace_discovery: TraceDiscoverySummary,
     checker_results: Vec<CheckerResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tlc_results: Option<Vec<TlcResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tlc_accept: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     coverage: Option<CoverageSummary>,
     accept: bool,
 }
@@ -129,6 +203,8 @@ fn main() {
             traces: Vec::new(),
         },
         checker_results: Vec::new(),
+        tlc_results: None,
+        tlc_accept: None,
         coverage: None,
         accept: false,
     };
@@ -252,6 +328,24 @@ fn main() {
         summary
             .checker_results
             .push(run_checker(&cli.checker_dir, inv, coverage_dir.as_deref()));
+    }
+
+    if cli.tlc_check {
+        let tlc_invocations = select_tlc_specs(
+            &log_path,
+            &summary.trace_discovery.traces,
+            &cli.tlc_spec_dir,
+        );
+        let mut results = Vec::new();
+        for inv in tlc_invocations {
+            results.push(run_tlc(&cli, &log_path, inv));
+        }
+        summary.tlc_accept = Some(
+            results
+                .iter()
+                .all(|r| matches!(r.status, TlcStatus::Accept)),
+        );
+        summary.tlc_results = Some(results);
     }
 
     summary.coverage = aggregate_coverage(&summary.checker_results);
@@ -381,6 +475,63 @@ fn select_checkers(log_path: &Path, traces: &[String]) -> Vec<CheckerInvocation>
     invocations
 }
 
+#[derive(Debug, Clone)]
+struct TlcInvocation {
+    module: PathBuf,
+    cfg: PathBuf,
+    trace_csv: PathBuf,
+}
+
+fn select_tlc_specs(log_path: &Path, traces: &[String], spec_dir: &Path) -> Vec<TlcInvocation> {
+    let has = |name: &str| traces.iter().any(|t| t == name);
+    let mut invocations = Vec::new();
+
+    if has("aqm_events.csv") {
+        invocations.push(TlcInvocation {
+            module: spec_dir.join("AqmTrace.tla"),
+            cfg: spec_dir.join("AqmTrace.cfg"),
+            trace_csv: log_path.join("aqm_events.csv"),
+        });
+    }
+    if has("pfc_events.csv") {
+        invocations.push(TlcInvocation {
+            module: spec_dir.join("PfcTrace.tla"),
+            cfg: spec_dir.join("PfcTrace.cfg"),
+            trace_csv: log_path.join("pfc_events.csv"),
+        });
+    }
+    if has("dcqcn_events.csv") {
+        invocations.push(TlcInvocation {
+            module: spec_dir.join("DcqcnTrace.tla"),
+            cfg: spec_dir.join("DcqcnTrace.cfg"),
+            trace_csv: log_path.join("dcqcn_events.csv"),
+        });
+    }
+    if has("wfq_events.csv") {
+        invocations.push(TlcInvocation {
+            module: spec_dir.join("WfqTrace.tla"),
+            cfg: spec_dir.join("WfqTrace.cfg"),
+            trace_csv: log_path.join("wfq_events.csv"),
+        });
+    }
+    if has("drr_events.csv") {
+        invocations.push(TlcInvocation {
+            module: spec_dir.join("DrrTrace.tla"),
+            cfg: spec_dir.join("DrrTrace.cfg"),
+            trace_csv: log_path.join("drr_events.csv"),
+        });
+    }
+    if has("cubic_events.csv") {
+        invocations.push(TlcInvocation {
+            module: spec_dir.join("CubicTrace.tla"),
+            cfg: spec_dir.join("CubicTrace.cfg"),
+            trace_csv: log_path.join("cubic_events.csv"),
+        });
+    }
+
+    invocations
+}
+
 fn run_checker(
     checker_dir: &Path,
     inv: CheckerInvocation,
@@ -409,6 +560,7 @@ fn run_checker(
             exit_code: None,
             stdout: String::new(),
             stderr: format!("Missing checker binary: {}", exe_path.display()),
+            runtime_ms: None,
             coverage_path: coverage_path_str,
             coverage: None,
         };
@@ -419,7 +571,9 @@ fn run_checker(
     if let Some(path) = &coverage_path {
         cmd.arg("--coverage-out").arg(path);
     }
+    let start = Instant::now();
     let output = cmd.output();
+    let runtime_ms = start.elapsed().as_millis();
     match output {
         Ok(output) => {
             let exit_code = output.status.code();
@@ -438,6 +592,7 @@ fn run_checker(
                 exit_code,
                 stdout,
                 stderr,
+                runtime_ms: Some(runtime_ms),
                 coverage_path: coverage_path_str,
                 coverage: coverage_path
                     .as_ref()
@@ -451,10 +606,359 @@ fn run_checker(
             exit_code: None,
             stdout: String::new(),
             stderr: format!("Failed to execute checker: {e}"),
+            runtime_ms: Some(runtime_ms),
             coverage_path: coverage_path_str,
             coverage: None,
         },
     }
+}
+
+fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
+    let start_total = Instant::now();
+    let module_str = inv.module.display().to_string();
+    let cfg_str = inv.cfg.display().to_string();
+    let trace_csv_str = inv.trace_csv.display().to_string();
+
+    let trace_ndjson = trace_export::default_ndjson_output_path(&inv.trace_csv);
+    let trace_ndjson_str = trace_ndjson.display().to_string();
+
+    if let Err(e) = trace_export::export_csv_to_ndjson(&inv.trace_csv, &trace_ndjson, true) {
+        return TlcResult {
+            module: module_str,
+            cfg: cfg_str,
+            trace_csv: trace_csv_str,
+            trace_ndjson: trace_ndjson_str,
+            trace_tla: String::new(),
+            argv: Vec::new(),
+            status: TlcStatus::Error,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("Failed to export CSV to NDJSON: {e}"),
+            runtime_ms: None,
+            total_runtime_ms: Some(start_total.elapsed().as_millis()),
+            diameter: None,
+            matched_prefix: None,
+            first_failure: None,
+        };
+    }
+
+    let meta_root = log_path.join("tlc");
+    let _ = fs::create_dir_all(&meta_root);
+    let meta_dir = meta_root.join(
+        inv.module
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("tlc"),
+    );
+    let _ = fs::create_dir_all(&meta_dir);
+
+    let spec_dir = meta_dir.join("spec");
+    let _ = fs::create_dir_all(&spec_dir);
+
+    let module_file = spec_dir.join(Path::new(
+        inv.module
+            .file_name()
+            .expect("TLC module path has no filename"),
+    ));
+    let cfg_file = spec_dir.join(Path::new(
+        inv.cfg.file_name().expect("TLC cfg path has no filename"),
+    ));
+    let trace_tla = spec_dir.join("TraceData.tla");
+    let trace_tla_str = trace_tla.display().to_string();
+
+    if let Err(e) = fs::copy(&inv.module, &module_file) {
+        return TlcResult {
+            module: module_str,
+            cfg: cfg_str,
+            trace_csv: trace_csv_str,
+            trace_ndjson: trace_ndjson_str,
+            trace_tla: trace_tla_str,
+            argv: Vec::new(),
+            status: TlcStatus::Error,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("Failed to copy TLA module into TLC workspace: {e}"),
+            runtime_ms: None,
+            total_runtime_ms: Some(start_total.elapsed().as_millis()),
+            diameter: None,
+            matched_prefix: None,
+            first_failure: None,
+        };
+    }
+    if let Err(e) = fs::copy(&inv.cfg, &cfg_file) {
+        return TlcResult {
+            module: module_str,
+            cfg: cfg_str,
+            trace_csv: trace_csv_str,
+            trace_ndjson: trace_ndjson_str,
+            trace_tla: trace_tla_str,
+            argv: Vec::new(),
+            status: TlcStatus::Error,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("Failed to copy TLC config into workspace: {e}"),
+            runtime_ms: None,
+            total_runtime_ms: Some(start_total.elapsed().as_millis()),
+            diameter: None,
+            matched_prefix: None,
+            first_failure: None,
+        };
+    }
+    if let Err(e) =
+        trace_export::export_csv_to_tla_trace_module(&inv.trace_csv, &trace_tla, true, "TraceData")
+    {
+        return TlcResult {
+            module: module_str,
+            cfg: cfg_str,
+            trace_csv: trace_csv_str,
+            trace_ndjson: trace_ndjson_str,
+            trace_tla: trace_tla_str,
+            argv: Vec::new(),
+            status: TlcStatus::Error,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("Failed to export CSV to TLA trace module: {e}"),
+            runtime_ms: None,
+            total_runtime_ms: Some(start_total.elapsed().as_millis()),
+            diameter: None,
+            matched_prefix: None,
+            first_failure: None,
+        };
+    }
+
+    let mut cmd = if let Some(bin) = &cli.tlc_bin {
+        Command::new(bin)
+    } else {
+        let Some(jar) = &cli.tlc_jar else {
+            return TlcResult {
+                module: module_str,
+                cfg: cfg_str,
+                trace_csv: trace_csv_str,
+                trace_ndjson: trace_ndjson_str,
+                trace_tla: String::new(),
+                argv: Vec::new(),
+                status: TlcStatus::MissingRunner,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "Missing TLC runner: pass --tlc-bin (wrapper) or --tlc-jar (tla2tools.jar)"
+                    .to_string(),
+                runtime_ms: None,
+                total_runtime_ms: Some(start_total.elapsed().as_millis()),
+                diameter: None,
+                matched_prefix: None,
+                first_failure: None,
+            };
+        };
+
+        let java = find_java_binary().unwrap_or_else(|| PathBuf::from("java"));
+        let mut cmd = Command::new(&java);
+        if !cli.tlc_no_dfs {
+            cmd.arg("-Dtlc2.tool.queue.IStateQueue=StateDeque");
+        }
+        cmd.arg("-cp").arg(jar).arg("tlc2.TLC");
+        cmd
+    };
+
+    cmd.arg("-workers").arg("1");
+    cmd.arg("-metadir").arg(&meta_dir);
+    cmd.arg("-config").arg(&cfg_file);
+    cmd.arg(&module_file);
+
+    let argv = std::iter::once(cmd.get_program().to_string_lossy().to_string())
+        .chain(
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .collect::<Vec<_>>();
+
+    let start = Instant::now();
+    let output = cmd.output();
+    let runtime_ms = start.elapsed().as_millis();
+
+    match output {
+        Ok(output) => {
+            let exit_code = output.status.code();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            let combined = format!("{stdout}\n{stderr}");
+            let diameter = parse_tlc_diameter(&combined);
+            let trace_len = count_nonempty_lines(&trace_ndjson).ok();
+            let matched_prefix = diameter.map(|d| d.saturating_sub(1));
+
+            let status = match exit_code {
+                Some(0) => match (trace_len, matched_prefix) {
+                    (Some(len), Some(prefix)) if prefix == len => TlcStatus::Accept,
+                    (Some(_), Some(_)) => TlcStatus::Reject,
+                    _ => TlcStatus::Error,
+                },
+                _ => TlcStatus::Error,
+            };
+
+            let first_failure = match (status.clone(), trace_len, matched_prefix) {
+                (TlcStatus::Reject, Some(len), Some(prefix)) if prefix < len => {
+                    let idx = prefix + 1;
+                    let (time_ns, event_id, kind) =
+                        read_trace_fields_at_index(&trace_ndjson, idx).unwrap_or_default();
+                    Some(TlcFirstFailure {
+                        trace_file: inv
+                            .trace_csv
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| inv.trace_csv.display().to_string()),
+                        index: idx,
+                        time_ns,
+                        event_id,
+                        kind,
+                    })
+                }
+                _ => None,
+            };
+
+            TlcResult {
+                module: module_str,
+                cfg: cfg_str,
+                trace_csv: trace_csv_str,
+                trace_ndjson: trace_ndjson_str,
+                trace_tla: trace_tla_str,
+                argv,
+                status,
+                exit_code,
+                stdout,
+                stderr,
+                runtime_ms: Some(runtime_ms),
+                total_runtime_ms: Some(start_total.elapsed().as_millis()),
+                diameter,
+                matched_prefix,
+                first_failure,
+            }
+        }
+        Err(e) => TlcResult {
+            module: module_str,
+            cfg: cfg_str,
+            trace_csv: trace_csv_str,
+            trace_ndjson: trace_ndjson_str,
+            trace_tla: trace_tla_str,
+            argv,
+            status: TlcStatus::Error,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("Failed to execute TLC runner: {e}"),
+            runtime_ms: Some(runtime_ms),
+            total_runtime_ms: Some(start_total.elapsed().as_millis()),
+            diameter: None,
+            matched_prefix: None,
+            first_failure: None,
+        },
+    }
+}
+
+fn find_java_binary() -> Option<PathBuf> {
+    if let Ok(home) = env::var("JAVA_HOME") {
+        let candidate = PathBuf::from(home).join("bin").join("java");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    for candidate in [
+        "/opt/homebrew/opt/openjdk/bin/java",
+        "/usr/local/opt/openjdk/bin/java",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    find_in_path("java")
+}
+
+fn find_in_path(exe: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(exe);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn parse_tlc_diameter(text: &str) -> Option<u64> {
+    let mut last = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((_, rest)) = line.split_once("Diameter:") {
+            let n = rest.trim().split_whitespace().next()?;
+            if let Ok(v) = n.parse::<u64>() {
+                last = Some(v);
+            }
+            continue;
+        }
+
+        let Some(rest) = line.strip_prefix("The depth of the complete state graph search is")
+        else {
+            continue;
+        };
+
+        let n = rest.trim().split_whitespace().next()?.trim_end_matches('.');
+        if let Ok(v) = n.parse::<u64>() {
+            last = Some(v);
+        }
+    }
+    last
+}
+
+fn count_nonempty_lines(path: &Path) -> Result<u64, String> {
+    let f =
+        File::open(path).map_err(|e| format!("Failed to open trace {}: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(f);
+    let mut count = 0u64;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read trace {}: {e}", path.display()))?;
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn read_trace_fields_at_index(
+    path: &Path,
+    index_1_based: u64,
+) -> Result<(Option<u64>, Option<u64>, Option<String>), String> {
+    let f =
+        File::open(path).map_err(|e| format!("Failed to open trace {}: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(f);
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("Failed to read trace {}: {e}", path.display()))?;
+        let i1 = (i as u64) + 1;
+        if i1 != index_1_based {
+            continue;
+        }
+
+        let v: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("Invalid NDJSON at line {i1}: {e}"))?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| format!("NDJSON line {i1} is not an object"))?;
+
+        let time_ns = obj.get("time_ns").and_then(|v| v.as_u64());
+        let event_id = obj.get("event_id").and_then(|v| v.as_u64());
+        let kind = obj
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return Ok((time_ns, event_id, kind));
+    }
+
+    Err(format!(
+        "Trace {} has no line {}",
+        path.display(),
+        index_1_based
+    ))
 }
 
 fn read_coverage_points(path: &Path) -> Option<Vec<String>> {

@@ -14,14 +14,14 @@ Yes—in principle you can verify “RFC compliance” in Lean, but there’s no
 
   What’s more common in the literature (non-Lean)
 
-  - Refinement-based verification of protocol implementations (e.g., IronFleet in Dafny). (microsoft.com (https://www.microsoft.com/en-us/research/publication/ironfleet-proving-practical-distributed-systems-correct/?utm_source=openai))
-  - Coq frameworks for verified distributed systems (e.g., Verdi). (github.com (https://github.com/uwplse/verdi?utm_source=openai))
-  - Automated noncompliance finding via learned models / blackbox checking (common for real protocol stacks; e.g., QUICtester, Prognosis). (arxiv.org (https://arxiv.org/abs/2505.12690?utm_source=openai))
+  - Refinement-based verification of protocol implementations (e.g., IronFleet in Dafny). (microsoft.com (https://www.microsoft.com/en-us/research/publication/ironfleet-proving-practical-distributed-systems-correct/))
+  - Coq frameworks for verified distributed systems (e.g., Verdi). (github.com (https://github.com/uwplse/verdi))
+  - Automated noncompliance finding via learned models / blackbox checking (common for real protocol stacks; e.g., QUICtester, Prognosis). (arxiv.org (https://arxiv.org/abs/2505.12690))
 
   How to proceed with your objective (Lean + Rust simulator)
 
   1. Define “adheres to the RFC” precisely: usually either (a) trace refinement (“every observable behavior of the simulator is allowed by the spec”) or (b) a checklist of RFC “MUST/SHOULD” properties as invariants/temporal properties.
-  2. Formalize the RFC subset you implement as a transition system in Lean (endpoints + network events). For ECN, this includes the IP ECN field behavior and TCP signaling/negotiation rules as you model them. (datatracker.ietf.org (https://datatracker.ietf.org/doc/html/rfc3168?utm_source=openai))
+  2. Formalize the RFC subset you implement as a transition system in Lean (endpoints + network events). For ECN, this includes the IP ECN field behavior and TCP signaling/negotiation rules as you model them. (datatracker.ietf.org (https://datatracker.ietf.org/doc/html/rfc3168))
   3. Prove compliance properties in Lean (invariants, and possibly liveness under explicit fairness assumptions). A practical workflow is “model check to find inductive invariants, then prove them in Lean,” as in the 2PC Lean work. (protocols-made-fun.com (https://protocols-made-fun.com/lean/2025/05/10/lean-two-phase-proofs.html))
   4. Connect Lean ↔ Rust via one of these realistic bridges:
       - Twin model + differential testing: keep a Lean executable spec and a Rust implementation; compare traces on randomized/bounded scenarios (good bug-finder; not a full proof).

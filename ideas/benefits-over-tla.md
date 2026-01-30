@@ -10,7 +10,7 @@ Here are the main benefits you should reasonably expect to see, and why they fol
 
 **LeanGuard expectation**
 
-* Runtime is essentially **O(number of trace rows)**, with low constant factors, because each row is replayed once in a deterministic order and checked locally (including snapshot equality).
+* Runtime is **O(n log n)** due to canonicalization (sorting by `(time_ns, event_id)`), plus **O(n)** deterministic replay with low constant factors (including snapshot equality).
 * This is exactly the “trace-certificate” design: the trace is intended to carry enough information (witnesses + post-state snapshots) so the checker doesn’t need to guess anything.
 
 **TLA+/TLC baseline expectation**
@@ -105,6 +105,7 @@ Here are the main benefits you should reasonably expect to see, and why they fol
 * TLA+ *can* model integer encodings well, but:
 
   * implementing fixed-point arithmetic and matching the logging conventions can be more awkward,
+  * practical TLC runs may require rescaling to fit TLC’s integer limits (and can therefore force small equality tolerances),
   * and TLC’s performance can suffer with heavy arithmetic on large integers/records if you’re not careful.
 
 **What you should see**
@@ -199,4 +200,3 @@ If you implement a fair TLC baseline (same traces, same canonicalization, same p
 * **much easier integration with semantic coverage and coverage-guided test generation**.
 
 Those are exactly the dimensions your codebase (Days + `leanguard-run` + `leanguard-testgen`) is already structured to exploit.
-
