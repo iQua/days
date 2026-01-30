@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     tlc_check: bool,
 
+    /// If set, require TLC baseline acceptance in addition to LeanGuard checkers.
+    #[arg(long, default_value_t = false)]
+    require_tlc_accept: bool,
+
     /// Directory containing baseline `.tla` modules and `.cfg` model configs.
     #[arg(long, default_value = "tla")]
     tlc_spec_dir: PathBuf,
@@ -356,6 +360,9 @@ fn main() {
             .checker_results
             .iter()
             .all(|r| matches!(r.status, CheckerStatus::Accept));
+        if summary.accept && cli.tlc_check && cli.require_tlc_accept {
+            summary.accept = summary.tlc_accept.unwrap_or(false);
+        }
     }
 
     let exit_code = if summary.accept { 0 } else { 1 };
@@ -642,7 +649,10 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
         };
     }
 
-    let meta_root = log_path.join("tlc");
+    let meta_root = match env::var_os("TLC_METADIR") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => log_path.join("tlc"),
+    };
     let _ = fs::create_dir_all(&meta_root);
     let meta_dir = meta_root.join(
         inv.module
@@ -729,7 +739,11 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
     let mut cmd = if let Some(bin) = &cli.tlc_bin {
         Command::new(bin)
     } else {
-        let Some(jar) = &cli.tlc_jar else {
+        let jar = cli
+            .tlc_jar
+            .clone()
+            .or_else(|| env::var_os("TLA2TOOLS_JAR").map(PathBuf::from));
+        let Some(jar) = jar.as_ref() else {
             return TlcResult {
                 module: module_str,
                 cfg: cfg_str,
@@ -740,7 +754,7 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
                 status: TlcStatus::MissingRunner,
                 exit_code: None,
                 stdout: String::new(),
-                stderr: "Missing TLC runner: pass --tlc-bin (wrapper) or --tlc-jar (tla2tools.jar)"
+                stderr: "Missing TLC runner: pass --tlc-bin (wrapper) or --tlc-jar /path/to/tla2tools.jar (or set TLA2TOOLS_JAR)"
                     .to_string(),
                 runtime_ms: None,
                 total_runtime_ms: Some(start_total.elapsed().as_millis()),

@@ -21,6 +21,12 @@ pub struct TestGenOptions {
     pub checker_dir: PathBuf,
     pub leanguard_run: Option<PathBuf>,
     pub allow_nondeterministic: bool,
+    pub tlc_check: bool,
+    pub require_tlc_accept: bool,
+    pub tlc_spec_dir: PathBuf,
+    pub tlc_bin: Option<PathBuf>,
+    pub tlc_jar: Option<PathBuf>,
+    pub tlc_no_dfs: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +455,12 @@ pub fn fuzz(
             &opts.checker_dir,
             &config_path,
             opts.allow_nondeterministic,
+            opts.tlc_check,
+            opts.require_tlc_accept,
+            &opts.tlc_spec_dir,
+            opts.tlc_bin.as_deref(),
+            opts.tlc_jar.as_deref(),
+            opts.tlc_no_dfs,
         );
 
         let (accept, run_summary, parsed) = match run {
@@ -720,6 +732,12 @@ fn campaign_with_options(
                 &opts.checker_dir,
                 &config_path,
                 opts.allow_nondeterministic,
+                opts.tlc_check,
+                opts.require_tlc_accept,
+                &opts.tlc_spec_dir,
+                opts.tlc_bin.as_deref(),
+                opts.tlc_jar.as_deref(),
+                opts.tlc_no_dfs,
             );
 
             let (run_accept, run_json, run_parsed) = match run {
@@ -936,6 +954,12 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         &opts.checker_dir,
         &config_path,
         opts.allow_nondeterministic,
+        opts.tlc_check,
+        opts.require_tlc_accept,
+        &opts.tlc_spec_dir,
+        opts.tlc_bin.as_deref(),
+        opts.tlc_jar.as_deref(),
+        opts.tlc_no_dfs,
     )?;
     let (json, parsed) = parse_run_output(&output)?;
     let accept = parsed.accept;
@@ -1011,6 +1035,12 @@ pub fn minimize(
             &opts.checker_dir,
             &config_path,
             opts.allow_nondeterministic,
+            opts.tlc_check,
+            opts.require_tlc_accept,
+            &opts.tlc_spec_dir,
+            opts.tlc_bin.as_deref(),
+            opts.tlc_jar.as_deref(),
+            opts.tlc_no_dfs,
         )?;
         let (_, parsed) = parse_run_output(&output)?;
         parsed.accept
@@ -1050,6 +1080,12 @@ pub fn minimize(
                 &opts.checker_dir,
                 &candidate_path,
                 opts.allow_nondeterministic,
+                opts.tlc_check,
+                opts.require_tlc_accept,
+                &opts.tlc_spec_dir,
+                opts.tlc_bin.as_deref(),
+                opts.tlc_jar.as_deref(),
+                opts.tlc_no_dfs,
             );
             let output = output?;
             let (_, parsed) = parse_run_output(&output)?;
@@ -2574,6 +2610,12 @@ fn run_leanguard(
     checker_dir: &Path,
     config_path: &Path,
     allow_nondeterministic: bool,
+    tlc_check: bool,
+    require_tlc_accept: bool,
+    tlc_spec_dir: &Path,
+    tlc_bin: Option<&Path>,
+    tlc_jar: Option<&Path>,
+    tlc_no_dfs: bool,
 ) -> Result<RunOutput, String> {
     let mut cmd = Command::new(leanguard_run);
     cmd.arg("--config")
@@ -2582,6 +2624,22 @@ fn run_leanguard(
         .arg(checker_dir);
     if allow_nondeterministic {
         cmd.arg("--allow-nondeterministic");
+    }
+    if tlc_check {
+        cmd.arg("--tlc-check");
+        if require_tlc_accept {
+            cmd.arg("--require-tlc-accept");
+        }
+        cmd.arg("--tlc-spec-dir").arg(tlc_spec_dir);
+        if let Some(bin) = tlc_bin {
+            cmd.arg("--tlc-bin").arg(bin);
+        }
+        if let Some(jar) = tlc_jar {
+            cmd.arg("--tlc-jar").arg(jar);
+        }
+        if tlc_no_dfs {
+            cmd.arg("--tlc-no-dfs");
+        }
     }
     let output = cmd
         .output()
