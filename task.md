@@ -120,6 +120,7 @@ Notes:
 - All runs below had `tlc_status = accept`.
 - Raw per-run data (do not commit): `logs/bench_leanguard_vs_tlc_2026-01-30.json`
 - To rerun: `python3 utils/bench_leanguard_vs_tlc.py --reps 5`
+- To export to Markdown + CSV: `python3 utils/export_experiment_results.py --out-md ideas/results.md --out-dir logs`
 
 | Protocol | Config | Events | checker_ms (mean±stdev) | tlc_total_ms (mean±stdev) | tlc_cmd_ms (mean±stdev) | tlc_total / checker |
 |---|---|---:|---:|---:|---:|---:|

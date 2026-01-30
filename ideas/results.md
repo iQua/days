@@ -1,5 +1,51 @@
 # Experiment results
 
+## Reproducing
+
+Prereqs:
+
+- Build LeanGuard checkers: `cd lean && lake build` (expects binaries under `lean/.lake/build/bin/`).
+- Have TLC jar available (e.g. `/path/to/tla2tools.jar`) or set `TLA2TOOLS_JAR`.
+
+1) Generate (or regenerate) the trace logs used by the experiments.
+
+These configs write under their own `log_path` (see each TOML). **Important:** the CSV logger appends, so use a fresh `log_path` (or delete the old directory) if you want clean runs.
+
+```bash
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/dcqcn_multi.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/dcqcn_1s.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/dcqcn_2s.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/dcqcn_10s.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/pfc.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/wfq_simple.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/drr_simple.toml
+cargo run --features lean,dcqcn,l2_pfc --bin days -- configs/cubic_simple.toml
+```
+
+2) Benchmark LeanGuard vs TLC:
+
+```bash
+python3 utils/bench_leanguard_vs_tlc.py \
+  --reps 5 \
+  --checker-dir lean/.lake/build/bin \
+  --tlc-jar /path/to/tla2tools.jar
+```
+
+3) Fault-injection agreement suite:
+
+```bash
+python3 utils/fault_injection_agreement.py \
+  --checker-dir lean/.lake/build/bin \
+  --tlc-jar /path/to/tla2tools.jar
+```
+
+4) Export the latest JSON runs to Markdown + CSV:
+
+```bash
+python3 utils/export_experiment_results.py --out-md ideas/results.md --out-dir logs
+```
+
 ## Benchmarks (LeanGuard vs TLC)
 
 - Timestamp: `2026-01-30T16:21:24`
