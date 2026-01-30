@@ -274,4 +274,6 @@ Next == Enqueue \/ Schedule \/ Depart
 
 TraceSpec == Init /\ [][Next]_Vars
 
+ProgressOk == IF l <= LenTrace THEN ENABLED Next ELSE TRUE
+
 =============================================================================

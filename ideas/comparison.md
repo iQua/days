@@ -442,10 +442,10 @@ Given your existing CSV-based ecosystem (LeanGuard, plotting, etc.), I’d do **
 You need a TLA+ module per trace family:
 
 * `DcqcnTrace.tla` (DCQCN baseline; in this repo it includes both the trace harness and the per-step reference semantics)
-* `PFC.tla`
-* `WFQ.tla`
-* `DRR.tla`
-* `AQM.tla`
+* `PfcTrace.tla`
+* `WfqTrace.tla`
+* `DrrTrace.tla`
+* `AqmTrace.tla`
 * (optional) a cross-layer `AQM_DCQCN.tla`
 
 These specs are the baseline’s “reference semantics,” analogous to your Lean semantics.
@@ -479,7 +479,10 @@ For each protocol, create a trace-validation module that:
 3. Defines `Next` to enforce that the `i`‑th trace entry corresponds to a valid step of the spec.
 
 In this repo, we currently keep this as **one module per protocol** (e.g., `tla/DcqcnTrace.tla`) plus a `.cfg` file
-that sets `SPECIFICATION TraceSpec` and disables deadlock checking (`CHECK_DEADLOCK FALSE`). Acceptance is determined by whether TLC finds a path that advances `i` through the full trace (practically: via TLC’s reported depth/diameter for the explored state graph).
+that sets `SPECIFICATION TraceSpec`, checks an explicit progress invariant (`INVARIANT ProgressOk`), and disables deadlock checking (`CHECK_DEADLOCK FALSE`).
+
+* **Acceptance:** TLC exits cleanly with no invariant violations (the trace can be replayed through the full length).
+* **Rejection:** if the trace cannot advance at some step, TLC violates `ProgressOk` (meaning “before end-of-trace, `Next` must be enabled”) and returns a counterexample. For diagnostics, we still parse TLC’s reported depth/diameter to compute the longest matched prefix and map that back to a failing CSV row.
 
 ### Skeleton (DCQCN example)
 

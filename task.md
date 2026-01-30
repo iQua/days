@@ -38,7 +38,8 @@ Build a **TLA+/TLC trace-validation baseline** that consumes the **same Days tra
 - Integrated TLC baseline runs into `src/bin/leanguard-run.rs`:
   - Flags: `--tlc-check`, `--tlc-spec-dir`, `--tlc-bin`, `--tlc-jar`, `--tlc-no-dfs`.
   - Output: optional `tlc_results` and `tlc_accept` fields in the JSON summary.
-  - Diagnostics: parses TLC output (`Diameter:` or “depth of the complete state graph search”) to estimate the longest matched prefix and reports the next failing NDJSON row (by `(time_ns,event_id,kind)` when present).
+  - Diagnostics: parses TLC output (`Diameter:` / “depth of the complete state graph search”) to estimate the longest matched prefix, and reports the next failing NDJSON row (by `(time_ns,event_id,kind)` when present).
+  - Made TLC “reject” less heuristic: each baseline `.cfg` checks `INVARIANT ProgressOk` (“before end-of-trace, `Next` must be enabled”), so trace mismatch produces an explicit TLC counterexample/invariant violation (classified as `reject`).
   - End-to-end verified: `configs/dcqcn_simple.toml` + TLC 2.19 (`/tmp/leanguard_refs/tla2tools_v1.7.4.jar`) produces `tlc_results[0].status = accept` and `matched_prefix == trace_len` on the shipped trace.
 
 ### In progress
@@ -96,6 +97,7 @@ Build a **TLA+/TLC trace-validation baseline** that consumes the **same Days tra
   - a line counter `l`,
   - and `Next` that reads `e == Trace[l]`, checks constraints, applies a step rule, and increments `l`.
 - Deadlock checking is not helpful for trace validation; the baseline uses `CHECK_DEADLOCK FALSE`.
+- For principled failure signaling, the baseline also checks `INVARIANT ProgressOk` (a state predicate using `ENABLED Next`) so “cannot advance the trace” becomes a standard TLC safety violation with a counterexample.
 - Practical performance tip: run DFS for trace validation via:
   - `JVM_OPTIONS=-Dtlc2.tool.queue.IStateQueue=StateDeque`
   - (per the TLA+ trace-validation guide; `StateDeque` was added in Jan 2024).
@@ -107,34 +109,35 @@ Because `TraceData.tla` is rescaled (to fit TLC’s integer limits), the DCQCN s
 
 ## Benchmark results (LeanGuard vs. TLC baseline)
 
-Timestamp: 2026-01-29 (local)
+Timestamp: 2026-01-30 (local)
 
 Notes:
 
 - `checker_ms_mean±stdev` is the runtime of the LeanGuard checker process for the protocol (e.g., `dcqcn_check`, `wfq_check`).
 - `tlc_total_ms_mean±stdev` is end-to-end TLC baseline time per run (export `TraceData.tla` + stage workspace + run TLC).
 - `tlc_cmd_ms_mean±stdev` is just the TLC process runtime (excludes export/staging overhead).
+- TLC runs include `INVARIANT ProgressOk` (uses `ENABLED Next`) to get principled REJECT counterexamples; this can noticeably increase TLC runtime for some specs (notably DRR).
 - All runs below had `tlc_status = accept`.
-- Raw per-run data (do not commit): `logs/bench_leanguard_vs_tlc_2026-01-29.json`
+- Raw per-run data (do not commit): `logs/bench_leanguard_vs_tlc_2026-01-30.json`
 - To rerun: `python3 utils/bench_leanguard_vs_tlc.py --reps 5`
 
 | Protocol | Config | Events | checker_ms (mean±stdev) | tlc_total_ms (mean±stdev) | tlc_cmd_ms (mean±stdev) | tlc_total / checker |
 |---|---|---:|---:|---:|---:|---:|
-| `aqm` | `configs/cubic_simple.toml` | 12 | 9.4 ± 2.1 | 601.2 ± 19.9 | 598.6 ± 19.6 | 67.3× |
-| `aqm` | `configs/dcqcn_simple.toml` | 242 | 13.0 ± 12.6 | 684.8 ± 65.5 | 670.0 ± 63.7 | 82.5× |
-| `aqm` | `configs/dcqcn_multi.toml` | 1,151 | 13.6 ± 3.8 | 830.6 ± 7.2 | 775.4 ± 7.2 | 65.7× |
-| `aqm` | `configs/dcqcn_1s.toml` | 242 | 7.6 ± 1.8 | 664.0 ± 14.5 | 651.0 ± 14.6 | 91.9× |
-| `aqm` | `configs/dcqcn_2s.toml` | 242 | 6.2 ± 1.1 | 663.2 ± 4.6 | 650.0 ± 4.6 | 109.4× |
-| `aqm` | `configs/dcqcn_10s.toml` | 242 | 20.6 ± 8.7 | 668.4 ± 11.2 | 654.4 ± 10.8 | 48.2× |
-| `aqm` | `configs/wfq_simple.toml` | 400 | 12.4 ± 0.9 | 718.6 ± 15.2 | 692.8 ± 14.5 | 58.2× |
-| `aqm` | `configs/drr_simple.toml` | 400 | 10.4 ± 3.2 | 684.4 ± 8.4 | 657.8 ± 9.3 | 74.2× |
-| `aqm` | `configs/pfc.toml` | 4,002 | 31.8 ± 6.6 | 1,304.4 ± 22.2 | 1,095.6 ± 15.3 | 42.5× |
-| `dcqcn` | `configs/dcqcn_simple.toml` | 2,084 | 23.0 ± 10.8 | 1,181.6 ± 34.1 | 1,044.2 ± 35.4 | 59.0× |
-| `dcqcn` | `configs/dcqcn_multi.toml` | 4,298 | 33.6 ± 3.0 | 1,759.0 ± 44.7 | 1,517.0 ± 48.3 | 52.8× |
-| `dcqcn` | `configs/dcqcn_1s.toml` | 10,084 | 66.4 ± 5.1 | 2,625.6 ± 58.4 | 2,115.6 ± 59.2 | 39.7× |
-| `dcqcn` | `configs/dcqcn_2s.toml` | 20,084 | 120.6 ± 3.8 | 4,590.2 ± 75.5 | 3,593.2 ± 72.9 | 38.1× |
-| `dcqcn` | `configs/dcqcn_10s.toml` | 100,084 | 599.6 ± 15.3 | 32,450.8 ± 969.1 | 27,061.2 ± 1,161.9 | 54.2× |
-| `pfc` | `configs/pfc.toml` | 104 | 13.4 ± 5.9 | 640.0 ± 12.5 | 628.2 ± 12.2 | 53.2× |
-| `wfq` | `configs/wfq_simple.toml` | 1,200 | 18.8 ± 9.1 | 1,238.0 ± 23.7 | 1,164.6 ± 24.9 | 74.4× |
-| `drr` | `configs/drr_simple.toml` | 800 | 15.0 ± 9.8 | 963.8 ± 33.5 | 896.4 ± 40.3 | 82.5× |
-| `cubic` | `configs/cubic_simple.toml` | 6 | 10.6 ± 12.2 | 652.8 ± 16.5 | 645.4 ± 15.6 | 115.7× |
+| `aqm` | `configs/cubic_simple.toml` | 12 | 9.0 ± 0.7 | 610.0 ± 18.9 | 606.2 ± 19.1 | 68.2× |
+| `aqm` | `configs/dcqcn_simple.toml` | 242 | 14.6 ± 12.6 | 708.4 ± 80.3 | 692.4 ± 74.8 | 67.2× |
+| `aqm` | `configs/dcqcn_multi.toml` | 1,151 | 10.4 ± 2.3 | 940.2 ± 155.1 | 882.6 ± 155.7 | 94.5× |
+| `aqm` | `configs/dcqcn_1s.toml` | 242 | 8.0 ± 1.0 | 675.0 ± 23.0 | 661.8 ± 23.4 | 85.6× |
+| `aqm` | `configs/dcqcn_2s.toml` | 242 | 6.4 ± 1.1 | 682.8 ± 29.3 | 669.8 ± 29.3 | 109.3× |
+| `aqm` | `configs/dcqcn_10s.toml` | 242 | 23.4 ± 9.2 | 687.8 ± 10.2 | 674.4 ± 10.4 | 39.6× |
+| `aqm` | `configs/wfq_simple.toml` | 400 | 12.0 ± 1.7 | 721.4 ± 13.2 | 696.6 ± 12.6 | 61.5× |
+| `aqm` | `configs/drr_simple.toml` | 400 | 10.0 ± 1.6 | 701.8 ± 13.6 | 677.4 ± 13.4 | 71.7× |
+| `aqm` | `configs/pfc.toml` | 4,002 | 32.8 ± 5.7 | 1,288.4 ± 20.1 | 1,108.4 ± 17.4 | 40.2× |
+| `dcqcn` | `configs/dcqcn_simple.toml` | 2,084 | 27.4 ± 9.0 | 1,269.6 ± 43.7 | 1,140.0 ± 40.4 | 49.4× |
+| `dcqcn` | `configs/dcqcn_multi.toml` | 4,298 | 34.4 ± 3.0 | 1,857.6 ± 50.2 | 1,617.6 ± 51.6 | 54.2× |
+| `dcqcn` | `configs/dcqcn_1s.toml` | 10,084 | 69.4 ± 9.0 | 2,838.6 ± 21.9 | 2,322.0 ± 24.3 | 41.4× |
+| `dcqcn` | `configs/dcqcn_2s.toml` | 20,084 | 123.0 ± 4.8 | 4,951.6 ± 197.3 | 3,957.8 ± 198.9 | 40.3× |
+| `dcqcn` | `configs/dcqcn_10s.toml` | 100,084 | 610.6 ± 17.0 | 30,278.8 ± 3,723.6 | 25,383.4 ± 3,667.9 | 49.6× |
+| `pfc` | `configs/pfc.toml` | 104 | 23.4 ± 27.8 | 646.4 ± 15.6 | 635.2 ± 14.3 | 49.4× |
+| `wfq` | `configs/wfq_simple.toml` | 1,200 | 26.8 ± 27.5 | 1,634.0 ± 34.9 | 1,570.6 ± 37.5 | 95.0× |
+| `drr` | `configs/drr_simple.toml` | 800 | 15.6 ± 9.7 | 4,532.4 ± 85.2 | 4,470.0 ± 83.4 | 351.6× |
+| `cubic` | `configs/cubic_simple.toml` | 6 | 21.4 ± 27.7 | 710.2 ± 16.5 | 703.6 ± 15.9 | 65.7× |

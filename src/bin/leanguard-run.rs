@@ -785,7 +785,9 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
             let combined = format!("{stdout}\n{stderr}");
             let diameter = parse_tlc_diameter(&combined);
             let trace_len = count_nonempty_lines(&trace_ndjson).ok();
-            let matched_prefix = diameter.map(|d| d.saturating_sub(1));
+            let matched_prefix = diameter
+                .map(|d| d.saturating_sub(1))
+                .or_else(|| parse_tlc_last_l(&combined).map(|l| l.saturating_sub(1)));
 
             let status = match exit_code {
                 Some(0) => match (trace_len, matched_prefix) {
@@ -793,7 +795,14 @@ fn run_tlc(cli: &Cli, log_path: &Path, inv: TlcInvocation) -> TlcResult {
                     (Some(_), Some(_)) => TlcStatus::Reject,
                     _ => TlcStatus::Error,
                 },
-                _ => TlcStatus::Error,
+                Some(_) => {
+                    if tlc_output_indicates_reject(&combined) {
+                        TlcStatus::Reject
+                    } else {
+                        TlcStatus::Error
+                    }
+                }
+                None => TlcStatus::Error,
             };
 
             let first_failure = match (status.clone(), trace_len, matched_prefix) {
@@ -891,24 +900,61 @@ fn parse_tlc_diameter(text: &str) -> Option<u64> {
     for line in text.lines() {
         let line = line.trim();
         if let Some((_, rest)) = line.split_once("Diameter:") {
-            let n = rest.trim().split_whitespace().next()?;
-            if let Ok(v) = n.parse::<u64>() {
+            if let Some(v) = parse_first_u64(rest) {
                 last = Some(v);
             }
             continue;
         }
 
-        let Some(rest) = line.strip_prefix("The depth of the complete state graph search is")
-        else {
-            continue;
+        let needle = "The depth of the complete state graph search is";
+        let rest = match line.split_once(needle) {
+            Some((_, rest)) => rest,
+            None => continue,
         };
 
-        let n = rest.trim().split_whitespace().next()?.trim_end_matches('.');
-        if let Ok(v) = n.parse::<u64>() {
+        if let Some(v) = parse_first_u64(rest) {
             last = Some(v);
         }
     }
     last
+}
+
+fn parse_first_u64(text: &str) -> Option<u64> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    let digits = text[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<u64>().ok()
+}
+
+fn parse_tlc_last_l(text: &str) -> Option<u64> {
+    let mut last = None;
+    for line in text.lines() {
+        let mut line = line.trim();
+        if let Some(rest) = line.strip_prefix("/\\") {
+            line = rest.trim();
+        }
+        if let Some(rest) = line.strip_prefix("l =") {
+            let n = rest.trim().split_whitespace().next()?;
+            if let Ok(v) = n.parse::<u64>() {
+                last = Some(v);
+            }
+        }
+    }
+    last
+}
+
+fn tlc_output_indicates_reject(text: &str) -> bool {
+    // TLC uses non-zero exit codes for most errors. For our baseline, treat
+    // "spec says trace can't proceed" errors as REJECT (not ERROR).
+    if text.contains("Invariant") && text.contains("is violated") {
+        return true;
+    }
+    if text.contains("The model has no initial states") {
+        return true;
+    }
+    false
 }
 
 fn count_nonempty_lines(path: &Path) -> Result<u64, String> {

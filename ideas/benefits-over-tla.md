@@ -26,6 +26,8 @@ Here are the main benefits you should reasonably expect to see, and why they fol
 
 * LeanGuard is likely to have **lower time/event** and **lower memory** for the same trace length when both are given the same information, especially on longer traces or many tests in CI.
 
+*Concretely in this repo today (Jan 30, 2026, `task.md`):* with the replay-like TLC baseline (generated `TraceData.tla` + `INVARIANT ProgressOk`), TLC end-to-end time is roughly **40×–110×** the Lean checker time on most configs/protocols (e.g., DCQCN is ~**40×–50×** from 10k–100k events), with some specs exhibiting larger overhead (notably DRR in our current model).
+
 ## 2) Better failure localization: first bad row vs model-checker counterexample
 
 **LeanGuard expectation**
