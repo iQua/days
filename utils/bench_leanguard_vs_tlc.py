@@ -8,7 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-import tomllib
+try:
+    import tomllib  # py311+
+except ModuleNotFoundError:
+    import tomli as tomllib  # py310
+
 
 
 @dataclass(frozen=True)

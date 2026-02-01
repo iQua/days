@@ -1,6 +1,9 @@
 [project]
 name = "days"
 version = "0.3.4"
+dependencies = [
+    "tomli>=2.4.0",
+]
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

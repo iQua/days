@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
@@ -1104,11 +1104,33 @@ fn read_trace_fields_at_index(
 
 fn read_coverage_points(path: &Path) -> Option<Vec<String>> {
     let content = fs::read_to_string(path).ok()?;
+
+    // Preferred: LeanGuard checkers write a JSON object (CoverageReport) with a `cover` field.
+    // See: days/lean/LeanGuard/Shared/Coverage.lean
+    #[derive(Debug, Deserialize)]
+    struct CoverageReportJson {
+        cover: Vec<String>,
+    }
+
+    if let Ok(mut report) = serde_json::from_str::<CoverageReportJson>(&content) {
+        report.cover.sort();
+        report.cover.dedup();
+        return Some(report.cover);
+    }
+
+    // Backward-compatible: allow a bare JSON array of strings.
     if let Ok(mut points) = serde_json::from_str::<Vec<String>>(&content) {
         points.sort();
         points.dedup();
         return Some(points);
     }
+
+    // Fallback: newline-separated points, but avoid treating JSON blobs as a single “point”.
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return None;
+    }
+
     let mut points = content
         .lines()
         .map(|line| line.trim())

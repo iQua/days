@@ -20,6 +20,9 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_nondeterministic: bool,
 
+    /// Disable passing `--coverage` to `leanguard-run` (semantic coverpoints).
+    #[arg(long, default_value_t = false)]
+    no_coverage: bool,
     /// Also run a TLC-based trace-validation baseline via leanguard-run.
     #[arg(long, default_value_t = false)]
     tlc_check: bool,
@@ -96,6 +99,7 @@ fn main() {
         checker_dir: cli.checker_dir,
         leanguard_run: cli.leanguard_run,
         allow_nondeterministic: cli.allow_nondeterministic,
+        coverage: !cli.no_coverage,
         tlc_check: cli.tlc_check,
         require_tlc_accept: cli.require_tlc_accept,
         tlc_spec_dir: cli.tlc_spec_dir,

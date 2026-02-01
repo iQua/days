@@ -21,6 +21,7 @@ fn test_seed_index_creates_corpus() {
         checker_dir: PathBuf::from("lean/.lake/build/bin"),
         leanguard_run: None,
         allow_nondeterministic: false,
+        coverage: true,
         tlc_check: false,
         require_tlc_accept: false,
         tlc_spec_dir: PathBuf::from("tla"),

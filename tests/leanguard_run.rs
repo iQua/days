@@ -71,6 +71,115 @@ fn leanguard_run_check_only_uses_manifest_and_runs_checkers() {
 }
 
 #[test]
+fn leanguard_run_parses_lean_coverage_report_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("logs");
+    fs::create_dir_all(&log_path).expect("create log dir");
+
+    let checker_dir = tmp.path().join("checkers");
+    fs::create_dir_all(&checker_dir).expect("create checker dir");
+
+    // Minimal config surface for leanguard-run: log_path + threading.
+    let config_path = tmp.path().join("case.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "log_path = \"{}\"\nthreading = \"single\"\n",
+            log_path.display()
+        ),
+    )
+    .expect("write config");
+
+    // Create manifest + dummy trace file (non-empty).
+    fs::write(
+        log_path.join("traces.json"),
+        r#"{"version":1,"traces":["dcqcn_events.csv"]}"#,
+    )
+    .expect("write manifest");
+    fs::write(log_path.join("dcqcn_events.csv"), "x").expect("write dcqcn_events.csv");
+
+    // Create a stub checker that writes Lean-style CoverageReport JSON to --coverage-out.
+    let checker_path = checker_dir.join("dcqcn_check");
+    let mut f = fs::File::create(&checker_path).expect("create stub checker");
+    writeln!(f, "#!/bin/sh").unwrap();
+    writeln!(f, "out=\"\"").unwrap();
+    writeln!(f, "while [ \"$#\" -gt 0 ]; do").unwrap();
+    writeln!(f, "  if [ \"$1\" = \"--coverage-out\" ]; then").unwrap();
+    writeln!(f, "    shift").unwrap();
+    writeln!(f, "    out=\"$1\"").unwrap();
+    writeln!(f, "  fi").unwrap();
+    writeln!(f, "  shift").unwrap();
+    writeln!(f, "done").unwrap();
+    writeln!(f, "if [ -n \"$out\" ]; then").unwrap();
+    writeln!(
+        f,
+        "{}",
+        r#"  echo '{"checker":"dcqcn_check","accept":true,"cover":["cp_b","cp_a"],"stats":{"rows":1,"processed_rows":1}}' > "$out""#,
+    )
+    .unwrap();
+    writeln!(f, "fi").unwrap();
+    writeln!(f, "echo ACCEPT").unwrap();
+    writeln!(f, "exit 0").unwrap();
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&checker_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&checker_path, perms).unwrap();
+    }
+
+    let mut cmd = cargo_bin_cmd!("leanguard-run");
+    cmd.args([
+        "--config",
+        config_path.to_str().unwrap(),
+        "--mode",
+        "check-only",
+        "--checker-dir",
+        checker_dir.to_str().unwrap(),
+        "--coverage",
+    ]);
+
+    let output = cmd.output().expect("run leanguard-run");
+    assert!(output.status.success(), "leanguard-run exit code");
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse leanguard-run JSON");
+    assert_eq!(v["accept"].as_bool(), Some(true));
+
+    let cov = v.get("coverage").expect("missing coverage");
+    let union = cov
+        .get("union")
+        .and_then(|v| v.as_array())
+        .expect("coverage union array");
+    let union_strs: Vec<&str> = union.iter().filter_map(|v| v.as_str()).collect();
+    assert!(union_strs.contains(&"cp_a"));
+    assert!(union_strs.contains(&"cp_b"));
+
+    let per = cov
+        .get("per_checker")
+        .and_then(|v| v.as_object())
+        .expect("coverage per_checker object");
+    let dcqcn_cov = per
+        .get("dcqcn_check")
+        .and_then(|v| v.as_array())
+        .expect("per_checker[dcqcn_check] array");
+    let dcqcn_cov: Vec<&str> = dcqcn_cov.iter().filter_map(|v| v.as_str()).collect();
+    assert!(dcqcn_cov.contains(&"cp_a"));
+    assert!(dcqcn_cov.contains(&"cp_b"));
+
+    let checker_results = v["checker_results"].as_array().expect("checker_results");
+    assert_eq!(checker_results.len(), 1);
+    let checker_cov = checker_results[0]
+        .get("coverage")
+        .and_then(|v| v.as_array())
+        .expect("checker_results[0].coverage");
+    let checker_cov: Vec<&str> = checker_cov.iter().filter_map(|v| v.as_str()).collect();
+    assert!(checker_cov.contains(&"cp_a"));
+    assert!(checker_cov.contains(&"cp_b"));
+}
+
+#[test]
 fn leanguard_run_check_only_can_run_tlc_via_stub_runner() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let log_path = tmp.path().join("logs");

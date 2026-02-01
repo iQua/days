@@ -21,6 +21,7 @@ pub struct TestGenOptions {
     pub checker_dir: PathBuf,
     pub leanguard_run: Option<PathBuf>,
     pub allow_nondeterministic: bool,
+    pub coverage: bool,
     pub tlc_check: bool,
     pub require_tlc_accept: bool,
     pub tlc_spec_dir: PathBuf,
@@ -455,6 +456,7 @@ pub fn fuzz(
             &opts.checker_dir,
             &config_path,
             opts.allow_nondeterministic,
+            opts.coverage,
             opts.tlc_check,
             opts.require_tlc_accept,
             &opts.tlc_spec_dir,
@@ -732,6 +734,7 @@ fn campaign_with_options(
                 &opts.checker_dir,
                 &config_path,
                 opts.allow_nondeterministic,
+                opts.coverage,
                 opts.tlc_check,
                 opts.require_tlc_accept,
                 &opts.tlc_spec_dir,
@@ -954,6 +957,7 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
         &opts.checker_dir,
         &config_path,
         opts.allow_nondeterministic,
+        opts.coverage,
         opts.tlc_check,
         opts.require_tlc_accept,
         &opts.tlc_spec_dir,
@@ -1035,6 +1039,7 @@ pub fn minimize(
             &opts.checker_dir,
             &config_path,
             opts.allow_nondeterministic,
+            opts.coverage,
             opts.tlc_check,
             opts.require_tlc_accept,
             &opts.tlc_spec_dir,
@@ -1080,6 +1085,7 @@ pub fn minimize(
                 &opts.checker_dir,
                 &candidate_path,
                 opts.allow_nondeterministic,
+                opts.coverage,
                 opts.tlc_check,
                 opts.require_tlc_accept,
                 &opts.tlc_spec_dir,
@@ -2610,6 +2616,7 @@ fn run_leanguard(
     checker_dir: &Path,
     config_path: &Path,
     allow_nondeterministic: bool,
+    coverage: bool,
     tlc_check: bool,
     require_tlc_accept: bool,
     tlc_spec_dir: &Path,
@@ -2622,6 +2629,9 @@ fn run_leanguard(
         .arg(config_path)
         .arg("--checker-dir")
         .arg(checker_dir);
+    if coverage {
+        cmd.arg("--coverage");
+    }
     if allow_nondeterministic {
         cmd.arg("--allow-nondeterministic");
     }
