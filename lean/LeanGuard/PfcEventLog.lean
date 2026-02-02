@@ -187,4 +187,24 @@ def checkRows (rows : List Row) : Except String Unit := do
   | .ok _ => pure ()
   | .error (e, _) => throw e
 
+
+/-- Enumerates all semantic coverpoints this checker may record via `covHit`. -/
+def coverpointCatalog : List String :=
+  [ "occ_eq_xoff"
+  , "occ_eq_xon"
+  , "occ_gt_xoff"
+  , "occ_lt_xon"
+  , "pause_assert"
+  , "pause_refresh"
+  , "prio_0_seen"
+  , "prio_1_seen"
+  , "prio_2_seen"
+  , "prio_3_seen"
+  , "prio_4_seen"
+  , "prio_5_seen"
+  , "prio_6_seen"
+  , "prio_7_seen"
+  , "resume"
+  ]
+
 end LeanGuard.PfcEventLog

@@ -37,6 +37,10 @@ def stringLt (a b : String) : Bool :=
   | Ordering.lt => true
   | _ => false
 
+def sortStrings (xs : List String) : List String :=
+  xs.toArray.qsort stringLt |>.toList
+
+
 def covList (cov : CoverageState) : List String :=
   cov.points.toList.toArray.qsort stringLt |>.toList
 

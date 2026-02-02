@@ -71,7 +71,9 @@ private def checkAll (aqmRows : List LeanGuard.AqmEventLog.Row)
   | .error (e, _) => throw e
 
 private def usage : String :=
-  "usage: aqm_dcqcn_check [--coverage-out <path>] <path/to/aqm_events.csv> <path/to/dcqcn_events.csv>"
+  "usage:\n"
+  ++ "  aqm_dcqcn_check [--coverage-out <path>] <path/to/aqm_events.csv> <path/to/dcqcn_events.csv>\n"
+  ++ "  aqm_dcqcn_check --emit-coverpoint-catalog"
 
 def main (args : List String) : IO UInt32 := do
   match parseCoverageOut args with
@@ -79,8 +81,18 @@ def main (args : List String) : IO UInt32 := do
       IO.eprintln usage
       pure 2
   | .ok parsed =>
-      match parsed.inputs with
-      | [aqmPath, dcqcnPath] =>
+      if parsed.emitCoverpointCatalog then
+        let cat :=
+          sortStrings
+              (LeanGuard.AqmEventLog.coverpointCatalog
+                ++ LeanGuard.DcqcnEventLog.coverpointCatalog)
+            |>.eraseDups
+        for cp in cat do
+          IO.println cp
+        pure 0
+      else
+        match parsed.inputs with
+        | [aqmPath, dcqcnPath] =>
           let aqmContent ← IO.FS.readFile aqmPath
           let dcqcnContent ← IO.FS.readFile dcqcnPath
           match LeanGuard.AqmEventLog.parseCsv aqmContent,
@@ -167,6 +179,6 @@ def main (args : List String) : IO UInt32 := do
                   | .error we =>
                       IO.eprintln we
                       pure 2
-      | _ =>
-          IO.eprintln usage
-          pure 2
+        | _ =>
+            IO.eprintln usage
+            pure 2

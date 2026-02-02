@@ -419,6 +419,20 @@ def checkRows (rows : List Row) : Except String Unit := do
   | .ok _ => pure ()
   | .error (e, _) => throw e
 
+
+/-- Enumerates all semantic coverpoints this checker may record via `covHit`. -/
+def coverpointCatalog : List String :=
+  [ "alpha_above_0p1"
+  , "alpha_below_0p1"
+  , "alpha_updated_nontrivial"
+  , "cnp_apply"
+  , "cnp_ignored_due_to_interval"
+  , "rate_clamped_max"
+  , "rate_clamped_min"
+  , "timer_with_cnp_seen"
+  , "timer_without_cnp_seen"
+  ]
+
 def dummyRow (timeNs eventId srcLine : Nat) : Row :=
   { timeNs
     eventId
