@@ -1,4 +1,14 @@
 {
+  "title": "Configuration Settings",
+  "pages": [
+    "overview",
+    "topology",
+    "switches",
+    "flows",
+    "collectives",
+    "l2",
+    "logging"
+  ],
   "overview": "Overview",
   "topology": "Topology",
   "switches": "Switches & Queues",

@@ -22,7 +22,3 @@ Then open:
 ```bash
 bun run build
 ```
-
-## Notes
-
-The original Days repository previously used MkDocs (`days/docs/mkdocs.yml`). This site migrates that content into MDX and adds additional reference pages derived from the current codebase (CLI + trace formats + Nexosim internals).
