@@ -1,0 +1,51 @@
+---
+title: Formal verification (note)
+description: Curated notes on verifying protocol behavior in simulators (Lean-based trace checking).
+---
+
+> **Note**: This page is a curated rewrite of `days/ideas/formal-verification.md`. The original note contains long exploratory sketches (including Lean pseudo-code) that are not always MDX-friendly.
+
+This note collects practical approaches to increasing confidence that a simulator’s protocol implementation matches a specification.
+
+## What “verification” can mean for a simulator
+
+There are (at least) three different goals people mix together:
+
+1. **Verify the entire simulator implementation** (runtime, scheduler, concurrency semantics, protocol logic). This is the strongest goal, and also the hardest.
+2. **Verify the protocol logic** (state machine, gates, rounding, invariants) while treating the runtime as a black box.
+3. **Verify executions** (traces) rather than code: treat simulator traces as *certificates* that can be checked against a trusted reference model.
+
+Days primarily targets (3) with **LeanGuard**:
+
+- Days emits *per-transition traces* (`*_events.csv`)
+- a Lean 4 checker canonicalizes and deterministically replays an executable spec
+- the checker returns `ACCEPT` / `REJECT` with the first counterexample
+
+See [/docs/verification/design](/docs/verification/design).
+
+## Lean-specific landscape (high level)
+
+There is no turnkey pipeline that says “Lean proves my Rust simulator implements RFC 3168”. What *is* practical today is:
+
+- write an executable Lean reference model and check concrete traces (LeanGuard approach)
+- use Lean for invariant proofs about the reference model itself
+- gradually shrink the trusted core by pushing more semantics into the reference model + checker
+
+If you truly want a machine-checked proof about *Rust code*, you typically need an additional Rust verification toolchain; Lean is excellent for specs and checkers, but does not (today) come with a standard end-to-end story for Rust program semantics.
+
+## Practical recipe (what works well for Days)
+
+1. **Choose an event vocabulary** that matches real transition points (send/recv/timer/decision).
+2. **Log deterministic snapshots** using integers and explicit units (e.g., `time_ns: u64`, `rate_bps: u64`) so the checker can compare by equality.
+3. **Define canonicalization** (e.g., `(time_ns, event_id)`) and reject duplicate keys.
+4. **Replay** the executable spec and compare post-state snapshots.
+5. Use the first counterexample row as a debugging primitive (this scales far better than manual log inspection).
+
+## Related approaches
+
+- **Refinement-based verification** (e.g., IronFleet in Dafny) and **verified distributed systems frameworks** (e.g., Verdi in Coq) are good reference points if you want full implementation-level guarantees, but the workflow is heavier than trace checking.
+
+## Original note
+
+- In-repo: `days/ideas/formal-verification.md`
+- GitHub: https://github.com/iqua/days/blob/main/ideas/formal-verification.md

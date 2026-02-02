@@ -1,0 +1,34 @@
+---
+title: Trace Manifest (traces.json)
+description: How Days records which per-transition traces were produced in a run.
+---
+
+When built with the appropriate features, Days can emit per-transition protocol traces such as:
+
+- `dcqcn_events.csv`
+- `pfc_events.csv`
+- `cubic_events.csv`
+- `wfq_events.csv`
+- ...
+
+At the end of a run, Days writes a JSON manifest file under `log_path`:
+
+- `<log_path>/traces.json`
+
+Source: `days/src/utils/trace_manifest.rs`
+
+## Schema (v1)
+
+```json
+{
+  "version": 1,
+  "traces": ["dcqcn_events.csv", "wfq_events.csv"]
+}
+```
+
+- `version`: currently always `1`
+- `traces`: list of trace filenames (relative to `log_path`) that are present and non-empty
+
+## Why it exists
+
+Tools like [/docs/reference/cli/leanguard-run](/docs/reference/cli/leanguard-run) use `traces.json` to decide which checkers to invoke, without having to guess based on the experiment configuration.

@@ -1,0 +1,75 @@
+---
+title: Protocol instantiations
+description: Trace families, replay state, and core obligations for the current LeanGuard checkers.
+---
+
+This page adapts `lean-paper/appendix-additional.tex` into docs form.
+
+All protocol instantiations share the same acceptance semantics (canonicalize-and-replay) and reuse the same obligation families (ParamFreeze, MonotoneTime, PendingMatch, Gate, Accounting, SnapshotEq). What differs is the **event vocabulary**, the **checker replay state**, and which obligations matter most.
+
+See also:
+
+- [/docs/reference/traces/schema](/docs/reference/traces/schema)
+- [/docs/research/design](/docs/research/design)
+
+## Summary table
+
+| Protocol family | Trace file / event kinds (representative) | Checker replay state (high level) | Core obligations enforced |
+|---|---|---|---|
+| AQM / ECN marking | `aqm_events.csv`: `decision` | per-queue frozen params; optional per-queue accounting | ParamFreeze, SnapshotEq (decision legality), optional Accounting |
+| PFC | `pfc_events.csv`: `pfc_sent`, `pfc_recv` (optional refresh) | per-port/per-priority pause state + pending-map | PendingMatch, Gate (refresh/cooldown), ParamFreeze, optional hysteresis |
+| WFQ scheduler | `wfq_events.csv`: `enqueue`, `schedule`, `depart` | queued packets + virtual time + pending scheduled packet | Accounting, PendingMatch (schedule/depart), SnapshotEq (tags/time), choice rule (min finish tag) |
+| DRR scheduler | `drr_events.csv`: `enqueue`, `schedule` | per-class FIFO queues + deficit counters + RR pointer | Accounting, SnapshotEq (deficit/pointer), choice rule (deficit eligibility), ParamFreeze |
+| CUBIC microbench | `cubic_events.csv`: CC micro-events (e.g. timeout-driven updates) | per-endpoint CC state + frozen parameters | SnapshotEq, ParamFreeze, MonotoneTime |
+
+## Notes by instantiation
+
+### AQM / ECN marking (`aqm_events.csv`)
+
+The trace logs one row per marking/drop decision at a particular queue. Rows include queue identity, packet identity, occupancy context, policy parameters, and the chosen action.
+
+Typical checks:
+
+- policy parameters are stable per queue (freeze-on-first-use)
+- the logged action is legal under the policy and the logged context
+- if the policy is probabilistic, any logged witness (random draw) is validated
+
+### PFC (`pfc_events.csv`)
+
+The trace logs PFC frames at emission and reception, and (depending on instrumentation) refresh/cooldown behavior.
+
+Typical checks:
+
+- `pfc_recv` must match a distinct earlier `pfc_sent` (no spurious receives)
+- refresh/cooldown gates are respected when modeled
+- per-port parameters stay constant across rows
+
+### WFQ scheduler (`wfq_events.csv`)
+
+Schedulers are a good fit for trace certificates because correctness hinges on small local state and choice rules.
+
+Typical checks:
+
+- `schedule` chooses a packet with minimal finish tag
+- tags and virtual time witnesses match the deterministic reference computation
+- scheduled packets depart exactly once (schedule/depart pairing)
+
+### DRR scheduler (`drr_events.csv`)
+
+DRR uses a different replay structure (deficit counters + round-robin pointer).
+
+Typical checks:
+
+- scheduled packets satisfy deficit eligibility at service time
+- deficit/pointer updates match the reference rule
+- queue contents are conserved under enqueue/schedule
+
+### CUBIC microbench (`cubic_events.csv`)
+
+The CUBIC trace family demonstrates that the design generalizes to end-host congestion-control update rules.
+
+Typical checks:
+
+- per-endpoint parameters are frozen and consistent
+- the logged post-state snapshot matches the replayed update rule
+- time is monotone per endpoint under canonical order

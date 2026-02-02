@@ -1,0 +1,49 @@
+---
+title: Installation
+description: Build Days from source and enable optional protocol features.
+---
+
+## Prerequisites
+
+- Rust toolchain (stable) with Cargo.
+- Optional: `cargo-nextest` for faster test runs.
+
+## Build
+
+```bash
+cargo build
+```
+
+## Run from source
+
+The `days` CLI expects exactly one argument: the path to a TOML configuration file.
+
+```bash
+RUST_LOG=info cargo run -- configs/simple.toml
+```
+
+## Feature flags
+
+Days uses Cargo features to keep the default build lean.
+
+- `l2`: enables the layer-2 module boundary (`src/l2/`)
+- `l2_pfc`: enables PFC components (implies `l2`)
+- `dcqcn`: enables the DCQCN flow type and related code
+- `lean`: enables additional per-transition protocol trace logging used by LeanGuard
+- `test`: enables extra assertions and test-only helpers
+
+Examples:
+
+```bash
+# Build with PFC support available (still opt-in at runtime via config)
+cargo build --features l2,l2_pfc
+
+# Run a PFC-configured experiment
+RUST_LOG=info cargo run --features l2,l2_pfc -- configs/pfc.toml
+
+# Run DCQCN (typically paired with PFC in lossless fabrics)
+RUST_LOG=info cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml
+
+# Emit dcqcn_events.csv for LeanGuard (conformance checking)
+RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc -- configs/dcqcn_simple.toml
+```

@@ -1,0 +1,9 @@
+{
+  "overview": "Overview",
+  "topology": "Topology",
+  "switches": "Switches & Queues",
+  "flows": "Flows",
+  "collectives": "Collectives",
+  "l2": "Link Layer (L2 / PFC)",
+  "logging": "Logging & Runtime"
+}

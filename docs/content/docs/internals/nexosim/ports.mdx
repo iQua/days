@@ -1,0 +1,39 @@
+---
+title: Ports & mailboxes
+description: Message passing in Nexosim (Output<T>, Mailbox<T>, EventSlot<T>).
+---
+
+Nexosim models communicate via typed message passing:
+
+- `Mailbox<T>`: the inbound queue for a model
+- `Output<T>`: a typed, connectable output port
+- `EventSlot<T>`: a sink that can be used to observe outputs in the bench harness
+
+Source: `days/crates/nexosim/src/ports.rs`
+
+## Connecting models
+
+During bench assembly, an `Output<T>` is connected to a handler method on another model:
+
+```rust
+producer.output.connect(Consumer::handle, &consumer_mailbox);
+```
+
+When the producer sends:
+
+```rust
+producer.output.send(msg).await;
+```
+
+Nexosim schedules delivery of the message into the consumer’s mailbox at the current (or delayed) simulation time.
+
+## How Days uses this
+
+Days builds a graph of models where, for example:
+
+- `PacketSwitch.outputs[next_id]` connects to either
+  - a scheduler’s `packet_received`, or
+  - a sink/source endpoint handler
+- schedulers connect their `output` to downstream switches (optionally through an L2 pipeline)
+
+The important architectural property is that **models own their state** and only communicate through these ports, which makes it feasible to run many models concurrently.

@@ -1,0 +1,49 @@
+---
+title: What ACCEPT certifies (DCQCN)
+description: Representative DCQCN-specific consequences of trace acceptance (pairing, gates, parameter stability, bounds).
+---
+
+This page adapts `lean-paper/appendix-dcqcn.tex` into docs form.
+
+It records DCQCN-specific consequences of **trace acceptance**. These are instances of the generic obligation templates described in [/docs/research/design](/docs/research/design) (pairing, gates, parameter stability, bounded state), specialized to the DCQCN event vocabulary (`cnp_sent`, `cnp_recv`, `timer_tick`).
+
+The statements below are with respect to the **canonicalized** trace order (sorted by `(time_ns, event_id)`), not raw CSV file order.
+
+## No spurious CNP receptions (pairing)
+
+Every `cnp_recv` row must correspond to a distinct earlier `cnp_sent` row with the same `(flow_id, pkt_id)` key.
+
+- A `cnp_recv` cannot appear without a prior matching `cnp_sent`.
+- No single `cnp_sent` can be consumed by more than one `cnp_recv` (injective matching).
+- Not every `cnp_sent` must be matched by the end of the trace: pending sends can remain (modeling loss or delay).
+
+Intuition: the checker maintains a pending set/map keyed by `(flow_id, pkt_id)` and enforces insert/remove discipline.
+
+## Interval-gate properties
+
+DCQCN has interval gates on both sink and source behavior:
+
+- **Sink gate:** consecutive `cnp_sent` rows for the same sink endpoint must be separated by at least `cnp_interval_ns`.
+- **Source gate:** multiplicative-decrease reaction on `cnp_recv` is applied at most once per `cnp_interval_ns`.
+  - If a `cnp_recv` arrives "too soon" (gate blocks), the trace must log the corresponding **no-op** post-state snapshot (unchanged under the source-gate semantics).
+
+Intuition: the checker stores per-endpoint "last gate time" and enforces either an update or a no-op snapshot depending on the gate outcome.
+
+## Parameter stability for endpoints
+
+For each endpoint, DCQCN parameters are constant across all rows for that endpoint, including (representative):
+
+- `g_ppb`, `mi_ppb`
+- `cnp_interval_ns`
+- rate bounds (`min_rate_bps`, `max_rate_bps`)
+
+Intuition: the checker uses a freeze-on-first-use record per endpoint; later rows must match the frozen parameter block exactly.
+
+## Bounded source state
+
+Every source snapshot row (`cnp_recv` and `timer_tick`) satisfies the bounds:
+
+- `0 <= alpha_ppb <= 1_000_000_000`
+- `min_rate_bps <= rate_bps <= max_rate_bps`
+
+Intuition: the executable update rules are designed to preserve these bounds, and the checker enforces snapshot equality with the computed post-state (so the logged snapshots inherit the invariant).

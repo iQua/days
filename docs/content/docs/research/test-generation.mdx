@@ -1,0 +1,73 @@
+---
+title: Semantic coverage & test generation
+description: Coverage-guided scenario generation using checker-derived semantic coverpoints.
+---
+
+This page adapts the paper’s test-generation section (`lean-paper/generation.tex`) into docs form.
+
+If you want the *implementation plan and knobs*, see the migrated engineering note:
+
+- [/docs/notes/test-generation](/docs/notes/test-generation)
+
+and the CLI reference:
+
+- [/docs/reference/cli/leanguard-testgen](/docs/reference/cli/leanguard-testgen)
+
+## Why test generation is needed
+
+LeanGuard makes a single execution *checkable*, but one accepted trace is not a test suite. To gain confidence across protocols and corner cases (gates, thresholds, rounding boundaries, interleavings), the goal is to build **many small adversarial executions** that can run routinely in CI.
+
+## Semantic coverage (spec-level)
+
+In this workflow, the simulator is the untrusted producer and the Lean checker is trusted. So we define coverage at the **specification level** rather than code coverage in the simulator implementation.
+
+### Coverpoints
+
+Coverpoints are semantically meaningful events during replay, for example:
+
+- **Event kinds**: observed `enqueue`, `schedule`, `depart`, `timer_tick`, …
+- **Guards / branches**: gate fired vs blocked; threshold crossed vs not; min/max clamp hit
+- **Obligations**: pairing map used; accounting update executed; time-monotonicity check executed
+- **Rounding / encoding**: boundary cases in integer encodings
+
+These coverpoints are emitted by the checker during replay (as deterministic observers of trusted semantics).
+
+## Coverage-guided loop
+
+The generator loop (conceptually):
+
+1. Start from a seed corpus (handwritten scenarios + prior regressions).
+2. Mutate or calibrate a candidate scenario (TOML + seeds + bounded duration).
+3. Run Days to emit trace certificates (`*_events.csv`).
+4. Run LeanGuard checkers to obtain:
+   - `ACCEPT`/`REJECT` (oracle),
+   - coverpoints (coverage sensor),
+   - first failing row (when rejected).
+5. Keep scenarios that expand global semantic coverage or produce useful minimized counterexamples.
+
+## Prototype results (from the paper)
+
+The paper evaluates the current prototype by running `leanguard-testgen` campaigns and recording checker-derived coverpoints (via `leanguard-run --coverage`).
+
+Semantic coverpoints reached in a 100-case budget:
+
+- **DCQCN**: 9/9 coverpoints reached; full coverage after the 14th accepted test.
+- **AQM**: 1/11–2/11 coverpoints (depending on seed scenario), reflecting that generic mutations mostly exercise the configured policy branch.
+- **PFC**: 5/15 coverpoints in the tested budget.
+
+Goal-directed calibration (DCQCN examples):
+
+- Target `cnp_ignored_due_to_interval`: goal hit rate improved from 12% to 21% when allowing up to 5 calibration iterations.
+- Target `rate_clamped_min`: hit rate improved from 94% to 100% with negligible extra calibration steps.
+
+Offline corpus reduction (set cover): in one 100-case DCQCN campaign, 97 tests were accepted, but a greedy set-cover selection found that **a single accepted test** already covered all 9/9 DCQCN coverpoints (a 97× reduction).
+
+## Corpus management
+
+A practical regression corpus should stay compact and inexpensive. The paper describes common strategies:
+
+- **Tiers**: micro-harness tests (isolated components) vs full integration scenarios
+- **Deduplication**: keep one representative per semantic signature (coverpoint bitset, canonical kind sequence, etc.)
+- **Minimization**: shrink failing scenarios while preserving the same first failure (delta debugging)
+
+The current prototype exposes these ideas via `leanguard-testgen` subcommands (`fuzz`, `campaign`, `minimize`, etc.).

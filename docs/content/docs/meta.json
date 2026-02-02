@@ -1,0 +1,16 @@
+{
+  "index": "Home",
+  "install": "Install",
+  "quickstart": "Quickstart",
+  "examples": "Examples",
+  "testing": "Testing",
+  "verification": "Verification",
+  "configuration": "Configuration",
+  "architecture": "Architecture",
+  "components": "Components",
+  "design-notes": "Design Notes",
+  "reference": "Reference",
+  "internals": "Internals",
+  "research": "Verification and Research",
+  "notes": "Notes (Curated)"
+}

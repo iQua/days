@@ -1,0 +1,8 @@
+{
+  "packet": "Packet",
+  "switch": "Switch",
+  "schedulers": "Schedulers",
+  "flows": "Flows",
+  "l2": "L2 (Frames + PFC)",
+  "logging": "Logging & Reports"
+}
