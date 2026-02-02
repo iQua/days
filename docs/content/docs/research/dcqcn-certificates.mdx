@@ -3,8 +3,6 @@ title: What ACCEPT certifies (DCQCN)
 description: Representative DCQCN-specific consequences of trace acceptance (pairing, gates, parameter stability, bounds).
 ---
 
-This page adapts `lean-paper/appendix-dcqcn.tex` into docs form.
-
 It records DCQCN-specific consequences of **trace acceptance**. These are instances of the generic obligation templates described in [/docs/research/design](/docs/research/design) (pairing, gates, parameter stability, bounded state), specialized to the DCQCN event vocabulary (`cnp_sent`, `cnp_recv`, `timer_tick`).
 
 The statements below are with respect to the **canonicalized** trace order (sorted by `(time_ns, event_id)`), not raw CSV file order.

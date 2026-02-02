@@ -3,13 +3,7 @@ title: Semantic coverage & test generation
 description: Coverage-guided scenario generation using checker-derived semantic coverpoints.
 ---
 
-This page adapts the paper’s test-generation section (`lean-paper/generation.tex`) into docs form.
-
-If you want the *implementation plan and knobs*, see the migrated engineering note:
-
-- [/docs/notes/test-generation](/docs/notes/test-generation)
-
-and the CLI reference:
+For more information about the CLI:
 
 - [/docs/reference/cli/leanguard-testgen](/docs/reference/cli/leanguard-testgen)
 
@@ -45,7 +39,7 @@ The generator loop (conceptually):
    - first failing row (when rejected).
 5. Keep scenarios that expand global semantic coverage or produce useful minimized counterexamples.
 
-## Prototype results (from the paper)
+## Prototype results
 
 The paper evaluates the current prototype by running `leanguard-testgen` campaigns and recording checker-derived coverpoints (via `leanguard-run --coverage`).
 

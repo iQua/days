@@ -1,11 +1,7 @@
 ---
 title: Paper summary
-description: High-level summary of the LeanGuard/Days research narrative (from lean-paper/).
+description: High-level summary of the LeanGuard/Days research narrative.
 ---
-
-The `lean-paper/` directory contains the LaTeX source for a research paper describing **LeanGuard** (a trace-certificate conformance-checking framework) and its implementation inside **Days**.
-
-This page is a docs-friendly summary of the main ideas.
 
 ![LeanGuard overview: the simulator emits a per-transition trace certificate and a trusted Lean checker replays it.](/figures/leanguard-intro.svg)
 
@@ -39,7 +35,6 @@ The generator mutates scenarios, keeps those that expand coverage, and minimizes
 See:
 
 - [/docs/research/test-generation](/docs/research/test-generation) (paper-derived overview + results)
-- [/docs/notes/test-generation](/docs/notes/test-generation) (engineering note)
 - [/docs/reference/cli/leanguard-testgen](/docs/reference/cli/leanguard-testgen) (CLI reference)
 
 ## Evaluation (high level)
@@ -48,5 +43,3 @@ The paper includes an experimental evaluation of:
 
 - trace checking cost (runtime/memory) on a suite of protocol traces
 - coverage-guided test generation behavior on a prototype corpus
-
-See `lean-paper/experiments.tex` for details.

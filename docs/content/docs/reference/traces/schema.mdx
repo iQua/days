@@ -5,7 +5,7 @@ description: Common conventions across *_events.csv trace families (canonicaliza
 
 Days emits **per-transition** protocol traces as CSV files named `*_events.csv` when built with the appropriate Cargo features (see [/docs/verification/leanguard](/docs/verification/leanguard)).
 
-This page records the shared schema conventions used across trace families. It is adapted from the paper appendix `lean-paper/appendix-schema.tex` and reconciled with the current Rust logging structs in `days/src/utils/logger.rs`.
+This page records the shared schema conventions used across trace families. It is reconciled with the current Rust logging structs in `days/src/utils/logger.rs`.
 
 ## Common CSV conventions
 
@@ -57,4 +57,3 @@ alpha_ppb,rate_bps,cnp_seen,last_cnp_ns
 100000,0,timer_tick,2,0,,,,,,,,,10000,500000000,500000000,10000000000,
 1000000000,10000000000,500000000,1000000000,0,10000000000,false,
 ```
-
