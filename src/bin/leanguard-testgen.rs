@@ -20,6 +20,35 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_nondeterministic: bool,
 
+    /// Disable passing `--coverage` to `leanguard-run` (semantic coverpoints).
+    #[arg(long, default_value_t = false)]
+    no_coverage: bool,
+    /// Also run a TLC-based trace-validation baseline via leanguard-run.
+    #[arg(long, default_value_t = false)]
+    tlc_check: bool,
+
+    /// If set, require TLC baseline acceptance in addition to LeanGuard checkers.
+    #[arg(long, default_value_t = false)]
+    require_tlc_accept: bool,
+
+    /// Directory containing baseline `.tla` modules and `.cfg` model configs.
+    #[arg(long, default_value = "tla")]
+    tlc_spec_dir: PathBuf,
+
+    /// Optional TLC runner executable. If provided, this binary is executed directly.
+    ///
+    /// If omitted, leanguard-run runs TLC via `java -cp <tlc_jar> tlc2.TLC ...`.
+    #[arg(long)]
+    tlc_bin: Option<PathBuf>,
+
+    /// Path to `tla2tools.jar` (required unless `--tlc-bin` is provided).
+    #[arg(long)]
+    tlc_jar: Option<PathBuf>,
+
+    /// Disable the DFS state queue optimization recommended for trace validation.
+    #[arg(long, default_value_t = false)]
+    tlc_no_dfs: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -70,6 +99,13 @@ fn main() {
         checker_dir: cli.checker_dir,
         leanguard_run: cli.leanguard_run,
         allow_nondeterministic: cli.allow_nondeterministic,
+        coverage: !cli.no_coverage,
+        tlc_check: cli.tlc_check,
+        require_tlc_accept: cli.require_tlc_accept,
+        tlc_spec_dir: cli.tlc_spec_dir,
+        tlc_bin: cli.tlc_bin,
+        tlc_jar: cli.tlc_jar,
+        tlc_no_dfs: cli.tlc_no_dfs,
     };
 
     let result = match cli.command {

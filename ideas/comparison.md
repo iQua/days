@@ -6,8 +6,8 @@ Below is a concrete “apples-to-apples” comparison plan for **LeanGuard vs a 
 
 I’m going to treat the baseline as:
 
-* **TLC-based trace validation** (the established TLA+ workflow), as described in the TLA+ trace-validation guidance and in recent research on trace validation with TLC. ([docs.tlapl.us][1])
-* And I’ll call out **TraceLink** as the “SOTA+” version of this line of work (automated mapping + causal-trace support), even if you don’t fully reimplement TraceLink for Days. ([fhackett.com][2])
+* **TLC-based trace validation** (the established TLA+ workflow), as described in the TLA+ trace-validation guidance and in recent research on trace validation with TLC. ([TLA+ trace validation guide][tla-trace-validation])
+* And I’ll call out **TraceLink** as the “SOTA+” version of this line of work (automated mapping + causal-trace support), even if you don’t fully reimplement TraceLink for Days. ([TraceLink][tracelink])
 
 ---
 
@@ -17,7 +17,7 @@ To keep the study fair, you want to control two big confounders:
 
 ### A. Equal information given to both checkers
 
-LeanGuard’s checkers typically consume a trace row that already contains **the “witness” post-state snapshot** (e.g., alpha/rate/etc. in DCQCN). A lot of TLA+ trace-validation work can operate on *partial* traces and let TLC infer missing values (which changes both logging cost and checker power). ([conf.tlapl.us][3])
+LeanGuard’s checkers typically consume a trace row that already contains **the “witness” post-state snapshot** (e.g., alpha/rate/etc. in DCQCN). A lot of TLA+ trace-validation work can operate on *partial* traces and let TLC infer missing values (which changes both logging cost and checker power). ([Merz 2024 trace-validation slides][merz-trace-validation-slides])
 
 So, define two modes, but make **Mode 1** the core “fair” one:
 
@@ -39,20 +39,15 @@ TLC trace validation also consumes a **sequence** of steps, so you should:
 
 ### Baseline (recommended): **Manual TLC trace validation**
 
-This is “classic” trace validation with TLA+/TLC: the trace is ingested, and TLC checks that each recorded step corresponds to a valid spec step (and optionally checks state equality against logged snapshots). This is exactly the “manual mapping” the TraceLink paper describes as the status quo in TLA+ trace validation priorandroid approachproduction.stüt
-
-[1]: https://docs.tlapl.us/using%3Atlc%3Atrace_validation?utm_source=chatgpt.com "using:tlc:trace_validation - TLA+ Wiki"
-[2]: https://fhackett.com/files/oopsla25-tracelink.pdf "TraceLinking Implementations with Their Verified Designs"
-[3]: https://conf.tlapl.us/2024-fm/slides-merz.pdf "Validating Traces of Distributed Systems Against [+]Specifications"
-
+This is “classic” trace validation with TLA+/TLC: the trace is ingested, and TLC checks that each recorded step corresponds to a valid spec step (and optionally checks state equality against logged snapshots). This is exactly the “manual mapping” the TraceLink paper describes as the status quo in TLA+ trace validation.
 
 It’s also aligned with the general “trace validation with TLC” workflow described on the TLA+ trace-validation guidance page.
 
 ### SOTA baseline (optional, if you want to claim “best known”): **TraceLink-style trace validation**
 
-TraceLink is explicitly positioned as a **push-button** approach that “automatically maps a trace … to a formal model,” supports causal tracing / multiple in([docs.tlapl.us][1]) 2025.
+TraceLink is explicitly positioned as a **push-button** approach that “automatically maps a trace … to a formal model,” and supports causal tracing / multiple interpretations. ([TraceLink][tracelink])
 
-But: TraceLink’s automation relies heavily on the PGo/MPCal toolchain integration, so for Days you’d likely be re-implementing *ideas* rather than using Tr([fhackett.com][2])
+But: TraceLink’s automation relies heavily on the PGo/MPCal toolchain integration, so for Days you’d likely be re-implementing *ideas* rather than using their tooling directly.
 For a LeanGuard paper comparison, I’d phrase it as:
 
 * **Primary baseline:** manual TLC trace validation (fair + portable)
@@ -65,7 +60,7 @@ For a LeanGuard paper comparison, I’d phrase it as:
 ### Step 3.1 — A shared trace artifact and canonicalization pipeline
 
 **Input:** Days already produces `*_events.csv` (one per component/algorithm).
-**Goa([conf.tlapl.us][3])canonical representation that both LeanGuard and TLC-based baseline will consume.
+**Goal:** produce a canonical representation that both LeanGuard and the TLC-based baseline will consume.
 
 Concretely:
 
@@ -74,17 +69,18 @@ Concretely:
 
    * Sort by `(time_ns, event_id)`
    * Check uniqueness (reject duplicates)
-3. **Convert to TLC-friendly format**
+3. **Convert to a TLC-friendly representation**
 
-   * The “standard” recent setup is **NDJSON** (one JSON object per line), because it plays well with TLC’s IO/JSON utilities shown in practical trace-validation setups. ([docs.tlapl.us][4])
+   Some TLC builds used in trace-validation research can internalize JSON/NDJSON traces into **TLA+ values** (e.g., `Trace == ndJsonDeserialize(...)` via the `Json`/`IOUtils` modules). However, released `tla2tools.jar` versions do not reliably ship these modules, and TLC’s integer arithmetic is practically limited to 32-bit signed integers. In practice, a reproducible baseline often needs a generated trace module and (for Days) a rescaling step for large fields like `*_bps` and `*_ns`.
 
-Example output line (NDJSON):
+   * **Option A (recommended for reproducibility):** export a generated `.tla` module (or a `.cfg` constant) that defines `Trace` as a sequence of records.
+   * **Option B (if your TLC build supports it):** export JSON/NDJSON (one object per row) and let TLC deserialize it (as in trace-validation research). ([trace validation paper][traceval-arxiv])
+
+Example NDJSON line (Option B):
 
 ```json
-{"time_ns":123456,"event_id":17,"kind":"CnpRecv","endpoint_id":0,"flow_id":1,"alpha_ppb":12000,"rate_bps":5000000000,"cnp_seen":true,"last_cnp_ns":123400,...}
+{"time_ns":123456,"event_id":17,"kind":"cnp_recv","endpoint_id":0,"flow_id":1,"alpha_ppb":12000,"rate_bps":5000000000,"cnp_seen":true,"last_cnp_ns":123400}
 ```
-
-Why NDJSON? Because many TLC trace-validation “load trace” harnesses are built around deserializing JSON/NDJSON into a sequence of records. ([docs.tlapl.us][4])
 
 > Fairness note: This conversion is “infrastructure,” not advantage to either side, because both can consume the same canonicalized trace.
 
@@ -99,7 +95,7 @@ Create a small reusable TLA+ module that:
 * at each step, reads `e == Trace[l]` and applies a spec action based on `e.kind`
 * increments `l`
 
-This is the “generic setup” style demonstrated in practical TLA+ trace-validation material. ([docs.tlapl.us][4])
+This is the “generic setup” style demonstrated in practical TLA+ trace-validation material. ([TLA+ trace validation guide][tla-trace-validation])
 
 Pseudo-skeleton (illustrative):
 
@@ -174,7 +170,7 @@ A common pitfall is benchmarking TLC in a mode that’s not representative.
 
 If your trace-check harness is deterministic (Mode 1), TLC’s explored state-space is essentially O(length(trace)).
 
-To keep TLC overhead reasonable, use recommended configuration tricks for trace validation (e.g., DFS queue optimizations) as documented in the TLA+ trace validation guidance. ([docs.tlapl.us][1])
+To keep TLC overhead reasonable, use recommended configuration tricks for trace validation (e.g., DFS queue optimizations) as documented in the TLA+ trace validation guidance. ([TLA+ trace validation guide][tla-trace-validation])
 
 This matters because otherwise you’re measuring “TLC default queue behavior” more than “TLA+ trace validation as practiced.”
 
@@ -245,7 +241,7 @@ If Days can produce nondeterministic ordering, measure:
 * without canonicalization, how fragile is each approach?
 * with canonicalization, do both become stable?
 
-If you want to bring in TraceLink ideas here, TraceLink explicitly addresses causal tracing / multiple allowed interpretations. ([fhackett.com][2])
+If you want to bring in TraceLink ideas here, TraceLink explicitly addresses causal tracing / multiple allowed interpretations. ([TraceLink][tracelink])
 But again: treat that as a “SOTA+” discussion unless you truly implement it.
 
 ---
@@ -276,16 +272,11 @@ That directly compares:
 * LeanGuard’s executable checker approach
 * vs. TLC’s spec-based trace replay approach
 
-…and avoids “TLA+ got an advantage because it didn’t require logging X” arguments. (You can still report that as a separate experiment, but don’t mix it into the main head-to-head.) ([conf.tlapl.us][3])
+…and avoids “TLA+ got an advantage because it didn’t require logging X” arguments. (You can still report that as a separate experiment, but don’t mix it into the main head-to-head.) ([Merz 2024 trace-validation slides][merz-trace-validation-slides])
 
 ---
 
 If you want, I can turn the above into a concrete checklist keyed to your repo layout (e.g., “add `tla/` directory with `TraceHarness.tla`, add a `trace_convert` tool, add a `--baseline` flag to `leanguard-run` / `leanguard-testgen`, and define the JSON schema for baseline results”), but the core outline above is the conceptual minimum that makes the study fair and defensible.
-
-[1]: https://docs.tlapl.us/using%3Atlc%3Atrace_validation?utm_source=chatgpt.com "using:tlc:trace_validation - TLA+ Wiki"
-[2]: https://fhackett.com/files/oopsla25-tracelink.pdf "TraceLinking Implementations with Their Verified Designs"
-[3]: https://conf.tlapl.us/2024-fm/slides-merz.pdf "Validating Traces of Distributed Systems Against [+]Specifications"
-[4]: https://docs.tlapl.us/using%3Atlc%3Atrace_validation "using:tlc:trace_validation - TLA+ Wiki"
 
 
 ---
@@ -296,7 +287,7 @@ What is the classic trace validation with TLA+/TLC, how should it be implemented
 
 “TLA+/TLC trace validation” is the classic *model-based* way to check that a concrete execution produced by an implementation is consistent with a TLA+ spec—without proving the whole implementation correct.
 
-It’s a good baseline to compare LeanGuard against because it’s the best-known “trusted checker over untrusted execution” workflow in the formal methods community, and it’s used in serious systems (e.g., Microsoft’s CCF). ([TLA+ Wiki][1])
+It’s a good baseline to compare LeanGuard against because it’s the best-known “trusted checker over untrusted execution” workflow in the formal methods community, and it’s used in serious systems (e.g., Microsoft’s CCF). ([TLA+ trace validation guide][tla-trace-validation])
 
 Below is what it is (algorithmically), and how I’d implement it **specifically for Days** given your current trace + CLI architecture.
 
@@ -317,7 +308,7 @@ You then build a *trace-constrained* TLA+ model (often called a **trace spec**) 
 
 TLC then does *constrained exploration*: it attempts to find *some* behavior consistent with the trace. If it can, you accept the trace; if it cannot, it rejects (and can give a counterexample prefix / last consistent state).
 
-This is exactly the philosophy you summarized in the paper’s generation section: checker is an oracle + diagnostics, and traces are certificates—except TLC can allow partial observation (missing variables, unknown internal actions), which turns checking into search. ([arXiv][2])
+This is exactly the philosophy you summarized in the paper’s generation section: checker is an oracle + diagnostics, and traces are certificates—except TLC can allow partial observation (missing variables, unknown internal actions), which turns checking into search. ([trace validation paper][traceval-arxiv])
 
 ### What’s “classic” about it
 
@@ -333,14 +324,14 @@ Two “classic” patterns exist:
    * unobserved internal actions / stuttering steps,
    * and sometimes different action interleavings.
 
-This is powerful but can explode combinatorially if the trace is too “thin”; the literature explicitly warns that “less information in the trace increases nondeterminism and may lead to combinatorial explosion,” and recommends strategies like **DFS bounded by the trace length** to find a matching behavior quickly. ([arXiv][2])
+This is powerful but can explode combinatorially if the trace is too “thin”; the literature explicitly warns that “less information in the trace increases nondeterminism and may lead to combinatorial explosion,” and recommends strategies like **DFS bounded by the trace length** to find a matching behavior quickly. ([trace validation paper][traceval-arxiv])
 
 ### How TLC is used in trace validation
 
 There are two main operational setups:
 
 * **Encode the trace as a constant / sequence** in the TLC model, then model check a “TraceSpec” that walks through it (works but can be awkward/large).
-* **Read the trace from a file (often NDJSON)** and validate it (this is how modern trace validation workflows are typically scripted in practice, including CCF). ([arXiv][2])
+* **Read the trace from a file** and internalize it into TLA+ values (often NDJSON via `ndJsonDeserialize` in some TLC builds), or fall back to generating a `TraceData.tla` module that defines `Trace == << ... >>`. ([trace validation paper][traceval-arxiv])
 
 ---
 
@@ -365,7 +356,7 @@ Add a parallel “baseline checker” path next to LeanGuard:
 
 ```
 Days run → *_events.csv (+ traces.json)
-        → (export) → TLC trace input (NDJSON or TLA constants)
+        → (export) → TLC trace input (NDJSON)
         → TLC validates against TLA+ spec
         → JSON summary alongside LeanGuard results
 ```
@@ -399,7 +390,7 @@ Only constrain TLC using:
 * event names (`kind`), ids (`endpoint_id`, `flow_id`, …), and maybe a few key state vars,
 * let the rest of spec variables be inferred by TLC search.
 
-This is “closer” to the general trace validation literature, but can become infeasible quickly unless traces are very informative (and for fairness you’d need to argue why you chose a given observation level). ([arXiv][2])
+This is “closer” to the general trace validation literature, but can become infeasible quickly unless traces are very informative (and for fairness you’d need to argue why you chose a given observation level). ([trace validation paper][traceval-arxiv])
 
 **Recommendation for Days:** Start with Baseline A for a fair comparison and practical runtimes; optionally report Baseline B as a secondary experiment showing the tradeoff between trace richness and validator complexity.
 
@@ -407,11 +398,12 @@ This is “closer” to the general trace validation literature, but can become 
 
 ## Step 2: Define the trace format TLC will consume
 
-### Use NDJSON (recommended)
+TLC needs the trace represented as **TLA+ values** (records/sequences). NDJSON deserialization exists in some TLC builds used by trace-validation work, but it is not reliably available in released `tla2tools.jar` distributions, and TLC is practically limited to 32-bit integers. So pick either:
 
-A common practice is **one JSON object per step**, and it aligns with existing trace validation tooling scripts. ([arXiv][2])
+* **Option A (recommended for reproducibility):** export a generated TLA module/config that defines `Trace == << ... >>` as a sequence of records.
+* **Option B (if supported in your TLC build):** export JSON/NDJSON (one object per step) and let TLC deserialize it (e.g., via `ndJsonDeserialize`). ([trace validation paper][traceval-arxiv])
 
-For each Days trace row, emit a line like:
+If you choose Option B, for each Days trace row emit something like:
 
 ```json
 {
@@ -426,8 +418,8 @@ For each Days trace row, emit a line like:
 
 Notes:
 
-* Keep **integer encodings** exactly as in LeanGuard traces (ppb, bps, ns). This avoids floating point differences and makes TLC comparisons exact.
-* Preserve canonical order (sort by `(time_ns, event_id)` before emitting NDJSON), or emit in that order directly.
+* If you use a released TLC jar, you may need to **rescale** large numeric fields (e.g., `*_bps`, `*_ns`) to fit TLC’s integer limits, and (depending on your scaling) allow small tolerances for snapshot equality.
+* Preserve canonical order (sort by `(time_ns, event_id)` before exporting), or export in that order directly.
 
 ### Where to implement the exporter
 
@@ -437,7 +429,7 @@ You have two choices:
    Pro: doesn’t touch simulation; easy to iterate.
    Con: adds a conversion step.
 
-2. **Emit NDJSON directly** from the logger path when a `tlc_trace = true` config flag is set.
+2. **Emit JSON/NDJSON directly** from the logger path when a `tlc_trace = true` config flag is set.
    Pro: simpler pipeline, fewer moving parts.
    Con: touches logger & feature gates.
 
@@ -449,11 +441,11 @@ Given your existing CSV-based ecosystem (LeanGuard, plotting, etc.), I’d do **
 
 You need a TLA+ module per trace family:
 
-* `DCQCN.tla` (or `SpecDCQCN.tla`)
-* `PFC.tla`
-* `WFQ.tla`
-* `DRR.tla`
-* `AQM.tla`
+* `DcqcnTrace.tla` (DCQCN baseline; in this repo it includes both the trace harness and the per-step reference semantics)
+* `PfcTrace.tla`
+* `WfqTrace.tla`
+* `DrrTrace.tla`
+* `AqmTrace.tla`
 * (optional) a cross-layer `AQM_DCQCN.tla`
 
 These specs are the baseline’s “reference semantics,” analogous to your Lean semantics.
@@ -480,11 +472,17 @@ This is exactly the kind of “component-local state + global replay loop” str
 
 ## Step 4: Write the *trace wrapper* module (the heart of “trace validation”)
 
-For each protocol, create a `TraceValidateX.tla` module that:
+For each protocol, create a trace-validation module that:
 
-1. Loads the trace (`Trace`) from NDJSON (or via a constant).
+1. Loads the trace (`Trace`) via a generated TLA module/constant (and optionally via NDJSON ingestion if your TLC build supports it).
 2. Introduces a trace pointer variable `i`.
 3. Defines `Next` to enforce that the `i`‑th trace entry corresponds to a valid step of the spec.
+
+In this repo, we currently keep this as **one module per protocol** (e.g., `tla/DcqcnTrace.tla`) plus a `.cfg` file
+that sets `SPECIFICATION TraceSpec`, checks an explicit progress invariant (`INVARIANT ProgressOk`), and disables deadlock checking (`CHECK_DEADLOCK FALSE`).
+
+* **Acceptance:** TLC exits cleanly with no invariant violations (the trace can be replayed through the full length).
+* **Rejection:** if the trace cannot advance at some step, TLC violates `ProgressOk` (meaning “before end-of-trace, `Next` must be enabled”) and returns a counterexample. For diagnostics, we still parse TLC’s reported depth/diameter to compute the longest matched prefix and map that back to a failing CSV row.
 
 ### Skeleton (DCQCN example)
 
@@ -502,14 +500,14 @@ At a high level:
 
 * `TraceAccepted`: `i = Len(Trace) + 1` (or equivalent), meaning all steps were validated.
 
-This is the standard “walk the trace and constrain `Next`” approach described in trace validation literature and practice. ([TLA+ Wiki][1])
+This is the standard “walk the trace and constrain `Next`” approach described in trace validation literature and practice. ([TLA+ trace validation guide][tla-trace-validation])
 
 ### Handling “partial observation” if you want Baseline B
 
 Instead of equating the entire post-state, you only equate observed fields and let TLC infer the rest. But that’s where state explosion can happen, and you’ll want:
 
 * strong constraints (log more),
-* and/or DFS bounded by trace length. ([arXiv][2])
+* and/or DFS bounded by trace length. ([trace validation paper][traceval-arxiv])
 
 ---
 
@@ -519,18 +517,19 @@ Instead of equating the entire post-state, you only equate observed fields and l
 
 Add flags like:
 
-* `--baseline tlc` (or `--tlc-check`)
+* `--tlc-check`
 * `--tlc-spec-dir tla/` (where the `.tla` files live)
-* `--tlc-bin <path>` (TLC jar or `tlc2.TLC`)
-* `--tlc-mode {full_snapshot, partial}`
+* `--tlc-bin <path>` (optional; run a wrapper executable directly)
+* `--tlc-jar <path>` (path to `tla2tools.jar`, if not using `--tlc-bin`)
+* `--tlc-no-dfs` (disable the DFS queue optimization used for trace validation)
 
 Flow:
 
 1. Existing `discover_traces(log_path)` gives you the list of trace CSVs (via manifest or scan).
 2. For each trace type:
 
-   * convert its CSV → NDJSON
-   * invoke TLC with the correct `TraceValidate*.tla` module
+   * export its CSV → a generated `TraceData.tla` module (and optionally also export a lossless `*.ndjson` for diagnostics)
+   * invoke TLC with the correct `*.tla` module + `.cfg` model config in a workspace where `TraceData.tla` is visible
 3. Record results in the same JSON summary schema you already output for LeanGuard checkers (Accept/Reject/Error + stdout/stderr).
 
 This keeps the “one entrypoint per scenario” design you already have with `leanguard-run`.
@@ -543,14 +542,14 @@ Either is fine; Option 1 is less plumbing.
 
 ### How to run TLC in practice
 
-CCF’s docs show a practical pattern: a wrapper script (`tlc.py`) that runs TLC with a specific trace file as input for validation. ([arXiv][2])
+CCF’s docs show a practical pattern: a wrapper script (`tlc.py`) that runs TLC with a specific trace file as input for validation. ([trace validation paper][traceval-arxiv])
 
 For Days, you can do the equivalent:
 
-* Have `leanguard-run` call something like:
+* Have `leanguard-run` call something like (Option A / generated trace module):
 
-  * `java -cp tla2tools.jar tlc2.TLC -modelcheck ... TraceValidateDCQCN.tla`
-  * with the trace path passed as a constant or env var (depending on how you read NDJSON).
+  * `java -Dtlc2.tool.queue.IStateQueue=StateDeque -cp path/to/tla2tools.jar tlc2.TLC -config <workspace>/DcqcnTrace.cfg <workspace>/DcqcnTrace.tla`
+  * where `<workspace>/` contains `DcqcnTrace.tla`, `DcqcnTrace.cfg`, and a generated `TraceData.tla`.
 * Parse TLC’s exit code / output to decide Accept vs Reject.
 
 ---
@@ -559,7 +558,7 @@ For Days, you can do the equivalent:
 
 To be a fair comparison study, align the interfaces:
 
-* **Same trace source:** the exact `*_events.csv` Days already emits (or a lossless NDJSON conversion of it).
+* **Same trace source:** the exact `*_events.csv` Days already emits (canonicalized), with a single conversion step for the baseline (e.g., generate `TraceData.tla` for TLC, and optionally also export lossless NDJSON for diagnostics).
 * **Same canonicalization order:** use `(time_ns, event_id)` ordering before feeding to TLC (since LeanGuard canonicalizes too).
 * **Same notion of “acceptance”:** for Baseline A, acceptance means “every logged step matches the reference semantics and snapshot.”
 * **Same determinism discipline:** run with `threading="single"` for both baselines by default (you already enforce this in `leanguard-run` unless `--allow-nondeterministic`).
@@ -576,11 +575,11 @@ To be a fair comparison study, align the interfaces:
   * missing/unobserved variables,
   * stuttering/internal actions,
   * nondeterminism due to partial logging,
-  * some degrees of concurrency/interleaving (especially when trace is an observation, not full state). ([TLA+ Wiki][1])
+  * some degrees of concurrency/interleaving (especially when trace is an observation, not full state). ([TLA+ trace validation guide][tla-trace-validation])
 
 ### Expected pain points (where LeanGuard will likely look better)
 
-* If you log less than full state, TLC can blow up quickly; the literature explicitly documents state explosion as trace precision decreases. ([arXiv][2])
+* If you log less than full state, TLC can blow up quickly; the literature explicitly documents state explosion as trace precision decreases. ([trace validation paper][traceval-arxiv])
 * Getting good diagnostics can be harder than a purpose-built “first failing row” replay checker, because TLC’s counterexamples are model-checking counterexamples (though you can structure them to point to the offending trace index).
 * Implementing protocol arithmetic carefully in TLA+ (fixed-point) is work you already did in Lean.
 
@@ -590,7 +589,7 @@ To be a fair comparison study, align the interfaces:
 
 1. Add `tla/` directory to the repo with:
 
-   * `SpecDCQCN.tla`, `TraceValidateDCQCN.tla`, etc.
+   * `DcqcnTrace.tla` + `DcqcnTrace.cfg` (and additional modules/configs for other protocols).
 2. Add `src/bin/days-trace-export.rs` that:
 
    * reads `*_events.csv`,
@@ -609,6 +608,7 @@ To be a fair comparison study, align the interfaces:
 
 If you want, I can also sketch what the **DCQCN trace wrapper** should look like in TLA+ in more detail (variables, action definitions, and exactly how to use the post-state snapshot fields you already log), but the blueprint above is the “classic TLC trace validation” story and the most direct way to implement it cleanly in Days.
 
-[1]: https://docs.tlapl.us/using%3Atlc%3Atrace_validation "using:tlc:trace_validation - TLA+ Wiki"
-[2]: https://arxiv.org/html/2404.16075v2 "Validating Traces of Distributed Programs Against \tlaplusSpecificationsThis work was partly supported by a grant from Oracle Corporation."
-
+[tla-trace-validation]: https://docs.tlapl.us/using%3Atlc%3Atrace_validation "using:tlc:trace_validation - TLA+ Wiki"
+[tracelink]: https://fhackett.com/files/oopsla25-tracelink.pdf "TraceLinking Implementations with Their Verified Designs"
+[merz-trace-validation-slides]: https://conf.tlapl.us/2024-fm/slides-merz.pdf "Validating Traces of Distributed Systems Against [+]Specifications"
+[traceval-arxiv]: https://arxiv.org/html/2404.16075v2 "Validating Traces of Distributed Programs Against TLA+ Specifications"

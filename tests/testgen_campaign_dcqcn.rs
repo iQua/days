@@ -21,6 +21,13 @@ fn test_campaign_dcqcn_targeted_mutations_in_dry_run() {
         checker_dir: PathBuf::from("lean/.lake/build/bin"),
         leanguard_run: None,
         allow_nondeterministic: false,
+        coverage: true,
+        tlc_check: false,
+        require_tlc_accept: false,
+        tlc_spec_dir: PathBuf::from("tla"),
+        tlc_bin: None,
+        tlc_jar: None,
+        tlc_no_dfs: false,
     };
 
     seed_index(&opts, &seeds_src).expect("seed-index");

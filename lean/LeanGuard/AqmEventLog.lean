@@ -298,4 +298,20 @@ def checkRows (rows : List Row) : Except String Unit := do
   | .ok _ => pure ()
   | .error (e, _) => throw e
 
+
+/-- Enumerates all semantic coverpoints this checker may record via `covHit`. -/
+def coverpointCatalog : List String :=
+  [ "ecn_threshold_drop_overflow"
+  , "ecn_threshold_mark"
+  , "ecn_threshold_pass"
+  , "mark_non_ecn_packet_drop"
+  , "red_between"
+  , "red_over_max"
+  , "red_should_drop"
+  , "red_should_mark"
+  , "red_under_min"
+  , "taildrop_enqueue"
+  , "taildrop_overflow_drop"
+  ]
+
 end LeanGuard.AqmEventLog

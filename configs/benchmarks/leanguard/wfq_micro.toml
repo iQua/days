@@ -1,0 +1,39 @@
+# Micro benchmark for LeanGuard WFQ/AQM trace checking.
+#
+# Topology: two switches (0 and 1), each with a host attached, connected by one link.
+# Traffic: two packet-distribution flows sharing the same output port so WFQ has real scheduling work.
+
+seed = 42
+edges = [[0, 1]]
+hosts = [0, 1]
+duration = 0.5
+threading = "single"
+log_path = "logs/bench/leanguard_wfq_micro"
+ui_interval = 1e9
+
+[switch]
+    port_rate = 1000000000 # 1 Gbps
+    capacity = 1024
+    weights = [1, 2]
+    discipline = "WFQ"
+    drop = "TailDrop"
+
+[[flow]]
+    flow_type = "PacketDistribution"
+    graph = [[0, 1]]
+
+    [flow.traffic]
+        initial_delay = 0.0
+        size = 1000000
+        arr_dist = { type = "Uniform", low = 0.0001, high = 0.0001 }
+        pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[[flow]]
+    flow_type = "PacketDistribution"
+    graph = [[0, 1]]
+
+    [flow.traffic]
+        initial_delay = 0.0
+        size = 1000000
+        arr_dist = { type = "Uniform", low = 0.0001, high = 0.0001 }
+        pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }

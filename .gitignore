@@ -12,9 +12,23 @@ logs/**
 # RepoPrompt
 .repoprompt/**
 
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+
 # MkDocs build output
 site/**
 docs/site/**
 
 # Leanguard
 leanguard_corpus/**
+
+# Local toolchains / external jars (keep uncommitted)
+tools/tla2tools.jar
+tools/CommunityModules-deps.jar
+
+# TLC generated artifacts (manual runs)
+tla/states/**
+
+# Paper draft is a separate repo and should not be committed here.
+lean-paper/
