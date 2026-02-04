@@ -806,20 +806,27 @@ fn campaign_with_options(
                 dcqcn_summary.as_ref(),
             );
 
-            if !accept
-                || goal_met
-                || iter >= max_iters
-                || campaign_opts.protocol != TargetProtocol::Dcqcn
-            {
+            let supports_calibration = matches!(
+                campaign_opts.protocol,
+                TargetProtocol::Dcqcn | TargetProtocol::Aqm
+            );
+            if !accept || goal_met || iter >= max_iters || !supports_calibration {
                 break;
             }
 
-            if let Some(change) = calibrate_dcqcn(
-                &mut config,
-                dcqcn_summary.as_ref(),
-                &campaign_opts.goal_coverpoints,
-                &mut rng,
-            ) {
+            let change = match campaign_opts.protocol {
+                TargetProtocol::Dcqcn => calibrate_dcqcn(
+                    &mut config,
+                    dcqcn_summary.as_ref(),
+                    &campaign_opts.goal_coverpoints,
+                    &mut rng,
+                ),
+                TargetProtocol::Aqm => {
+                    calibrate_aqm(&mut config, &campaign_opts.goal_coverpoints, &mut rng, iter)
+                }
+                _ => None,
+            };
+            if let Some(change) = change {
                 let calibration_step = Mutation::CalibrationStep {
                     iter,
                     knob: change.reason.knob.to_string(),
@@ -1508,6 +1515,7 @@ fn apply_targeted_mutations(
 ) -> Vec<Mutation> {
     match protocol {
         TargetProtocol::Dcqcn => mutate_dcqcn_targeted(config, rng, goal),
+        TargetProtocol::Aqm => mutate_aqm_targeted(config, rng, goal),
         _ => Vec::new(),
     }
 }
@@ -1675,6 +1683,37 @@ fn mutate_switch_capacity(config: &mut toml::Value, rng: &mut StdRng) -> Option<
     })
 }
 
+fn mutate_switch_port_rate_down(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let table = config.as_table_mut()?;
+    let switch = table.get_mut("switch")?.as_table_mut()?;
+    let current = switch.get("port_rate").and_then(value_to_f64)?;
+    let factors = [0.5, 0.75];
+    let factor = *factors.choose(rng)?;
+    let new_value = (current * factor).max(1.0);
+    switch.insert("port_rate".to_string(), toml::Value::Float(new_value));
+    Some(Mutation::TweakSwitchPortRate {
+        from: current,
+        to: new_value,
+    })
+}
+
+fn mutate_switch_capacity_down(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let table = config.as_table_mut()?;
+    let switch = table.get_mut("switch")?.as_table_mut()?;
+    let current = switch.get("capacity").and_then(value_to_i64)?;
+    let factors = [0.5, 0.75];
+    let factor = *factors.choose(rng)?;
+    let mut new_value = ((current as f64) * factor).round() as i64;
+    if new_value < 1 {
+        new_value = 1;
+    }
+    switch.insert("capacity".to_string(), toml::Value::Integer(new_value));
+    Some(Mutation::TweakSwitchCapacity {
+        from: current,
+        to: new_value,
+    })
+}
+
 fn mutate_shuffle_edges(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
     let table = config.as_table_mut()?;
     let edges = table.get_mut("edges")?.as_array_mut()?;
@@ -1757,6 +1796,39 @@ fn mutate_dcqcn_targeted(
         }
     }
 
+    mutations
+}
+
+fn mutate_aqm_targeted(
+    config: &mut toml::Value,
+    rng: &mut StdRng,
+    goal: &[String],
+) -> Vec<Mutation> {
+    // AQM config surface (from configs/*.toml):
+    // - switch: drop, port_rate, capacity, ecn_threshold
+    let mut mutations = Vec::new();
+
+    let mut targeted: Vec<fn(&mut toml::Value, &mut StdRng) -> Option<Mutation>> = Vec::new();
+    if goal
+        .iter()
+        .any(|g| g.eq_ignore_ascii_case("ecn_threshold_drop_overflow"))
+    {
+        targeted.push(mutate_switch_capacity_down);
+        targeted.push(mutate_switch_port_rate_down);
+        targeted.push(mutate_switch_ecn_threshold_up);
+    }
+
+    if targeted.is_empty() {
+        return mutations;
+    }
+
+    targeted.shuffle(rng);
+    let picks = targeted.len();
+    for mutator in targeted.into_iter().take(picks) {
+        if let Some(mutation) = mutator(config, rng) {
+            mutations.push(mutation);
+        }
+    }
     mutations
 }
 
@@ -2031,6 +2103,27 @@ fn mutate_switch_ecn_threshold(config: &mut toml::Value, rng: &mut StdRng) -> Op
     })
 }
 
+fn mutate_switch_ecn_threshold_up(config: &mut toml::Value, rng: &mut StdRng) -> Option<Mutation> {
+    let current = config
+        .get("switch")
+        .and_then(|v| v.get("ecn_threshold"))
+        .and_then(value_to_f64)?;
+    let factors = [1.25, 1.5, 2.0];
+    let factor = *factors.choose(rng)?;
+    let mut new_value = (current * factor).clamp(0.01, 0.99);
+    if (new_value - current).abs() < f64::EPSILON {
+        new_value = (current + 0.05).clamp(0.01, 0.99);
+    }
+    if new_value <= current {
+        return None;
+    }
+    let from = update_switch_value(config, "ecn_threshold", new_value)?;
+    Some(Mutation::TweakSwitchEcnThreshold {
+        from,
+        to: new_value,
+    })
+}
+
 fn calibrate_dcqcn(
     config: &mut toml::Value,
     summary: Option<&DcqcnTraceSummary>,
@@ -2047,7 +2140,7 @@ fn calibrate_dcqcn(
     };
 
     if summary.cnp_sent == 0 || summary.cnp_recv == 0 {
-        if let Some(change) = adjust_switch_ecn_threshold(config, 0.5) {
+        if let Some(change) = adjust_switch_ecn_threshold(config, 0.5, "increase ECN marking") {
             return Some(change);
         }
         return adjust_dcqcn_rate(config, rng, 1.5, "increase CNP activity");
@@ -2087,10 +2180,43 @@ fn calibrate_dcqcn(
     }
 
     if missing("timer_without_cnp_seen") {
-        if let Some(change) = adjust_switch_ecn_threshold(config, 1.5) {
+        if let Some(change) = adjust_switch_ecn_threshold(config, 1.5, "reduce ECN marking") {
             return Some(change);
         }
         return adjust_dcqcn_rate(config, rng, 0.5, "reduce CNP frequency");
+    }
+
+    None
+}
+
+fn calibrate_aqm(
+    config: &mut toml::Value,
+    goal: &[String],
+    rng: &mut StdRng,
+    iter: usize,
+) -> Option<CalibrationChange> {
+    let missing =
+        |name: &str| !goal.is_empty() && goal.iter().any(|g| g.eq_ignore_ascii_case(name));
+
+    if missing("ecn_threshold_drop_overflow") {
+        // Rotate across a small set of increasingly aggressive knobs to increase the
+        // chance of observing an overflow drop under ECN-threshold AQM.
+        for offset in 0..5 {
+            let choice = (iter + offset) % 5;
+            let change = match choice {
+                0 => adjust_switch_capacity(config, 0.5, "increase overflow likelihood"),
+                1 => adjust_switch_port_rate(config, 0.5, "increase queue buildup"),
+                2 => {
+                    adjust_switch_ecn_threshold(config, 1.5, "delay ECN marking to allow overflow")
+                }
+                3 => adjust_cnp_interval(config, rng, 2.0),
+                4 => adjust_dcqcn_rate(config, rng, 2.0, "increase offered load for overflow"),
+                _ => None,
+            };
+            if change.is_some() {
+                return change;
+            }
+        }
     }
 
     None
@@ -2252,7 +2378,96 @@ fn set_dcqcn_max_rate(
     })
 }
 
-fn adjust_switch_ecn_threshold(config: &mut toml::Value, factor: f64) -> Option<CalibrationChange> {
+fn adjust_switch_port_rate(
+    config: &mut toml::Value,
+    factor: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
+    let current = config
+        .get("switch")
+        .and_then(|v| v.get("port_rate"))
+        .and_then(value_to_f64)?;
+    if current <= 1.0 && factor < 1.0 {
+        return None;
+    }
+    let mut new_value = (current * factor).max(1.0);
+    if (new_value - current).abs() < f64::EPSILON {
+        new_value = if factor < 1.0 {
+            (current - 1.0).max(1.0)
+        } else {
+            current + 1.0
+        };
+    }
+    if (new_value - current).abs() < f64::EPSILON {
+        return None;
+    }
+
+    let from = update_switch_value(config, "port_rate", new_value)?;
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakSwitchPortRate {
+            from,
+            to: new_value,
+        }],
+        reason: CalibrationReason {
+            knob: "switch.port_rate",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+fn adjust_switch_capacity(
+    config: &mut toml::Value,
+    factor: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
+    let current = config
+        .get("switch")
+        .and_then(|v| v.get("capacity"))
+        .and_then(value_to_i64)?;
+    if current <= 1 && factor < 1.0 {
+        return None;
+    }
+    let mut new_value = ((current as f64) * factor).round() as i64;
+    if new_value < 1 {
+        new_value = 1;
+    }
+    if new_value == current {
+        new_value = if factor < 1.0 {
+            current - 1
+        } else {
+            current + 1
+        };
+        if new_value < 1 {
+            new_value = 1;
+        }
+    }
+    if new_value == current {
+        return None;
+    }
+
+    let switch = config.as_table_mut()?.get_mut("switch")?.as_table_mut()?;
+    switch.insert("capacity".to_string(), toml::Value::Integer(new_value));
+    Some(CalibrationChange {
+        mutations: vec![Mutation::TweakSwitchCapacity {
+            from: current,
+            to: new_value,
+        }],
+        reason: CalibrationReason {
+            knob: "switch.capacity",
+            from: format!("{current}"),
+            to: format!("{new_value}"),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+fn adjust_switch_ecn_threshold(
+    config: &mut toml::Value,
+    factor: f64,
+    reason: &str,
+) -> Option<CalibrationChange> {
     let current = config
         .get("switch")
         .and_then(|v| v.get("ecn_threshold"))
@@ -2271,7 +2486,7 @@ fn adjust_switch_ecn_threshold(config: &mut toml::Value, factor: f64) -> Option<
             knob: "switch.ecn_threshold",
             from: format!("{current}"),
             to: format!("{new_value}"),
-            reason: "adjust ECN threshold".to_string(),
+            reason: reason.to_string(),
         },
     })
 }
