@@ -1,0 +1,39 @@
+---
+title: days
+description: Run a simulation from a single TOML configuration file.
+---
+
+The default binary (built from `src/main.rs`) runs a simulation described by a TOML configuration file.
+
+## Usage
+
+```bash
+RUST_LOG=info cargo run --release -- <path/to/config.toml>
+```
+
+Examples:
+
+```bash
+# Minimal example
+RUST_LOG=info cargo run --release -- configs/simple.toml
+
+# TCP example
+RUST_LOG=info cargo run --release -- configs/tcp_simple.toml
+```
+
+## Arguments
+
+- **`<path/to/config.toml>`** (required): path to the configuration file.
+
+If you do not pass exactly one argument, the binary will `panic!` with a usage message.
+
+## Logging
+
+Days uses `RUST_LOG` for runtime logging.
+
+- Default level if unset: `info`
+- Increase verbosity: `RUST_LOG=debug ...`
+
+## Concurrency tracing
+
+If `tracing_active = true` in the config (see [/docs/configuration/logging](/docs/configuration/logging)), Days will install a `tracing_subscriber` pipeline (including a lightweight concurrency tracker). Otherwise it falls back to `env_logger`.

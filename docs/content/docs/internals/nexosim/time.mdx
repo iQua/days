@@ -1,0 +1,20 @@
+---
+title: Time model
+description: MonotonicTime and how simulation time advances in Nexosim (and Days).
+---
+
+Nexosim represents simulation time using `MonotonicTime` (a monotonic timestamp type).
+
+Source: `days/crates/nexosim/src/time.rs`
+
+## Days convention: seconds as f64
+
+Although Nexosim uses a dedicated time type internally, Days largely exposes time as **seconds (`f64`)** in its model logic and configuration:
+
+- config fields like `duration` and distribution parameters are `f64` seconds
+- packets carry a `Packet.time: f64` timestamp
+- scheduling uses `Duration::from_secs_f64(...)`
+
+This is a deliberate performance choice: most hot-path handlers avoid calling `cx.time()` and instead treat the incoming message timestamp as “now”.
+
+See [/docs/architecture/time-concurrency](/docs/architecture/time-concurrency).

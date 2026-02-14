@@ -1,0 +1,59 @@
+---
+title: Trace schema conventions
+description: Common conventions across *_events.csv trace families (canonicalization, units, and required fields).
+---
+
+Days emits **per-transition** protocol traces as CSV files named `*_events.csv` when built with the appropriate Cargo features (see [/docs/verification/leanguard](/docs/verification/leanguard)).
+
+This page records the shared schema conventions used across trace families. It is reconciled with the current Rust logging structs in `days/src/utils/logger.rs`.
+
+## Common CSV conventions
+
+Across trace families (DCQCN, PFC, WFQ, DRR, CUBIC, AQM), Days follows the same high-level rules:
+
+- **One row per semantic transition**: each row corresponds to one protocol transition (send/recv/timer/decision/enqueue/schedule/…).
+- **Canonicalization key**: acceptance is defined over a canonical order rather than raw file order.
+  - In the current checkers, the key is `(time_ns, event_id)`.
+  - Duplicate keys are rejected to avoid ambiguous replay.
+- **Stable identifiers**: rows include stable IDs (endpoint/scheduler/port id, flow id, packet id, priority/class id) so the checker can enforce pairing and accounting obligations (no spurious receives, no phantom dequeues, etc.).
+- **Kind-specific optional columns**: traces are emitted as a single CSV schema per family. Fields not applicable to a given `kind` are left empty; the checker parses them as optional values and enforces kind-specific required-field constraints.
+- **Diagnostics refer to file line numbers**: checkers keep track of original CSV line numbers for error reporting (line numbers include the header, so the first data row is line 2).
+
+## Field naming and encoding conventions
+
+Traces avoid floating-point printing and language-dependent formatting by encoding key quantities as integers with explicit units. Common patterns:
+
+| Pattern | Meaning | Encoding / notes |
+|---|---|---|
+| `time_ns`, `*_ns` | time and intervals | integer nanoseconds (rounded from internal `f64` times under explicit rules) |
+| `*_bps` | rates | integer bits per second |
+| `*_bytes`, `*_b` | sizes | integer bytes (`*_b` often used for packet/frame sizes) |
+| `*_ppb` | fixed-point probabilities / gains | "parts per billion": `round(x * 1e9)` (typically in `[0, 1e9]`) |
+| `kind` | event tag | finite vocabulary string; determines required fields and replay rule |
+| booleans | flags | `true` / `false` |
+
+## Trace family overview (schematic)
+
+This table is intentionally schematic: it highlights the certificate *shape* (identifiers, event kinds, witnesses/snapshots) rather than prescribing a single global schema across all protocols.
+
+| Trace file | Representative kinds | Key identifiers | Witness / snapshot fields (examples) |
+|---|---|---|---|
+| `dcqcn_events.csv` | `cnp_sent`, `cnp_recv`, `timer_tick` | `endpoint_id`, `flow_id`, `pkt_id` | source snapshot (`alpha_ppb`, `rate_bps`, `cnp_seen`, `last_cnp_ns`); CNP header fields; gate parameters |
+| `aqm_events.csv` | `decision` | `scheduler_id`, `queue_id`, `packet_id` | occupancy/capacity context; action (`enqueue`/`drop`/`mark_ecn`); optional randomness witness |
+| `pfc_events.csv` | `pfc_sent`, `pfc_recv` | sender/receiver id, `priority` | pause/resume intent; pause-time encoding; optional occupancy/threshold context; refresh/drain timing |
+| `wfq_events.csv` | `enqueue`, `schedule`, `depart` | `scheduler_id`, `packet_id`, `class_id` | virtual-time and finish-tag witnesses (`vtime_ns`, `finish_time_ns`), schedule/depart witnesses |
+| `drr_events.csv` | `enqueue`, `schedule` | `scheduler_id`, `class_id`, `packet_id` | deficit/pointer witnesses (`deficit_bytes`, `scan_steps`, `batch_id`), quantum parameters |
+| `cubic_events.csv` | `ack`, `congestion`, `timeout` | `endpoint_id`, `flow_id` | congestion-control snapshot (`cwnd_bytes`, `ssthresh_bytes`, …) and encoded parameters |
+
+## Example: DCQCN header and one `timer_tick` row
+
+Line breaks are inserted for readability. Different `kind` values populate different subsets of the columns.
+
+```text
+time_ns,event_id,kind,endpoint_id,flow_id,pkt_id,pkt_flow_id,trigger_ecn,cnp_priority,
+cnp_size_b,cnp_ecn,cnp_cwr,cnp_last_packet,cnp_interval_ns,g_ppb,mi_ppb,
+init_rate_bps,min_rate_bps,max_rate_bps,ai_rate_bps,hai_rate_bps,
+alpha_ppb,rate_bps,cnp_seen,last_cnp_ns
+100000,0,timer_tick,2,0,,,,,,,,,10000,500000000,500000000,10000000000,
+1000000000,10000000000,500000000,1000000000,0,10000000000,false,
+```

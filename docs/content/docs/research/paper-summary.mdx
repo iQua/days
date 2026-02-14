@@ -1,0 +1,45 @@
+---
+title: Paper summary
+description: High-level summary of the LeanGuard/Days research narrative.
+---
+
+![LeanGuard overview: the simulator emits a per-transition trace certificate and a trusted Lean checker replays it.](/figures/leanguard-intro.svg)
+
+## Core idea: trace certificates + trusted replay
+
+LeanGuard follows an "untrusted producer / trusted checker" workflow:
+
+1. **Days** emits a *per-transition* trace (one row per protocol transition), including a deterministic snapshot of post-state.
+2. A **Lean 4 checker** canonicalizes the trace (typically sorting by `(time_ns, event_id)` and rejecting duplicates).
+3. The checker **replays** an executable reference model and returns `ACCEPT` or `REJECT` with the first counterexample row.
+
+See:
+
+- [/docs/verification/design](/docs/verification/design) (practical guide)
+- [/docs/research/design](/docs/research/design) (more formal design notes)
+- [/docs/reference/traces/schema](/docs/reference/traces/schema) (row conventions and encodings)
+
+## Why canonicalization matters
+
+Because Days can run many models concurrently, the physical file order of trace rows is not treated as semantically meaningful. Canonicalization is part of the specification: the checker defines what ordering is acceptable, and the simulator only needs to log enough information to support that ordering.
+
+## Scaling beyond one run: coverage-guided generation
+
+The paper also describes a test generation loop that uses checkers as both:
+
+- a correctness oracle (`ACCEPT`/`REJECT` + first failing step)
+- a **semantic coverage sensor** (which spec-level branches/obligations were exercised)
+
+The generator mutates scenarios, keeps those that expand coverage, and minimizes failures into stable regression tests.
+
+See:
+
+- [/docs/research/test-generation](/docs/research/test-generation) (paper-derived overview + results)
+- [/docs/reference/cli/leanguard-testgen](/docs/reference/cli/leanguard-testgen) (CLI reference)
+
+## Evaluation (high level)
+
+The paper includes an experimental evaluation of:
+
+- trace checking cost (runtime/memory) on a suite of protocol traces
+- coverage-guided test generation behavior on a prototype corpus

@@ -1,0 +1,67 @@
+---
+title: L2 (Frames + PFC)
+description: Optional link-layer frames and priority-based flow control pipeline.
+---
+
+Layer-2 support is optional and is designed to have **zero overhead when disabled**:
+
+- compile-time opt-in via Cargo features (`l2`, `l2_pfc`)
+- runtime opt-in via config (`link.mode = "Pfc"`)
+
+## Frame model
+
+When L2 is compiled in, internal link pipelines use `LinkFrame` (`src/l2/frame.rs`):
+
+- `LinkFrame::Data(Packet)`
+- `LinkFrame::Pfc(PfcFrame)` (only with `l2_pfc`)
+
+Frames carry timestamps and sizes so that links can serialize them at a given rate.
+
+## Link serializer
+
+`Link` (`src/l2/link.rs`) is a small model that:
+
+- queues `LinkFrame`s,
+- schedules a delivery event after `size_bits / rate_bps`,
+- forwards the frame downstream via `output: Output<LinkFrame>`.
+
+This lets L2 control frames and data frames share the same serialization logic.
+
+## PFC (802.1Qbb-style pause)
+
+PFC is implemented by two per-edge actors (`src/l2/pfc.rs`):
+
+- **Ingress** (`PfcIngressPort`): per-priority buffering, XON/XOFF thresholds, generates pause/resume frames upstream.
+- **Egress** (`PfcEgressGate`): per-priority gating of outbound frames based on received pause frames.
+
+Pipeline constructed by the topology builder (`Topology::attach_pfc_link`):
+
+```
+Scheduler
+  -> PfcEgressGate (gates per priority)
+  -> Link (serializes frames)
+  -> PfcIngressPort (buffers + generates PFC)
+  -> downstream PacketSwitch
+
+PfcIngressPort.pfc_output -> PfcEgressGate.pfc_received (reverse direction)
+```
+
+### Ingress behavior
+
+`PfcIngressPort` tracks per-priority occupancy and:
+
+- asserts pause when `occupancy >= xoff[prio]`,
+- clears pause when `occupancy <= xon[prio]`,
+- optionally refreshes pause frames and schedules drain retries when downstream is congested.
+
+Forward progress depends on a `can_forward(packet)` closure, which is connected to scheduler queue occupancy (`QueueState`) so that ingress can avoid triggering downstream drops.
+
+### Egress behavior
+
+`PfcEgressGate` maintains:
+
+- `paused_until[prio]` deadlines,
+- per-priority queues,
+- a scheduled “resume” event at the earliest next deadline.
+
+It only drains frames for priorities that are not paused, and time-stamps drained frames at the current simulated time.

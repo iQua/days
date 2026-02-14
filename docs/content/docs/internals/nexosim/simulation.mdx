@@ -1,0 +1,30 @@
+---
+title: Simulation lifecycle
+description: SimInit, Simulation, and stepping semantics in Nexosim.
+---
+
+Nexosim runs a discrete-event simulation by repeatedly:
+
+1. executing all events scheduled for the current simulation time
+2. advancing to the next time at which at least one event is scheduled
+
+In Days, the main entrypoint is `Topology::run`, which:
+
+- builds a `SimInit`
+- registers all models and mailboxes
+- calls `init(...)` to obtain a `Simulation`
+- runs `sim.step_until(Duration::from_secs_f64(duration))`
+
+## Key APIs
+
+Source: `days/crates/nexosim/src/simulation.rs`
+
+- `SimInit`: builder for assembling a bench (models, mailboxes, runtime knobs)
+- `Simulation`:
+  - `process_event(...)`: inject an event/request into a model (often used for “start” actions)
+  - `step()`: advance to the next event time and process all events at that time
+  - `step_until(Duration)`: run until a target time
+
+## Ordering and determinism
+
+Within a given simulated timestamp, Nexosim may execute ready tasks in parallel (depending on executor configuration). Days therefore avoids treating wall-clock execution order as semantically meaningful and relies on deterministic *trace canonicalization* for verification (see [/docs/verification/design](/docs/verification/design)).

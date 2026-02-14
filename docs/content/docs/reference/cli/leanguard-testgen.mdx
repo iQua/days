@@ -1,0 +1,122 @@
+---
+title: leanguard-testgen
+description: Coverage-guided test generation on top of leanguard-run (fuzz, minimize, campaign).
+---
+
+`leanguard-testgen` drives the coverage-guided test generation pipeline described in the Days research notes.
+
+Source: `days/src/bin/leanguard-testgen.rs`
+
+## Top-level options
+
+- `--corpus-root <dir>` (default: `leanguard_corpus`)
+- `--checker-dir <dir>` (default: `lean/.lake/build/bin`)
+- `--leanguard-run <path>` (optional)
+  - If omitted, `leanguard-testgen` will try to execute `leanguard-run` (either as a sibling binary or via `$PATH`).
+- `--allow-nondeterministic` (default: false)
+
+## Subcommands
+
+### `seed-index`
+
+```bash
+cargo run --bin leanguard-testgen -- seed-index <seeds_src>
+```
+
+Build an index of seed configs.
+
+### `fuzz`
+
+```bash
+cargo run --bin leanguard-testgen -- fuzz --budget <N> [--rng-seed <u64>]
+```
+
+Run random mutations for a fixed budget.
+
+### `replay`
+
+```bash
+cargo run --bin leanguard-testgen -- replay <case_dir>
+```
+
+Re-run a saved failing (or interesting) case directory.
+
+### `minimize`
+
+```bash
+cargo run --bin leanguard-testgen -- minimize <case_dir> [--max-iters 25]
+```
+
+Attempt to shrink a failing case while preserving the failure (delta debugging over scenario mutations).
+
+### `campaign`
+
+```bash
+cargo run --bin leanguard-testgen -- campaign \
+  --protocol <name> \
+  --budget <N> \
+  [--rng-seed <u64>] \
+  [--goal <string>] \
+  [--max-calibration-iters <N>] \
+  [--seed-filter <string>] \
+  [--dry-run] \
+  [--use-trace-signature]
+```
+
+Run a full generation campaign for a protocol.
+
+The command prints JSON summaries to stdout (or errors to stderr with a non-zero exit code).
+
+## Corpus layout and artifacts
+
+By default, `leanguard-testgen` writes a persistent corpus under `--corpus-root` (default: `leanguard_corpus/`).
+
+Typical directory layout:
+
+```text
+leanguard_corpus/
+  seeds/                 # seed *.toml copied in by seed-index
+  accepted/<case_id>/     # per-case artifacts (accepted)
+  rejected/<case_id>/     # per-case artifacts (rejected)
+  metadata/
+    seeds_index.json      # seed inventory
+    global_coverage.json  # persistent union for novelty tracking
+    <case_id>.json        # per-case metadata record
+  _work/                  # temporary scratch space (best-effort cleaned)
+```
+
+Each case directory (`accepted/<case_id>/` or `rejected/<case_id>/`) contains:
+
+- `config.toml`: the final scenario config (with `log_path` rewritten to the case’s `logs/` dir)
+- `logs/`: the Days log directory (including any `*_events.csv` traces)
+- `run_summary.json`: the JSON summary produced by `leanguard-run`
+- `mutations.json`: the list of scenario mutations applied
+
+### `metadata/global_coverage.json`
+
+The current implementation stores a **minimal** global-union structure:
+
+```json
+{
+  "version": 1,
+  "observed": ["<item>", "..."]
+}
+```
+
+Where each "observed" item is either:
+
+- a checker-emitted semantic coverpoint (when coverage is enabled and available), or
+- a trace signature entry like `trace_kind_hash:<trace_file>:<hash>` when `--use-trace-signature` is enabled.
+
+This file is used to classify newly accepted cases as `new` vs `redundant` in the per-case metadata.
+
+### `metadata/<case_id>.json`
+
+Each case also produces a metadata record with:
+
+- the seed parent
+- file paths for the case
+- the applied mutations
+- accept/reject status and discovered traces
+- coverage mode + observed items + novelty classification
+- (for campaigns) protocol/goal/corpus options

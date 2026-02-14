@@ -1,0 +1,15 @@
+{
+  "title": "Architectural Design",
+  "pages": [
+    "overview",
+    "code-tour",
+    "simulation-engine",
+    "topology-build",
+    "time-concurrency"
+  ],
+  "overview": "Overview",
+  "simulation-engine": "Simulation Engine",
+  "topology-build": "Topology Build Pipeline",
+  "code-tour": "Code Tour",
+  "time-concurrency": "Time & Concurrency"
+}

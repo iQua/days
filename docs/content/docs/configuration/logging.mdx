@@ -1,0 +1,175 @@
+---
+title: Logging & Runtime
+description: Seed, duration, threading, mailbox sizing, CSV reports, and tracing.
+---
+
+This page documents “general” configuration keys that are not specific to flows/topology.
+
+Implementation notes:
+
+- `CsvLogger` reads logging keys from `src/utils/logger.rs`.
+- Runtime/UI/tracing keys are read from small config structs in `src/topos/topo.rs` and `src/utils/`.
+
+## `seed` (required)
+
+Random seed used for reproducibility (flow-set endpoint selection, random distributions, RED randomness).
+
+```toml
+seed = 1000
+```
+
+## `duration` (optional)
+
+Total simulated time in seconds.
+
+- Default (topology): `1500.0`
+
+```toml
+duration = 20.0
+```
+
+Note: `duration` is parsed by multiple subsystems (topology, UI, tracing). For consistency, prefer setting it explicitly.
+
+## `threading` (optional)
+
+Threading model for the simulation runtime.
+
+```toml
+threading = "single"
+```
+
+- Allowed values: `single`, `multiple`
+- `single` uses a single-threaded runtime.
+- `multiple` uses one worker per CPU core by default.
+- If omitted, Days uses the `nexosim` default runtime configuration.
+
+## `num_threads` (optional)
+
+Overrides the number of runtime worker threads when `threading = "multiple"`.
+
+```toml
+threading = "multiple"
+num_threads = 4
+```
+
+## `hot_workers` (optional)
+
+Number of hot standby worker threads. Hot workers remain active and ready to pick up tasks, reducing latency for bursty workloads.
+
+```toml
+hot_workers = 2
+```
+
+## `concurrency_level` (optional)
+
+Concurrency acceleration mode for the simulation runtime.
+
+- Allowed values: `default`, `accelerated`
+
+```toml
+concurrency_level = "accelerated"
+```
+
+## `time_quantum_ns` (optional)
+
+Simulation time quantum in nanoseconds. Controls the granularity of time-based scheduling in the simulation engine.
+
+```toml
+time_quantum_ns = 1000
+```
+
+## `mailbox_capacity` (optional)
+
+Mailbox capacity for most models (bounded message queues).
+
+- Default: `16`
+
+```toml
+mailbox_capacity = 32
+```
+
+## CSV reporting
+
+### `log_path` (optional)
+
+Output directory for CSV files.
+
+- Default: `./output`
+
+```toml
+log_path = "./logs/run1"
+```
+
+Days will create the directory if needed and will write:
+
+- `sources.csv`, `sinks.csv`, `switches.csv`
+- plus optional `pfc.csv` depending on features.
+- plus optional per-transition protocol traces for LeanGuard (`*_events.csv`) depending on features:
+  - `aqm_events.csv` (`--features lean`)
+  - `dcqcn_events.csv` (`--features dcqcn,lean`)
+  - `pfc_events.csv` (`--features l2_pfc,lean`)
+  - `cubic_events.csv` (`--features lean`)
+  - `drr_events.csv` (`--features lean`)
+  - `wfq_events.csv` (`--features lean`)
+ - `traces.json`: a manifest listing which `*_events.csv` traces are non-empty (written at the end of a run).
+
+### `report_interval` (optional)
+
+Interval in seconds between periodic report rows.
+
+- Default: `f64::MAX` (effectively “no periodic reports”; data is flushed at the end)
+
+```toml
+report_interval = 1.0
+```
+
+## Progress UI
+
+### `ui_interval` (optional)
+
+UI refresh interval in seconds.
+
+- Default: `duration / 100`
+
+```toml
+ui_interval = 1.0
+```
+
+## Concurrency tracing (optional)
+
+Enable lightweight concurrency sampling:
+
+```toml
+tracing_active = true
+tracing_interval = 1.0
+```
+
+- `tracing_active` (default: `false`)
+- `tracing_interval` (default: `duration / 100`)
+
+When enabled, Days installs a tracing subscriber layer and computes a wall-clock average concurrency during `Simulation::step_until` (and logs the peak observed by the tracing layer).
+
+## Application-level sources for TCP collectives (optional)
+
+For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with a shared, actor-managed byte buffer (`src/flows/app_source.rs`).
+
+Configure the actor under `[app_source]`:
+
+```toml
+[app_source]
+req_channel_capacity = 256
+chunk_size = 512
+initial_delay = 1
+run_interval = 50
+```
+
+Fields and defaults:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `req_channel_capacity` | `usize` | `256` | Channel capacity for buffer requests |
+| `chunk_size` | `usize` | `512` | Preferred chunk size for requests (bytes) |
+| `initial_delay` | `u64` | `1` | Actor start delay (microseconds) |
+| `run_interval` | `u64` | `50` | Actor polling interval (microseconds) |
+
+If `[app_source]` is omitted entirely, Days uses `AppBufferConfig::default()` with the defaults above.

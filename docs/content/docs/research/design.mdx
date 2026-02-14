@@ -1,0 +1,70 @@
+---
+title: Trace-certificate checking (design)
+description: More formal design notes on canonicalize-and-replay, trust boundaries, and reusable obligations.
+---
+
+If you are looking for a practical guide, start with:
+
+- [/docs/verification/design](/docs/verification/design)
+
+## Workflow and trust boundary
+
+LeanGuard follows an **untrusted producer / trusted checker** model:
+
+- **Days** is an *untrusted* trace producer.
+- The **checker** (Lean executable + Lean kernel) is the trusted consumer.
+
+This dramatically shrinks the trusted computing base (TCB): you do not need to verify the simulator runtime (event queue, executor, parallel scheduling), only that the emitted trace certificate matches the reference semantics.
+
+## Canonical order is part of the specification
+
+Trace rows can be emitted in a nondeterministic file order due to concurrency, buffering, or parallel execution.
+
+LeanGuard therefore defines acceptance over a **canonicalized** trace:
+
+- Each row has a deterministic key.
+- Rows are sorted by the key.
+- Duplicate keys are rejected.
+
+In the current Days tooling, the canonical key is `(time_ns, event_id)`.
+
+See also: [/docs/reference/traces/schema](/docs/reference/traces/schema).
+
+## Trace certificate contract
+
+A trace family is designed to be a **self-contained replay certificate**:
+
+Each semantic transition point emits exactly one row containing enough information to deterministically replay that transition, and (when applicable) compare the checker-computed post-state to a logged post-state snapshot.
+
+Concretely, a row should contain:
+
+- **When/where**: simulation time and stable component identity (endpoint/port/scheduler instance).
+- **What happened**: an event kind (`kind`) selecting the transition rule.
+- **Guards and parameters**: values needed to evaluate gates/thresholds; the checker rejects parameter drift.
+- **Witness/snapshot**:
+  - either a compact witness that the chosen action is legal,
+  - or an explicit snapshot of post-state needed for deterministic replay.
+
+## Acceptance by canonicalize-and-replay
+
+At a high level:
+
+1. Parse rows (and keep original CSV line numbers for diagnostics).
+2. Canonicalize by sorting on the key and rejecting duplicates.
+3. Fold a partial `step` function over the canonicalized rows.
+4. Return `ACCEPT` if every step succeeds; otherwise `REJECT` with the first failing row.
+
+This yields linear-time replay after the sort (`O(n log n)` canonicalization + `O(n)` replay).
+
+## Reusable obligation patterns
+
+Across protocol families, the same classes of obligations recur. In the paper’s terminology, these are reusable combinators/templates:
+
+- **ParamFreeze**: record per-component parameters on first use; reject mismatches later.
+- **MonotoneTime**: enforce per-component time monotonicity under canonical order.
+- **PendingMatch**: maintain pending maps for paired events (send/recv, enqueue/dequeue).
+- **Gate**: enforce interval/cooldown/refresh/epoch gating rules.
+- **Accounting**: enforce nonnegativity and conservation for counters (queue occupancy, credits, etc.).
+- **SnapshotEq**: recompute post-state under explicit encodings and compare to logged snapshot.
+
+These patterns are what make it feasible to add new checkers with relatively little duplicated structure.
