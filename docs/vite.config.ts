@@ -9,6 +9,10 @@ import { nitro } from 'nitro/vite';
 export default defineConfig({
   server: {
     port: 3000,
+    allowedHosts: ['days.sh'],
+  },
+  preview: {
+    allowedHosts: ['days.sh'],
   },
   plugins: [
     mdx(await import('./source.config')),
