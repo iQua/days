@@ -15,11 +15,12 @@ Simulation outputs are written under `log_path` (default: `./output/`) as CSV fi
 All design and configuration documentation lives under `docs/`:
 
 ```bash
-pip install -r docs/requirements.txt
-mkdocs serve -f docs/mkdocs.yml
+cd docs/
+bun install
+bun dev
+```
 
 Alternatively, one can directly visit the [documentation website](https://days.sh/docs/).
-```
 
 ## Examples
 
