@@ -79,6 +79,8 @@ pub struct Port {
 
 impl Port {
     const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+    // Start tolerance for timestamp comparisons.
+    const START_EPS_S: f64 = 1e-12;
 
     pub fn new(
         rate: f64,
@@ -316,7 +318,7 @@ impl Port {
         let packet_time = packet.time;
         self.queue.push_back(packet);
 
-        if packet_time >= self.busy_until && self.in_flight == 0 {
+        if packet_time + Self::START_EPS_S >= self.busy_until && self.in_flight == 0 {
             self.run(packet_time, cx).await;
         }
     }
