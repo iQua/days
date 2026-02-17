@@ -1,6 +1,6 @@
 [package]
 name = "days"
-version = "0.4"
+version = "0.4.0"
 description = "Days: A Performant Discrete-Event Simulator for Network Simulations"
 authors = ["Baochun Li <bli@ece.toronto.edu>"]
 repository = "https://github.com/iqua/days"
@@ -10,13 +10,15 @@ categories = ["simulation", "science"]
 license = "Apache-2.0"
 edition = "2021"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 test = []
 l2 = []
 l2_pfc = ["l2"]
 dcqcn = []
 lean = []
-perf_stats = ["nexosim/perf_stats"]
 
 [dependencies]
 csv = "1.4"
@@ -25,7 +27,7 @@ clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.18"
 indicatif-log-bridge = "0.2"
 log = "0.4"
-nexosim = { version = "0.3", features = ["tracing"] }
+nexosim = { version = "0.4.0", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [ "fmt", "env-filter", "registry" ] }
 parking_lot = "0.12"

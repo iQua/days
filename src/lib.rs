@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::Deserialize;
 
 pub mod flows;
+pub mod ffi;
 #[cfg(feature = "l2")]
 pub mod l2;
 pub mod schedulers;
