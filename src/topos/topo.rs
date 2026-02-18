@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::flows::FlowSize;
 use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
-use crate::flows::collective::{Collective, CollectiveType};
+use crate::flows::collective::{Collective, CollectiveType, build_ring_allreduce_flow_templates};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSink, PacketStatistics};
@@ -128,12 +128,6 @@ pub struct PfcLinkConfig {
 pub struct LinkConfig {
     mode: Option<LinkMode>,
     pfc: Option<PfcLinkConfig>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Scatter,
-    Gather,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -598,78 +592,31 @@ impl Topology {
             let collective_type = collective.collective_type.clone();
             match collective_type {
                 CollectiveType::RingAllReduce => {
-                    let n = collective.sources.len();
+                    let templates = build_ring_allreduce_flow_templates(&collective.sources);
                     let mut flow_id = collective.first_flow_id;
+                    for template in templates {
+                        let starts_after = template
+                            .starts_after
+                            .iter()
+                            .map(|idx| collective.first_flow_id + *idx)
+                            .collect();
 
-                    let mut last_scatter: Vec<Option<usize>> = vec![None; n];
-                    let mut last_gather: Vec<Option<usize>> = vec![None; n];
+                        let flow = Flow::new(FlowParams {
+                            id: flow_id,
+                            path: None,
+                            starts_before: Vec::new(),
+                            starts_after,
+                            flow_type: collective.flow_type.clone(),
+                            source_host: template.source_host,
+                            sink_host: template.sink_host,
+                            routing: collective.routing.clone(),
+                            traffic: collective.traffic.clone(),
+                            priority: 0,
+                            seed: collective.id,
+                        });
 
-                    for (rank, &src) in collective.sources.iter().enumerate() {
-                        let dst = collective.sources[(rank + 1) % n];
-
-                        for _step in 1..n {
-                            let mut starts_after = Vec::new();
-                            if let Some(prev_flow_id) = last_scatter[rank] {
-                                starts_after.push(prev_flow_id);
-                            }
-
-                            let flow = Flow::new(FlowParams {
-                                id: flow_id,
-                                path: None,
-                                starts_before: Vec::new(),
-                                starts_after,
-                                flow_type: collective.flow_type.clone(),
-                                source_host: src,
-                                sink_host: dst,
-                                routing: collective.routing.clone(),
-                                traffic: collective.traffic.clone(),
-                                priority: 0,
-                                seed: collective.id,
-                            });
-
-                            self.flows.push(flow);
-
-                            last_scatter[rank] = Some(flow_id);
-
-                            flow_id += 1;
-                        }
-                    }
-
-                    for (rank, &src) in collective.sources.iter().enumerate() {
-                        let dst = collective.sources[(rank + 1) % n];
-
-                        for step in 1..n {
-                            let mut starts_after = Vec::new();
-                            if let Some(prev_flow_id) = last_gather[rank] {
-                                starts_after.push(prev_flow_id);
-                            }
-
-                            if step == 1 {
-                                if let Some(scatter_flow_id) = last_scatter[rank] {
-                                    starts_after.push(scatter_flow_id);
-                                }
-                            }
-
-                            let flow = Flow::new(FlowParams {
-                                id: flow_id,
-                                path: None,
-                                starts_before: Vec::new(),
-                                starts_after,
-                                flow_type: collective.flow_type.clone(),
-                                source_host: src,
-                                sink_host: dst,
-                                routing: collective.routing.clone(),
-                                traffic: collective.traffic.clone(),
-                                priority: 0,
-                                seed: collective.id,
-                            });
-
-                            self.flows.push(flow);
-
-                            last_gather[rank] = Some(flow_id);
-
-                            flow_id += 1;
-                        }
+                        self.flows.push(flow);
+                        flow_id += 1;
                     }
 
                     collective.flow_count = flow_id - collective.first_flow_id;
@@ -1254,43 +1201,31 @@ impl Topology {
                     _ => panic!("RingAllReduce only supports byte-based flows."),
                 };
                 let n = collective.sources.len();
+                if n == 0 {
+                    continue;
+                }
                 let chunk_size = total_size / n;
+                let templates = build_ring_allreduce_flow_templates(&collective.sources);
 
-                let mut flow_id = collective.first_flow_id;
+                for (local_idx, template) in templates.iter().enumerate() {
+                    let flow_id = collective.first_flow_id + local_idx;
+                    let src_host = template.source_host;
+                    let dst_host = template.sink_host;
+                    let chunk_owner = template.chunk_owner;
+                    let chunk_offset = chunk_owner * chunk_size;
+                    let chunk_len = if chunk_owner == n - 1 {
+                        total_size - chunk_offset
+                    } else {
+                        chunk_size
+                    };
 
-                for phase in [Phase::Scatter, Phase::Gather] {
-                    for rank in 0..n {
-                        for step in 1..n {
-                            let src_host = collective.sources[rank]; // flow's sender
-                            let dst_host = collective.sources[(rank + 1) % n];
+                    // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
+                    let data_src = conn_map.entry((src_host, dst_host)).or_insert_with(|| {
+                        AppDataSource::create_source_buffer(total_size, self.app_source_cfg)
+                    });
 
-                            // which chunk travels in this hop
-                            let chunk_owner = match phase {
-                                Phase::Scatter => (rank + n - step + 1) % n,
-                                Phase::Gather => (rank + n - step) % n,
-                            };
-                            let chunk_offset = chunk_owner * chunk_size;
-                            let chunk_len = if chunk_owner == n - 1 {
-                                total_size - chunk_offset
-                            } else {
-                                chunk_size
-                            };
-
-                            // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
-                            let data_src =
-                                conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                    AppDataSource::create_source_buffer(
-                                        total_size,
-                                        self.app_source_cfg,
-                                    )
-                                });
-
-                            let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
-                            flow_id_to_source_handle.insert(flow_id, handle);
-
-                            flow_id += 1;
-                        }
-                    }
+                    let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
+                    flow_id_to_source_handle.insert(flow_id, handle);
                 }
             }
         }
