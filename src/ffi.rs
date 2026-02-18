@@ -1105,7 +1105,16 @@ impl RuntimeCore {
             return Err("runtime pointer is null".to_string());
         }
 
-        let mut ready_flows: Vec<(usize, usize, i32, i32, u64, AllReduceExecMode)> = Vec::new();
+        let mut ready_flows: Vec<(
+            usize,
+            usize,
+            i32,
+            i32,
+            u64,
+            AllReduceExecMode,
+            RingCollectiveKind,
+            usize,
+        )> = Vec::new();
         {
             let active = self
                 .active_allreduce
@@ -1123,6 +1132,8 @@ impl RuntimeCore {
                                 flow.dst,
                                 flow.bytes,
                                 AllReduceExecMode::Dag,
+                                active.collective_kind,
+                                active.ring_channels,
                             ));
                         }
                     }
@@ -1148,15 +1159,17 @@ impl RuntimeCore {
                             flow.dst,
                             flow.bytes,
                             AllReduceExecMode::NcclCompat,
+                            active.collective_kind,
+                            active.ring_channels,
                         ));
                     }
                 }
             }
         }
 
-        for (flow_index, _channel_id, src, dst, bytes, mode) in ready_flows {
+        for (flow_index, _channel_id, src, dst, bytes, mode, collective_kind, ring_channels) in ready_flows {
             let submit_delay_ns = if mode == AllReduceExecMode::NcclCompat {
-                nccl_compat_submit_delay_ns()
+                nccl_compat_submit_delay_ns_for(collective_kind, ring_channels)
             } else {
                 0
             };
@@ -1856,11 +1869,33 @@ fn trace_submit_send_max() -> usize {
         .unwrap_or(200)
 }
 
-fn nccl_compat_submit_delay_ns() -> u64 {
-    std::env::var("DAYS_NCCL_COMPAT_SUBMIT_DELAY_NS")
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(10)
+}
+
+fn nccl_compat_submit_delay_ns_for(kind: RingCollectiveKind, ring_channels: usize) -> u64 {
+    let global = env_u64("DAYS_NCCL_COMPAT_SUBMIT_DELAY_NS");
+    match kind {
+        RingCollectiveKind::AllReduce => global.unwrap_or(10),
+        RingCollectiveKind::AllGather => env_u64("DAYS_ALLGATHER_NCCL_COMPAT_SUBMIT_DELAY_NS")
+            .or(global)
+            .unwrap_or(10),
+        RingCollectiveKind::ReduceScatter => {
+            if let Some(v) = env_u64("DAYS_REDUCESCATTER_NCCL_COMPAT_SUBMIT_DELAY_NS").or(global)
+            {
+                v
+            } else if ring_channels <= 1 {
+                // Single-channel RS needs a larger submit skew to align with legacy
+                // SimAI NcclFlowModel timing.
+                38
+            } else {
+                // Multi-channel RS matches legacy timing with the baseline skew.
+                10
+            }
+        }
+    }
 }
 
 fn nccl_compat_completion_delay_ns() -> u64 {
