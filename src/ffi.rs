@@ -165,6 +165,7 @@ struct AllReduceParticipant {
 }
 
 struct PendingAllReduceRegistration {
+    collective_kind: RingCollectiveKind,
     group_size: usize,
     ranks: Vec<usize>,
     bytes: u64,
@@ -189,7 +190,37 @@ enum AllReduceExecMode {
     NcclCompat,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RingCollectiveKind {
+    AllReduce,
+    AllGather,
+    ReduceScatter,
+}
+
+impl RingCollectiveKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RingCollectiveKind::AllReduce => "allreduce",
+            RingCollectiveKind::AllGather => "allgather",
+            RingCollectiveKind::ReduceScatter => "reducescatter",
+        }
+    }
+
+    fn nccl_compat_stage_count(self, group_size: usize) -> usize {
+        let ring_steps = group_size.saturating_sub(1);
+        match self {
+            RingCollectiveKind::AllReduce => 2usize.saturating_mul(ring_steps),
+            RingCollectiveKind::AllGather | RingCollectiveKind::ReduceScatter => ring_steps,
+        }
+    }
+
+    fn uses_module_dag_templates(self) -> bool {
+        self == RingCollectiveKind::AllReduce
+    }
+}
+
 struct ActiveAllReduceCollective {
+    collective_kind: RingCollectiveKind,
     mode: AllReduceExecMode,
     group_size: usize,
     ranks: Vec<usize>,
@@ -982,8 +1013,9 @@ impl RuntimeCore {
         Ok(flows)
     }
 
-    fn build_allreduce_flows_nccl_compat(
+    fn build_ring_collective_flows_nccl_compat(
         &self,
+        collective_kind: RingCollectiveKind,
         op_id: u64,
         ranks: &[usize],
         bytes: u64,
@@ -996,7 +1028,7 @@ impl RuntimeCore {
 
         let effective_channels = ring_channels.max(1);
         let per_flow_bytes = bytes / group_size as u64 / effective_channels as u64;
-        let stage_count = 2usize.saturating_mul(group_size.saturating_sub(1));
+        let stage_count = collective_kind.nccl_compat_stage_count(group_size);
         let per_channel_flow_count = group_size.saturating_mul(stage_count);
 
         let mut flows: Vec<RuntimeCollectiveFlow> =
@@ -1028,7 +1060,8 @@ impl RuntimeCore {
                     let cur_index = channel_base + stage * group_size + rank;
                     if dep_index >= flows.len() || cur_index >= flows.len() {
                         return Err(format!(
-                            "invalid nccl_compat dependency dep={} cur={}",
+                            "invalid {} nccl_compat dependency dep={} cur={}",
+                            collective_kind.as_str(),
                             dep_index, cur_index
                         ));
                     }
@@ -1046,8 +1079,9 @@ impl RuntimeCore {
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "[TRACE][native-allreduce-compat] op_id={} group_size={} ring_channels={} input_bytes={} \
+                "[TRACE][native-{}-compat] op_id={} group_size={} ring_channels={} input_bytes={} \
                  per_flow_bytes={} stage_count={} flow_count_actual={} ring_edges={{{}}}",
+                collective_kind.as_str(),
                 op_id,
                 group_size,
                 effective_channels,
@@ -1076,7 +1110,7 @@ impl RuntimeCore {
             let active = self
                 .active_allreduce
                 .get_mut(&op_id)
-                .ok_or_else(|| format!("allreduce op {} is not active", op_id))?;
+                .ok_or_else(|| format!("collective op {} is not active", op_id))?;
             match active.mode {
                 AllReduceExecMode::Dag => {
                     for (flow_index, flow) in active.flows.iter_mut().enumerate() {
@@ -1238,7 +1272,13 @@ impl RuntimeCore {
             return 0;
         };
         match active.mode {
-            AllReduceExecMode::NcclCompat => nccl_compat_completion_delay_ns(),
+            AllReduceExecMode::NcclCompat => {
+                if active.collective_kind == RingCollectiveKind::AllReduce {
+                    nccl_compat_completion_delay_ns()
+                } else {
+                    0
+                }
+            }
             AllReduceExecMode::Dag => 0,
         }
     }
@@ -1343,16 +1383,84 @@ impl RuntimeCore {
         ring_channels: usize,
         callback: RuntimeCallback,
     ) -> Result<(), String> {
+        self.submit_ring_collective(
+            runtime_ptr,
+            RingCollectiveKind::AllReduce,
+            op_id,
+            rank,
+            ranks,
+            bytes,
+            ring_channels,
+            callback,
+        )
+    }
+
+    fn submit_allgather_collective(
+        &mut self,
+        runtime_ptr: *mut DaysRuntime,
+        op_id: u64,
+        rank: usize,
+        ranks: Vec<usize>,
+        bytes: u64,
+        ring_channels: usize,
+        callback: RuntimeCallback,
+    ) -> Result<(), String> {
+        self.submit_ring_collective(
+            runtime_ptr,
+            RingCollectiveKind::AllGather,
+            op_id,
+            rank,
+            ranks,
+            bytes,
+            ring_channels,
+            callback,
+        )
+    }
+
+    fn submit_reducescatter_collective(
+        &mut self,
+        runtime_ptr: *mut DaysRuntime,
+        op_id: u64,
+        rank: usize,
+        ranks: Vec<usize>,
+        bytes: u64,
+        ring_channels: usize,
+        callback: RuntimeCallback,
+    ) -> Result<(), String> {
+        self.submit_ring_collective(
+            runtime_ptr,
+            RingCollectiveKind::ReduceScatter,
+            op_id,
+            rank,
+            ranks,
+            bytes,
+            ring_channels,
+            callback,
+        )
+    }
+
+    fn submit_ring_collective(
+        &mut self,
+        runtime_ptr: *mut DaysRuntime,
+        collective_kind: RingCollectiveKind,
+        op_id: u64,
+        rank: usize,
+        ranks: Vec<usize>,
+        bytes: u64,
+        ring_channels: usize,
+        callback: RuntimeCallback,
+    ) -> Result<(), String> {
+        let collective_name = collective_kind.as_str();
         if runtime_ptr.is_null() {
             return Err("runtime pointer is null".to_string());
         }
 
         if ranks.is_empty() {
-            return Err("allreduce group ranks must be non-empty".to_string());
+            return Err(format!("{collective_name} group ranks must be non-empty"));
         }
         if !ranks.contains(&rank) {
             return Err(format!(
-                "allreduce registration rank {} is not in group {:?}",
+                "{collective_name} registration rank {} is not in group {:?}",
                 rank, ranks
             ));
         }
@@ -1360,7 +1468,7 @@ impl RuntimeCore {
         let mut dedup = HashSet::with_capacity(ranks.len());
         for &node in &ranks {
             if !dedup.insert(node) {
-                return Err(format!("allreduce group has duplicate node {}", node));
+                return Err(format!("{collective_name} group has duplicate node {}", node));
             }
         }
 
@@ -1371,7 +1479,7 @@ impl RuntimeCore {
         for &node in &ranks {
             if node >= topology.node_num {
                 return Err(format!(
-                    "allreduce group node {} out of range (node_num={})",
+                    "{collective_name} group node {} out of range (node_num={})",
                     node, topology.node_num
                 ));
             }
@@ -1379,26 +1487,32 @@ impl RuntimeCore {
 
         let group_size = ranks.len();
         let ring_channels = ring_channels.max(1);
-        let exec_mode = allreduce_exec_mode();
+        let exec_mode = ring_collective_exec_mode(collective_kind);
         match exec_mode {
             AllReduceExecMode::Dag => {
+                if !collective_kind.uses_module_dag_templates() {
+                    return Err(format!(
+                        "{collective_name} does not support dag mode; set DAYS_ALLREDUCE_EXEC_MODE=nccl_compat",
+                    ));
+                }
                 match self.pending_allreduce.entry(op_id) {
                     std::collections::hash_map::Entry::Occupied(mut occupied) => {
                         let entry = occupied.get_mut();
-                        if entry.group_size != group_size
+                        if entry.collective_kind != collective_kind
+                            || entry.group_size != group_size
                             || entry.ranks != ranks
                             || entry.bytes != bytes
                             || entry.ring_channels != ring_channels
                         {
                             return Err(format!(
-                                "allreduce op {} has inconsistent registrations",
-                                op_id
+                                "{} op {} has inconsistent registrations",
+                                collective_name, op_id
                             ));
                         }
                         if entry.participants.iter().any(|p| p.rank == rank) {
                             return Err(format!(
-                                "allreduce op {} duplicate registration from rank {}",
-                                op_id, rank
+                                "{} op {} duplicate registration from rank {}",
+                                collective_name, op_id, rank
                             ));
                         }
                         entry
@@ -1407,6 +1521,7 @@ impl RuntimeCore {
                     }
                     std::collections::hash_map::Entry::Vacant(vacant) => {
                         vacant.insert(PendingAllReduceRegistration {
+                            collective_kind,
                             group_size,
                             ranks: ranks.clone(),
                             bytes,
@@ -1428,7 +1543,7 @@ impl RuntimeCore {
                 let registration = self
                     .pending_allreduce
                     .remove(&op_id)
-                    .ok_or_else(|| format!("missing allreduce registration for op {}", op_id))?;
+                    .ok_or_else(|| format!("missing {collective_name} registration for op {}", op_id))?;
                 let participant_callbacks: Vec<RuntimeCallback> = registration
                     .participants
                     .iter()
@@ -1463,6 +1578,7 @@ impl RuntimeCore {
                 self.active_allreduce.insert(
                     op_id,
                     ActiveAllReduceCollective {
+                        collective_kind,
                         mode: AllReduceExecMode::Dag,
                         group_size: registration.group_size,
                         ranks: registration.ranks,
@@ -1492,21 +1608,22 @@ impl RuntimeCore {
                     let mut callback_now: Option<RuntimeCallback> = None;
                     let should_submit_more;
                     let should_remove;
-                    if active.mode != AllReduceExecMode::NcclCompat
+                    if active.collective_kind != collective_kind
+                        || active.mode != AllReduceExecMode::NcclCompat
                         || active.group_size != group_size
                         || active.ranks != ranks
                         || active.bytes != bytes
                         || active.ring_channels != ring_channels
                     {
                         return Err(format!(
-                            "allreduce op {} has inconsistent registrations",
-                            op_id
+                            "{} op {} has inconsistent registrations",
+                            collective_name, op_id
                         ));
                     }
                     if !active.registered_ranks.insert(rank) {
                         return Err(format!(
-                            "allreduce op {} duplicate registration from rank {}",
-                            op_id, rank
+                            "{} op {} duplicate registration from rank {}",
+                            collective_name, op_id, rank
                         ));
                     }
                     active.participant_callbacks_by_rank.insert(rank, callback);
@@ -1534,8 +1651,13 @@ impl RuntimeCore {
                     return self.submit_ready_allreduce_flows(runtime_ptr, op_id);
                 }
 
-                let flows =
-                    self.build_allreduce_flows_nccl_compat(op_id, &ranks, bytes, ring_channels)?;
+                let flows = self.build_ring_collective_flows_nccl_compat(
+                    collective_kind,
+                    op_id,
+                    &ranks,
+                    bytes,
+                    ring_channels,
+                )?;
                 if flows.is_empty() {
                     self.queue_callbacks_now(vec![callback]);
                     return Ok(());
@@ -1543,8 +1665,8 @@ impl RuntimeCore {
 
                 if trace_allreduce_split_enabled() {
                     eprintln!(
-                        "[TRACE][native-allreduce-mode] op_id={} mode=nccl_compat",
-                        op_id
+                        "[TRACE][native-{}-mode] op_id={} mode=nccl_compat",
+                        collective_name, op_id
                     );
                 }
 
@@ -1561,6 +1683,7 @@ impl RuntimeCore {
                 self.active_allreduce.insert(
                     op_id,
                     ActiveAllReduceCollective {
+                        collective_kind,
                         mode: AllReduceExecMode::NcclCompat,
                         group_size,
                         ranks,
@@ -1756,6 +1879,16 @@ fn allreduce_exec_mode() -> AllReduceExecMode {
             AllReduceExecMode::NcclCompat
         }
         _ => AllReduceExecMode::Dag,
+    }
+}
+
+fn ring_collective_exec_mode(kind: RingCollectiveKind) -> AllReduceExecMode {
+    match kind {
+        RingCollectiveKind::AllReduce => allreduce_exec_mode(),
+        RingCollectiveKind::AllGather | RingCollectiveKind::ReduceScatter => {
+            // Align with SimAI MockNccl ring-flow model for AG/RS by default.
+            AllReduceExecMode::NcclCompat
+        }
     }
 }
 
@@ -1974,6 +2107,84 @@ pub unsafe extern "C" fn days_net_runtime_submit_allreduce_collective(
     callback: Option<DaysCallback>,
     callback_arg: *mut c_void,
 ) -> i32 {
+    submit_ring_collective_ffi(
+        runtime,
+        RingCollectiveKind::AllReduce,
+        op_id,
+        rank,
+        group_size,
+        group_ranks,
+        bytes,
+        allreduce_channels,
+        callback,
+        callback_arg,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn days_net_runtime_submit_allgather_collective(
+    runtime: *mut DaysRuntime,
+    op_id: u64,
+    rank: i32,
+    group_size: i32,
+    group_ranks: *const i32,
+    bytes: u64,
+    allgather_channels: i32,
+    callback: Option<DaysCallback>,
+    callback_arg: *mut c_void,
+) -> i32 {
+    submit_ring_collective_ffi(
+        runtime,
+        RingCollectiveKind::AllGather,
+        op_id,
+        rank,
+        group_size,
+        group_ranks,
+        bytes,
+        allgather_channels,
+        callback,
+        callback_arg,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn days_net_runtime_submit_reducescatter_collective(
+    runtime: *mut DaysRuntime,
+    op_id: u64,
+    rank: i32,
+    group_size: i32,
+    group_ranks: *const i32,
+    bytes: u64,
+    reducescatter_channels: i32,
+    callback: Option<DaysCallback>,
+    callback_arg: *mut c_void,
+) -> i32 {
+    submit_ring_collective_ffi(
+        runtime,
+        RingCollectiveKind::ReduceScatter,
+        op_id,
+        rank,
+        group_size,
+        group_ranks,
+        bytes,
+        reducescatter_channels,
+        callback,
+        callback_arg,
+    )
+}
+
+unsafe fn submit_ring_collective_ffi(
+    runtime: *mut DaysRuntime,
+    collective_kind: RingCollectiveKind,
+    op_id: u64,
+    rank: i32,
+    group_size: i32,
+    group_ranks: *const i32,
+    bytes: u64,
+    ring_channels_raw: i32,
+    callback: Option<DaysCallback>,
+    callback_arg: *mut c_void,
+) -> i32 {
     if runtime.is_null() {
         return -1;
     }
@@ -2000,8 +2211,8 @@ pub unsafe extern "C" fn days_net_runtime_submit_allreduce_collective(
         callback,
         callback_arg: callback_arg as usize,
     };
-    let ring_channels = if allreduce_channels > 0 {
-        allreduce_channels as usize
+    let ring_channels = if ring_channels_raw > 0 {
+        ring_channels_raw as usize
     } else {
         1
     };
@@ -2012,19 +2223,42 @@ pub unsafe extern "C" fn days_net_runtime_submit_allreduce_collective(
         Err(_) => return -3,
     };
 
-    match core.submit_allreduce_collective(
-        runtime,
-        op_id,
-        rank as usize,
-        ranks,
-        bytes,
-        ring_channels,
-        callback,
-    ) {
+    let submit_result = match collective_kind {
+        RingCollectiveKind::AllReduce => core.submit_allreduce_collective(
+            runtime,
+            op_id,
+            rank as usize,
+            ranks,
+            bytes,
+            ring_channels,
+            callback,
+        ),
+        RingCollectiveKind::AllGather => core.submit_allgather_collective(
+            runtime,
+            op_id,
+            rank as usize,
+            ranks,
+            bytes,
+            ring_channels,
+            callback,
+        ),
+        RingCollectiveKind::ReduceScatter => core.submit_reducescatter_collective(
+            runtime,
+            op_id,
+            rank as usize,
+            ranks,
+            bytes,
+            ring_channels,
+            callback,
+        ),
+    };
+
+    match submit_result {
         Ok(()) => 0,
         Err(err) => {
             eprintln!(
-                "[ERROR][submit-allreduce] op_id={} rank={} group_size={} bytes={} ring_channels={} err={}",
+                "[ERROR][submit-{}] op_id={} rank={} group_size={} bytes={} ring_channels={} err={}",
+                collective_kind.as_str(),
                 op_id,
                 rank,
                 group_size,
