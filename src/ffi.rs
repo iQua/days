@@ -173,6 +173,7 @@ struct PendingAllReduceRegistration {
 }
 
 struct RuntimeCollectiveFlow {
+    channel_id: usize,
     src: i32,
     dst: i32,
     bytes: u64,
@@ -182,16 +183,44 @@ struct RuntimeCollectiveFlow {
     completed: bool,
 }
 
-struct ActiveAllReduceCollective {
-    flows: Vec<RuntimeCollectiveFlow>,
-    completed_flows: usize,
-    participant_callbacks: Vec<RuntimeCallback>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllReduceExecMode {
+    Dag,
+    NcclCompat,
 }
 
+struct ActiveAllReduceCollective {
+    mode: AllReduceExecMode,
+    group_size: usize,
+    ranks: Vec<usize>,
+    bytes: u64,
+    ring_channels: usize,
+    flows: Vec<RuntimeCollectiveFlow>,
+    qp_busy: HashSet<(usize, i32, i32)>,
+    completed_flows: usize,
+    participant_callbacks: Vec<RuntimeCallback>,
+    participant_callbacks_by_rank: HashMap<usize, RuntimeCallback>,
+    registered_ranks: HashSet<usize>,
+    remaining_local_flows: HashMap<usize, usize>,
+    notified_ranks: HashSet<usize>,
+    collective_complete: bool,
+}
+
+#[derive(Clone, Copy)]
 struct AllReduceFlowContext {
     runtime: usize,
     op_id: u64,
     flow_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AllReduceFlowSubmitContext {
+    runtime: usize,
+    op_id: u64,
+    flow_index: usize,
+    src: i32,
+    dst: i32,
+    bytes: u64,
 }
 
 struct RuntimeHostSink {
@@ -476,6 +505,7 @@ struct RuntimeCore {
     flow_meta: HashMap<usize, (usize, usize, u64)>,
     pending_allreduce: HashMap<u64, PendingAllReduceRegistration>,
     active_allreduce: HashMap<u64, ActiveAllReduceCollective>,
+    trace_submit_send_count: usize,
 }
 
 impl RuntimeCore {
@@ -494,6 +524,7 @@ impl RuntimeCore {
             flow_meta: HashMap::new(),
             pending_allreduce: HashMap::new(),
             active_allreduce: HashMap::new(),
+            trace_submit_send_count: 0,
         }
     }
 
@@ -676,11 +707,6 @@ impl RuntimeCore {
             .as_ref()
             .ok_or_else(|| "topology is not loaded".to_string())?;
 
-        let sim = self
-            .simulation
-            .as_mut()
-            .ok_or_else(|| "simulation is not initialized".to_string())?;
-
         if src < 0 || dst < 0 {
             return Err("src/dst must be non-negative".to_string());
         }
@@ -713,6 +739,46 @@ impl RuntimeCore {
         let flow_id = self.next_flow_id;
         self.next_flow_id = self.next_flow_id.saturating_add(1);
         self.flow_meta.insert(flow_id, (src, dst, bytes));
+        if trace_submit_send_enabled() {
+            let trace_idx = self.trace_submit_send_count;
+            self.trace_submit_send_count = self.trace_submit_send_count.saturating_add(1);
+            if trace_idx < trace_submit_send_max() {
+                let callback_ptr = callback.callback as usize;
+                let native_ptr = days_allreduce_flow_done_callback as usize;
+                if callback_ptr == native_ptr {
+                    let mut op_id = 0u64;
+                    let mut op_flow_index = usize::MAX;
+                    let ctx_ptr = callback.callback_arg as *const AllReduceFlowContext;
+                    if !ctx_ptr.is_null() {
+                        unsafe {
+                            op_id = (*ctx_ptr).op_id;
+                            op_flow_index = (*ctx_ptr).flow_index;
+                        }
+                    }
+                    eprintln!(
+                        "[TRACE][submit-send] idx={} t_ns={} kind=native_allreduce op_id={} op_flow={} src={} dst={} bytes={} flow_id={}",
+                        trace_idx,
+                        self.current_time_ns(),
+                        op_id,
+                        op_flow_index,
+                        src,
+                        dst,
+                        bytes,
+                        flow_id
+                    );
+                } else {
+                    eprintln!(
+                        "[TRACE][submit-send] idx={} t_ns={} kind=ffi_send src={} dst={} bytes={} flow_id={}",
+                        trace_idx,
+                        self.current_time_ns(),
+                        src,
+                        dst,
+                        bytes,
+                        flow_id
+                    );
+                }
+            }
+        }
 
         self.pending_events.fetch_add(1, AtomicOrdering::Relaxed);
 
@@ -723,6 +789,11 @@ impl RuntimeCore {
                 .map_err(|_| "failed to lock inflight callback map".to_string())?;
             inflight.insert(flow_id, callback);
         }
+
+        let sim = self
+            .simulation
+            .as_mut()
+            .ok_or_else(|| "simulation is not initialized".to_string())?;
 
         for hop in path.windows(2) {
             let current = hop[0];
@@ -795,6 +866,16 @@ impl RuntimeCore {
         }
     }
 
+    fn pending_callbacks_from_active(active: ActiveAllReduceCollective) -> Vec<RuntimeCallback> {
+        let mut callbacks = active.participant_callbacks;
+        for (rank, callback) in active.participant_callbacks_by_rank {
+            if !active.notified_ranks.contains(&rank) {
+                callbacks.push(callback);
+            }
+        }
+        callbacks
+    }
+
     fn build_allreduce_flows_from_module(
         &self,
         op_id: u64,
@@ -817,10 +898,11 @@ impl RuntimeCore {
         let mut flows: Vec<RuntimeCollectiveFlow> =
             Vec::with_capacity(templates.len().saturating_mul(effective_channels));
 
-        for _channel in 0..effective_channels {
+        for channel_id in 0..effective_channels {
             let channel_base = flows.len();
             for template in templates.iter() {
                 flows.push(RuntimeCollectiveFlow {
+                    channel_id,
                     src: template.source_host as i32,
                     dst: template.sink_host as i32,
                     bytes: per_flow_bytes,
@@ -900,6 +982,86 @@ impl RuntimeCore {
         Ok(flows)
     }
 
+    fn build_allreduce_flows_nccl_compat(
+        &self,
+        op_id: u64,
+        ranks: &[usize],
+        bytes: u64,
+        ring_channels: usize,
+    ) -> Result<Vec<RuntimeCollectiveFlow>, String> {
+        let group_size = ranks.len();
+        if group_size <= 1 {
+            return Ok(Vec::new());
+        }
+
+        let effective_channels = ring_channels.max(1);
+        let per_flow_bytes = bytes / group_size as u64 / effective_channels as u64;
+        let stage_count = 2usize.saturating_mul(group_size.saturating_sub(1));
+        let per_channel_flow_count = group_size.saturating_mul(stage_count);
+
+        let mut flows: Vec<RuntimeCollectiveFlow> =
+            Vec::with_capacity(per_channel_flow_count.saturating_mul(effective_channels));
+
+        for channel_id in 0..effective_channels {
+            let channel_base = flows.len();
+            for _stage in 0..stage_count {
+                for rank in 0..group_size {
+                    flows.push(RuntimeCollectiveFlow {
+                        channel_id,
+                        src: ranks[rank] as i32,
+                        dst: ranks[(rank + 1) % group_size] as i32,
+                        bytes: per_flow_bytes,
+                        remaining_prereqs: 0,
+                        dependents: Vec::new(),
+                        submitted: false,
+                        completed: false,
+                    });
+                }
+            }
+
+            // Match MockNccl ring-flow model: each stage t flow on rank r depends on
+            // stage t-1 flow on rank prev(r), forming the ring wavefront.
+            for stage in 1..stage_count {
+                for rank in 0..group_size {
+                    let prev_rank = (rank + group_size - 1) % group_size;
+                    let dep_index = channel_base + (stage - 1) * group_size + prev_rank;
+                    let cur_index = channel_base + stage * group_size + rank;
+                    if dep_index >= flows.len() || cur_index >= flows.len() {
+                        return Err(format!(
+                            "invalid nccl_compat dependency dep={} cur={}",
+                            dep_index, cur_index
+                        ));
+                    }
+                    flows[cur_index].remaining_prereqs = 1;
+                    flows[dep_index].dependents.push(cur_index);
+                }
+            }
+        }
+
+        if trace_allreduce_split_enabled() {
+            let ring_edges = ranks
+                .iter()
+                .enumerate()
+                .map(|(idx, &src)| format!("{src}->{}", ranks[(idx + 1) % group_size]))
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "[TRACE][native-allreduce-compat] op_id={} group_size={} ring_channels={} input_bytes={} \
+                 per_flow_bytes={} stage_count={} flow_count_actual={} ring_edges={{{}}}",
+                op_id,
+                group_size,
+                effective_channels,
+                bytes,
+                per_flow_bytes,
+                stage_count,
+                flows.len(),
+                ring_edges
+            );
+        }
+
+        Ok(flows)
+    }
+
     fn submit_ready_allreduce_flows(
         &mut self,
         runtime_ptr: *mut DaysRuntime,
@@ -909,34 +1071,78 @@ impl RuntimeCore {
             return Err("runtime pointer is null".to_string());
         }
 
-        let mut ready_flows: Vec<(usize, i32, i32, u64)> = Vec::new();
+        let mut ready_flows: Vec<(usize, usize, i32, i32, u64, AllReduceExecMode)> = Vec::new();
         {
             let active = self
                 .active_allreduce
                 .get_mut(&op_id)
                 .ok_or_else(|| format!("allreduce op {} is not active", op_id))?;
-            for (flow_index, flow) in active.flows.iter_mut().enumerate() {
-                if !flow.submitted && !flow.completed && flow.remaining_prereqs == 0 {
-                    flow.submitted = true;
-                    ready_flows.push((flow_index, flow.src, flow.dst, flow.bytes));
+            match active.mode {
+                AllReduceExecMode::Dag => {
+                    for (flow_index, flow) in active.flows.iter_mut().enumerate() {
+                        if !flow.submitted && !flow.completed && flow.remaining_prereqs == 0 {
+                            flow.submitted = true;
+                            ready_flows.push((
+                                flow_index,
+                                flow.channel_id,
+                                flow.src,
+                                flow.dst,
+                                flow.bytes,
+                                AllReduceExecMode::Dag,
+                            ));
+                        }
+                    }
+                }
+                AllReduceExecMode::NcclCompat => {
+                    for (flow_index, flow) in active.flows.iter_mut().enumerate() {
+                        if flow.submitted || flow.completed || flow.remaining_prereqs != 0 {
+                            continue;
+                        }
+                        if !active.registered_ranks.contains(&(flow.src as usize)) {
+                            continue;
+                        }
+                        let qp_key = (flow.channel_id, flow.src, flow.dst);
+                        if active.qp_busy.contains(&qp_key) {
+                            continue;
+                        }
+                        flow.submitted = true;
+                        active.qp_busy.insert(qp_key);
+                        ready_flows.push((
+                            flow_index,
+                            flow.channel_id,
+                            flow.src,
+                            flow.dst,
+                            flow.bytes,
+                            AllReduceExecMode::NcclCompat,
+                        ));
+                    }
                 }
             }
         }
 
-        for (flow_index, src, dst, bytes) in ready_flows {
-            let flow_ctx = AllReduceFlowContext {
-                runtime: runtime_ptr as usize,
-                op_id,
-                flow_index,
+        for (flow_index, _channel_id, src, dst, bytes, mode) in ready_flows {
+            let submit_delay_ns = if mode == AllReduceExecMode::NcclCompat {
+                nccl_compat_submit_delay_ns()
+            } else {
+                0
             };
-            let callback = RuntimeCallback {
-                callback: days_allreduce_flow_done_callback,
-                callback_arg: Box::into_raw(Box::new(flow_ctx)) as usize,
+            let submit_result = if submit_delay_ns > 0 {
+                self.schedule_allreduce_flow_submission(
+                    runtime_ptr,
+                    op_id,
+                    flow_index,
+                    src,
+                    dst,
+                    bytes,
+                    submit_delay_ns,
+                )
+            } else {
+                self.submit_allreduce_flow_transport(runtime_ptr, op_id, flow_index, src, dst, bytes)
             };
-            if let Err(err) = self.submit_send(src, dst, bytes, callback) {
+            if let Err(err) = submit_result {
                 let active = self.active_allreduce.remove(&op_id);
                 if let Some(active) = active {
-                    self.queue_callbacks_now(active.participant_callbacks);
+                    self.queue_callbacks_now(Self::pending_callbacks_from_active(active));
                 }
                 return Err(format!("failed to submit allreduce flow: {err}"));
             }
@@ -945,13 +1151,107 @@ impl RuntimeCore {
         Ok(())
     }
 
+    fn submit_allreduce_flow_transport(
+        &mut self,
+        runtime_ptr: *mut DaysRuntime,
+        op_id: u64,
+        flow_index: usize,
+        src: i32,
+        dst: i32,
+        bytes: u64,
+    ) -> Result<(), String> {
+        let Some(active) = self.active_allreduce.get(&op_id) else {
+            return Ok(());
+        };
+        if flow_index >= active.flows.len() {
+            return Ok(());
+        }
+        let flow = &active.flows[flow_index];
+        if flow.completed || !flow.submitted {
+            return Ok(());
+        }
+
+        let flow_ctx = AllReduceFlowContext {
+            runtime: runtime_ptr as usize,
+            op_id,
+            flow_index,
+        };
+        let callback = RuntimeCallback {
+            callback: days_allreduce_flow_done_callback,
+            callback_arg: Box::into_raw(Box::new(flow_ctx)) as usize,
+        };
+        self.submit_send(src, dst, bytes, callback)
+    }
+
+    fn schedule_allreduce_flow_submission(
+        &mut self,
+        runtime_ptr: *mut DaysRuntime,
+        op_id: u64,
+        flow_index: usize,
+        src: i32,
+        dst: i32,
+        bytes: u64,
+        delay_ns: u64,
+    ) -> Result<(), String> {
+        let submit_ctx = AllReduceFlowSubmitContext {
+            runtime: runtime_ptr as usize,
+            op_id,
+            flow_index,
+            src,
+            dst,
+            bytes,
+        };
+        let callback = RuntimeCallback {
+            callback: days_allreduce_flow_submit_callback,
+            callback_arg: Box::into_raw(Box::new(submit_ctx)) as usize,
+        };
+        self.schedule_event(delay_ns, callback)
+    }
+
+    fn dispatch_allreduce_flow_submission(
+        &mut self,
+        runtime_ptr: *mut DaysRuntime,
+        submit_ctx: AllReduceFlowSubmitContext,
+    ) {
+        let submit_result = self.submit_allreduce_flow_transport(
+            runtime_ptr,
+            submit_ctx.op_id,
+            submit_ctx.flow_index,
+            submit_ctx.src,
+            submit_ctx.dst,
+            submit_ctx.bytes,
+        );
+        if let Err(err) = submit_result {
+            let active = self.active_allreduce.remove(&submit_ctx.op_id);
+            if let Some(active) = active {
+                self.queue_callbacks_now(Self::pending_callbacks_from_active(active));
+            }
+            eprintln!(
+                "[ERROR][submit-allreduce] op_id={} flow_index={} err={}",
+                submit_ctx.op_id, submit_ctx.flow_index, err
+            );
+        }
+    }
+
+    fn allreduce_completion_delay_ns(&self, op_id: u64) -> u64 {
+        let Some(active) = self.active_allreduce.get(&op_id) else {
+            return 0;
+        };
+        match active.mode {
+            AllReduceExecMode::NcclCompat => nccl_compat_completion_delay_ns(),
+            AllReduceExecMode::Dag => 0,
+        }
+    }
+
     fn complete_allreduce_flow(
         &mut self,
         runtime_ptr: *mut DaysRuntime,
         op_id: u64,
         flow_index: usize,
     ) {
-        let mut completion_callbacks: Option<Vec<RuntimeCallback>> = None;
+        let mut completion_callbacks: Vec<RuntimeCallback> = Vec::new();
+        let mut collective_complete = false;
+        let mut should_remove = false;
         {
             let active = match self.active_allreduce.get_mut(&op_id) {
                 Some(active) => active,
@@ -974,14 +1274,52 @@ impl RuntimeCore {
                 }
             }
 
-            if active.completed_flows == active.flows.len() {
-                completion_callbacks = Some(active.participant_callbacks.clone());
+            let flow = &active.flows[flow_index];
+            let src_rank = flow.src as usize;
+            let dst_rank = flow.dst as usize;
+            if active.mode == AllReduceExecMode::NcclCompat {
+                active.qp_busy.remove(&(flow.channel_id, flow.src, flow.dst));
+
+                for rank in [src_rank, dst_rank] {
+                    if let Some(remaining) = active.remaining_local_flows.get_mut(&rank) {
+                        if *remaining > 0 {
+                            *remaining -= 1;
+                        }
+                        if *remaining == 0 && active.notified_ranks.insert(rank) {
+                            if let Some(callback) = active.participant_callbacks_by_rank.get(&rank)
+                            {
+                                completion_callbacks.push(*callback);
+                            }
+                        }
+                    }
+                }
             }
+
+            if active.completed_flows == active.flows.len() {
+                active.collective_complete = true;
+                if active.mode == AllReduceExecMode::Dag {
+                    completion_callbacks.extend(active.participant_callbacks.clone());
+                }
+            }
+            collective_complete = active.collective_complete;
+            should_remove = match active.mode {
+                AllReduceExecMode::Dag => active.collective_complete,
+                AllReduceExecMode::NcclCompat => {
+                    active.collective_complete
+                        && active.registered_ranks.len() == active.group_size
+                        && active.notified_ranks.len() == active.group_size
+                }
+            };
         }
 
-        if let Some(callbacks) = completion_callbacks {
+        if !completion_callbacks.is_empty() {
+            self.queue_callbacks_now(completion_callbacks);
+        }
+        if should_remove {
             self.active_allreduce.remove(&op_id);
-            self.queue_callbacks_now(callbacks);
+            return;
+        }
+        if collective_complete {
             return;
         }
 
@@ -990,7 +1328,7 @@ impl RuntimeCore {
             .is_err()
         {
             if let Some(active) = self.active_allreduce.remove(&op_id) {
-                self.queue_callbacks_now(active.participant_callbacks);
+                self.queue_callbacks_now(Self::pending_callbacks_from_active(active));
             }
         }
     }
@@ -1041,85 +1379,208 @@ impl RuntimeCore {
 
         let group_size = ranks.len();
         let ring_channels = ring_channels.max(1);
-        match self.pending_allreduce.entry(op_id) {
-            std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                let entry = occupied.get_mut();
-                if entry.group_size != group_size
-                    || entry.ranks != ranks
-                    || entry.bytes != bytes
-                    || entry.ring_channels != ring_channels
-                {
-                    return Err(format!(
-                        "allreduce op {} has inconsistent registrations",
-                        op_id
-                    ));
+        let exec_mode = allreduce_exec_mode();
+        match exec_mode {
+            AllReduceExecMode::Dag => {
+                match self.pending_allreduce.entry(op_id) {
+                    std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                        let entry = occupied.get_mut();
+                        if entry.group_size != group_size
+                            || entry.ranks != ranks
+                            || entry.bytes != bytes
+                            || entry.ring_channels != ring_channels
+                        {
+                            return Err(format!(
+                                "allreduce op {} has inconsistent registrations",
+                                op_id
+                            ));
+                        }
+                        if entry.participants.iter().any(|p| p.rank == rank) {
+                            return Err(format!(
+                                "allreduce op {} duplicate registration from rank {}",
+                                op_id, rank
+                            ));
+                        }
+                        entry
+                            .participants
+                            .push(AllReduceParticipant { rank, callback });
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        vacant.insert(PendingAllReduceRegistration {
+                            group_size,
+                            ranks: ranks.clone(),
+                            bytes,
+                            ring_channels,
+                            participants: vec![AllReduceParticipant { rank, callback }],
+                        });
+                    }
                 }
-                if entry.participants.iter().any(|p| p.rank == rank) {
-                    return Err(format!(
-                        "allreduce op {} duplicate registration from rank {}",
-                        op_id, rank
-                    ));
+
+                let ready_to_start = self
+                    .pending_allreduce
+                    .get(&op_id)
+                    .map(|entry| entry.participants.len() == entry.group_size)
+                    .unwrap_or(false);
+                if !ready_to_start {
+                    return Ok(());
                 }
-                entry
+
+                let registration = self
+                    .pending_allreduce
+                    .remove(&op_id)
+                    .ok_or_else(|| format!("missing allreduce registration for op {}", op_id))?;
+                let participant_callbacks: Vec<RuntimeCallback> = registration
                     .participants
-                    .push(AllReduceParticipant { rank, callback });
+                    .iter()
+                    .map(|p| p.callback)
+                    .collect();
+
+                if registration.group_size <= 1 || registration.bytes == 0 {
+                    self.queue_callbacks_now(participant_callbacks);
+                    return Ok(());
+                }
+
+                let flows = self.build_allreduce_flows_from_module(
+                    op_id,
+                    &registration.ranks,
+                    registration.bytes,
+                    registration.ring_channels,
+                )?;
+                if flows.is_empty() {
+                    self.queue_callbacks_now(participant_callbacks);
+                    return Ok(());
+                }
+
+                if trace_allreduce_split_enabled() {
+                    eprintln!("[TRACE][native-allreduce-mode] op_id={} mode=dag", op_id);
+                }
+
+                let mut registered_ranks = HashSet::with_capacity(registration.group_size);
+                for participant in &registration.participants {
+                    registered_ranks.insert(participant.rank);
+                }
+
+                self.active_allreduce.insert(
+                    op_id,
+                    ActiveAllReduceCollective {
+                        mode: AllReduceExecMode::Dag,
+                        group_size: registration.group_size,
+                        ranks: registration.ranks,
+                        bytes: registration.bytes,
+                        ring_channels: registration.ring_channels,
+                        flows,
+                        qp_busy: HashSet::new(),
+                        completed_flows: 0,
+                        participant_callbacks,
+                        participant_callbacks_by_rank: HashMap::new(),
+                        registered_ranks,
+                        remaining_local_flows: HashMap::new(),
+                        notified_ranks: HashSet::new(),
+                        collective_complete: false,
+                    },
+                );
+
+                self.submit_ready_allreduce_flows(runtime_ptr, op_id)
             }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(PendingAllReduceRegistration {
-                    group_size,
-                    ranks: ranks.clone(),
-                    bytes,
-                    ring_channels,
-                    participants: vec![AllReduceParticipant { rank, callback }],
-                });
+            AllReduceExecMode::NcclCompat => {
+                if group_size <= 1 || bytes == 0 {
+                    self.queue_callbacks_now(vec![callback]);
+                    return Ok(());
+                }
+
+                if let Some(active) = self.active_allreduce.get_mut(&op_id) {
+                    let mut callback_now: Option<RuntimeCallback> = None;
+                    let should_submit_more;
+                    let should_remove;
+                    if active.mode != AllReduceExecMode::NcclCompat
+                        || active.group_size != group_size
+                        || active.ranks != ranks
+                        || active.bytes != bytes
+                        || active.ring_channels != ring_channels
+                    {
+                        return Err(format!(
+                            "allreduce op {} has inconsistent registrations",
+                            op_id
+                        ));
+                    }
+                    if !active.registered_ranks.insert(rank) {
+                        return Err(format!(
+                            "allreduce op {} duplicate registration from rank {}",
+                            op_id, rank
+                        ));
+                    }
+                    active.participant_callbacks_by_rank.insert(rank, callback);
+                    if active.remaining_local_flows.get(&rank).copied().unwrap_or(0) == 0
+                        && active.notified_ranks.insert(rank)
+                    {
+                        callback_now = Some(callback);
+                    }
+
+                    should_remove = active.collective_complete
+                        && active.registered_ranks.len() == active.group_size
+                        && active.notified_ranks.len() == active.group_size;
+                    should_submit_more = !active.collective_complete;
+
+                    if let Some(cb) = callback_now {
+                        self.queue_callbacks_now(vec![cb]);
+                    }
+                    if should_remove {
+                        self.active_allreduce.remove(&op_id);
+                        return Ok(());
+                    }
+                    if !should_submit_more {
+                        return Ok(());
+                    }
+                    return self.submit_ready_allreduce_flows(runtime_ptr, op_id);
+                }
+
+                let flows =
+                    self.build_allreduce_flows_nccl_compat(op_id, &ranks, bytes, ring_channels)?;
+                if flows.is_empty() {
+                    self.queue_callbacks_now(vec![callback]);
+                    return Ok(());
+                }
+
+                if trace_allreduce_split_enabled() {
+                    eprintln!(
+                        "[TRACE][native-allreduce-mode] op_id={} mode=nccl_compat",
+                        op_id
+                    );
+                }
+
+                let mut registered_ranks = HashSet::with_capacity(group_size);
+                registered_ranks.insert(rank);
+                let mut callbacks_by_rank = HashMap::with_capacity(group_size);
+                callbacks_by_rank.insert(rank, callback);
+                let mut remaining_local_flows = HashMap::with_capacity(group_size);
+                for flow in &flows {
+                    *remaining_local_flows.entry(flow.src as usize).or_insert(0) += 1;
+                    *remaining_local_flows.entry(flow.dst as usize).or_insert(0) += 1;
+                }
+
+                self.active_allreduce.insert(
+                    op_id,
+                    ActiveAllReduceCollective {
+                        mode: AllReduceExecMode::NcclCompat,
+                        group_size,
+                        ranks,
+                        bytes,
+                        ring_channels,
+                        flows,
+                        qp_busy: HashSet::new(),
+                        completed_flows: 0,
+                        participant_callbacks: Vec::new(),
+                        participant_callbacks_by_rank: callbacks_by_rank,
+                        registered_ranks,
+                        remaining_local_flows,
+                        notified_ranks: HashSet::new(),
+                        collective_complete: false,
+                    },
+                );
+
+                self.submit_ready_allreduce_flows(runtime_ptr, op_id)
             }
         }
-
-        let ready_to_start = self
-            .pending_allreduce
-            .get(&op_id)
-            .map(|entry| entry.participants.len() == entry.group_size)
-            .unwrap_or(false);
-        if !ready_to_start {
-            return Ok(());
-        }
-
-        let registration = self
-            .pending_allreduce
-            .remove(&op_id)
-            .ok_or_else(|| format!("missing allreduce registration for op {}", op_id))?;
-        let participant_callbacks: Vec<RuntimeCallback> = registration
-            .participants
-            .iter()
-            .map(|p| p.callback)
-            .collect();
-
-        if registration.group_size <= 1 || registration.bytes == 0 {
-            self.queue_callbacks_now(participant_callbacks);
-            return Ok(());
-        }
-
-        let flows = self.build_allreduce_flows_from_module(
-            op_id,
-            &registration.ranks,
-            registration.bytes,
-            registration.ring_channels,
-        )?;
-        if flows.is_empty() {
-            self.queue_callbacks_now(participant_callbacks);
-            return Ok(());
-        }
-
-        self.active_allreduce.insert(
-            op_id,
-            ActiveAllReduceCollective {
-                flows,
-                completed_flows: 0,
-                participant_callbacks,
-            },
-        );
-
-        self.submit_ready_allreduce_flows(runtime_ptr, op_id)
     }
 }
 
@@ -1135,6 +1596,45 @@ impl DaysRuntime {
     }
 }
 
+fn complete_allreduce_flow_from_ctx(runtime_ptr: *mut DaysRuntime, flow_ctx: AllReduceFlowContext) {
+    if runtime_ptr.is_null() {
+        return;
+    }
+    let runtime = unsafe { &*runtime_ptr };
+    let mut core = match runtime.core.lock() {
+        Ok(core) => core,
+        Err(_) => return,
+    };
+    core.complete_allreduce_flow(runtime_ptr, flow_ctx.op_id, flow_ctx.flow_index);
+}
+
+unsafe extern "C" fn days_allreduce_flow_submit_callback(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+
+    let submit_ctx = Box::from_raw(arg as *mut AllReduceFlowSubmitContext);
+    let runtime_ptr = submit_ctx.runtime as *mut DaysRuntime;
+    if runtime_ptr.is_null() {
+        return;
+    }
+
+    let runtime = &*runtime_ptr;
+    let mut core = match runtime.core.lock() {
+        Ok(core) => core,
+        Err(_) => return,
+    };
+    core.dispatch_allreduce_flow_submission(runtime_ptr, *submit_ctx);
+}
+
+unsafe extern "C" fn days_allreduce_flow_complete_callback(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let flow_ctx = Box::from_raw(arg as *mut AllReduceFlowContext);
+    complete_allreduce_flow_from_ctx(flow_ctx.runtime as *mut DaysRuntime, *flow_ctx);
+}
+
 unsafe extern "C" fn days_allreduce_flow_done_callback(arg: *mut c_void) {
     if arg.is_null() {
         return;
@@ -1146,12 +1646,31 @@ unsafe extern "C" fn days_allreduce_flow_done_callback(arg: *mut c_void) {
         return;
     }
 
-    let runtime = &*runtime_ptr;
-    let mut core = match runtime.core.lock() {
-        Ok(core) => core,
-        Err(_) => return,
+    let delay_ns = {
+        let runtime = &*runtime_ptr;
+        let mut core = match runtime.core.lock() {
+            Ok(core) => core,
+            Err(_) => return,
+        };
+        let delay_ns = core.allreduce_completion_delay_ns(flow_ctx.op_id);
+        if delay_ns > 0 {
+            let callback = RuntimeCallback {
+                callback: days_allreduce_flow_complete_callback,
+                callback_arg: Box::into_raw(Box::new(*flow_ctx)) as usize,
+            };
+            if core.schedule_event(delay_ns, callback).is_ok() {
+                return;
+            }
+        }
+        delay_ns
     };
-    core.complete_allreduce_flow(runtime_ptr, flow_ctx.op_id, flow_ctx.flow_index);
+    if delay_ns > 0 {
+        eprintln!(
+            "[WARN][native-allreduce] failed to schedule delayed completion for op_id={} flow_index={}; completing immediately",
+            flow_ctx.op_id, flow_ctx.flow_index
+        );
+    }
+    complete_allreduce_flow_from_ctx(runtime_ptr, *flow_ctx);
 }
 
 fn endpoint_id(node_num: usize, node_id: usize) -> usize {
@@ -1195,6 +1714,49 @@ fn trace_allreduce_split_max_flows() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(12)
+}
+
+fn trace_submit_send_enabled() -> bool {
+    std::env::var("DAYS_TRACE_SUBMIT_SEND")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && normalized != "0" && normalized != "false"
+        })
+        .unwrap_or(false)
+}
+
+fn trace_submit_send_max() -> usize {
+    std::env::var("DAYS_TRACE_SUBMIT_SEND_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(200)
+}
+
+fn nccl_compat_submit_delay_ns() -> u64 {
+    std::env::var("DAYS_NCCL_COMPAT_SUBMIT_DELAY_NS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(10)
+}
+
+fn nccl_compat_completion_delay_ns() -> u64 {
+    std::env::var("DAYS_NCCL_COMPAT_COMPLETION_DELAY_NS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn allreduce_exec_mode() -> AllReduceExecMode {
+    let raw = std::env::var("DAYS_ALLREDUCE_EXEC_MODE")
+        .or_else(|_| std::env::var("DAYS_ALLREDUCE_MODEL"))
+        .unwrap_or_else(|_| "dag".to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "nccl_compat" | "nccl-treeflow" | "nccltreeflow" | "treeflow" | "compat" => {
+            AllReduceExecMode::NcclCompat
+        }
+        _ => AllReduceExecMode::Dag,
+    }
 }
 
 fn next_non_empty_line<I>(lines: &mut I) -> Result<Option<String>, String>
@@ -1460,7 +2022,18 @@ pub unsafe extern "C" fn days_net_runtime_submit_allreduce_collective(
         callback,
     ) {
         Ok(()) => 0,
-        Err(_) => -3,
+        Err(err) => {
+            eprintln!(
+                "[ERROR][submit-allreduce] op_id={} rank={} group_size={} bytes={} ring_channels={} err={}",
+                op_id,
+                rank,
+                group_size,
+                bytes,
+                ring_channels,
+                err
+            );
+            -3
+        }
     }
 }
 
