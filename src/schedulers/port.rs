@@ -81,6 +81,8 @@ impl Port {
     const DEFAULT_RUN_BATCH_SIZE: usize = 64;
     // Start tolerance for timestamp comparisons.
     const START_EPS_S: f64 = 1e-12;
+    // Keep scheduled events strictly in the future at nexosim's nanosecond granularity.
+    const MIN_SCHEDULE_DELAY_S: f64 = 1e-9;
 
     pub fn new(
         rate: f64,
@@ -399,7 +401,7 @@ impl Port {
 
                 self.packet_sent(departure_time, &packet);
 
-                let delay = (departure_time - run_time).max(0.0);
+                let delay = (departure_time - run_time).max(Self::MIN_SCHEDULE_DELAY_S);
                 schedule.push((Duration::from_secs_f64(delay), packet));
 
                 self.in_flight += 1;
