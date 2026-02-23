@@ -11,6 +11,47 @@ Days is built around a small set of concepts:
 
 Days uses the `nexosim` crate as the simulation engine. Each actor implements `nexosim::model::Model` and receives messages through connected `Output<T>` ports and `Mailbox<T>` mailboxes.
 
+## Bird's-eye architecture
+
+The following diagram shows the high-level structure of Days and how the major runtime pieces interact.
+
+```mermaid
+flowchart LR
+  CFG[Simulation config TOML]
+  CLI[days CLI or binary]
+  OUT[CSV reports and protocol traces]
+
+  subgraph REPO[Days repository]
+    direction TB
+    TOP[Topology builder src/topos]
+    FLO[Flows src/flows]
+    SW[Switches src/switches]
+    SCH[Schedulers src/schedulers]
+    L2[Optional L2/PFC src/l2]
+    OBS[Observability src/utils]
+    SIM[nexosim simulation engine]
+  end
+
+  CFG --> TOP
+  CLI --> TOP
+  TOP -->|instantiate and wire models| SIM
+
+  SIM --> FLO
+  SIM --> SW
+  SIM --> SCH
+  SIM --> L2
+
+  FLO -->|packets and control| SW
+  SW -->|per-hop forwarding| SCH
+  SCH -->|next hop| SW
+
+  SCH -->|when PFC enabled| L2
+  L2 --> SW
+
+  SIM -->|periodic report events| OBS
+  OBS --> OUT
+```
+
 ## Main components
 
 - **Topology builder** (`src/topos/`): parses the TOML config, builds the network graph, instantiates models, wires ports, and runs the simulation.
