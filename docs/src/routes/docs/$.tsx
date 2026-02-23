@@ -8,6 +8,7 @@ import defaultMdxComponents from 'fumadocs-ui/mdx';
 import { baseOptions } from '@/lib/layout.shared';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
 import { Suspense } from 'react';
+import { Mermaid } from '@/components/mdx/mermaid';
 
 export const Route = createFileRoute('/docs/$')({
   component: Page,
@@ -49,6 +50,7 @@ const clientLoader = browserCollections.docs.createClientLoader({
           <MDX
             components={{
               ...defaultMdxComponents,
+              Mermaid,
             }}
           />
         </DocsBody>
