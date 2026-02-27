@@ -741,6 +741,7 @@ impl Simulation {
         let mut has_events = false;
         let max_groups_per_step_task = self.max_groups_per_step_task;
         let use_bundling = max_groups_per_step_task > 1;
+        let allow_direct_fast_spawn = !use_bundling && !self.executor.is_multi_threaded();
         let mut bundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
         let mut bundle_seq = SeqFuture::new();
         let mut bundle_len = 0usize;
@@ -782,6 +783,8 @@ impl Simulation {
                 actions_this_step += 1;
             }
 
+            let mut candidate_next = peek_next_key(&mut scheduler_queue);
+
             let first_fut = match item {
                 QueueItem::Event(event) => {
                     #[cfg(feature = "perf_stats")]
@@ -808,6 +811,22 @@ impl Simulation {
                         source.future_owned(event.arg, event.key)?
                     }
                 }
+                QueueItem::FastEvent(event)
+                    if allow_direct_fast_spawn && candidate_next != Some(current_key) =>
+                {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        scheduled_fast_this_step += 1;
+                        groups_this_step += 1;
+                    }
+
+                    // Dominant hot path in Days ST/MT runs: singleton fast events.
+                    // Spawn directly to avoid transient future boxing.
+                    event.spawn_and_forget(&self.executor);
+                    has_events = true;
+                    next_key = candidate_next;
+                    continue;
+                }
                 QueueItem::FastEvent(event) => {
                     #[cfg(feature = "perf_stats")]
                     {
@@ -830,7 +849,6 @@ impl Simulation {
                 }
             };
 
-            let mut candidate_next = peek_next_key(&mut scheduler_queue);
             if candidate_next != Some(current_key) {
                 // Fast path: singleton group.
                 push_group_future(first_fut);

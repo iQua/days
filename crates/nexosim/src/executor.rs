@@ -165,6 +165,10 @@ impl Executor {
         }
     }
 
+    pub(crate) fn is_multi_threaded(&self) -> bool {
+        matches!(self, Self::MtExecutor(_))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn is_quiescent(&self) -> bool {
         match self {
