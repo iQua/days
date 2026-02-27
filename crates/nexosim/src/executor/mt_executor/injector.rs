@@ -86,6 +86,7 @@ impl<T, const BUCKET_CAPACITY: usize> Injector<T, BUCKET_CAPACITY> {
     /// Inserts multiple tasks while taking the injector lock only once.
     ///
     /// This amortizes mutex overhead in workloads that spawn many tiny tasks.
+    #[allow(dead_code)]
     pub(crate) fn insert_tasks<I>(&self, tasks: I)
     where
         I: IntoIterator<Item = T>,

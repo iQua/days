@@ -117,6 +117,7 @@ impl Executor {
     }
 
     /// Spawns many tasks, amortizing external call overhead.
+    #[allow(dead_code)]
     pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
     where
         I: IntoIterator<Item = T>,
@@ -161,10 +162,12 @@ impl Executor {
         res
     }
 
+    #[allow(dead_code)]
     pub(super) fn executor_id(&self) -> usize {
         self.inner.as_ref().unwrap().context.executor_id
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_quiescent(&self) -> bool {
         true
     }

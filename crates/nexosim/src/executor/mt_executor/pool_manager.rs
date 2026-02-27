@@ -118,6 +118,7 @@ impl PoolManager {
 
     /// Unparks an idle worker selected from the provided mask and marks it as
     /// active. Returns `true` if a worker was activated.
+    #[allow(dead_code)]
     pub(super) fn try_activate_from_mask(&self, mask: usize) -> bool {
         let mask = mask & self.all_workers_mask();
         if mask == 0 {
@@ -210,6 +211,7 @@ impl PoolManager {
         self.active_workers.store(0, Ordering::Release);
     }
 
+    #[allow(dead_code)]
     fn all_workers_mask(&self) -> usize {
         if self.pool_size == usize::BITS as usize {
             !0
@@ -218,6 +220,7 @@ impl PoolManager {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn pool_size(&self) -> usize {
         self.pool_size
     }

@@ -293,12 +293,12 @@ pub use sink::{
 };
 pub use source::{EventSource, QuerySource, ReplyReader};
 
-pub(crate) use output::PORT_REG;
 pub(crate) use source::{ReplyWriter, query_replier};
 
 /// Compatibility event sink that mirrors the old `EventSlot` convenience API.
 ///
 /// It keeps only the latest event and exposes it through `Iterator::next`.
+#[derive(Debug)]
 pub struct EventSlot<T: Send + 'static> {
     writer: EventSlotWriter<T>,
     reader: EventSlotReader<T>,

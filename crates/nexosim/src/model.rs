@@ -329,18 +329,12 @@
 //! }
 //! ```
 use std::any::type_name;
-use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::Mutex;
-
-use serde::{Serialize, de::DeserializeOwned};
 
 use crate::path::Path;
-use crate::ports::PORT_REG;
 use crate::simulation::{
-    Address, EVENT_KEY_REG, EventKeyReg, ExecutionError, RestoreError, SaveError, Simulation,
+    Address, EventKeyReg, ExecutionError, RestoreError, SaveError, Simulation,
 };
-use crate::util::serialization::serialization_config;
 
 pub use context::{BuildContext, Context, ModelRegistry, SchedulableId};
 

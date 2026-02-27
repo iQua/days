@@ -72,6 +72,7 @@ impl<K: Copy + Ord, V> PriorityQueue<K, V> {
     ///
     /// The epoch is used to break ties for equal keys and must be unique for a
     /// given key if stable ordering is required.
+    #[allow(dead_code)]
     pub(crate) fn insert_with_epoch(&mut self, key: K, value: V, epoch: u64) {
         assert_ne!(epoch, u64::MAX);
         let item = Item { key, value, epoch };

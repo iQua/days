@@ -238,6 +238,7 @@ impl Executor {
     }
 
     /// Spawns many tasks while amortizing synchronization overhead.
+    #[allow(dead_code)]
     pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
     where
         I: IntoIterator<Item = T>,
@@ -283,6 +284,7 @@ impl Executor {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn executor_id(&self) -> usize {
         self.context.executor_id
     }
@@ -290,6 +292,7 @@ impl Executor {
     /// Backward-compatible hook retained for Days local tuning knobs.
     pub(crate) fn set_hot_worker_count(&self, _hot_worker_count: usize) {}
 
+    #[allow(dead_code)]
     pub(crate) fn is_quiescent(&self) -> bool {
         self.context.pool_manager.pool_is_idle()
     }
