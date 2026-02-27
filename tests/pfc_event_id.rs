@@ -32,7 +32,7 @@ impl FrameSource {
         }
     }
 
-    async fn send_burst(&mut self, _: (), cx: &mut Context<Self>) {
+    async fn send_burst(&mut self, _: (), cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         for i in 0..self.count {
             let mut packet = Packet::new(self.size, i, 0, now);
@@ -43,7 +43,8 @@ impl FrameSource {
 }
 
 impl Model for FrameSource {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         cx.schedule_event(Duration::from_secs_f64(1e-9), Self::send_burst, ())
             .unwrap();
         self.into()

@@ -37,7 +37,7 @@ impl EcnCounter {
     async fn packet_received(
         &mut self,
         packet: days::flows::packet::Packet,
-        _: &mut Context<Self>,
+        _: &Context<Self>,
     ) {
         if self.count_data {
             if matches!(packet.ecn, EcnField::Ce) {
@@ -51,7 +51,9 @@ impl EcnCounter {
     }
 }
 
-impl Model for EcnCounter {}
+impl Model for EcnCounter {
+    type Env = ();
+}
 
 fn main() {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
@@ -122,7 +124,7 @@ fn main() {
         .connect(EcnCounter::packet_received, &ack_counter_mbox);
 
     let mut sink_statistics = nexosim::ports::EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
@@ -133,10 +135,10 @@ fn main() {
         .add_model(ack_counter, ack_counter_mbox, "ECNAckCounter")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             let _ = sim.step_until(Duration::from_secs(10));
 
-            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
             }

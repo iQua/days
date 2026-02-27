@@ -182,4 +182,6 @@ impl DistPacketSource {
     }
 }
 
-impl Model for DistPacketSource {}
+impl Model for DistPacketSource {
+    type Env = ();
+}

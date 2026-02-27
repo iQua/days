@@ -12,7 +12,9 @@ use rand::rngs::SmallRng;
 use serde::Serialize;
 use tracing::instrument;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
@@ -64,6 +66,11 @@ impl std::fmt::Display for PacketSource {
 }
 
 impl PacketSource {
+    const RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+    const FETCH_APP_DATA_SID: SchedulableId<Self, f64> = SchedulableId::__from_decorated(1);
+    const PERIODIC_TIMER_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(2);
+    const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(3);
+
     pub fn new(
         flow_id: usize,
         flow_start_after: Vec<usize>,
@@ -152,7 +159,7 @@ impl PacketSource {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
         #[cfg(test)]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -216,7 +223,7 @@ impl PacketSource {
                 cx.schedule_periodic_event(
                     Duration::from_secs_f64(delay),
                     Duration::from_secs_f64(0.1),
-                    Self::periodic_timer_event,
+                    &Self::PERIODIC_TIMER_SID,
                     (),
                 )
                 .unwrap();
@@ -246,7 +253,7 @@ impl PacketSource {
                     let delay = (fetch_time - start_time).max(0.0);
                     cx.schedule_event(
                         Duration::from_secs_f64(delay),
-                        Self::fetch_app_data,
+                        &Self::FETCH_APP_DATA_SID,
                         fetch_time,
                     )
                     .unwrap();
@@ -264,7 +271,7 @@ impl PacketSource {
                 cx.schedule_periodic_event(
                     Duration::from_secs_f64(delay),
                     Duration::from_secs_f64(interval),
-                    Self::periodic_timer_event,
+                    &Self::PERIODIC_TIMER_SID,
                     (),
                 )
                 .unwrap();
@@ -276,7 +283,7 @@ impl PacketSource {
     fn fetch_app_data<'a>(
         &'a mut self,
         current_time: f64,
-        cx: &'a mut Context<Self>,
+        cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let current_time = quantize_time(current_time);
@@ -308,7 +315,7 @@ impl PacketSource {
                             let delay = (next_time - timestamp).max(0.0);
                             cx.schedule_event(
                                 Duration::from_secs_f64(delay),
-                                Self::fetch_app_data,
+                                &Self::FETCH_APP_DATA_SID,
                                 next_time,
                             )
                             .unwrap();
@@ -333,7 +340,7 @@ impl PacketSource {
             }
         }
     }
-    async fn periodic_timer_event<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn periodic_timer_event<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
         let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
         match self {
             PacketSource::DistPacketSource(_) => (),
@@ -358,7 +365,7 @@ impl PacketSource {
                     source.time = next_time;
                     // schedules the next packet to be sent
                     let delay = (next_time - now).max(0.0);
-                    cx.schedule_event(Duration::from_secs_f64(delay), Self::run, ())
+                    cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
                         .unwrap();
                 }
             }
@@ -368,7 +375,7 @@ impl PacketSource {
                         let next_time = quantize_after(now, interval);
                         let delay = (next_time - now).max(0.0);
                         source.time = next_time;
-                        cx.schedule_event(Duration::from_secs_f64(delay), Self::run, ())
+                        cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
                             .unwrap();
                     }
                 }
@@ -380,7 +387,7 @@ impl PacketSource {
                         let next_time = quantize_after(now, interval);
                         let delay = (next_time - now).max(0.0);
                         source.time = next_time;
-                        cx.schedule_event(Duration::from_secs_f64(delay), Self::run, ())
+                        cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
                             .unwrap();
                     }
                 }
@@ -388,7 +395,7 @@ impl PacketSource {
         }
     }
 
-    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         match self {
@@ -434,7 +441,7 @@ impl PacketSource {
     pub fn run<'a>(
         &'a mut self,
         _: (),
-        cx: &'a mut Context<Self>,
+        cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             let mut now = match self {
@@ -517,7 +524,7 @@ impl PacketSource {
         }
     }
 
-    pub async fn flow_finished(&mut self, flow_finish_msg: FlowFinishMsg, cx: &mut Context<Self>) {
+    pub async fn flow_finished(&mut self, flow_finish_msg: FlowFinishMsg, cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         debug!(
@@ -639,13 +646,13 @@ impl PacketSource {
         }
     }
 
-    fn start_report_logger(&self, initial_delay: f64, cx: &mut Context<Self>) {
+    fn start_report_logger(&self, initial_delay: f64, cx: &Context<Self>) {
         let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(initial_delay + report_interval),
                 Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                &Self::LOG_REPORT_SID,
                 (),
             )
             .unwrap();
@@ -654,13 +661,25 @@ impl PacketSource {
 }
 
 impl Model for PacketSource {
-    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::run));
+        registry.add(cx.register_schedulable(Self::fetch_app_data));
+        registry.add(cx.register_schedulable(Self::periodic_timer_event));
+        registry.add(cx.register_schedulable(Self::log_report));
+        registry
+    }
+
+    async fn init(mut self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         if self.start_now() {
             let initial_delay = self.advance_initial_delay();
             self.prepare_run(0.0, initial_delay, cx).await;
 
             if initial_delay > 0.0 {
-                cx.schedule_event(Duration::from_secs_f64(initial_delay), Self::run, ())
+                cx.schedule_event(Duration::from_secs_f64(initial_delay), &Self::RUN_SID, ())
                     .unwrap();
             } else {
                 self.run((), cx).await;

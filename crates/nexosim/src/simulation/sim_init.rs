@@ -113,6 +113,28 @@ impl SimInit {
         }
     }
 
+    /// Compatibility shim retained for Days' forked API surface.
+    ///
+    /// In this Nexosim fork, hot-worker tuning is forwarded to the executor.
+    pub fn set_hot_worker_count(mut self, hot_worker_count: usize) -> Self {
+        self.executor.set_hot_worker_count(hot_worker_count);
+        self
+    }
+
+    /// Compatibility shim retained for Days' forked API surface.
+    ///
+    /// Group-per-step tuning is not configurable in this Nexosim revision.
+    pub fn set_max_groups_per_step_task(self, _max_groups: usize) -> Self {
+        self
+    }
+
+    /// Compatibility shim retained for Days' forked API surface.
+    ///
+    /// Time quantization is managed externally in Days for now.
+    pub fn set_time_quantum_ns(self, _quantum_ns: u64) -> Self {
+        self
+    }
+
     /// Configures the simulation to run with the provided
     /// [`Clock`] and [`Ticker`].
     ///

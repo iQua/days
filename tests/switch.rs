@@ -26,7 +26,7 @@ impl PacketEmitter {
         }
     }
 
-    async fn emit(&mut self, _: (), cx: &mut Context<Self>) {
+    async fn emit(&mut self, _: (), cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         let mut packet = self.packet.clone();
         packet.time = now;
@@ -35,7 +35,8 @@ impl PacketEmitter {
 }
 
 impl Model for PacketEmitter {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         cx.schedule_event(self.delay, Self::emit, ()).unwrap();
         self.into()
     }
@@ -76,7 +77,7 @@ fn build_switch_with_outputs(
             .outputs
             .get_mut(output_id)
             .expect("missing output for fib entry")
-            .connect_sink(&queue);
+            .connect_sink(queue.writer());
         queues.push(queue);
     }
 

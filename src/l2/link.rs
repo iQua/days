@@ -46,7 +46,7 @@ impl Link {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn frame_received(&mut self, mut frame: LinkFrame, cx: &mut Context<Self>) {
+    pub async fn frame_received(&mut self, mut frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -126,4 +126,6 @@ impl Link {
     }
 }
 
-impl Model for Link {}
+impl Model for Link {
+    type Env = ();
+}

@@ -152,7 +152,7 @@ use crate::endpoints::{EventSourceEntryAny, QuerySourceEntryAny, ReplyReaderAny}
 use crate::executor::{Executor, ExecutorError, Signal};
 use crate::model::{BuildContext, Context, Model, ProtoModel, RegisteredModel};
 use crate::path::Path;
-use crate::ports::{ReplierFn, query_replier};
+use crate::ports::{InputFn, ReplierFn, query_replier};
 use crate::time::{AtomicTime, Clock, Deadline, MonotonicTime, SyncStatus, Ticker};
 use crate::util::seq_futures::SeqFuture;
 use crate::util::serialization::serialization_config;
@@ -368,6 +368,45 @@ impl Simulation {
             .ok_or(ExecutionError::InvalidEventId(event_id.0))?;
 
         let fut = source.future_owned(Box::new(arg), None)?;
+
+        self.process_future(fut)
+    }
+
+    /// Processes an event immediately by targeting an input function and address.
+    ///
+    /// This compatibility helper mirrors the legacy Days API surface.
+    pub fn process_event_fn<M, F, T, S>(
+        &mut self,
+        func: F,
+        arg: T,
+        address: impl Into<Address<M>>,
+    ) -> Result<(), ExecutionError>
+    where
+        M: Model,
+        F: for<'a> InputFn<'a, M, T, S>,
+        T: Send + Clone + 'static,
+        S: Send + Sync + 'static,
+    {
+        let sender = address.into().0;
+
+        let fut = async move {
+            // Ignore send errors.
+            let _ = sender
+                .send(
+                    move |model: &mut M,
+                          scheduler,
+                          env,
+                          recycle_box: RecycleBox<()>|
+                          -> RecycleBox<dyn Future<Output = ()> + Send + '_> {
+                        let fut = async move {
+                            func.call(model, arg, scheduler, env).await;
+                        };
+
+                        coerce_box!(RecycleBox::recycle(recycle_box, fut))
+                    },
+                )
+                .await;
+        };
 
         self.process_future(fut)
     }

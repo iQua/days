@@ -376,4 +376,6 @@ impl DcqcnPacketSource {
     }
 }
 
-impl Model for DcqcnPacketSource {}
+impl Model for DcqcnPacketSource {
+    type Env = ();
+}

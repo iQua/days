@@ -101,7 +101,7 @@ fn test_static_priority_scheduler() {
     sp.output.connect(PacketSink::packet_received, &sink_mbox);
 
     let mut sink_statistics = EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
@@ -112,12 +112,12 @@ fn test_static_priority_scheduler() {
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             // starts the simulation
             let _ = sim.step_until(Duration::from_secs(10));
 
             // requests the packet sink to report statistics
-            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);

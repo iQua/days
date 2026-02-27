@@ -198,7 +198,7 @@ impl SinkStatistics {
     pub fn collect_statistics(&mut self, mut sim: Simulation) -> Simulation {
         for sink_id in self.sink_ids.iter() {
             let sink_addr = self.sink_addresses.get(sink_id).unwrap();
-            let _ = sim.process_event(PacketSink::report, *sink_id, sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, *sink_id, sink_addr);
 
             let mut sink_statistics = self.sink_statistics.remove(sink_id).unwrap();
             if let Some(statistics) = sink_statistics.next() {
@@ -1070,7 +1070,7 @@ impl Topology {
             stats.sink_ids.push(sink.id());
             stats.sink_addresses.insert(sink.id(), sink_mbox.address());
             let sink_stats = EventSlot::new();
-            sink.statistics().connect_sink(&sink_stats);
+            sink.statistics().connect_sink(sink_stats.writer());
             stats.sink_statistics.insert(sink.id(), sink_stats);
 
             sink.output()
@@ -1202,7 +1202,7 @@ impl Topology {
         }
 
         match self.sim_init.init(MonotonicTime::EPOCH) {
-            Ok((simulation, _)) => simulation,
+            Ok(simulation) => simulation,
             Err(error) => panic!("Problem when initializing the simulation: {error:?}"),
         }
     }

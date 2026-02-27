@@ -866,7 +866,9 @@ impl TCPPacketSource {
     }
 }
 
-impl Model for TCPPacketSource {}
+impl Model for TCPPacketSource {
+    type Env = ();
+}
 
 #[cfg(test)]
 mod tests {

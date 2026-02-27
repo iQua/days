@@ -217,7 +217,7 @@ impl PfcIngressPort {
         self.pfc_output.send(frame).await;
     }
 
-    fn schedule_refresh(&mut self, now: f64, priority: usize, cx: &mut Context<Self>) {
+    fn schedule_refresh(&mut self, now: f64, priority: usize, cx: &Context<Self>) {
         if let Some(interval) = self.config.refresh_interval {
             let refresh_at = quantize_after(now, interval);
             let should_schedule = match self.refresh_scheduled_at[priority] {
@@ -236,7 +236,7 @@ impl PfcIngressPort {
         }
     }
 
-    async fn assert_pause(&mut self, now: f64, priority: usize, cx: &mut Context<Self>) {
+    async fn assert_pause(&mut self, now: f64, priority: usize, cx: &Context<Self>) {
         let now = quantize_time(now);
         if !self.pause_active[priority] {
             self.pause_active[priority] = true;
@@ -257,7 +257,7 @@ impl PfcIngressPort {
         }
     }
 
-    async fn handle_packet(&mut self, packet: Packet, now: f64, cx: &mut Context<Self>) {
+    async fn handle_packet(&mut self, packet: Packet, now: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         let priority = packet.priority as usize;
         let cap = self.config.buffer_capacity[priority];
@@ -288,7 +288,7 @@ impl PfcIngressPort {
         }
     }
 
-    async fn drain(&mut self, now: f64, cx: &mut Context<Self>) {
+    async fn drain(&mut self, now: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         self.time = now;
         let mut needs_retry = false;
@@ -311,7 +311,7 @@ impl PfcIngressPort {
         }
     }
 
-    fn schedule_drain_retry(&mut self, now: f64, cx: &mut Context<Self>) {
+    fn schedule_drain_retry(&mut self, now: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         let interval = self.config.drain_interval.unwrap_or(1e-6);
         let retry_at = quantize_after(now, interval);
@@ -331,7 +331,7 @@ impl PfcIngressPort {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn frame_received(&mut self, frame: LinkFrame, cx: &mut Context<Self>) {
+    pub async fn frame_received(&mut self, frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -357,12 +357,12 @@ impl PfcIngressPort {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         self.frame_received(LinkFrame::Data(packet), cx).await;
     }
 
     #[instrument(skip(self, cx))]
-    async fn refresh(&mut self, priority: usize, cx: &mut Context<Self>) {
+    async fn refresh(&mut self, priority: usize, cx: &Context<Self>) {
         let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
         self.refresh_scheduled_at[priority] = None;
         if self.pause_active[priority] {
@@ -371,7 +371,7 @@ impl PfcIngressPort {
     }
 
     #[instrument(skip(self, cx))]
-    async fn drain_retry(&mut self, now: f64, cx: &mut Context<Self>) {
+    async fn drain_retry(&mut self, now: f64, cx: &Context<Self>) {
         self.drain_scheduled_at = None;
         self.drain(now, cx).await;
     }
@@ -406,7 +406,8 @@ impl PfcIngressPort {
 }
 
 impl Model for PfcIngressPort {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
 
         if report_interval < f64::MAX {
@@ -532,7 +533,7 @@ impl PfcEgressGate {
         }
     }
 
-    fn schedule_resume(&mut self, now: f64, cx: &mut Context<Self>) {
+    fn schedule_resume(&mut self, now: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         if let Some(resume_at_raw) = self.next_resume_time(now) {
             let resume_at = quantize_time(resume_at_raw);
@@ -555,7 +556,7 @@ impl PfcEgressGate {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn frame_received(&mut self, frame: LinkFrame, cx: &mut Context<Self>) {
+    pub async fn frame_received(&mut self, frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -574,12 +575,12 @@ impl PfcEgressGate {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         self.frame_received(LinkFrame::Data(packet), cx).await;
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn pfc_received(&mut self, frame: PfcFrame, cx: &mut Context<Self>) {
+    pub async fn pfc_received(&mut self, frame: PfcFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -626,7 +627,7 @@ impl PfcEgressGate {
     }
 
     #[instrument(skip(self, cx))]
-    async fn resume(&mut self, now: f64, cx: &mut Context<Self>) {
+    async fn resume(&mut self, now: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         self.resume_scheduled_at = None;
         self.drain_ready(now).await;
@@ -649,7 +650,9 @@ impl PfcEgressGate {
     }
 }
 
-impl Model for PfcEgressGate {}
+impl Model for PfcEgressGate {
+    type Env = ();
+}
 
 #[cfg(all(test, feature = "l2_pfc"))]
 mod tests {

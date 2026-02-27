@@ -13,7 +13,9 @@ use std::time::Duration;
 use log::debug;
 use tracing::instrument;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::Serialize;
@@ -218,6 +220,8 @@ impl std::fmt::Display for PacketSink {
 }
 
 impl PacketSink {
+    const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     pub fn new(source: &PacketSource) -> Self {
         match source {
             PacketSource::DistPacketSource(_) => {
@@ -273,7 +277,7 @@ impl PacketSink {
         }
     }
 
-    pub async fn report(&mut self, endpoint_id: usize, cx: &mut Context<Self>) {
+    pub async fn report(&mut self, endpoint_id: usize, cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         assert_eq!(endpoint_id, self.id());
@@ -297,7 +301,7 @@ impl PacketSink {
     }
 
     #[instrument(skip(self, _cx))]
-    pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, _cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = _cx
@@ -339,7 +343,7 @@ impl PacketSink {
         }
     }
 
-    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         match self {
@@ -358,13 +362,22 @@ impl PacketSink {
 }
 
 impl Model for PacketSink {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::log_report));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
                 Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                &Self::LOG_REPORT_SID,
                 (),
             )
             .unwrap();

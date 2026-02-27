@@ -295,3 +295,38 @@ pub use source::{EventSource, QuerySource, ReplyReader};
 
 pub(crate) use output::PORT_REG;
 pub(crate) use source::{ReplyWriter, query_replier};
+
+/// Compatibility event sink that mirrors the old `EventSlot` convenience API.
+///
+/// It keeps only the latest event and exposes it through `Iterator::next`.
+pub struct EventSlot<T: Send + 'static> {
+    writer: EventSlotWriter<T>,
+    reader: EventSlotReader<T>,
+}
+
+impl<T: Send + 'static> EventSlot<T> {
+    /// Creates an enabled slot.
+    pub fn new() -> Self {
+        let (writer, reader) = event_slot(SinkState::Enabled);
+        Self { writer, reader }
+    }
+
+    /// Returns a writer handle compatible with `Output::connect_sink`.
+    pub fn writer(&self) -> EventSlotWriter<T> {
+        self.writer.clone()
+    }
+}
+
+impl<T: Send + 'static> Default for EventSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + 'static> Iterator for EventSlot<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reader.try_read()
+    }
+}

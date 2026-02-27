@@ -65,7 +65,7 @@ impl PacketSwitch {
     }
 
     #[instrument(skip(self, _cx))]
-    pub async fn packet_received(&mut self, packet: Packet, _cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, _cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             use nexosim::time::MonotonicTime;
@@ -122,4 +122,6 @@ impl PacketSwitch {
     }
 }
 
-impl Model for PacketSwitch {}
+impl Model for PacketSwitch {
+    type Env = ();
+}

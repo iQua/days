@@ -63,7 +63,8 @@ impl EcnBurstSource {
 }
 
 impl Model for EcnBurstSource {
-    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    async fn init(mut self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         self.run((), cx).await;
         self.into()
     }
@@ -90,7 +91,7 @@ fn test_red_ecn_marks_ce_in_simulation() {
     let mut sink_slot = EventSlot::new();
 
     source.output.connect(Port::packet_received, &port_mbox);
-    port.output.connect_sink(&sink_slot);
+    port.output.connect_sink(sink_slot.writer());
 
     let t0 = MonotonicTime::EPOCH;
     let (mut sim, _) = SimInit::new()

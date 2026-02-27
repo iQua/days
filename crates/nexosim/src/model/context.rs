@@ -147,33 +147,6 @@ impl<M: Model> Context<M> {
         )
     }
 
-    /// Schedules multiple events at future times on this model.
-    ///
-    /// An error is returned if any of the specified deadlines is not in the
-    /// future of the current simulation time. If an error is returned, no
-    /// event is scheduled.
-    ///
-    /// Events scheduled for the same time are guaranteed to be processed
-    /// according to the scheduling order.
-    pub fn schedule_event_batch<F, T, S, D>(
-        &self,
-        deadlines_and_args: Vec<(D, T)>,
-        func: F,
-    ) -> Result<(), SchedulingError>
-    where
-        F: for<'a> InputFn<'a, M, T, S> + Clone,
-        T: Send + Clone + 'static,
-        S: Send + 'static,
-        D: Deadline + Copy,
-    {
-        self.scheduler.schedule_event_batch_from(
-            deadlines_and_args,
-            func,
-            &self.address,
-            self.origin_id,
-        )
-    }
-
     /// Schedules a cancellable event at a future time on this model and returns
     /// an action key.
     ///

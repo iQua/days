@@ -13,14 +13,15 @@ struct BatchEmitter {
 }
 
 impl BatchEmitter {
-    async fn emit(&mut self, value: u32, cx: &mut Context<Self>) {
+    async fn emit(&mut self, value: u32, cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         self.output.send((value, now)).await;
     }
 }
 
 impl Model for BatchEmitter {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         cx.schedule_event(Duration::from_millis(1), Self::emit, 0u32)
             .unwrap();
 
@@ -45,7 +46,7 @@ fn schedule_event_batch_preserves_order() {
     let queue = EventQueue::new();
 
     let mut emitter = BatchEmitter::default();
-    emitter.output.connect_sink(&queue);
+    emitter.output.connect_sink(queue.writer());
     let mut reader = queue.into_reader();
 
     let emitter_mbox = Mailbox::new();
@@ -89,14 +90,15 @@ struct AtomicityEmitter {
 }
 
 impl AtomicityEmitter {
-    async fn emit(&mut self, value: u32, cx: &mut Context<Self>) {
+    async fn emit(&mut self, value: u32, cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         self.output.send((value, now)).await;
     }
 }
 
 impl Model for AtomicityEmitter {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         assert!(
             cx.schedule_event_batch(
                 vec![(Duration::ZERO, 1u32), (Duration::from_millis(1), 2u32)],
@@ -120,7 +122,7 @@ fn schedule_event_batch_is_atomic_on_error() {
     let queue = EventQueue::new();
 
     let mut emitter = AtomicityEmitter::default();
-    emitter.output.connect_sink(&queue);
+    emitter.output.connect_sink(queue.writer());
     let mut reader = queue.into_reader();
 
     let emitter_mbox = Mailbox::new();

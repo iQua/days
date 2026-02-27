@@ -8,7 +8,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use tachyonix::{Receiver, Sender, channel};
 
@@ -185,6 +187,8 @@ pub struct AppSourceBuffer {
 }
 
 impl AppSourceBuffer {
+    const RUN_ONCE_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     pub fn new(buffer: Vec<u8>, config: &AppBufferConfig) -> (Self, Sender<AppSourceRequest>) {
         let (tx, rx) = channel(config.req_channel_capacity);
 
@@ -201,11 +205,20 @@ impl AppSourceBuffer {
 }
 
 impl Model for AppSourceBuffer {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::run_once));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         // schedules the actor's run_once function after the configured initial interval
         cx.schedule_event(
             Duration::from_micros(self.initial_delay),
-            Self::run_once,
+            &Self::RUN_ONCE_SID,
             (),
         )
         .expect("schedule_event failed");
@@ -219,7 +232,7 @@ impl AppSourceBuffer {
     fn run_once<'a>(
         &'a mut self,
         _: (),
-        cx: &'a mut Context<Self>,
+        cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             while let Ok(req) = self.rx.try_recv() {
@@ -241,7 +254,11 @@ impl AppSourceBuffer {
                 }
             }
 
-            cx.schedule_event(Duration::from_micros(self.run_interval), Self::run_once, ())
+            cx.schedule_event(
+                Duration::from_micros(self.run_interval),
+                &Self::RUN_ONCE_SID,
+                (),
+            )
                 .expect("reschedule run_once failed");
         }
     }

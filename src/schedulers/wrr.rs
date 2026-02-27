@@ -8,7 +8,9 @@ use std::time::Duration;
 use log::debug;
 use tracing::instrument;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
@@ -95,6 +97,9 @@ pub struct WRRServer {
 }
 
 impl WRRServer {
+    const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
+
     const DEFAULT_RUN_BATCH_SIZE: usize = 64;
 
     pub fn new(
@@ -331,7 +336,7 @@ impl WRRServer {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -361,7 +366,7 @@ impl WRRServer {
         self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
         self.send(packet).await;
         self.in_flight = self.in_flight.saturating_sub(1);
         if self.in_flight == 0 {
@@ -426,7 +431,7 @@ impl WRRServer {
     }
 
     #[instrument(skip(self, cx))]
-    pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
+    pub fn run(&mut self, now: f64, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -470,8 +475,10 @@ impl WRRServer {
         }
 
         if !schedule.is_empty() {
-            cx.schedule_event_batch(schedule, Self::send_and_run)
-                .unwrap();
+            for (deadline, packet) in schedule {
+                cx.schedule_event(deadline, &Self::SEND_AND_RUN_SID, packet)
+                    .unwrap();
+            }
         }
     }
 
@@ -488,7 +495,7 @@ impl WRRServer {
         }
     }
 
-    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         let report = self.prepare_report(now);
@@ -555,14 +562,24 @@ impl ReportStatistics for WRRServer {
 }
 
 impl Model for WRRServer {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_and_run));
+        registry.add(cx.register_schedulable(Self::log_report));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
 
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
                 Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                &Self::LOG_REPORT_SID,
                 (),
             )
             .unwrap();

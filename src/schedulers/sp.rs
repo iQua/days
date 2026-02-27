@@ -8,7 +8,9 @@ use std::time::Duration;
 use log::debug;
 use tracing::instrument;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
@@ -91,6 +93,9 @@ pub struct SPServer {
 }
 
 impl SPServer {
+    const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
+
     pub fn new(
         rate: f64,
         capacity: usize,
@@ -311,7 +316,7 @@ impl SPServer {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -345,7 +350,7 @@ impl SPServer {
         self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
         self.send(packet).await;
         self.run(self.time, cx);
     }
@@ -400,7 +405,7 @@ impl SPServer {
     }
 
     #[instrument(skip(self, cx))]
-    pub fn run(&mut self, now: f64, cx: &mut Context<Self>) {
+    pub fn run(&mut self, now: f64, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -419,7 +424,11 @@ impl SPServer {
         self.time = run_time;
 
         self.schedule_packet(|_now, delay, outbound| {
-            cx.schedule_event(Duration::from_secs_f64(delay), Self::send_and_run, outbound)
+            cx.schedule_event(
+                Duration::from_secs_f64(delay),
+                &Self::SEND_AND_RUN_SID,
+                outbound,
+            )
                 .unwrap();
         });
     }
@@ -445,7 +454,7 @@ impl SPServer {
         }
     }
 
-    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         let report = self.prepare_report(now);
@@ -512,14 +521,24 @@ impl ReportStatistics for SPServer {
 }
 
 impl Model for SPServer {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_and_run));
+        registry.add(cx.register_schedulable(Self::log_report));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
 
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
                 Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                &Self::LOG_REPORT_SID,
                 (),
             )
             .unwrap();

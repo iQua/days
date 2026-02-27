@@ -192,7 +192,9 @@ impl TCPPacketSink {
     }
 }
 
-impl Model for TCPPacketSink {}
+impl Model for TCPPacketSink {
+    type Env = ();
+}
 
 #[cfg(test)]
 mod tests {
