@@ -2,187 +2,257 @@
 
 use std::time::Duration;
 
-use nexosim::model::{Context, Model};
-use nexosim::ports::{EventQueue, Output};
-use nexosim::simulation::{ActionKey, Mailbox, SimInit};
+use serde::{Deserialize, Serialize};
+
+use nexosim::model::{BuildContext, Context, Model, ProtoModel, SchedulableId, schedulable};
+use nexosim::ports::{EventSinkReader, EventSource, Output, SinkState, event_queue};
+use nexosim::simulation::{EventKey, Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
 const MT_NUM_THREADS: usize = 4;
 
 fn model_schedule_event(num_threads: usize) {
-    #[derive(Default)]
+    #[derive(Default, Serialize, Deserialize)]
     struct TestModel {
         output: Output<()>,
     }
+    #[Model]
     impl TestModel {
-        fn trigger(&mut self, _: (), cx: &mut Context<Self>) {
-            cx.schedule_event(Duration::from_secs(2), Self::action, ())
+        fn trigger(&mut self, _: (), cx: &Context<Self>) {
+            cx.schedule_event(Duration::from_secs(2), schedulable!(Self::action), ())
                 .unwrap();
         }
+        #[nexosim(schedulable)]
         async fn action(&mut self) {
             self.output.send(()).await;
         }
     }
-    impl Model for TestModel {}
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
 
-    let output = EventQueue::new();
-    model.output.connect_sink(&output);
-    let mut output = output.into_reader();
-    let addr = mbox.address();
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, "")
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut bench = SimInit::with_num_threads(num_threads);
 
-    simu.process_event(TestModel::trigger, (), addr).unwrap();
+    let trigger = EventSource::new()
+        .connect(TestModel::trigger, &mbox)
+        .register(&mut bench);
+
+    let mut simu = bench.add_model(model, mbox, "").init(t0).unwrap();
+
+    simu.process_event(&trigger, ()).unwrap();
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-    assert!(output.next().is_some());
+    assert!(output.try_read().is_some());
     simu.step().unwrap();
-    assert!(output.next().is_none());
+    assert!(output.try_read().is_none());
+}
+
+// This test mainly checks that ModelRegistry and SchedulableId with bit-masking
+// works properly when multiple models are involved and will not override their
+// inputs.
+fn multiple_models_scheduling(num_threads: usize) {
+    const MODEL_COUNT: usize = 3;
+
+    #[derive(Serialize, Deserialize)]
+    struct TestModel {
+        delay: u64,
+        val: usize,
+        output: Output<usize>,
+    }
+    #[Model]
+    impl TestModel {
+        #[nexosim(init)]
+        async fn init(&mut self, cx: &Context<Self>, _: &mut ()) {
+            cx.schedule_event(
+                Duration::from_secs(self.delay),
+                schedulable!(Self::action),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Does nothing, but alters the ModelRegistry
+        #[nexosim(schedulable)]
+        async fn dead_input(&mut self) {}
+
+        #[nexosim(schedulable)]
+        async fn action(&mut self) {
+            self.output.send(self.val).await;
+        }
+    }
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+
+    // Iterate in reverse, to avoid happy accidents.
+    // Last added model will be scheduled first, etc.
+    for idx in (0..MODEL_COUNT).rev() {
+        let mut model = TestModel {
+            delay: idx as u64 + 1,
+            val: 13 * (idx + 1),
+            output: Output::default(),
+        };
+        let mbox = Mailbox::new();
+        model.output.connect_sink(sink.clone());
+        bench = bench.add_model(model, mbox, &format!("Model_{idx}"));
+    }
+
+    let mut simu = bench.init(MonotonicTime::EPOCH).unwrap();
+
+    for idx in 0..MODEL_COUNT {
+        simu.step().unwrap();
+        // This should assert that the order of the SourceIds is correct. If
+        // bit-masking is removed from `SchedulableId::__from_decorated` this
+        // would fail.
+        assert_eq!(output.try_read(), Some(13 * (idx + 1)));
+    }
 }
 
 fn model_cancel_future_keyed_event(num_threads: usize) {
-    #[derive(Default)]
+    #[derive(Default, Serialize, Deserialize)]
     struct TestModel {
         output: Output<i32>,
-        key: Option<ActionKey>,
+        key: Option<EventKey>,
     }
+    #[Model]
     impl TestModel {
-        fn trigger(&mut self, _: (), cx: &mut Context<Self>) {
-            cx.schedule_event(Duration::from_secs(1), Self::action1, ())
+        fn trigger(&mut self, _: (), cx: &Context<Self>) {
+            cx.schedule_event(Duration::from_secs(1), schedulable!(Self::action1), ())
                 .unwrap();
             self.key = cx
-                .schedule_keyed_event(Duration::from_secs(2), Self::action2, ())
+                .schedule_keyed_event(Duration::from_secs(2), schedulable!(Self::action2), ())
                 .ok();
         }
+        #[nexosim(schedulable)]
         async fn action1(&mut self) {
             self.output.send(1).await;
             // Cancel the call to `action2`.
             self.key.take().unwrap().cancel();
         }
+        #[nexosim(schedulable)]
         async fn action2(&mut self) {
             self.output.send(2).await;
         }
     }
-    impl Model for TestModel {}
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
 
-    let output = EventQueue::new();
-    model.output.connect_sink(&output);
-    let mut output = output.into_reader();
-    let addr = mbox.address();
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let trigger = EventSource::new()
+        .connect(TestModel::trigger, &mbox)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, "")
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut simu = bench.add_model(model, mbox, "").init(t0).unwrap();
 
-    simu.process_event(TestModel::trigger, (), addr).unwrap();
+    simu.process_event(&trigger, ()).unwrap();
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(1));
-    assert_eq!(output.next(), Some(1));
+    assert_eq!(output.try_read(), Some(1));
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(1));
-    assert!(output.next().is_none());
+    assert!(output.try_read().is_none());
 }
 
 fn model_cancel_same_time_keyed_event(num_threads: usize) {
-    #[derive(Default)]
+    #[derive(Default, Serialize, Deserialize)]
     struct TestModel {
         output: Output<i32>,
-        key: Option<ActionKey>,
+        key: Option<EventKey>,
     }
+    #[Model]
     impl TestModel {
-        fn trigger(&mut self, _: (), cx: &mut Context<Self>) {
-            cx.schedule_event(Duration::from_secs(2), Self::action1, ())
+        fn trigger(&mut self, _: (), cx: &Context<Self>) {
+            cx.schedule_event(Duration::from_secs(2), schedulable!(Self::action1), ())
                 .unwrap();
             self.key = cx
-                .schedule_keyed_event(Duration::from_secs(2), Self::action2, ())
+                .schedule_keyed_event(Duration::from_secs(2), schedulable!(Self::action2), ())
                 .ok();
         }
+        #[nexosim(schedulable)]
         async fn action1(&mut self) {
             self.output.send(1).await;
             // Cancel the call to `action2`.
             self.key.take().unwrap().cancel();
         }
+        #[nexosim(schedulable)]
         async fn action2(&mut self) {
             self.output.send(2).await;
         }
     }
-    impl Model for TestModel {}
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
 
-    let output = EventQueue::new();
-    model.output.connect_sink(&output);
-    let mut output = output.into_reader();
-    let addr = mbox.address();
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let trigger = EventSource::new()
+        .connect(TestModel::trigger, &mbox)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, "")
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut simu = bench.add_model(model, mbox, "").init(t0).unwrap();
 
-    simu.process_event(TestModel::trigger, (), addr).unwrap();
+    simu.process_event(&trigger, ()).unwrap();
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-    assert_eq!(output.next(), Some(1));
-    assert!(output.next().is_none());
+    assert_eq!(output.try_read(), Some(1));
+    assert!(output.try_read().is_none());
     simu.step().unwrap();
-    assert!(output.next().is_none());
+    assert!(output.try_read().is_none());
 }
 
 fn model_schedule_periodic_event(num_threads: usize) {
-    #[derive(Default)]
+    #[derive(Default, Serialize, Deserialize)]
     struct TestModel {
         output: Output<i32>,
     }
+    #[Model]
     impl TestModel {
-        fn trigger(&mut self, _: (), cx: &mut Context<Self>) {
+        fn trigger(&mut self, _: (), cx: &Context<Self>) {
             cx.schedule_periodic_event(
                 Duration::from_secs(2),
                 Duration::from_secs(3),
-                Self::action,
+                schedulable!(Self::action),
                 42,
             )
             .unwrap();
         }
+        #[nexosim(schedulable)]
         async fn action(&mut self, payload: i32) {
             self.output.send(payload).await;
         }
     }
-    impl Model for TestModel {}
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
 
-    let output = EventQueue::new();
-    model.output.connect_sink(&output);
-    let mut output = output.into_reader();
-    let addr = mbox.address();
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let trigger = EventSource::new()
+        .connect(TestModel::trigger, &mbox)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, "")
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut simu = bench.add_model(model, mbox, "").init(t0).unwrap();
 
-    simu.process_event(TestModel::trigger, (), addr).unwrap();
+    simu.process_event(&trigger, ()).unwrap();
 
     // Move to the next events at t0 + 2s + k*3s.
     for k in 0..10 {
@@ -191,61 +261,127 @@ fn model_schedule_periodic_event(num_threads: usize) {
             simu.time(),
             t0 + Duration::from_secs(2) + k * Duration::from_secs(3)
         );
-        assert_eq!(output.next(), Some(42));
-        assert!(output.next().is_none());
+        assert_eq!(output.try_read(), Some(42));
+        assert!(output.try_read().is_none());
     }
 }
 
 fn model_cancel_periodic_event(num_threads: usize) {
-    #[derive(Default)]
+    #[derive(Default, Serialize, Deserialize)]
     struct TestModel {
         output: Output<()>,
-        key: Option<ActionKey>,
+        key: Option<EventKey>,
     }
+    #[Model]
     impl TestModel {
-        fn trigger(&mut self, _: (), cx: &mut Context<Self>) {
+        fn trigger(&mut self, _: (), cx: &Context<Self>) {
             self.key = cx
                 .schedule_keyed_periodic_event(
                     Duration::from_secs(2),
                     Duration::from_secs(3),
-                    Self::action,
+                    schedulable!(Self::action),
                     (),
                 )
                 .ok();
         }
+        #[nexosim(schedulable)]
         async fn action(&mut self) {
             self.output.send(()).await;
             // Cancel the next events.
             self.key.take().unwrap().cancel();
         }
     }
-    impl Model for TestModel {}
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
 
-    let output = EventQueue::new();
-    model.output.connect_sink(&output);
-    let mut output = output.into_reader();
-    let addr = mbox.address();
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let trigger = EventSource::new()
+        .connect(TestModel::trigger, &mbox)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, "")
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut simu = bench.add_model(model, mbox, "").init(t0).unwrap();
 
-    simu.process_event(TestModel::trigger, (), addr).unwrap();
+    simu.process_event(&trigger, ()).unwrap();
 
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-    assert!(output.next().is_some());
-    assert!(output.next().is_none());
+    assert!(output.try_read().is_some());
+    assert!(output.try_read().is_none());
 
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-    assert!(output.next().is_none());
+    assert!(output.try_read().is_none());
+}
+
+fn model_schedule_manually_registered_input(num_threads: usize) {
+    #[derive(Default)]
+    struct TestProtoModel {
+        output: Output<usize>,
+    }
+
+    impl ProtoModel for TestProtoModel {
+        type Model = TestModel;
+
+        fn build(self, cx: &mut BuildContext<Self>) -> (Self::Model, ()) {
+            let action2 =
+                cx.register_schedulable(async |model: &mut TestModel| model.output.send(2).await);
+
+            (TestModel::new(self.output, action2), ())
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestModel {
+        output: Output<usize>,
+        action2: SchedulableId<Self, ()>,
+    }
+    #[Model]
+    impl TestModel {
+        fn new(output: Output<usize>, action2: SchedulableId<Self, ()>) -> Self {
+            Self { output, action2 }
+        }
+        fn trigger(&mut self, _: (), cx: &Context<Self>) {
+            cx.schedule_event(Duration::from_secs(1), schedulable!(Self::action1), ())
+                .unwrap();
+            cx.schedule_event(Duration::from_secs(2), &self.action2, ())
+                .unwrap();
+        }
+        #[nexosim(schedulable)]
+        async fn action1(&mut self) {
+            self.output.send(1).await;
+        }
+    }
+
+    let mut model = TestProtoModel::default();
+    let mbox = Mailbox::new();
+
+    let (sink, mut output) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
+
+    let t0 = MonotonicTime::EPOCH;
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let trigger = EventSource::new()
+        .connect(TestModel::trigger, &mbox)
+        .register(&mut bench);
+
+    let mut simu = bench.add_model(model, mbox, "").init(t0).unwrap();
+
+    simu.process_event(&trigger, ()).unwrap();
+    simu.step().unwrap();
+    assert_eq!(simu.time(), t0 + Duration::from_secs(1));
+    assert_eq!(output.try_read(), Some(1));
+    simu.step().unwrap();
+    assert_eq!(simu.time(), t0 + Duration::from_secs(2));
+    assert_eq!(output.try_read(), Some(2));
+    simu.step().unwrap();
+    assert!(output.try_read().is_none());
 }
 
 #[test]
@@ -256,6 +392,16 @@ fn model_schedule_event_st() {
 #[test]
 fn model_schedule_event_mt() {
     model_schedule_event(MT_NUM_THREADS);
+}
+
+#[test]
+fn multiple_models_scheduling_st() {
+    multiple_models_scheduling(1);
+}
+
+#[test]
+fn multiple_models_scheduling_mt() {
+    multiple_models_scheduling(MT_NUM_THREADS);
 }
 
 #[test]
@@ -296,4 +442,14 @@ fn model_cancel_periodic_event_st() {
 #[test]
 fn model_cancel_periodic_event_mt() {
     model_cancel_periodic_event(MT_NUM_THREADS);
+}
+
+#[test]
+fn model_schedule_manually_registered_input_st() {
+    model_schedule_manually_registered_input(1)
+}
+
+#[test]
+fn model_schedule_manually_registered_input_mt() {
+    model_schedule_manually_registered_input(MT_NUM_THREADS)
 }

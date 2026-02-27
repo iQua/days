@@ -7,7 +7,12 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
 
+//--------
+// Errors 
+//--------
+
 enum ErrorCode {
+  // Generic errors.
   INTERNAL_ERROR = 0;
   MISSING_ARGUMENT = 1;
   INVALID_TIME = 2;
@@ -16,20 +21,41 @@ enum ErrorCode {
   INVALID_MESSAGE = 5;
   INVALID_KEY = 6;
   INVALID_TIMEOUT = 7;
-  INITIALIZER_PANIC = 10;
-  SIMULATION_NOT_STARTED = 11;
-  SIMULATION_HALTED = 12;
-  SIMULATION_TERMINATED = 13;
-  SIMULATION_DEADLOCK = 14;
-  SIMULATION_MESSAGE_LOSS = 15;
-  SIMULATION_NO_RECIPIENT = 16;
-  SIMULATION_PANIC = 17;
-  SIMULATION_TIMEOUT = 18;
-  SIMULATION_OUT_OF_SYNC = 19;
-  SIMULATION_BAD_QUERY = 20;
-  SIMULATION_TIME_OUT_OF_RANGE = 21;
-  SOURCE_NOT_FOUND = 30;
-  SINK_NOT_FOUND = 31;
+
+  // Bench building and initialization errors.
+  BENCH_PANIC = 20;
+  BENCH_ERROR = 21;
+  BENCH_NOT_BUILT = 22;
+  DUPLICATE_EVENT_SOURCE = 23;
+  DUPLICATE_QUERY_SOURCE = 24;
+  DUPLICATE_EVENT_SINK = 25;
+  INVALID_BENCH_CONFIG = 26;
+  
+  // Simulation runtime error.
+  SIMULATION_PANIC = 40;
+  SIMULATION_NOT_STARTED = 42;
+  SIMULATION_TERMINATED = 43;
+  SIMULATION_DEADLOCK = 44;
+  SIMULATION_MESSAGE_LOSS = 45;
+  SIMULATION_NO_RECIPIENT = 46;
+  SIMULATION_TIMEOUT = 47;
+  SIMULATION_OUT_OF_SYNC = 48;
+  SIMULATION_BAD_QUERY = 49;
+  SIMULATION_TIME_OUT_OF_RANGE = 50;
+  
+  // Monitoring errors.
+  EVENT_SOURCE_NOT_FOUND = 60;
+  QUERY_SOURCE_NOT_FOUND = 61;
+  SINK_NOT_FOUND = 62;
+  SINK_TERMINATED = 63;
+  SINK_READ_RACE = 64;
+  SINK_READ_TIMEOUT = 65;
+  INVALID_EVENT_TYPE = 66;
+  INVALID_QUERY_TYPE = 67;
+
+  // Serialization error.
+  SAVE_ERROR = 80;
+  RESTORE_ERROR = 81;
 }
 
 message Error {
@@ -37,15 +63,86 @@ message Error {
   string message = 2;
 }
 
+
+//------------
+// Leaf types 
+//------------
+
+message Path {
+  repeated string segments = 1;
+}
+
+message EventSourceSchema {
+  Path source = 1;
+  string event = 2;
+}
+
+message QuerySourceSchema {
+  Path source = 1;
+  string request = 2;
+  string reply = 3;
+}
+
+message EventSinkSchema {
+  Path sink = 1;
+  string event = 2;
+}
+
 message EventKey {
   uint64 subkey1 = 1;
   uint64 subkey2 = 2;
 }
 
-message InitRequest { bytes cfg = 2; }
+//----------------------
+// Requests and replies
+//----------------------
+
+message BuildRequest {
+  bytes cfg = 1;
+}
+message BuildReply {
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 1;
+    Error error = 100;
+  }
+}
+
+message InitRequest {
+  google.protobuf.Timestamp time = 1;
+}
 message InitReply {
   oneof result { // Always returns exactly 1 variant.
     google.protobuf.Empty empty = 1;
+    Error error = 100;
+  }
+}
+
+message InitAndRunRequest {
+  google.protobuf.Timestamp time = 1;
+}
+message InitAndRunReply {
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Timestamp time = 1;
+    Error error = 100;
+  }
+}
+
+message RestoreRequest {
+  bytes state = 1;
+}
+message RestoreReply {
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 1;
+    Error error = 100;
+  }
+}
+
+message RestoreAndRunRequest {
+  bytes state = 1;
+}
+message RestoreAndRunReply {
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Timestamp time = 1;
     Error error = 100;
   }
 }
@@ -62,6 +159,14 @@ message HaltRequest {}
 message HaltReply {
   oneof result { // Always returns exactly 1 variant.
     google.protobuf.Empty empty = 1;
+    Error error = 100;
+  }
+}
+
+message SaveRequest {}
+message SaveReply {
+  oneof result { // Always returns exactly 1 variant.
+    bytes state = 1;
     Error error = 100;
   }
 }
@@ -95,10 +200,93 @@ message StepUntilReply {
   }
 }
 
-message StepUnboundedRequest {}
-message StepUnboundedReply {
+message RunRequest {}
+message RunReply {
   oneof result { // Always returns exactly 1 variant.
     google.protobuf.Timestamp time = 1;
+    Error error = 100;
+  }
+}
+
+message ListEventSourcesRequest {}
+message ListEventSourcesReply {
+  // This field is hoisted because protobuf3 does not support `repeated` within
+  // a `oneof`. It is Always empty if an error is returned.
+  repeated Path sources = 1;
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 10;
+    Error error = 100;
+  }
+}
+
+message GetEventSourceSchemasRequest {
+  repeated Path sources = 1;
+}
+message GetEventSourceSchemasReply {
+  // This field is hoisted because protobuf3 does not support `repeated` within
+  // a `oneof`. It is Always empty if an error is returned.
+  repeated EventSourceSchema schemas = 1;
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 10;
+    Error error = 100;
+  }
+}
+
+message ListQuerySourcesRequest {}
+message ListQuerySourcesReply {
+  // This field is hoisted because protobuf3 does not support `repeated` within
+  // a `oneof`. It is Always empty if an error is returned
+  repeated Path sources = 1;
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 10;
+    Error error = 100;
+  }
+}
+
+message GetQuerySourceSchemasRequest {
+  repeated Path sources = 1;
+}
+message GetQuerySourceSchemasReply {
+  // This field is hoisted because protobuf3 does not support `repeated` within
+  // a `oneof`. It is Always empty if an error is returned.
+  repeated QuerySourceSchema schemas = 1;
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 10;
+    Error error = 100;
+  }
+}
+
+message ListEventSinksRequest {}
+message ListEventSinksReply {
+  // This field is hoisted because protobuf3 does not support `repeated` within
+  // a `oneof`. It is Always empty if an error is returned.
+  repeated Path sinks = 1;
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 10;
+    Error error = 100;
+  }
+}
+
+message GetEventSinkSchemasRequest {
+  repeated Path sinks = 1;
+}
+message GetEventSinkSchemasReply {
+  // This field is hoisted because protobuf3 does not support `repeated` within
+  // a `oneof`. It is Always empty if an error is returned.
+  repeated EventSinkSchema schemas = 1;
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 10;
+    Error error = 100;
+  }
+}
+
+message InjectEventRequest {
+  Path source = 3;
+  bytes event = 4;
+}
+message InjectEventReply {
+  oneof result { // Always returns exactly 1 variant.
+    google.protobuf.Empty empty = 1;
     Error error = 100;
   }
 }
@@ -108,7 +296,7 @@ message ScheduleEventRequest {
     google.protobuf.Timestamp time = 1;
     google.protobuf.Duration duration = 2;
   }
-  string source_name = 3;
+  Path source = 3;
   bytes event = 4;
   google.protobuf.Duration period = 5;
   bool with_key = 6;
@@ -121,7 +309,9 @@ message ScheduleEventReply {
   }
 }
 
-message CancelEventRequest { EventKey key = 1; }
+message CancelEventRequest {
+  EventKey key = 1;
+}
 message CancelEventReply {
   oneof result { // Always returns exactly 1 variant.
     google.protobuf.Empty empty = 1;
@@ -130,7 +320,7 @@ message CancelEventReply {
 }
 
 message ProcessEventRequest {
-  string source_name = 1;
+  Path source = 1;
   bytes event = 2;
 }
 message ProcessEventReply {
@@ -141,7 +331,7 @@ message ProcessEventReply {
 }
 
 message ProcessQueryRequest {
-  string source_name = 1;
+  Path source = 1;
   bytes request = 2;
 }
 message ProcessQueryReply {
@@ -154,8 +344,10 @@ message ProcessQueryReply {
   }
 }
 
-message ReadEventsRequest { string sink_name = 1; }
-message ReadEventsReply {
+message TryReadEventsRequest {
+  Path sink = 1;
+}
+message TryReadEventsReply {
   // This field is hoisted because protobuf3 does not support `repeated` within
   // a `oneof`. It is Always empty if an error is returned
   repeated bytes events = 1;
@@ -165,68 +357,67 @@ message ReadEventsReply {
   }
 }
 
-message AwaitEventRequest {
-  string sink_name = 1;
+message ReadEventRequest {
+  Path sink = 1;
   google.protobuf.Duration timeout = 2;
 }
-message AwaitEventReply {
+message ReadEventReply {
   oneof result { // Always returns exactly 1 variant.
     bytes event = 1;
     Error error = 100;
   }
 }
 
-message OpenSinkRequest { string sink_name = 1; }
-message OpenSinkReply {
+message EnableSinkRequest {
+  Path sink = 1;
+}
+message EnableSinkReply {
   oneof result { // Always returns exactly 1 variant.
     google.protobuf.Empty empty = 10;
     Error error = 100;
   }
 }
 
-message CloseSinkRequest { string sink_name = 1; }
-message CloseSinkReply {
+message DisableSinkRequest {
+  Path sink = 1;
+}
+message DisableSinkReply {
   oneof result { // Always returns exactly 1 variant.
     google.protobuf.Empty empty = 10;
     Error error = 100;
   }
 }
 
-// A convenience message type for custom transport implementation.
-message AnyRequest {
-  oneof request { // Expects exactly 1 variant.
-    InitRequest init_request = 1;
-    HaltRequest halt_request = 2;
-    TimeRequest time_request = 3;
-    StepRequest step_request = 4;
-    StepUntilRequest step_until_request = 5;
-    ScheduleEventRequest schedule_event_request = 6;
-    CancelEventRequest cancel_event_request = 7;
-    ProcessEventRequest process_event_request = 8;
-    ProcessQueryRequest process_query_request = 9;
-    ReadEventsRequest read_events_request = 10;
-    OpenSinkRequest open_sink_request = 11;
-    CloseSinkRequest close_sink_request = 12;
-    AwaitEventRequest await_event_request = 13;
-    StepUnboundedRequest step_unbounded_request = 14;
-    TerminateRequest terminate_request = 15;
-  }
-}
+//---------
+// Service
+//---------
 
 service Simulation {
+  rpc Build(BuildRequest) returns (BuildReply);
   rpc Init(InitRequest) returns (InitReply);
-  rpc Terminate(TerminateRequest) returns (TerminateReply);
+  rpc InitAndRun(InitAndRunRequest) returns (InitAndRunReply);
   rpc Halt(HaltRequest) returns (HaltReply);
+  rpc Terminate(TerminateRequest) returns (TerminateReply);
+  rpc Save(SaveRequest) returns (SaveReply);
+  rpc Restore(RestoreRequest) returns (RestoreReply);
+  rpc RestoreAndRun(RestoreAndRunRequest) returns (RestoreAndRunReply);
   rpc Time(TimeRequest) returns (TimeReply);
   rpc Step(StepRequest) returns (StepReply);
   rpc StepUntil(StepUntilRequest) returns (StepUntilReply);
-  rpc StepUnbounded(StepUnboundedRequest) returns (StepUnboundedReply);
+  rpc Run(RunRequest) returns (RunReply);
+  rpc ListEventSources(ListEventSourcesRequest) returns (ListEventSourcesReply);
+  rpc GetEventSourceSchemas(GetEventSourceSchemasRequest) returns (GetEventSourceSchemasReply);
+  rpc ListQuerySources(ListQuerySourcesRequest) returns (ListQuerySourcesReply);
+  rpc GetQuerySourceSchemas(GetQuerySourceSchemasRequest) returns (GetQuerySourceSchemasReply);
+  rpc ListEventSinks(ListEventSinksRequest) returns (ListEventSinksReply);
+  rpc GetEventSinkSchemas(GetEventSinkSchemasRequest) returns (GetEventSinkSchemasReply);
+  rpc InjectEvent(InjectEventRequest) returns (InjectEventReply);
   rpc ScheduleEvent(ScheduleEventRequest) returns (ScheduleEventReply);
   rpc CancelEvent(CancelEventRequest) returns (CancelEventReply);
   rpc ProcessEvent(ProcessEventRequest) returns (ProcessEventReply);
   rpc ProcessQuery(ProcessQueryRequest) returns (ProcessQueryReply);
-  rpc ReadEvents(ReadEventsRequest) returns (ReadEventsReply);
-  rpc AwaitEvent(AwaitEventRequest) returns (AwaitEventReply);
-  rpc OpenSink(OpenSinkRequest) returns (OpenSinkReply);
-  rpc CloseSink(CloseSinkRequest) returns (CloseSinkReply);
+  rpc TryReadEvents(TryReadEventsRequest) returns (TryReadEventsReply);
+  rpc ReadEvent(ReadEventRequest) returns (ReadEventReply);
+  rpc EnableSink(EnableSinkRequest) returns (EnableSinkReply);
+  rpc DisableSink(DisableSinkRequest) returns (DisableSinkReply);
 }

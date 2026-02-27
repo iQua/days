@@ -1,12 +1,21 @@
 use std::fmt;
+use std::marker::PhantomData;
+use std::sync::Mutex;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
-use crate::executor::{Executor, Signal};
-use crate::ports::InputFn;
-use crate::simulation::{self, ActionKey, Address, GlobalScheduler, Mailbox, SchedulingError};
-use crate::time::{Deadline, MonotonicTime};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::{Model, ProtoModel};
+use crate::executor::{Executor, Signal};
+use crate::path::Path;
+use crate::ports::InputFn;
+use crate::simulation::{
+    self, Address, EventId, EventIdErased, EventKey, GlobalScheduler, InjectorQueue, InputSource,
+    Mailbox, ModelInjector, SchedulerRegistry, SchedulingError,
+};
+use crate::time::{ClockReader, Deadline, MonotonicTime};
+
+use super::{Model, ProtoModel, RegisteredModel};
 
 #[cfg(all(test, not(nexosim_loom)))]
 use crate::channel::Receiver;
@@ -14,30 +23,8 @@ use crate::channel::Receiver;
 /// A local context for models.
 ///
 /// A `Context` is a handle to the global context associated to a model
-/// instance. It can be used by the model to retrieve the simulation time or
-/// schedule delayed actions on itself.
-///
-/// ### Caveat: self-scheduling `async` methods
-///
-/// Due to a current rustc issue, `async` methods that schedule themselves will
-/// not compile unless an explicit `Send` bound is added to the returned future.
-/// This can be done by replacing the `async` signature with a partially
-/// desugared signature such as:
-///
-/// ```ignore
-/// fn self_scheduling_method<'a>(
-///     &'a mut self,
-///     arg: MyEventType,
-///     cx: &'a mut Context<Self>
-/// ) -> impl Future<Output=()> + Send + 'a {
-///     async move {
-///         /* implementation */
-///     }
-/// }
-/// ```
-///
-/// Self-scheduling methods which are not `async` are not affected by this
-/// issue.
+/// instance. It can be used by the model to retrieve the model's [Path] and the
+/// simulation time, or to schedule delayed events on itself.
 ///
 /// # Examples
 ///
@@ -45,70 +32,65 @@ use crate::channel::Receiver;
 ///
 /// ```
 /// use std::time::Duration;
-/// use nexosim::model::{Context, Model};
+/// use serde::{Deserialize, Serialize};
+/// use nexosim::model::{schedulable, Context, Model};
 /// use nexosim::ports::Output;
 ///
-/// #[derive(Default)]
+/// #[derive(Default, Serialize, Deserialize)]
 /// pub struct DelayedGreeter {
 ///     msg_out: Output<String>,
 /// }
 ///
+/// #[Model]
 /// impl DelayedGreeter {
 ///     // Triggers a greeting on the output port after some delay [input port].
-///     pub async fn greet_with_delay(&mut self, delay: Duration, cx: &mut Context<Self>) {
+///     pub async fn greet_with_delay(&mut self, delay: Duration, cx: &Context<Self>) {
 ///         let time = cx.time();
 ///         let greeting = format!("Hello, this message was scheduled at: {:?}.", time);
 ///
 ///         if delay.is_zero() {
 ///             self.msg_out.send(greeting).await;
 ///         } else {
-///             cx.schedule_event(delay, Self::send_msg, greeting).unwrap();
+///             cx.schedule_event(delay, schedulable!(Self::send_msg), greeting).unwrap();
 ///         }
 ///     }
 ///
 ///     // Sends a message to the output [private input port].
+///     #[nexosim(schedulable)]
 ///     async fn send_msg(&mut self, msg: String) {
 ///         self.msg_out.send(msg).await;
 ///     }
 /// }
-/// impl Model for DelayedGreeter {}
 /// ```
-// The self-scheduling caveat seems related to this issue:
-// https://github.com/rust-lang/rust/issues/78649
 pub struct Context<M: Model> {
-    name: String,
+    path: Path,
     scheduler: GlobalScheduler,
     address: Address<M>,
     origin_id: usize,
+    model_registry: Arc<ModelRegistry>,
 }
 
 impl<M: Model> Context<M> {
     /// Creates a new local context.
     pub(crate) fn new(
-        name: String,
+        path: Path,
         scheduler: GlobalScheduler,
         address: Address<M>,
         origin_id: usize,
+        model_registry: Arc<ModelRegistry>,
     ) -> Self {
-        // The only requirement for the origin ID is that it must be (i)
-        // specific to each model and (ii) different from 0 (which is reserved
-        // for the global scheduler).
-        assert_ne!(origin_id, 0);
-
         Self {
-            name,
+            path,
             scheduler,
             address,
             origin_id,
+            model_registry,
         }
     }
 
-    /// Returns the fully qualified model instance name.
-    ///
-    /// The fully qualified name is made of the unqualified model name, if
-    /// relevant prepended by the dot-separated names of all parent models.
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Returns the path to the model instance.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Returns the current simulation time.
@@ -125,41 +107,44 @@ impl<M: Model> Context<M> {
     ///
     /// ```
     /// use std::time::Duration;
-    ///
-    /// use nexosim::model::{Context, Model};
+    /// use serde::{Deserialize, Serialize};
+    /// use nexosim::model::{schedulable, Context, Model};
     ///
     /// // A timer.
+    /// #[derive(Serialize, Deserialize)]
     /// pub struct Timer {}
     ///
+    /// #[Model]
     /// impl Timer {
     ///     // Sets an alarm [input port].
-    ///     pub fn set(&mut self, setting: Duration, cx: &mut Context<Self>) {
-    ///         if cx.schedule_event(setting, Self::ring, ()).is_err() {
+    ///     pub fn set(&mut self, setting: Duration, cx: &Context<Self>) {
+    ///         if cx.schedule_event(setting, schedulable!(Self::ring), ()).is_err() {
     ///             println!("The alarm clock can only be set for a future time");
     ///         }
     ///     }
     ///
     ///     // Rings [private input port].
+    ///     #[nexosim(schedulable)]
     ///     fn ring(&mut self) {
     ///         println!("Brringggg");
     ///     }
     /// }
-    ///
-    /// impl Model for Timer {}
     /// ```
-    pub fn schedule_event<F, T, S>(
+    pub fn schedule_event<T>(
         &self,
         deadline: impl Deadline,
-        func: F,
+        schedulable_id: &SchedulableId<M, T>,
         arg: T,
     ) -> Result<(), SchedulingError>
     where
-        F: for<'a> InputFn<'a, M, T, S>,
         T: Send + Clone + 'static,
-        S: Send + 'static,
     {
-        self.scheduler
-            .schedule_event_from(deadline, func, arg, &self.address, self.origin_id)
+        self.scheduler.schedule_event_from(
+            deadline,
+            &schedulable_id.source_id(&self.model_registry),
+            arg,
+            self.origin_id,
+        )
     }
 
     /// Schedules multiple events at future times on this model.
@@ -198,21 +183,23 @@ impl<M: Model> Context<M> {
     /// # Examples
     ///
     /// ```
-    /// use nexosim::model::{Context, Model};
-    /// use nexosim::simulation::ActionKey;
+    /// use serde::{Deserialize, Serialize};
+    /// use nexosim::model::{schedulable, Context, Model};
+    /// use nexosim::simulation::EventKey;
     /// use nexosim::time::MonotonicTime;
     ///
     /// // An alarm clock that can be cancelled.
-    /// #[derive(Default)]
+    /// #[derive(Default, Serialize, Deserialize)]
     /// pub struct CancellableAlarmClock {
-    ///     event_key: Option<ActionKey>,
+    ///     event_key: Option<EventKey>,
     /// }
     ///
+    /// #[Model]
     /// impl CancellableAlarmClock {
     ///     // Sets an alarm [input port].
-    ///     pub fn set(&mut self, setting: MonotonicTime, cx: &mut Context<Self>) {
+    ///     pub fn set(&mut self, setting: MonotonicTime, cx: &Context<Self>) {
     ///         self.cancel();
-    ///         match cx.schedule_keyed_event(setting, Self::ring, ()) {
+    ///         match cx.schedule_keyed_event(setting, schedulable!(Self::ring), ()) {
     ///             Ok(event_key) => self.event_key = Some(event_key),
     ///             Err(_) => println!("The alarm clock can only be set for a future time"),
     ///         };
@@ -224,29 +211,25 @@ impl<M: Model> Context<M> {
     ///     }
     ///
     ///     // Rings the alarm [private input port].
+    ///     #[nexosim(schedulable)]
     ///     fn ring(&mut self) {
     ///         println!("Brringggg!");
     ///     }
     /// }
-    ///
-    /// impl Model for CancellableAlarmClock {}
     /// ```
-    pub fn schedule_keyed_event<F, T, S>(
+    pub fn schedule_keyed_event<T>(
         &self,
         deadline: impl Deadline,
-        func: F,
+        schedulable_id: &SchedulableId<M, T>,
         arg: T,
-    ) -> Result<ActionKey, SchedulingError>
+    ) -> Result<EventKey, SchedulingError>
     where
-        F: for<'a> InputFn<'a, M, T, S>,
         T: Send + Clone + 'static,
-        S: Send + 'static,
     {
         let event_key = self.scheduler.schedule_keyed_event_from(
             deadline,
-            func,
+            &schedulable_id.source_id(&self.model_registry),
             arg,
-            &self.address,
             self.origin_id,
         )?;
 
@@ -262,20 +245,22 @@ impl<M: Model> Context<M> {
     ///
     /// ```
     /// use std::time::Duration;
-    ///
-    /// use nexosim::model::{Context, Model};
+    /// use serde::{Deserialize, Serialize};
+    /// use nexosim::model::{schedulable, Context, Model};
     /// use nexosim::time::MonotonicTime;
     ///
     /// // An alarm clock beeping at 1Hz.
+    /// #[derive(Serialize, Deserialize)]
     /// pub struct BeepingAlarmClock {}
     ///
+    /// #[Model]
     /// impl BeepingAlarmClock {
     ///     // Sets an alarm [input port].
-    ///     pub fn set(&mut self, setting: MonotonicTime, cx: &mut Context<Self>) {
+    ///     pub fn set(&mut self, setting: MonotonicTime, cx: &Context<Self>) {
     ///         if cx.schedule_periodic_event(
     ///             setting,
     ///             Duration::from_secs(1), // 1Hz = 1/1s
-    ///             Self::beep,
+    ///             schedulable!(Self::beep),
     ///             ()
     ///         ).is_err() {
     ///             println!("The alarm clock can only be set for a future time");
@@ -283,31 +268,27 @@ impl<M: Model> Context<M> {
     ///     }
     ///
     ///     // Emits a single beep [private input port].
+    ///     #[nexosim(schedulable)]
     ///     fn beep(&mut self) {
     ///         println!("Beep!");
     ///     }
     /// }
-    ///
-    /// impl Model for BeepingAlarmClock {}
     /// ```
-    pub fn schedule_periodic_event<F, T, S>(
+    pub fn schedule_periodic_event<T>(
         &self,
         deadline: impl Deadline,
         period: Duration,
-        func: F,
+        schedulable_id: &SchedulableId<M, T>,
         arg: T,
     ) -> Result<(), SchedulingError>
     where
-        F: for<'a> InputFn<'a, M, T, S> + Clone,
         T: Send + Clone + 'static,
-        S: Send + 'static,
     {
         self.scheduler.schedule_periodic_event_from(
             deadline,
             period,
-            func,
+            &schedulable_id.source_id(&self.model_registry),
             arg,
-            &self.address,
             self.origin_id,
         )
     }
@@ -322,26 +303,27 @@ impl<M: Model> Context<M> {
     ///
     /// ```
     /// use std::time::Duration;
-    ///
-    /// use nexosim::model::{Context, Model};
-    /// use nexosim::simulation::ActionKey;
+    /// use serde::{Deserialize, Serialize};
+    /// use nexosim::model::{schedulable, Context, Model};
+    /// use nexosim::simulation::EventKey;
     /// use nexosim::time::MonotonicTime;
     ///
     /// // An alarm clock beeping at 1Hz that can be cancelled before it sets off, or
     /// // stopped after it sets off.
-    /// #[derive(Default)]
+    /// #[derive(Default, Serialize, Deserialize)]
     /// pub struct CancellableBeepingAlarmClock {
-    ///     event_key: Option<ActionKey>,
+    ///     event_key: Option<EventKey>,
     /// }
     ///
+    /// #[Model]
     /// impl CancellableBeepingAlarmClock {
     ///     // Sets an alarm [input port].
-    ///     pub fn set(&mut self, setting: MonotonicTime, cx: &mut Context<Self>) {
+    ///     pub fn set(&mut self, setting: MonotonicTime, cx: &Context<Self>) {
     ///         self.cancel();
     ///         match cx.schedule_keyed_periodic_event(
     ///             setting,
     ///             Duration::from_secs(1), // 1Hz = 1/1s
-    ///             Self::beep,
+    ///             schedulable!(Self::beep),
     ///             ()
     ///         ) {
     ///             Ok(event_key) => self.event_key = Some(event_key),
@@ -355,31 +337,27 @@ impl<M: Model> Context<M> {
     ///     }
     ///
     ///     // Emits a single beep [private input port].
+    ///     #[nexosim(schedulable)]
     ///     fn beep(&mut self) {
     ///         println!("Beep!");
     ///     }
     /// }
-    ///
-    /// impl Model for CancellableBeepingAlarmClock {}
     /// ```
-    pub fn schedule_keyed_periodic_event<F, T, S>(
+    pub fn schedule_keyed_periodic_event<T>(
         &self,
         deadline: impl Deadline,
         period: Duration,
-        func: F,
+        schedulable_id: &SchedulableId<M, T>,
         arg: T,
-    ) -> Result<ActionKey, SchedulingError>
+    ) -> Result<EventKey, SchedulingError>
     where
-        F: for<'a> InputFn<'a, M, T, S> + Clone,
         T: Send + Clone + 'static,
-        S: Send + 'static,
     {
         let event_key = self.scheduler.schedule_keyed_periodic_event_from(
             deadline,
             period,
-            func,
+            &schedulable_id.source_id(&self.model_registry),
             arg,
-            &self.address,
             self.origin_id,
         )?;
 
@@ -387,10 +365,25 @@ impl<M: Model> Context<M> {
     }
 }
 
+#[cfg(all(test, not(nexosim_loom)))]
+impl<M: Model<Env = ()>> Context<M> {
+    /// Creates a dummy context for testing purposes.
+    pub(crate) fn new_dummy() -> Self {
+        let dummy_address = Receiver::new(1).sender();
+        Context::new(
+            Path::from(""),
+            GlobalScheduler::new_dummy(),
+            Address(dummy_address),
+            0,
+            Arc::new(ModelRegistry::default()),
+        )
+    }
+}
+
 impl<M: Model> fmt::Debug for Context<M> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Context")
-            .field("name", &self.name())
+            .field("path", &self.path())
             .field("time", &self.time())
             .field("address", &self.address)
             .field("origin_id", &self.origin_id)
@@ -398,55 +391,64 @@ impl<M: Model> fmt::Debug for Context<M> {
     }
 }
 
-/// Context available when building a model from a model prototype.
+/// A context available when building a model from a model prototype.
 ///
-/// A `BuildContext` can be used to add the sub-models of a hierarchical model
-/// to the simulation bench.
+/// A `BuildContext` can be used for a variety of purposes, including:
+///
+/// - to spawn sub-models onto the simulation with
+///   [`BuildContext::add_submodel`],
+/// - to pass a [`ModelInjector`] retrieved with [`BuildContext::injector`] to
+///   any background thread that may need to communicate with the model,
+/// - to manually register a schedulable method with
+///   [`BuildContext::register_schedulable`],
+/// - to provide a clock reader to the model with
+///   [`BuildContext::clock_reader`].
 ///
 /// # Examples
 ///
 /// A model that multiplies its input by four using two sub-models that each
-/// multiply their input by two.
+/// multiply their input by two:
 ///
 /// ```text
 ///             ┌───────────────────────────────────────┐
-///             │ MyltiplyBy4                           │
+///             │              MultiplyBy4              │
 ///             │   ┌─────────────┐   ┌─────────────┐   │
 ///             │   │             │   │             │   │
 /// Input ●─────┼──►│ MultiplyBy2 ├──►│ MultiplyBy2 ├───┼─────► Output
 ///         f64 │   │             │   │             │   │ f64
 ///             │   └─────────────┘   └─────────────┘   │
-///             │                                       │
 ///             └───────────────────────────────────────┘
 /// ```
 ///
 /// ```
 /// use std::time::Duration;
+/// use serde::{Deserialize, Serialize};
 /// use nexosim::model::{BuildContext, Model, ProtoModel};
 /// use nexosim::ports::Output;
 /// use nexosim::simulation::Mailbox;
 ///
-/// #[derive(Default)]
+/// #[derive(Default, Serialize, Deserialize)]
 /// struct MultiplyBy2 {
 ///     pub output: Output<i32>,
 /// }
+/// #[Model]
 /// impl MultiplyBy2 {
 ///     pub async fn input(&mut self, value: i32) {
 ///         self.output.send(value * 2).await;
 ///     }
 /// }
-/// impl Model for MultiplyBy2 {}
 ///
+/// #[derive(Serialize, Deserialize)]
 /// pub struct MultiplyBy4 {
 ///     // Private forwarding output.
 ///     forward: Output<i32>,
 /// }
+/// #[Model]
 /// impl MultiplyBy4 {
 ///     pub async fn input(&mut self, value: i32) {
 ///         self.forward.send(value).await;
 ///     }
 /// }
-/// impl Model for MultiplyBy4 {}
 ///
 /// pub struct ProtoMultiplyBy4 {
 ///     pub output: Output<i32>,
@@ -457,7 +459,7 @@ impl<M: Model> fmt::Debug for Context<M> {
 ///     fn build(
 ///         self,
 ///         cx: &mut BuildContext<Self>)
-///     -> MultiplyBy4 {
+///     -> (MultiplyBy4, ()) {
 ///         let mut mult = MultiplyBy4 { forward: Output::default() };
 ///         let mut submult1 = MultiplyBy2::default();
 ///
@@ -476,47 +478,60 @@ impl<M: Model> fmt::Debug for Context<M> {
 ///         cx.add_submodel(submult1, submult1_mbox, "submultiplier 1");
 ///         cx.add_submodel(submult2, submult2_mbox, "submultiplier 2");
 ///
-///         mult
+///         (mult, ())
 ///     }
 /// }
-///
 /// ```
-#[derive(Debug)]
 pub struct BuildContext<'a, P: ProtoModel> {
     mailbox: &'a Mailbox<P::Model>,
-    name: &'a String,
+    path: &'a Path,
     scheduler: &'a GlobalScheduler,
+    scheduler_registry: &'a mut SchedulerRegistry,
+    injector: &'a Arc<Mutex<InjectorQueue>>,
+    origin_id: usize,
     executor: &'a Executor,
     abort_signal: &'a Signal,
-    model_names: &'a mut Vec<String>,
+    registered_models: &'a mut Vec<RegisteredModel>,
+    is_resumed: Arc<AtomicBool>,
+    model_registry: Option<&'a Arc<ModelRegistry>>,
 }
 
 impl<'a, P: ProtoModel> BuildContext<'a, P> {
-    /// Creates a new local context.
+    /// Creates a new local context without a model registry.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         mailbox: &'a Mailbox<P::Model>,
-        name: &'a String,
+        path: &'a Path,
         scheduler: &'a GlobalScheduler,
+        scheduler_registry: &'a mut SchedulerRegistry,
+        injector: &'a Arc<Mutex<InjectorQueue>>,
+        origin_id: usize,
         executor: &'a Executor,
         abort_signal: &'a Signal,
-        model_names: &'a mut Vec<String>,
+        registered_models: &'a mut Vec<RegisteredModel>,
+        is_resumed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mailbox,
-            name,
+            path,
             scheduler,
+            scheduler_registry,
+            injector,
+            origin_id,
             executor,
             abort_signal,
-            model_names,
+            registered_models,
+            is_resumed,
+            model_registry: None,
         }
     }
 
-    /// Returns the fully qualified model instance name.
+    /// Returns the path to the model.
     ///
-    /// The fully qualified name is made of the unqualified model name, if
-    /// relevant prepended by the dot-separated names of all parent models.
-    pub fn name(&self) -> &str {
-        self.name
+    /// The path is constituted by the name of all parent models (if any) and of
+    /// this model, starting from the root.
+    pub fn path(&self) -> &Path {
+        self.path
     }
 
     /// Returns a handle to the model's mailbox.
@@ -524,48 +539,155 @@ impl<'a, P: ProtoModel> BuildContext<'a, P> {
         self.mailbox.address()
     }
 
+    /// Registers a self-schedulable input.
+    ///
+    /// Typically, registering self-schedulable inputs is not necessary since
+    /// the [`macro@Model`] procedural macro does this automatically for methods
+    /// annotated with `[nexosim(schedulable)]`, enabling the use of the
+    /// [`schedulable!`](crate::model::schedulable!) macro and alleviating the
+    /// need to keep [`SchedulableId`] handles within the model.
+    ///
+    /// However, if the [`trait@Model`] trait is implemented manually or if a
+    /// non-method function needs to be scheduled, `register_schedulable` can be
+    /// used instead to obtain a [`SchedulableId`].
+    pub fn register_schedulable<F, T, S>(&mut self, func: F) -> SchedulableId<P::Model, T>
+    where
+        F: for<'f> InputFn<'f, P::Model, T, S> + Clone + Sync,
+        T: Serialize + DeserializeOwned + Clone + Send + 'static,
+        S: Send + Sync + 'static,
+    {
+        let source = InputSource::new(func, self.address().clone());
+        let id = self.scheduler_registry.add_event_source(source);
+
+        SchedulableId(id.0, PhantomData, PhantomData)
+    }
+
     /// Adds a sub-model to the simulation bench.
     ///
-    /// The `name` argument needs not be unique. It is appended to that of the
-    /// parent models' names using a dot separator (e.g.
-    /// `parent_name.child_name`) to build the fully qualified name. The use of
-    /// the dot character in the unqualified name is possible but discouraged.
-    /// If an empty string is provided, it is replaced by the string
-    /// `<unknown>`.
-    pub fn add_submodel<S: ProtoModel>(
-        &mut self,
-        model: S,
-        mailbox: Mailbox<S::Model>,
-        name: impl Into<String>,
-    ) {
-        let mut submodel_name = name.into();
-        if submodel_name.is_empty() {
-            submodel_name = String::from("<unknown>");
-        };
-        submodel_name = self.name.to_string() + "." + &submodel_name;
+    /// The [`Path`] to the sub-model is formed by the concatenation of the path
+    /// to this parent model and of the `name` argument. Because model paths are
+    /// used for logging and error reporting, the use of unique names is
+    /// recommended.
+    pub fn add_submodel<S>(&mut self, model: S, mailbox: Mailbox<S::Model>, name: &str)
+    where
+        S: ProtoModel,
+    {
+        let submodel_path = self.path.join(name);
 
         simulation::add_model(
             model,
             mailbox,
-            submodel_name,
+            submodel_path,
             self.scheduler.clone(),
+            self.scheduler_registry,
+            self.injector,
             self.executor,
             self.abort_signal,
-            self.model_names,
+            self.registered_models,
+            self.is_resumed.clone(),
         );
+    }
+
+    /// Returns a clock reader instance.
+    pub fn clock_reader(&self) -> ClockReader {
+        self.scheduler.clock_reader()
+    }
+
+    /// Returns an injector associated to this model.
+    pub fn injector(&self) -> ModelInjector<P::Model> {
+        ModelInjector::new(
+            self.injector.clone(),
+            self.origin_id,
+            self.model_registry.unwrap().clone(),
+        )
+    }
+
+    /// Sets the model registry.
+    ///
+    /// Warning: this method must be called prior to any call to
+    /// [`injector`](Self::injector).
+    pub(crate) fn set_model_registry(&mut self, model_registry: &'a Arc<ModelRegistry>) {
+        self.model_registry = Some(model_registry);
     }
 }
 
-#[cfg(all(test, not(nexosim_loom)))]
-impl<M: Model> Context<M> {
-    /// Creates a dummy context for testing purposes.
-    pub(crate) fn new_dummy() -> Self {
-        let dummy_address = Receiver::new(1).sender();
-        Context::new(
-            String::new(),
-            GlobalScheduler::new_dummy(),
-            Address(dummy_address),
-            1, // anything but 0
-        )
+impl<'a, P: ProtoModel> fmt::Debug for BuildContext<'a, P> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("BuildContext")
+            .field("path", &self.path)
+            .field("origin_id", &self.origin_id)
+            .field("is_resumed", &self.is_resumed)
+            .finish()
     }
 }
+
+/// An internal registry of inputs that can be scheduled with the
+/// [`schedulable!`](crate::model::schedulable) macro.
+///
+/// The `ModelRegistry` of each model is automatically populated by the
+/// [`Model`](crate::model) procedural macro based on the inputs decorated with
+/// `#[nexosim(schedulable)]`.
+#[derive(Debug, Default)]
+pub struct ModelRegistry(Vec<EventIdErased>);
+impl ModelRegistry {
+    #[doc(hidden)]
+    pub fn add<M: Model, T>(&mut self, schedulable_id: SchedulableId<M, T>) {
+        self.0.push(EventIdErased(schedulable_id.0));
+    }
+    pub(crate) fn get<M: Model, T>(&self, idx: usize) -> SchedulableId<M, T> {
+        SchedulableId(self.0[idx].0, PhantomData, PhantomData)
+    }
+}
+
+/// A type-safe identifier for schedulable model inputs.
+///
+/// Typically, creating a `SchedulableId` manually is not necessary since the
+/// [`macro@Model`] procedural macro does this automatically and makes it
+/// possible to use the [`schedulable!`](crate::model::schedulable!) macro to
+/// dynamically creates a `SchedulableId`.
+///
+/// However, if the [`trait@Model`] trait is implemented manually or if a
+/// non-method function or closure needs to be registered, a `SchedulableId` can
+/// be obtained by calling [`BuildContext::register_schedulable`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SchedulableId<M, T>(usize, PhantomData<M>, PhantomData<T>);
+impl<M: Model, T> SchedulableId<M, T> {
+    const REGISTRY_MASK: usize = 1 << (usize::BITS - 1);
+
+    // This method is used by the proc-macro to construct compile time ids for the
+    // inputs decorated with the #[nexosim(schedulable)] attribute.
+    // Those ids are differentiated by setting the most significant byte on the
+    // usize int.
+    //
+    // The `id` input argument refers to input's index in the `ModelRegistry` and
+    // thus can be used to obtain a valid `SchedulerRegistry` index.
+    #[doc(hidden)]
+    pub const fn __from_decorated(id: usize) -> Self {
+        Self(id | Self::REGISTRY_MASK, PhantomData, PhantomData)
+    }
+
+    // When a `SchedulableId` is created with a manual call to
+    // `BuildContext::register_schedulable`, its internal value directly
+    // corresponds to its index within the `SchedulerRegistry`.
+    //
+    // However, as those indices are not known at compilation time, the
+    // proc-macro generated `SchedulableId`s for decorated methods use
+    // indirection via the `ModelRegistry` to retrieve their entry in the
+    // `SchedulerRegistry`.
+    pub(crate) fn source_id(&self, registry: &ModelRegistry) -> EventId<T> {
+        match self.0 & Self::REGISTRY_MASK {
+            0 => EventId(self.0, PhantomData),
+            _ => EventId(
+                registry.get::<M, T>(self.0 ^ Self::REGISTRY_MASK).0,
+                PhantomData,
+            ),
+        }
+    }
+}
+
+impl<M, T> Clone for SchedulableId<M, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<M, T> Copy for SchedulableId<M, T> {}

@@ -308,15 +308,22 @@ impl<'a> ShuffledStealers<'a> {
             (0, 0)
         } else {
             let next_candidate = bit::find_bit(candidates, |count| {
-                rng.gen_bounded(count as u64) as usize + 1
+                rng.rand_bounded(count as u64) as usize + 1
             });
 
             // Right-rotate the candidates so that the bit corresponding to the
             // randomly selected worker becomes the LSB.
-            let candidate_count = stealers.len();
-            let lower_bits = candidates & ((1 << next_candidate) - 1);
-            let candidates =
-                (candidates >> next_candidate) | (lower_bits << (candidate_count - next_candidate));
+            let candidates = if next_candidate == 0 {
+                candidates
+            } else {
+                let candidate_count = stealers.len();
+                let lower_bits = candidates & ((1 << next_candidate) - 1);
+
+                // The left shift cannot overflow since `next_candidate >= 1``
+                // and the number of worker threads (`candidate_count`) cannot
+                // exceed `usize::BITS`.
+                (candidates >> next_candidate) | (lower_bits << (candidate_count - next_candidate))
+            };
 
             (candidates, next_candidate)
         };

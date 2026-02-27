@@ -3,7 +3,7 @@
 //! This example demonstrates in particular:
 //!
 //! * the use of requestor and replier ports,
-//! * simulation monitoring with event slots.
+//! * simulation monitoring.
 //!
 //! ```text
 //!                                                     ┌────────┐
@@ -26,12 +26,15 @@
 //!                       │          ├───────────────────────────────► Total power
 //!                       └──────────┘
 //! ```
+use serde::{Deserialize, Serialize};
+
 use nexosim::model::Model;
-use nexosim::ports::{EventSlot, Output, Requestor};
+use nexosim::ports::{EventSinkReader, EventSource, Output, Requestor, SinkState, event_slot};
 use nexosim::simulation::{Mailbox, SimInit, SimulationError};
 use nexosim::time::MonotonicTime;
 
 /// Power supply.
+#[derive(Serialize, Deserialize)]
 pub struct PowerSupply {
     /// Electrical output [V → A] -- requestor port.
     pub pwr_out: Requestor<f64, f64>,
@@ -39,6 +42,7 @@ pub struct PowerSupply {
     pub power: Output<f64>,
 }
 
+#[Model]
 impl PowerSupply {
     /// Creates a power supply.
     fn new() -> Self {
@@ -65,9 +69,8 @@ impl PowerSupply {
     }
 }
 
-impl Model for PowerSupply {}
-
 /// Power supply.
+#[derive(Serialize, Deserialize)]
 pub struct Load {
     /// Power consumption [W] -- output port.
     pub power: Output<f64>,
@@ -76,6 +79,7 @@ pub struct Load {
     conductance: f64,
 }
 
+#[Model]
 impl Load {
     /// Creates a load with the specified resistance [Ω].
     fn new(resistance: f64) -> Self {
@@ -97,8 +101,6 @@ impl Load {
     }
 }
 
-impl Model for Load {}
-
 fn main() -> Result<(), SimulationError> {
     // ---------------
     // Bench assembly.
@@ -113,7 +115,6 @@ fn main() -> Result<(), SimulationError> {
     let mut load2 = Load::new(r2);
     let mut load3 = Load::new(r3);
 
-    // Mailboxes.
     let psu_mbox = Mailbox::new();
     let load1_mbox = Mailbox::new();
     let load2_mbox = Mailbox::new();
@@ -124,28 +125,30 @@ fn main() -> Result<(), SimulationError> {
     psu.pwr_out.connect(Load::pwr_in, &load2_mbox);
     psu.pwr_out.connect(Load::pwr_in, &load3_mbox);
 
-    // Model handles for simulation.
-    let mut psu_power = EventSlot::new();
-    let mut load1_power = EventSlot::new();
-    let mut load2_power = EventSlot::new();
-    let mut load3_power = EventSlot::new();
-    psu.power.connect_sink(&psu_power);
-    load1.power.connect_sink(&load1_power);
-    load2.power.connect_sink(&load2_power);
-    load3.power.connect_sink(&load3_power);
-    let psu_addr = psu_mbox.address();
+    // Endpoints.
+    let mut bench = SimInit::new();
 
-    // Start time (arbitrary since models do not depend on absolute time).
-    let t0 = MonotonicTime::EPOCH;
+    let voltage_setting = EventSource::new()
+        .connect(PowerSupply::voltage_setting, &psu_mbox)
+        .register(&mut bench);
+
+    let (sink, mut psu_power) = event_slot(SinkState::Enabled);
+    psu.power.connect_sink(sink);
+    let (sink, mut load1_power) = event_slot(SinkState::Enabled);
+    load1.power.connect_sink(sink);
+    let (sink, mut load2_power) = event_slot(SinkState::Enabled);
+    load2.power.connect_sink(sink);
+    let (sink, mut load3_power) = event_slot(SinkState::Enabled);
+    load3.power.connect_sink(sink);
 
     // Assembly and initialization.
-    let mut simu = SimInit::new()
+    let t0 = MonotonicTime::EPOCH; // arbitrary since models do not depend on absolute time
+    let mut simu = bench
         .add_model(psu, psu_mbox, "psu")
         .add_model(load1, load1_mbox, "load1")
         .add_model(load2, load2_mbox, "load2")
         .add_model(load3, load3_mbox, "load3")
-        .init(t0)?
-        .0;
+        .init(t0)?;
 
     // ----------
     // Simulation.
@@ -159,14 +162,14 @@ fn main() -> Result<(), SimulationError> {
 
     // Vary the supply voltage, check the load and power supply consumptions.
     for voltage in [10.0, 15.0, 20.0] {
-        simu.process_event(PowerSupply::voltage_setting, voltage, &psu_addr)?;
+        simu.process_event(&voltage_setting, voltage)?;
 
         let v_square = voltage * voltage;
-        assert!(same_power(load1_power.next().unwrap(), v_square / r1));
-        assert!(same_power(load2_power.next().unwrap(), v_square / r2));
-        assert!(same_power(load3_power.next().unwrap(), v_square / r3));
+        assert!(same_power(load1_power.try_read().unwrap(), v_square / r1));
+        assert!(same_power(load2_power.try_read().unwrap(), v_square / r2));
+        assert!(same_power(load3_power.try_read().unwrap(), v_square / r3));
         assert!(same_power(
-            psu_power.next().unwrap(),
+            psu_power.try_read().unwrap(),
             v_square * (1.0 / r1 + 1.0 / r2 + 1.0 / r3)
         ));
     }

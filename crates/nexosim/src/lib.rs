@@ -1,9 +1,9 @@
 //! A high-performance, discrete-event computation framework for system
 //! simulation.
 //!
-//! NeXosim (né Asynchronix) is a developer-friendly, yet highly optimized
-//! software simulator able to scale to very large simulation with complex
-//! time-driven state machines.
+//! NeXosim is a developer-friendly, yet highly optimized software simulator
+//! able to scale to very large simulation with complex time-driven state
+//! machines.
 //!
 //! It promotes a component-oriented architecture that is familiar to system
 //! engineers and closely resembles [flow-based programming][FBP]: a model is
@@ -24,7 +24,7 @@
 //!
 //! Simulating a system typically involves three distinct activities:
 //!
-//! 1. the design of simulation models for each sub-system,
+//! 1. the design of simulation models for each node of the system,
 //! 2. the assembly of a simulation bench from a set of models, performed by
 //!    inter-connecting model ports,
 //! 3. the execution of the simulation, managed through periodical increments of
@@ -39,13 +39,14 @@
 //! * _output ports_, which are instances of the [`Output`](ports::Output) type
 //!   and can be used to broadcast a message,
 //! * _requestor ports_, which are instances of the
-//!   [`Requestor`](ports::Requestor) or [`UniRequestor`](ports::UniRequestor)
-//!   types and can be used to broadcast a message and receive an iterator
-//!   yielding the replies from all connected replier ports,
+//!   [`UniRequestor`](ports::UniRequestor) or [`Requestor`](ports::Requestor)
+//!   types and can be used to send/broadcast a message and receive a single
+//!   reply ([`UniRequestor`](ports::UniRequestor)) or an iterator over the
+//!   replies of all connected replier ports ([`Requestor`](ports::Requestor)),
 //! * _input ports_, which are synchronous or asynchronous methods that
 //!   implement the [`InputFn`](ports::InputFn) trait and take an `&mut self`
-//!   argument, a message argument, and an optional
-//!   [`&mut Context`](model::Context) argument,
+//!   argument, a message argument and, optionally, [`&Context`](model::Context)
+//!   and [`&Model::Env`](model::Model::Env) arguments,
 //! * _replier ports_, which are similar to input ports but implement the
 //!   [`ReplierFn`](ports::ReplierFn) trait and return a reply.
 //!
@@ -53,26 +54,31 @@
 //! to as *events*, while messages exchanged between requestor and replier ports
 //! are referred to as *requests* and *replies*.
 //!
-//! Models must implement the [`Model`](model::Model) trait. The main purpose of
-//! this trait is to allow models to specify a
-//! [`Model::init`](model::Model::init) method that is guaranteed to run once
-//! and only once when the simulation is initialized, _i.e._ after all models
+//! Models must implement the [`Model`](trait@model::Model) trait, which is most
+//! conveniently done by annotating the `impl` block of the model with the
+//! [`#[Model]`](macro@model::Model) macro. This trait allows models to specify
+//! a custom [`Model::init`](model::Model::init) method that is guaranteed to
+//! run exactly once when the simulation is initialized, _i.e._ after all models
 //! have been connected but before the simulation starts.
-//!
-//! The [`Model::init`](model::Model::init) methods has a default
-//! implementations, so models that do not require setup and initialization can
-//! simply implement the trait with a one-liner such as `impl Model for MyModel
-//! {}`.
 //!
 //! More complex models can be built with the [`ProtoModel`](model::ProtoModel)
 //! trait. The [`ProtoModel::build`](model::ProtoModel::build) method makes it
 //! possible to:
 //!
-//! * build the final [`Model`](model::Model) from a builder (the *model prototype*),
+//! * build the final [`Model`](trait@model::Model) from a builder (the *model
+//!   prototype*),
 //! * perform possibly blocking actions when the model is added to the
 //!   simulation rather than when the simulation starts, such as establishing a
 //!   network connection or configuring hardware devices,
 //! * connect submodels and add them to the simulation.
+//!
+//! In typical scenarios the [`Model`](trait@model::Model) trait can be
+//! implemented by a [`Model`](macro@model::Model) proc-macro, applied to the
+//! main `impl` block of the model struct. Definition for the `init` method
+//! can be provided by using a custom `#[nexosim(init)]` attribute.
+//! Moreover, input methods can be decorated with
+//! `#[nexosim(schedulable)]` attribute to allow convenient self-scheduling
+//! within the model.
 //!
 //! ### A simple model
 //!
@@ -91,19 +97,20 @@
 //! `Multiplier` could be implemented as follows:
 //!
 //! ```
+//! use serde::{Deserialize, Serialize};
 //! use nexosim::model::Model;
 //! use nexosim::ports::Output;
 //!
-//! #[derive(Default)]
+//! #[derive(Default, Serialize, Deserialize)]
 //! pub struct Multiplier {
 //!     pub output: Output<f64>,
 //! }
+//! #[Model]
 //! impl Multiplier {
 //!     pub async fn input(&mut self, value: f64) {
 //!         self.output.send(2.0 * value).await;
 //!     }
 //! }
-//! impl Model for Multiplier {}
 //! ```
 //!
 //! ### A model using the local context
@@ -112,29 +119,33 @@
 //! access to the current simulation time. To do so, input and replier methods
 //! can take an optional argument that gives them access to a local context.
 //!
-//! To show how the local context can be used in practice, let us implement
-//! `Delay`, a model which simply forwards its input unmodified after a 1s
-//! delay:
+//! To show how the local context can be used in practice, let us implement a
+//! `Delay` model which simply forwards its input after a 1s delay. Note as well
+//! the use of the [`schedulable!`](model::schedulable) macro which, together
+//! with the `[nexosim(Schedulable)]` attribute, make it possible for a model to
+//! self-schedule its inputs.
 //!
 //! ```
 //! use std::time::Duration;
-//! use nexosim::model::{Context, Model};
+//! use serde::{Deserialize, Serialize};
+//! use nexosim::model::{Context, Model, schedulable};
 //! use nexosim::ports::Output;
 //!
-//! #[derive(Default)]
+//! #[derive(Default, Serialize, Deserialize)]
 //! pub struct Delay {
 //!    pub output: Output<f64>,
 //! }
+//! #[Model]
 //! impl Delay {
-//!     pub fn input(&mut self, value: f64, cx: &mut Context<Self>) {
-//!         cx.schedule_event(Duration::from_secs(1), Self::send, value).unwrap();
+//!     pub fn input(&mut self, value: f64, cx: &Context<Self>) {
+//!         cx.schedule_event(Duration::from_secs(1), schedulable!(Self::send), value).unwrap();
 //!     }
 //!
+//!     #[nexosim(schedulable)]
 //!     async fn send(&mut self, value: f64) {
 //!         self.output.send(value).await;
 //!     }
 //! }
-//! impl Model for Delay {}
 //! ```
 //!
 //! ## Assembling simulation benches
@@ -146,7 +157,11 @@
 //! creation of a [`Mailbox`](simulation::Mailbox) for each model. A mailbox is
 //! essentially a fixed-capacity buffer for events and requests. While each
 //! model has only one mailbox, it is possible to create an arbitrary number of
-//! [`Address`](simulation::Mailbox)es pointing to that mailbox.
+//! [`Address`](simulation::Mailbox)es pointing to that mailbox. For
+//! convenience, methods such as [`Output::connect`](ports::Output::connect)
+//! accept as the target either a [`&Mailbox`](simulation::Mailbox) reference
+//! from which an address is created, or a pre-instantiated
+//! [`Address`](simulation::Mailbox).
 //!
 //! Addresses are used among others to connect models: each output or requestor
 //! port has a `connect` method that takes as argument a function pointer to
@@ -180,34 +195,36 @@
 //! ```
 //! # mod models {
 //! #     use std::time::Duration;
-//! #     use nexosim::model::{Context, Model};
+//! #     use serde::{Deserialize, Serialize};
+//! #     use nexosim::model::{Context, Model, schedulable};
 //! #     use nexosim::ports::Output;
-//! #     #[derive(Default)]
+//! #     #[derive(Default, Serialize, Deserialize)]
 //! #     pub struct Multiplier {
 //! #         pub output: Output<f64>,
 //! #     }
+//! #     #[Model]
 //! #     impl Multiplier {
 //! #         pub async fn input(&mut self, value: f64) {
 //! #             self.output.send(2.0 * value).await;
 //! #         }
 //! #     }
-//! #     impl Model for Multiplier {}
-//! #     #[derive(Default)]
+//! #     #[derive(Default, Serialize, Deserialize)]
 //! #     pub struct Delay {
 //! #        pub output: Output<f64>,
 //! #     }
+//! #     #[Model]
 //! #     impl Delay {
-//! #         pub fn input(&mut self, value: f64, cx: &mut Context<Self>) {
-//! #             cx.schedule_event(Duration::from_secs(1), Self::send, value).unwrap();
+//! #         pub fn input(&mut self, value: f64, cx: &Context<Self>) {
+//! #             cx.schedule_event(Duration::from_secs(1), schedulable!(Self::send), value).unwrap();
 //! #         }
+//! #         #[nexosim(schedulable)]
 //! #         async fn send(&mut self, value: f64) { // this method can be private
 //! #             self.output.send(value).await;
 //! #         }
 //! #     }
-//! #     impl Model for Delay {}
 //! # }
 //! use std::time::Duration;
-//! use nexosim::ports::EventSlot;
+//! use nexosim::ports::{EventSource, SinkState, event_slot};
 //! use nexosim::simulation::{Mailbox, SimInit};
 //! use nexosim::time::MonotonicTime;
 //!
@@ -232,13 +249,18 @@
 //! delay1.output.connect(Delay::input, &delay2_mbox);
 //!
 //! // Keep handles to the system input and output for the simulation.
-//! let mut output_slot = EventSlot::new();
-//! delay2.output.connect_sink(&output_slot);
-//! let input_address = multiplier1_mbox.address();
+//! let mut bench = SimInit::new();
+//!
+//! let input = EventSource::new()
+//!     .connect(Multiplier::input, &multiplier1_mbox)
+//!     .register(&mut bench);
+//!
+//! let (sink, mut output) = event_slot(SinkState::Enabled);
+//! delay2.output.connect_sink(sink);
 //!
 //! // Pick an arbitrary simulation start time and build the simulation.
 //! let t0 = MonotonicTime::EPOCH;
-//! let (mut simu, scheduler) = SimInit::new()
+//! let mut simu = bench
 //!     .add_model(multiplier1, multiplier1_mbox, "multiplier1")
 //!     .add_model(multiplier2, multiplier2_mbox, "multiplier2")
 //!     .add_model(delay1, delay1_mbox, "delay1")
@@ -255,9 +277,9 @@
 //! 1. by advancing time, either until the next scheduled event with
 //!    [`Simulation::step`](simulation::Simulation::step), until a specific
 //!    deadline with
-//!    [`Simulation::step_until`](simulation::Simulation::step_until), or
-//!    until there are no more scheduled events with
-//!    [`Simulation::step_unbounded`](simulation::Simulation::step_unbounded).
+//!    [`Simulation::step_until`](simulation::Simulation::step_until), or until
+//!    there are no more scheduled events with
+//!    [`Simulation::run`](simulation::Simulation::run).
 //! 2. by sending events or queries without advancing simulation time, using
 //!    [`Simulation::process_event`](simulation::Simulation::process_event) or
 //!    [`Simulation::send_query`](simulation::Simulation::process_query),
@@ -266,14 +288,14 @@
 //! When initialized with the default clock, the simulation will run as fast as
 //! possible, without regard for the actual wall clock time. Alternatively, the
 //! simulation time can be synchronized to the wall clock time using
-//! [`SimInit::set_clock`](simulation::SimInit::set_clock) and providing a
+//! [`SimInit::with_clock`](simulation::SimInit::with_clock) and providing a
 //! custom [`Clock`](time::Clock) type or a readily-available real-time clock
 //! such as [`AutoSystemClock`](time::AutoSystemClock).
 //!
-//! Simulation outputs can be monitored using [`EventSlot`](ports::EventSlot)s,
-//! [`EventQueue`](ports::EventQueue)s, or any implementer of the
-//! [`EventSink`](ports::EventSink) trait, connected to one or several model
-//! output ports.
+//! Simulation outputs can be monitored using
+//! [`event_slot`](ports::event_slot)s, [`event_queue`](ports::event_queue)s, or
+//! any implementer of the [`EventSinkWriter`](ports::EventSinkWriter) trait
+//! connected to one or several model output ports.
 //!
 //! This is an example of simulation that could be performed using the above
 //! bench assembly:
@@ -281,34 +303,36 @@
 //! ```
 //! # mod models {
 //! #     use std::time::Duration;
-//! #     use nexosim::model::{Context, Model};
+//! #     use serde::{Deserialize, Serialize};
+//! #     use nexosim::model::{schedulable, Context, Model};
 //! #     use nexosim::ports::Output;
-//! #     #[derive(Default)]
+//! #     #[derive(Default, Serialize, Deserialize)]
 //! #     pub struct Multiplier {
 //! #         pub output: Output<f64>,
 //! #     }
+//! #     #[Model]
 //! #     impl Multiplier {
 //! #         pub async fn input(&mut self, value: f64) {
 //! #             self.output.send(2.0 * value).await;
 //! #         }
 //! #     }
-//! #     impl Model for Multiplier {}
-//! #     #[derive(Default)]
+//! #     #[derive(Default, Serialize, Deserialize)]
 //! #     pub struct Delay {
 //! #        pub output: Output<f64>,
 //! #     }
+//! #     #[Model]
 //! #     impl Delay {
-//! #         pub fn input(&mut self, value: f64, cx: &mut Context<Self>) {
-//! #             cx.schedule_event(Duration::from_secs(1), Self::send, value).unwrap();
+//! #         pub fn input(&mut self, value: f64, cx: &Context<Self>) {
+//! #             cx.schedule_event(Duration::from_secs(1), schedulable!(Self::send), value).unwrap();
 //! #         }
+//! #         #[nexosim(schedulable)]
 //! #         async fn send(&mut self, value: f64) { // this method can be private
 //! #             self.output.send(value).await;
 //! #         }
 //! #     }
-//! #     impl Model for Delay {}
 //! # }
 //! # use std::time::Duration;
-//! # use nexosim::ports::EventSlot;
+//! # use nexosim::ports::{EventSinkReader, EventSource, SinkState, event_slot};
 //! # use nexosim::simulation::{Mailbox, SimInit};
 //! # use nexosim::time::MonotonicTime;
 //! # use models::{Delay, Multiplier};
@@ -324,33 +348,35 @@
 //! # multiplier1.output.connect(Multiplier::input, &multiplier2_mbox);
 //! # multiplier2.output.connect(Delay::input, &delay2_mbox);
 //! # delay1.output.connect(Delay::input, &delay2_mbox);
-//! # let mut output_slot = EventSlot::new();
-//! # delay2.output.connect_sink(&output_slot);
-//! # let input_address = multiplier1_mbox.address();
+//! # let mut bench = SimInit::new();
+//! # let input = EventSource::new()
+//! #     .connect(Multiplier::input, &multiplier1_mbox)
+//! #     .register(&mut bench);
+//! # let (sink, mut output) = event_slot(SinkState::Enabled);
+//! # delay2.output.connect_sink(sink);
 //! # let t0 = MonotonicTime::EPOCH;
-//! # let mut simu = SimInit::new()
+//! # let mut simu = bench
 //! #     .add_model(multiplier1, multiplier1_mbox, "multiplier1")
 //! #     .add_model(multiplier2, multiplier2_mbox, "multiplier2")
 //! #     .add_model(delay1, delay1_mbox, "delay1")
 //! #     .add_model(delay2, delay2_mbox, "delay2")
-//! #     .init(t0)?
-//! #     .0;
+//! #     .init(t0)?;
 //! // Send a value to the first multiplier.
-//! simu.process_event(Multiplier::input, 21.0, &input_address)?;
+//! simu.process_event(&input, 21.0)?;
 //!
 //! // The simulation is still at t0 so nothing is expected at the output of the
 //! // second delay gate.
-//! assert!(output_slot.next().is_none());
+//! assert!(output.try_read().is_none());
 //!
 //! // Advance simulation time until the next event and check the time and output.
 //! simu.step()?;
 //! assert_eq!(simu.time(), t0 + Duration::from_secs(1));
-//! assert_eq!(output_slot.next(), Some(84.0));
+//! assert_eq!(output.try_read(), Some(84.0));
 //!
 //! // Get the answer to the ultimate question of life, the universe & everything.
 //! simu.step()?;
 //! assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-//! assert_eq!(output_slot.next(), Some(42.0));
+//! assert_eq!(output.try_read(), Some(42.0));
 //!
 //! # Ok::<(), nexosim::simulation::SimulationError>(())
 //! ```
@@ -402,22 +428,22 @@
 //!
 //! ```toml
 //! [dependencies]
-//! nexosim = { version = "0.4", features = ["tracing"] }
+//! nexosim = { version = "1", features = ["tracing"] }
 //! ```
 //!
 //! See the [`tracing`] module for more information.
 //!
 //! ## Server
 //!
-//! The `server` feature provides a gRPC server for remote control and monitoring,
-//! e.g. from a Python client. It can be activated with:
+//! The `server` feature provides a gRPC server for remote control and
+//! monitoring, *e.g.* from a Python client. It can be activated with:
 //!
 //! ```toml
 //! [dependencies]
-//! nexosim = { version = "0.4", features = ["server"] }
+//! nexosim = { version = "1", features = ["server"] }
 //! ```
 //!
-//! See the [`registry`] and [`server`] modules for more information.
+//! See the [`endpoints`] and [`server`] modules for more information.
 //!
 //! Front-end usage documentation will be added upon release of the NeXosim
 //! Python client.
@@ -452,37 +478,38 @@
 //!   models just like [`Output`](ports::Output) and
 //!   [`Requestor`](ports::Requestor) ports, but for use as simulation
 //!   endpoints.
-//! * the [`registry`] and [`server`] modules make it possible to manage and
-//!   monitor a simulation locally or remotely from a NeXosim Python client,
-//! * the [`simulation`] module discusses **mailbox capacity** and pathological
-//!   situations that may lead to a **deadlock**,
-//! * the [`time`] module introduces the [`time::MonotonicTime`] monotonic
-//!   timestamp object and **simulation clocks**.
+//! * the [`server`] modules makes it possible to remotely manage a simulation
+//!   bench via gRPC,
+//! * the [`simulation`] module discusses mailbox capacity, deadlocks and custom
+//!   clocks,
+//! * the [`time`] module introduces [`MonotonicTime`](time::MonotonicTime)
+//!   timestamps,  [`Clock`](time::Clock)s and [`Ticker`](time::Ticker)s.
 //! * the [`tracing`] module discusses time-stamping and filtering of `tracing`
 //!   events.
-//!
 #![warn(missing_docs, missing_debug_implementations, unreachable_pub)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg_hide))]
-#![cfg_attr(docsrs, doc(cfg_hide(feature = "dev-hooks")))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg(hide(feature = "dev-hooks"))))]
 
 pub(crate) mod channel;
+pub mod endpoints;
 pub(crate) mod executor;
 mod loom_exports;
 pub(crate) mod macros;
 pub mod model;
+pub mod path;
 pub mod ports;
-pub mod simulation;
-pub mod time;
-pub(crate) mod util;
-
-#[cfg(feature = "server")]
-pub mod registry;
 #[cfg(feature = "server")]
 pub mod server;
-
+pub mod simulation;
+pub mod time;
 #[cfg(feature = "tracing")]
 pub mod tracing;
+pub(crate) mod util;
 
 #[cfg(feature = "dev-hooks")]
 #[doc(hidden)]
 pub mod dev_hooks;
+
+pub use nexosim_macros::{self, Message};
+#[doc(hidden)]
+pub use schemars::{self, JsonSchema};
