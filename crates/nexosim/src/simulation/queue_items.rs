@@ -464,9 +464,50 @@ where
     }
 }
 
+pub(crate) trait FastScheduledEvent: Send + 'static {
+    fn event_id(&self) -> EventIdErased;
+    fn into_future(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    fn to_serializable_parts(
+        &self,
+    ) -> Result<(EventIdErased, Vec<u8>, Option<Duration>, Option<EventKey>), ExecutionError>;
+}
+
+pub(crate) struct FastEvent {
+    inner: Box<dyn FastScheduledEvent>,
+}
+
+impl FastEvent {
+    pub(crate) fn new(inner: Box<dyn FastScheduledEvent>) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn event_id(&self) -> EventIdErased {
+        self.inner.event_id()
+    }
+
+    pub(crate) fn into_future(self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.inner.into_future()
+    }
+
+    pub(crate) fn to_serializable_parts(
+        &self,
+    ) -> Result<(EventIdErased, Vec<u8>, Option<Duration>, Option<EventKey>), ExecutionError> {
+        self.inner.to_serializable_parts()
+    }
+}
+
+impl std::fmt::Debug for FastEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("FastEvent")
+            .field("event_id", &self.event_id().0)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) enum QueueItem {
-    Event(Event),
-    Query(Query),
+    Event(Box<Event>),
+    FastEvent(FastEvent),
+    Query(Box<Query>),
 }
 impl QueueItem {
     pub(crate) fn serialize(
@@ -477,6 +518,15 @@ impl QueueItem {
             QueueItem::Event(event) => {
                 SerializableQueueItem::Event(event.to_serializable(&registry.event_registry)?)
             }
+            QueueItem::FastEvent(event) => {
+                let (event_id, arg, period, key) = event.to_serializable_parts()?;
+                SerializableQueueItem::Event(SerializableEvent {
+                    event_id,
+                    arg,
+                    period,
+                    key,
+                })
+            }
             QueueItem::Query(query) => {
                 SerializableQueueItem::Query(query.to_serializable(&registry.query_registry)?)
             }
@@ -486,6 +536,10 @@ impl QueueItem {
             match self {
                 QueueItem::Event(event) => SaveError::EventSerializationError {
                     event_id: event.event_id.0,
+                    cause: Box::new(e),
+                },
+                QueueItem::FastEvent(event) => SaveError::EventSerializationError {
+                    event_id: event.event_id().0,
                     cause: Box::new(e),
                 },
                 QueueItem::Query(query) => SaveError::QuerySerializationError {
@@ -508,10 +562,16 @@ impl QueueItem {
 
         Ok(match item {
             SerializableQueueItem::Event(event) => {
-                QueueItem::Event(Event::from_serializable(event, &registry.event_registry)?)
+                QueueItem::Event(Box::new(Event::from_serializable(
+                    event,
+                    &registry.event_registry,
+                )?))
             }
             SerializableQueueItem::Query(query) => {
-                QueueItem::Query(Query::from_serializable(query, &registry.query_registry)?)
+                QueueItem::Query(Box::new(Query::from_serializable(
+                    query,
+                    &registry.query_registry,
+                )?))
             }
         })
     }

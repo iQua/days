@@ -22,7 +22,6 @@ use task::Promise;
 static NEXT_EXECUTOR_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
-#[non_exhaustive]
 pub(crate) enum ExecutorError {
     /// Not all messages have been processed.
     UnprocessedMessages(usize),
@@ -42,7 +41,24 @@ pub(crate) struct SimulationContext {
 
 scoped_thread_local!(pub(crate) static SIMULATION_CONTEXT: SimulationContext);
 
+// Executor instance identifier for the currently executing executor task, if any.
+// This is set by both single- and multi-threaded executors while polling tasks.
+scoped_thread_local!(pub(crate) static EXECUTOR_ID: usize);
+
+// Worker thread identifier for the currently executing executor task, if any.
+// This is set by both single- and multi-threaded executors while polling tasks.
+scoped_thread_local!(pub(crate) static WORKER_ID: usize);
+
+pub(crate) fn executor_id() -> Option<usize> {
+    EXECUTOR_ID.map(|id| *id)
+}
+
+pub(crate) fn worker_id() -> Option<usize> {
+    WORKER_ID.map(|id| *id)
+}
+
 #[cfg(feature = "perf_stats")]
+#[allow(dead_code)]
 pub(crate) fn report_executor_perf_stats() {
     mt_executor::report_perf_stats();
 }
@@ -115,7 +131,6 @@ impl Executor {
     }
 
     /// Spawns many tasks which output will never be retrieved.
-    #[allow(dead_code)]
     pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
     where
         I: IntoIterator<Item = T>,
@@ -137,7 +152,6 @@ impl Executor {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn executor_id(&self) -> usize {
         match self {
             Self::StExecutor(executor) => executor.executor_id(),

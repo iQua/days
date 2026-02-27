@@ -125,6 +125,7 @@ pub(crate) use queue_items::{
     SchedulerRegistry,
 };
 pub(crate) use scheduler::GlobalScheduler;
+pub(crate) use scheduler::SchedulerState;
 
 use std::any::{Any, TypeId};
 use std::cell::Cell;
@@ -138,6 +139,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::time::Duration;
 use std::{panic, task};
+
+#[cfg(feature = "perf_stats")]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use pin_project::pin_project;
 use recycle_box::{RecycleBox, coerce_box};
@@ -165,6 +169,66 @@ thread_local! { pub(crate) static CURRENT_MODEL_ID: Cell<ModelId> = const { Cell
 // Note: `usize::MAX` is not a valid origin ID as it is denotes the lack of an
 // origin ID for a `ModelId`.
 const GLOBAL_ORIGIN_ID: usize = usize::MAX - 1;
+
+#[cfg(feature = "perf_stats")]
+static STEPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static ACTIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static GROUPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static SCHEDULED_EVENTS_ERASED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static SCHEDULED_EVENTS_FAST: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static INJECTED_EVENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static SCHEDULED_QUERIES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static MAX_ACTIONS_PER_STEP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "perf_stats")]
+static MAX_GROUPS_PER_STEP: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "perf_stats")]
+fn bump_max(dst: &AtomicU64, v: u64) {
+    let mut cur = dst.load(AtomicOrdering::Relaxed);
+    while v > cur {
+        match dst.compare_exchange_weak(cur, v, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+#[cfg(feature = "perf_stats")]
+fn report_sim_perf_stats() {
+    let steps = STEPS.load(AtomicOrdering::Relaxed);
+    let actions = ACTIONS.load(AtomicOrdering::Relaxed);
+    let groups = GROUPS.load(AtomicOrdering::Relaxed);
+    let erased = SCHEDULED_EVENTS_ERASED.load(AtomicOrdering::Relaxed);
+    let fast = SCHEDULED_EVENTS_FAST.load(AtomicOrdering::Relaxed);
+    let injected = INJECTED_EVENTS.load(AtomicOrdering::Relaxed);
+    let queries = SCHEDULED_QUERIES.load(AtomicOrdering::Relaxed);
+    let nonzero_steps = steps.max(1);
+
+    eprintln!(
+        "[perf_stats] steps={} actions={} groups={} avg_actions/step={:.2} avg_groups/step={:.2} max_actions/step={} max_groups/step={} scheduled_erased={} scheduled_fast={} injected_events={} scheduled_queries={}",
+        steps,
+        actions,
+        groups,
+        actions as f64 / nonzero_steps as f64,
+        groups as f64 / nonzero_steps as f64,
+        MAX_ACTIONS_PER_STEP.load(AtomicOrdering::Relaxed),
+        MAX_GROUPS_PER_STEP.load(AtomicOrdering::Relaxed),
+        erased,
+        fast,
+        injected,
+        queries,
+    );
+
+    crate::executor::report_executor_perf_stats();
+}
 
 /// The simulation environment.
 ///
@@ -209,7 +273,7 @@ const GLOBAL_ORIGIN_ID: usize = usize::MAX - 1;
 /// See [the module-level documentation](self) for more.
 pub struct Simulation {
     executor: Executor,
-    scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+    scheduler_state: Arc<SchedulerState>,
     scheduler_registry: SchedulerRegistry,
     injector_queue: Arc<Mutex<InjectorQueue>>,
     time: AtomicTime,
@@ -217,6 +281,7 @@ pub struct Simulation {
     clock_tolerance: Option<Duration>,
     ticker: Option<Box<dyn Ticker>>,
     timeout: Duration,
+    max_groups_per_step_task: usize,
     observers: Vec<(Path, Box<dyn ChannelObserver>)>,
     registered_models: Vec<RegisteredModel>,
     is_halted: Arc<AtomicBool>,
@@ -228,7 +293,7 @@ impl Simulation {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         executor: Executor,
-        scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+        scheduler_state: Arc<SchedulerState>,
         scheduler_registry: SchedulerRegistry,
         injector_queue: Arc<Mutex<InjectorQueue>>,
         time: AtomicTime,
@@ -236,13 +301,14 @@ impl Simulation {
         clock_tolerance: Option<Duration>,
         ticker: Option<Box<dyn Ticker>>,
         timeout: Duration,
+        max_groups_per_step_task: usize,
         observers: Vec<(Path, Box<dyn ChannelObserver>)>,
         registered_models: Vec<RegisteredModel>,
         is_halted: Arc<AtomicBool>,
     ) -> Self {
         Self {
             executor,
-            scheduler_queue,
+            scheduler_state,
             scheduler_registry,
             injector_queue,
             time,
@@ -250,6 +316,7 @@ impl Simulation {
             clock_tolerance,
             ticker,
             timeout,
+            max_groups_per_step_task: max_groups_per_step_task.max(1),
             observers,
             registered_models,
             is_halted,
@@ -265,7 +332,7 @@ impl Simulation {
     /// Returns a scheduler handle.
     pub fn scheduler(&self) -> Scheduler {
         Scheduler::new(
-            self.scheduler_queue.clone(),
+            self.scheduler_state.clone(),
             self.time.reader(),
             self.is_halted.clone(),
         )
@@ -653,7 +720,8 @@ impl Simulation {
             let tick = ticker.next_tick(self.time.read());
             (tick <= upper_time_bound).then_some(tick)
         });
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.scheduler_state.scheduler_queue.lock().unwrap();
+        self.scheduler_state.flush_local(&mut scheduler_queue);
         let mut next_key = peek_next_key(&mut scheduler_queue);
         let time = match (next_key, next_tick) {
             (Some(key), Some(tick)) => tick.min(key.0),
@@ -665,52 +733,185 @@ impl Simulation {
         self.time.write(time);
 
         let mut has_events = false;
+        let max_groups_per_step_task = self.max_groups_per_step_task;
+        let use_bundling = max_groups_per_step_task > 1;
+        let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
+            if use_bundling {
+                Vec::new()
+            } else {
+                Vec::with_capacity(64)
+            };
+        let mut bundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
+        let mut bundle_seq = SeqFuture::new();
+        let mut bundle_len = 0usize;
+        let mut push_group_future = |fut: Pin<Box<dyn Future<Output = ()> + Send>>| {
+            if use_bundling {
+                bundle_seq.push(fut);
+                bundle_len += 1;
+
+                if bundle_len == max_groups_per_step_task {
+                    let full_bundle = std::mem::replace(&mut bundle_seq, SeqFuture::new());
+                    bundled_futs.push(Box::pin(full_bundle));
+                    bundle_len = 0;
+                }
+            } else {
+                spawn_futs.push(fut);
+            }
+        };
+
+        #[cfg(feature = "perf_stats")]
+        let mut actions_this_step: u64 = 0;
+        #[cfg(feature = "perf_stats")]
+        let mut groups_this_step: u64 = 0;
+        #[cfg(feature = "perf_stats")]
+        let mut scheduled_erased_this_step: u64 = 0;
+        #[cfg(feature = "perf_stats")]
+        let mut scheduled_fast_this_step: u64 = 0;
+        #[cfg(feature = "perf_stats")]
+        let mut injected_this_step: u64 = 0;
+        #[cfg(feature = "perf_stats")]
+        let mut queries_this_step: u64 = 0;
 
         // Spawn scheduled events matching the current time stamp.
         while next_key.map(|key| key.0 == time).unwrap_or(false) {
-            // Merge all events with the same origin in a single future to
-            // preserve event ordering.
-            let mut event_seq = SeqFuture::new();
-            next_key = loop {
-                let ((time, origin_id), item) = scheduler_queue.pull().unwrap();
+            let current_key = next_key.unwrap();
+            let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-                let fut = match item {
-                    QueueItem::Event(event) => {
-                        let source = self
-                            .scheduler_registry
-                            .get_event_source(&event.event_id)
-                            .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+            #[cfg(feature = "perf_stats")]
+            {
+                actions_this_step += 1;
+            }
 
-                        if let Some(period) = event.period {
-                            let fut = source.future_borrowed(&*event.arg, event.key.as_ref())?;
-                            scheduler_queue
-                                .insert((time + period, origin_id), QueueItem::Event(event));
-                            fut
-                        } else {
-                            source.future_owned(event.arg, event.key)?
-                        }
+            let first_fut = match item {
+                QueueItem::Event(event) => {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        scheduled_erased_this_step += 1;
                     }
-                    QueueItem::Query(query) => {
-                        let source = self
-                            .scheduler_registry
-                            .get_query_source(&query.query_id)
-                            .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
-                        source.future(query.arg, query.replier)?
+
+                    let source = self
+                        .scheduler_registry
+                        .get_event_source(&event.event_id)
+                        .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                    if let Some(period) = event.period {
+                        let fut = source.future_borrowed(&*event.arg, event.key.as_ref())?;
+                        let next_time = self.scheduler_state.quantize_time(item_time + period);
+                        let seq = self.scheduler_state.next_seq(origin_id);
+                        scheduler_queue.insert_with_epoch(
+                            (next_time, origin_id),
+                            QueueItem::Event(event),
+                            seq,
+                        );
+                        fut
+                    } else {
+                        source.future_owned(event.arg, event.key)?
                     }
-                };
+                }
+                QueueItem::FastEvent(event) => {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        scheduled_fast_this_step += 1;
+                    }
 
-                event_seq.push(fut);
+                    event.into_future()
+                }
+                QueueItem::Query(query) => {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        queries_this_step += 1;
+                    }
 
-                let key = peek_next_key(&mut scheduler_queue);
-                if key != next_key {
-                    break key;
+                    let source = self
+                        .scheduler_registry
+                        .get_query_source(&query.query_id)
+                        .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
+                    source.future(query.arg, query.replier)?
                 }
             };
 
-            // Spawn a compound future that sequentially polls all events
-            // targeting the same mailbox.
-            self.executor.spawn_and_forget(event_seq);
+            let mut candidate_next = peek_next_key(&mut scheduler_queue);
+            if candidate_next != Some(current_key) {
+                // Fast path: singleton group.
+                push_group_future(first_fut);
+            } else {
+                // Merge all events with the same origin in a single future to
+                // preserve event ordering.
+                let mut event_seq = SeqFuture::new();
+                event_seq.push(first_fut);
+
+                while candidate_next == Some(current_key) {
+                    let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
+
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        actions_this_step += 1;
+                    }
+
+                    let fut = match item {
+                        QueueItem::Event(event) => {
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                scheduled_erased_this_step += 1;
+                            }
+
+                            let source = self
+                                .scheduler_registry
+                                .get_event_source(&event.event_id)
+                                .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                            if let Some(period) = event.period {
+                                let fut = source.future_borrowed(&*event.arg, event.key.as_ref())?;
+                                let next_time = self.scheduler_state.quantize_time(item_time + period);
+                                let seq = self.scheduler_state.next_seq(origin_id);
+                                scheduler_queue.insert_with_epoch(
+                                    (next_time, origin_id),
+                                    QueueItem::Event(event),
+                                    seq,
+                                );
+                                fut
+                            } else {
+                                source.future_owned(event.arg, event.key)?
+                            }
+                        }
+                        QueueItem::FastEvent(event) => {
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                scheduled_fast_this_step += 1;
+                            }
+
+                            event.into_future()
+                        }
+                        QueueItem::Query(query) => {
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                queries_this_step += 1;
+                            }
+
+                            let source = self
+                                .scheduler_registry
+                                .get_query_source(&query.query_id)
+                                .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
+                            source.future(query.arg, query.replier)?
+                        }
+                    };
+
+                    event_seq.push(fut);
+                    candidate_next = peek_next_key(&mut scheduler_queue);
+                }
+
+                // Spawn a compound future that sequentially polls all events
+                // targeting the same mailbox.
+                push_group_future(Box::pin(event_seq));
+            }
+
+            #[cfg(feature = "perf_stats")]
+            {
+                groups_this_step += 1;
+            }
+
             has_events = true;
+            next_key = candidate_next;
         }
 
         // Make sure the scheduler's mutex is released before the potentially
@@ -722,25 +923,56 @@ impl Simulation {
         {
             let mut injector_queue = self.injector_queue.lock().unwrap();
 
-            if let Some(mut origin_id) = injector_queue.peek().map(|item| *item.0) {
+            if injector_queue.peek().is_some() {
                 has_events = true;
-                let mut event_seq = SeqFuture::new();
-                while let Some((id, event)) = injector_queue.pull() {
+                while let Some((origin_id, event)) = injector_queue.pull() {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        actions_this_step += 1;
+                        injected_this_step += 1;
+                    }
+
                     let source = self
                         .scheduler_registry
                         .get_event_source(&event.event_id)
                         .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
 
-                    let fut = source.future_owned(event.arg, event.key)?;
-                    if id != origin_id {
-                        self.executor.spawn_and_forget(event_seq);
-                        event_seq = SeqFuture::new();
-                        origin_id = id
-                    }
-                    event_seq.push(fut);
-                }
+                    let first_fut = source.future_owned(event.arg, event.key)?;
+                    let mut next_origin_id = injector_queue.peek().map(|item| *item.0);
 
-                self.executor.spawn_and_forget(event_seq);
+                    if next_origin_id != Some(origin_id) {
+                        // Fast path: singleton group.
+                        push_group_future(first_fut);
+                    } else {
+                        let mut event_seq = SeqFuture::new();
+                        event_seq.push(first_fut);
+
+                        while next_origin_id == Some(origin_id) {
+                            let (_id, event) = injector_queue.pull().unwrap();
+
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                actions_this_step += 1;
+                                injected_this_step += 1;
+                            }
+
+                            let source = self
+                                .scheduler_registry
+                                .get_event_source(&event.event_id)
+                                .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                            event_seq.push(source.future_owned(event.arg, event.key)?);
+                            next_origin_id = injector_queue.peek().map(|item| *item.0);
+                        }
+
+                        push_group_future(Box::pin(event_seq));
+                    }
+
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        groups_this_step += 1;
+                    }
+                }
             }
         }
 
@@ -749,7 +981,29 @@ impl Simulation {
 
         // Run the executor is necessary.
         if has_events {
+            if use_bundling {
+                if bundle_len > 0 {
+                    let tail_bundle = std::mem::replace(&mut bundle_seq, SeqFuture::new());
+                    bundled_futs.push(Box::pin(tail_bundle));
+                }
+                self.executor.spawn_and_forget_batch(bundled_futs);
+            } else {
+                self.executor.spawn_and_forget_batch(spawn_futs);
+            }
             self.run_executor()?;
+
+            #[cfg(feature = "perf_stats")]
+            {
+                STEPS.fetch_add(1, AtomicOrdering::Relaxed);
+                ACTIONS.fetch_add(actions_this_step, AtomicOrdering::Relaxed);
+                GROUPS.fetch_add(groups_this_step, AtomicOrdering::Relaxed);
+                SCHEDULED_EVENTS_ERASED.fetch_add(scheduled_erased_this_step, AtomicOrdering::Relaxed);
+                SCHEDULED_EVENTS_FAST.fetch_add(scheduled_fast_this_step, AtomicOrdering::Relaxed);
+                INJECTED_EVENTS.fetch_add(injected_this_step, AtomicOrdering::Relaxed);
+                SCHEDULED_QUERIES.fetch_add(queries_this_step, AtomicOrdering::Relaxed);
+                bump_max(&MAX_ACTIONS_PER_STEP, actions_this_step);
+                bump_max(&MAX_GROUPS_PER_STEP, groups_this_step);
+            }
         }
 
         Ok(Some(time))
@@ -771,7 +1025,11 @@ impl Simulation {
         loop {
             match self.step_to_next(target_time) {
                 // The target time was reached exactly.
-                Ok(time) if time == target_time => return Ok(()),
+                Ok(time) if time == target_time => {
+                    #[cfg(feature = "perf_stats")]
+                    report_sim_perf_stats();
+                    return Ok(());
+                }
                 // No events are scheduled before or at the target time.
                 Ok(None) => {
                     if let Some(target_time) = target_time {
@@ -779,6 +1037,8 @@ impl Simulation {
                         self.time.write(target_time);
                         self.synchronize(target_time)?;
                     }
+                    #[cfg(feature = "perf_stats")]
+                    report_sim_perf_stats();
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -829,7 +1089,8 @@ impl Simulation {
 
     /// Saves the scheduler queue, maintaining its event order.
     fn save_queue(&self) -> Result<Vec<u8>, ExecutionError> {
-        let scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.scheduler_state.scheduler_queue.lock().unwrap();
+        self.scheduler_state.flush_local(&mut scheduler_queue);
         let queue = scheduler_queue
             .iter()
             .map(|(k, v)| match v.serialize(&self.scheduler_registry) {
@@ -851,13 +1112,16 @@ impl Simulation {
                 })?
                 .0;
 
-        let mut scheduler_queue = self.scheduler_queue.lock().unwrap();
+        let mut scheduler_queue = self.scheduler_state.scheduler_queue.lock().unwrap();
         scheduler_queue.clear();
+        self.scheduler_state.reset_origin_seqs();
 
         for entry in deserialized {
-            scheduler_queue.insert(
+            let seq = self.scheduler_state.next_seq(entry.0.1);
+            scheduler_queue.insert_with_epoch(
                 entry.0,
                 QueueItem::deserialize(&entry.1, &self.scheduler_registry)?,
+                seq,
             );
         }
         Ok(())

@@ -23,7 +23,7 @@ use crate::util::sync_cell::SyncCell;
 
 use super::{
     EventId, ExecutionError, GlobalScheduler, Mailbox, QueryId, SchedulerQueue, SchedulerRegistry,
-    Signal, Simulation, SimulationError, add_model,
+    SchedulerState, Signal, Simulation, SimulationError, add_model,
 };
 
 type PostCallback = dyn FnOnce(&mut Simulation) -> Result<(), SimulationError> + Send + 'static;
@@ -31,7 +31,7 @@ type PostCallback = dyn FnOnce(&mut Simulation) -> Result<(), SimulationError> +
 /// Builder for a multi-threaded, discrete-event simulation.
 pub struct SimInit {
     executor: Executor,
-    scheduler_queue: Arc<Mutex<SchedulerQueue>>,
+    scheduler_state: Arc<SchedulerState>,
     scheduler_registry: SchedulerRegistry,
     injector_queue: Arc<Mutex<InjectorQueue>>,
     event_sink_registry: EventSinkRegistry,
@@ -45,6 +45,7 @@ pub struct SimInit {
     clock_tolerance: Option<Duration>,
     ticker: Option<Box<dyn Ticker>>,
     timeout: Duration,
+    max_groups_per_step_task: usize,
     observers: Vec<(Path, Box<dyn ChannelObserver>)>,
     abort_signal: Signal,
     registered_models: Vec<RegisteredModel>,
@@ -88,10 +89,16 @@ impl SimInit {
         } else {
             Executor::new_multi_threaded(num_threads, simulation_context, abort_signal.clone())
         };
+        let scheduler_queue = Arc::new(Mutex::new(SchedulerQueue::new()));
+        let scheduler_state = Arc::new(SchedulerState::new(
+            scheduler_queue,
+            executor.executor_id(),
+            num_threads,
+        ));
 
         Self {
             executor,
-            scheduler_queue: Arc::new(Mutex::new(SchedulerQueue::new())),
+            scheduler_state,
             scheduler_registry: SchedulerRegistry::default(),
             injector_queue: Arc::new(Mutex::new(InjectorQueue::new())),
             event_sink_registry: EventSinkRegistry::default(),
@@ -105,6 +112,7 @@ impl SimInit {
             clock_tolerance: None,
             ticker: None,
             timeout: Duration::ZERO,
+            max_groups_per_step_task: 1,
             observers: Vec::new(),
             abort_signal,
             registered_models: Vec::new(),
@@ -123,15 +131,18 @@ impl SimInit {
 
     /// Compatibility shim retained for Days' forked API surface.
     ///
-    /// Group-per-step tuning is not configurable in this Nexosim revision.
-    pub fn set_max_groups_per_step_task(self, _max_groups: usize) -> Self {
+    /// Sets the maximum number of origin groups bundled into a single executor
+    /// task per step.
+    pub fn set_max_groups_per_step_task(mut self, max_groups: usize) -> Self {
+        self.max_groups_per_step_task = max_groups.max(1);
         self
     }
 
     /// Compatibility shim retained for Days' forked API surface.
     ///
-    /// Time quantization is managed externally in Days for now.
-    pub fn set_time_quantum_ns(self, _quantum_ns: u64) -> Self {
+    /// Sets scheduler time quantization in nanoseconds.
+    pub fn set_time_quantum_ns(self, quantum_ns: u64) -> Self {
+        self.scheduler_state.set_time_quantum_ns(quantum_ns);
         self
     }
 
@@ -273,7 +284,7 @@ impl SimInit {
         self.observers
             .push((path.clone(), Box::new(mailbox.0.observer())));
         let scheduler = GlobalScheduler::new(
-            self.scheduler_queue.clone(),
+            self.scheduler_state.clone(),
             self.time.reader(),
             self.is_halted.clone(),
         );
@@ -359,6 +370,8 @@ impl SimInit {
     ///
     /// The simulation object is returned upon success.
     pub fn init(mut self, start_time: MonotonicTime) -> Result<Simulation, SimulationError> {
+        self.scheduler_state
+            .init_origin_seqs(self.registered_models.len());
         self.time.write(start_time);
         if let SyncStatus::OutOfSync(lag) = self.clock.synchronize(start_time)
             && let Some(tolerance) = &self.clock_tolerance
@@ -382,6 +395,8 @@ impl SimInit {
     /// The simulation object is returned upon success.
     pub fn restore<R: std::io::Read>(mut self, state: R) -> Result<Simulation, SimulationError> {
         self.is_resumed.store(true, Ordering::Relaxed);
+        self.scheduler_state
+            .init_origin_seqs(self.registered_models.len());
 
         let callback = self.post_restore_callback.take();
 
@@ -497,7 +512,7 @@ impl SimInit {
     fn build(self) -> Simulation {
         Simulation::new(
             self.executor,
-            self.scheduler_queue,
+            self.scheduler_state,
             self.scheduler_registry,
             self.injector_queue,
             self.time,
@@ -505,6 +520,7 @@ impl SimInit {
             self.clock_tolerance,
             self.ticker,
             self.timeout,
+            self.max_groups_per_step_task,
             self.observers,
             self.registered_models,
             self.is_halted,
