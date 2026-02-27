@@ -129,6 +129,11 @@ impl<K: Copy + Ord, V> PriorityQueue<K, V> {
         self.heap.clear();
         self.next_epoch = 0;
     }
+
+    /// Reserves capacity for at least `additional` more elements.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.heap.reserve(additional);
+    }
 }
 
 #[cfg(all(test, not(nexosim_loom)))]

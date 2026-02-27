@@ -319,6 +319,14 @@ impl SchedulerState {
     }
 
     pub(super) fn flush_local(&self, scheduler_queue: &mut SchedulerQueue) {
+        let mut total_pending = 0usize;
+        for buf in self.local_buffers.buffers.iter() {
+            total_pending += unsafe { &*buf.get() }.len();
+        }
+        if total_pending != 0 {
+            scheduler_queue.reserve(total_pending);
+        }
+
         for buf in self.local_buffers.buffers.iter() {
             let buf = unsafe { &mut *buf.get() };
             for item in buf.drain(..) {
@@ -417,6 +425,15 @@ impl LocalScheduleBuffers {
         debug_assert!(worker_id < self.buffers.len());
 
         unsafe { &mut *self.buffers[worker_id].get() }.push(item);
+    }
+
+    fn reserve(&self, worker_id: usize, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+
+        debug_assert!(worker_id < self.buffers.len());
+        unsafe { &mut *self.buffers[worker_id].get() }.reserve(additional);
     }
 }
 
@@ -765,6 +782,9 @@ impl GlobalScheduler {
         }
 
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
+            self.state
+                .local_buffers
+                .reserve(worker_id, deadlines_and_args.len());
             let now = self.time();
             for (deadline, _) in &deadlines_and_args {
                 let time = (*deadline).into_time(now);
@@ -802,6 +822,7 @@ impl GlobalScheduler {
             }
         }
 
+        scheduler_queue.reserve(deadlines_and_args.len());
         for (deadline, arg) in deadlines_and_args {
             let time = self.state.quantize_time(deadline.into_time(now));
             let seq = self.state.next_seq(origin_id);
@@ -843,6 +864,9 @@ impl GlobalScheduler {
         let use_prepared_fast_events = self.state.prefers_prepared_fast_events();
 
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
+            self.state
+                .local_buffers
+                .reserve(worker_id, deadlines_and_args.len());
             let now = self.time();
             for (deadline, _) in &deadlines_and_args {
                 let time = (*deadline).into_time(now);
@@ -907,6 +931,7 @@ impl GlobalScheduler {
             }
         }
 
+        scheduler_queue.reserve(deadlines_and_args.len());
         if use_prepared_fast_events {
             for (deadline, arg) in deadlines_and_args {
                 let time = self.state.quantize_time(deadline.into_time(now));
