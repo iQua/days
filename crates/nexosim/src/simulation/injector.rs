@@ -1,5 +1,6 @@
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::model::{Model, ModelRegistry, SchedulableId};
@@ -28,6 +29,7 @@ pub(crate) type InjectorQueue = PriorityQueue<usize, Event>;
 /// instance.
 pub struct ModelInjector<M: Model> {
     queue: Arc<Mutex<InjectorQueue>>,
+    nonempty_hint: Arc<AtomicBool>,
     origin_id: usize,
     model_registry: Arc<ModelRegistry>,
     _model: PhantomData<M>,
@@ -36,11 +38,13 @@ pub struct ModelInjector<M: Model> {
 impl<M: Model> ModelInjector<M> {
     pub(crate) fn new(
         queue: Arc<Mutex<InjectorQueue>>,
+        nonempty_hint: Arc<AtomicBool>,
         origin_id: usize,
         model_registry: Arc<ModelRegistry>,
     ) -> Self {
         Self {
             queue,
+            nonempty_hint,
             origin_id,
             model_registry,
             _model: PhantomData,
@@ -66,6 +70,7 @@ impl<M: Model> ModelInjector<M> {
         let mut queue = self.queue.lock().unwrap();
         let event = Event::new(&schedulable_id.source_id(&self.model_registry), arg);
         queue.insert(self.origin_id, event);
+        self.nonempty_hint.store(true, Ordering::Release);
     }
 }
 
@@ -81,6 +86,7 @@ impl<M: Model> Clone for ModelInjector<M> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
+            nonempty_hint: self.nonempty_hint.clone(),
             origin_id: self.origin_id,
             model_registry: self.model_registry.clone(),
             _model: PhantomData,
@@ -96,11 +102,15 @@ impl<M: Model> Clone for ModelInjector<M> {
 #[derive(Clone)]
 pub struct Injector {
     queue: Arc<Mutex<InjectorQueue>>,
+    nonempty_hint: Arc<AtomicBool>,
 }
 
 impl Injector {
-    pub(crate) fn new(queue: Arc<Mutex<InjectorQueue>>) -> Self {
-        Self { queue }
+    pub(crate) fn new(queue: Arc<Mutex<InjectorQueue>>, nonempty_hint: Arc<AtomicBool>) -> Self {
+        Self {
+            queue,
+            nonempty_hint,
+        }
     }
 
     /// Injects an event to be processed as soon as possible.
@@ -127,6 +137,7 @@ impl Injector {
     pub(crate) fn inject_built_event(&self, event: Event) {
         let mut queue = self.queue.lock().unwrap();
         queue.insert(GLOBAL_ORIGIN_ID, event);
+        self.nonempty_hint.store(true, Ordering::Release);
     }
 }
 

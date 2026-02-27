@@ -320,7 +320,10 @@ mod tests {
             event_sink_info_registry,
             event_source_registry: Arc::new(event_source_registry),
             query_source_registry: Arc::new(query_source_registry),
-            injector: Injector::new(Arc::new(Mutex::new(PriorityQueue::new()))),
+            injector: Injector::new(
+                Arc::new(Mutex::new(PriorityQueue::new())),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
         }
     }
 

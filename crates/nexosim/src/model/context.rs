@@ -536,6 +536,7 @@ pub struct BuildContext<'a, P: ProtoModel> {
     scheduler: &'a GlobalScheduler,
     scheduler_registry: &'a mut SchedulerRegistry,
     injector: &'a Arc<Mutex<InjectorQueue>>,
+    injector_nonempty_hint: &'a Arc<AtomicBool>,
     origin_id: usize,
     executor: &'a Executor,
     abort_signal: &'a Signal,
@@ -553,6 +554,7 @@ impl<'a, P: ProtoModel> BuildContext<'a, P> {
         scheduler: &'a GlobalScheduler,
         scheduler_registry: &'a mut SchedulerRegistry,
         injector: &'a Arc<Mutex<InjectorQueue>>,
+        injector_nonempty_hint: &'a Arc<AtomicBool>,
         origin_id: usize,
         executor: &'a Executor,
         abort_signal: &'a Signal,
@@ -565,6 +567,7 @@ impl<'a, P: ProtoModel> BuildContext<'a, P> {
             scheduler,
             scheduler_registry,
             injector,
+            injector_nonempty_hint,
             origin_id,
             executor,
             abort_signal,
@@ -629,6 +632,7 @@ impl<'a, P: ProtoModel> BuildContext<'a, P> {
             self.scheduler.clone(),
             self.scheduler_registry,
             self.injector,
+            self.injector_nonempty_hint,
             self.executor,
             self.abort_signal,
             self.registered_models,
@@ -645,6 +649,7 @@ impl<'a, P: ProtoModel> BuildContext<'a, P> {
     pub fn injector(&self) -> ModelInjector<P::Model> {
         ModelInjector::new(
             self.injector.clone(),
+            self.injector_nonempty_hint.clone(),
             self.origin_id,
             self.model_registry.unwrap().clone(),
         )

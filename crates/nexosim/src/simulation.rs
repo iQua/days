@@ -276,6 +276,7 @@ pub struct Simulation {
     scheduler_state: Arc<SchedulerState>,
     scheduler_registry: SchedulerRegistry,
     injector_queue: Arc<Mutex<InjectorQueue>>,
+    injector_nonempty_hint: Arc<AtomicBool>,
     time: AtomicTime,
     clock: Box<dyn Clock>,
     clock_tolerance: Option<Duration>,
@@ -296,6 +297,7 @@ impl Simulation {
         scheduler_state: Arc<SchedulerState>,
         scheduler_registry: SchedulerRegistry,
         injector_queue: Arc<Mutex<InjectorQueue>>,
+        injector_nonempty_hint: Arc<AtomicBool>,
         time: AtomicTime,
         clock: Box<dyn Clock>,
         clock_tolerance: Option<Duration>,
@@ -311,6 +313,7 @@ impl Simulation {
             scheduler_state,
             scheduler_registry,
             injector_queue,
+            injector_nonempty_hint,
             time,
             clock,
             clock_tolerance,
@@ -326,7 +329,10 @@ impl Simulation {
 
     /// Returns an injector handle.
     pub fn injector(&self) -> Injector {
-        Injector::new(self.injector_queue.clone())
+        Injector::new(
+            self.injector_queue.clone(),
+            self.injector_nonempty_hint.clone(),
+        )
     }
 
     /// Returns a scheduler handle.
@@ -920,7 +926,7 @@ impl Simulation {
 
         // Spawn injector events. The events are assumed to be non-periodic and
         // non-cancellable.
-        {
+        if self.injector_nonempty_hint.load(Ordering::Acquire) {
             let mut injector_queue = self.injector_queue.lock().unwrap();
 
             if injector_queue.peek().is_some() {
@@ -973,6 +979,10 @@ impl Simulation {
                         groups_this_step += 1;
                     }
                 }
+            }
+
+            if injector_queue.peek().is_none() {
+                self.injector_nonempty_hint.store(false, Ordering::Release);
             }
         }
 
@@ -1673,6 +1683,7 @@ pub(crate) fn add_model<P>(
     scheduler: GlobalScheduler,
     scheduler_registry: &mut SchedulerRegistry,
     injector: &Arc<Mutex<InjectorQueue>>,
+    injector_nonempty_hint: &Arc<AtomicBool>,
     executor: &Executor,
     abort_signal: &Signal,
     registered_models: &mut Vec<RegisteredModel>,
@@ -1690,6 +1701,7 @@ pub(crate) fn add_model<P>(
         &scheduler,
         scheduler_registry,
         injector,
+        injector_nonempty_hint,
         model_id.0,
         executor,
         abort_signal,

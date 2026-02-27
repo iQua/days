@@ -34,6 +34,7 @@ pub struct SimInit {
     scheduler_state: Arc<SchedulerState>,
     scheduler_registry: SchedulerRegistry,
     injector_queue: Arc<Mutex<InjectorQueue>>,
+    injector_nonempty_hint: Arc<AtomicBool>,
     event_sink_registry: EventSinkRegistry,
     event_sink_info_registry: EventSinkInfoRegistry,
     event_source_registry: EventSourceRegistry,
@@ -62,7 +63,10 @@ impl SimInit {
 
     /// Returns an injector handle.
     pub fn injector(&self) -> Injector {
-        Injector::new(self.injector_queue.clone())
+        Injector::new(
+            self.injector_queue.clone(),
+            self.injector_nonempty_hint.clone(),
+        )
     }
 
     /// Creates a builder for a simulation running on the specified number of
@@ -101,6 +105,7 @@ impl SimInit {
             scheduler_state,
             scheduler_registry: SchedulerRegistry::default(),
             injector_queue: Arc::new(Mutex::new(InjectorQueue::new())),
+            injector_nonempty_hint: Arc::new(AtomicBool::new(false)),
             event_sink_registry: EventSinkRegistry::default(),
             event_sink_info_registry: EventSinkInfoRegistry::default(),
             event_source_registry: EventSourceRegistry::default(),
@@ -296,6 +301,7 @@ impl SimInit {
             scheduler,
             &mut self.scheduler_registry,
             &self.injector_queue,
+            &self.injector_nonempty_hint,
             &self.executor,
             &self.abort_signal,
             &mut self.registered_models,
@@ -515,6 +521,7 @@ impl SimInit {
             self.scheduler_state,
             self.scheduler_registry,
             self.injector_queue,
+            self.injector_nonempty_hint,
             self.time,
             self.clock,
             self.clock_tolerance,
