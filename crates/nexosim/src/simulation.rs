@@ -741,12 +741,6 @@ impl Simulation {
         let mut has_events = false;
         let max_groups_per_step_task = self.max_groups_per_step_task;
         let use_bundling = max_groups_per_step_task > 1;
-        let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
-            if use_bundling {
-                Vec::new()
-            } else {
-                Vec::with_capacity(64)
-            };
         let mut bundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
         let mut bundle_seq = SeqFuture::new();
         let mut bundle_len = 0usize;
@@ -761,7 +755,7 @@ impl Simulation {
                     bundle_len = 0;
                 }
             } else {
-                spawn_futs.push(fut);
+                self.executor.spawn_and_forget(fut);
             }
         };
 
@@ -997,8 +991,6 @@ impl Simulation {
                     bundled_futs.push(Box::pin(tail_bundle));
                 }
                 self.executor.spawn_and_forget_batch(bundled_futs);
-            } else {
-                self.executor.spawn_and_forget_batch(spawn_futs);
             }
             self.run_executor()?;
 
