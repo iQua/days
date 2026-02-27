@@ -15,6 +15,7 @@ use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::channel::Sender;
+use crate::executor::Executor;
 use crate::macros::scoped_thread_local::scoped_thread_local;
 use crate::model::Model;
 use crate::ports::{EventSource, InputFn, QuerySource, ReplyReader, ReplyWriter, query_replier};
@@ -467,6 +468,9 @@ where
 pub(crate) trait FastScheduledEvent: Send + 'static {
     fn event_id(&self) -> EventIdErased;
     fn into_future(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    fn spawn_and_forget(self: Box<Self>, executor: &Executor) {
+        executor.spawn_and_forget(self.into_future());
+    }
     fn to_serializable_parts(
         &self,
     ) -> Result<(EventIdErased, Vec<u8>, Option<Duration>, Option<EventKey>), ExecutionError>;
@@ -487,6 +491,10 @@ impl FastEvent {
 
     pub(crate) fn into_future(self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.inner.into_future()
+    }
+
+    pub(crate) fn spawn_and_forget(self, executor: &Executor) {
+        self.inner.spawn_and_forget(executor);
     }
 
     pub(crate) fn to_serializable_parts(

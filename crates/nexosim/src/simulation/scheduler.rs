@@ -15,6 +15,7 @@ use recycle_box::{RecycleBox, coerce_box};
 use serde::Serialize;
 
 use crate::channel::Sender;
+use crate::executor::Executor;
 use crate::model::Model;
 use crate::ports::{InputFn, ReplyReader};
 use crate::simulation::queue_items::{
@@ -496,6 +497,34 @@ where
         };
 
         Box::pin(fut)
+    }
+
+    fn spawn_and_forget(self: Box<Self>, executor: &Executor) {
+        let Self {
+            sender,
+            func,
+            arg,
+            _phantom: _,
+            ..
+        } = *self;
+
+        let arg = arg.expect("fast scheduled event consumed more than once");
+
+        executor.spawn_and_forget(async move {
+            // Ignore send errors (e.g. no recipient), like the standard scheduler path.
+            let _ = sender
+                .send(
+                    move |model: &mut M,
+                          scheduler,
+                          env,
+                          recycle_box: RecycleBox<()>|
+                          -> RecycleBox<dyn Future<Output = ()> + Send + '_> {
+                        let fut = func.call(model, arg, scheduler, env);
+                        coerce_box!(RecycleBox::recycle(recycle_box, fut))
+                    },
+                )
+                .await;
+        });
     }
 
     fn to_serializable_parts(
