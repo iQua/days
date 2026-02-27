@@ -475,10 +475,8 @@ impl WRRServer {
         }
 
         if !schedule.is_empty() {
-            for (deadline, packet) in schedule {
-                cx.schedule_event(deadline, &Self::SEND_AND_RUN_SID, packet)
-                    .unwrap();
-            }
+            cx.schedule_event_batch_fast(schedule, &Self::SEND_AND_RUN_SID, Self::send_and_run)
+                .unwrap();
         }
     }
 

@@ -216,9 +216,10 @@ impl Model for AppSourceBuffer {
 
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         // schedules the actor's run_once function after the configured initial interval
-        cx.schedule_event(
+        cx.schedule_event_fast(
             Duration::from_micros(self.initial_delay),
             &Self::RUN_ONCE_SID,
+            Self::run_once,
             (),
         )
         .expect("schedule_event failed");
@@ -254,9 +255,10 @@ impl AppSourceBuffer {
                 }
             }
 
-            cx.schedule_event(
+            cx.schedule_event_fast(
                 Duration::from_micros(self.run_interval),
                 &Self::RUN_ONCE_SID,
+                Self::run_once,
                 (),
             )
                 .expect("reschedule run_once failed");

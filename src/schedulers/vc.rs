@@ -489,9 +489,10 @@ impl VirtualClockServer {
         self.time = run_time;
 
         self.schedule_packet(|_now, delay, outbound| {
-            cx.schedule_event(
+            cx.schedule_event_fast(
                 Duration::from_secs_f64(delay),
                 &Self::SEND_AND_RUN_SID,
+                Self::send_and_run,
                 outbound.packet,
             )
             .unwrap();

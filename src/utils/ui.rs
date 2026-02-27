@@ -82,7 +82,12 @@ impl UserInterface {
             if delay <= 0.0 {
                 self.run((), cx);
             } else {
-                cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
+                cx.schedule_event_fast(
+                    Duration::from_secs_f64(delay),
+                    &Self::RUN_SID,
+                    Self::run,
+                    (),
+                )
                     .unwrap();
             }
         }
@@ -98,7 +103,12 @@ impl UserInterface {
                 self.progress_bar.inc(1);
             }
 
-            cx.schedule_event(Duration::from_secs_f64(self.ui_interval), &Self::RUN_SID, ())
+            cx.schedule_event_fast(
+                Duration::from_secs_f64(self.ui_interval),
+                &Self::RUN_SID,
+                Self::run,
+                (),
+            )
                 .unwrap();
         }
     }

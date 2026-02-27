@@ -251,9 +251,10 @@ impl PacketSource {
 
                     let fetch_time = quantize_after(start_time, interval);
                     let delay = (fetch_time - start_time).max(0.0);
-                    cx.schedule_event(
+                    cx.schedule_event_fast(
                         Duration::from_secs_f64(delay),
                         &Self::FETCH_APP_DATA_SID,
+                        Self::fetch_app_data,
                         fetch_time,
                     )
                     .unwrap();
@@ -313,9 +314,10 @@ impl PacketSource {
                             source.send_buffer += size;
                             let next_time = quantize_after(timestamp, interval);
                             let delay = (next_time - timestamp).max(0.0);
-                            cx.schedule_event(
+                            cx.schedule_event_fast(
                                 Duration::from_secs_f64(delay),
                                 &Self::FETCH_APP_DATA_SID,
+                                Self::fetch_app_data,
                                 next_time,
                             )
                             .unwrap();
@@ -365,7 +367,12 @@ impl PacketSource {
                     source.time = next_time;
                     // schedules the next packet to be sent
                     let delay = (next_time - now).max(0.0);
-                    cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
+                    cx.schedule_event_fast(
+                        Duration::from_secs_f64(delay),
+                        &Self::RUN_SID,
+                        Self::run,
+                        (),
+                    )
                         .unwrap();
                 }
             }
@@ -375,7 +382,12 @@ impl PacketSource {
                         let next_time = quantize_after(now, interval);
                         let delay = (next_time - now).max(0.0);
                         source.time = next_time;
-                        cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
+                        cx.schedule_event_fast(
+                            Duration::from_secs_f64(delay),
+                            &Self::RUN_SID,
+                            Self::run,
+                            (),
+                        )
                             .unwrap();
                     }
                 }
@@ -387,7 +399,12 @@ impl PacketSource {
                         let next_time = quantize_after(now, interval);
                         let delay = (next_time - now).max(0.0);
                         source.time = next_time;
-                        cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, ())
+                        cx.schedule_event_fast(
+                            Duration::from_secs_f64(delay),
+                            &Self::RUN_SID,
+                            Self::run,
+                            (),
+                        )
                             .unwrap();
                     }
                 }
@@ -679,7 +696,12 @@ impl Model for PacketSource {
             self.prepare_run(0.0, initial_delay, cx).await;
 
             if initial_delay > 0.0 {
-                cx.schedule_event(Duration::from_secs_f64(initial_delay), &Self::RUN_SID, ())
+                cx.schedule_event_fast(
+                    Duration::from_secs_f64(initial_delay),
+                    &Self::RUN_SID,
+                    Self::run,
+                    (),
+                )
                     .unwrap();
             } else {
                 self.run((), cx).await;

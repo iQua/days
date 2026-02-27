@@ -147,6 +147,81 @@ impl<M: Model> Context<M> {
         )
     }
 
+    /// Schedules an event at a future time on this model using a typed
+    /// dispatch fast path.
+    ///
+    /// This bypasses type-erased dispatch at execution time while preserving a
+    /// serializable queue representation.
+    pub fn schedule_event_fast<T, F, S>(
+        &self,
+        deadline: impl Deadline,
+        schedulable_id: &SchedulableId<M, T>,
+        func: F,
+        arg: T,
+    ) -> Result<(), SchedulingError>
+    where
+        T: Serialize + Send + Clone + 'static,
+        F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
+        self.scheduler.schedule_event_fast_from(
+            deadline,
+            &schedulable_id.source_id(&self.model_registry),
+            func,
+            arg,
+            self.address.clone(),
+            self.origin_id,
+        )
+    }
+
+    /// Schedules multiple events at future times on this model.
+    ///
+    /// An error is returned if any of the specified deadlines is not in the
+    /// future of the current simulation time. If an error is returned, no
+    /// event is scheduled.
+    pub fn schedule_event_batch<T, D>(
+        &self,
+        deadlines_and_args: Vec<(D, T)>,
+        schedulable_id: &SchedulableId<M, T>,
+    ) -> Result<(), SchedulingError>
+    where
+        T: Send + Clone + 'static,
+        D: Deadline + Copy,
+    {
+        self.scheduler.schedule_event_batch_from(
+            deadlines_and_args,
+            &schedulable_id.source_id(&self.model_registry),
+            self.origin_id,
+        )
+    }
+
+    /// Schedules multiple events at future times on this model using a typed
+    /// dispatch fast path.
+    ///
+    /// This bypasses type-erased dispatch at execution time while preserving a
+    /// serializable queue representation.
+    pub fn schedule_event_batch_fast<T, D, F, S>(
+        &self,
+        deadlines_and_args: Vec<(D, T)>,
+        schedulable_id: &SchedulableId<M, T>,
+        func: F,
+    ) -> Result<(), SchedulingError>
+    where
+        T: Serialize + Send + Clone + 'static,
+        D: Deadline + Copy,
+        F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
+        self.scheduler.schedule_event_batch_fast_from(
+            deadlines_and_args,
+            &schedulable_id.source_id(&self.model_registry),
+            func,
+            self.address.clone(),
+            self.origin_id,
+        )
+    }
+
+
     /// Schedules a cancellable event at a future time on this model and returns
     /// an action key.
     ///

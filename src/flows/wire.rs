@@ -123,19 +123,23 @@ impl Wire {
             schedule.push((Duration::from_secs_f64(delay), packet));
 
             if schedule.len() == self.run_batch_size {
-                for (deadline, packet) in schedule.drain(..) {
-                    cx.schedule_event(deadline, &Self::FORWARD_SCHEDULED_SID, packet)
-                        .unwrap();
-                }
+                cx.schedule_event_batch_fast(
+                    schedule,
+                    &Self::FORWARD_SCHEDULED_SID,
+                    Self::forward_scheduled,
+                )
+                .unwrap();
                 schedule = Vec::with_capacity(self.run_batch_size);
             }
         }
 
         if !schedule.is_empty() {
-            for (deadline, packet) in schedule {
-                cx.schedule_event(deadline, &Self::FORWARD_SCHEDULED_SID, packet)
-                    .unwrap();
-            }
+            cx.schedule_event_batch_fast(
+                schedule,
+                &Self::FORWARD_SCHEDULED_SID,
+                Self::forward_scheduled,
+            )
+            .unwrap();
         }
     }
 

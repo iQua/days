@@ -410,10 +410,12 @@ impl Port {
             }
 
             if !schedule.is_empty() {
-                for (deadline, packet) in schedule {
-                    cx.schedule_event(deadline, &Self::SEND_SCHEDULED_SID, packet)
-                        .unwrap();
-                }
+                cx.schedule_event_batch_fast(
+                    schedule,
+                    &Self::SEND_SCHEDULED_SID,
+                    Self::send_scheduled,
+                )
+                .unwrap();
             }
         }
     }
