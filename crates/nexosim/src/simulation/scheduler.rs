@@ -958,6 +958,130 @@ impl GlobalScheduler {
         Ok(())
     }
 
+    /// Schedules multiple events at future times using a typed fast path, draining
+    /// the provided buffer in place.
+    ///
+    /// This variant retains the allocation capacity of `deadlines_and_args` on
+    /// return, which helps hot callers reuse a scratch vector without repeated
+    /// allocate/free cycles.
+    pub(crate) fn schedule_event_batch_fast_from_in_place<M, F, T, S, D>(
+        &self,
+        deadlines_and_args: &mut Vec<(D, T)>,
+        event_id: &EventId<T>,
+        func: F,
+        address: impl Into<Address<M>>,
+        origin_id: usize,
+    ) -> Result<(), SchedulingError>
+    where
+        M: Model,
+        F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
+        T: Serialize + Send + Clone + 'static,
+        S: Send + Sync + 'static,
+        D: Deadline + Copy,
+    {
+        if deadlines_and_args.is_empty() {
+            return Ok(());
+        }
+
+        let sender = address.into().0;
+        let event_id = EventIdErased::from(event_id);
+        let use_prepared_fast_events = self.state.prefers_prepared_fast_events();
+
+        if let Some(worker_id) = self.state.local_worker_id_if_owned() {
+            self.state
+                .local_buffers
+                .reserve(worker_id, deadlines_and_args.len());
+            let now = self.time();
+            for (deadline, _) in deadlines_and_args.iter() {
+                let time = (*deadline).into_time(now);
+                if now >= time {
+                    return Err(SchedulingError::InvalidScheduledTime);
+                }
+            }
+
+            if use_prepared_fast_events {
+                for (deadline, arg) in deadlines_and_args.drain(..) {
+                    let time = self.state.quantize_time(deadline.into_time(now));
+                    let seq = self.state.next_seq(origin_id);
+                    let item = QueueItem::FastEvent(FastEvent::new(Box::new(
+                        FastBatchPreparedEvent::new(event_id, sender.clone(), func.clone(), arg),
+                    )));
+
+                    self.state.local_buffers.push(
+                        worker_id,
+                        LocalScheduleItem {
+                            time,
+                            origin_id,
+                            seq,
+                            item,
+                        },
+                    );
+                }
+            } else {
+                for (deadline, arg) in deadlines_and_args.drain(..) {
+                    let time = self.state.quantize_time(deadline.into_time(now));
+                    let seq = self.state.next_seq(origin_id);
+                    let item = QueueItem::FastEvent(FastEvent::new(Box::new(FastBatchEvent::new(
+                        event_id,
+                        sender.clone(),
+                        func.clone(),
+                        arg,
+                    ))));
+
+                    self.state.local_buffers.push(
+                        worker_id,
+                        LocalScheduleItem {
+                            time,
+                            origin_id,
+                            seq,
+                            item,
+                        },
+                    );
+                }
+            }
+
+            return Ok(());
+        }
+
+        // The scheduler queue must always be locked when reading the time (see
+        // `schedule_from`).
+        let mut scheduler_queue = self.state.scheduler_queue.lock().unwrap();
+        let now = self.time();
+
+        for (deadline, _) in deadlines_and_args.iter() {
+            let time = (*deadline).into_time(now);
+            if now >= time {
+                return Err(SchedulingError::InvalidScheduledTime);
+            }
+        }
+
+        scheduler_queue.reserve(deadlines_and_args.len());
+        if use_prepared_fast_events {
+            for (deadline, arg) in deadlines_and_args.drain(..) {
+                let time = self.state.quantize_time(deadline.into_time(now));
+                let seq = self.state.next_seq(origin_id);
+                let item = QueueItem::FastEvent(FastEvent::new(Box::new(
+                    FastBatchPreparedEvent::new(event_id, sender.clone(), func.clone(), arg),
+                )));
+                scheduler_queue.insert_with_epoch((time, origin_id), item, seq);
+            }
+        } else {
+            for (deadline, arg) in deadlines_and_args.drain(..) {
+                let time = self.state.quantize_time(deadline.into_time(now));
+                let seq = self.state.next_seq(origin_id);
+                let item = QueueItem::FastEvent(FastEvent::new(Box::new(FastBatchEvent::new(
+                    event_id,
+                    sender.clone(),
+                    func.clone(),
+                    arg,
+                ))));
+                scheduler_queue.insert_with_epoch((time, origin_id), item, seq);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Schedules a cancellable event identified by its identifier and origin at
     /// a future time and returns an event key.
     pub(crate) fn schedule_keyed_event_from<T>(

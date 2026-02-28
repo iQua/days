@@ -221,6 +221,32 @@ impl<M: Model> Context<M> {
         )
     }
 
+    /// Schedules multiple events at future times on this model using a typed
+    /// dispatch fast path, draining the provided buffer in place.
+    ///
+    /// The vector capacity is preserved on return so callers can reuse a
+    /// scratch buffer without repeated allocation/deallocation.
+    pub fn schedule_event_batch_fast_in_place<T, D, F, S>(
+        &self,
+        deadlines_and_args: &mut Vec<(D, T)>,
+        schedulable_id: &SchedulableId<M, T>,
+        func: F,
+    ) -> Result<(), SchedulingError>
+    where
+        T: Serialize + Send + Clone + 'static,
+        D: Deadline + Copy,
+        F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
+        self.scheduler.schedule_event_batch_fast_from_in_place(
+            deadlines_and_args,
+            &schedulable_id.source_id(&self.model_registry),
+            func,
+            self.address.clone(),
+            self.origin_id,
+        )
+    }
+
 
     /// Schedules a cancellable event at a future time on this model and returns
     /// an action key.
