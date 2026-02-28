@@ -73,6 +73,7 @@ pub struct Port {
     throughput_mean: f64,
     queueing_delay_mean: f64,
     run_batch_size: usize,
+    run_schedule_scratch: Vec<(Duration, Packet)>,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -148,6 +149,7 @@ impl Port {
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
             run_batch_size,
+            run_schedule_scratch: Vec::with_capacity(run_batch_size),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -387,7 +389,7 @@ impl Port {
                 return;
             }
 
-            let mut schedule = Vec::with_capacity(self.run_batch_size);
+            self.run_schedule_scratch.clear();
             let mut service_start = run_time;
 
             for _ in 0..self.run_batch_size {
@@ -403,15 +405,16 @@ impl Port {
                 self.packet_sent(departure_time, &packet);
 
                 let delay = (departure_time - run_time).max(0.0);
-                schedule.push((Duration::from_secs_f64(delay), packet));
+                self.run_schedule_scratch
+                    .push((Duration::from_secs_f64(delay), packet));
 
                 self.in_flight += 1;
                 service_start = departure_time;
             }
 
-            if !schedule.is_empty() {
-                cx.schedule_event_batch_fast(
-                    schedule,
+            if !self.run_schedule_scratch.is_empty() {
+                cx.schedule_event_batch_fast_in_place(
+                    &mut self.run_schedule_scratch,
                     &Self::SEND_SCHEDULED_SID,
                     Self::send_scheduled,
                 )
