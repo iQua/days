@@ -699,33 +699,43 @@ impl Simulation {
         }
 
         let upper_time_bound = upper_time_bound.unwrap_or(MonotonicTime::MAX);
+        let fast_only_scheduled_hint = self.scheduler_state.fast_only_scheduled_hint();
 
         // Closure returning the next key which time stamp is no older than the
         // upper bound, if any. Cancelled events are pulled and discarded.
         let peek_next_key = |scheduler_queue: &mut MutexGuard<SchedulerQueue>| {
-            loop {
+            if fast_only_scheduled_hint {
                 match scheduler_queue.peek() {
-                    Some((&key, item)) if key.0 <= upper_time_bound => {
-                        // Discard and evict cancelled events.
-                        if let QueueItem::Event(event) = item
-                            && event.is_cancelled()
-                        {
-                            scheduler_queue.pull();
-                        } else {
-                            break Some(key);
+                    Some((&key, _)) if key.0 <= upper_time_bound => Some(key),
+                    _ => None,
+                }
+            } else {
+                loop {
+                    match scheduler_queue.peek() {
+                        Some((&key, item)) if key.0 <= upper_time_bound => {
+                            // Discard and evict cancelled events.
+                            if let QueueItem::Event(event) = item
+                                && event.is_cancelled()
+                            {
+                                scheduler_queue.pull();
+                            } else {
+                                break Some(key);
+                            }
                         }
+                        _ => break None,
                     }
-                    _ => break None,
                 }
             }
         };
 
         // Set to simulation time to the next scheduled event or next tick,
         // whichever is earlier.
-        let next_tick = self.ticker.as_mut().and_then(|ticker| {
+        let next_tick = if let Some(ticker) = self.ticker.as_mut() {
             let tick = ticker.next_tick(self.time.read());
             (tick <= upper_time_bound).then_some(tick)
-        });
+        } else {
+            None
+        };
         let mut scheduler_queue = self.scheduler_state.scheduler_queue.lock().unwrap();
         self.scheduler_state.flush_local(&mut scheduler_queue);
         let mut next_key = peek_next_key(&mut scheduler_queue);
@@ -742,23 +752,9 @@ impl Simulation {
         let max_groups_per_step_task = self.max_groups_per_step_task;
         let use_bundling = max_groups_per_step_task > 1;
         let allow_direct_fast_spawn = !use_bundling && !self.executor.is_multi_threaded();
-        let mut unbundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
-        let mut bundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
-        let mut bundle_seq = SeqFuture::new();
-        let mut bundle_len = 0usize;
+        let mut spawn_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::with_capacity(64);
         let mut push_group_future = |fut: Pin<Box<dyn Future<Output = ()> + Send>>| {
-            if use_bundling {
-                bundle_seq.push(fut);
-                bundle_len += 1;
-
-                if bundle_len == max_groups_per_step_task {
-                    let full_bundle = std::mem::replace(&mut bundle_seq, SeqFuture::new());
-                    bundled_futs.push(Box::pin(full_bundle));
-                    bundle_len = 0;
-                }
-            } else {
-                unbundled_futs.push(fut);
-            }
+            spawn_futs.push(fut);
         };
 
         #[cfg(feature = "perf_stats")]
@@ -787,6 +783,30 @@ impl Simulation {
             let mut candidate_next = peek_next_key(&mut scheduler_queue);
 
             let first_fut = match item {
+                QueueItem::FastEvent(event)
+                    if allow_direct_fast_spawn && candidate_next != Some(current_key) =>
+                {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        scheduled_fast_this_step += 1;
+                        groups_this_step += 1;
+                    }
+
+                    // Dominant hot path in Days ST/MT runs: singleton fast events.
+                    // Spawn directly to avoid transient future boxing.
+                    event.spawn_and_forget(&self.executor);
+                    has_events = true;
+                    next_key = candidate_next;
+                    continue;
+                }
+                QueueItem::FastEvent(event) => {
+                    #[cfg(feature = "perf_stats")]
+                    {
+                        scheduled_fast_this_step += 1;
+                    }
+
+                    event.into_future()
+                }
                 QueueItem::Event(event) => {
                     #[cfg(feature = "perf_stats")]
                     {
@@ -811,30 +831,6 @@ impl Simulation {
                     } else {
                         source.future_owned(event.arg, event.key)?
                     }
-                }
-                QueueItem::FastEvent(event)
-                    if allow_direct_fast_spawn && candidate_next != Some(current_key) =>
-                {
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        scheduled_fast_this_step += 1;
-                        groups_this_step += 1;
-                    }
-
-                    // Dominant hot path in Days ST/MT runs: singleton fast events.
-                    // Spawn directly to avoid transient future boxing.
-                    event.spawn_and_forget(&self.executor);
-                    has_events = true;
-                    next_key = candidate_next;
-                    continue;
-                }
-                QueueItem::FastEvent(event) => {
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        scheduled_fast_this_step += 1;
-                    }
-
-                    event.into_future()
                 }
                 QueueItem::Query(query) => {
                     #[cfg(feature = "perf_stats")]
@@ -868,6 +864,14 @@ impl Simulation {
                     }
 
                     let fut = match item {
+                        QueueItem::FastEvent(event) => {
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                scheduled_fast_this_step += 1;
+                            }
+
+                            event.into_future()
+                        }
                         QueueItem::Event(event) => {
                             #[cfg(feature = "perf_stats")]
                             {
@@ -892,14 +896,6 @@ impl Simulation {
                             } else {
                                 source.future_owned(event.arg, event.key)?
                             }
-                        }
-                        QueueItem::FastEvent(event) => {
-                            #[cfg(feature = "perf_stats")]
-                            {
-                                scheduled_fast_this_step += 1;
-                            }
-
-                            event.into_future()
                         }
                         QueueItem::Query(query) => {
                             #[cfg(feature = "perf_stats")]
@@ -939,64 +935,62 @@ impl Simulation {
 
         // Spawn injector events. The events are assumed to be non-periodic and
         // non-cancellable.
-        if self.injector_nonempty_hint.load(Ordering::Acquire) {
+        if self.injector_nonempty_hint.load(Ordering::Relaxed)
+            && self.injector_nonempty_hint.load(Ordering::Acquire)
+        {
             let mut injector_queue = self.injector_queue.lock().unwrap();
 
-            if injector_queue.peek().is_some() {
+            while let Some((origin_id, event)) = injector_queue.pull() {
                 has_events = true;
-                while let Some((origin_id, event)) = injector_queue.pull() {
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        actions_this_step += 1;
-                        injected_this_step += 1;
-                    }
+                #[cfg(feature = "perf_stats")]
+                {
+                    actions_this_step += 1;
+                    injected_this_step += 1;
+                }
 
-                    let source = self
-                        .scheduler_registry
-                        .get_event_source(&event.event_id)
-                        .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+                let source = self
+                    .scheduler_registry
+                    .get_event_source(&event.event_id)
+                    .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
 
-                    let first_fut = source.future_owned(event.arg, event.key)?;
-                    let mut next_origin_id = injector_queue.peek().map(|item| *item.0);
+                let first_fut = source.future_owned(event.arg, event.key)?;
+                let mut next_origin_id = injector_queue.peek().map(|item| *item.0);
 
-                    if next_origin_id != Some(origin_id) {
-                        // Fast path: singleton group.
-                        push_group_future(first_fut);
-                    } else {
-                        let mut event_seq = SeqFuture::new();
-                        event_seq.push(first_fut);
+                if next_origin_id != Some(origin_id) {
+                    // Fast path: singleton group.
+                    push_group_future(first_fut);
+                } else {
+                    let mut event_seq = SeqFuture::new();
+                    event_seq.push(first_fut);
 
-                        while next_origin_id == Some(origin_id) {
-                            let (_id, event) = injector_queue.pull().unwrap();
+                    while next_origin_id == Some(origin_id) {
+                        let (_id, event) = injector_queue.pull().unwrap();
 
-                            #[cfg(feature = "perf_stats")]
-                            {
-                                actions_this_step += 1;
-                                injected_this_step += 1;
-                            }
-
-                            let source = self
-                                .scheduler_registry
-                                .get_event_source(&event.event_id)
-                                .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
-
-                            event_seq.push(source.future_owned(event.arg, event.key)?);
-                            next_origin_id = injector_queue.peek().map(|item| *item.0);
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            actions_this_step += 1;
+                            injected_this_step += 1;
                         }
 
-                        push_group_future(Box::pin(event_seq));
+                        let source = self
+                            .scheduler_registry
+                            .get_event_source(&event.event_id)
+                            .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                        event_seq.push(source.future_owned(event.arg, event.key)?);
+                        next_origin_id = injector_queue.peek().map(|item| *item.0);
                     }
 
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        groups_this_step += 1;
-                    }
+                    push_group_future(Box::pin(event_seq));
+                }
+
+                #[cfg(feature = "perf_stats")]
+                {
+                    groups_this_step += 1;
                 }
             }
 
-            if injector_queue.peek().is_none() {
-                self.injector_nonempty_hint.store(false, Ordering::Release);
-            }
+            self.injector_nonempty_hint.store(false, Ordering::Release);
         }
 
         // Block until the deadline.
@@ -1004,14 +998,36 @@ impl Simulation {
 
         // Run the executor is necessary.
         if has_events {
-            if use_bundling {
-                if bundle_len > 0 {
-                    let tail_bundle = std::mem::replace(&mut bundle_seq, SeqFuture::new());
-                    bundled_futs.push(Box::pin(tail_bundle));
+            if !spawn_futs.is_empty() {
+                if !use_bundling {
+                    self.executor.spawn_and_forget_batch(spawn_futs);
+                } else {
+                    let mut bundled =
+                        Vec::with_capacity(spawn_futs.len() / max_groups_per_step_task + 1);
+                    let mut iter = spawn_futs.into_iter();
+
+                    loop {
+                        let mut seq = SeqFuture::new();
+                        let mut added = 0usize;
+                        for _ in 0..max_groups_per_step_task {
+                            match iter.next() {
+                                Some(fut) => {
+                                    seq.push(fut);
+                                    added += 1;
+                                }
+                                None => break,
+                            }
+                        }
+
+                        if added == 0 {
+                            break;
+                        }
+
+                        bundled.push(Box::pin(seq));
+                    }
+
+                    self.executor.spawn_and_forget_batch(bundled);
                 }
-                self.executor.spawn_and_forget_batch(bundled_futs);
-            } else if !unbundled_futs.is_empty() {
-                self.executor.spawn_and_forget_batch(unbundled_futs);
             }
             self.run_executor()?;
 
