@@ -318,8 +318,7 @@ impl Flow {
                 let priority = checked_priority(flow_set.priority);
 
                 for id_counter in 0..flow_set.flow_count {
-                    let host_pair: Vec<usize> =
-                        hosts.choose_multiple(&mut rng, 2).cloned().collect();
+                    let host_pair: Vec<usize> = hosts.sample(&mut rng, 2).cloned().collect();
 
                     let flow_id = first_flow_id + id_counter as usize;
                     let starts_before = flow_set.starts_before.clone().unwrap_or_default();

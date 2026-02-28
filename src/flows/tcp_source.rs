@@ -897,7 +897,8 @@ mod tests {
                 cubic: None,
             }),
         );
-        let rng = SmallRng::from_os_rng();
+        let mut rng = rand::rng();
+        let rng = SmallRng::from_rng(&mut rng);
         TCPPacketSource::new(0, Vec::new(), traffic, 0, None, rng)
     }
 

@@ -83,7 +83,10 @@ impl PacketSource {
         let global_seed = get_seed();
         let rng = match global_seed {
             1.. => SmallRng::seed_from_u64((global_seed + seed) as u64),
-            _ => SmallRng::from_os_rng(),
+            _ => {
+                let mut rng = rand::rng();
+                SmallRng::from_rng(&mut rng)
+            }
         };
 
         match flow_type {

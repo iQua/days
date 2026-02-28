@@ -42,7 +42,10 @@ impl Wire {
         let seed = get_seed();
         let rng = match seed {
             1.. => SmallRng::seed_from_u64(seed as u64),
-            _ => SmallRng::from_os_rng(),
+            _ => {
+                let mut rng = rand::rng();
+                SmallRng::from_rng(&mut rng)
+            }
         };
 
         Wire {
