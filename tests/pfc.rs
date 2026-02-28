@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
@@ -20,6 +22,8 @@ struct FrameSource {
 }
 
 impl FrameSource {
+    const SEND_BURST_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(count: usize, size: usize) -> Self {
         Self {
             count,
@@ -40,8 +44,20 @@ impl FrameSource {
 
 impl Model for FrameSource {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_burst));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(Duration::from_secs_f64(1e-9), Self::send_burst, ())
+        cx.schedule_event(
+            Duration::from_secs_f64(1e-9),
+            &Self::SEND_BURST_SID,
+            (),
+        )
             .unwrap();
         self.into()
     }
@@ -78,6 +94,8 @@ struct DelayedFrameSource {
 }
 
 impl DelayedFrameSource {
+    const SEND_ONCE_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(delay: Duration, size: usize) -> Self {
         Self {
             delay,
@@ -96,8 +114,16 @@ impl DelayedFrameSource {
 
 impl Model for DelayedFrameSource {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_once));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, Self::send_once, ()).unwrap();
+        cx.schedule_event(self.delay, &Self::SEND_ONCE_SID, ()).unwrap();
         self.into()
     }
 }
@@ -108,6 +134,8 @@ struct GateToggle {
 }
 
 impl GateToggle {
+    const OPEN_GATE_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(open: Arc<AtomicBool>, delay: Duration) -> Self {
         Self { open, delay }
     }
@@ -119,8 +147,16 @@ impl GateToggle {
 
 impl Model for GateToggle {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::open_gate));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, Self::open_gate, ()).unwrap();
+        cx.schedule_event(self.delay, &Self::OPEN_GATE_SID, ()).unwrap();
         self.into()
     }
 }
@@ -160,7 +196,7 @@ fn test_pfc_pause_frames_emitted() {
         .connect(PfcSink::frame_received, &sink_mbox);
 
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::new()
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox, "FrameSource")
         .add_model(ingress, ingress_mbox, "PfcIngress")
         .add_model(sink, sink_mbox, "PfcSink")
@@ -223,7 +259,7 @@ fn test_pfc_resume_frames_emitted_after_drain() {
         .connect(PfcSink::frame_received, &sink_mbox);
 
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::new()
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox, "FrameSource")
         .add_model(late_source, late_source_mbox, "LateFrameSource")
         .add_model(ingress, ingress_mbox, "PfcIngress")

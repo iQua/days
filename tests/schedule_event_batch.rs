@@ -2,8 +2,10 @@
 
 use std::time::Duration;
 
-use nexosim::model::{Context, InitializedModel, Model};
-use nexosim::ports::{EventQueue, Output};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
+use nexosim::ports::{EventSinkReader, Output, SinkState, event_queue};
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
@@ -13,6 +15,8 @@ struct BatchEmitter {
 }
 
 impl BatchEmitter {
+    const EMIT_SID: SchedulableId<Self, u32> = SchedulableId::__from_decorated(0);
+
     async fn emit(&mut self, value: u32, cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         self.output.send((value, now)).await;
@@ -21,8 +25,16 @@ impl BatchEmitter {
 
 impl Model for BatchEmitter {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::emit));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(Duration::from_millis(1), Self::emit, 0u32)
+        cx.schedule_event(Duration::from_millis(1), &Self::EMIT_SID, 0u32)
             .unwrap();
 
         cx.schedule_event_batch(
@@ -31,7 +43,7 @@ impl Model for BatchEmitter {
                 (Duration::from_millis(1), 2u32),
                 (Duration::from_millis(3), 3u32),
             ],
-            Self::emit,
+            &Self::EMIT_SID,
         )
         .unwrap();
 
@@ -43,15 +55,14 @@ impl Model for BatchEmitter {
 fn schedule_event_batch_preserves_order() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let queue = EventQueue::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
 
     let mut emitter = BatchEmitter::default();
-    emitter.output.connect_sink(queue.writer());
-    let mut reader = queue.into_reader();
+    emitter.output.connect_sink(writer);
 
     let emitter_mbox = Mailbox::new();
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::with_num_threads(1)
+    let mut sim = SimInit::with_num_threads(1)
         .add_model(emitter, emitter_mbox, "Emitter")
         .init(t0)
         .unwrap();
@@ -59,7 +70,7 @@ fn schedule_event_batch_preserves_order() {
     sim.step_until(t0 + Duration::from_millis(5)).unwrap();
 
     let mut got = Vec::new();
-    while let Some(evt) = reader.next() {
+    while let Some(evt) = reader.try_read() {
         got.push(evt);
     }
 
@@ -90,6 +101,8 @@ struct AtomicityEmitter {
 }
 
 impl AtomicityEmitter {
+    const EMIT_SID: SchedulableId<Self, u32> = SchedulableId::__from_decorated(0);
+
     async fn emit(&mut self, value: u32, cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         self.output.send((value, now)).await;
@@ -98,17 +111,25 @@ impl AtomicityEmitter {
 
 impl Model for AtomicityEmitter {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::emit));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         assert!(
             cx.schedule_event_batch(
                 vec![(Duration::ZERO, 1u32), (Duration::from_millis(1), 2u32)],
-                Self::emit,
+                &Self::EMIT_SID,
             )
             .is_err(),
             "batch scheduling a non-future event should fail",
         );
 
-        cx.schedule_event(Duration::from_millis(2), Self::emit, 99u32)
+        cx.schedule_event(Duration::from_millis(2), &Self::EMIT_SID, 99u32)
             .unwrap();
 
         self.into()
@@ -119,15 +140,14 @@ impl Model for AtomicityEmitter {
 fn schedule_event_batch_is_atomic_on_error() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let queue = EventQueue::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
 
     let mut emitter = AtomicityEmitter::default();
-    emitter.output.connect_sink(queue.writer());
-    let mut reader = queue.into_reader();
+    emitter.output.connect_sink(writer);
 
     let emitter_mbox = Mailbox::new();
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::with_num_threads(1)
+    let mut sim = SimInit::with_num_threads(1)
         .add_model(emitter, emitter_mbox, "Emitter")
         .init(t0)
         .unwrap();
@@ -135,7 +155,7 @@ fn schedule_event_batch_is_atomic_on_error() {
     sim.step_until(t0 + Duration::from_millis(5)).unwrap();
 
     let mut got = Vec::new();
-    while let Some(evt) = reader.next() {
+    while let Some(evt) = reader.try_read() {
         got.push(evt);
     }
 

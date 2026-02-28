@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use csv::ReaderBuilder;
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
@@ -24,6 +26,8 @@ struct FrameSource {
 }
 
 impl FrameSource {
+    const SEND_BURST_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(count: usize, size: usize) -> Self {
         Self {
             count,
@@ -44,8 +48,20 @@ impl FrameSource {
 
 impl Model for FrameSource {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_burst));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(Duration::from_secs_f64(1e-9), Self::send_burst, ())
+        cx.schedule_event(
+            Duration::from_secs_f64(1e-9),
+            &Self::SEND_BURST_SID,
+            (),
+        )
             .unwrap();
         self.into()
     }
@@ -91,7 +107,7 @@ fn pfc_events_include_event_id_and_match_sent_recv() {
         .connect(PfcEgressGate::pfc_received, &gate_mbox);
 
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::new()
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox, "FrameSource")
         .add_model(ingress, ingress_mbox, "PfcIngress")
         .add_model(gate, gate_mbox, "PfcGate")
