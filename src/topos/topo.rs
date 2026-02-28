@@ -335,10 +335,11 @@ impl Topology {
                     info!("Using default concurrency level.");
                 }
                 ConcurrencyLevel::Accelerated => {
-                    // In Days workloads, bundling origin groups into a single
-                    // executor task consistently regresses throughput.
-                    // Keep groups unbundled to preserve parallelism.
-                    sim_init = sim_init.set_max_groups_per_step_task(1);
+                    // Keep accelerated mode distinct from default by bundling
+                    // origin groups in proportion to runtime thread count.
+                    // This preserves the intended high-throughput policy used
+                    // by large multi-thread benchmarks.
+                    sim_init = sim_init.set_max_groups_per_step_task(runtime_num_threads);
                     info!("Using accelerated concurrency level.");
                 }
             }
