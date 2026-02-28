@@ -36,7 +36,7 @@ pub struct Wire {
 impl Wire {
     const FORWARD_SCHEDULED_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
 
-    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+    const DEFAULT_RUN_BATCH_SIZE: usize = 1;
 
     pub fn new(wire_id: usize, delay_dist: DistributionInfo) -> Wire {
         let seed = get_seed();

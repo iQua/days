@@ -126,7 +126,7 @@ impl DRRServer {
     const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
-    const DEFAULT_RUN_BATCH_SIZE: usize = 64;
+    const DEFAULT_RUN_BATCH_SIZE: usize = 1;
 
     pub fn new(
         rate: f64,
