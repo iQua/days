@@ -49,8 +49,8 @@ The choice is made in `Topology::new` (`src/topos/topo.rs`) using `SimInit::with
 
 Days constructs the full model graph in two stages:
 
-1. Create `Mailbox<T>` for every model and attach `Output<T>` ports.
-2. Register models into the simulation initializer (`SimInit`) and call `init(...)` to produce a `Simulation`.
+1. Create `Mailbox<M>` for every model and attach `Output<T>` ports.
+2. Register models into the simulation initializer (`SimInit`) and call `init(MonotonicTime::EPOCH)` to produce a `Simulation`.
 
 The entrypoint `Topology::run` (`src/topos/topo.rs`) performs this wiring and then runs:
 

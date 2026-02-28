@@ -9,7 +9,7 @@ Days is built around a small set of concepts:
 - **Actor model**: each simulated component is an actor that owns its state and communicates via message passing.
 - **Packets carry time**: most components avoid querying the global simulation clock by reading the timestamp stored in the message itself.
 
-Days uses the `nexosim` crate as the simulation engine. Each actor implements `nexosim::model::Model` and receives messages through connected `Output<T>` ports and `Mailbox<T>` mailboxes.
+Days uses the `nexosim` crate as the simulation engine. Each actor implements `nexosim::model::Model` and receives messages through connected `Output<T>` ports and model mailboxes (`Mailbox<M>`).
 
 ## Bird's-eye architecture
 

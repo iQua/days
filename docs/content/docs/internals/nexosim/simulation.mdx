@@ -17,13 +17,15 @@ In Days, the main entrypoint is `Topology::run`, which:
 
 ## Key APIs
 
-Source: `days/crates/nexosim/src/simulation.rs`
+Source: `crates/nexosim/src/simulation.rs`
 
 - `SimInit`: builder for assembling a bench (models, mailboxes, runtime knobs)
 - `Simulation`:
-  - `process_event(...)`: inject an event/request into a model (often used for “start” actions)
+  - `process_event(...)`: inject an event into a model (often used for “start” actions)
+  - `process_query(...)`: inject a request/reply query into a model and wait for the reply
   - `step()`: advance to the next event time and process all events at that time
   - `step_until(Duration)`: run until a target time
+  - `run()`: run until the simulation is halted
 
 ## Ordering and determinism
 

@@ -41,7 +41,7 @@ threading = "single"
 - Allowed values: `single`, `multiple`
 - `single` uses a single-threaded runtime.
 - `multiple` uses one worker per CPU core by default.
-- If omitted, Days uses the `nexosim` default runtime configuration.
+- If omitted, Days calls `SimInit::new()`, which uses all logical CPU threads by default in the current Nexosim port.
 
 ## `num_threads` (optional)
 
