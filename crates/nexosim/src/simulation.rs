@@ -742,6 +742,7 @@ impl Simulation {
         let max_groups_per_step_task = self.max_groups_per_step_task;
         let use_bundling = max_groups_per_step_task > 1;
         let allow_direct_fast_spawn = !use_bundling && !self.executor.is_multi_threaded();
+        let mut unbundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
         let mut bundled_futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
         let mut bundle_seq = SeqFuture::new();
         let mut bundle_len = 0usize;
@@ -756,7 +757,7 @@ impl Simulation {
                     bundle_len = 0;
                 }
             } else {
-                self.executor.spawn_and_forget(fut);
+                unbundled_futs.push(fut);
             }
         };
 
@@ -1009,6 +1010,8 @@ impl Simulation {
                     bundled_futs.push(Box::pin(tail_bundle));
                 }
                 self.executor.spawn_and_forget_batch(bundled_futs);
+            } else if !unbundled_futs.is_empty() {
+                self.executor.spawn_and_forget_batch(unbundled_futs);
             }
             self.run_executor()?;
 
