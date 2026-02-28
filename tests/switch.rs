@@ -6,9 +6,7 @@ use std::time::Duration;
 use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
 };
-use nexosim::ports::{
-    EventQueueReader, EventSinkReader, Output, SinkState, event_queue,
-};
+use nexosim::ports::{EventQueueReader, EventSinkReader, Output, SinkState, event_queue};
 use nexosim::simulation::{Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
@@ -159,7 +157,10 @@ fn control_packets_forward_to_r_fib_output() {
 
     sim.step_until(t0 + Duration::from_millis(5)).unwrap();
 
-    assert!(reader_a.try_read().is_none(), "control packet sent to fib output");
+    assert!(
+        reader_a.try_read().is_none(),
+        "control packet sent to fib output"
+    );
     let received = reader_b.try_read().expect("no control packet forwarded");
     assert_eq!(received.flow_id, 1);
     assert_eq!(received.packet_id, 2);
@@ -185,7 +186,10 @@ fn ack_packets_forward_to_r_fib_output() {
 
     sim.step_until(t0 + Duration::from_millis(5)).unwrap();
 
-    assert!(reader_a.try_read().is_none(), "ack packet sent to fib output");
+    assert!(
+        reader_a.try_read().is_none(),
+        "ack packet sent to fib output"
+    );
     let received = reader_b.try_read().expect("no ack packet forwarded");
     assert_eq!(received.flow_id, 1);
     assert_eq!(received.packet_id, 3);

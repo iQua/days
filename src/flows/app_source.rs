@@ -261,7 +261,7 @@ impl AppSourceBuffer {
                 Self::run_once,
                 (),
             )
-                .expect("reschedule run_once failed");
+            .expect("reschedule run_once failed");
         }
     }
 }

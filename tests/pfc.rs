@@ -53,11 +53,7 @@ impl Model for FrameSource {
     }
 
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(
-            Duration::from_secs_f64(1e-9),
-            &Self::SEND_BURST_SID,
-            (),
-        )
+        cx.schedule_event(Duration::from_secs_f64(1e-9), &Self::SEND_BURST_SID, ())
             .unwrap();
         self.into()
     }
@@ -123,7 +119,8 @@ impl Model for DelayedFrameSource {
     }
 
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, &Self::SEND_ONCE_SID, ()).unwrap();
+        cx.schedule_event(self.delay, &Self::SEND_ONCE_SID, ())
+            .unwrap();
         self.into()
     }
 }
@@ -156,7 +153,8 @@ impl Model for GateToggle {
     }
 
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, &Self::OPEN_GATE_SID, ()).unwrap();
+        cx.schedule_event(self.delay, &Self::OPEN_GATE_SID, ())
+            .unwrap();
         self.into()
     }
 }

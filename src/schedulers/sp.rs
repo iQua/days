@@ -430,7 +430,7 @@ impl SPServer {
                 Self::send_and_run,
                 outbound,
             )
-                .unwrap();
+            .unwrap();
         });
     }
 

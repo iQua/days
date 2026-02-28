@@ -373,7 +373,7 @@ impl PacketSource {
                         Self::run,
                         (),
                     )
-                        .unwrap();
+                    .unwrap();
                 }
             }
             PacketSource::TCPPacketSource(source) => {
@@ -388,7 +388,7 @@ impl PacketSource {
                             Self::run,
                             (),
                         )
-                            .unwrap();
+                        .unwrap();
                     }
                 }
             }
@@ -405,7 +405,7 @@ impl PacketSource {
                             Self::run,
                             (),
                         )
-                            .unwrap();
+                        .unwrap();
                     }
                 }
             }
@@ -702,7 +702,7 @@ impl Model for PacketSource {
                     Self::run,
                     (),
                 )
-                    .unwrap();
+                .unwrap();
             } else {
                 self.run((), cx).await;
             }

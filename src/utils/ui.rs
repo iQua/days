@@ -88,7 +88,7 @@ impl UserInterface {
                     Self::run,
                     (),
                 )
-                    .unwrap();
+                .unwrap();
             }
         }
     }
@@ -109,7 +109,7 @@ impl UserInterface {
                 Self::run,
                 (),
             )
-                .unwrap();
+            .unwrap();
         }
     }
 }

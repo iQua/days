@@ -34,11 +34,7 @@ impl EcnCounter {
         }
     }
 
-    async fn packet_received(
-        &mut self,
-        packet: days::flows::packet::Packet,
-        _: &Context<Self>,
-    ) {
+    async fn packet_received(&mut self, packet: days::flows::packet::Packet, _: &Context<Self>) {
         if self.count_data {
             if matches!(packet.ecn, EcnField::Ce) {
                 *self.ce_count.lock().unwrap() += 1;

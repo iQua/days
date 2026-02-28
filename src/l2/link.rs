@@ -7,9 +7,7 @@ use std::time::Duration;
 use log::debug;
 use tracing::instrument;
 
-use nexosim::model::{
-    BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId,
-};
+use nexosim::model::{BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId};
 use nexosim::ports::Output;
 #[cfg(feature = "test")]
 use nexosim::time::MonotonicTime;
@@ -112,10 +110,18 @@ impl Link {
 
                 let delay = (departure_time - self.time).max(0.0);
 
-                cx.schedule_event(Duration::from_secs_f64(delay), &Self::SEND_SID, frame.clone())
-                    .unwrap();
-                cx.schedule_event(Duration::from_secs_f64(delay), &Self::RUN_SID, departure_time)
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(delay),
+                    &Self::SEND_SID,
+                    frame.clone(),
+                )
+                .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(delay),
+                    &Self::RUN_SID,
+                    departure_time,
+                )
+                .unwrap();
 
                 self.busy_until = departure_time;
 

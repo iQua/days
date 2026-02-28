@@ -57,11 +57,7 @@ impl Model for FrameSource {
     }
 
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        cx.schedule_event(
-            Duration::from_secs_f64(1e-9),
-            &Self::SEND_BURST_SID,
-            (),
-        )
+        cx.schedule_event(Duration::from_secs_f64(1e-9), &Self::SEND_BURST_SID, ())
             .unwrap();
         self.into()
     }
