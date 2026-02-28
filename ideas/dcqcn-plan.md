@@ -150,7 +150,7 @@ Add one or two example configs in `configs/`:
 
 Update `docs/examples/index.md` with commands:
 
-- `cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml`
+- `cargo run --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml`
 
 ## Milestones
 

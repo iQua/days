@@ -19,7 +19,7 @@ cargo build
 The `days` CLI expects exactly one argument: the path to a TOML configuration file.
 
 ```bash
-RUST_LOG=info cargo run -- configs/simple.toml
+RUST_LOG=info cargo run --bin days -- configs/simple.toml
 ```
 
 ## Feature flags
@@ -39,11 +39,11 @@ Examples:
 cargo build --features l2,l2_pfc
 
 # Run a PFC-configured experiment
-RUST_LOG=info cargo run --features l2,l2_pfc -- configs/pfc.toml
+RUST_LOG=info cargo run --features l2,l2_pfc --bin days -- configs/pfc.toml
 
 # Run DCQCN (typically paired with PFC in lossless fabrics)
-RUST_LOG=info cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml
+RUST_LOG=info cargo run --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
 
 # Emit dcqcn_events.csv for LeanGuard (conformance checking)
-RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc -- configs/dcqcn_simple.toml
+RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc --bin days -- configs/dcqcn_simple.toml
 ```

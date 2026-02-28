@@ -31,7 +31,7 @@ perf = ["nexosim/perf"]
 Run with:
 
 ```bash
-cargo run --features perf -- configs/exp_tcp_fattree.toml
+cargo run --features perf --bin days -- configs/exp_tcp_fattree.toml
 ```
 
 If you don’t want to touch Days features, you can still run with `--features nexosim/perf` depending on how your workspace features are wired.

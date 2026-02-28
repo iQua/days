@@ -29,7 +29,7 @@ Days also writes a trace manifest at `log_path/traces.json` listing which `*_eve
 Build and run with DCQCN + trace logging enabled:
 
 ```bash
-RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc -- configs/dcqcn_simple.toml
+RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc --bin days -- configs/dcqcn_simple.toml
 ```
 
 This writes `dcqcn_events.csv` under `log_path`.
@@ -39,7 +39,7 @@ This writes `dcqcn_events.csv` under `log_path`.
 Build and run with PFC + trace logging enabled:
 
 ```bash
-RUST_LOG=info cargo run --features l2_pfc,lean -- configs/pfc.toml
+RUST_LOG=info cargo run --features l2_pfc,lean --bin days -- configs/pfc.toml
 ```
 
 This writes `pfc_events.csv` under `log_path`.
@@ -49,7 +49,7 @@ This writes `pfc_events.csv` under `log_path`.
 CUBIC event tracing is enabled by the `lean` feature:
 
 ```bash
-RUST_LOG=info cargo run --features lean -- configs/simple.toml
+RUST_LOG=info cargo run --features lean --bin days -- configs/simple.toml
 ```
 
 If your scenario includes TCP flows using CUBIC, Days writes `cubic_events.csv` under `log_path`.
@@ -59,7 +59,7 @@ If your scenario includes TCP flows using CUBIC, Days writes `cubic_events.csv` 
 DRR event tracing is enabled by the `lean` feature:
 
 ```bash
-RUST_LOG=info cargo run --features lean -- configs/simple.toml
+RUST_LOG=info cargo run --features lean --bin days -- configs/simple.toml
 ```
 
 If your scenario includes a DRR scheduler, Days writes `drr_events.csv` under `log_path`.
@@ -69,7 +69,7 @@ If your scenario includes a DRR scheduler, Days writes `drr_events.csv` under `l
 WFQ event tracing is enabled by the `lean` feature:
 
 ```bash
-RUST_LOG=info cargo run --features lean -- configs/simple.toml
+RUST_LOG=info cargo run --features lean --bin days -- configs/simple.toml
 ```
 
 If your scenario includes a WFQ scheduler, Days writes `wfq_events.csv` under `log_path`.

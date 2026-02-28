@@ -634,7 +634,7 @@ Yes, proceed to do (a).
       - cnp_sent at DcqcnPacketSink::maybe_send_cnp (src/flows/dcqcn_sink.rs:144)
       - cnp_recv + timer_tick at DcqcnPacketSource (src/flows/dcqcn_source.rs:157, src/flows/dcqcn_source.rs:216)
 
-  To generate the file: cargo run --features dcqcn,lean -- configs/dcqcn_simple.toml (writes dcqcn_events.csv under the config’s log_path).
+  To generate the file: cargo run --features dcqcn,lean --bin days -- configs/dcqcn_simple.toml (writes dcqcn_events.csv under the config’s log_path).
 
   Tests run: cargo test --features test -- --show-output, cargo test --features "test,dcqcn,lean" -- --show-output.
 
@@ -652,7 +652,7 @@ Now proceed to complete (b), (b) add a tiny Lean/CLI “parse CSV → List Row �
 To run it on real output:
 
 ```
-cargo run --features dcqcn,lean -- configs/dcqcn_simple.toml
+cargo run --features dcqcn,lean --bin days -- configs/dcqcn_simple.toml
 cd lean
 lake build
 lake exe dcqcn_check ../logs/dcqcn_simple/dcqcn_events.csv

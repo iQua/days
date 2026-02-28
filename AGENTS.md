@@ -16,7 +16,7 @@ In this project, a new discrete-event network simulator, called Days, has been i
 ## Build, Test, and Development Commands
 - `cargo build` builds the default simulator.
 - `cargo build --features l2,l2_pfc` enables L2/PFC support (still controlled by config at runtime).
-- `cargo run -- configs/simple.toml` runs a sample simulation from the repo.
+- `cargo run --release --bin days -- configs/simple.toml` runs a sample simulation from the repo.
 - `RUST_LOG=debug days configs/simple.toml` runs the installed binary with verbose logging.
 - `cargo fmt --all` formats Rust code; `cargo clippy --all-features` runs linting.
 - `cargo test --features test -- --show-output` runs unit + integration tests.

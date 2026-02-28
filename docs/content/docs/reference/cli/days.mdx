@@ -8,17 +8,17 @@ The default binary (built from `src/main.rs`) runs a simulation described by a T
 ## Usage
 
 ```bash
-RUST_LOG=info cargo run --release -- <path/to/config.toml>
+RUST_LOG=info cargo run --release --bin days -- <path/to/config.toml>
 ```
 
 Examples:
 
 ```bash
 # Minimal example
-RUST_LOG=info cargo run --release -- configs/simple.toml
+RUST_LOG=info cargo run --release --bin days -- configs/simple.toml
 
 # TCP example
-RUST_LOG=info cargo run --release -- configs/tcp_simple.toml
+RUST_LOG=info cargo run --release --bin days -- configs/tcp_simple.toml
 ```
 
 ## Arguments

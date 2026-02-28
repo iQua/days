@@ -5,7 +5,7 @@ description: Run config-driven simulations and Rust example binaries.
 
 Days supports two “example styles”:
 
-1. **Config-driven simulations** (`configs/*.toml`) run via the CLI (`cargo run -- <config>`).
+1. **Config-driven simulations** (`configs/*.toml`) run via the CLI (`cargo run --bin days -- <config>`).
 2. **Rust examples** (`examples/*.rs`) run via `cargo run --example <name>`.
 
 ## Config examples
@@ -13,19 +13,19 @@ Days supports two “example styles”:
 Run a config from the repo root:
 
 ```bash
-RUST_LOG=info cargo run -- configs/simple.toml
+RUST_LOG=info cargo run --bin days -- configs/simple.toml
 ```
 
 Measure wall-clock time without logs:
 
 ```bash
-time cargo run -- configs/simple.toml
+time cargo run --bin days -- configs/simple.toml
 ```
 
 DCQCN example (requires `dcqcn` and typically `l2_pfc`):
 
 ```bash
-RUST_LOG=info cargo run --features dcqcn,l2_pfc -- configs/dcqcn_simple.toml
+RUST_LOG=info cargo run --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
 ```
 
 ## Rust examples
