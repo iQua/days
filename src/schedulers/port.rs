@@ -7,7 +7,9 @@ use std::time::Duration;
 use log::debug;
 use tracing::instrument;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
@@ -71,6 +73,7 @@ pub struct Port {
     throughput_mean: f64,
     queueing_delay_mean: f64,
     run_batch_size: usize,
+    run_schedule_scratch: Vec<(Duration, Packet)>,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -78,6 +81,9 @@ pub struct Port {
 }
 
 impl Port {
+    const SEND_SCHEDULED_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
+
     const DEFAULT_RUN_BATCH_SIZE: usize = 64;
 
     pub fn new(
@@ -143,6 +149,7 @@ impl Port {
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
             run_batch_size,
+            run_schedule_scratch: Vec::with_capacity(run_batch_size),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -238,7 +245,7 @@ impl Port {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -328,11 +335,11 @@ impl Port {
         self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
         self.send_scheduled(packet, cx).await;
     }
 
-    async fn send_scheduled(&mut self, packet: Packet, cx: &mut Context<Self>) {
+    async fn send_scheduled(&mut self, packet: Packet, cx: &Context<Self>) {
         self.send(packet).await;
 
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -360,7 +367,7 @@ impl Port {
     pub fn run<'a>(
         &'a mut self,
         now: f64,
-        cx: &'a mut Context<Self>,
+        cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             #[cfg(feature = "test")]
@@ -382,7 +389,7 @@ impl Port {
                 return;
             }
 
-            let mut schedule = Vec::with_capacity(self.run_batch_size);
+            self.run_schedule_scratch.clear();
             let mut service_start = run_time;
 
             for _ in 0..self.run_batch_size {
@@ -398,15 +405,20 @@ impl Port {
                 self.packet_sent(departure_time, &packet);
 
                 let delay = (departure_time - run_time).max(0.0);
-                schedule.push((Duration::from_secs_f64(delay), packet));
+                self.run_schedule_scratch
+                    .push((Duration::from_secs_f64(delay), packet));
 
                 self.in_flight += 1;
                 service_start = departure_time;
             }
 
-            if !schedule.is_empty() {
-                cx.schedule_event_batch(schedule, Self::send_scheduled)
-                    .unwrap();
+            if !self.run_schedule_scratch.is_empty() {
+                cx.schedule_event_batch_fast_in_place(
+                    &mut self.run_schedule_scratch,
+                    &Self::SEND_SCHEDULED_SID,
+                    Self::send_scheduled,
+                )
+                .unwrap();
             }
         }
     }
@@ -430,7 +442,7 @@ impl Port {
         }
     }
 
-    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
         let report = self.prepare_report(now);
@@ -497,14 +509,24 @@ impl ReportStatistics for Port {
 }
 
 impl Model for Port {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_scheduled));
+        registry.add(cx.register_schedulable(Self::log_report));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
 
         if report_interval < f64::MAX {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
                 Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                &Self::LOG_REPORT_SID,
                 (),
             )
             .unwrap();

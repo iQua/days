@@ -95,7 +95,7 @@ fn main() {
         .connect(PacketSource::packet_received, &source_mbox);
 
     let mut sink_statistics = EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     // instantiates the simulator
     let t0 = MonotonicTime::EPOCH;
@@ -106,12 +106,12 @@ fn main() {
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             // starts the simulation
             let _ = sim.step_until(Duration::from_secs(20));
 
             // requests the packet sink to report statistics
-            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, 2, &sink_addr);
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
             }

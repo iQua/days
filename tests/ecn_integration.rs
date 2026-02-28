@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::{EventSlot, Output};
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
@@ -23,6 +25,8 @@ struct EcnBurstSource {
 }
 
 impl EcnBurstSource {
+    const RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(flow_id: usize, size: usize, count: usize) -> Self {
         Self {
             time: 0.0,
@@ -34,36 +38,39 @@ impl EcnBurstSource {
         }
     }
 
-    fn run<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl std::future::Future<Output = ()> + Send + 'a {
-        async move {
-            if self.remaining == 0 {
-                return;
-            }
+    async fn run(&mut self, _: (), cx: &Context<Self>) {
+        if self.remaining == 0 {
+            return;
+        }
 
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            self.time = now;
+        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        self.time = now;
 
-            let mut packet = Packet::new(self.size, self.next_id, self.flow_id, now);
-            packet.ecn = EcnField::Ect0;
-            self.next_id += 1;
-            self.remaining -= 1;
+        let mut packet = Packet::new(self.size, self.next_id, self.flow_id, now);
+        packet.ecn = EcnField::Ect0;
+        self.next_id += 1;
+        self.remaining -= 1;
 
-            self.output.send(packet).await;
+        self.output.send(packet).await;
 
-            if self.remaining > 0 {
-                cx.schedule_event(Duration::from_secs_f64(0.0005), Self::run, ())
-                    .unwrap();
-            }
+        if self.remaining > 0 {
+            cx.schedule_event(Duration::from_secs_f64(0.0005), &Self::RUN_SID, ())
+                .unwrap();
         }
     }
 }
 
 impl Model for EcnBurstSource {
-    async fn init(mut self, cx: &mut Context<Self>) -> InitializedModel<Self> {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::run));
+        registry
+    }
+
+    async fn init(mut self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         self.run((), cx).await;
         self.into()
     }
@@ -90,10 +97,10 @@ fn test_red_ecn_marks_ce_in_simulation() {
     let mut sink_slot = EventSlot::new();
 
     source.output.connect(Port::packet_received, &port_mbox);
-    port.output.connect_sink(&sink_slot);
+    port.output.connect_sink(sink_slot.writer());
 
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::new()
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox, "ECNSource")
         .add_model(port, port_mbox, "ECNPort")
         .init(t0)

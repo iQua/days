@@ -2,18 +2,22 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use nexosim::model::Model;
+use nexosim::path::Path;
 use nexosim::ports::{EventSource, Output, QuerySource, Requestor};
 use nexosim::simulation::{ExecutionError, Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
 const MT_NUM_THREADS: usize = 4;
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct TestModel {
     output: Output<()>,
     requestor: Requestor<(), ()>,
 }
+#[Model]
 impl TestModel {
     async fn activate_output(&mut self) {
         self.output.send(()).await;
@@ -22,7 +26,6 @@ impl TestModel {
         let _ = self.requestor.send(()).await;
     }
 }
-impl Model for TestModel {}
 
 /// Send an event from a model to a dead input.
 fn no_input_from_model(num_threads: usize) {
@@ -37,16 +40,20 @@ fn no_input_from_model(num_threads: usize) {
 
     drop(bad_mbox);
 
-    let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, MODEL_NAME)
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut bench = SimInit::with_num_threads(num_threads);
 
-    match simu.process_event(TestModel::activate_output, (), addr) {
+    let activate_output = EventSource::new()
+        .connect(TestModel::activate_output, &addr)
+        .register(&mut bench);
+
+    let mut simu = bench
+        .add_model(model, mbox, MODEL_NAME)
+        .init(MonotonicTime::EPOCH)
+        .unwrap();
+
+    match simu.process_event(&activate_output, ()) {
         Err(ExecutionError::NoRecipient { model }) => {
-            assert_eq!(model, Some(String::from(MODEL_NAME)));
+            assert_eq!(model, Some(Path::from(MODEL_NAME)));
         }
         _ => panic!("missing recipient not detected"),
     }
@@ -58,7 +65,6 @@ fn no_replier_from_model(num_threads: usize) {
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
-    let addr = mbox.address();
     let bad_mbox = Mailbox::new();
 
     model
@@ -67,16 +73,20 @@ fn no_replier_from_model(num_threads: usize) {
 
     drop(bad_mbox);
 
-    let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, MODEL_NAME)
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut bench = SimInit::with_num_threads(num_threads);
 
-    match simu.process_event(TestModel::activate_requestor, (), addr) {
+    let activate_requestor = EventSource::new()
+        .connect(TestModel::activate_requestor, &mbox)
+        .register(&mut bench);
+
+    let mut simu = bench
+        .add_model(model, mbox, MODEL_NAME)
+        .init(MonotonicTime::EPOCH)
+        .unwrap();
+
+    match simu.process_event(&activate_requestor, ()) {
         Err(ExecutionError::NoRecipient { model }) => {
-            assert_eq!(model, Some(String::from(MODEL_NAME)));
+            assert_eq!(model, Some(Path::from(MODEL_NAME)));
         }
         _ => panic!("missing recipient not detected"),
     }
@@ -86,16 +96,20 @@ fn no_replier_from_model(num_threads: usize) {
 fn no_input_from_scheduler(num_threads: usize) {
     let bad_mbox = Mailbox::new();
 
-    let mut src = EventSource::new();
-    src.connect(TestModel::activate_output, &bad_mbox);
-    let event = src.event(());
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let activate_output = EventSource::new()
+        .connect(TestModel::activate_output, &bad_mbox)
+        .register(&mut bench);
 
     drop(bad_mbox);
 
-    let t0 = MonotonicTime::EPOCH;
-    let (mut simu, scheduler) = SimInit::with_num_threads(num_threads).init(t0).unwrap();
+    let mut simu = bench.init(MonotonicTime::EPOCH).unwrap();
+    let scheduler = simu.scheduler();
 
-    scheduler.schedule(Duration::from_secs(1), event).unwrap();
+    scheduler
+        .schedule_event(Duration::from_secs(1), &activate_output, ())
+        .unwrap();
 
     match simu.step() {
         Err(ExecutionError::NoRecipient { model }) => {
@@ -105,25 +119,25 @@ fn no_input_from_scheduler(num_threads: usize) {
     }
 }
 
-/// Send a query from the scheduler to a dead input.
-fn no_replier_from_scheduler(num_threads: usize) {
+/// Process a query on a dead input.
+fn no_replier_from_query(num_threads: usize) {
     let bad_mbox = Mailbox::new();
-
-    let mut src = QuerySource::new();
-    src.connect(TestModel::activate_requestor, &bad_mbox);
-    let query = src.query(()).0;
+    let addr = bad_mbox.address();
 
     drop(bad_mbox);
 
-    let t0 = MonotonicTime::EPOCH;
-    let (mut simu, scheduler) = SimInit::with_num_threads(num_threads).init(t0).unwrap();
+    let mut bench = SimInit::with_num_threads(num_threads);
 
-    scheduler.schedule(Duration::from_secs(1), query).unwrap();
+    let query = QuerySource::new()
+        .connect(TestModel::activate_requestor, &addr)
+        .register(&mut bench);
 
-    match simu.step() {
-        Err(ExecutionError::NoRecipient { model }) => {
-            assert_eq!(model, None);
-        }
+    let mut simu = bench.init(MonotonicTime::EPOCH).unwrap();
+
+    let result = simu.process_query(&query, ());
+
+    match result {
+        Err(ExecutionError::NoRecipient { .. }) => (),
         _ => panic!("missing recipient not detected"),
     }
 }
@@ -143,22 +157,24 @@ fn dropped_address(num_threads: usize) {
     let addr_a = mbox_a.address();
     let _ = mbox_b.address(); // Create and drop immediately an address before any other exists.
 
+    let mut bench = SimInit::with_num_threads(num_threads);
+
     model_a
         .output
         .connect(TestModel::activate_requestor, &mbox_b);
 
+    let activate_output = EventSource::new()
+        .connect(TestModel::activate_output, addr_a)
+        .register(&mut bench);
+
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
+    let mut simu = bench
         .add_model(model_a, mbox_a, MODEL_A_NAME)
         .add_model(model_b, mbox_b, MODEL_B_NAME)
         .init(t0)
-        .unwrap()
-        .0;
+        .unwrap();
 
-    assert!(
-        simu.process_event(TestModel::activate_output, (), addr_a)
-            .is_ok()
-    );
+    assert!(simu.process_event(&activate_output, ()).is_ok());
 }
 
 #[test]
@@ -192,13 +208,13 @@ fn no_input_from_scheduler_mt() {
 }
 
 #[test]
-fn no_replier_from_scheduler_st() {
-    no_replier_from_scheduler(1);
+fn no_replier_from_query_st() {
+    no_replier_from_query(1);
 }
 
 #[test]
-fn no_replier_from_scheduler_mt() {
-    no_replier_from_scheduler(MT_NUM_THREADS);
+fn no_replier_from_query_mt() {
+    no_replier_from_query(MT_NUM_THREADS);
 }
 
 #[test]

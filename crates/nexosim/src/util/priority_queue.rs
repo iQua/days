@@ -72,6 +72,7 @@ impl<K: Copy + Ord, V> PriorityQueue<K, V> {
     ///
     /// The epoch is used to break ties for equal keys and must be unique for a
     /// given key if stable ordering is required.
+    #[allow(dead_code)]
     pub(crate) fn insert_with_epoch(&mut self, key: K, value: V, epoch: u64) {
         assert_ne!(epoch, u64::MAX);
         let item = Item { key, value, epoch };
@@ -113,11 +114,25 @@ impl<K: Copy + Ord, V> PriorityQueue<K, V> {
     ///
     /// This operation has *O*(1) non-amortized theoretical complexity.
     pub(crate) fn peek(&self) -> Option<(&K, &V)> {
-        let Item {
-            ref key, ref value, ..
-        } = self.heap.peek()?;
+        let Item { key, value, .. } = self.heap.peek()?;
 
         Some((key, value))
+    }
+
+    /// Creates an iterator over queue's elements.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.heap.iter().map(|a| (&a.key, &a.value))
+    }
+
+    /// Empties the queue.
+    pub(crate) fn clear(&mut self) {
+        self.heap.clear();
+        self.next_epoch = 0;
+    }
+
+    /// Reserves capacity for at least `additional` more elements.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.heap.reserve(additional);
     }
 }
 

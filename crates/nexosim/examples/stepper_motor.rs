@@ -17,15 +17,18 @@
 //!                                                   └─────────┘
 //! ```
 
-use std::future::Future;
+use std::iter;
 use std::time::Duration;
 
-use nexosim::model::{Context, InitializedModel, Model};
-use nexosim::ports::{EventQueue, Output};
+use serde::{Deserialize, Serialize};
+
+use nexosim::model::{Context, Model, schedulable};
+use nexosim::ports::{EventSinkReader, EventSource, Output, SinkState, event_queue};
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
 /// Stepper motor.
+#[derive(Serialize, Deserialize)]
 pub struct Motor {
     /// Position [-] -- output port.
     pub position: Output<u16>,
@@ -35,7 +38,7 @@ pub struct Motor {
     /// Torque applied by the load [N·m] -- internal state.
     torque: f64,
 }
-
+#[Model]
 impl Motor {
     /// Number of steps per revolution.
     pub const STEPS_PER_REV: u16 = 200;
@@ -49,6 +52,12 @@ impl Motor {
             pos: position % Self::STEPS_PER_REV,
             torque: 0.0,
         }
+    }
+
+    /// Broadcasts the initial position of the motor.
+    #[nexosim(init)]
+    async fn init(&mut self) {
+        self.position.send(self.pos).await;
     }
 
     /// Coil currents [A] -- input port.
@@ -88,15 +97,8 @@ impl Motor {
     }
 }
 
-impl Model for Motor {
-    /// Broadcasts the initial position of the motor.
-    async fn init(mut self, _: &mut Context<Self>) -> InitializedModel<Self> {
-        self.position.send(self.pos).await;
-        self.into()
-    }
-}
-
 /// Stepper motor driver.
+#[derive(Serialize, Deserialize)]
 pub struct Driver {
     /// Coil A and coil B currents [A] -- output port.
     pub current_out: Output<(f64, f64)>,
@@ -108,7 +110,7 @@ pub struct Driver {
     /// Nominal coil current (absolute value) [A] -- constant.
     current: f64,
 }
-
+#[Model]
 impl Driver {
     /// Minimum supported pulse rate [Hz].
     const MIN_PPS: f64 = 1.0;
@@ -126,7 +128,7 @@ impl Driver {
     }
 
     /// Pulse rate (sign = direction) [Hz] -- input port.
-    pub async fn pulse_rate(&mut self, pps: f64, cx: &mut Context<Self>) {
+    pub async fn pulse_rate(&mut self, pps: f64, cx: &Context<Self>) {
         let pps = pps.signum() * pps.abs().clamp(Self::MIN_PPS, Self::MAX_PPS);
         if pps == self.pps {
             return;
@@ -146,37 +148,30 @@ impl Driver {
     ///
     /// Note: self-scheduling async methods must be for now defined with an
     /// explicit signature instead of `async fn` due to a rustc issue.
-    fn send_pulse<'a>(
-        &'a mut self,
-        _: (),
-        cx: &'a mut Context<Self>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let current_out = match self.next_phase {
-                0 => (self.current, 0.0),
-                1 => (0.0, self.current),
-                2 => (-self.current, 0.0),
-                3 => (0.0, -self.current),
-                _ => unreachable!(),
-            };
-            self.current_out.send(current_out).await;
+    #[nexosim(schedulable)]
+    async fn send_pulse(&mut self, _: (), cx: &Context<Self>) {
+        let current_out = match self.next_phase {
+            0 => (self.current, 0.0),
+            1 => (0.0, self.current),
+            2 => (-self.current, 0.0),
+            3 => (0.0, -self.current),
+            _ => unreachable!(),
+        };
+        self.current_out.send(current_out).await;
 
-            if self.pps == 0.0 {
-                return;
-            }
-
-            self.next_phase = (self.next_phase + (self.pps.signum() + 4.0) as u8) % 4;
-
-            let pulse_duration = Duration::from_secs_f64(1.0 / self.pps.abs());
-
-            // Schedule the next pulse.
-            cx.schedule_event(pulse_duration, Self::send_pulse, ())
-                .unwrap();
+        if self.pps == 0.0 {
+            return;
         }
+
+        self.next_phase = (self.next_phase + (self.pps.signum() + 4.0) as u8) % 4;
+
+        let pulse_duration = Duration::from_secs_f64(1.0 / self.pps.abs());
+
+        // Schedule the next pulse.
+        cx.schedule_event(pulse_duration, schedulable!(Self::send_pulse), ())
+            .unwrap();
     }
 }
-
-impl Model for Driver {}
 
 #[allow(dead_code)]
 fn main() -> Result<(), nexosim::simulation::SimulationError> {
@@ -196,18 +191,22 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     // Connections.
     driver.current_out.connect(Motor::current_in, &motor_mbox);
 
-    // Model handles for simulation.
-    let position = EventQueue::new();
-    motor.position.connect_sink(&position);
-    let mut position = position.into_reader();
-    let motor_addr = motor_mbox.address();
-    let driver_addr = driver_mbox.address();
+    // Endpoints.
+    let mut bench = SimInit::new();
 
-    // Start time (arbitrary since models do not depend on absolute time).
-    let t0 = MonotonicTime::EPOCH;
+    let pulse_rate = EventSource::new()
+        .connect(Driver::pulse_rate, &driver_mbox)
+        .register(&mut bench);
+    let motor_load = EventSource::new()
+        .connect(Motor::load, &motor_mbox)
+        .register(&mut bench);
+
+    let (sink, mut position) = event_queue(SinkState::Enabled);
+    motor.position.connect_sink(sink);
 
     // Assembly and initialization.
-    let (mut simu, scheduler) = SimInit::new()
+    let t0 = MonotonicTime::EPOCH; // arbitrary since models do not depend on absolute time
+    let mut simu = bench
         .add_model(driver, driver_mbox, "driver")
         .add_model(motor, motor_mbox, "motor")
         .init(t0)?;
@@ -216,20 +215,17 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     // Simulation.
     // ----------
 
+    let scheduler = simu.scheduler();
+
     // Check initial conditions.
     let mut t = t0;
     assert_eq!(simu.time(), t);
-    assert_eq!(position.next(), Some(init_pos));
-    assert!(position.next().is_none());
+    assert_eq!(position.try_read(), Some(init_pos));
+    assert!(position.try_read().is_none());
 
     // Start the motor in 2s with a PPS of 10Hz.
     scheduler
-        .schedule_event(
-            Duration::from_secs(2),
-            Driver::pulse_rate,
-            10.0,
-            &driver_addr,
-        )
+        .schedule_event(Duration::from_secs(2), &pulse_rate, 10.0)
         .unwrap();
 
     // Advance simulation time to two next events.
@@ -244,7 +240,8 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     // driver the rotor should have synchronized with the driver, with a
     // position given by this beautiful formula.
     let mut pos = (((init_pos + 1) / 4) * 4 + 1) % Motor::STEPS_PER_REV;
-    assert_eq!(position.by_ref().last().unwrap(), pos);
+    let last_pos = iter::from_fn(|| position.try_read()).last();
+    assert_eq!(last_pos, Some(pos));
 
     // Advance simulation time by 0.9s, which with a 10Hz PPS should correspond to
     // 9 position increments.
@@ -253,28 +250,28 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     assert_eq!(simu.time(), t);
     for _ in 0..9 {
         pos = (pos + 1) % Motor::STEPS_PER_REV;
-        assert_eq!(position.next(), Some(pos));
+        assert_eq!(position.try_read(), Some(pos));
     }
-    assert!(position.next().is_none());
+    assert!(position.try_read().is_none());
 
     // Increase the load beyond the torque limit for a 1A driver current.
-    simu.process_event(Motor::load, 2.0, &motor_addr)?;
+    simu.process_event(&motor_load, 2.0)?;
 
     // Advance simulation time and check that the motor is blocked.
     simu.step()?;
     t += Duration::new(0, 100_000_000);
     assert_eq!(simu.time(), t);
-    assert!(position.next().is_none());
+    assert!(position.try_read().is_none());
 
     // Do it again.
     simu.step()?;
     t += Duration::new(0, 100_000_000);
     assert_eq!(simu.time(), t);
-    assert!(position.next().is_none());
+    assert!(position.try_read().is_none());
 
     // Decrease the load below the torque limit for a 1A driver current and
     // advance simulation time.
-    simu.process_event(Motor::load, 0.5, &motor_addr)?;
+    simu.process_event(&motor_load, 0.5)?;
     simu.step()?;
     t += Duration::new(0, 100_000_000);
 
@@ -283,7 +280,7 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     // makes a step backward before it moves forward again.
     assert_eq!(simu.time(), t);
     pos = (pos + Motor::STEPS_PER_REV - 1) % Motor::STEPS_PER_REV;
-    assert_eq!(position.next(), Some(pos));
+    assert_eq!(position.try_read(), Some(pos));
 
     // Advance simulation time by 0.7s, which with a 10Hz PPS should correspond to
     // 7 position increments.
@@ -292,18 +289,18 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     assert_eq!(simu.time(), t);
     for _ in 0..7 {
         pos = (pos + 1) % Motor::STEPS_PER_REV;
-        assert_eq!(position.next(), Some(pos));
+        assert_eq!(position.try_read(), Some(pos));
     }
-    assert!(position.next().is_none());
+    assert!(position.try_read().is_none());
 
     // Now make the motor rotate in the opposite direction. Note that this
     // driver only accounts for a new PPS at the next pulse.
-    simu.process_event(Driver::pulse_rate, -10.0, &driver_addr)?;
+    simu.process_event(&pulse_rate, -10.0)?;
     simu.step()?;
     t += Duration::new(0, 100_000_000);
     assert_eq!(simu.time(), t);
     pos = (pos + 1) % Motor::STEPS_PER_REV;
-    assert_eq!(position.next(), Some(pos));
+    assert_eq!(position.try_read(), Some(pos));
 
     // Advance simulation time by 1.9s, which with a -10Hz PPS should correspond
     // to 19 position decrements.
@@ -311,7 +308,8 @@ fn main() -> Result<(), nexosim::simulation::SimulationError> {
     t += Duration::new(1, 900_000_000);
     assert_eq!(simu.time(), t);
     pos = (pos + Motor::STEPS_PER_REV - 19) % Motor::STEPS_PER_REV;
-    assert_eq!(position.by_ref().last(), Some(pos));
+    let last_pos = iter::from_fn(|| position.try_read()).last();
+    assert_eq!(last_pos, Some(pos));
 
     Ok(())
 }

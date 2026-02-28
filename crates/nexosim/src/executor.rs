@@ -58,6 +58,7 @@ pub(crate) fn worker_id() -> Option<usize> {
 }
 
 #[cfg(feature = "perf_stats")]
+#[allow(dead_code)]
 pub(crate) fn report_executor_perf_stats() {
     mt_executor::report_perf_stats();
 }
@@ -164,6 +165,11 @@ impl Executor {
         }
     }
 
+    pub(crate) fn is_multi_threaded(&self) -> bool {
+        matches!(self, Self::MtExecutor(_))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn is_quiescent(&self) -> bool {
         match self {
             Self::StExecutor(executor) => executor.is_quiescent(),

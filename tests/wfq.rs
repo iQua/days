@@ -101,7 +101,7 @@ fn test_weighted_fair_queueing() {
     wfq.output.connect(PacketSink::packet_received, &sink_mbox);
 
     let mut sink_statistics = EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     // Initialize simulation
     let t0 = MonotonicTime::EPOCH;
@@ -112,12 +112,12 @@ fn test_weighted_fair_queueing() {
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             // Run simulation for 50 seconds to allow scheduler to stabilize
             let _ = sim.step_until(Duration::from_secs(50));
 
             // Request statistics report
-            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);

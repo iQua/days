@@ -1,17 +1,20 @@
 //! Deadlock-detection for model loops.
 
+use serde::{Deserialize, Serialize};
+
 use nexosim::model::Model;
-use nexosim::ports::{Output, Requestor};
+use nexosim::ports::{EventSource, Output, QuerySource, Requestor};
 use nexosim::simulation::{DeadlockInfo, ExecutionError, Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
 const MT_NUM_THREADS: usize = 4;
 
-#[derive(Default)]
+#[derive(Default, Deserialize, Serialize)]
 struct TestModel {
     output: Output<()>,
     requestor: Requestor<(), ()>,
 }
+#[Model]
 impl TestModel {
     async fn activate_output(&mut self) {
         self.output.send(()).await;
@@ -20,7 +23,6 @@ impl TestModel {
         let _ = self.requestor.send(()).await;
     }
 }
-impl Model for TestModel {}
 
 /// Overflows a mailbox by sending 2 messages in loopback for each incoming
 /// message.
@@ -30,25 +32,22 @@ fn deadlock_on_mailbox_overflow(num_threads: usize) {
 
     let mut model = TestModel::default();
     let mbox = Mailbox::with_capacity(MAILBOX_SIZE);
-    let addr = mbox.address();
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let activate_output = EventSource::new()
+        .connect(TestModel::activate_output, &mbox)
+        .register(&mut bench);
 
     // Make two self-connections so that each outgoing message generates two
     // incoming messages.
-    model
-        .output
-        .connect(TestModel::activate_output, addr.clone());
-    model
-        .output
-        .connect(TestModel::activate_output, addr.clone());
+    model.output.connect(TestModel::activate_output, &mbox);
+    model.output.connect(TestModel::activate_output, &mbox);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, MODEL_NAME)
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut simu = bench.add_model(model, mbox, MODEL_NAME).init(t0).unwrap();
 
-    match simu.process_event(TestModel::activate_output, (), addr) {
+    match simu.process_event(&activate_output, ()) {
         Err(ExecutionError::Deadlock(deadlock_info)) => {
             // We expect only 1 deadlocked model.
             assert_eq!(deadlock_info.len(), 1);
@@ -71,20 +70,21 @@ fn deadlock_on_query_loopback(num_threads: usize) {
 
     let mut model = TestModel::default();
     let mbox = Mailbox::new();
-    let addr = mbox.address();
 
     model
         .requestor
-        .connect(TestModel::activate_requestor, addr.clone());
+        .connect(TestModel::activate_requestor, &mbox);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let query = QuerySource::new()
+        .connect(TestModel::activate_requestor, &mbox)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, MODEL_NAME)
-        .init(t0)
-        .unwrap()
-        .0;
+    let mut simu = bench.add_model(model, mbox, MODEL_NAME).init(t0).unwrap();
 
-    match simu.process_query(TestModel::activate_requestor, (), addr) {
+    match simu.process_query(&query, ()) {
         Err(ExecutionError::Deadlock(deadlock_info)) => {
             // We expect only 1 deadlocked model.
             assert_eq!(deadlock_info.len(), 1);
@@ -110,26 +110,29 @@ fn deadlock_on_transitive_query_loopback(num_threads: usize) {
     let mut model2 = TestModel::default();
     let mbox1 = Mailbox::new();
     let mbox2 = Mailbox::new();
-    let addr1 = mbox1.address();
-    let addr2 = mbox2.address();
 
     model1
         .requestor
-        .connect(TestModel::activate_requestor, addr2);
+        .connect(TestModel::activate_requestor, &mbox2);
 
     model2
         .requestor
-        .connect(TestModel::activate_requestor, addr1.clone());
+        .connect(TestModel::activate_requestor, &mbox1);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let query = QuerySource::new()
+        .connect(TestModel::activate_requestor, &mbox1)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
+    let mut simu = bench
         .add_model(model1, mbox1, MODEL1_NAME)
         .add_model(model2, mbox2, MODEL2_NAME)
         .init(t0)
-        .unwrap()
-        .0;
+        .unwrap();
 
-    match simu.process_query(TestModel::activate_requestor, (), addr1) {
+    match simu.process_query(&query, ()) {
         Err(ExecutionError::Deadlock(deadlock_info)) => {
             // We expect only 1 deadlocked model.
             assert_eq!(deadlock_info.len(), 1);
@@ -158,36 +161,38 @@ fn deadlock_on_multiple_query_loopback(num_threads: usize) {
     let mbox0 = Mailbox::new();
     let mbox1 = Mailbox::new();
     let mbox2 = Mailbox::new();
-    let addr0 = mbox0.address();
-    let addr1 = mbox1.address();
-    let addr2 = mbox2.address();
 
     model0
         .requestor
-        .connect(TestModel::activate_requestor, addr1.clone());
+        .connect(TestModel::activate_requestor, &mbox1);
 
     model0
         .requestor
-        .connect(TestModel::activate_requestor, addr2.clone());
+        .connect(TestModel::activate_requestor, &mbox2);
 
     model1
         .requestor
-        .connect(TestModel::activate_requestor, addr1);
+        .connect(TestModel::activate_requestor, &mbox1);
 
     model2
         .requestor
-        .connect(TestModel::activate_requestor, addr2);
+        .connect(TestModel::activate_requestor, &mbox2);
+
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let query = QuerySource::new()
+        .connect(TestModel::activate_requestor, &mbox0)
+        .register(&mut bench);
 
     let t0 = MonotonicTime::EPOCH;
-    let mut simu = SimInit::with_num_threads(num_threads)
+    let mut simu = bench
         .add_model(model0, mbox0, MODEL0_NAME)
         .add_model(model1, mbox1, MODEL1_NAME)
         .add_model(model2, mbox2, MODEL2_NAME)
         .init(t0)
-        .unwrap()
-        .0;
+        .unwrap();
 
-    match simu.process_query(TestModel::activate_requestor, (), addr0) {
+    match simu.process_query(&query, ()) {
         Err(ExecutionError::Deadlock(deadlock_info)) => {
             // We expect 2 deadlocked models.
             assert_eq!(deadlock_info.len(), 2);

@@ -103,7 +103,7 @@ fn test_virtual_clock_scheduler() {
     vc.output.connect(PacketSink::packet_received, &sink_mbox);
 
     let mut sink_statistics = EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     // Initialize simulation
     let t0 = MonotonicTime::EPOCH;
@@ -114,12 +114,12 @@ fn test_virtual_clock_scheduler() {
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             // Run simulation for 100 seconds to allow scheduler to stabilize
             let _ = sim.step_until(Duration::from_secs(100));
 
             // Request statistics report
-            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
 
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);

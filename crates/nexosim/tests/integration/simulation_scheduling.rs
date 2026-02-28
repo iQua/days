@@ -2,20 +2,31 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
 #[cfg(not(miri))]
 use nexosim::model::Context;
 use nexosim::model::Model;
-use nexosim::ports::{EventQueue, EventQueueReader, Output};
-use nexosim::simulation::{Address, Mailbox, Scheduler, SimInit, Simulation};
+use nexosim::ports::{
+    EventQueueReader, EventSinkReader, EventSource, Output, SinkState, event_queue,
+};
+use nexosim::simulation::{EventId, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 
 const MT_NUM_THREADS: usize = 4;
 
 // Input-to-output pass-through model.
-struct PassThroughModel<T: Clone + Send + 'static> {
+#[derive(Serialize, Deserialize)]
+struct PassThroughModel<T>
+where
+    T: Clone + Send + 'static,
+{
     pub output: Output<T>,
 }
-impl<T: Clone + Send + 'static> PassThroughModel<T> {
+impl<T> PassThroughModel<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
     pub fn new() -> Self {
         Self {
             output: Output::default(),
@@ -25,93 +36,91 @@ impl<T: Clone + Send + 'static> PassThroughModel<T> {
         self.output.send(arg).await;
     }
 }
-impl<T: Clone + Send + 'static> Model for PassThroughModel<T> {}
+impl<T> Model for PassThroughModel<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    type Env = ();
+}
 
 /// A simple bench containing a single pass-through model (input forwarded to
 /// output) running as fast as possible.
-fn passthrough_bench<T: Clone + Send + 'static>(
+fn passthrough_bench<T>(
     num_threads: usize,
     t0: MonotonicTime,
-) -> (
-    Simulation,
-    Scheduler,
-    Address<PassThroughModel<T>>,
-    EventQueueReader<T>,
-) {
+) -> (Simulation, EventId<T>, EventQueueReader<T>)
+where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
     // Bench assembly.
     let mut model = PassThroughModel::new();
     let mbox = Mailbox::new();
 
-    let out_stream = EventQueue::new();
-    model.output.connect_sink(&out_stream);
+    let (sink, out_stream) = event_queue(SinkState::Enabled);
+    model.output.connect_sink(sink);
     let addr = mbox.address();
 
-    let (simu, scheduler) = SimInit::with_num_threads(num_threads)
-        .add_model(model, mbox, "")
-        .init(t0)
-        .unwrap();
+    let mut bench = SimInit::with_num_threads(num_threads);
 
-    (simu, scheduler, addr, out_stream.into_reader())
+    let input = EventSource::new()
+        .connect(PassThroughModel::input, &addr)
+        .register(&mut bench);
+
+    let simu = bench.add_model(model, mbox, "").init(t0).unwrap();
+
+    (simu, input, out_stream)
 }
 
 fn schedule_events(num_threads: usize) {
     let t0 = MonotonicTime::EPOCH;
-    let (mut simu, scheduler, addr, mut output) = passthrough_bench(num_threads, t0);
+    let (mut simu, source, mut output) = passthrough_bench(num_threads, t0);
+    let scheduler = simu.scheduler();
 
     // Queue 2 events at t0+3s and t0+2s, in reverse order.
     scheduler
-        .schedule_event(Duration::from_secs(3), PassThroughModel::input, (), &addr)
+        .schedule_event(Duration::from_secs(3), &source, ())
         .unwrap();
     scheduler
-        .schedule_event(
-            t0 + Duration::from_secs(2),
-            PassThroughModel::input,
-            (),
-            &addr,
-        )
+        .schedule_event(t0 + Duration::from_secs(2), &source, ())
         .unwrap();
 
     // Move to the 1st event at t0+2s.
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-    assert!(output.next().is_some());
+    assert!(output.try_read().is_some());
 
     // Schedule another event in 4s (at t0+6s).
     scheduler
-        .schedule_event(Duration::from_secs(4), PassThroughModel::input, (), &addr)
+        .schedule_event(Duration::from_secs(4), &source, ())
         .unwrap();
 
     // Move to the 2nd event at t0+3s.
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(3));
-    assert!(output.next().is_some());
+    assert!(output.try_read().is_some());
 
     // Move to the 3rd event at t0+6s.
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(6));
-    assert!(output.next().is_some());
-    assert!(output.next().is_none());
+    assert!(output.try_read().is_some());
+    assert!(output.try_read().is_none());
 }
 
 fn schedule_keyed_events(num_threads: usize) {
     let t0 = MonotonicTime::EPOCH;
-    let (mut simu, scheduler, addr, mut output) = passthrough_bench(num_threads, t0);
+    let (mut simu, source, mut output) = passthrough_bench(num_threads, t0);
+    let scheduler = simu.scheduler();
 
     let event_t1 = scheduler
-        .schedule_keyed_event(
-            t0 + Duration::from_secs(1),
-            PassThroughModel::input,
-            1,
-            &addr,
-        )
+        .schedule_keyed_event(t0 + Duration::from_secs(1), &source, 1)
         .unwrap();
 
     let event_t2_1 = scheduler
-        .schedule_keyed_event(Duration::from_secs(2), PassThroughModel::input, 21, &addr)
+        .schedule_keyed_event(Duration::from_secs(2), &source, 21)
         .unwrap();
 
     scheduler
-        .schedule_event(Duration::from_secs(2), PassThroughModel::input, 22, &addr)
+        .schedule_event(Duration::from_secs(2), &source, 22)
         .unwrap();
 
     // Move to the 1st event at t0+1.
@@ -121,38 +130,32 @@ fn schedule_keyed_events(num_threads: usize) {
     // that the cancellation had no effect.
     event_t1.cancel();
     assert_eq!(simu.time(), t0 + Duration::from_secs(1));
-    assert_eq!(output.next(), Some(1));
+    assert_eq!(output.try_read(), Some(1));
 
     // Cancel the second event (t0+2) before it is meant to takes place and
     // check that we move directly to the 3rd event.
     event_t2_1.cancel();
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(2));
-    assert_eq!(output.next(), Some(22));
-    assert!(output.next().is_none());
+    assert_eq!(output.try_read(), Some(22));
+    assert!(output.try_read().is_none());
 }
 
 fn schedule_periodic_events(num_threads: usize) {
     let t0 = MonotonicTime::EPOCH;
-    let (mut simu, scheduler, addr, mut output) = passthrough_bench(num_threads, t0);
+    let (mut simu, source, mut output) = passthrough_bench(num_threads, t0);
+    let scheduler = simu.scheduler();
 
     // Queue 2 periodic events at t0 + 3s + k*2s.
     scheduler
-        .schedule_periodic_event(
-            Duration::from_secs(3),
-            Duration::from_secs(2),
-            PassThroughModel::input,
-            1,
-            &addr,
-        )
+        .schedule_periodic_event(Duration::from_secs(3), Duration::from_secs(2), &source, 1)
         .unwrap();
     scheduler
         .schedule_periodic_event(
             t0 + Duration::from_secs(3),
             Duration::from_secs(2),
-            PassThroughModel::input,
+            &source,
             2,
-            &addr,
         )
         .unwrap();
 
@@ -163,42 +166,36 @@ fn schedule_periodic_events(num_threads: usize) {
             simu.time(),
             t0 + Duration::from_secs(3) + k * Duration::from_secs(2)
         );
-        assert_eq!(output.next(), Some(1));
-        assert_eq!(output.next(), Some(2));
-        assert!(output.next().is_none());
+        assert_eq!(output.try_read(), Some(1));
+        assert_eq!(output.try_read(), Some(2));
+        assert!(output.try_read().is_none());
     }
 }
 
 fn schedule_periodic_keyed_events(num_threads: usize) {
     let t0 = MonotonicTime::EPOCH;
-    let (mut simu, scheduler, addr, mut output) = passthrough_bench(num_threads, t0);
+    let (mut simu, source, mut output) = passthrough_bench(num_threads, t0);
+    let scheduler = simu.scheduler();
 
     // Queue 2 periodic events at t0 + 3s + k*2s.
     scheduler
-        .schedule_periodic_event(
-            Duration::from_secs(3),
-            Duration::from_secs(2),
-            PassThroughModel::input,
-            1,
-            &addr,
-        )
+        .schedule_periodic_event(Duration::from_secs(3), Duration::from_secs(2), &source, 1)
         .unwrap();
     let event2_key = scheduler
         .schedule_keyed_periodic_event(
             t0 + Duration::from_secs(3),
             Duration::from_secs(2),
-            PassThroughModel::input,
+            &source,
             2,
-            &addr,
         )
         .unwrap();
 
     // Move to the next event at t0+3s.
     simu.step().unwrap();
     assert_eq!(simu.time(), t0 + Duration::from_secs(3));
-    assert_eq!(output.next(), Some(1));
-    assert_eq!(output.next(), Some(2));
-    assert!(output.next().is_none());
+    assert_eq!(output.try_read(), Some(1));
+    assert_eq!(output.try_read(), Some(2));
+    assert!(output.try_read().is_none());
 
     // Cancel the second event.
     event2_key.cancel();
@@ -210,8 +207,8 @@ fn schedule_periodic_keyed_events(num_threads: usize) {
             simu.time(),
             t0 + Duration::from_secs(3) + k * Duration::from_secs(2)
         );
-        assert_eq!(output.next(), Some(1));
-        assert!(output.next().is_none());
+        assert_eq!(output.try_read(), Some(1));
+        assert!(output.try_read().is_none());
     }
 }
 
@@ -263,7 +260,7 @@ use nexosim::time::{AutoSystemClock, Clock, SystemClock};
 
 // Model that outputs timestamps at init and each time its input is triggered.
 #[cfg(not(miri))]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct TimestampModel {
     pub stamp: Output<(Instant, SystemTime)>,
 }
@@ -275,7 +272,13 @@ impl TimestampModel {
 }
 #[cfg(not(miri))]
 impl Model for TimestampModel {
-    async fn init(mut self, _: &mut Context<Self>) -> nexosim::model::InitializedModel<Self> {
+    type Env = ();
+
+    async fn init(
+        mut self,
+        _: &Context<Self>,
+        _: &mut (),
+    ) -> nexosim::model::InitializedModel<Self> {
         self.stamp.send((Instant::now(), SystemTime::now())).await;
         self.into()
     }
@@ -289,25 +292,30 @@ fn timestamp_bench(
     clock: impl Clock + 'static,
 ) -> (
     Simulation,
-    Scheduler,
-    Address<TimestampModel>,
+    EventId<()>,
     EventQueueReader<(Instant, SystemTime)>,
 ) {
     // Bench assembly.
     let mut model = TimestampModel::default();
     let mbox = Mailbox::new();
 
-    let stamp_stream = EventQueue::new();
-    model.stamp.connect_sink(&stamp_stream);
+    let (sink, stamp_stream) = event_queue(SinkState::Enabled);
+    model.stamp.connect_sink(sink);
     let addr = mbox.address();
 
-    let (simu, scheduler) = SimInit::with_num_threads(num_threads)
+    let mut bench = SimInit::with_num_threads(num_threads);
+
+    let trigger = EventSource::new()
+        .connect(TimestampModel::trigger, &addr)
+        .register(&mut bench);
+
+    let simu = bench
         .add_model(model, mbox, "")
-        .set_clock(clock)
+        .with_tickless_clock(clock)
         .init(t0)
         .unwrap();
 
-    (simu, scheduler, addr, stamp_stream.into_reader())
+    (simu, trigger, stamp_stream)
 }
 
 #[cfg(not(miri))]
@@ -333,16 +341,11 @@ fn system_clock_from_instant(num_threads: usize) {
 
         let clock = SystemClock::from_instant(simulation_ref, wall_clock_ref);
 
-        let (mut simu, scheduler, addr, mut stamp) = timestamp_bench(num_threads, t0, clock);
+        let (mut simu, source, mut stamp) = timestamp_bench(num_threads, t0, clock);
 
         // Queue a single event at t0 + 0.1s.
-        scheduler
-            .schedule_event(
-                Duration::from_secs_f64(0.1),
-                TimestampModel::trigger,
-                (),
-                &addr,
-            )
+        simu.scheduler()
+            .schedule_event(Duration::from_secs_f64(0.1), &source, ())
             .unwrap();
 
         // Check the stamps.
@@ -350,7 +353,7 @@ fn system_clock_from_instant(num_threads: usize) {
             simulation_ref_offset + wall_clock_offset,
             simulation_ref_offset + wall_clock_offset + 0.1,
         ] {
-            let measured_time = (stamp.next().unwrap().0 - wall_clock_init).as_secs_f64();
+            let measured_time = (stamp.try_read().unwrap().0 - wall_clock_init).as_secs_f64();
             assert!(
                 (expected_time - measured_time).abs() <= TOLERANCE,
                 "Expected t = {expected_time:.6}s +/- {TOLERANCE:.6}s, measured t = {measured_time:.6}s",
@@ -384,16 +387,11 @@ fn system_clock_from_system_time(num_threads: usize) {
 
         let clock = SystemClock::from_system_time(simulation_ref, wall_clock_ref);
 
-        let (mut simu, scheduler, addr, mut stamp) = timestamp_bench(num_threads, t0, clock);
+        let (mut simu, source, mut stamp) = timestamp_bench(num_threads, t0, clock);
 
         // Queue a single event at t0 + 0.1s.
-        scheduler
-            .schedule_event(
-                Duration::from_secs_f64(0.1),
-                TimestampModel::trigger,
-                (),
-                &addr,
-            )
+        simu.scheduler()
+            .schedule_event(Duration::from_secs_f64(0.1), &source, ())
             .unwrap();
 
         // Check the stamps.
@@ -402,7 +400,7 @@ fn system_clock_from_system_time(num_threads: usize) {
             simulation_ref_offset + wall_clock_offset + 0.1,
         ] {
             let measured_time = stamp
-                .next()
+                .try_read()
                 .unwrap()
                 .1
                 .duration_since(wall_clock_init)
@@ -423,34 +421,28 @@ fn auto_system_clock(num_threads: usize) {
     let t0 = MonotonicTime::EPOCH;
     const TOLERANCE: f64 = 0.005; // [s]
 
-    let (mut simu, scheduler, addr, mut stamp) =
-        timestamp_bench(num_threads, t0, AutoSystemClock::new());
+    let (mut simu, source, mut stamp) = timestamp_bench(num_threads, t0, AutoSystemClock::new());
     let instant_t0 = Instant::now();
+    let scheduler = simu.scheduler();
 
     // Queue a periodic event at t0 + 0.2s + k*0.2s.
     scheduler
         .schedule_periodic_event(
             Duration::from_secs_f64(0.2),
             Duration::from_secs_f64(0.2),
-            TimestampModel::trigger,
+            &source,
             (),
-            &addr,
         )
         .unwrap();
 
     // Queue a single event at t0 + 0.3s.
     scheduler
-        .schedule_event(
-            Duration::from_secs_f64(0.3),
-            TimestampModel::trigger,
-            (),
-            &addr,
-        )
+        .schedule_event(Duration::from_secs_f64(0.3), &source, ())
         .unwrap();
 
     // Check the stamps.
     for expected_time in [0.0, 0.2, 0.3, 0.4, 0.6] {
-        let measured_time = (stamp.next().unwrap().0 - instant_t0).as_secs_f64();
+        let measured_time = (stamp.try_read().unwrap().0 - instant_t0).as_secs_f64();
         assert!(
             (expected_time - measured_time).abs() <= TOLERANCE,
             "Expected t = {expected_time:.6}s +/- {TOLERANCE:.6}s, measured t = {measured_time:.6}s",

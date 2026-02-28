@@ -27,7 +27,7 @@ where
     S: Fn(Runnable, T) + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
 {
-    let this = &*(ptr as *const Task<F, S, T>);
+    let this = unsafe { &*(ptr as *const Task<F, S, T>) };
 
     // Set the `CLOSED` flag if the task is in the `Completed` phase.
     //
@@ -56,7 +56,9 @@ where
         };
     }
 
-    let output = this.core.with_mut(|c| ManuallyDrop::take(&mut (*c).output));
+    let output = this
+        .core
+        .with_mut(|c| unsafe { ManuallyDrop::take(&mut (*c).output) });
 
     Stage::Ready(output)
 }
@@ -69,7 +71,7 @@ where
     S: Fn(Runnable, T) + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
 {
-    let this = &*(ptr as *const Task<F, S, T>);
+    let this = unsafe { &*(ptr as *const Task<F, S, T>) };
 
     // Decrement the reference count.
     //
@@ -92,13 +94,14 @@ where
         // Set a drop guard to ensure that the task is deallocated whether
         // or not the `core` member panics when dropped.
         let _drop_guard = RunOnDrop::new(|| {
-            dealloc(ptr as *mut u8, Layout::new::<Task<F, S, T>>());
+            unsafe { dealloc(ptr as *mut u8, Layout::new::<Task<F, S, T>>()) };
         });
-
-        if state & POLLING == POLLING {
-            this.core.with_mut(|c| ManuallyDrop::drop(&mut (*c).future));
-        } else if state & CLOSED == 0 {
-            this.core.with_mut(|c| ManuallyDrop::drop(&mut (*c).output));
+        unsafe {
+            if state & POLLING == POLLING {
+                this.core.with_mut(|c| ManuallyDrop::drop(&mut (*c).future));
+            } else if state & CLOSED == 0 {
+                this.core.with_mut(|c| ManuallyDrop::drop(&mut (*c).output));
+            }
         }
         // Else the `CLOSED` flag is set but the `POLLING` flag is cleared
         // so the future was already dropped.
@@ -117,7 +120,8 @@ pub(crate) enum Stage<T> {
 }
 
 impl<U> Stage<U> {
-    /// Maps a `Stage<U>` to `Stage<V>` by applying a function to a contained value.
+    /// Maps a `Stage<U>` to `Stage<V>` by applying a function to a contained
+    /// value.
     #[allow(unused)]
     pub(crate) fn map<V, F>(self, f: F) -> Stage<V>
     where

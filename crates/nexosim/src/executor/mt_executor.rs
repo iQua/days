@@ -100,6 +100,7 @@ fn add_duration_ns(counter: &AtomicU64, duration: Duration) {
 }
 
 #[cfg(feature = "perf_stats")]
+#[allow(dead_code)]
 pub(super) fn report_perf_stats() {
     eprintln!(
         "[perf_stats] main_wait_parks={} main_wait_park_time_ns={} worker_parks={} worker_linger_hits={} worker_linger_success={} worker_linger_timeout={}",
@@ -380,6 +381,7 @@ impl Executor {
             .store(clamped, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_quiescent(&self) -> bool {
         self.context.pool_manager.pool_is_idle()
     }

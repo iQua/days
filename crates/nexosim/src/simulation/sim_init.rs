@@ -1,33 +1,57 @@
-use std::fmt;
-use std::sync::atomic::AtomicBool;
+use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{fmt, mem};
+
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::channel::ChannelObserver;
+use crate::endpoints::{
+    Endpoints, EventSinkInfoRegistry, EventSinkRegistry, EventSourceRegistry, QuerySourceRegistry,
+};
 use crate::executor::{Executor, SimulationContext};
-use crate::model::ProtoModel;
-use crate::time::{AtomicTime, Clock, MonotonicTime, NoClock, TearableAtomicTime};
-use crate::util::priority_queue::PriorityQueue;
+use crate::model::{Message, ProtoModel, RegisteredModel};
+use crate::path::Path;
+use crate::ports::{EventSinkReader, EventSource, QuerySource};
+use crate::simulation::InjectorQueue;
+use crate::simulation::injector::Injector;
+use crate::time::{
+    AtomicTime, Clock, ClockReader, MonotonicTime, NoClock, SyncStatus, TearableAtomicTime, Ticker,
+};
 use crate::util::sync_cell::SyncCell;
 
 use super::{
-    ExecutionError, GlobalScheduler, Mailbox, Scheduler, SchedulerState, Signal, Simulation,
-    add_model,
+    EventId, ExecutionError, GlobalScheduler, Mailbox, QueryId, SchedulerQueue, SchedulerRegistry,
+    SchedulerState, Signal, Simulation, SimulationError, add_model,
 };
+
+type PostCallback = dyn FnOnce(&mut Simulation) -> Result<(), SimulationError> + Send + 'static;
 
 /// Builder for a multi-threaded, discrete-event simulation.
 pub struct SimInit {
     executor: Executor,
     scheduler_state: Arc<SchedulerState>,
+    scheduler_registry: SchedulerRegistry,
+    injector_queue: Arc<Mutex<InjectorQueue>>,
+    injector_nonempty_hint: Arc<AtomicBool>,
+    event_sink_registry: EventSinkRegistry,
+    event_sink_info_registry: EventSinkInfoRegistry,
+    event_source_registry: EventSourceRegistry,
+    query_source_registry: QuerySourceRegistry,
     time: AtomicTime,
     is_halted: Arc<AtomicBool>,
-    clock: Box<dyn Clock + 'static>,
+    is_resumed: Arc<AtomicBool>,
+    clock: Box<dyn Clock>,
     clock_tolerance: Option<Duration>,
+    ticker: Option<Box<dyn Ticker>>,
     timeout: Duration,
     max_groups_per_step_task: usize,
-    observers: Vec<(String, Box<dyn ChannelObserver>)>,
+    observers: Vec<(Path, Box<dyn ChannelObserver>)>,
     abort_signal: Signal,
-    model_names: Vec<String>,
+    registered_models: Vec<RegisteredModel>,
+    post_init_callback: Option<Box<PostCallback>>,
+    post_restore_callback: Option<Box<PostCallback>>,
 }
 
 impl SimInit {
@@ -35,6 +59,14 @@ impl SimInit {
     /// available logical threads.
     pub fn new() -> Self {
         Self::with_num_threads(num_cpus::get())
+    }
+
+    /// Returns an injector handle.
+    pub fn injector(&self) -> Injector {
+        Injector::new(
+            self.injector_queue.clone(),
+            self.injector_nonempty_hint.clone(),
+        )
     }
 
     /// Creates a builder for a simulation running on the specified number of
@@ -61,8 +93,7 @@ impl SimInit {
         } else {
             Executor::new_multi_threaded(num_threads, simulation_context, abort_signal.clone())
         };
-
-        let scheduler_queue = Arc::new(Mutex::new(PriorityQueue::new()));
+        let scheduler_queue = Arc::new(Mutex::new(SchedulerQueue::new()));
         let scheduler_state = Arc::new(SchedulerState::new(
             scheduler_queue,
             executor.executor_id(),
@@ -72,84 +103,94 @@ impl SimInit {
         Self {
             executor,
             scheduler_state,
+            scheduler_registry: SchedulerRegistry::default(),
+            injector_queue: Arc::new(Mutex::new(InjectorQueue::new())),
+            injector_nonempty_hint: Arc::new(AtomicBool::new(false)),
+            event_sink_registry: EventSinkRegistry::default(),
+            event_sink_info_registry: EventSinkInfoRegistry::default(),
+            event_source_registry: EventSourceRegistry::default(),
+            query_source_registry: QuerySourceRegistry::default(),
             time,
             is_halted: Arc::new(AtomicBool::new(false)),
+            is_resumed: Arc::new(AtomicBool::new(false)),
             clock: Box::new(NoClock::new()),
             clock_tolerance: None,
+            ticker: None,
             timeout: Duration::ZERO,
             max_groups_per_step_task: 1,
             observers: Vec::new(),
             abort_signal,
-            model_names: Vec::new(),
+            registered_models: Vec::new(),
+            post_init_callback: None,
+            post_restore_callback: None,
         }
     }
 
-    /// Sets the simulation time quantization quantum in nanoseconds.
+    /// Compatibility shim retained for Days' forked API surface.
     ///
-    /// A value of 0 disables quantization.
-    pub fn set_time_quantum_ns(self, quantum_ns: u64) -> Self {
-        self.scheduler_state.set_time_quantum_ns(quantum_ns);
-        self
-    }
-
-    /// Sets the number of hot standby workers.
+    /// In this Nexosim fork, hot-worker tuning is forwarded to the executor.
     pub fn set_hot_worker_count(mut self, hot_worker_count: usize) -> Self {
         self.executor.set_hot_worker_count(hot_worker_count);
         self
     }
 
-    /// Sets the maximum number of action groups bundled into a single executor
-    /// task per step.
+    /// Compatibility shim retained for Days' forked API surface.
     ///
-    /// A value of 1 preserves the default behavior (one task per group).
+    /// Sets the maximum number of origin groups bundled into a single executor
+    /// task per step.
     pub fn set_max_groups_per_step_task(mut self, max_groups: usize) -> Self {
         self.max_groups_per_step_task = max_groups.max(1);
         self
     }
 
-    /// Adds a model and its mailbox to the simulation bench.
+    /// Compatibility shim retained for Days' forked API surface.
     ///
-    /// The `name` argument needs not be unique. The use of the dot character in
-    /// the name is possible but discouraged as it can cause confusion with the
-    /// fully qualified name of a submodel. If an empty string is provided, it
-    /// is replaced by the string `<unknown>`.
-    pub fn add_model<P: ProtoModel>(
-        mut self,
-        model: P,
-        mailbox: Mailbox<P::Model>,
-        name: impl Into<String>,
-    ) -> Self {
-        let mut name = name.into();
-        if name.is_empty() {
-            name = String::from("<unknown>");
-        };
-        self.observers
-            .push((name.clone(), Box::new(mailbox.0.observer())));
-        let scheduler = GlobalScheduler::new(
-            self.scheduler_state.clone(),
-            self.time.reader(),
-            self.is_halted.clone(),
-        );
+    /// Sets scheduler time quantization in nanoseconds.
+    pub fn set_time_quantum_ns(self, quantum_ns: u64) -> Self {
+        self.scheduler_state.set_time_quantum_ns(quantum_ns);
+        self
+    }
 
-        add_model(
-            model,
-            mailbox,
-            name,
-            scheduler,
-            &self.executor,
-            &self.abort_signal,
-            &mut self.model_names,
-        );
+    /// Configures the simulation to run with the provided
+    /// [`Clock`] and [`Ticker`].
+    ///
+    /// A [`Ticker`] forces the synchronization clock to wake up at regular
+    /// intervals, independent of the events in the scheduler. This improves
+    /// responsiveness towards the processing of injected events and
+    /// [`Scheduler::halt`](crate::simulation::Scheduler::halt) requests.
+    ///
+    /// A [`Ticker`] also relaxes the constraints on concurrent event
+    /// scheduling. In tickless mode, calls to [`Simulation::step`],
+    /// [`Simulation::step_until`] and [`Simulation::run`] cause the simulation
+    /// to block until the clock reaches the target time, prohibiting the
+    /// concurrent scheduling of events within the current idle window. With a
+    /// [`Ticker`], this window is reduced to at most the interval between
+    /// ticks.
+    ///
+    /// Note that when a [`Ticker`] is configured, calls to [`Simulation::run`]
+    /// will wait for new injected events and will not return until
+    /// [`Scheduler::halt`](crate::simulation::Scheduler::halt) is called.
+    pub fn with_clock(mut self, clock: impl Clock, ticker: impl Ticker) -> Self {
+        self.clock = Box::new(clock);
+        self.ticker = Some(Box::new(ticker));
 
         self
     }
 
-    /// Synchronizes the simulation with the provided [`Clock`].
+    /// Configures the simulation to run in tickless mode with the provided
+    /// [`Clock`].
     ///
-    /// If the clock isn't explicitly set then the default [`NoClock`] is used,
-    /// resulting in the simulation running as fast as possible.
-    pub fn set_clock(mut self, clock: impl Clock + 'static) -> Self {
+    /// Note that in tickless mode, the simulation always sleep until the
+    /// deadline of the next event in the scheduler queue, which may render the
+    /// simulation unresponsive and prohibits events scheduling within the
+    /// current idle window.
+    ///
+    /// Tickless mode is only recommended when the simulation runs as fast as
+    /// possible, for instance with the default [`NoClock`] clock. In other
+    /// cases, [`SimInit::with_clock`] is usually the right choice.
+    pub fn with_tickless_clock(mut self, clock: impl Clock) -> Self {
         self.clock = Box::new(clock);
+        self.ticker = None;
 
         self
     }
@@ -159,7 +200,7 @@ impl SimInit {
     /// When a clock synchronization tolerance is set, then any report of
     /// synchronization loss by [`Clock::synchronize`] that exceeds the
     /// specified tolerance will trigger an [`ExecutionError::OutOfSync`] error.
-    pub fn set_clock_tolerance(mut self, tolerance: Duration) -> Self {
+    pub fn with_clock_tolerance(mut self, tolerance: Duration) -> Self {
         self.clock_tolerance = Some(tolerance);
 
         self
@@ -174,50 +215,323 @@ impl SimInit {
     ///
     /// A null duration disables the timeout, which is the default behavior.
     ///
-    /// See also [`Simulation::set_timeout`].
+    /// See also [`Simulation::with_timeout`].
     #[cfg(not(target_family = "wasm"))]
-    pub fn set_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
 
         self
+    }
+
+    /// Registers a callback function executed right after the simulation is
+    /// initialized and before it starts.
+    ///
+    /// Initial event scheduling or input processing is possible at this stage.
+    pub fn with_post_init(
+        mut self,
+        callback: impl FnOnce(&mut Simulation) -> Result<(), SimulationError> + Send + 'static,
+    ) -> Self {
+        self.post_init_callback = Some(Box::new(callback));
+        self
+    }
+
+    /// Registers a callback function executed right after the simulation is
+    /// restored from a persisted state and before it resumes.
+    ///
+    /// If necessary, real-time clock resynchronization can be performed at this
+    /// stage. Otherwise simulation actions such as event scheduling or querying
+    /// are also possible.
+    pub fn with_post_restore(
+        mut self,
+        callback: impl FnOnce(&mut Simulation) -> Result<(), SimulationError> + Send + 'static,
+    ) -> Self {
+        self.post_restore_callback = Some(Box::new(callback));
+        self
+    }
+
+    /// Converts an event source to an [`EventId`] that can later be used to
+    /// schedule and process events within the simulation instance being built.
+    pub(crate) fn link_event_source<T>(&mut self, source: EventSource<T>) -> EventId<T>
+    where
+        T: Serialize + DeserializeOwned + Clone + Send + 'static,
+    {
+        self.scheduler_registry.add_event_source(source)
+    }
+
+    /// Converts a query source to a [`QueryId`] that can later be used to
+    /// schedule events within the simulation instance being built.
+    pub(crate) fn link_query_source<T, R>(&mut self, source: QuerySource<T, R>) -> QueryId<T, R>
+    where
+        T: Serialize + DeserializeOwned + Clone + Send + 'static,
+        R: Send + 'static,
+    {
+        self.scheduler_registry.add_query_source(source)
+    }
+
+    /// Returns a simulation clock reader.
+    ///
+    /// Note that the time returned by the clock reader is meaningless before
+    /// the simulation starts.
+    pub fn clock_reader(&self) -> ClockReader {
+        ClockReader::from_atomic_time_reader(&self.time.reader())
+    }
+
+    /// Adds a model and its mailbox to the simulation bench.
+    ///
+    /// The `name` argument defines the [`Path`] to this top-level model and the
+    /// root path of its submodels. Because model paths are used for logging and
+    /// error reports, the use of unique names is recommended.
+    pub fn add_model<P>(mut self, model: P, mailbox: Mailbox<P::Model>, name: &str) -> Self
+    where
+        P: ProtoModel,
+    {
+        let path: Path = name.into();
+        self.observers
+            .push((path.clone(), Box::new(mailbox.0.observer())));
+        let scheduler = GlobalScheduler::new(
+            self.scheduler_state.clone(),
+            self.time.reader(),
+            self.is_halted.clone(),
+        );
+
+        add_model(
+            model,
+            mailbox,
+            path,
+            scheduler,
+            &mut self.scheduler_registry,
+            &self.injector_queue,
+            &self.injector_nonempty_hint,
+            &self.executor,
+            &self.abort_signal,
+            &mut self.registered_models,
+            self.is_resumed.clone(),
+        );
+
+        self
+    }
+
+    /// Adds an event sink to the endpoint registry under the provided path.
+    ///
+    /// Note that this method is exclusively meant for the implementation of
+    /// custom event sinks. Dedicated sink builder functions such as
+    /// [event_queue_endpoint](crate::ports::event_queue_endpoint) should be
+    /// preferred in all other cases.
+    ///
+    /// An error is returned if the path is already used by another event sink.
+    /// The error is convertible to an [`BenchError`].
+    pub fn bind_event_sink<S, T>(
+        &mut self,
+        sink: S,
+        path: impl Into<Path>,
+    ) -> Result<(), DuplicateEventSinkError>
+    where
+        S: EventSinkReader<T> + Send + Sync + 'static,
+        T: Message + Serialize + 'static,
+    {
+        let path = path.into();
+
+        self.event_sink_info_registry
+            .register::<T>(path.clone())
+            .map_err(|path| DuplicateEventSinkError { path })?;
+
+        self.event_sink_registry
+            .add(sink, path)
+            .map_err(|(path, _)| DuplicateEventSinkError { path })
+    }
+
+    /// Adds an event sink to the endpoint registry under the provided path,
+    /// without requiring a [`Message`] implementation for its item type.
+    ///
+    /// Note that this method is exclusively meant for the implementation of
+    /// custom event sinks. Dedicated sink builder functions such as
+    /// [event_queue_endpoint](crate::ports::event_queue_endpoint) should be
+    /// preferred in all other cases.
+    ///
+    /// An error is returned if the path is already used by another event sink.
+    /// The error is convertible to an [`BenchError`].
+    pub fn bind_event_sink_raw<S, T>(
+        &mut self,
+        sink: S,
+        path: impl Into<Path>,
+    ) -> Result<(), DuplicateEventSinkError>
+    where
+        S: EventSinkReader<T> + Send + Sync + 'static,
+        T: Serialize + 'static,
+    {
+        let path = path.into();
+
+        self.event_sink_info_registry
+            .register_raw(path.clone())
+            .map_err(|path| DuplicateEventSinkError { path })?;
+
+        self.event_sink_registry
+            .add(sink, path)
+            .map_err(|(path, _)| DuplicateEventSinkError { path })
     }
 
     /// Builds a simulation initialized at the specified simulation time,
     /// executing the [`Model::init`](crate::model::Model::init) method on all
     /// model initializers.
     ///
-    /// The simulation object and its associated scheduler are returned upon
-    /// success.
-    pub fn init(
-        self,
-        start_time: MonotonicTime,
-    ) -> Result<(Simulation, Scheduler), ExecutionError> {
+    /// The simulation object is returned upon success.
+    pub fn init(mut self, start_time: MonotonicTime) -> Result<Simulation, SimulationError> {
         self.scheduler_state
-            .init_origin_seqs(self.model_names.len().checked_add(1).unwrap());
-
+            .init_origin_seqs(self.registered_models.len());
         self.time.write(start_time);
+        if let SyncStatus::OutOfSync(lag) = self.clock.synchronize(start_time)
+            && let Some(tolerance) = &self.clock_tolerance
+            && &lag > tolerance
+        {
+            return Err(ExecutionError::OutOfSync(lag).into());
+        }
 
-        let scheduler = Scheduler::new(
-            self.scheduler_state.clone(),
-            self.time.reader(),
-            self.is_halted.clone(),
-        );
-        let mut simulation = Simulation::new(
+        let callback = self.post_init_callback.take();
+        let mut simulation = self.build();
+        if let Some(callback) = callback {
+            callback(&mut simulation)?;
+        }
+        simulation.run_executor()?;
+
+        Ok(simulation)
+    }
+
+    /// Restores a simulation from a previously persisted state.
+    ///
+    /// The simulation object is returned upon success.
+    pub fn restore<R: std::io::Read>(mut self, state: R) -> Result<Simulation, SimulationError> {
+        self.is_resumed.store(true, Ordering::Relaxed);
+        self.scheduler_state
+            .init_origin_seqs(self.registered_models.len());
+
+        let callback = self.post_restore_callback.take();
+
+        let mut simulation = self.build();
+
+        let restored_time = simulation.restore(state)?;
+
+        simulation.time.write(restored_time);
+        if let SyncStatus::OutOfSync(lag) = simulation.clock.synchronize(simulation.time())
+            && let Some(tolerance) = &simulation.clock_tolerance
+            && &lag > tolerance
+        {
+            return Err(ExecutionError::OutOfSync(lag).into());
+        }
+
+        if let Some(callback) = callback {
+            callback(&mut simulation)?;
+        }
+
+        Ok(simulation)
+    }
+
+    /// Adds an event source to the endpoint registry under the provided path.
+    ///
+    /// If the path is already used by another event source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`].
+    pub(crate) fn bind_event_source<T>(
+        &mut self,
+        source: EventSource<T>,
+        path: Path,
+    ) -> Result<(), DuplicateEventSourceError<T>>
+    where
+        T: Message + Serialize + DeserializeOwned + Clone + Send + 'static,
+    {
+        self.event_source_registry
+            .add(source, path, &mut self.scheduler_registry)
+            .map_err(|(path, source)| DuplicateEventSourceError { path, source })
+    }
+
+    /// Adds an event source to the endpoint registry under the provided path,
+    /// without requiring a [`Message`] implementation for its item type.
+    ///
+    /// If the path is already used by another event source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`].
+    pub(crate) fn bind_event_source_raw<T>(
+        &mut self,
+        source: EventSource<T>,
+        path: Path,
+    ) -> Result<(), DuplicateEventSourceError<T>>
+    where
+        T: Serialize + DeserializeOwned + Clone + Send + 'static,
+    {
+        self.event_source_registry
+            .add_raw(source, path, &mut self.scheduler_registry)
+            .map_err(|(path, source)| DuplicateEventSourceError { path, source })
+    }
+
+    /// Adds a query source to the endpoint registry under the provided path.
+    ///
+    /// If the path is already used by another query source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`].
+    pub(crate) fn bind_query_source<T, R>(
+        &mut self,
+        source: QuerySource<T, R>,
+        path: Path,
+    ) -> Result<(), DuplicateQuerySourceError<QuerySource<T, R>>>
+    where
+        T: Message + Serialize + DeserializeOwned + Clone + Send + 'static,
+        R: Message + Serialize + Send + 'static,
+    {
+        self.query_source_registry
+            .add(source, path, &mut self.scheduler_registry)
+            .map_err(|(path, source)| DuplicateQuerySourceError { path, source })
+    }
+
+    /// Adds a query source to the endpoint registry under the provided path,
+    /// without requiring [`Message`] implementations for its query and response
+    /// types.
+    ///
+    /// If the path is already used by another query source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`].
+    pub(crate) fn bind_query_source_raw<T, R>(
+        &mut self,
+        source: QuerySource<T, R>,
+        path: Path,
+    ) -> Result<(), DuplicateQuerySourceError<QuerySource<T, R>>>
+    where
+        T: Serialize + DeserializeOwned + Clone + Send + 'static,
+        R: Serialize + Send + 'static,
+    {
+        self.query_source_registry
+            .add_raw(source, path, &mut self.scheduler_registry)
+            .map_err(|(path, source)| DuplicateQuerySourceError { path, source })
+    }
+
+    /// Take ownership of the current endpoint directory.
+    ///
+    /// This leaves the `SimInit` instance with an empty endpoint directory.
+    pub fn take_endpoints(&mut self) -> Endpoints {
+        Endpoints::new(
+            mem::take(&mut self.event_sink_registry),
+            mem::take(&mut self.event_sink_info_registry),
+            mem::take(&mut self.event_source_registry),
+            mem::take(&mut self.query_source_registry),
+        )
+    }
+
+    /// Builds a [`Simulation`] from this [`SimInit`] instance.
+    fn build(self) -> Simulation {
+        Simulation::new(
             self.executor,
             self.scheduler_state,
+            self.scheduler_registry,
+            self.injector_queue,
+            self.injector_nonempty_hint,
             self.time,
             self.clock,
             self.clock_tolerance,
+            self.ticker,
             self.timeout,
             self.max_groups_per_step_task,
             self.observers,
-            self.model_names,
+            self.registered_models,
             self.is_halted,
-        );
-        simulation.synchronize_clock(start_time)?;
-        simulation.run()?;
-
-        Ok((simulation, scheduler))
+        )
     }
 }
 
@@ -230,5 +544,143 @@ impl Default for SimInit {
 impl fmt::Debug for SimInit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SimInit").finish_non_exhaustive()
+    }
+}
+
+/// An error returned when the construction of a simulation bench fails.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum BenchError {
+    /// An attempt to add an input or event source failed because the provided
+    /// path is already in use by another event source.
+    DuplicateEventSource(Path),
+    /// An attempt to add a query source failed because the provided path is
+    /// already in use by another query source.
+    DuplicateQuerySource(Path),
+    /// An attempt to add an event sink failed because the provided path is
+    /// already in use by another event sink.
+    DuplicateEventSink(Path),
+}
+
+impl fmt::Display for BenchError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateEventSource(path) => write!(
+                fmt,
+                "cannot add input or event source under `{path}`: this path is already in use by another event source",
+            ),
+            Self::DuplicateQuerySource(path) => write!(
+                fmt,
+                "cannot add query source under `{path}`: this path is already in use by another query source",
+            ),
+            Self::DuplicateEventSink(path) => write!(
+                fmt,
+                "cannot add event sink under `{path}`: this path is already in use by another event sink",
+            ),
+        }
+    }
+}
+impl Error for BenchError {}
+
+/// An error returned when attempting to bind an event source to an existing
+/// path.
+pub struct DuplicateEventSourceError<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    /// Path to the event source.
+    pub path: Path,
+    /// The event source.
+    pub source: EventSource<T>,
+}
+impl<T> fmt::Display for DuplicateEventSourceError<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            fmt,
+            "cannot add event source under `{}`: this path is already in use by another event source",
+            self.path
+        )
+    }
+}
+impl<T> fmt::Debug for DuplicateEventSourceError<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DuplicateEventSource")
+            .field("path", &self.path)
+            .field("source", &"<EventSource<T>>")
+            .finish()
+    }
+}
+impl<T> Error for DuplicateEventSourceError<T> where
+    T: Serialize + DeserializeOwned + Clone + Send + 'static
+{
+}
+
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static> From<DuplicateEventSourceError<T>>
+    for BenchError
+{
+    fn from(e: DuplicateEventSourceError<T>) -> Self {
+        Self::DuplicateEventSource(e.path)
+    }
+}
+
+/// An error returned when attempting to bind a query source to an existing
+/// path.
+pub struct DuplicateQuerySourceError<S> {
+    /// Path to the query source.
+    pub path: Path,
+    /// The query source.
+    pub source: S,
+}
+impl<S> fmt::Display for DuplicateQuerySourceError<S> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            fmt,
+            "cannot add query source under `{}`: this path is already in use by another query sink",
+            self.path
+        )
+    }
+}
+impl<S> fmt::Debug for DuplicateQuerySourceError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DuplicateQuerySource")
+            .field("path", &self.path)
+            .field("source", &"<QuerySource<T, R>>")
+            .finish()
+    }
+}
+impl<S> Error for DuplicateQuerySourceError<S> {}
+
+impl<S> From<DuplicateQuerySourceError<S>> for BenchError {
+    fn from(e: DuplicateQuerySourceError<S>) -> Self {
+        Self::DuplicateQuerySource(e.path)
+    }
+}
+
+/// An error returned when attempting to bind an event sink to an existing path.
+#[derive(Debug)]
+pub struct DuplicateEventSinkError {
+    /// Path to the event sink.
+    pub path: Path,
+}
+impl fmt::Display for DuplicateEventSinkError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            fmt,
+            "cannot add event sink under `{}`: this path is already in use by another event sink",
+            self.path
+        )
+    }
+}
+impl Error for DuplicateEventSinkError {}
+
+impl From<DuplicateEventSinkError> for BenchError {
+    fn from(e: DuplicateEventSinkError) -> Self {
+        Self::DuplicateEventSink(e.path)
     }
 }

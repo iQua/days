@@ -14,7 +14,9 @@ use super::NEXT_EXECUTOR_ID;
 use super::task::{self, CancelToken, Promise, Runnable};
 
 use crate::channel;
-use crate::executor::{ExecutorError, SIMULATION_CONTEXT, Signal, SimulationContext};
+use crate::executor::{
+    EXECUTOR_ID, ExecutorError, SIMULATION_CONTEXT, Signal, SimulationContext, WORKER_ID,
+};
 use crate::macros::scoped_thread_local::scoped_thread_local;
 use crate::simulation::CURRENT_MODEL_ID;
 
@@ -117,6 +119,7 @@ impl Executor {
     }
 
     /// Spawns many tasks, amortizing external call overhead.
+    #[allow(dead_code)]
     pub(crate) fn spawn_and_forget_batch<I, T>(&self, futures: I)
     where
         I: IntoIterator<Item = T>,
@@ -161,10 +164,12 @@ impl Executor {
         res
     }
 
+    #[allow(dead_code)]
     pub(super) fn executor_id(&self) -> usize {
         self.inner.as_ref().unwrap().context.executor_id
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_quiescent(&self) -> bool {
         true
     }
@@ -184,26 +189,33 @@ struct ExecutorInner {
 
 impl ExecutorInner {
     fn run(&mut self) -> Result<(), ExecutorError> {
-        // In case this executor is nested in another one, reset the counter of in-flight messages.
+        // In case this executor is nested in another one, reset the counter of
+        // in-flight messages.
         let msg_count_stash = channel::THREAD_MSG_COUNT.replace(self.context.msg_count);
+        let worker_id = 0usize;
+        let executor_id = self.context.executor_id;
 
         let result = SIMULATION_CONTEXT.set(&self.simulation_context, || {
-            ACTIVE_TASKS.set(&self.active_tasks, || {
-                EXECUTOR_CONTEXT.set(&self.context, || {
-                    panic::catch_unwind(AssertUnwindSafe(|| {
-                        loop {
-                            let task = match self.context.queue.borrow_mut().pop() {
-                                Some(task) => task,
-                                None => break,
-                            };
+            EXECUTOR_ID.set(&executor_id, || {
+                WORKER_ID.set(&worker_id, || {
+                    ACTIVE_TASKS.set(&self.active_tasks, || {
+                        EXECUTOR_CONTEXT.set(&self.context, || {
+                            panic::catch_unwind(AssertUnwindSafe(|| {
+                                loop {
+                                    let task = match self.context.queue.borrow_mut().pop() {
+                                        Some(task) => task,
+                                        None => break,
+                                    };
 
-                            task.run();
+                                    task.run();
 
-                            if self.abort_signal.is_set() {
-                                return;
-                            }
-                        }
-                    }))
+                                    if self.abort_signal.is_set() {
+                                        return;
+                                    }
+                                }
+                            }))
+                        })
+                    })
                 })
             })
         });

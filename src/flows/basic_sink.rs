@@ -127,4 +127,6 @@ impl BasicPacketSink {
     }
 }
 
-impl Model for BasicPacketSink {}
+impl Model for BasicPacketSink {
+    type Env = ();
+}

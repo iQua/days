@@ -66,7 +66,7 @@ fn test_cnp_generated_on_ce() {
     let mut sink = DcqcnPacketSink::new(0, &traffic);
 
     let mut slot = EventSlot::new();
-    sink.output.connect_sink(&slot);
+    sink.output.connect_sink(slot.writer());
 
     let mut packet = Packet::new(1200, 1, 0, 0.0);
     packet.ecn = EcnField::Ce;

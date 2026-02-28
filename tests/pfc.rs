@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
@@ -20,6 +22,8 @@ struct FrameSource {
 }
 
 impl FrameSource {
+    const SEND_BURST_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(count: usize, size: usize) -> Self {
         Self {
             count,
@@ -28,7 +32,7 @@ impl FrameSource {
         }
     }
 
-    async fn send_burst(&mut self, _: (), cx: &mut Context<Self>) {
+    async fn send_burst(&mut self, _: (), cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         for i in 0..self.count {
             let mut packet = Packet::new(self.size, i, 0, now);
@@ -39,8 +43,17 @@ impl FrameSource {
 }
 
 impl Model for FrameSource {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(Duration::from_secs_f64(1e-9), Self::send_burst, ())
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_burst));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
+        cx.schedule_event(Duration::from_secs_f64(1e-9), &Self::SEND_BURST_SID, ())
             .unwrap();
         self.into()
     }
@@ -56,7 +69,7 @@ impl PfcSink {
         Self { pause, resume }
     }
 
-    async fn frame_received(&mut self, frame: PfcFrame, _: &mut Context<Self>) {
+    async fn frame_received(&mut self, frame: PfcFrame, _: &Context<Self>) {
         let has_pause = frame.pause_quanta.iter().any(|&q| q > 0);
         if has_pause {
             self.pause.fetch_add(1, Ordering::Relaxed);
@@ -66,7 +79,9 @@ impl PfcSink {
     }
 }
 
-impl Model for PfcSink {}
+impl Model for PfcSink {
+    type Env = ();
+}
 
 struct DelayedFrameSource {
     delay: Duration,
@@ -75,6 +90,8 @@ struct DelayedFrameSource {
 }
 
 impl DelayedFrameSource {
+    const SEND_ONCE_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(delay: Duration, size: usize) -> Self {
         Self {
             delay,
@@ -83,7 +100,7 @@ impl DelayedFrameSource {
         }
     }
 
-    async fn send_once(&mut self, _: (), cx: &mut Context<Self>) {
+    async fn send_once(&mut self, _: (), cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         let mut packet = Packet::new(self.size, 0, 0, now);
         packet.set_priority(0);
@@ -92,8 +109,18 @@ impl DelayedFrameSource {
 }
 
 impl Model for DelayedFrameSource {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, Self::send_once, ()).unwrap();
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send_once));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
+        cx.schedule_event(self.delay, &Self::SEND_ONCE_SID, ())
+            .unwrap();
         self.into()
     }
 }
@@ -104,18 +131,30 @@ struct GateToggle {
 }
 
 impl GateToggle {
+    const OPEN_GATE_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
+
     fn new(open: Arc<AtomicBool>, delay: Duration) -> Self {
         Self { open, delay }
     }
 
-    async fn open_gate(&mut self, _: (), _: &mut Context<Self>) {
+    async fn open_gate(&mut self, _: (), _: &Context<Self>) {
         self.open.store(true, Ordering::Relaxed);
     }
 }
 
 impl Model for GateToggle {
-    async fn init(self, cx: &mut Context<Self>) -> InitializedModel<Self> {
-        cx.schedule_event(self.delay, Self::open_gate, ()).unwrap();
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::open_gate));
+        registry
+    }
+
+    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
+        cx.schedule_event(self.delay, &Self::OPEN_GATE_SID, ())
+            .unwrap();
         self.into()
     }
 }
@@ -155,7 +194,7 @@ fn test_pfc_pause_frames_emitted() {
         .connect(PfcSink::frame_received, &sink_mbox);
 
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::new()
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox, "FrameSource")
         .add_model(ingress, ingress_mbox, "PfcIngress")
         .add_model(sink, sink_mbox, "PfcSink")
@@ -218,7 +257,7 @@ fn test_pfc_resume_frames_emitted_after_drain() {
         .connect(PfcSink::frame_received, &sink_mbox);
 
     let t0 = MonotonicTime::EPOCH;
-    let (mut sim, _) = SimInit::new()
+    let mut sim = SimInit::new()
         .add_model(source, source_mbox, "FrameSource")
         .add_model(late_source, late_source_mbox, "LateFrameSource")
         .add_model(ingress, ingress_mbox, "PfcIngress")

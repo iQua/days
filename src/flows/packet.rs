@@ -1,18 +1,18 @@
 //! A very simple struct that represents a packet.
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TCPAck {
     pub sequence_num: usize,
     pub acknowledged_size: usize,
     pub ece: bool,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ControlPacket {
     DcqcnCnp,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EcnField {
     NotEct,
     Ect0,
@@ -26,7 +26,7 @@ impl EcnField {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Packet {
     /// Packets in Days are typically created by packet sources, and run through
     /// a sequence of packet-forwarding switches. It may be entered into a queue

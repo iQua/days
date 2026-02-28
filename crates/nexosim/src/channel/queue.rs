@@ -93,10 +93,8 @@ struct Slot<T: ?Sized> {
 /// `usize` and share the following layout:
 ///
 /// ```text
-///
 /// | <- MSB                                LSB -> |
 /// | Sequence count | flag (1 bit) | Buffer index |
-///
 /// ```
 ///
 /// The purpose of the flag differs depending on the field:
@@ -107,7 +105,6 @@ struct Slot<T: ?Sized> {
 /// - slot stamp: the flag de-facto extends the mantissa of the buffer index,
 ///   which makes it in particular possible to support queues with a capacity of
 ///   1 without special-casing.
-///
 pub(super) struct Queue<T: ?Sized> {
     /// Buffer position of the slot to which the next closure will be written.
     ///
@@ -258,8 +255,8 @@ impl<T: ?Sized> Queue<T> {
 
             // Extract the closure from the slot and set the stamp to the value of
             // the dequeue position increased by one sequence increment.
-            slot.message.with_mut(
-                |msg_box| match mem::replace(&mut *msg_box, MessageBox::None) {
+            slot.message.with_mut(|msg_box| {
+                match mem::replace(unsafe { &mut *msg_box }, MessageBox::None) {
                     MessageBox::Populated(msg) => {
                         let borrow = MessageBorrow {
                             queue: self,
@@ -271,8 +268,8 @@ impl<T: ?Sized> Queue<T> {
                         Ok(borrow)
                     }
                     _ => unreachable!(),
-                },
-            )
+                }
+            })
         } else {
             // Check whether the queue was closed. Even if the closed flag is
             // set and the slot is empty, there might still be a producer that

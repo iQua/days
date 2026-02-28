@@ -7,7 +7,7 @@ use std::time::Duration;
 use log::debug;
 use tracing::instrument;
 
-use nexosim::model::{Context, Model};
+use nexosim::model::{BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId};
 use nexosim::ports::Output;
 #[cfg(feature = "test")]
 use nexosim::time::MonotonicTime;
@@ -30,6 +30,9 @@ pub struct Link {
 }
 
 impl Link {
+    const SEND_SID: SchedulableId<Self, LinkFrame> = SchedulableId::__from_decorated(0);
+    const RUN_SID: SchedulableId<Self, f64> = SchedulableId::__from_decorated(1);
+
     pub fn new(link_id: usize, rate: f64) -> Link {
         Link {
             link_id,
@@ -46,7 +49,7 @@ impl Link {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn frame_received(&mut self, mut frame: LinkFrame, cx: &mut Context<Self>) {
+    pub async fn frame_received(&mut self, mut frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -77,7 +80,7 @@ impl Link {
     pub fn run<'a>(
         &'a mut self,
         now: f64,
-        cx: &'a mut Context<Self>,
+        cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
             #[cfg(feature = "test")]
@@ -107,10 +110,18 @@ impl Link {
 
                 let delay = (departure_time - self.time).max(0.0);
 
-                cx.schedule_event(Duration::from_secs_f64(delay), Self::send, frame.clone())
-                    .unwrap();
-                cx.schedule_event(Duration::from_secs_f64(delay), Self::run, departure_time)
-                    .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(delay),
+                    &Self::SEND_SID,
+                    frame.clone(),
+                )
+                .unwrap();
+                cx.schedule_event(
+                    Duration::from_secs_f64(delay),
+                    &Self::RUN_SID,
+                    departure_time,
+                )
+                .unwrap();
 
                 self.busy_until = departure_time;
 
@@ -126,4 +137,14 @@ impl Link {
     }
 }
 
-impl Model for Link {}
+impl Model for Link {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::send));
+        registry.add(cx.register_schedulable(Self::run));
+        registry
+    }
+}

@@ -116,7 +116,7 @@ fn test_weighted_round_robin() {
 
     // We will capture the sink statistics (List of forwarded packets, etc.)
     let mut sink_statistics = EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     // Initialize simulation starting at time = 0.
     let t0 = MonotonicTime::EPOCH;
@@ -127,13 +127,13 @@ fn test_weighted_round_robin() {
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             // Run the simulation until 50 seconds to allow enough time
             // for both sources to send a good number of packets.
             let _ = sim.step_until(Duration::from_secs(50));
 
             // Request a statistics report from the sink.
-            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
 
             // Retrieve the statistics from the sink, if any were reported.
             if let Some(statistics) = sink_statistics.next() {

@@ -84,10 +84,10 @@ fn main() {
         .add_model(sink, sink_mbox, "Sink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             let _ = sim.step_until(Duration::from_secs(10));
 
-            let _ = sim.process_event(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, 2, &sink_addr);
 
             info!(
                 "Simulation completed at time {:.3}.",

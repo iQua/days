@@ -1,23 +1,19 @@
 //! Simulation server.
 
+use std::error;
 use std::future::Future;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::{Mutex, RwLock};
 
 use serde::de::DeserializeOwned;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::transport::Server;
 
-use crate::registry::EndpointRegistry;
-use crate::simulation::{Simulation, SimulationError};
+use crate::server::services::GrpcSimulationService;
+use crate::simulation::SimInit;
 
-use super::codegen::simulation::*;
-use super::key_registry::KeyRegistry;
-use super::services::InitService;
-use super::services::{ControllerService, MonitorService, SchedulerService};
+use super::codegen::simulation::simulation_server;
 
 /// Runs a simulation from a network server.
 ///
@@ -27,7 +23,7 @@ use super::services::{ControllerService, MonitorService, SchedulerService};
 /// public event and query interface.
 pub fn run<F, I>(sim_gen: F, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(I) -> Result<(Simulation, EndpointRegistry), SimulationError> + Send + 'static,
+    F: FnMut(I) -> Result<SimInit, Box<dyn error::Error>> + Send + 'static,
     I: DeserializeOwned,
 {
     run_service(GrpcSimulationService::new(sim_gen), addr, None)
@@ -47,7 +43,7 @@ pub fn run_with_shutdown<F, I, S>(
     signal: S,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(I) -> Result<(Simulation, EndpointRegistry), SimulationError> + Send + 'static,
+    F: FnMut(I) -> Result<SimInit, Box<dyn error::Error>> + Send + 'static,
     I: DeserializeOwned,
     for<'a> S: Future<Output = ()> + 'a,
 {
@@ -94,7 +90,7 @@ fn run_service(
 #[cfg(unix)]
 pub fn run_local<F, I, P>(sim_gen: F, path: P) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(I) -> Result<(Simulation, EndpointRegistry), SimulationError> + Send + 'static,
+    F: FnMut(I) -> Result<SimInit, Box<dyn error::Error>> + Send + 'static,
     I: DeserializeOwned,
     P: AsRef<Path>,
 {
@@ -118,7 +114,7 @@ pub fn run_local_with_shutdown<F, I, P, S>(
     signal: S,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(I) -> Result<(Simulation, EndpointRegistry), SimulationError> + Send + 'static,
+    F: FnMut(I) -> Result<SimInit, Box<dyn error::Error>> + Send + 'static,
     I: DeserializeOwned,
     P: AsRef<Path>,
     for<'a> S: Future<Output = ()> + 'a,
@@ -193,249 +189,4 @@ fn run_local_service(
 
         Ok(())
     })
-}
-
-struct GrpcSimulationService {
-    init_service: Mutex<InitService>,
-    controller_service: Arc<Mutex<ControllerService>>,
-    monitor_service: Arc<RwLock<MonitorService>>,
-    scheduler_service: Mutex<SchedulerService>,
-}
-
-impl GrpcSimulationService {
-    /// Creates a new `GrpcSimulationService` without any active simulation.
-    ///
-    /// The argument is a closure that takes an initialization configuration and
-    /// is called every time the simulation is (re)started by the remote client.
-    /// It must create a new simulation, complemented by a registry that exposes
-    /// the public event and query interface.
-    pub(crate) fn new<F, I>(sim_gen: F) -> Self
-    where
-        F: FnMut(I) -> Result<(Simulation, EndpointRegistry), SimulationError> + Send + 'static,
-        I: DeserializeOwned,
-    {
-        Self {
-            init_service: Mutex::new(InitService::new(sim_gen)),
-            controller_service: Arc::new(Mutex::new(ControllerService::NotStarted)),
-            monitor_service: Arc::new(RwLock::new(MonitorService::NotStarted)),
-            scheduler_service: Mutex::new(SchedulerService::NotStarted),
-        }
-    }
-
-    /// Executes a method of the controller service.
-    async fn execute_controller_fn<T, U, F>(&self, request: T, f: F) -> Result<Response<U>, Status>
-    where
-        T: Send + 'static,
-        U: Send + 'static,
-        F: Fn(&mut ControllerService, T) -> U + Send + 'static,
-    {
-        let controller = self.controller_service.clone();
-        // May block.
-        let res = tokio::task::spawn_blocking(move || f(&mut controller.lock().unwrap(), request))
-            .await
-            .unwrap();
-
-        Ok(Response::new(res))
-    }
-
-    /// Executes a read method of the monitor service.
-    async fn execute_monitor_read_fn<T, U, F>(
-        &self,
-        request: T,
-        f: F,
-    ) -> Result<Response<U>, Status>
-    where
-        T: Send + 'static,
-        U: Send + 'static,
-        F: Fn(&MonitorService, T) -> U + Send + 'static,
-    {
-        let monitor = self.monitor_service.clone();
-        // May block.
-        let res = tokio::task::spawn_blocking(move || f(&monitor.read().unwrap(), request))
-            .await
-            .unwrap();
-
-        Ok(Response::new(res))
-    }
-
-    /// Executes a write method of the monitor service.
-    async fn execute_monitor_write_fn<T, U, F>(
-        &self,
-        request: T,
-        f: F,
-    ) -> Result<Response<U>, Status>
-    where
-        T: Send + 'static,
-        U: Send + 'static,
-        F: Fn(&mut MonitorService, T) -> U + Send + 'static,
-    {
-        let monitor = self.monitor_service.clone();
-        // May block.
-        let res = tokio::task::spawn_blocking(move || f(&mut monitor.write().unwrap(), request))
-            .await
-            .unwrap();
-
-        Ok(Response::new(res))
-    }
-
-    /// Executes a method of the scheduler service.
-    // For some reason clippy emits a warning when generic `Response<U>` is
-    // used, while not complaining with a concrete type.
-    #[allow(clippy::result_large_err)]
-    fn execute_scheduler_fn<T, U, F>(&self, request: T, f: F) -> Result<Response<U>, Status>
-    where
-        F: Fn(&mut SchedulerService, T) -> U,
-    {
-        Ok(Response::new(f(
-            &mut self.scheduler_service.lock().unwrap(),
-            request,
-        )))
-    }
-}
-
-#[tonic::async_trait]
-impl simulation_server::Simulation for GrpcSimulationService {
-    async fn init(&self, request: Request<InitRequest>) -> Result<Response<InitReply>, Status> {
-        let request = request.into_inner();
-
-        let (reply, bench) = self.init_service.lock().unwrap().init(request);
-
-        if let Some((simulation, scheduler, endpoint_registry)) = bench {
-            let event_source_registry = Arc::new(endpoint_registry.event_source_registry);
-            let query_source_registry = endpoint_registry.query_source_registry;
-            let event_sink_registry = endpoint_registry.event_sink_registry;
-
-            *self.controller_service.lock().unwrap() = ControllerService::Started {
-                simulation,
-                event_source_registry: event_source_registry.clone(),
-                query_source_registry,
-            };
-            *self.monitor_service.write().unwrap() = MonitorService::Started {
-                event_sink_registry,
-            };
-            *self.scheduler_service.lock().unwrap() = SchedulerService::Started {
-                scheduler,
-                event_source_registry,
-                key_registry: KeyRegistry::default(),
-            };
-        }
-
-        Ok(Response::new(reply))
-    }
-    async fn terminate(
-        &self,
-        _request: Request<TerminateRequest>,
-    ) -> Result<Response<TerminateReply>, Status> {
-        *self.controller_service.lock().unwrap() = ControllerService::NotStarted;
-        *self.monitor_service.write().unwrap() = MonitorService::NotStarted;
-        *self.scheduler_service.lock().unwrap() = SchedulerService::NotStarted;
-
-        Ok(Response::new(TerminateReply {
-            result: Some(terminate_reply::Result::Empty(())),
-        }))
-    }
-    async fn halt(&self, request: Request<HaltRequest>) -> Result<Response<HaltReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_scheduler_fn(request, SchedulerService::halt)
-    }
-    async fn time(&self, request: Request<TimeRequest>) -> Result<Response<TimeReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_scheduler_fn(request, SchedulerService::time)
-    }
-    async fn step(&self, request: Request<StepRequest>) -> Result<Response<StepReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_controller_fn(request, ControllerService::step)
-            .await
-    }
-    async fn step_until(
-        &self,
-        request: Request<StepUntilRequest>,
-    ) -> Result<Response<StepUntilReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_controller_fn(request, ControllerService::step_until)
-            .await
-    }
-    async fn step_unbounded(
-        &self,
-        request: Request<StepUnboundedRequest>,
-    ) -> Result<Response<StepUnboundedReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_controller_fn(request, ControllerService::step_unbounded)
-            .await
-    }
-    async fn schedule_event(
-        &self,
-        request: Request<ScheduleEventRequest>,
-    ) -> Result<Response<ScheduleEventReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_scheduler_fn(request, SchedulerService::schedule_event)
-    }
-    async fn cancel_event(
-        &self,
-        request: Request<CancelEventRequest>,
-    ) -> Result<Response<CancelEventReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_scheduler_fn(request, SchedulerService::cancel_event)
-    }
-    async fn process_event(
-        &self,
-        request: Request<ProcessEventRequest>,
-    ) -> Result<Response<ProcessEventReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_controller_fn(request, ControllerService::process_event)
-            .await
-    }
-    async fn process_query(
-        &self,
-        request: Request<ProcessQueryRequest>,
-    ) -> Result<Response<ProcessQueryReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_controller_fn(request, ControllerService::process_query)
-            .await
-    }
-    async fn read_events(
-        &self,
-        request: Request<ReadEventsRequest>,
-    ) -> Result<Response<ReadEventsReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_monitor_read_fn(request, MonitorService::read_events)
-            .await
-    }
-    async fn await_event(
-        &self,
-        request: Request<AwaitEventRequest>,
-    ) -> Result<Response<AwaitEventReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_monitor_read_fn(request, MonitorService::await_event)
-            .await
-    }
-    async fn open_sink(
-        &self,
-        request: Request<OpenSinkRequest>,
-    ) -> Result<Response<OpenSinkReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_monitor_write_fn(request, MonitorService::open_sink)
-            .await
-    }
-    async fn close_sink(
-        &self,
-        request: Request<CloseSinkRequest>,
-    ) -> Result<Response<CloseSinkReply>, Status> {
-        let request = request.into_inner();
-
-        self.execute_monitor_write_fn(request, MonitorService::close_sink)
-            .await
-    }
 }

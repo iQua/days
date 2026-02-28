@@ -231,4 +231,6 @@ impl DcqcnPacketSink {
     }
 }
 
-impl Model for DcqcnPacketSink {}
+impl Model for DcqcnPacketSink {
+    type Env = ();
+}

@@ -2,18 +2,23 @@ mod broadcaster;
 mod sender;
 
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
 
-use crate::model::Model;
+use futures_channel::oneshot;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::model::{Message, Model};
+use crate::path::Path;
 use crate::ports::InputFn;
 use crate::simulation::{
-    Action, ActionKey, Address, KeyedOnceAction, KeyedPeriodicAction, OnceAction, PeriodicAction,
+    Address, DuplicateEventSourceError, DuplicateQuerySourceError, EventId, QueryId, SimInit,
 };
-use crate::util::slot;
 use crate::util::unwrap_or_throw::UnwrapOrThrow;
 
-use broadcaster::{EventBroadcaster, QueryBroadcaster, ReplyIterator};
+pub(crate) use broadcaster::ReplyIterator;
+use broadcaster::{EventBroadcaster, QueryBroadcaster};
 use sender::{
     FilterMapInputSender, FilterMapReplierSender, InputSender, MapInputSender, MapReplierSender,
     ReplierSender,
@@ -27,11 +32,11 @@ use super::ReplierFn;
 /// port in that it can send events to connected input ports. It is not meant,
 /// however, to be instantiated as a member of a model, but rather as a
 /// simulation control endpoint instantiated during bench assembly.
-pub struct EventSource<T: Clone + Send + 'static> {
+pub struct EventSource<T: Serialize + DeserializeOwned + Clone + Send + 'static> {
     broadcaster: EventBroadcaster<T>,
 }
 
-impl<T: Clone + Send + 'static> EventSource<T> {
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static> EventSource<T> {
     /// Creates a disconnected `EventSource` port.
     pub fn new() -> Self {
         Self::default()
@@ -43,7 +48,7 @@ impl<T: Clone + Send + 'static> EventSource<T> {
     /// The input port must be an asynchronous method of a model of type `M`
     /// taking as argument a value of type `T` plus, optionally, a scheduler
     /// reference.
-    pub fn connect<M, F, S>(&mut self, input: F, address: impl Into<Address<M>>)
+    pub fn connect<M, F, S>(mut self, input: F, address: impl Into<Address<M>>) -> Self
     where
         M: Model,
         F: for<'a> InputFn<'a, M, T, S> + Clone + Sync,
@@ -51,6 +56,7 @@ impl<T: Clone + Send + 'static> EventSource<T> {
     {
         let sender = Box::new(InputSender::new(input, address.into().0));
         self.broadcaster.add(sender);
+        self
     }
 
     /// Adds an auto-converting connection to an input port of the model
@@ -62,7 +68,12 @@ impl<T: Clone + Send + 'static> EventSource<T> {
     /// The input port must be an asynchronous method of a model of type `M`
     /// taking as argument a value of the type returned by the mapping closure
     /// plus, optionally, a context reference.
-    pub fn map_connect<M, C, F, U, S>(&mut self, map: C, input: F, address: impl Into<Address<M>>)
+    pub fn map_connect<M, C, F, U, S>(
+        mut self,
+        map: C,
+        input: F,
+        address: impl Into<Address<M>>,
+    ) -> Self
     where
         M: Model,
         C: for<'a> Fn(&'a T) -> U + Send + Sync + 'static,
@@ -72,6 +83,7 @@ impl<T: Clone + Send + 'static> EventSource<T> {
     {
         let sender = Box::new(MapInputSender::new(map, input, address.into().0));
         self.broadcaster.add(sender);
+        self
     }
 
     /// Adds an auto-converting, filtered connection to an input port of the
@@ -84,11 +96,12 @@ impl<T: Clone + Send + 'static> EventSource<T> {
     /// taking as argument a value of the type returned by the mapping closure
     /// plus, optionally, a context reference.
     pub fn filter_map_connect<M, C, F, U, S>(
-        &mut self,
+        mut self,
         map: C,
         input: F,
         address: impl Into<Address<M>>,
-    ) where
+    ) -> Self
+    where
         M: Model,
         C: for<'a> Fn(&'a T) -> Option<U> + Send + Sync + 'static,
         F: for<'a> InputFn<'a, M, U, S> + Clone + Sync,
@@ -97,80 +110,72 @@ impl<T: Clone + Send + 'static> EventSource<T> {
     {
         let sender = Box::new(FilterMapInputSender::new(map, input, address.into().0));
         self.broadcaster.add(sender);
+        self
     }
 
-    /// Returns an action which, when processed, broadcasts an event to all
-    /// connected input ports.
-    pub fn event(&self, arg: T) -> Action {
+    /// Converts an event source to an [`EventId`] that can later be used to
+    /// schedule and process events within the simulation instance being built.
+    ///
+    /// This is typically only of interest when controlling the simulation from
+    /// Rust. For simulations controlled by a remote client, use
+    /// [`EventSource::bind_endpoint`] or [`EventSource::bind_endpoint_raw`].
+    pub fn register(self, sim_init: &mut SimInit) -> EventId<T> {
+        sim_init.link_event_source(self)
+    }
+
+    /// Returns a future for a broadcast of the event provided in argument.
+    ///
+    /// This method can be e.g. used to spawn scheduled events from the queue.
+    /// When processed, it broadcasts the event to all connected input ports.
+    pub(crate) fn event_future(&self, arg: T) -> impl Future<Output = ()> + use<T> {
         let fut = self.broadcaster.broadcast(arg);
-        let fut = async {
+
+        async {
             fut.await.unwrap_or_throw();
-        };
-
-        Action::new(OnceAction::new(fut))
-    }
-
-    /// Returns a cancellable action and a cancellation key; when processed, the
-    /// action broadcasts an event to all connected input ports.
-    pub fn keyed_event(&self, arg: T) -> (Action, ActionKey) {
-        let action_key = ActionKey::new();
-        let fut = self.broadcaster.broadcast(arg);
-
-        let action = Action::new(KeyedOnceAction::new(
-            // Cancellation is ignored once the action is already spawned on the
-            // executor. This means the action cannot be cancelled once the
-            // simulation step targeted by the action is running, but since an
-            // event source is meant to be used outside the simulator, this
-            // shouldn't be an issue in practice.
-            |_| async {
-                fut.await.unwrap_or_throw();
-            },
-            action_key.clone(),
-        ));
-
-        (action, action_key)
-    }
-
-    /// Returns a periodically recurring action which, when processed,
-    /// broadcasts an event to all connected input ports.
-    pub fn periodic_event(self: &Arc<Self>, period: Duration, arg: T) -> Action {
-        let source = self.clone();
-
-        Action::new(PeriodicAction::new(
-            || async move {
-                let fut = source.broadcaster.broadcast(arg);
-                fut.await.unwrap_or_throw();
-            },
-            period,
-        ))
-    }
-
-    /// Returns a cancellable, periodically recurring action and a cancellation
-    /// key; when processed, the action broadcasts an event to all connected
-    /// input ports.
-    pub fn keyed_periodic_event(self: &Arc<Self>, period: Duration, arg: T) -> (Action, ActionKey) {
-        let action_key = ActionKey::new();
-        let source = self.clone();
-
-        let action = Action::new(KeyedPeriodicAction::new(
-            // Cancellation is ignored once the action is already spawned on the
-            // executor. This means the action cannot be cancelled while the
-            // simulation is running, but since an event source is meant to be
-            // used outside the simulator, this shouldn't be an issue in
-            // practice.
-            |_| async move {
-                let fut = source.broadcaster.broadcast(arg);
-                fut.await.unwrap_or_throw();
-            },
-            period,
-            action_key.clone(),
-        ));
-
-        (action, action_key)
+        }
     }
 }
 
-impl<T: Clone + Send + 'static> Default for EventSource<T> {
+impl<T: Message + Serialize + DeserializeOwned + Clone + Send + 'static> EventSource<T> {
+    /// Adds this event source to the endpoint registry under the provided path.
+    ///
+    /// If the path is already used by another event source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`](crate::simulation::BenchError).
+    ///
+    /// This is typically only of interest when controlling the simulation from
+    /// a remote client or via the [Endpoints](crate::endpoints::Endpoints) API.
+    /// In other cases, use [`EventSource::register`].
+    pub fn bind_endpoint(
+        self,
+        sim_init: &mut SimInit,
+        path: impl Into<Path>,
+    ) -> Result<(), DuplicateEventSourceError<T>> {
+        sim_init.bind_event_source(self, path.into())
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static> EventSource<T> {
+    /// Adds an event source to the endpoint registry under the provided path,
+    /// without requiring a [`Message`] implementation for its item type.
+    ///
+    /// If the path is already used by another event source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`](crate::simulation::BenchError).
+    ///
+    /// This is typically only of interest when controlling the simulation from
+    /// a remote client or via the [Endpoints](crate::endpoints::Endpoints) API.
+    /// In other cases, use [`EventSource::register`].
+    pub fn bind_endpoint_raw(
+        self,
+        sim_init: &mut SimInit,
+        path: impl Into<Path>,
+    ) -> Result<(), DuplicateEventSourceError<T>> {
+        sim_init.bind_event_source_raw(self, path.into())
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static> Default for EventSource<T> {
     fn default() -> Self {
         Self {
             broadcaster: EventBroadcaster::default(),
@@ -178,7 +183,7 @@ impl<T: Clone + Send + 'static> Default for EventSource<T> {
     }
 }
 
-impl<T: Clone + Send + 'static> fmt::Debug for EventSource<T> {
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static> fmt::Debug for EventSource<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -195,11 +200,14 @@ impl<T: Clone + Send + 'static> fmt::Debug for EventSource<T> {
 /// connected replier ports and receive replies. It is not meant, however, to be
 /// instantiated as a member of a model, but rather as a simulation monitoring
 /// endpoint instantiated during bench assembly.
-pub struct QuerySource<T: Clone + Send + 'static, R: Send + 'static> {
+pub struct QuerySource<T: Serialize + DeserializeOwned + Clone + Send + 'static, R: Send + 'static>
+{
     broadcaster: QueryBroadcaster<T, R>,
 }
 
-impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static, R: Send + 'static>
+    QuerySource<T, R>
+{
     /// Creates a disconnected `EventSource` port.
     pub fn new() -> Self {
         Self::default()
@@ -211,7 +219,7 @@ impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
     /// The replier port must be an asynchronous method of a model of type `M`
     /// returning a value of type `R` and taking as argument a value of type `T`
     /// plus, optionally, a context reference.
-    pub fn connect<M, F, S>(&mut self, replier: F, address: impl Into<Address<M>>)
+    pub fn connect<M, F, S>(mut self, replier: F, address: impl Into<Address<M>>) -> Self
     where
         M: Model,
         F: for<'a> ReplierFn<'a, M, T, R, S> + Clone + Sync,
@@ -219,6 +227,7 @@ impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
     {
         let sender = Box::new(ReplierSender::new(replier, address.into().0));
         self.broadcaster.add(sender);
+        self
     }
 
     /// Adds an auto-converting connection to a replier port of the model
@@ -232,12 +241,13 @@ impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
     /// taking as argument a value of the type returned by the query mapping
     /// closure plus, optionally, a context reference.
     pub fn map_connect<M, C, D, F, U, Q, S>(
-        &mut self,
+        mut self,
         query_map: C,
         reply_map: D,
         replier: F,
         address: impl Into<Address<M>>,
-    ) where
+    ) -> Self
+    where
         M: Model,
         C: for<'a> Fn(&'a T) -> U + Send + Sync + 'static,
         D: Fn(Q) -> R + Send + Sync + 'static,
@@ -253,6 +263,7 @@ impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
             address.into().0,
         ));
         self.broadcaster.add(sender);
+        self
     }
 
     /// Adds an auto-converting, filtered connection to a replier port of the
@@ -266,12 +277,13 @@ impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
     /// taking as argument a value of the type returned by the query mapping
     /// closure plus, optionally, a context reference.
     pub fn filter_map_connect<M, C, D, F, U, Q, S>(
-        &mut self,
+        mut self,
         query_filter_map: C,
         reply_map: D,
         replier: F,
         address: impl Into<Address<M>>,
-    ) where
+    ) -> Self
+    where
         M: Model,
         C: for<'a> Fn(&'a T) -> Option<U> + Send + Sync + 'static,
         D: Fn(Q) -> R + Send + Sync + 'static,
@@ -287,25 +299,84 @@ impl<T: Clone + Send + 'static, R: Send + 'static> QuerySource<T, R> {
             address.into().0,
         ));
         self.broadcaster.add(sender);
+        self
     }
 
-    /// Returns an action which, when processed, broadcasts a query to all
-    /// connected replier ports.
-    pub fn query(&self, arg: T) -> (Action, ReplyReceiver<R>) {
-        let (writer, reader) = slot::slot();
+    /// Converts a query source to a [`QueryId`] that can later be used to
+    /// schedule and process events within the simulation instance being built.
+    ///
+    /// This is typically only of interest when controlling the simulation from
+    /// Rust. For simulations controlled by a remote client, use
+    /// [`QuerySource::bind_endpoint`] or [`QuerySource::bind_endpoint_raw`].
+    pub fn register(self, sim_init: &mut SimInit) -> QueryId<T, R> {
+        sim_init.link_query_source(self)
+    }
+
+    pub(crate) fn query_future(
+        &self,
+        arg: T,
+        replier: Option<ReplyWriter<R>>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let fut = self.broadcaster.broadcast(arg);
+
         let fut = async move {
             let replies = fut.await.unwrap_or_throw();
-            let _ = writer.write(replies);
+            if let Some(replier) = replier {
+                replier.send(replies);
+            }
         };
-
-        let action = Action::new(OnceAction::new(fut));
-
-        (action, ReplyReceiver::<R>(reader))
+        Box::pin(fut)
     }
 }
 
-impl<T: Clone + Send + 'static, R: Send + 'static> Default for QuerySource<T, R> {
+impl<
+    T: Message + Serialize + DeserializeOwned + Clone + Send + 'static,
+    R: Message + Serialize + Send + 'static,
+> QuerySource<T, R>
+{
+    /// Adds a query source to the endpoint registry under the provided path.
+    ///
+    /// If the path is already used by another query source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`](crate::simulation::BenchError).
+    ///
+    /// This is typically only of interest when controlling the simulation from
+    /// a remote client. For simulations controlled from Rust, use
+    /// [`QuerySource::register`].
+    pub fn bind_endpoint(
+        self,
+        sim_init: &mut SimInit,
+        path: impl Into<Path>,
+    ) -> Result<(), DuplicateQuerySourceError<Self>> {
+        sim_init.bind_query_source(self, path.into())
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static, R: Serialize + Send + 'static>
+    QuerySource<T, R>
+{
+    /// Adds a query source to the endpoint registry under the provided path,
+    /// without requiring a [`Message`] implementation for its item type.
+    ///
+    /// If the path is already used by another query source, the source provided
+    /// as argument is returned in the error. The error is convertible to an
+    /// [`BenchError`](crate::simulation::BenchError).
+    ///
+    /// This is typically only of interest when controlling the simulation from
+    /// a remote client. For simulations controlled from Rust, use
+    /// [`QuerySource::register`].
+    pub fn bind_endpoint_raw(
+        self,
+        path: impl Into<Path>,
+        sim_init: &mut SimInit,
+    ) -> Result<(), DuplicateQuerySourceError<Self>> {
+        sim_init.bind_query_source_raw(self, path.into())
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static, R: Send + 'static> Default
+    for QuerySource<T, R>
+{
     fn default() -> Self {
         Self {
             broadcaster: QueryBroadcaster::default(),
@@ -313,7 +384,9 @@ impl<T: Clone + Send + 'static, R: Send + 'static> Default for QuerySource<T, R>
     }
 }
 
-impl<T: Clone + Send + 'static, R: Send + 'static> fmt::Debug for QuerySource<T, R> {
+impl<T: Serialize + DeserializeOwned + Clone + Send + 'static, R: Send + 'static> fmt::Debug
+    for QuerySource<T, R>
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -323,21 +396,43 @@ impl<T: Clone + Send + 'static, R: Send + 'static> fmt::Debug for QuerySource<T,
     }
 }
 
-/// A receiver for all replies collected from a single query broadcast.
-pub struct ReplyReceiver<R>(slot::SlotReader<ReplyIterator<R>>);
+/// A typed consumer handle to a query reply channel.
+#[derive(Debug)]
+pub struct ReplyReader<R>(oneshot::Receiver<ReplyIterator<R>>);
+impl<R: Send + 'static> ReplyReader<R> {
+    /// A non blocking read attempt. If successful, returns an iterator over
+    /// query replies.
+    pub fn try_read(&mut self) -> Option<impl Iterator<Item = R>> {
+        self.0.try_recv().ok()?
+    }
 
-impl<R> ReplyReceiver<R> {
-    /// Returns all replies to a query.
-    ///
-    /// Returns `None` if the replies are not yet available or if they were
-    /// already taken in a previous call to `take`.
-    pub fn take(&mut self) -> Option<impl Iterator<Item = R>> {
-        self.0.try_read().ok()
+    /// A blocking read. If successful, returns an iterator over query replies.
+    /// Will return immediately with a `None` value if the channel has already
+    /// been read.
+    pub fn read(self) -> Option<impl Iterator<Item = R>> {
+        pollster::block_on(self)
     }
 }
 
-impl<R> fmt::Debug for ReplyReceiver<R> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Replies")
+impl<R: Send + 'static> Future for ReplyReader<R> {
+    type Output = Option<ReplyIterator<R>>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx).map(Result::ok)
     }
+}
+
+pub(crate) struct ReplyWriter<R>(oneshot::Sender<ReplyIterator<R>>);
+impl<R: Send + 'static> ReplyWriter<R> {
+    pub(crate) fn send(self, reply: ReplyIterator<R>) {
+        let _ = self.0.send(reply);
+    }
+}
+
+pub(crate) fn query_replier<R: Send + 'static>() -> (ReplyWriter<R>, ReplyReader<R>) {
+    let (tx, rx) = oneshot::channel();
+    (ReplyWriter(tx), ReplyReader(rx))
 }

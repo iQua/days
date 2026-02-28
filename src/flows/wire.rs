@@ -11,7 +11,7 @@ use rand::rngs::SmallRng;
 use rand_distr::Exp;
 use tracing::instrument;
 
-use nexosim::model::{Context, Model};
+use nexosim::model::{BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId};
 use nexosim::ports::Output;
 #[cfg(feature = "test")]
 use nexosim::time::MonotonicTime;
@@ -30,9 +30,12 @@ pub struct Wire {
     pub output: Output<Packet>,
     pending_departures: VecDeque<Packet>,
     run_batch_size: usize,
+    schedule_scratch: Vec<(Duration, Packet)>,
 }
 
 impl Wire {
+    const FORWARD_SCHEDULED_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+
     const DEFAULT_RUN_BATCH_SIZE: usize = 64;
 
     pub fn new(wire_id: usize, delay_dist: DistributionInfo) -> Wire {
@@ -49,6 +52,7 @@ impl Wire {
             output: Output::default(),
             pending_departures: VecDeque::new(),
             run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
+            schedule_scratch: Vec::new(),
         }
     }
 
@@ -59,7 +63,7 @@ impl Wire {
     }
 
     #[instrument(skip(self, cx))]
-    pub async fn packet_received(&mut self, mut packet: Packet, cx: &mut Context<Self>) {
+    pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
             let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
@@ -110,26 +114,39 @@ impl Wire {
         }
     }
 
-    fn schedule_departures(&mut self, now: f64, cx: &mut Context<Self>) {
+    fn schedule_departures(&mut self, now: f64, cx: &Context<Self>) {
         if self.pending_departures.is_empty() {
             return;
         }
 
-        let mut schedule = Vec::with_capacity(self.run_batch_size);
+        if self.schedule_scratch.capacity() < self.run_batch_size {
+            self.schedule_scratch
+                .reserve(self.run_batch_size - self.schedule_scratch.capacity());
+        }
+
+        self.schedule_scratch.clear();
         while let Some(packet) = self.pending_departures.pop_front() {
             let delay = (packet.time - now).max(0.0);
-            schedule.push((Duration::from_secs_f64(delay), packet));
+            self.schedule_scratch
+                .push((Duration::from_secs_f64(delay), packet));
 
-            if schedule.len() == self.run_batch_size {
-                cx.schedule_event_batch(schedule, Self::forward_scheduled)
-                    .unwrap();
-                schedule = Vec::with_capacity(self.run_batch_size);
+            if self.schedule_scratch.len() == self.run_batch_size {
+                cx.schedule_event_batch_fast_in_place(
+                    &mut self.schedule_scratch,
+                    &Self::FORWARD_SCHEDULED_SID,
+                    Self::forward_scheduled,
+                )
+                .unwrap();
             }
         }
 
-        if !schedule.is_empty() {
-            cx.schedule_event_batch(schedule, Self::forward_scheduled)
-                .unwrap();
+        if !self.schedule_scratch.is_empty() {
+            cx.schedule_event_batch_fast_in_place(
+                &mut self.schedule_scratch,
+                &Self::FORWARD_SCHEDULED_SID,
+                Self::forward_scheduled,
+            )
+            .unwrap();
         }
     }
 
@@ -143,9 +160,18 @@ impl Wire {
         self.output.send(packet).await;
     }
 
-    async fn forward_scheduled(&mut self, packet: Packet, _: &mut Context<Self>) {
+    async fn forward_scheduled(&mut self, packet: Packet, _: &Context<Self>) {
         self.forward_packet(packet).await;
     }
 }
 
-impl Model for Wire {}
+impl Model for Wire {
+    type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::forward_scheduled));
+        registry
+    }
+}

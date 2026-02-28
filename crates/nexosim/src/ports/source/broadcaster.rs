@@ -4,9 +4,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::vec;
 
-use pin_project::pin_project;
-
 use diatomic_waker::WakeSink;
+use pin_project::pin_project;
 
 use super::sender::{Sender, SenderFuture};
 
@@ -107,7 +106,10 @@ impl<T: Clone + Send> EventBroadcaster<T> {
     }
 
     /// Broadcasts an event to all addresses.
-    pub(super) fn broadcast(&self, arg: T) -> impl Future<Output = Result<(), SendError>> + Send {
+    pub(super) fn broadcast(
+        &self,
+        arg: T,
+    ) -> impl Future<Output = Result<(), SendError>> + Send + use<T> {
         enum Fut<F1, F2> {
             Empty,
             Single(F1),
@@ -183,7 +185,7 @@ impl<T: Clone + Send, R: Send> QueryBroadcaster<T, R> {
     pub(super) fn broadcast(
         &self,
         arg: T,
-    ) -> impl Future<Output = Result<ReplyIterator<R>, SendError>> + Send {
+    ) -> impl Future<Output = Result<ReplyIterator<R>, SendError>> + Send + use<T, R> {
         enum Fut<F1, F2> {
             Empty,
             Single(F1),
@@ -379,8 +381,7 @@ enum SenderFutureState<R> {
 }
 
 /// An iterator over the replies to a broadcasted request.
-pub(crate) struct ReplyIterator<R>(vec::IntoIter<SenderFutureState<R>>);
-
+pub struct ReplyIterator<R>(vec::IntoIter<SenderFutureState<R>>);
 impl<R> Iterator for ReplyIterator<R> {
     type Item = R;
 
@@ -396,6 +397,12 @@ impl<R> Iterator for ReplyIterator<R> {
     }
 }
 
+impl<R> std::fmt::Debug for ReplyIterator<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyIterator").finish_non_exhaustive()
+    }
+}
+
 #[cfg(all(test, not(nexosim_loom)))]
 mod tests {
     use std::sync::Arc;
@@ -403,6 +410,7 @@ mod tests {
     use std::thread;
 
     use futures_executor::block_on;
+    use serde::{Deserialize, Serialize};
 
     use crate::channel::Receiver;
 
@@ -423,8 +431,28 @@ mod tests {
             self.inner.fetch_add(by, Ordering::Relaxed);
         }
     }
-    impl Model for SumModel {}
+    impl Model for SumModel {
+        type Env = ();
+    }
+    impl Serialize for SumModel {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_u64(self.inner.load(Ordering::Relaxed) as u64)
+        }
+    }
+    impl<'de> Deserialize<'de> for SumModel {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let counter = usize::deserialize(deserializer)?;
+            Ok(SumModel::new(Arc::new(AtomicUsize::new(counter))))
+        }
+    }
 
+    #[derive(Serialize, Deserialize)]
     struct DoubleModel {}
     impl DoubleModel {
         fn new() -> Self {
@@ -434,7 +462,9 @@ mod tests {
             2 * value
         }
     }
-    impl Model for DoubleModel {}
+    impl Model for DoubleModel {
+        type Env = ();
+    }
 
     #[test]
     fn broadcast_event_smoke() {
@@ -465,8 +495,8 @@ mod tests {
                     let mut sum_model = SumModel::new(sum.clone());
 
                     move || {
-                        let mut dummy_cx = Context::new_dummy();
-                        block_on(mailbox.recv(&mut sum_model, &mut dummy_cx)).unwrap();
+                        let dummy_cx = Context::new_dummy();
+                        block_on(mailbox.recv(&mut sum_model, &dummy_cx, &mut ())).unwrap();
                     }
                 })
             })
@@ -527,11 +557,20 @@ mod tests {
                     let mut sum_model = SumModel::new(sum.clone());
 
                     move || {
-                        let mut dummy_cx = Context::new_dummy();
+                        let dummy_cx = Context::new_dummy();
                         block_on(async {
-                            mailbox.recv(&mut sum_model, &mut dummy_cx).await.unwrap();
-                            mailbox.recv(&mut sum_model, &mut dummy_cx).await.unwrap();
-                            mailbox.recv(&mut sum_model, &mut dummy_cx).await.unwrap();
+                            mailbox
+                                .recv(&mut sum_model, &dummy_cx, &mut ())
+                                .await
+                                .unwrap();
+                            mailbox
+                                .recv(&mut sum_model, &dummy_cx, &mut ())
+                                .await
+                                .unwrap();
+                            mailbox
+                                .recv(&mut sum_model, &dummy_cx, &mut ())
+                                .await
+                                .unwrap();
                         });
                     }
                 })
@@ -545,7 +584,8 @@ mod tests {
 
         assert_eq!(
             sum.load(Ordering::Relaxed),
-            N_RECV * ((N_RECV - 1) + BROADCAST_ALL) // Twice the sum of all IDs + N_RECV times the special value
+            N_RECV * ((N_RECV - 1) + BROADCAST_ALL) /* Twice the sum of all IDs + N_RECV times
+                                                     * the special value */
         );
     }
 
@@ -578,8 +618,8 @@ mod tests {
                     let mut double_model = DoubleModel::new();
 
                     move || {
-                        let mut dummy_cx = Context::new_dummy();
-                        block_on(mailbox.recv(&mut double_model, &mut dummy_cx)).unwrap();
+                        let dummy_cx = Context::new_dummy();
+                        block_on(mailbox.recv(&mut double_model, &dummy_cx, &mut ())).unwrap();
                         thread::sleep(std::time::Duration::from_millis(100));
                     }
                 })
@@ -647,19 +687,19 @@ mod tests {
                     let mut double_model = DoubleModel::new();
 
                     move || {
-                        let mut dummy_cx = Context::new_dummy();
+                        let dummy_cx = Context::new_dummy();
 
                         block_on(async {
                             mailbox
-                                .recv(&mut double_model, &mut dummy_cx)
+                                .recv(&mut double_model, &dummy_cx, &mut ())
                                 .await
                                 .unwrap();
                             mailbox
-                                .recv(&mut double_model, &mut dummy_cx)
+                                .recv(&mut double_model, &dummy_cx, &mut ())
                                 .await
                                 .unwrap();
                             mailbox
-                                .recv(&mut double_model, &mut dummy_cx)
+                                .recv(&mut double_model, &dummy_cx, &mut ())
                                 .await
                                 .unwrap();
                         });
@@ -676,7 +716,9 @@ mod tests {
 
         assert_eq!(
             sum,
-            N_RECV * ((N_RECV - 1) + BROADCAST_ALL) * 2 * 3, // Twice the sum of all IDs + N_RECV times the special value, then doubled and tripled
+            N_RECV * ((N_RECV - 1) + BROADCAST_ALL) * 2 * 3, /* Twice the sum of all IDs +
+                                                              * N_RECV times the special value,
+                                                              * then doubled and tripled */
         );
     }
 }

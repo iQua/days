@@ -118,6 +118,7 @@ impl PoolManager {
 
     /// Unparks an idle worker selected from the provided mask and marks it as
     /// active. Returns `true` if a worker was activated.
+    #[allow(dead_code)]
     pub(super) fn try_activate_from_mask(&self, mask: usize) -> bool {
         let mask = mask & self.all_workers_mask();
         if mask == 0 {
@@ -210,6 +211,7 @@ impl PoolManager {
         self.active_workers.store(0, Ordering::Release);
     }
 
+    #[allow(dead_code)]
     fn all_workers_mask(&self) -> usize {
         if self.pool_size == usize::BITS as usize {
             !0
@@ -218,6 +220,7 @@ impl PoolManager {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn pool_size(&self) -> usize {
         self.pool_size
     }
@@ -308,15 +311,22 @@ impl<'a> ShuffledStealers<'a> {
             (0, 0)
         } else {
             let next_candidate = bit::find_bit(candidates, |count| {
-                rng.gen_bounded(count as u64) as usize + 1
+                rng.rand_bounded(count as u64) as usize + 1
             });
 
             // Right-rotate the candidates so that the bit corresponding to the
             // randomly selected worker becomes the LSB.
-            let candidate_count = stealers.len();
-            let lower_bits = candidates & ((1 << next_candidate) - 1);
-            let candidates =
-                (candidates >> next_candidate) | (lower_bits << (candidate_count - next_candidate));
+            let candidates = if next_candidate == 0 {
+                candidates
+            } else {
+                let candidate_count = stealers.len();
+                let lower_bits = candidates & ((1 << next_candidate) - 1);
+
+                // The left shift cannot overflow since `next_candidate >= 1``
+                // and the number of worker threads (`candidate_count`) cannot
+                // exceed `usize::BITS`.
+                (candidates >> next_candidate) | (lower_bits << (candidate_count - next_candidate))
+            };
 
             (candidates, next_candidate)
         };

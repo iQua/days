@@ -73,7 +73,7 @@ fn test_drop_strategy_taildrop_small_buffer() {
     port.output.connect(PacketSink::packet_received, &sink_mbox);
 
     let mut sink_statistics = EventSlot::new();
-    sink.statistics().connect_sink(&sink_statistics);
+    sink.statistics().connect_sink(sink_statistics.writer());
 
     let t0 = MonotonicTime::EPOCH;
     match SimInit::new()
@@ -82,9 +82,9 @@ fn test_drop_strategy_taildrop_small_buffer() {
         .add_model(sink, sink_mbox, "TailDropSink")
         .init(t0)
     {
-        Ok((mut sim, _)) => {
+        Ok(mut sim) => {
             let _ = sim.step_until(Duration::from_secs(10));
-            let _ = sim.process_event(PacketSink::report, sink_id, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
 
             let packets_sent = CsvLogger::get_instance().total_packets_sent();
             if let Some(statistics) = sink_statistics.next() {
