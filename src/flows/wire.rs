@@ -30,6 +30,7 @@ pub struct Wire {
     pub output: Output<Packet>,
     pending_departures: VecDeque<Packet>,
     run_batch_size: usize,
+    schedule_scratch: Vec<(Duration, Packet)>,
 }
 
 impl Wire {
@@ -51,6 +52,7 @@ impl Wire {
             output: Output::default(),
             pending_departures: VecDeque::new(),
             run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
+            schedule_scratch: Vec::new(),
         }
     }
 
@@ -117,25 +119,30 @@ impl Wire {
             return;
         }
 
-        let mut schedule = Vec::with_capacity(self.run_batch_size);
+        if self.schedule_scratch.capacity() < self.run_batch_size {
+            self.schedule_scratch
+                .reserve(self.run_batch_size - self.schedule_scratch.capacity());
+        }
+
+        self.schedule_scratch.clear();
         while let Some(packet) = self.pending_departures.pop_front() {
             let delay = (packet.time - now).max(0.0);
-            schedule.push((Duration::from_secs_f64(delay), packet));
+            self.schedule_scratch
+                .push((Duration::from_secs_f64(delay), packet));
 
-            if schedule.len() == self.run_batch_size {
-                cx.schedule_event_batch_fast(
-                    schedule,
+            if self.schedule_scratch.len() == self.run_batch_size {
+                cx.schedule_event_batch_fast_in_place(
+                    &mut self.schedule_scratch,
                     &Self::FORWARD_SCHEDULED_SID,
                     Self::forward_scheduled,
                 )
                 .unwrap();
-                schedule = Vec::with_capacity(self.run_batch_size);
             }
         }
 
-        if !schedule.is_empty() {
-            cx.schedule_event_batch_fast(
-                schedule,
+        if !self.schedule_scratch.is_empty() {
+            cx.schedule_event_batch_fast_in_place(
+                &mut self.schedule_scratch,
                 &Self::FORWARD_SCHEDULED_SID,
                 Self::forward_scheduled,
             )
