@@ -5,10 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use nexosim::model::{Context, InitializedModel, Model};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
 use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 
@@ -26,7 +28,7 @@ fn to_ns(time_s: f64) -> u64 {
     (time_s.max(0.0) * 1e9).round() as u64
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PfcFrame {
     pub time: f64,
     pub sender_id: u64,
@@ -131,6 +133,10 @@ pub struct PfcIngressPort {
 }
 
 impl PfcIngressPort {
+    const REFRESH_SID: SchedulableId<Self, usize> = SchedulableId::__from_decorated(0);
+    const DRAIN_RETRY_SID: SchedulableId<Self, f64> = SchedulableId::__from_decorated(1);
+    const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(2);
+
     pub fn new(
         port_id: usize,
         peer_gate_id: usize,
@@ -228,7 +234,7 @@ impl PfcIngressPort {
                 self.refresh_scheduled_at[priority] = Some(refresh_at);
                 cx.schedule_event(
                     Duration::from_secs_f64((refresh_at - now).max(0.0)),
-                    Self::refresh,
+                    &Self::REFRESH_SID,
                     priority,
                 )
                 .unwrap();
@@ -323,7 +329,7 @@ impl PfcIngressPort {
             self.drain_scheduled_at = Some(retry_at);
             cx.schedule_event(
                 Duration::from_secs_f64((retry_at - now).max(0.0)),
-                Self::drain_retry,
+                &Self::DRAIN_RETRY_SID,
                 retry_at,
             )
             .unwrap();
@@ -397,7 +403,7 @@ impl PfcIngressPort {
         self.max_occupancy = self.total_occupancy;
     }
 
-    async fn log_report<'a>(&'a mut self, _: (), cx: &'a mut Context<Self>) {
+    async fn log_report(&mut self, _: (), cx: &Context<Self>) {
         let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
         let report = self.prepare_report(now);
         CsvLogger::log_report(Report::PfcPortReport(report), ReportTiming::InProgress);
@@ -407,6 +413,16 @@ impl PfcIngressPort {
 
 impl Model for PfcIngressPort {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::refresh));
+        registry.add(cx.register_schedulable(Self::drain_retry));
+        registry.add(cx.register_schedulable(Self::log_report));
+        registry
+    }
+
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
 
@@ -414,7 +430,7 @@ impl Model for PfcIngressPort {
             cx.schedule_periodic_event(
                 Duration::from_secs_f64(report_interval),
                 Duration::from_secs_f64(report_interval),
-                Self::log_report,
+                &Self::LOG_REPORT_SID,
                 (),
             )
             .unwrap();
@@ -443,6 +459,8 @@ pub struct PfcEgressGate {
 }
 
 impl PfcEgressGate {
+    const RESUME_SID: SchedulableId<Self, f64> = SchedulableId::__from_decorated(0);
+
     pub fn new(gate_id: usize, rate: f64) -> Self {
         Self {
             gate_id,
@@ -545,7 +563,7 @@ impl PfcEgressGate {
                 self.resume_scheduled_at = Some(resume_at);
                 cx.schedule_event(
                     Duration::from_secs_f64((resume_at - now).max(0.0)),
-                    Self::resume,
+                    &Self::RESUME_SID,
                     resume_at,
                 )
                 .unwrap();
@@ -652,6 +670,13 @@ impl PfcEgressGate {
 
 impl Model for PfcEgressGate {
     type Env = ();
+    fn register_schedulables(
+        cx: &mut BuildContext<impl ProtoModel<Model = Self>>,
+    ) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.add(cx.register_schedulable(Self::resume));
+        registry
+    }
 }
 
 #[cfg(all(test, feature = "l2_pfc"))]

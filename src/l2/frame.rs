@@ -2,7 +2,7 @@
 
 use crate::flows::packet::Packet;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LinkFrame {
     Data(Packet),
     #[cfg(feature = "l2_pfc")]
