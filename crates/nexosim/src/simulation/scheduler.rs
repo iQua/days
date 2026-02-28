@@ -289,6 +289,7 @@ pub(crate) struct SchedulerState {
     pub(super) local_buffers: LocalScheduleBuffers,
     executor_id: usize,
     prefer_prepared_fast_events: bool,
+    fast_only_scheduled_hint: AtomicBool,
     origin_seqs: OnceLock<Box<[CachePadded<AtomicU64>]>>,
     global_origin_seq: CachePadded<AtomicU64>,
     time_quantum_ns: AtomicU64,
@@ -312,6 +313,7 @@ impl SchedulerState {
             local_buffers: LocalScheduleBuffers { buffers },
             executor_id,
             prefer_prepared_fast_events,
+            fast_only_scheduled_hint: AtomicBool::new(true),
             origin_seqs: OnceLock::new(),
             global_origin_seq: CachePadded::new(AtomicU64::new(0)),
             time_quantum_ns: AtomicU64::new(0),
@@ -319,14 +321,6 @@ impl SchedulerState {
     }
 
     pub(super) fn flush_local(&self, scheduler_queue: &mut SchedulerQueue) {
-        let mut total_pending = 0usize;
-        for buf in self.local_buffers.buffers.iter() {
-            total_pending += unsafe { &*buf.get() }.len();
-        }
-        if total_pending != 0 {
-            scheduler_queue.reserve(total_pending);
-        }
-
         for buf in self.local_buffers.buffers.iter() {
             let buf = unsafe { &mut *buf.get() };
             for item in buf.drain(..) {
@@ -397,6 +391,17 @@ impl SchedulerState {
     #[inline]
     fn prefers_prepared_fast_events(&self) -> bool {
         self.prefer_prepared_fast_events
+    }
+
+    #[inline]
+    fn mark_non_fast_scheduled(&self) {
+        self.fast_only_scheduled_hint
+            .store(false, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn fast_only_scheduled_hint(&self) -> bool {
+        self.fast_only_scheduled_hint.load(Ordering::Relaxed)
     }
 
     fn local_worker_id_if_owned(&self) -> Option<usize> {
@@ -780,6 +785,7 @@ impl GlobalScheduler {
         if deadlines_and_args.is_empty() {
             return Ok(());
         }
+        self.state.mark_non_fast_scheduled();
 
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
             self.state
@@ -1180,6 +1186,10 @@ impl GlobalScheduler {
         item: QueueItem,
         origin_id: usize,
     ) -> Result<(), SchedulingError> {
+        if !matches!(&item, QueueItem::FastEvent(_)) {
+            self.state.mark_non_fast_scheduled();
+        }
+
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
             let now = self.time();
             let time = deadline.into_time(now);
