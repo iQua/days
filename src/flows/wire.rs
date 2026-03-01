@@ -29,12 +29,13 @@ pub struct Wire {
 
     pub output: Output<Packet>,
     pending_departures: VecDeque<Packet>,
+    scheduled_departures: VecDeque<Packet>,
     run_batch_size: usize,
-    schedule_scratch: Vec<(Duration, Packet)>,
+    schedule_scratch: Vec<(Duration, ())>,
 }
 
 impl Wire {
-    const FORWARD_SCHEDULED_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const FORWARD_SCHEDULED_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
 
     const DEFAULT_RUN_BATCH_SIZE: usize = 1;
 
@@ -54,6 +55,7 @@ impl Wire {
             rng,
             output: Output::default(),
             pending_departures: VecDeque::new(),
+            scheduled_departures: VecDeque::new(),
             run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
             schedule_scratch: Vec::new(),
         }
@@ -130,8 +132,9 @@ impl Wire {
         self.schedule_scratch.clear();
         while let Some(packet) = self.pending_departures.pop_front() {
             let delay = (packet.time - now).max(0.0);
+            self.scheduled_departures.push_back(packet);
             self.schedule_scratch
-                .push((Duration::from_secs_f64(delay), packet));
+                .push((Duration::from_secs_f64(delay), ()));
 
             if self.schedule_scratch.len() == self.run_batch_size {
                 cx.schedule_event_batch_fast_in_place(
@@ -163,7 +166,15 @@ impl Wire {
         self.output.send(packet).await;
     }
 
-    async fn forward_scheduled(&mut self, packet: Packet, _: &Context<Self>) {
+    async fn forward_scheduled(&mut self, _: (), _: &Context<Self>) {
+        let Some(packet) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "Wire {} scheduled departure queue underflow",
+                self.wire_id
+            );
+            return;
+        };
         self.forward_packet(packet).await;
     }
 }
