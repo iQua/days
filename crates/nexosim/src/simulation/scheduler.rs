@@ -8,9 +8,11 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
+use pin_project::pin_project;
 use recycle_box::{RecycleBox, coerce_box};
 use serde::Serialize;
 
@@ -289,6 +291,8 @@ pub(crate) struct SchedulerState {
     pub(super) local_buffers: LocalScheduleBuffers,
     executor_id: usize,
     prefer_prepared_fast_events: bool,
+    prefer_prepared_fast_events_single: bool,
+    always_reserve_batch: bool,
     fast_only_scheduled_hint: AtomicBool,
     origin_seqs: OnceLock<Box<[CachePadded<AtomicU64>]>>,
     global_origin_seq: CachePadded<AtomicU64>,
@@ -296,13 +300,43 @@ pub(crate) struct SchedulerState {
 }
 
 impl SchedulerState {
+    fn parse_bool_env(name: &str) -> Option<bool> {
+        let Ok(raw) = std::env::var(name) else {
+            return None;
+        };
+
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn resolve_prepared_fast_events_policy(num_workers: usize) -> bool {
+        let default = num_workers > 1;
+        Self::parse_bool_env("NEXOSIM_PREPARED_FAST_EVENTS").unwrap_or(default)
+    }
+
+    fn resolve_prepared_fast_events_single_policy(num_workers: usize) -> bool {
+        let default = num_workers > 1;
+        Self::parse_bool_env("NEXOSIM_PREPARED_FAST_EVENTS_SINGLE").unwrap_or(default)
+    }
+
+    fn resolve_always_reserve_batch_policy() -> bool {
+        Self::parse_bool_env("NEXOSIM_BATCH_RESERVE_ALWAYS").unwrap_or(false)
+    }
+
     pub(crate) fn new(
         scheduler_queue: Arc<Mutex<SchedulerQueue>>,
         executor_id: usize,
         num_workers: usize,
     ) -> Self {
         let num_workers = num_workers.max(1);
-        let prefer_prepared_fast_events = num_workers > 1;
+        let prefer_prepared_fast_events =
+            Self::resolve_prepared_fast_events_policy(num_workers);
+        let prefer_prepared_fast_events_single =
+            Self::resolve_prepared_fast_events_single_policy(num_workers);
+        let always_reserve_batch = Self::resolve_always_reserve_batch_policy();
         let buffers = (0..num_workers)
             .map(|_| CachePadded::new(UnsafeCell::new(Vec::new())))
             .collect::<Vec<_>>()
@@ -313,6 +347,8 @@ impl SchedulerState {
             local_buffers: LocalScheduleBuffers { buffers },
             executor_id,
             prefer_prepared_fast_events,
+            prefer_prepared_fast_events_single,
+            always_reserve_batch,
             fast_only_scheduled_hint: AtomicBool::new(true),
             origin_seqs: OnceLock::new(),
             global_origin_seq: CachePadded::new(AtomicU64::new(0)),
@@ -391,6 +427,16 @@ impl SchedulerState {
     #[inline]
     fn prefers_prepared_fast_events(&self) -> bool {
         self.prefer_prepared_fast_events
+    }
+
+    #[inline]
+    fn prefers_prepared_fast_events_single(&self) -> bool {
+        self.prefer_prepared_fast_events_single
+    }
+
+    #[inline]
+    fn always_reserve_batch(&self) -> bool {
+        self.always_reserve_batch
     }
 
     #[inline]
@@ -481,6 +527,35 @@ where
     }
 }
 
+#[inline(always)]
+fn make_fast_batch_future<M, F, T, S>(
+    sender: Sender<M>,
+    func: F,
+    arg: T,
+) -> impl Future<Output = ()> + Send + 'static
+where
+    M: Model,
+    F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
+    S: Send + Sync + 'static,
+    T: Serialize + Send + 'static,
+{
+    async move {
+        // Ignore send errors (e.g. no recipient), like the standard scheduler path.
+        let _ = sender
+            .send(
+                move |model: &mut M,
+                      scheduler,
+                      env,
+                      recycle_box: RecycleBox<()>|
+                      -> RecycleBox<dyn Future<Output = ()> + Send + '_> {
+                    let fut = func.call(model, arg, scheduler, env);
+                    coerce_box!(RecycleBox::recycle(recycle_box, fut))
+                },
+            )
+            .await;
+    }
+}
+
 impl<M, F, S, T> FastScheduledEvent for FastBatchEvent<M, F, S, T>
 where
     M: Model,
@@ -502,23 +577,7 @@ where
         } = *self;
 
         let arg = arg.expect("fast scheduled event consumed more than once");
-        let fut = async move {
-            // Ignore send errors (e.g. no recipient), like the standard scheduler path.
-            let _ = sender
-                .send(
-                    move |model: &mut M,
-                          scheduler,
-                          env,
-                          recycle_box: RecycleBox<()>|
-                          -> RecycleBox<dyn Future<Output = ()> + Send + '_> {
-                        let fut = func.call(model, arg, scheduler, env);
-                        coerce_box!(RecycleBox::recycle(recycle_box, fut))
-                    },
-                )
-                .await;
-        };
-
-        Box::pin(fut)
+        Box::pin(make_fast_batch_future(sender, func, arg))
     }
 
     fn spawn_and_forget(self: Box<Self>, executor: &Executor) {
@@ -531,22 +590,7 @@ where
         } = *self;
 
         let arg = arg.expect("fast scheduled event consumed more than once");
-
-        executor.spawn_and_forget(async move {
-            // Ignore send errors (e.g. no recipient), like the standard scheduler path.
-            let _ = sender
-                .send(
-                    move |model: &mut M,
-                          scheduler,
-                          env,
-                          recycle_box: RecycleBox<()>|
-                          -> RecycleBox<dyn Future<Output = ()> + Send + '_> {
-                        let fut = func.call(model, arg, scheduler, env);
-                        coerce_box!(RecycleBox::recycle(recycle_box, fut))
-                    },
-                )
-                .await;
-        });
+        executor.spawn_and_forget(make_fast_batch_future(sender, func, arg));
     }
 
     fn to_serializable_parts(
@@ -584,63 +628,65 @@ where
     }
 }
 
-struct FastBatchPreparedEvent<T>
+#[pin_project]
+struct FastBatchPreparedEvent<T, Fut>
 where
     T: Serialize + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
     event_id: EventIdErased,
     arg: Option<T>,
-    fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    #[pin]
+    fut: Fut,
 }
 
-impl<T> FastBatchPreparedEvent<T>
+fn new_prepared_fast_batch_event<M, F, T, S>(
+    event_id: EventIdErased,
+    sender: Sender<M>,
+    func: F,
+    arg: T,
+) -> FastBatchPreparedEvent<T, impl Future<Output = ()> + Send + 'static>
 where
+    M: Model,
+    F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
+    S: Send + Sync + 'static,
     T: Serialize + Send + Clone + 'static,
 {
-    fn new<M, F, S>(event_id: EventIdErased, sender: Sender<M>, func: F, arg: T) -> Self
-    where
-        M: Model,
-        F: for<'a> InputFn<'a, M, T, S> + Clone + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-    {
-        let serializable_arg = arg.clone();
+    let serializable_arg = arg.clone();
+    let fut = make_fast_batch_future(sender, func, arg);
 
-        let fut = async move {
-            // Ignore send errors (e.g. no recipient), like the standard scheduler path.
-            let _ = sender
-                .send(
-                    move |model: &mut M,
-                          scheduler,
-                          env,
-                          recycle_box: RecycleBox<()>|
-                          -> RecycleBox<dyn Future<Output = ()> + Send + '_> {
-                        let fut = func.call(model, arg, scheduler, env);
-                        coerce_box!(RecycleBox::recycle(recycle_box, fut))
-                    },
-                )
-                .await;
-        };
-
-        Self {
-            event_id,
-            arg: Some(serializable_arg),
-            fut: Some(Box::pin(fut)),
-        }
+    FastBatchPreparedEvent {
+        event_id,
+        arg: Some(serializable_arg),
+        fut,
     }
 }
 
-impl<T> FastScheduledEvent for FastBatchPreparedEvent<T>
+impl<T, Fut> Future for FastBatchPreparedEvent<T, Fut>
 where
     T: Serialize + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    type Output = ();
+
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().fut.poll(cx)
+    }
+}
+
+impl<T, Fut> FastScheduledEvent for FastBatchPreparedEvent<T, Fut>
+where
+    T: Serialize + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
     fn event_id(&self) -> EventIdErased {
         self.event_id
     }
 
-    fn into_future(mut self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        self.fut
-            .take()
-            .expect("fast scheduled event consumed more than once")
+    fn into_future(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        // No extra allocation is needed: `Self` is already a `Future`.
+        Box::into_pin(self)
     }
 
     fn to_serializable_parts(
@@ -663,9 +709,10 @@ where
     }
 }
 
-impl<T> fmt::Debug for FastBatchPreparedEvent<T>
+impl<T, Fut> fmt::Debug for FastBatchPreparedEvent<T, Fut>
 where
     T: Serialize + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FastBatchPreparedEvent")
@@ -758,11 +805,12 @@ impl GlobalScheduler {
     {
         let sender = address.into().0;
         let event_id = EventIdErased::from(event_id);
-        let event: Box<dyn FastScheduledEvent> = if self.state.prefers_prepared_fast_events() {
-            Box::new(FastBatchPreparedEvent::new(event_id, sender, func, arg))
-        } else {
-            Box::new(FastBatchEvent::new(event_id, sender, func, arg))
-        };
+        let event: Box<dyn FastScheduledEvent> =
+            if self.state.prefers_prepared_fast_events_single() {
+                Box::new(new_prepared_fast_batch_event(event_id, sender, func, arg))
+            } else {
+                Box::new(FastBatchEvent::new(event_id, sender, func, arg))
+            };
         let item = QueueItem::FastEvent(FastEvent::new(event));
 
         self.schedule_item_from(deadline, item, origin_id)
@@ -786,11 +834,13 @@ impl GlobalScheduler {
             return Ok(());
         }
         self.state.mark_non_fast_scheduled();
-
+        let reserve_batch = self.state.always_reserve_batch() || deadlines_and_args.len() > 1;
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
-            self.state
-                .local_buffers
-                .reserve(worker_id, deadlines_and_args.len());
+            if reserve_batch {
+                self.state
+                    .local_buffers
+                    .reserve(worker_id, deadlines_and_args.len());
+            }
             let now = self.time();
             for (deadline, _) in &deadlines_and_args {
                 let time = (*deadline).into_time(now);
@@ -828,7 +878,9 @@ impl GlobalScheduler {
             }
         }
 
-        scheduler_queue.reserve(deadlines_and_args.len());
+        if reserve_batch {
+            scheduler_queue.reserve(deadlines_and_args.len());
+        }
         for (deadline, arg) in deadlines_and_args {
             let time = self.state.quantize_time(deadline.into_time(now));
             let seq = self.state.next_seq(origin_id);
@@ -864,15 +916,17 @@ impl GlobalScheduler {
         if deadlines_and_args.is_empty() {
             return Ok(());
         }
-
+        let reserve_batch = self.state.always_reserve_batch() || deadlines_and_args.len() > 1;
         let sender = address.into().0;
         let event_id = EventIdErased::from(event_id);
         let use_prepared_fast_events = self.state.prefers_prepared_fast_events();
 
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
-            self.state
-                .local_buffers
-                .reserve(worker_id, deadlines_and_args.len());
+            if reserve_batch {
+                self.state
+                    .local_buffers
+                    .reserve(worker_id, deadlines_and_args.len());
+            }
             let now = self.time();
             for (deadline, _) in &deadlines_and_args {
                 let time = (*deadline).into_time(now);
@@ -886,7 +940,7 @@ impl GlobalScheduler {
                     let time = self.state.quantize_time(deadline.into_time(now));
                     let seq = self.state.next_seq(origin_id);
                     let item = QueueItem::FastEvent(FastEvent::new(Box::new(
-                        FastBatchPreparedEvent::new(event_id, sender.clone(), func.clone(), arg),
+                        new_prepared_fast_batch_event(event_id, sender.clone(), func.clone(), arg),
                     )));
 
                     self.state.local_buffers.push(
@@ -937,13 +991,15 @@ impl GlobalScheduler {
             }
         }
 
-        scheduler_queue.reserve(deadlines_and_args.len());
+        if reserve_batch {
+            scheduler_queue.reserve(deadlines_and_args.len());
+        }
         if use_prepared_fast_events {
             for (deadline, arg) in deadlines_and_args {
                 let time = self.state.quantize_time(deadline.into_time(now));
                 let seq = self.state.next_seq(origin_id);
                 let item = QueueItem::FastEvent(FastEvent::new(Box::new(
-                    FastBatchPreparedEvent::new(event_id, sender.clone(), func.clone(), arg),
+                    new_prepared_fast_batch_event(event_id, sender.clone(), func.clone(), arg),
                 )));
                 scheduler_queue.insert_with_epoch((time, origin_id), item, seq);
             }
@@ -988,15 +1044,17 @@ impl GlobalScheduler {
         if deadlines_and_args.is_empty() {
             return Ok(());
         }
-
+        let reserve_batch = self.state.always_reserve_batch() || deadlines_and_args.len() > 1;
         let sender = address.into().0;
         let event_id = EventIdErased::from(event_id);
         let use_prepared_fast_events = self.state.prefers_prepared_fast_events();
 
         if let Some(worker_id) = self.state.local_worker_id_if_owned() {
-            self.state
-                .local_buffers
-                .reserve(worker_id, deadlines_and_args.len());
+            if reserve_batch {
+                self.state
+                    .local_buffers
+                    .reserve(worker_id, deadlines_and_args.len());
+            }
             let now = self.time();
             for (deadline, _) in deadlines_and_args.iter() {
                 let time = (*deadline).into_time(now);
@@ -1010,7 +1068,7 @@ impl GlobalScheduler {
                     let time = self.state.quantize_time(deadline.into_time(now));
                     let seq = self.state.next_seq(origin_id);
                     let item = QueueItem::FastEvent(FastEvent::new(Box::new(
-                        FastBatchPreparedEvent::new(event_id, sender.clone(), func.clone(), arg),
+                        new_prepared_fast_batch_event(event_id, sender.clone(), func.clone(), arg),
                     )));
 
                     self.state.local_buffers.push(
@@ -1061,13 +1119,15 @@ impl GlobalScheduler {
             }
         }
 
-        scheduler_queue.reserve(deadlines_and_args.len());
+        if reserve_batch {
+            scheduler_queue.reserve(deadlines_and_args.len());
+        }
         if use_prepared_fast_events {
             for (deadline, arg) in deadlines_and_args.drain(..) {
                 let time = self.state.quantize_time(deadline.into_time(now));
                 let seq = self.state.next_seq(origin_id);
                 let item = QueueItem::FastEvent(FastEvent::new(Box::new(
-                    FastBatchPreparedEvent::new(event_id, sender.clone(), func.clone(), arg),
+                    new_prepared_fast_batch_event(event_id, sender.clone(), func.clone(), arg),
                 )));
                 scheduler_queue.insert_with_epoch((time, origin_id), item, seq);
             }
@@ -1232,6 +1292,7 @@ impl GlobalScheduler {
 
         Ok(())
     }
+
 }
 
 impl fmt::Debug for GlobalScheduler {
