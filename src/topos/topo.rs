@@ -335,11 +335,8 @@ impl Topology {
                     info!("Using default concurrency level.");
                 }
                 ConcurrencyLevel::Accelerated => {
-                    // Keep accelerated mode distinct from default by bundling
-                    // origin groups in proportion to runtime thread count.
-                    // This preserves the intended high-throughput policy used
-                    // by large multi-thread benchmarks.
-                    sim_init = sim_init.set_max_groups_per_step_task(runtime_num_threads);
+                    let groups_per_task = runtime_num_threads.saturating_mul(10).max(1);
+                    sim_init = sim_init.set_max_groups_per_step_task(groups_per_task);
                     info!("Using accelerated concurrency level.");
                 }
             }
