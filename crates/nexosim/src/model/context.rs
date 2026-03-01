@@ -247,7 +247,6 @@ impl<M: Model> Context<M> {
         )
     }
 
-
     /// Schedules a cancellable event at a future time on this model and returns
     /// an action key.
     ///
