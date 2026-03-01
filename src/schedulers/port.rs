@@ -73,7 +73,8 @@ pub struct Port {
     throughput_mean: f64,
     queueing_delay_mean: f64,
     run_batch_size: usize,
-    run_schedule_scratch: Vec<(Duration, Packet)>,
+    run_schedule_scratch: Vec<(Duration, ())>,
+    scheduled_departures: VecDeque<Packet>,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -81,7 +82,7 @@ pub struct Port {
 }
 
 impl Port {
-    const SEND_SCHEDULED_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const SEND_SCHEDULED_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
     const DEFAULT_RUN_BATCH_SIZE: usize = 1;
@@ -150,6 +151,7 @@ impl Port {
             queueing_delay_mean: 0.0,
             run_batch_size,
             run_schedule_scratch: Vec::with_capacity(run_batch_size),
+            scheduled_departures: VecDeque::with_capacity(run_batch_size),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -336,10 +338,23 @@ impl Port {
     }
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
-        self.send_scheduled(packet, cx).await;
+        self.send(packet).await;
+
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0 {
+            self.run(self.time, cx).await;
+        }
     }
 
-    async fn send_scheduled(&mut self, packet: Packet, cx: &Context<Self>) {
+    async fn send_scheduled(&mut self, _: (), cx: &Context<Self>) {
+        let Some(packet) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "Port {} scheduled departure queue underflow",
+                self.scheduler_id
+            );
+            return;
+        };
         self.send(packet).await;
 
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -405,8 +420,9 @@ impl Port {
                 self.packet_sent(departure_time, &packet);
 
                 let delay = (departure_time - run_time).max(0.0);
+                self.scheduled_departures.push_back(packet);
                 self.run_schedule_scratch
-                    .push((Duration::from_secs_f64(delay), packet));
+                    .push((Duration::from_secs_f64(delay), ()));
 
                 self.in_flight += 1;
                 service_start = departure_time;
