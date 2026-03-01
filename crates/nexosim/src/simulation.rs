@@ -771,107 +771,40 @@ impl Simulation {
         let mut queries_this_step: u64 = 0;
 
         // Spawn scheduled events matching the current time stamp.
-        while next_key.map(|key| key.0 == time).unwrap_or(false) {
-            let current_key = next_key.unwrap();
-            let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
+        if fast_only_scheduled_hint {
+            while next_key.map(|key| key.0 == time).unwrap_or(false) {
+                let current_key = next_key.unwrap();
+                let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-            #[cfg(feature = "perf_stats")]
-            {
-                actions_this_step += 1;
-            }
-
-            let mut candidate_next = peek_next_key(&mut scheduler_queue);
-
-            let first_fut = match item {
-                QueueItem::FastEvent(event)
-                    if allow_direct_fast_spawn && candidate_next != Some(current_key) =>
+                #[cfg(feature = "perf_stats")]
                 {
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        scheduled_fast_this_step += 1;
-                        groups_this_step += 1;
+                    actions_this_step += 1;
+                }
+
+                let mut candidate_next = peek_next_key(&mut scheduler_queue);
+
+                let first_fut = if let QueueItem::FastEvent(event) = item {
+                    if allow_direct_fast_spawn && candidate_next != Some(current_key) {
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            scheduled_fast_this_step += 1;
+                            groups_this_step += 1;
+                        }
+
+                        event.spawn_and_forget(&self.executor);
+                        has_events = true;
+                        next_key = candidate_next;
+                        continue;
                     }
 
-                    // Dominant hot path in Days ST/MT runs: singleton fast events.
-                    // Spawn directly to avoid transient future boxing.
-                    event.spawn_and_forget(&self.executor);
-                    has_events = true;
-                    next_key = candidate_next;
-                    continue;
-                }
-                QueueItem::FastEvent(event) => {
                     #[cfg(feature = "perf_stats")]
                     {
                         scheduled_fast_this_step += 1;
                     }
 
                     event.into_future()
-                }
-                QueueItem::Event(event) => {
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        scheduled_erased_this_step += 1;
-                    }
-
-                    let source = self
-                        .scheduler_registry
-                        .get_event_source(&event.event_id)
-                        .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
-
-                    if let Some(period) = event.period {
-                        let fut = source.future_borrowed(&*event.arg, event.key.as_ref())?;
-                        let next_time = self.scheduler_state.quantize_time(item_time + period);
-                        let seq = self.scheduler_state.next_seq(origin_id);
-                        scheduler_queue.insert_with_epoch(
-                            (next_time, origin_id),
-                            QueueItem::Event(event),
-                            seq,
-                        );
-                        fut
-                    } else {
-                        source.future_owned(event.arg, event.key)?
-                    }
-                }
-                QueueItem::Query(query) => {
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        queries_this_step += 1;
-                    }
-
-                    let source = self
-                        .scheduler_registry
-                        .get_query_source(&query.query_id)
-                        .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
-                    source.future(query.arg, query.replier)?
-                }
-            };
-
-            if candidate_next != Some(current_key) {
-                // Fast path: singleton group.
-                push_group_future(first_fut);
-            } else {
-                // Merge all events with the same origin in a single future to
-                // preserve event ordering.
-                let mut event_seq = SeqFuture::new();
-                event_seq.push(first_fut);
-
-                while candidate_next == Some(current_key) {
-                    let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
-
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        actions_this_step += 1;
-                    }
-
-                    let fut = match item {
-                        QueueItem::FastEvent(event) => {
-                            #[cfg(feature = "perf_stats")]
-                            {
-                                scheduled_fast_this_step += 1;
-                            }
-
-                            event.into_future()
-                        }
+                } else {
+                    match item {
                         QueueItem::Event(event) => {
                             #[cfg(feature = "perf_stats")]
                             {
@@ -909,24 +842,252 @@ impl Simulation {
                                 .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
                             source.future(query.arg, query.replier)?
                         }
-                    };
+                        QueueItem::FastEvent(_) => unreachable!(),
+                    }
+                };
 
-                    event_seq.push(fut);
-                    candidate_next = peek_next_key(&mut scheduler_queue);
+                if candidate_next != Some(current_key) {
+                    // Fast path: singleton group.
+                    push_group_future(first_fut);
+                } else {
+                    let mut event_seq = SeqFuture::new();
+                    event_seq.push(first_fut);
+
+                    while candidate_next == Some(current_key) {
+                        let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
+
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            actions_this_step += 1;
+                        }
+
+                        let fut = if let QueueItem::FastEvent(event) = item {
+                            #[cfg(feature = "perf_stats")]
+                            {
+                                scheduled_fast_this_step += 1;
+                            }
+
+                            event.into_future()
+                        } else {
+                            match item {
+                                QueueItem::Event(event) => {
+                                    #[cfg(feature = "perf_stats")]
+                                    {
+                                        scheduled_erased_this_step += 1;
+                                    }
+
+                                    let source = self
+                                        .scheduler_registry
+                                        .get_event_source(&event.event_id)
+                                        .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                                    if let Some(period) = event.period {
+                                        let fut =
+                                            source.future_borrowed(&*event.arg, event.key.as_ref())?;
+                                        let next_time =
+                                            self.scheduler_state.quantize_time(item_time + period);
+                                        let seq = self.scheduler_state.next_seq(origin_id);
+                                        scheduler_queue.insert_with_epoch(
+                                            (next_time, origin_id),
+                                            QueueItem::Event(event),
+                                            seq,
+                                        );
+                                        fut
+                                    } else {
+                                        source.future_owned(event.arg, event.key)?
+                                    }
+                                }
+                                QueueItem::Query(query) => {
+                                    #[cfg(feature = "perf_stats")]
+                                    {
+                                        queries_this_step += 1;
+                                    }
+
+                                    let source = self
+                                        .scheduler_registry
+                                        .get_query_source(&query.query_id)
+                                        .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
+                                    source.future(query.arg, query.replier)?
+                                }
+                                QueueItem::FastEvent(_) => unreachable!(),
+                            }
+                        };
+
+                        event_seq.push(fut);
+                        candidate_next = peek_next_key(&mut scheduler_queue);
+                    }
+
+                    // Spawn a compound future that sequentially polls all events
+                    // targeting the same mailbox.
+                    push_group_future(Box::pin(event_seq));
                 }
 
-                // Spawn a compound future that sequentially polls all events
-                // targeting the same mailbox.
-                push_group_future(Box::pin(event_seq));
-            }
+                #[cfg(feature = "perf_stats")]
+                {
+                    groups_this_step += 1;
+                }
 
-            #[cfg(feature = "perf_stats")]
-            {
-                groups_this_step += 1;
+                has_events = true;
+                next_key = candidate_next;
             }
+        } else {
+            while next_key.map(|key| key.0 == time).unwrap_or(false) {
+                let current_key = next_key.unwrap();
+                let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-            has_events = true;
-            next_key = candidate_next;
+                #[cfg(feature = "perf_stats")]
+                {
+                    actions_this_step += 1;
+                }
+
+                let mut candidate_next = peek_next_key(&mut scheduler_queue);
+
+                let first_fut = match item {
+                    QueueItem::FastEvent(event)
+                        if allow_direct_fast_spawn && candidate_next != Some(current_key) =>
+                    {
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            scheduled_fast_this_step += 1;
+                            groups_this_step += 1;
+                        }
+
+                        // Dominant hot path in Days ST/MT runs: singleton fast events.
+                        // Spawn directly to avoid transient future boxing.
+                        event.spawn_and_forget(&self.executor);
+                        has_events = true;
+                        next_key = candidate_next;
+                        continue;
+                    }
+                    QueueItem::FastEvent(event) => {
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            scheduled_fast_this_step += 1;
+                        }
+
+                        event.into_future()
+                    }
+                    QueueItem::Event(event) => {
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            scheduled_erased_this_step += 1;
+                        }
+
+                        let source = self
+                            .scheduler_registry
+                            .get_event_source(&event.event_id)
+                            .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                        if let Some(period) = event.period {
+                            let fut = source.future_borrowed(&*event.arg, event.key.as_ref())?;
+                            let next_time = self.scheduler_state.quantize_time(item_time + period);
+                            let seq = self.scheduler_state.next_seq(origin_id);
+                            scheduler_queue.insert_with_epoch(
+                                (next_time, origin_id),
+                                QueueItem::Event(event),
+                                seq,
+                            );
+                            fut
+                        } else {
+                            source.future_owned(event.arg, event.key)?
+                        }
+                    }
+                    QueueItem::Query(query) => {
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            queries_this_step += 1;
+                        }
+
+                        let source = self
+                            .scheduler_registry
+                            .get_query_source(&query.query_id)
+                            .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
+                        source.future(query.arg, query.replier)?
+                    }
+                };
+
+                if candidate_next != Some(current_key) {
+                    // Fast path: singleton group.
+                    push_group_future(first_fut);
+                } else {
+                    // Merge all events with the same origin in a single future to
+                    // preserve event ordering.
+                    let mut event_seq = SeqFuture::new();
+                    event_seq.push(first_fut);
+
+                    while candidate_next == Some(current_key) {
+                        let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
+
+                        #[cfg(feature = "perf_stats")]
+                        {
+                            actions_this_step += 1;
+                        }
+
+                        let fut = match item {
+                            QueueItem::FastEvent(event) => {
+                                #[cfg(feature = "perf_stats")]
+                                {
+                                    scheduled_fast_this_step += 1;
+                                }
+
+                                event.into_future()
+                            }
+                            QueueItem::Event(event) => {
+                                #[cfg(feature = "perf_stats")]
+                                {
+                                    scheduled_erased_this_step += 1;
+                                }
+
+                                let source = self
+                                    .scheduler_registry
+                                    .get_event_source(&event.event_id)
+                                    .ok_or(ExecutionError::InvalidEventId(event.event_id.0))?;
+
+                                if let Some(period) = event.period {
+                                    let fut = source.future_borrowed(&*event.arg, event.key.as_ref())?;
+                                    let next_time = self.scheduler_state.quantize_time(item_time + period);
+                                    let seq = self.scheduler_state.next_seq(origin_id);
+                                    scheduler_queue.insert_with_epoch(
+                                        (next_time, origin_id),
+                                        QueueItem::Event(event),
+                                        seq,
+                                    );
+                                    fut
+                                } else {
+                                    source.future_owned(event.arg, event.key)?
+                                }
+                            }
+                            QueueItem::Query(query) => {
+                                #[cfg(feature = "perf_stats")]
+                                {
+                                    queries_this_step += 1;
+                                }
+
+                                let source = self
+                                    .scheduler_registry
+                                    .get_query_source(&query.query_id)
+                                    .ok_or(ExecutionError::InvalidQueryId(query.query_id.0))?;
+                                source.future(query.arg, query.replier)?
+                            }
+                        };
+
+                        event_seq.push(fut);
+                        candidate_next = peek_next_key(&mut scheduler_queue);
+                    }
+
+                    // Spawn a compound future that sequentially polls all events
+                    // targeting the same mailbox.
+                    push_group_future(Box::pin(event_seq));
+                }
+
+                #[cfg(feature = "perf_stats")]
+                {
+                    groups_this_step += 1;
+                }
+
+                has_events = true;
+                next_key = candidate_next;
+            }
         }
 
         // Make sure the scheduler's mutex is released before the potentially
