@@ -7,7 +7,7 @@
 //! pp. 19, 1990.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,6 +133,7 @@ pub struct VirtualClockServer {
     queueing_delay_mean: f64,
 
     time_packet_sent: f64,
+    scheduled_departures: VecDeque<Packet>,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -140,7 +141,7 @@ pub struct VirtualClockServer {
 }
 
 impl VirtualClockServer {
-    const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const SEND_AND_RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
     pub fn new(
@@ -209,6 +210,7 @@ impl VirtualClockServer {
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
             time_packet_sent: 0.0,
+            scheduled_departures: VecDeque::new(),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -423,7 +425,15 @@ impl VirtualClockServer {
         self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
+    pub async fn send_and_run(&mut self, _: (), cx: &Context<Self>) {
+        let Some(packet) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "VirtualClockServer {} scheduled departure queue underflow",
+                self.scheduler_id
+            );
+            return;
+        };
         self.send(packet).await;
         self.run(self.time, cx);
     }
@@ -434,18 +444,19 @@ impl VirtualClockServer {
     {
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
-
-            let outbound = tagged_outbound.packet.clone();
-            let class_id = (self.flow_classes)(outbound.flow_id);
+            let packet_id = tagged_outbound.packet.packet_id;
+            let packet_size = tagged_outbound.packet.size;
+            let flow_id = tagged_outbound.packet.flow_id;
+            let class_id = (self.flow_classes)(flow_id);
             let flow_queue_count = self.flow_queue_count.entry(class_id).or_insert(0);
             *flow_queue_count -= 1;
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
-            *byte_size -= outbound.size;
+            *byte_size -= packet_size;
 
             tagged_outbound.packet.queueing_delay_update(self.time);
 
             // sends the packet out to the next element after a timeout
-            let timeout = outbound.size as f64 * 8.0 / self.rate;
+            let timeout = packet_size as f64 * 8.0 / self.rate;
             let departure_time = quantize_after(self.time, timeout);
             tagged_outbound.packet.departure_update(departure_time);
             self.time_packet_sent = departure_time;
@@ -460,9 +471,9 @@ impl VirtualClockServer {
                 "VirtualClockServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                         {} packets in the queue.",
                 self.scheduler_id,
-                outbound.packet_id,
-                outbound.size,
-                outbound.flow_id,
+                packet_id,
+                packet_size,
+                flow_id,
                 departure_time,
                 self.scheduler_queue.len(),
             );
@@ -488,15 +499,21 @@ impl VirtualClockServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
+        let mut events = Vec::with_capacity(1);
         self.schedule_packet(|_now, delay, outbound| {
+            events.push((delay, outbound));
+        });
+
+        for (delay, outbound) in events {
+            self.scheduled_departures.push_back(outbound.packet);
             cx.schedule_event_fast(
                 Duration::from_secs_f64(delay),
                 &Self::SEND_AND_RUN_SID,
                 Self::send_and_run,
-                outbound.packet,
+                (),
             )
             .unwrap();
-        });
+        }
     }
 
     #[cfg(test)]

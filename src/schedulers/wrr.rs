@@ -89,6 +89,8 @@ pub struct WRRServer {
     throughput_mean: f64,
     queueing_delay_mean: f64,
     run_batch_size: usize,
+    run_schedule_scratch: Vec<(Duration, ())>,
+    scheduled_departures: VecDeque<Packet>,
     in_flight: usize,
 
     /// a vector of packets that have been sent out, only used for unit testing
@@ -97,7 +99,7 @@ pub struct WRRServer {
 }
 
 impl WRRServer {
-    const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const SEND_AND_RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
     const DEFAULT_RUN_BATCH_SIZE: usize = 1;
@@ -178,6 +180,8 @@ impl WRRServer {
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
             run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
+            run_schedule_scratch: Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE),
+            scheduled_departures: VecDeque::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE),
             in_flight: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
@@ -188,6 +192,14 @@ impl WRRServer {
         self.run_batch_size = run_batch_size
             .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
             .max(1);
+        if self.run_schedule_scratch.capacity() < self.run_batch_size {
+            self.run_schedule_scratch
+                .reserve(self.run_batch_size - self.run_schedule_scratch.capacity());
+        }
+        if self.scheduled_departures.capacity() < self.run_batch_size {
+            self.scheduled_departures
+                .reserve(self.run_batch_size - self.scheduled_departures.capacity());
+        }
     }
 
     pub fn id(&self) -> usize {
@@ -366,7 +378,15 @@ impl WRRServer {
         self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
+    pub async fn send_and_run(&mut self, _: (), cx: &Context<Self>) {
+        let Some(packet) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "WRRServer {} scheduled departure queue underflow",
+                self.scheduler_id
+            );
+            return;
+        };
         self.send(packet).await;
         self.in_flight = self.in_flight.saturating_sub(1);
         if self.in_flight == 0 {
@@ -453,7 +473,7 @@ impl WRRServer {
             return;
         }
 
-        let mut schedule = Vec::with_capacity(self.run_batch_size);
+        self.run_schedule_scratch.clear();
         let mut service_start = run_time;
         let mut visit_class = None;
 
@@ -469,14 +489,20 @@ impl WRRServer {
             }
 
             let delay = (departure_time - run_time).max(0.0);
-            schedule.push((Duration::from_secs_f64(delay), packet));
+            self.scheduled_departures.push_back(packet);
+            self.run_schedule_scratch
+                .push((Duration::from_secs_f64(delay), ()));
             self.in_flight += 1;
             service_start = departure_time;
         }
 
-        if !schedule.is_empty() {
-            cx.schedule_event_batch_fast(schedule, &Self::SEND_AND_RUN_SID, Self::send_and_run)
-                .unwrap();
+        if !self.run_schedule_scratch.is_empty() {
+            cx.schedule_event_batch_fast_in_place(
+                &mut self.run_schedule_scratch,
+                &Self::SEND_AND_RUN_SID,
+                Self::send_and_run,
+            )
+            .unwrap();
         }
     }
 

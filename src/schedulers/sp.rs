@@ -86,6 +86,7 @@ pub struct SPServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+    scheduled_departures: VecDeque<Packet>,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -93,7 +94,7 @@ pub struct SPServer {
 }
 
 impl SPServer {
-    const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const SEND_AND_RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
     pub fn new(
@@ -162,6 +163,7 @@ impl SPServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            scheduled_departures: VecDeque::new(),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -350,7 +352,15 @@ impl SPServer {
         self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
+    pub async fn send_and_run(&mut self, _: (), cx: &Context<Self>) {
+        let Some(packet) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "SPServer {} scheduled departure queue underflow",
+                self.scheduler_id
+            );
+            return;
+        };
         self.send(packet).await;
         self.run(self.time, cx);
     }
@@ -387,17 +397,20 @@ impl SPServer {
 
             // call provided event handler
             let delay = (departure_time - self.time).max(0.0);
-            schedule_event(self.time, delay, packet.clone());
+            let packet_id = packet.packet_id;
+            let packet_size = packet.size;
+            let packet_flow_id = packet.flow_id;
+            schedule_event(self.time, delay, packet);
 
             self.busy_until = departure_time;
 
             debug!(
                 "SPServer {} will send packet {} ({} bytes, priority {}) from flow {} at time {:.8e}. {} packets in the priority queue.",
                 self.scheduler_id,
-                packet.packet_id,
-                packet.size,
+                packet_id,
+                packet_size,
                 current_priority,
-                packet.flow_id,
+                packet_flow_id,
                 departure_time,
                 queue.len(),
             );
@@ -423,15 +436,21 @@ impl SPServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
+        let mut events = Vec::with_capacity(1);
         self.schedule_packet(|_now, delay, outbound| {
+            events.push((delay, outbound));
+        });
+
+        for (delay, outbound) in events {
+            self.scheduled_departures.push_back(outbound);
             cx.schedule_event_fast(
                 Duration::from_secs_f64(delay),
                 &Self::SEND_AND_RUN_SID,
                 Self::send_and_run,
-                outbound,
+                (),
             )
             .unwrap();
-        });
+        }
     }
 
     #[cfg(test)]

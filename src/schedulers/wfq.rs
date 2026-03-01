@@ -9,7 +9,7 @@
 //! https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=234856
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,6 +151,7 @@ pub struct WFQServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
+    scheduled_departures: VecDeque<Packet>,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -158,7 +159,7 @@ pub struct WFQServer {
 }
 
 impl WFQServer {
-    const SEND_AND_RUN_SID: SchedulableId<Self, Packet> = SchedulableId::__from_decorated(0);
+    const SEND_AND_RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
     pub fn new(
@@ -237,6 +238,7 @@ impl WFQServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
+            scheduled_departures: VecDeque::new(),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -522,8 +524,6 @@ impl WFQServer {
     #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
-
-        self.output.send(packet.clone()).await;
         self.update_stats_on_packet_forwarded(&packet);
         self.update_internal_states(&packet, self.time_packet_sent);
 
@@ -534,10 +534,10 @@ impl WFQServer {
                 .take()
                 .expect("WFQ pending log missing for depart event");
             debug_assert!(
-                pending.packet_id == packet.packet_id && pending.flow_id == packet.flow_id,
-                "WFQ pending log mismatch for scheduler {}",
-                self.scheduler_id
-            );
+                    pending.packet_id == packet.packet_id && pending.flow_id == packet.flow_id,
+                    "WFQ pending log mismatch for scheduler {}",
+                    self.scheduler_id
+                );
             self.log_wfq_event(
                 WfqEventKind::Depart,
                 packet.time,
@@ -545,11 +545,21 @@ impl WFQServer {
                 pending.class_id,
                 pending.finish_time,
                 Some(packet.time),
-            );
+                );
         }
+
+        self.output.send(packet).await;
     }
 
-    pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
+    pub async fn send_and_run(&mut self, _: (), cx: &Context<Self>) {
+        let Some(packet) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "WFQServer {} scheduled departure queue underflow",
+                self.scheduler_id
+            );
+            return;
+        };
         self.send(packet).await;
         self.run(self.time, cx);
     }
@@ -562,14 +572,16 @@ impl WFQServer {
         // schedules one packet with the smallest finish time
         if !self.scheduler_queue.is_empty() {
             let mut tagged_outbound = self.scheduler_queue.pop().unwrap();
-            let outbound = tagged_outbound.packet.clone();
-            let class_id = (self.flow_classes)(outbound.flow_id);
+            let packet_id = tagged_outbound.packet.packet_id;
+            let packet_size = tagged_outbound.packet.size;
+            let flow_id = tagged_outbound.packet.flow_id;
+            let class_id = (self.flow_classes)(flow_id);
             let byte_size = self.byte_sizes.entry(class_id).or_insert(0);
-            *byte_size -= outbound.size;
+            *byte_size -= packet_size;
             tagged_outbound.packet.queueing_delay_update(self.time);
 
             // sends the packet out to the next element after a timeout
-            let timeout = outbound.size as f64 * 8.0 / self.rate;
+            let timeout = packet_size as f64 * 8.0 / self.rate;
 
             let departure_time = quantize_after(self.time, timeout);
 
@@ -577,11 +589,10 @@ impl WFQServer {
 
             self.time_packet_sent = departure_time;
             let delay = (departure_time - self.time).max(0.0);
-            schedule_event(self.time, delay, tagged_outbound.clone());
 
             #[cfg(feature = "lean")]
             {
-                let class_id = (self.flow_classes)(outbound.flow_id);
+                let class_id = (self.flow_classes)(flow_id);
                 debug_assert!(
                     self.pending_log.is_none(),
                     "WFQ pending log already set for scheduler {}",
@@ -596,12 +607,14 @@ impl WFQServer {
                     Some(departure_time),
                 );
                 self.pending_log = Some(WfqPendingLog {
-                    packet_id: tagged_outbound.packet.packet_id,
-                    flow_id: tagged_outbound.packet.flow_id,
+                    packet_id,
+                    flow_id,
                     class_id,
                     finish_time: tagged_outbound.tag,
                 });
             }
+
+            schedule_event(self.time, delay, tagged_outbound);
 
             self.busy_until = departure_time;
 
@@ -609,9 +622,9 @@ impl WFQServer {
                 "WFQServer {} will send packet {} ({} bytes) from flow {} at time {:.8e}. \
                         {} packets in the queue.",
                 self.scheduler_id,
-                outbound.packet_id,
-                outbound.size,
-                outbound.flow_id,
+                packet_id,
+                packet_size,
+                flow_id,
                 departure_time,
                 self.scheduler_queue.len(),
             );
@@ -637,15 +650,21 @@ impl WFQServer {
         let run_time = quantize_time(now);
         self.time = run_time;
 
+        let mut events = Vec::with_capacity(1);
         self.schedule_packet(|_now, delay, outbound| {
+            events.push((delay, outbound));
+        });
+
+        for (delay, outbound) in events {
+            self.scheduled_departures.push_back(outbound.packet);
             cx.schedule_event_fast(
                 Duration::from_secs_f64(delay),
                 &Self::SEND_AND_RUN_SID,
                 Self::send_and_run,
-                outbound.packet,
+                (),
             )
             .unwrap();
-        });
+        }
     }
 
     #[cfg(test)]
