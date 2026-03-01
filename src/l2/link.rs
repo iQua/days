@@ -23,6 +23,8 @@ pub struct Link {
     rate: f64,
     /// pending frames
     queue: VecDeque<LinkFrame>,
+    /// frames already dequeued and scheduled for transmission
+    scheduled_departures: VecDeque<LinkFrame>,
     /// time until which the link is busy transmitting
     busy_until: f64,
 
@@ -30,7 +32,7 @@ pub struct Link {
 }
 
 impl Link {
-    const SEND_SID: SchedulableId<Self, LinkFrame> = SchedulableId::__from_decorated(0);
+    const SEND_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const RUN_SID: SchedulableId<Self, f64> = SchedulableId::__from_decorated(1);
 
     pub fn new(link_id: usize, rate: f64) -> Link {
@@ -39,6 +41,7 @@ impl Link {
             time: 0.0,
             rate,
             queue: VecDeque::new(),
+            scheduled_departures: VecDeque::new(),
             busy_until: 0.0,
             output: Output::default(),
         }
@@ -71,7 +74,15 @@ impl Link {
     }
 
     #[instrument(skip(self))]
-    pub async fn send(&mut self, frame: LinkFrame) {
+    pub async fn send(&mut self, _: ()) {
+        let Some(frame) = self.scheduled_departures.pop_front() else {
+            debug_assert!(
+                false,
+                "Link {} scheduled departure queue underflow",
+                self.link_id
+            );
+            return;
+        };
         self.time = frame.time();
         self.output.send(frame).await;
     }
@@ -110,12 +121,9 @@ impl Link {
 
                 let delay = (departure_time - self.time).max(0.0);
 
-                cx.schedule_event(
-                    Duration::from_secs_f64(delay),
-                    &Self::SEND_SID,
-                    frame.clone(),
-                )
-                .unwrap();
+                self.scheduled_departures.push_back(frame);
+                cx.schedule_event(Duration::from_secs_f64(delay), &Self::SEND_SID, ())
+                    .unwrap();
                 cx.schedule_event(
                     Duration::from_secs_f64(delay),
                     &Self::RUN_SID,
