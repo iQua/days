@@ -534,10 +534,10 @@ impl WFQServer {
                 .take()
                 .expect("WFQ pending log missing for depart event");
             debug_assert!(
-                    pending.packet_id == packet.packet_id && pending.flow_id == packet.flow_id,
-                    "WFQ pending log mismatch for scheduler {}",
-                    self.scheduler_id
-                );
+                pending.packet_id == packet.packet_id && pending.flow_id == packet.flow_id,
+                "WFQ pending log mismatch for scheduler {}",
+                self.scheduler_id
+            );
             self.log_wfq_event(
                 WfqEventKind::Depart,
                 packet.time,
@@ -545,7 +545,7 @@ impl WFQServer {
                 pending.class_id,
                 pending.finish_time,
                 Some(packet.time),
-                );
+            );
         }
 
         self.output.send(packet).await;
