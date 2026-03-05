@@ -377,22 +377,13 @@ impl Flow {
                 path
             }
             Routing::PathFromConfig(routing) => {
-                let source_host = NodeIndex::new(self.source_host);
-                let sink_host = NodeIndex::new(self.sink_host);
+                let mut path = vec![NodeIndex::new(self.source_id)];
 
-                let mut path = routing.path.clone();
-                if path.first() == Some(&source_host) {
-                    path.remove(0);
-                }
-                if path.last() == Some(&sink_host) {
-                    path.pop();
-                }
+                path.append(&mut routing.path.clone());
 
-                let mut adjusted_path = vec![NodeIndex::new(self.source_id)];
-                adjusted_path.append(&mut path);
-                adjusted_path.push(NodeIndex::new(self.sink_id));
+                path.push(NodeIndex::new(self.sink_id));
 
-                adjusted_path
+                path
             }
             Routing::ECMP(_) => {
                 // Selects a path using Equal-Cost Multi-Path (ECMP) routing
@@ -565,9 +556,11 @@ mod tests {
             path,
             vec![
                 NodeIndex::new(7),
+                NodeIndex::new(0),
                 NodeIndex::new(1),
                 NodeIndex::new(2),
                 NodeIndex::new(3),
+                NodeIndex::new(4),
                 NodeIndex::new(9)
             ]
         );
