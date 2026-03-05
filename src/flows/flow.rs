@@ -377,13 +377,22 @@ impl Flow {
                 path
             }
             Routing::PathFromConfig(routing) => {
-                let mut path = vec![NodeIndex::new(self.source_id)];
+                let source_host = NodeIndex::new(self.source_host);
+                let sink_host = NodeIndex::new(self.sink_host);
 
-                path.append(&mut routing.path.clone());
+                let mut path = routing.path.clone();
+                if path.first() == Some(&source_host) {
+                    path.remove(0);
+                }
+                if path.last() == Some(&sink_host) {
+                    path.pop();
+                }
 
-                path.push(NodeIndex::new(self.sink_id));
+                let mut adjusted_path = vec![NodeIndex::new(self.source_id)];
+                adjusted_path.append(&mut path);
+                adjusted_path.push(NodeIndex::new(self.sink_id));
 
-                path
+                adjusted_path
             }
             Routing::ECMP(_) => {
                 // Selects a path using Equal-Cost Multi-Path (ECMP) routing
@@ -529,6 +538,39 @@ mod tests {
         assert_eq!(path[2], NodeIndex::new(2));
         assert_eq!(path[3], NodeIndex::new(3));
         assert_eq!(path[4], NodeIndex::new(4));
+    }
+
+    #[test]
+    fn test_compute_path_from_config_path_includes_endpoints() {
+        let mut flow = Flow {
+            id: 4,
+            starts_before: vec![],
+            starts_after: vec![],
+            flow_type: FlowType::PacketDistribution,
+            source_host: 0,
+            sink_host: 4,
+            source_id: 7,
+            sink_id: 9,
+            routing: Routing::PathFromConfig(PathFromConfig::new(vec![0, 1, 2, 3, 4])),
+            traffic: TrafficCharacteristics::default(),
+            priority: 0,
+            seed: 0,
+        };
+
+        let graph = create_graph(&[(0, 1), (1, 2), (2, 3), (3, 4)]);
+
+        let path = flow.compute_path(graph.clone());
+
+        assert_eq!(
+            path,
+            vec![
+                NodeIndex::new(7),
+                NodeIndex::new(1),
+                NodeIndex::new(2),
+                NodeIndex::new(3),
+                NodeIndex::new(9)
+            ]
+        );
     }
 
     #[test]

@@ -537,7 +537,8 @@ impl PacketSource {
                 };
 
                 // notifies the Progress coroutine that the packet source finished running
-                self.ui_output().send(FlowFinishMsg { flow_id: 0 }).await;
+                let flow_id = self.flow_id();
+                self.ui_output().send(FlowFinishMsg { flow_id }).await;
 
                 debug!("{} finished running at {:.3}.", name, now);
             }
