@@ -17,13 +17,13 @@ use log::{debug, error, info};
 use petgraph::graph::UnGraph;
 use serde::Deserialize;
 
-use crate::flows::FlowSize;
 use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
+use crate::flows::{FlowSize, TrafficCharacteristics};
 #[cfg(feature = "l2_pfc")]
 use crate::l2::link::Link;
 #[cfg(feature = "l2_pfc")]
@@ -245,6 +245,46 @@ pub struct Topology {
 }
 
 impl Topology {
+    fn ring_chunk_owner(phase: Phase, n: usize, rank: usize, step: usize) -> usize {
+        match phase {
+            Phase::Scatter => (rank + n - step + 1) % n,
+            Phase::Gather => (rank + n - step) % n,
+        }
+    }
+
+    fn ring_chunk_bounds(
+        total_size: usize,
+        n: usize,
+        phase: Phase,
+        rank: usize,
+        step: usize,
+    ) -> (usize, usize) {
+        let chunk_size = total_size / n;
+        let chunk_owner = Self::ring_chunk_owner(phase, n, rank, step);
+        let chunk_offset = chunk_owner * chunk_size;
+        let chunk_len = if chunk_owner == n - 1 {
+            total_size - chunk_offset
+        } else {
+            chunk_size
+        };
+        (chunk_offset, chunk_len)
+    }
+
+    fn ring_hop_traffic(
+        traffic: &TrafficCharacteristics,
+        n: usize,
+        phase: Phase,
+        rank: usize,
+        step: usize,
+    ) -> TrafficCharacteristics {
+        let mut hop_traffic = traffic.clone();
+        if let FlowSize::Bytes(total_size) = traffic.size {
+            let (_, chunk_len) = Self::ring_chunk_bounds(total_size, n, phase, rank, step);
+            hop_traffic.size = FlowSize::Bytes(chunk_len);
+        }
+        hop_traffic
+    }
+
     pub fn new(
         config_path: &str,
         graph: UnGraph<usize, ()>,
@@ -609,7 +649,7 @@ impl Topology {
                     for (rank, &src) in collective.sources.iter().enumerate() {
                         let dst = collective.sources[(rank + 1) % n];
 
-                        for _step in 1..n {
+                        for step in 1..n {
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
                                 path: None,
@@ -619,7 +659,13 @@ impl Topology {
                                 source_host: src,
                                 sink_host: dst,
                                 routing: collective.routing.clone(),
-                                traffic: collective.traffic.clone(),
+                                traffic: Self::ring_hop_traffic(
+                                    &collective.traffic,
+                                    n,
+                                    Phase::Scatter,
+                                    rank,
+                                    step,
+                                ),
                                 priority: 0,
                                 seed: collective.id,
                             });
@@ -634,7 +680,7 @@ impl Topology {
                     for (rank, &src) in collective.sources.iter().enumerate() {
                         let dst = collective.sources[(rank + 1) % n];
 
-                        for _step in 1..n {
+                        for step in 1..n {
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
                                 path: None,
@@ -644,7 +690,13 @@ impl Topology {
                                 source_host: src,
                                 sink_host: dst,
                                 routing: collective.routing.clone(),
-                                traffic: collective.traffic.clone(),
+                                traffic: Self::ring_hop_traffic(
+                                    &collective.traffic,
+                                    n,
+                                    Phase::Gather,
+                                    rank,
+                                    step,
+                                ),
                                 priority: 0,
                                 seed: collective.id,
                             });
@@ -1300,7 +1352,6 @@ impl Topology {
                     _ => panic!("RingAllReduce only supports byte-based flows."),
                 };
                 let n = collective.sources.len();
-                let chunk_size = total_size / n;
 
                 let mut flow_id = collective.first_flow_id;
 
@@ -1310,17 +1361,8 @@ impl Topology {
                             let src_host = collective.sources[rank]; // flow's sender
                             let dst_host = collective.sources[(rank + 1) % n];
 
-                            // which chunk travels in this hop
-                            let chunk_owner = match phase {
-                                Phase::Scatter => (rank + n - step + 1) % n,
-                                Phase::Gather => (rank + n - step) % n,
-                            };
-                            let chunk_offset = chunk_owner * chunk_size;
-                            let chunk_len = if chunk_owner == n - 1 {
-                                total_size - chunk_offset
-                            } else {
-                                chunk_size
-                            };
+                            let (chunk_offset, chunk_len) =
+                                Self::ring_chunk_bounds(total_size, n, phase, rank, step);
 
                             // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
                             let data_src =
@@ -1659,5 +1701,76 @@ mod ring_allreduce_serialization_tests {
                 rank
             );
         }
+    }
+
+    #[test]
+    fn ring_allreduce_packet_distribution_uses_chunk_sized_bytes() {
+        let n = 4usize;
+        let total_size = 10usize;
+        let traffic = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(total_size),
+            DistributionInfo::Uniform {
+                low: 1.0,
+                high: 1.0,
+            },
+            DistributionInfo::DiscreteUniform { low: 1, high: 1 },
+            None,
+        );
+
+        let collective = Collective {
+            id: 88,
+            collective_type: CollectiveType::RingAllReduce,
+            first_flow_id: 2000,
+            flow_type: FlowType::PacketDistribution,
+            flow_count: n,
+            graph: None,
+            paths: None,
+            sources: (0..n).collect(),
+            sinks: (0..n).map(|i| (i + 1) % n).collect(),
+            routing: None,
+            traffic,
+        };
+
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            runtime_num_threads: 1,
+            graph: UnGraph::<usize, ()>::default(),
+            hosts: (0..n).collect(),
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![collective],
+            switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        topo.process_collectives();
+
+        let sizes: Vec<usize> = topo
+            .flows
+            .iter()
+            .map(|flow| match flow.traffic.size {
+                FlowSize::Bytes(size) => size,
+                FlowSize::Duration(duration) => {
+                    panic!("expected byte-sized ring flows, got duration {duration}")
+                }
+            })
+            .collect();
+
+        assert_eq!(sizes.len(), 2 * n * (n - 1));
+        assert!(sizes.iter().all(|size| *size < total_size));
+        assert_eq!(sizes.iter().filter(|&&size| size == 2).count(), 18);
+        assert_eq!(sizes.iter().filter(|&&size| size == 4).count(), 6);
+        assert_eq!(sizes.iter().sum::<usize>(), 2 * (n - 1) * total_size);
     }
 }
