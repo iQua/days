@@ -35,7 +35,7 @@ This matters because `PacketSwitch.outputs` can target either a neighboring swit
 
 Collectives (`[[collective]]` / `[[collective_set]]`) are high-level communication patterns used for ML-style workloads. Before routing, `Topology::process_collectives` produces concrete `Flow` entries for each collective.
 
-Special case: `CollectiveType::RingAllReduce` expands into scatter + gather phases with explicit dependency ordering.
+Special case: `CollectiveType::RingAllReduce` expands into reduce-scatter-style + all-gather-style traffic phases with explicit dependency ordering. This expansion models communication, not payload reduction.
 
 ## 4) Connect switches (create per-edge schedulers)
 

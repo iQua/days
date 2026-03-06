@@ -5,6 +5,8 @@ description: High-level communication patterns expanded into concrete flows.
 
 Collectives are higher-level communication patterns (common in ML training workloads) that are expanded into concrete flows at simulation start (`Topology::process_collectives` in `src/topos/topo.rs`).
 
+Days does not model payload contents. In particular, `RingAllReduce` exists to reproduce the network traffic pattern of a reduce-scatter plus all-gather schedule; it does not simulate arithmetic reduction over application data.
+
 Parsing is implemented in `src/flows/collective.rs`.
 
 Supported `collective_type` values:
@@ -39,7 +41,7 @@ Supported fields:
 - `collective_type` (required)
 - `first_flow_id` (optional): base ID for flows produced by this collective
 - `flow_type` (required): `PacketDistribution` or `TCP` (or `DCQCN` if enabled)
-- `flow_count` (required): number of flows in the collective
+- `flow_count` (required): number of flows in the collective; for `RingAllReduce`, this is the ring size / participant count used for expansion
 - `paths` (optional): explicit per-flow paths; sources/sinks are derived from each path’s endpoints
 - `sources` / `sinks` (optional): explicit per-flow endpoints
 - `routing` (optional): routing protocol for produced flows
@@ -48,6 +50,7 @@ Supported fields:
 Notes:
 
 - The optional `graph` field is currently stored but not used to derive endpoints; to control endpoints, use `sources`/`sinks` or `paths`.
+- `RingAllReduce` is expanded internally into per-hop traffic flows for a reduce-scatter-style phase followed by an all-gather-style phase.
 
 ## Endpoint selection rules
 
@@ -99,16 +102,19 @@ Fields:
 
 Flow ID assignment:
 
-- Each collective in the set gets a contiguous flow ID range:
+- For non-ring collectives, each collective in the set gets a contiguous flow ID range:
   - `first_flow_id + index * flow_count .. first_flow_id + (index + 1) * flow_count`
+- For `RingAllReduce`, the configured `flow_count` is the ring size. Runtime expansion produces `2 * flow_count * (flow_count - 1)` concrete flows per collective.
 
 ## TCP collectives and application data
 
 For TCP collectives, Days can optionally back flows with application-level byte buffers (`src/flows/app_source.rs`).
 
+These buffers are synthetic byte stores used to bound transmitted bytes and pacing. Days does not mutate or interpret payload contents while modeling the collective.
+
 Behavior:
 
-- **TCP Broadcast**: all flows in the broadcast share the same buffer, so each receiver gets the same byte stream.
-- **TCP RingAllReduce**: each hop sends a specific chunk (byte range) of the overall buffer, using per-flow offset/length handles.
+- **TCP Broadcast**: all flows in the broadcast share one collective-wide buffer, so each receiver gets the same byte stream.
+- **TCP RingAllReduce**: each directed ring link uses its own app-source buffer, and each generated hop reads a specific byte range from that link-local buffer via an offset/length handle. This models per-hop byte counts for the ring schedule; it does not model payload reduction across hops.
 
 Tune the app-source actor via `[app_source]` (see [/docs/configuration/logging](/docs/configuration/logging)).

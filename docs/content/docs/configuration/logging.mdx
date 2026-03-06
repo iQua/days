@@ -151,7 +151,11 @@ When enabled, Days installs a tracing subscriber layer and computes a wall-clock
 
 ## Application-level sources for TCP collectives (optional)
 
-For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with a shared, actor-managed byte buffer (`src/flows/app_source.rs`).
+For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with actor-managed byte buffers (`src/flows/app_source.rs`).
+
+- `Broadcast` uses one shared buffer per collective.
+- `RingAllReduce` uses one buffer per directed ring link.
+- These buffers are synthetic byte stores used for traffic generation only; Days does not model payload mutation or reduction.
 
 Configure the actor under `[app_source]`:
 
@@ -168,7 +172,7 @@ Fields and defaults:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `req_channel_capacity` | `usize` | `256` | Channel capacity for buffer requests |
-| `chunk_size` | `usize` | `512` | Preferred chunk size for requests (bytes) |
+| `chunk_size` | `usize` | `512` | Parsed app-source setting; currently not used for TCP packetization or ring chunk sizing |
 | `initial_delay` | `u64` | `1` | Actor start delay (microseconds) |
 | `run_interval` | `u64` | `50` | Actor polling interval (microseconds) |
 

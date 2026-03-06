@@ -7,7 +7,7 @@ log_path = "logs/collective_tcp"
 
 [app_source]
 req_channel_capacity = 128
-app_chunk_size = 512
+chunk_size = 512
 initial_delay = 1
 run_interval = 50
 
