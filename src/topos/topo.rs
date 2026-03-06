@@ -244,6 +244,11 @@ pub struct Topology {
     app_source_cfg: AppBufferConfig,
 }
 
+struct PreparedTcpAppSources {
+    flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle>,
+    owned_sources: Vec<AppDataSource>,
+}
+
 impl Topology {
     fn ring_chunk_owner(phase: Phase, n: usize, rank: usize, step: usize) -> usize {
         match phase {
@@ -268,6 +273,75 @@ impl Topology {
             chunk_size
         };
         (chunk_offset, chunk_len)
+    }
+
+    fn prepare_tcp_app_sources(&self) -> PreparedTcpAppSources {
+        let mut flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle> = HashMap::new();
+        let mut owned_sources: Vec<AppDataSource> = Vec::new();
+        let mut ring_source_indices: HashMap<(usize, usize), usize> = HashMap::new();
+
+        for collective in &self.collectives {
+            match (&collective.collective_type, &collective.flow_type) {
+                (CollectiveType::Broadcast, FlowType::TCP) => {
+                    let total_size = match collective.traffic.size {
+                        FlowSize::Bytes(size) => size,
+                        _ => panic!("Only byte-based broadcast is supported."),
+                    };
+
+                    let data_src =
+                        AppDataSource::create_source_buffer(total_size, self.app_source_cfg);
+                    for flow_id in
+                        collective.first_flow_id..collective.first_flow_id + collective.flow_count
+                    {
+                        flow_id_to_source_handle.insert(flow_id, data_src.handle());
+                    }
+                    owned_sources.push(data_src);
+                }
+                (CollectiveType::RingAllReduce, FlowType::TCP) => {
+                    let total_size = match collective.traffic.size {
+                        FlowSize::Bytes(size) => size,
+                        _ => panic!("RingAllReduce only supports byte-based flows."),
+                    };
+                    let n = collective.sources.len();
+                    let mut flow_id = collective.first_flow_id;
+
+                    for phase in [Phase::Scatter, Phase::Gather] {
+                        for rank in 0..n {
+                            for step in 1..n {
+                                let src_host = collective.sources[rank];
+                                let dst_host = collective.sources[(rank + 1) % n];
+                                let source_index = if let Some(&index) =
+                                    ring_source_indices.get(&(src_host, dst_host))
+                                {
+                                    index
+                                } else {
+                                    let index = owned_sources.len();
+                                    owned_sources.push(AppDataSource::create_source_buffer(
+                                        total_size,
+                                        self.app_source_cfg,
+                                    ));
+                                    ring_source_indices.insert((src_host, dst_host), index);
+                                    index
+                                };
+
+                                let (chunk_offset, chunk_len) =
+                                    Self::ring_chunk_bounds(total_size, n, phase, rank, step);
+                                let handle = owned_sources[source_index]
+                                    .handle_with_offset(chunk_offset, Some(chunk_len));
+                                flow_id_to_source_handle.insert(flow_id, handle);
+                                flow_id += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        PreparedTcpAppSources {
+            flow_id_to_source_handle,
+            owned_sources,
+        }
     }
 
     fn ring_hop_traffic(
@@ -1317,84 +1391,11 @@ impl Topology {
         // produces flows within all collectives in the network graph
         self.process_collectives();
 
-        // Prepares application-level packet sources and their actors (only for TCP Broadcast).
-        let mut app_sources: HashMap<usize, AppDataSource> = HashMap::new();
-        let mut flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle> = HashMap::new();
-        let mut conn_map: HashMap<(usize, usize), AppDataSource> = HashMap::new();
-
-        for collective in &self.collectives {
-            if matches!(
-                (&collective.collective_type, &collective.flow_type),
-                (CollectiveType::Broadcast, FlowType::TCP)
-            ) {
-                let total_size = match collective.traffic.size {
-                    FlowSize::Bytes(s) => s,
-                    _ => panic!("Only byte-based broadcast is supported."),
-                };
-
-                // create unique AppDataSource and actor (no MSS needed - TCP handles packetization)
-                let data_src = AppDataSource::create_source_buffer(total_size, self.app_source_cfg);
-                // assign handle to each flow：all flows obtain data from the same data_src
-                for flow_id in
-                    collective.first_flow_id..collective.first_flow_id + collective.flow_count
-                {
-                    flow_id_to_source_handle.insert(flow_id, data_src.handle());
-                }
-                app_sources.insert(collective.id, data_src);
-            }
-            // Ring-AllReduce (TCP)
-            if matches!(
-                (&collective.collective_type, &collective.flow_type),
-                (CollectiveType::RingAllReduce, FlowType::TCP)
-            ) {
-                let total_size = match collective.traffic.size {
-                    FlowSize::Bytes(b) => b,
-                    _ => panic!("RingAllReduce only supports byte-based flows."),
-                };
-                let n = collective.sources.len();
-
-                let mut flow_id = collective.first_flow_id;
-
-                for phase in [Phase::Scatter, Phase::Gather] {
-                    for rank in 0..n {
-                        for step in 1..n {
-                            let src_host = collective.sources[rank]; // flow's sender
-                            let dst_host = collective.sources[(rank + 1) % n];
-
-                            let (chunk_offset, chunk_len) =
-                                Self::ring_chunk_bounds(total_size, n, phase, rank, step);
-
-                            // ensure we have one AppSourceBuffer for this src_host (no MSS - TCP handles packetization)
-                            let data_src =
-                                conn_map.entry((src_host, dst_host)).or_insert_with(|| {
-                                    AppDataSource::create_source_buffer(
-                                        total_size,
-                                        self.app_source_cfg,
-                                    )
-                                });
-
-                            let handle = data_src.handle_with_offset(chunk_offset, Some(chunk_len));
-                            flow_id_to_source_handle.insert(flow_id, handle);
-
-                            flow_id += 1;
-                        }
-                    }
-                }
-            }
-        }
+        let mut prepared_tcp_app_sources = self.prepare_tcp_app_sources();
 
         let mut actor_count = 0usize;
 
-        for ((src, _dst), mut ds) in conn_map.into_iter() {
-            if let Some(actor) = ds.take_actor() {
-                let mbox = Mailbox::new();
-                self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
-                actor_count += 1;
-            }
-            app_sources.insert(src, ds);
-        }
-
-        for ds in app_sources.values_mut() {
+        for ds in prepared_tcp_app_sources.owned_sources.iter_mut() {
             if let Some(actor) = ds.take_actor() {
                 let mbox = Mailbox::new();
                 self.sim_init = self.sim_init.add_model(actor, mbox, "AppSourceBuffer");
@@ -1405,8 +1406,8 @@ impl Topology {
         debug!(
             "Initialized {} AppSource actors for {} TCP flows with {} unique source handles",
             actor_count,
-            flow_id_to_source_handle.len(),
-            app_sources.len()
+            prepared_tcp_app_sources.flow_id_to_source_handle.len(),
+            prepared_tcp_app_sources.owned_sources.len()
         );
 
         let mut ui_mbox: Mailbox<UserInterface> = Mailbox::with_capacity(self.mailbox_capacity);
@@ -1415,8 +1416,11 @@ impl Topology {
         self = self.connect(graph);
 
         // attaches packet sources and sinks from flows to hosts in the network graph
-        (self, ui_mbox) =
-            self.attach_flows(&mut statistics, ui_mbox, Some(flow_id_to_source_handle));
+        (self, ui_mbox) = self.attach_flows(
+            &mut statistics,
+            ui_mbox,
+            Some(prepared_tcp_app_sources.flow_id_to_source_handle),
+        );
 
         // computes feasible paths for all flows, and sets FIBs for all switches
         self.route_flows();
@@ -1494,9 +1498,10 @@ mod tests {
 #[cfg(test)]
 mod ring_allreduce_serialization_tests {
     use super::*;
+    use crate::flows::cc::CCAlgorithm;
     use crate::flows::collective::{Collective, CollectiveType};
     use crate::flows::flow::FlowType;
-    use crate::flows::{DistributionInfo, TrafficCharacteristics};
+    use crate::flows::{DistributionInfo, TCPCharacteristics, TrafficCharacteristics};
     use std::collections::HashMap;
 
     // Helper: minimal, unused-in-test switch config. Adjust DropStrategy variant if needed.
@@ -1772,5 +1777,102 @@ mod ring_allreduce_serialization_tests {
         assert_eq!(sizes.iter().filter(|&&size| size == 2).count(), 18);
         assert_eq!(sizes.iter().filter(|&&size| size == 4).count(), 6);
         assert_eq!(sizes.iter().sum::<usize>(), 2 * (n - 1) * total_size);
+    }
+
+    #[test]
+    fn mixed_tcp_broadcast_and_ring_keep_distinct_app_source_owners() {
+        let hosts: Vec<usize> = vec![0, 1, 2, 3, 4];
+        let tcp = Some(TCPCharacteristics {
+            cc_algorithm: CCAlgorithm::TCPReno,
+            ecn: false,
+            cubic: None,
+        });
+        let broadcast_traffic = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(3072),
+            DistributionInfo::Uniform {
+                low: 3.0,
+                high: 4.0,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 2000,
+                high: 2500,
+            },
+            tcp.clone(),
+        );
+        let ring_traffic = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(512),
+            DistributionInfo::Uniform {
+                low: 3.0,
+                high: 4.0,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 2000,
+                high: 2500,
+            },
+            tcp,
+        );
+
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            runtime_num_threads: 1,
+            graph: UnGraph::<usize, ()>::default(),
+            hosts,
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![
+                Collective {
+                    id: 0,
+                    collective_type: CollectiveType::Broadcast,
+                    first_flow_id: 0,
+                    flow_type: FlowType::TCP,
+                    flow_count: 4,
+                    graph: None,
+                    paths: None,
+                    sources: vec![4, 4, 4, 4],
+                    sinks: vec![2, 3, 0, 1],
+                    routing: None,
+                    traffic: broadcast_traffic,
+                },
+                Collective {
+                    id: 1,
+                    collective_type: CollectiveType::RingAllReduce,
+                    first_flow_id: 4,
+                    flow_type: FlowType::TCP,
+                    flow_count: 4,
+                    graph: None,
+                    paths: None,
+                    sources: vec![0, 1, 2, 3],
+                    sinks: vec![1, 2, 3, 0],
+                    routing: None,
+                    traffic: ring_traffic,
+                },
+            ],
+            switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        topo.process_collectives();
+        let prepared = topo.prepare_tcp_app_sources();
+
+        assert_eq!(topo.flows.len(), 28);
+        assert_eq!(prepared.flow_id_to_source_handle.len(), 28);
+        assert_eq!(
+            prepared.owned_sources.len(),
+            5,
+            "expected 1 broadcast source plus 4 ring link sources"
+        );
     }
 }
