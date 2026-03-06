@@ -422,15 +422,15 @@ impl TCPPacketSource {
                 self.congestion_control.more_dupacks_received();
 
                 // transmits a new packet, if allowed by the new value of cwnd
-                if self.last_ack + self.congestion_control.get_cwnd() >= ack.sequence_num
-                    && self.next_seq < self.send_buffer
-                {
+                let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
+                let send_size = self.sendable_bytes(cwnd_limit);
+                if send_size > 0 {
                     debug!(
                         "TCPPacketSource {} will send packet {} ({} bytes) at time {:.3} as dupack > 3.",
-                        self.endpoint_id, self.next_seq, self.mss, now,
+                        self.endpoint_id, self.next_seq, send_size, now,
                     );
 
-                    let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+                    let mut packet = Packet::new(send_size, self.next_seq, self.flow_id, now);
                     packet.set_priority(self.priority);
                     self.apply_ecn_on_new_data(&mut packet);
                     self.output.send(packet.clone()).await;
@@ -697,6 +697,12 @@ impl TCPPacketSource {
         packet.cwr = false;
     }
 
+    fn sendable_bytes(&self, cwnd_limit: usize) -> usize {
+        let send_limit = min(self.send_buffer, cwnd_limit);
+        let available = send_limit.saturating_sub(self.next_seq);
+        min(self.mss, available)
+    }
+
     /// Checks if any sent packet reached timeout at regularly occurring intervals.
     pub async fn timer_tick(&mut self, now: f64) {
         while !self.timeout_queue.is_empty() {
@@ -768,25 +774,27 @@ impl TCPPacketSource {
         self.pull_from_appsource(now).await;
 
         let cwnd_limit = self.last_ack + self.congestion_control.get_cwnd();
-        let can_send = self.next_seq < self.send_buffer
-            && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit);
-        if !can_send {
+        let send_size = self.sendable_bytes(cwnd_limit);
+        if send_size == 0 {
             return None;
         }
 
         let pacing_rate = self.congestion_control.get_pacing_rate();
         let pacing_interval = if pacing_rate > 0.0 {
-            self.mss as f64 / pacing_rate
+            send_size as f64 / pacing_rate
         } else {
             0.0
         };
 
         if !pacing_interval.is_finite() || pacing_interval <= 0.0 {
             // No pacing rate yet; send as much as the window allows.
-            while self.next_seq < self.send_buffer
-                && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit)
-            {
-                let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+            loop {
+                let send_size = self.sendable_bytes(cwnd_limit);
+                if send_size == 0 {
+                    break;
+                }
+
+                let mut packet = Packet::new(send_size, self.next_seq, self.flow_id, now);
                 packet.set_priority(self.priority);
                 self.apply_ecn_on_new_data(&mut packet);
 
@@ -801,7 +809,7 @@ impl TCPPacketSource {
             return Some(interval);
         }
 
-        let mut packet = Packet::new(self.mss, self.next_seq, self.flow_id, now);
+        let mut packet = Packet::new(send_size, self.next_seq, self.flow_id, now);
         packet.set_priority(self.priority);
         self.apply_ecn_on_new_data(&mut packet);
 
@@ -811,8 +819,7 @@ impl TCPPacketSource {
         let pacing_interval = pacing_interval.max(Self::MIN_PACING_INTERVAL);
         self.busy_until = now + pacing_interval;
 
-        let next_can_send = self.next_seq < self.send_buffer
-            && self.next_seq + self.mss <= min(self.send_buffer, cwnd_limit);
+        let next_can_send = self.sendable_bytes(cwnd_limit) > 0;
         if next_can_send {
             return Some(pacing_interval);
         }
@@ -991,5 +998,46 @@ mod tests {
 
         assert_eq!(source.dupack, 3);
         assert_eq!(source.pending_lost_bytes, source.mss);
+    }
+
+    #[test]
+    fn test_send_packet_sends_buffered_sub_mss_segment() {
+        let mut source = make_source(false);
+        source.send_buffer = 128;
+        source.traffic_exceeded = true;
+
+        let next_interval = block_on(source.send_packet(0.0));
+
+        assert_eq!(next_interval, None);
+        assert_eq!(source.next_seq, 128);
+        assert_eq!(source.packets_sent, 1);
+        assert_eq!(source.sent_size, 128);
+
+        let packet = source.sent_packets.get(&0).expect("short segment not sent");
+        assert_eq!(packet.packet_id, 0);
+        assert_eq!(packet.size, 128);
+    }
+
+    #[test]
+    fn test_send_packet_sends_partial_tail_segment() {
+        let mut source = make_source(false);
+        source.next_seq = source.mss;
+        source.last_ack = source.mss;
+        source.send_buffer = 600;
+        source.traffic_exceeded = true;
+
+        let next_interval = block_on(source.send_packet(0.0));
+
+        assert_eq!(next_interval, None);
+        assert_eq!(source.next_seq, 600);
+        assert_eq!(source.packets_sent, 1);
+        assert_eq!(source.sent_size, 88);
+
+        let packet = source
+            .sent_packets
+            .get(&source.mss)
+            .expect("tail segment not sent");
+        assert_eq!(packet.packet_id, source.mss);
+        assert_eq!(packet.size, 88);
     }
 }

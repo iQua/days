@@ -438,7 +438,7 @@ impl PacketSource {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
                 if source.traffic_exceeded
-                    && source.next_seq + source.mss > source.send_buffer
+                    && source.next_seq >= source.send_buffer
                     && source.next_seq == source.last_ack
                 {
                     source.wrap_up(now).await;
@@ -715,5 +715,63 @@ impl Model for PacketSource {
         }
 
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flows::cc::CCAlgorithm;
+    use crate::flows::flow::FlowType;
+    use crate::flows::{DistributionInfo, TCPCharacteristics};
+    use futures::executor::block_on;
+
+    fn make_tcp_packet_source() -> PacketSource {
+        let traffic = TrafficCharacteristics::new(
+            0.0,
+            Some(1.0),
+            None,
+            DistributionInfo::Uniform {
+                low: 0.1,
+                high: 0.1,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
+            Some(TCPCharacteristics {
+                cc_algorithm: CCAlgorithm::TCPReno,
+                ecn: false,
+                cubic: None,
+            }),
+        );
+
+        PacketSource::new(0, Vec::new(), FlowType::TCP, traffic, 0, 0, None)
+    }
+
+    #[test]
+    fn test_tcp_stop_run_waits_for_sub_mss_segment_to_be_sent() {
+        let mut source = make_tcp_packet_source();
+        let PacketSource::TCPPacketSource(tcp) = &mut source else {
+            panic!("expected TCP packet source");
+        };
+        tcp.send_buffer = 128;
+        tcp.traffic_exceeded = true;
+
+        assert!(!block_on(source.stop_run(0.0)));
+    }
+
+    #[test]
+    fn test_tcp_stop_run_finishes_after_all_buffered_bytes_are_acked() {
+        let mut source = make_tcp_packet_source();
+        let PacketSource::TCPPacketSource(tcp) = &mut source else {
+            panic!("expected TCP packet source");
+        };
+        tcp.send_buffer = 128;
+        tcp.next_seq = 128;
+        tcp.last_ack = 128;
+        tcp.traffic_exceeded = true;
+
+        assert!(block_on(source.stop_run(0.0)));
     }
 }
