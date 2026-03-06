@@ -88,6 +88,20 @@ pub struct CollectiveParams {
 }
 
 impl Collective {
+    fn reserved_flow_count(collective_type: &CollectiveType, flow_count: usize) -> usize {
+        match collective_type {
+            CollectiveType::RingAllReduce => {
+                let ring_hops = flow_count
+                    .checked_mul(flow_count.saturating_sub(1))
+                    .expect("RingAllReduce flow count overflow");
+                2usize
+                    .checked_mul(ring_hops)
+                    .expect("RingAllReduce flow count overflow")
+            }
+            _ => flow_count,
+        }
+    }
+
     pub fn new(params: CollectiveParams) -> Self {
         Self {
             id: params.id,
@@ -313,7 +327,13 @@ impl Collective {
                     );
                     first_flow_id = new_first_flow_id;
                 }
-                update_next_flow_id(first_flow_id + collective.flow_count);
+                let reserved_flow_count =
+                    Self::reserved_flow_count(&collective_type, collective.flow_count);
+                update_next_flow_id(
+                    first_flow_id
+                        .checked_add(reserved_flow_count)
+                        .expect("Collective flow id overflow"),
+                );
 
                 collectives.push(Collective::new(CollectiveParams {
                     id: next_collective_id(),
@@ -368,8 +388,17 @@ impl Collective {
                     );
                     first_flow_id = new_first_flow_id;
                 }
+                let reserved_flow_count =
+                    Self::reserved_flow_count(&collective_type, collective_set.flow_count);
                 update_next_flow_id(
-                    first_flow_id + collective_set.collective_count * collective_set.flow_count,
+                    first_flow_id
+                        .checked_add(
+                            collective_set
+                                .collective_count
+                                .checked_mul(reserved_flow_count)
+                                .expect("Collective set flow id overflow"),
+                        )
+                        .expect("Collective set flow id overflow"),
                 );
 
                 for index in 0..collective_set.collective_count {
@@ -388,7 +417,13 @@ impl Collective {
                     collectives.push(Collective::new(CollectiveParams {
                         id: next_collective_id(),
                         collective_type: collective_type.clone(),
-                        first_flow_id: first_flow_id + index * collective_set.flow_count,
+                        first_flow_id: first_flow_id
+                            .checked_add(
+                                index
+                                    .checked_mul(reserved_flow_count)
+                                    .expect("Collective set flow id overflow"),
+                            )
+                            .expect("Collective set flow id overflow"),
                         flow_type: flow_type.clone(),
                         flow_count: collective_set.flow_count,
                         graph: None,

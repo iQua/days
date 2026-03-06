@@ -600,25 +600,21 @@ impl Topology {
             match collective_type {
                 CollectiveType::RingAllReduce => {
                     let n = collective.sources.len();
+                    let steps = n.saturating_sub(1);
                     let mut flow_id = collective.first_flow_id;
 
-                    let mut last_scatter: Vec<Option<usize>> = vec![None; n];
-                    let mut last_gather: Vec<Option<usize>> = vec![None; n];
+                    let mut scatter_flow_indices = vec![Vec::with_capacity(steps); n];
+                    let mut gather_flow_indices = vec![Vec::with_capacity(steps); n];
 
                     for (rank, &src) in collective.sources.iter().enumerate() {
                         let dst = collective.sources[(rank + 1) % n];
 
                         for _step in 1..n {
-                            let mut starts_after = Vec::new();
-                            if let Some(prev_flow_id) = last_scatter[rank] {
-                                starts_after.push(prev_flow_id);
-                            }
-
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
                                 path: None,
                                 starts_before: Vec::new(),
-                                starts_after,
+                                starts_after: Vec::new(),
                                 flow_type: collective.flow_type.clone(),
                                 source_host: src,
                                 sink_host: dst,
@@ -628,9 +624,8 @@ impl Topology {
                                 seed: collective.id,
                             });
 
+                            scatter_flow_indices[rank].push(self.flows.len());
                             self.flows.push(flow);
-
-                            last_scatter[rank] = Some(flow_id);
 
                             flow_id += 1;
                         }
@@ -639,23 +634,12 @@ impl Topology {
                     for (rank, &src) in collective.sources.iter().enumerate() {
                         let dst = collective.sources[(rank + 1) % n];
 
-                        for step in 1..n {
-                            let mut starts_after = Vec::new();
-                            if let Some(prev_flow_id) = last_gather[rank] {
-                                starts_after.push(prev_flow_id);
-                            }
-
-                            if step == 1 {
-                                if let Some(scatter_flow_id) = last_scatter[rank] {
-                                    starts_after.push(scatter_flow_id);
-                                }
-                            }
-
+                        for _step in 1..n {
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
                                 path: None,
                                 starts_before: Vec::new(),
-                                starts_after,
+                                starts_after: Vec::new(),
                                 flow_type: collective.flow_type.clone(),
                                 source_host: src,
                                 sink_host: dst,
@@ -665,11 +649,72 @@ impl Topology {
                                 seed: collective.id,
                             });
 
+                            gather_flow_indices[rank].push(self.flows.len());
                             self.flows.push(flow);
 
-                            last_gather[rank] = Some(flow_id);
-
                             flow_id += 1;
+                        }
+                    }
+
+                    if steps > 0 {
+                        for rank in 0..n {
+                            let prev_rank = (rank + n - 1) % n;
+
+                            for step_idx in 0..steps {
+                                let flow_index = scatter_flow_indices[rank][step_idx];
+                                let mut starts_after = Vec::new();
+
+                                if step_idx > 0 {
+                                    // A rank can only forward the next scatter chunk after:
+                                    // 1. its prior send on the same outgoing link completes, and
+                                    // 2. the predecessor rank has delivered the chunk for this hop.
+                                    let local_prev =
+                                        self.flows[scatter_flow_indices[rank][step_idx - 1]].id;
+                                    let upstream_prev = self.flows
+                                        [scatter_flow_indices[prev_rank][step_idx - 1]]
+                                        .id;
+                                    starts_after.push(local_prev);
+                                    starts_after.push(upstream_prev);
+                                }
+
+                                starts_after.sort_unstable();
+                                starts_after.dedup();
+                                self.flows[flow_index].starts_after = starts_after;
+                            }
+                        }
+
+                        for rank in 0..n {
+                            let prev_rank = (rank + n - 1) % n;
+
+                            for step_idx in 0..steps {
+                                let flow_index = gather_flow_indices[rank][step_idx];
+                                let mut starts_after = Vec::new();
+
+                                if step_idx == 0 {
+                                    // Gather starts only after this rank finishes its scatter phase,
+                                    // and after the predecessor rank completes the upstream hop for
+                                    // the chunk selected by the current gather mapping.
+                                    let local_scatter_done =
+                                        self.flows[scatter_flow_indices[rank][steps - 1]].id;
+                                    let upstream_chunk_ready =
+                                        self.flows[scatter_flow_indices[prev_rank][0]].id;
+                                    starts_after.push(local_scatter_done);
+                                    starts_after.push(upstream_chunk_ready);
+                                } else {
+                                    // Subsequent gather hops require both local link serialization
+                                    // and delivery of the next chunk from the predecessor rank.
+                                    let local_prev =
+                                        self.flows[gather_flow_indices[rank][step_idx - 1]].id;
+                                    let upstream_prev =
+                                        self.flows[gather_flow_indices[prev_rank][step_idx - 1]].id;
+                                    starts_after.push(local_prev);
+                                    starts_after.push(upstream_prev);
+                                }
+
+                                starts_after.sort_unstable();
+                                starts_after.dedup();
+                                self.flows[flow_index].starts_after = starts_after;
+                            }
                         }
                     }
 
@@ -1509,6 +1554,9 @@ mod ring_allreduce_serialization_tests {
         for rank in 0..n {
             let src = sources[rank];
             let dst = sources[(rank + 1) % n];
+            let prev_rank = (rank + n - 1) % n;
+            let prev_src = sources[prev_rank];
+            let prev_dst = sources[rank];
 
             // There are exactly (n-1) flows on this link in each phase.
             let mut s_ids: Vec<usize> = scatter
@@ -1525,15 +1573,44 @@ mod ring_allreduce_serialization_tests {
                 .collect();
             g_ids.sort_unstable();
 
+            let mut prev_s_ids: Vec<usize> = scatter
+                .iter()
+                .filter(|f| f.source_host == prev_src && f.sink_host == prev_dst)
+                .map(|f| f.id)
+                .collect();
+            prev_s_ids.sort_unstable();
+
+            let mut prev_g_ids: Vec<usize> = gather
+                .iter()
+                .filter(|f| f.source_host == prev_src && f.sink_host == prev_dst)
+                .map(|f| f.id)
+                .collect();
+            prev_g_ids.sort_unstable();
+
             assert_eq!(s_ids.len(), n - 1, "rank {} scatter count", rank);
             assert_eq!(g_ids.len(), n - 1, "rank {} gather count", rank);
+            assert_eq!(
+                prev_s_ids.len(),
+                n - 1,
+                "prev rank {} scatter count",
+                prev_rank
+            );
+            assert_eq!(
+                prev_g_ids.len(),
+                n - 1,
+                "prev rank {} gather count",
+                prev_rank
+            );
 
-            // --- These asserts require the fix that populates `starts_after` on successors. ---
-
-            // Scatter should be serialized: S1 -> S2 -> S3 via starts_after on successors.
+            // Scatter should require both local serialization and upstream chunk delivery.
             assert!(
                 by_id[&s_ids[1]].starts_after.contains(&s_ids[0]),
                 "scatter[1] should wait for scatter[0] for rank {}",
+                rank
+            );
+            assert!(
+                by_id[&s_ids[1]].starts_after.contains(&prev_s_ids[0]),
+                "scatter[1] should wait for predecessor scatter[0] for rank {}",
                 rank
             );
             assert!(
@@ -1541,23 +1618,44 @@ mod ring_allreduce_serialization_tests {
                 "scatter[2] should wait for scatter[1] for rank {}",
                 rank
             );
+            assert!(
+                by_id[&s_ids[2]].starts_after.contains(&prev_s_ids[1]),
+                "scatter[2] should wait for predecessor scatter[1] for rank {}",
+                rank
+            );
 
-            // The first gather step should wait for the last scatter step (cross-phase gating).
+            // The first gather step should wait for local scatter completion and the
+            // predecessor's upstream scatter hop for the selected chunk.
             assert!(
                 by_id[&g_ids[0]].starts_after.contains(&s_ids[n - 2]),
                 "gather[0] should wait for last scatter for rank {}",
                 rank
             );
+            assert!(
+                by_id[&g_ids[0]].starts_after.contains(&prev_s_ids[0]),
+                "gather[0] should wait for predecessor scatter[0] for rank {}",
+                rank
+            );
 
-            // Gather should be serialized: G1 -> G2 -> G3 via starts_after on successors.
+            // Gather should require both local serialization and upstream delivery.
             assert!(
                 by_id[&g_ids[1]].starts_after.contains(&g_ids[0]),
                 "gather[1] should wait for gather[0] for rank {}",
                 rank
             );
             assert!(
+                by_id[&g_ids[1]].starts_after.contains(&prev_g_ids[0]),
+                "gather[1] should wait for predecessor gather[0] for rank {}",
+                rank
+            );
+            assert!(
                 by_id[&g_ids[2]].starts_after.contains(&g_ids[1]),
                 "gather[2] should wait for gather[1] for rank {}",
+                rank
+            );
+            assert!(
+                by_id[&g_ids[2]].starts_after.contains(&prev_g_ids[1]),
+                "gather[2] should wait for predecessor gather[1] for rank {}",
                 rank
             );
         }
