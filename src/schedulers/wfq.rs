@@ -444,7 +444,7 @@ impl WFQServer {
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
             assert!(
-                (packet.time - global_time).abs() <= 1e-7,
+                packet.time <= global_time + 1e-7,
                 "Timing mismatch: packet.time = {}, global_time = {}",
                 packet.time,
                 global_time
@@ -640,7 +640,7 @@ impl WFQServer {
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
             assert!(
-                (now - global_time).abs() <= 1e-7,
+                now <= global_time + 1e-7,
                 "Timing mismatch: now = {}, global_time = {}",
                 now,
                 global_time

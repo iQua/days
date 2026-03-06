@@ -154,7 +154,7 @@ When enabled, Days installs a tracing subscriber layer and computes a wall-clock
 For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with actor-managed byte buffers (`src/flows/app_source.rs`).
 
 - `Broadcast` uses one shared buffer per collective.
-- `RingAllReduce` uses one buffer per directed ring link.
+- `RingAllReduce` uses one buffer per collective per directed ring link.
 - These buffers are synthetic byte stores used for traffic generation only; Days does not model payload mutation or reduction.
 
 Configure the actor under `[app_source]`:

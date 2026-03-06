@@ -266,6 +266,17 @@ impl AppSourceBuffer {
     }
 }
 
+#[cfg(test)]
+impl AppSourceBuffer {
+    pub async fn respond_once_for_test(&mut self) {
+        let req = self.rx.recv().await.expect("expected request");
+        let start = req.start.min(self.buffer.len());
+        let end = (req.start + req.size).min(self.buffer.len());
+        let data = self.buffer[start..end].to_vec();
+        let _ = req.respond_to.send(data).await;
+    }
+}
+
 pub struct AppDataSource {
     handle: AppSourceBufferHandle,
 }

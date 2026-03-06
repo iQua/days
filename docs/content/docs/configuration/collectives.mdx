@@ -51,6 +51,8 @@ Notes:
 
 - The optional `graph` field is currently stored but not used to derive endpoints; to control endpoints, use `sources`/`sinks` or `paths`.
 - `RingAllReduce` is expanded internally into per-hop traffic flows for a reduce-scatter-style phase followed by an all-gather-style phase.
+- `RingAllReduce` currently supports byte-sized traffic only. Duration-based ring collectives are rejected.
+- For byte-sized `RingAllReduce`, `traffic.size` must be at least the ring size so every generated hop carries a non-zero chunk.
 
 ## Endpoint selection rules
 
@@ -115,6 +117,6 @@ These buffers are synthetic byte stores used to bound transmitted bytes and paci
 Behavior:
 
 - **TCP Broadcast**: all flows in the broadcast share one collective-wide buffer, so each receiver gets the same byte stream.
-- **TCP RingAllReduce**: each directed ring link uses its own app-source buffer, and each generated hop reads a specific byte range from that link-local buffer via an offset/length handle. This models per-hop byte counts for the ring schedule; it does not model payload reduction across hops.
+- **TCP RingAllReduce**: each collective gets one app-source buffer per directed ring link, and each generated hop reads a specific byte range from that link-local buffer via an offset/length handle. This models per-hop byte counts for the ring schedule; it does not model payload reduction across hops.
 
 Tune the app-source actor via `[app_source]` (see [/docs/configuration/logging](/docs/configuration/logging)).

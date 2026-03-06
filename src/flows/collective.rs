@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::flows::flow::FlowType;
 use crate::flows::route::RoutingConfig;
-use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
+use crate::flows::{FlowSize, TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_collective_id, next_flow_id, seed_from_config, update_next_flow_id};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,7 +88,10 @@ pub struct CollectiveParams {
 }
 
 impl Collective {
-    fn reserved_flow_count(collective_type: &CollectiveType, flow_count: usize) -> usize {
+    pub(crate) fn reserved_flow_count(
+        collective_type: &CollectiveType,
+        flow_count: usize,
+    ) -> usize {
         match collective_type {
             CollectiveType::RingAllReduce => {
                 let ring_hops = flow_count
@@ -99,6 +102,30 @@ impl Collective {
                     .expect("RingAllReduce flow count overflow")
             }
             _ => flow_count,
+        }
+    }
+
+    fn validate_ring_traffic(
+        collective_type: &CollectiveType,
+        flow_count: usize,
+        traffic: &TrafficCharacteristics,
+    ) {
+        if !matches!(collective_type, CollectiveType::RingAllReduce) {
+            return;
+        }
+
+        match traffic.size {
+            FlowSize::Bytes(size) => {
+                assert!(
+                    size >= flow_count,
+                    "RingAllReduce requires byte size {size} to be at least the ring size {flow_count}"
+                );
+            }
+            FlowSize::Duration(duration) => {
+                panic!(
+                    "RingAllReduce does not support duration-based traffic (got duration {duration})"
+                );
+            }
         }
     }
 
@@ -137,7 +164,9 @@ impl Collective {
             let collective_paths = paths.clone();
 
             let first_flow_id = next_flow_id();
-            update_next_flow_id(first_flow_id + flow_count);
+            update_next_flow_id(
+                first_flow_id + Self::reserved_flow_count(&collective_type, flow_count),
+            );
 
             let params = CollectiveParams {
                 id: next_collective_id(),
@@ -316,6 +345,7 @@ impl Collective {
                 );
 
                 let traffic = TrafficCharacteristics::clone(&collective.traffic);
+                Self::validate_ring_traffic(&collective_type, collective.flow_count, &traffic);
 
                 let mut first_flow_id = next_flow_id();
                 if let Some(new_first_flow_id) = collective.first_flow_id {
@@ -413,6 +443,11 @@ impl Collective {
                     );
 
                     let traffic = TrafficCharacteristics::clone(&collective_set.traffic);
+                    Self::validate_ring_traffic(
+                        &collective_type,
+                        collective_set.flow_count,
+                        &traffic,
+                    );
 
                     collectives.push(Collective::new(CollectiveParams {
                         id: next_collective_id(),

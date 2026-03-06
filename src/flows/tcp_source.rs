@@ -304,8 +304,7 @@ impl TCPPacketSource {
 
         let win_left = window_end - buffered_end;
 
-        // window too small to send a full segment, wait for ACKs
-        if win_left < self.mss {
+        if win_left == 0 {
             return;
         }
 
@@ -880,9 +879,11 @@ impl Model for TCPPacketSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flows::app_source::AppDataSource;
     use crate::flows::packet::TCPAck;
     use crate::flows::{DistributionInfo, TCPCharacteristics};
     use futures::executor::block_on;
+    use futures::join;
     use rand::SeedableRng;
 
     fn make_source(ecn: bool) -> TCPPacketSource {
@@ -1039,5 +1040,31 @@ mod tests {
             .expect("tail segment not sent");
         assert_eq!(packet.packet_id, source.mss);
         assert_eq!(packet.size, 88);
+    }
+
+    #[test]
+    fn test_pull_from_appsource_accepts_sub_mss_window() {
+        let mut source = make_source(false);
+        let cwnd = source.congestion_control.get_cwnd();
+        let mut data_src = AppDataSource::create_source_buffer(
+            128,
+            crate::flows::app_source::AppBufferConfig::default(),
+        );
+        let mut actor = data_src.take_actor().expect("missing app source actor");
+        source.app_source = Some(data_src.handle());
+        source.synthetic_source = None;
+        source.remaining_bytes = 128;
+        source.send_buffer = cwnd - 128;
+        source.next_seq = source.send_buffer;
+
+        block_on(async {
+            let pull = source.pull_from_appsource(0.0);
+            let respond = actor.respond_once_for_test();
+            let (_, ()) = join!(pull, respond);
+        });
+
+        assert_eq!(source.send_buffer, cwnd);
+        assert_eq!(source.remaining_bytes, 0);
+        assert!(source.traffic_exceeded);
     }
 }

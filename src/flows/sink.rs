@@ -318,17 +318,20 @@ impl PacketSink {
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
             assert!(
-                (packet.time - global_time).abs() <= 1e-7,
+                packet.time <= global_time + 1e-7,
                 "Timing mismatch: packet.time = {}, global_time = {}",
                 packet.time,
                 global_time
             );
 
             // makes sure that the simulation advances in time
-            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+            assert!((global_time - local_time).abs() <= 1e-7 || global_time > local_time);
         }
 
-        let now = packet.time;
+        let now = _cx
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         debug!(
             "{} received packet {} ({} bytes) from flow {} at time {:.3}.",

@@ -159,3 +159,55 @@ cc_algorithm = "TCPReno"
         );
     }
 }
+
+#[test]
+#[should_panic(expected = "RingAllReduce requires byte size 2 to be at least the ring size 4")]
+fn ring_collective_rejects_undersized_byte_payload_from_config() {
+    let config = r#"
+seed = 1
+
+[[collective]]
+collective_type = "RingAllReduce"
+first_flow_id = 4000000
+flow_type = "PacketDistribution"
+flow_count = 4
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 2
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+"#;
+
+    let file = write_config(config);
+    let hosts = vec![0, 1, 2, 3];
+    let _ = Collective::collectives_from_config(file.path().to_str().unwrap(), &hosts);
+}
+
+#[test]
+#[should_panic(expected = "RingAllReduce does not support duration-based traffic")]
+fn ring_collective_rejects_duration_traffic_from_config() {
+    let config = r#"
+seed = 1
+
+[[collective]]
+collective_type = "RingAllReduce"
+first_flow_id = 5000000
+flow_type = "PacketDistribution"
+flow_count = 4
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+duration = 10.0
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+"#;
+
+    let file = write_config(config);
+    let hosts = vec![0, 1, 2, 3];
+    let _ = Collective::collectives_from_config(file.path().to_str().unwrap(), &hosts);
+}

@@ -116,6 +116,27 @@ impl TCPPacketSink {
         }
     }
 
+    fn build_acknowledgment(&self, packet: &Packet, now: f64) -> Packet {
+        Packet {
+            time: now,
+            creation_time: packet.creation_time,
+            size: 40,
+            packet_id: packet.packet_id,
+            flow_id: packet.flow_id,
+            queueing_delay: packet.queueing_delay,
+            last_packet: false,
+            priority: packet.priority,
+            ack: Some(TCPAck {
+                sequence_num: self.next_seq_expected,
+                acknowledged_size: packet.size,
+                ece: self.ecn_echo,
+            }),
+            control: None,
+            ecn: EcnField::NotEct,
+            cwr: false,
+        }
+    }
+
     #[instrument(skip(self))]
     pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
@@ -141,24 +162,7 @@ impl TCPPacketSink {
 
         self.next_seq_expected = self.recv_buffer[0].1;
 
-        let acknowledgment = Packet {
-            time: packet.time,
-            creation_time: packet.creation_time,
-            size: 40,
-            packet_id: packet.packet_id,
-            flow_id: packet.flow_id,
-            queueing_delay: packet.queueing_delay,
-            last_packet: false,
-            priority: packet.priority,
-            ack: Some(TCPAck {
-                sequence_num: self.next_seq_expected,
-                acknowledged_size: packet.size,
-                ece: self.ecn_echo,
-            }),
-            control: None,
-            ecn: EcnField::NotEct,
-            cwr: false,
-        };
+        let acknowledgment = self.build_acknowledgment(&packet, now);
 
         // sends the acknowledgment packet out to the TCPPacketSource now
         let ack_size = acknowledgment.size;
@@ -238,5 +242,26 @@ mod tests {
         cwr_packet.cwr = true;
         sink.update_ecn_echo(&cwr_packet);
         assert!(!sink.ecn_echo);
+    }
+
+    #[test]
+    fn test_ack_uses_current_send_time_and_original_creation_time() {
+        let mut sink = TCPPacketSink::new(3);
+        let packet = Packet::new(512, 7, 3, 0.125);
+
+        sink.recv_buffer
+            .push((packet.packet_id, packet.packet_id + packet.size));
+        sink.next_seq_expected = packet.packet_id + packet.size;
+
+        let ack = sink.build_acknowledgment(&packet, 0.250);
+
+        assert_eq!(ack.time, 0.250);
+        assert_eq!(ack.creation_time, 0.125);
+        assert_eq!(ack.packet_id, 7);
+        assert_eq!(ack.flow_id, 3);
+        assert_eq!(
+            ack.ack.expect("missing ack").sequence_num,
+            packet.packet_id + packet.size
+        );
     }
 }

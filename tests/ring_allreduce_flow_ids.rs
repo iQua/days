@@ -120,3 +120,25 @@ pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
     assert_eq!(collectives[1].first_flow_id, 200024);
     assert_eq!(collectives[2].first_flow_id, 200048);
 }
+
+#[test]
+fn ring_collectives_from_graph_reserve_expanded_flow_ranges() {
+    let _guard = flow_id_test_lock().lock().unwrap();
+    let _reset = FlowIdReset::capture();
+    update_next_flow_id(300000);
+
+    let collectives = Collective::collectives_from_graph(
+        days::flows::collective::CollectiveType::RingAllReduce,
+        vec![
+            vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+            vec![(4, 5), (5, 6), (6, 7), (7, 4)],
+        ],
+        None,
+        vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+        vec![vec![1, 2, 3, 0], vec![5, 6, 7, 4]],
+    );
+
+    assert_eq!(collectives.len(), 2);
+    assert_eq!(collectives[0].first_flow_id, 300000);
+    assert_eq!(collectives[1].first_flow_id, 300024);
+}

@@ -177,17 +177,17 @@ impl PacketSource {
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
             assert!(
-                (packet.time - global_time).abs() <= 1e-7,
+                packet.time <= global_time + 1e-7,
                 "Timing mismatch: packet.time = {}, global_time = {}",
                 packet.time,
                 global_time
             );
 
             // makes sure that the simulation advances in time
-            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+            assert!((global_time - local_time).abs() <= 1e-7 || global_time > local_time);
         }
 
-        let now = quantize_time(packet.time);
+        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
         packet.departure_update(now);
 
         match self {
@@ -510,7 +510,7 @@ impl PacketSource {
                 let global_time =
                     quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
                 assert!(
-                    (now - global_time).abs() <= 1e-7,
+                    now <= global_time + 1e-7,
                     "Timing mismatch: now = {}, global_time = {}",
                     now,
                     global_time

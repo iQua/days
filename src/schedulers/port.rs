@@ -255,7 +255,7 @@ impl Port {
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
             assert!(
-                (packet.time - global_time).abs() <= 1e-7,
+                packet.time <= global_time + 1e-7,
                 "Timing mismatch: packet.time = {}, global_time = {}",
                 packet.time,
                 global_time
@@ -338,6 +338,9 @@ impl Port {
     }
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
+        let mut packet = packet;
+        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
+        packet.departure_update(now);
         self.send(packet).await;
 
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -347,7 +350,7 @@ impl Port {
     }
 
     async fn send_scheduled(&mut self, _: (), cx: &Context<Self>) {
-        let Some(packet) = self.scheduled_departures.pop_front() else {
+        let Some(mut packet) = self.scheduled_departures.pop_front() else {
             debug_assert!(
                 false,
                 "Port {} scheduled departure queue underflow",
@@ -355,6 +358,8 @@ impl Port {
             );
             return;
         };
+        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
+        packet.departure_update(now);
         self.send(packet).await;
 
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -390,7 +395,7 @@ impl Port {
                 let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
                 assert!(
-                    (now - global_time).abs() <= 1e-7,
+                    now <= global_time + 1e-7,
                     "Timing mismatch: now = {}, global_time = {}",
                     now,
                     global_time

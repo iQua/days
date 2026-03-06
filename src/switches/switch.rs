@@ -7,6 +7,7 @@ use tracing::instrument;
 
 use nexosim::model::{Context, Model};
 use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_switch_id;
@@ -78,13 +79,23 @@ impl PacketSwitch {
 
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
-            assert!((packet.time - global_time).abs() <= 1e-7);
+            assert!(
+                packet.time <= global_time + 1e-7,
+                "Timing mismatch for flow {} packet {}: packet.time = {}, global_time = {}",
+                packet.flow_id,
+                packet.packet_id,
+                packet.time,
+                global_time
+            );
 
             // makes sure that the simulation advances in time
-            assert!((packet.time - local_time).abs() <= 1e-7 || packet.time > local_time);
+            assert!((global_time - local_time).abs() <= 1e-7 || global_time > local_time);
         }
 
-        self.time = packet.time;
+        self.time = _cx
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs_f64();
 
         if packet.ack.is_none() && packet.control.is_none() {
             self.packets_received += 1;

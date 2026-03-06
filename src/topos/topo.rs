@@ -250,10 +250,30 @@ struct PreparedTcpAppSources {
 }
 
 impl Topology {
+    fn ring_next_hop(collective: &Collective, rank: usize) -> usize {
+        collective.sinks[rank]
+    }
+
+    fn ring_total_size(collective: &Collective) -> usize {
+        match collective.traffic.size {
+            FlowSize::Bytes(size) => {
+                assert!(
+                    size >= collective.sources.len(),
+                    "RingAllReduce byte size ({size}) must be at least the ring size ({})",
+                    collective.sources.len()
+                );
+                size
+            }
+            FlowSize::Duration(duration) => panic!(
+                "RingAllReduce does not support duration-based traffic (got duration {duration})"
+            ),
+        }
+    }
+
     fn ring_chunk_owner(phase: Phase, n: usize, rank: usize, step: usize) -> usize {
         match phase {
             Phase::Scatter => (rank + n - step + 1) % n,
-            Phase::Gather => (rank + n - step) % n,
+            Phase::Gather => (rank + n - step + 2) % n,
         }
     }
 
@@ -278,7 +298,7 @@ impl Topology {
     fn prepare_tcp_app_sources(&self) -> PreparedTcpAppSources {
         let mut flow_id_to_source_handle: HashMap<usize, AppSourceBufferHandle> = HashMap::new();
         let mut owned_sources: Vec<AppDataSource> = Vec::new();
-        let mut ring_source_indices: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut ring_source_indices: HashMap<(usize, usize, usize), usize> = HashMap::new();
 
         for collective in &self.collectives {
             match (&collective.collective_type, &collective.flow_type) {
@@ -298,10 +318,7 @@ impl Topology {
                     owned_sources.push(data_src);
                 }
                 (CollectiveType::RingAllReduce, FlowType::TCP) => {
-                    let total_size = match collective.traffic.size {
-                        FlowSize::Bytes(size) => size,
-                        _ => panic!("RingAllReduce only supports byte-based flows."),
-                    };
+                    let total_size = Self::ring_total_size(collective);
                     let n = collective.sources.len();
                     let mut flow_id = collective.first_flow_id;
 
@@ -309,9 +326,9 @@ impl Topology {
                         for rank in 0..n {
                             for step in 1..n {
                                 let src_host = collective.sources[rank];
-                                let dst_host = collective.sources[(rank + 1) % n];
+                                let dst_host = Self::ring_next_hop(collective, rank);
                                 let source_index = if let Some(&index) =
-                                    ring_source_indices.get(&(src_host, dst_host))
+                                    ring_source_indices.get(&(collective.id, src_host, dst_host))
                                 {
                                     index
                                 } else {
@@ -320,7 +337,8 @@ impl Topology {
                                         total_size,
                                         self.app_source_cfg,
                                     ));
-                                    ring_source_indices.insert((src_host, dst_host), index);
+                                    ring_source_indices
+                                        .insert((collective.id, src_host, dst_host), index);
                                     index
                                 };
 
@@ -346,16 +364,15 @@ impl Topology {
 
     fn ring_hop_traffic(
         traffic: &TrafficCharacteristics,
+        total_size: usize,
         n: usize,
         phase: Phase,
         rank: usize,
         step: usize,
     ) -> TrafficCharacteristics {
         let mut hop_traffic = traffic.clone();
-        if let FlowSize::Bytes(total_size) = traffic.size {
-            let (_, chunk_len) = Self::ring_chunk_bounds(total_size, n, phase, rank, step);
-            hop_traffic.size = FlowSize::Bytes(chunk_len);
-        }
+        let (_, chunk_len) = Self::ring_chunk_bounds(total_size, n, phase, rank, step);
+        hop_traffic.size = FlowSize::Bytes(chunk_len);
         hop_traffic
     }
 
@@ -715,13 +732,14 @@ impl Topology {
                 CollectiveType::RingAllReduce => {
                     let n = collective.sources.len();
                     let steps = n.saturating_sub(1);
+                    let total_size = Self::ring_total_size(collective);
                     let mut flow_id = collective.first_flow_id;
 
                     let mut scatter_flow_indices = vec![Vec::with_capacity(steps); n];
                     let mut gather_flow_indices = vec![Vec::with_capacity(steps); n];
 
                     for (rank, &src) in collective.sources.iter().enumerate() {
-                        let dst = collective.sinks[rank];
+                        let dst = Self::ring_next_hop(collective, rank);
                         let path = collective.paths.as_ref().map(|paths| paths[rank].clone());
 
                         for step in 1..n {
@@ -736,6 +754,7 @@ impl Topology {
                                 routing: collective.routing.clone(),
                                 traffic: Self::ring_hop_traffic(
                                     &collective.traffic,
+                                    total_size,
                                     n,
                                     Phase::Scatter,
                                     rank,
@@ -753,7 +772,7 @@ impl Topology {
                     }
 
                     for (rank, &src) in collective.sources.iter().enumerate() {
-                        let dst = collective.sinks[rank];
+                        let dst = Self::ring_next_hop(collective, rank);
                         let path = collective.paths.as_ref().map(|paths| paths[rank].clone());
 
                         for step in 1..n {
@@ -768,6 +787,7 @@ impl Topology {
                                 routing: collective.routing.clone(),
                                 traffic: Self::ring_hop_traffic(
                                     &collective.traffic,
+                                    total_size,
                                     n,
                                     Phase::Gather,
                                     rank,
@@ -819,13 +839,13 @@ impl Topology {
                                 let mut starts_after = Vec::new();
 
                                 if step_idx == 0 {
-                                    // Gather starts only after this rank finishes its scatter phase,
-                                    // and after the predecessor rank completes the upstream hop for
-                                    // the chunk selected by the current gather mapping.
+                                    // The first gather hop forwards the locally retained reduced
+                                    // chunk, which becomes available only after both this rank and
+                                    // the predecessor rank finish the last scatter hop.
                                     let local_scatter_done =
                                         self.flows[scatter_flow_indices[rank][steps - 1]].id;
                                     let upstream_chunk_ready =
-                                        self.flows[scatter_flow_indices[prev_rank][0]].id;
+                                        self.flows[scatter_flow_indices[prev_rank][steps - 1]].id;
                                     starts_after.push(local_scatter_done);
                                     starts_after.push(upstream_chunk_ready);
                                 } else {
@@ -1530,11 +1550,11 @@ mod ring_allreduce_serialization_tests {
         let sources: Vec<usize> = (0..n).collect();
         let sinks: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
 
-        // Minimal traffic; only size matters (byte-based).
+        // Minimal traffic; a non-even size makes gather chunk order observable.
         let traffic = TrafficCharacteristics::new(
-            0.0,        // initial_delay
-            None,       // duration
-            Some(4096), // size (bytes)
+            0.0,      // initial_delay
+            None,     // duration
+            Some(10), // size (bytes)
             DistributionInfo::Exp { lambda: 1.0 },
             DistributionInfo::DiscreteUniform {
                 low: 512,
@@ -1602,10 +1622,10 @@ mod ring_allreduce_serialization_tests {
 
         for rank in 0..n {
             let src = sources[rank];
-            let dst = sources[(rank + 1) % n];
+            let dst = sinks[rank];
             let prev_rank = (rank + n - 1) % n;
             let prev_src = sources[prev_rank];
-            let prev_dst = sources[rank];
+            let prev_dst = sinks[prev_rank];
 
             // There are exactly (n-1) flows on this link in each phase.
             let mut s_ids: Vec<usize> = scatter
@@ -1673,16 +1693,17 @@ mod ring_allreduce_serialization_tests {
                 rank
             );
 
-            // The first gather step should wait for local scatter completion and the
-            // predecessor's upstream scatter hop for the selected chunk.
+            // The first gather step forwards the locally retained reduced chunk,
+            // which requires the predecessor to complete the last scatter hop.
             assert!(
                 by_id[&g_ids[0]].starts_after.contains(&s_ids[n - 2]),
                 "gather[0] should wait for last scatter for rank {}",
                 rank
             );
             assert!(
-                by_id[&g_ids[0]].starts_after.contains(&prev_s_ids[0]),
-                "gather[0] should wait for predecessor scatter[0] for rank {}",
+                by_id[&g_ids[0]].starts_after.contains(&prev_s_ids[n - 2]),
+                "gather[0] should wait for predecessor scatter[{}] for rank {}",
+                n - 2,
                 rank
             );
 
@@ -1708,6 +1729,22 @@ mod ring_allreduce_serialization_tests {
                 rank
             );
         }
+
+        let rank0_gather_sizes: Vec<usize> = gather
+            .iter()
+            .filter(|flow| flow.source_host == 0 && flow.sink_host == 1)
+            .map(|flow| match flow.traffic.size {
+                FlowSize::Bytes(size) => size,
+                FlowSize::Duration(duration) => {
+                    panic!("expected byte-sized gather flows, got duration {duration}")
+                }
+            })
+            .collect();
+        assert_eq!(
+            rank0_gather_sizes,
+            vec![2, 2, 4],
+            "rank 0 gather should forward chunk owners [1, 0, 3]"
+        );
     }
 
     #[test]
@@ -1876,6 +1913,203 @@ mod ring_allreduce_serialization_tests {
             5,
             "expected 1 broadcast source plus 4 ring link sources"
         );
+    }
+
+    #[test]
+    fn ring_tcp_app_sources_are_scoped_per_collective() {
+        let hosts: Vec<usize> = (0..4).collect();
+        let tcp = Some(TCPCharacteristics {
+            cc_algorithm: CCAlgorithm::TCPReno,
+            ecn: false,
+            cubic: None,
+        });
+        let small_ring = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(512),
+            DistributionInfo::Uniform {
+                low: 1.0,
+                high: 1.0,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
+            tcp.clone(),
+        );
+        let large_ring = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(2048),
+            DistributionInfo::Uniform {
+                low: 1.0,
+                high: 1.0,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
+            tcp,
+        );
+
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            runtime_num_threads: 1,
+            graph: UnGraph::<usize, ()>::default(),
+            hosts,
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![
+                Collective {
+                    id: 10,
+                    collective_type: CollectiveType::RingAllReduce,
+                    first_flow_id: 4000,
+                    flow_type: FlowType::TCP,
+                    flow_count: 4,
+                    graph: None,
+                    paths: None,
+                    sources: vec![0, 1, 2, 3],
+                    sinks: vec![1, 2, 3, 0],
+                    routing: None,
+                    traffic: small_ring,
+                },
+                Collective {
+                    id: 11,
+                    collective_type: CollectiveType::RingAllReduce,
+                    first_flow_id: 4024,
+                    flow_type: FlowType::TCP,
+                    flow_count: 4,
+                    graph: None,
+                    paths: None,
+                    sources: vec![0, 1, 2, 3],
+                    sinks: vec![1, 2, 3, 0],
+                    routing: None,
+                    traffic: large_ring,
+                },
+            ],
+            switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        topo.process_collectives();
+        let prepared = topo.prepare_tcp_app_sources();
+
+        assert_eq!(
+            prepared.owned_sources.len(),
+            8,
+            "each collective should get its own four directed-link buffers"
+        );
+        assert_eq!(
+            prepared.flow_id_to_source_handle[&4000].get_length(),
+            Some(128)
+        );
+        assert_eq!(
+            prepared.flow_id_to_source_handle[&4024].get_length(),
+            Some(512)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "RingAllReduce byte size (2) must be at least the ring size (4)")]
+    fn ring_allreduce_rejects_undersized_byte_traffic() {
+        let collective = Collective {
+            id: 120,
+            collective_type: CollectiveType::RingAllReduce,
+            first_flow_id: 5000,
+            flow_type: FlowType::PacketDistribution,
+            flow_count: 4,
+            graph: None,
+            paths: None,
+            sources: vec![0, 1, 2, 3],
+            sinks: vec![1, 2, 3, 0],
+            routing: None,
+            traffic: TrafficCharacteristics::new(
+                0.0,
+                None,
+                Some(2),
+                DistributionInfo::Uniform {
+                    low: 1.0,
+                    high: 1.0,
+                },
+                DistributionInfo::DiscreteUniform { low: 1, high: 1 },
+                None,
+            ),
+        };
+
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            runtime_num_threads: 1,
+            graph: UnGraph::<usize, ()>::default(),
+            hosts: vec![0, 1, 2, 3],
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![collective],
+            switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        topo.process_collectives();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "RingAllReduce does not support duration-based traffic (got duration 10)"
+    )]
+    fn ring_allreduce_rejects_duration_based_traffic() {
+        let collective = Collective {
+            id: 121,
+            collective_type: CollectiveType::RingAllReduce,
+            first_flow_id: 6000,
+            flow_type: FlowType::PacketDistribution,
+            flow_count: 4,
+            graph: None,
+            paths: None,
+            sources: vec![0, 1, 2, 3],
+            sinks: vec![1, 2, 3, 0],
+            routing: None,
+            traffic: TrafficCharacteristics::default(),
+        };
+
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            runtime_num_threads: 1,
+            graph: UnGraph::<usize, ()>::default(),
+            hosts: vec![0, 1, 2, 3],
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![collective],
+            switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        topo.process_collectives();
     }
 
     #[test]
