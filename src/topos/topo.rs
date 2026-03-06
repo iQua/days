@@ -721,12 +721,13 @@ impl Topology {
                     let mut gather_flow_indices = vec![Vec::with_capacity(steps); n];
 
                     for (rank, &src) in collective.sources.iter().enumerate() {
-                        let dst = collective.sources[(rank + 1) % n];
+                        let dst = collective.sinks[rank];
+                        let path = collective.paths.as_ref().map(|paths| paths[rank].clone());
 
                         for step in 1..n {
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
-                                path: None,
+                                path: path.clone(),
                                 starts_before: Vec::new(),
                                 starts_after: Vec::new(),
                                 flow_type: collective.flow_type.clone(),
@@ -752,12 +753,13 @@ impl Topology {
                     }
 
                     for (rank, &src) in collective.sources.iter().enumerate() {
-                        let dst = collective.sources[(rank + 1) % n];
+                        let dst = collective.sinks[rank];
+                        let path = collective.paths.as_ref().map(|paths| paths[rank].clone());
 
                         for step in 1..n {
                             let flow = Flow::new(FlowParams {
                                 id: flow_id,
-                                path: None,
+                                path: path.clone(),
                                 starts_before: Vec::new(),
                                 starts_after: Vec::new(),
                                 flow_type: collective.flow_type.clone(),
@@ -1874,5 +1876,81 @@ mod ring_allreduce_serialization_tests {
             5,
             "expected 1 broadcast source plus 4 ring link sources"
         );
+    }
+
+    #[test]
+    fn ring_allreduce_preserves_configured_paths_on_expanded_flows() {
+        let paths = vec![vec![0, 10, 1], vec![1, 11, 2], vec![2, 12, 0]];
+        let collective = Collective {
+            id: 99,
+            collective_type: CollectiveType::RingAllReduce,
+            first_flow_id: 3000,
+            flow_type: FlowType::PacketDistribution,
+            flow_count: 3,
+            graph: None,
+            paths: Some(paths.clone()),
+            sources: vec![0, 1, 2],
+            sinks: vec![1, 2, 0],
+            routing: None,
+            traffic: TrafficCharacteristics::new(
+                0.0,
+                None,
+                Some(1536),
+                DistributionInfo::Uniform {
+                    low: 1.0,
+                    high: 1.0,
+                },
+                DistributionInfo::DiscreteUniform {
+                    low: 512,
+                    high: 512,
+                },
+                None,
+            ),
+        };
+
+        let mut topo = Topology {
+            sim_init: SimInit::new(),
+            runtime_num_threads: 1,
+            graph: UnGraph::<usize, ()>::default(),
+            hosts: vec![0, 1, 2],
+            switches: HashMap::new(),
+            switch_mailboxes: HashMap::new(),
+            flows: Vec::new(),
+            collectives: vec![collective],
+            switch_config: dummy_switch_cfg(),
+            link_config: LinkConfig::default(),
+            #[cfg(feature = "l2_pfc")]
+            fib_views: HashMap::new(),
+            #[cfg(feature = "l2_pfc")]
+            output_states: Arc::new(RwLock::new(HashMap::new())),
+            mailbox_capacity: 16,
+            config_path: String::new(),
+            duration: 1.0,
+            app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+        };
+
+        topo.process_collectives();
+
+        for (rank, expected_path) in paths.iter().enumerate() {
+            let src = rank;
+            let dst = (rank + 1) % paths.len();
+            let link_flows: Vec<_> = topo
+                .flows
+                .iter()
+                .filter(|flow| flow.source_host == src && flow.sink_host == dst)
+                .collect();
+
+            assert_eq!(
+                link_flows.len(),
+                4,
+                "each rank should expand to 2 scatter + 2 gather"
+            );
+            assert!(link_flows.iter().all(|flow| matches!(
+                &flow.routing,
+                crate::flows::route::Routing::PathFromConfig(path)
+                    if path.path.iter().map(|node| node.index()).collect::<Vec<_>>()
+                        == *expected_path
+            )));
+        }
     }
 }
