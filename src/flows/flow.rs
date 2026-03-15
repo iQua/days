@@ -10,9 +10,7 @@ use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
 use serde::Deserialize;
 
-use crate::flows::route::{
-    ECMP, PathFromConfig, Routing, RoutingConfig, RoutingProtocol, ShortestPath,
-};
+use crate::flows::route::{ECMP, PathFromConfig, Routing, RoutingConfig, ShortestPath};
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
@@ -441,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_compute_shortest_path() {
-        let mut flow = Flow {
+        let flow = Flow {
             id: 1,
             starts_before: vec![],
             starts_after: vec![],
@@ -470,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_compute_ecmp_path() {
-        let mut flow = Flow {
+        let flow = Flow {
             id: 2,
             starts_before: vec![],
             starts_after: vec![],
@@ -505,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_compute_path_from_config() {
-        let mut flow = Flow {
+        let flow = Flow {
             id: 3,
             starts_before: vec![],
             starts_after: vec![],

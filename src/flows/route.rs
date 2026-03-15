@@ -86,14 +86,14 @@ impl ShortestPath {
 
     fn fat_tree_params(graph: &UnGraph<usize, ()>) -> Option<(usize, usize, usize)> {
         let total_nodes = graph.node_count();
-        if total_nodes == 0 || total_nodes % 5 != 0 {
+        if total_nodes == 0 || !total_nodes.is_multiple_of(5) {
             return None;
         }
 
         let num_layer_switches = total_nodes.checked_mul(2)? / 5;
         let doubled = num_layer_switches.checked_mul(2)?;
         let k = (doubled as f64).sqrt() as usize;
-        if k == 0 || k * k != doubled || k % 2 != 0 {
+        if k == 0 || k * k != doubled || !k.is_multiple_of(2) {
             return None;
         }
 
@@ -285,10 +285,6 @@ impl ECMP {
         }
     }
 
-    fn compute_hash(&self) -> u64 {
-        Self::compute_hash_for(self.flow_id, self.source_host, self.sink_host)
-    }
-
     fn compute_hash_for(flow_id: usize, source_host: usize, sink_host: usize) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
@@ -311,8 +307,8 @@ impl ECMP {
         paths: &[Vec<NodeIndex>],
     ) -> Vec<NodeIndex> {
         // Use the hash to select a path
-        let index = (Self::compute_hash_for(flow_id, source_host, sink_host) as usize)
-            % paths.len();
+        let index =
+            (Self::compute_hash_for(flow_id, source_host, sink_host) as usize) % paths.len();
         paths[index].clone()
     }
 
