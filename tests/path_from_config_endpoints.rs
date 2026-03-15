@@ -48,7 +48,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
     flow.source_id = 7;
     flow.sink_id = 9;
 
-    let path = flow.compute_path(graph);
+    let path = flow.compute_path(&graph);
 
     assert_eq!(
         path,
