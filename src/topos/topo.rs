@@ -1341,8 +1341,8 @@ impl Topology {
         let pg = multi.add(progress_bar);
         let mut flow_count = 0;
 
-        for flow in self.flows.iter_mut() {
-            let path = flow.compute_path(self.graph.clone());
+        for flow in self.flows.iter() {
+            let path = flow.compute_path(&self.graph);
 
             for window in path.windows(2) {
                 let node_id = window.first().unwrap().index();

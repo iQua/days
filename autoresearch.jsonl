@@ -1,2 +1,3 @@
 {"type":"config","name":"Optimize exp_tcp_fattree runtime","metricName":"wall_s","metricUnit":"s","bestDirection":"lower"}
 {"run":1,"commit":"6a457db","metric":36.7,"metrics":{},"status":"keep","description":"perf(autoresearch): add exp_tcp_fattree harness and cold-build baseline","timestamp":1773541930433,"segment":0}
+{"run":2,"commit":"d212294","metric":10.89,"metrics":{},"status":"keep","description":"perf(autoresearch): record warm baseline for exp_tcp_fattree","timestamp":1773541952711,"segment":0}

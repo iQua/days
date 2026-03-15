@@ -47,13 +47,14 @@ impl ShortestPath {
     pub fn new(graph: UnGraph<usize, ()>) -> ShortestPath {
         ShortestPath { graph }
     }
-}
 
-impl RoutingProtocol for ShortestPath {
-    /// Returns a shortest path between two nodes in the graph using A*.
-    fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
+    pub fn compute_route_in(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Vec<NodeIndex> {
         let path = astar(
-            &self.graph,
+            graph,
             start,
             |n| n == end,
             |_| 1, // Uniform cost
@@ -64,6 +65,13 @@ impl RoutingProtocol for ShortestPath {
             Some((_, path)) => path,
             None => panic!("No path can be found."),
         }
+    }
+}
+
+impl RoutingProtocol for ShortestPath {
+    /// Returns a shortest path between two nodes in the graph using A*.
+    fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
+        Self::compute_route_in(&self.graph, start, end)
     }
 }
 
@@ -112,25 +120,48 @@ impl ECMP {
     }
 
     fn compute_hash(&self) -> u64 {
+        Self::compute_hash_for(self.flow_id, self.source_host, self.sink_host)
+    }
+
+    fn compute_hash_for(flow_id: usize, source_host: usize, sink_host: usize) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
         // Compute a hash value based on flow attributes
-        self.flow_id.hash(&mut hasher);
-        self.source_host.hash(&mut hasher);
-        self.sink_host.hash(&mut hasher);
+        flow_id.hash(&mut hasher);
+        source_host.hash(&mut hasher);
+        sink_host.hash(&mut hasher);
         hasher.finish()
     }
 
     /// Selects one of the equal-cost paths using a hash of flow attributes.
     fn select_ecmp_path(&self, paths: &[Vec<NodeIndex>]) -> Vec<NodeIndex> {
+        Self::select_ecmp_path_for(self.flow_id, self.source_host, self.sink_host, paths)
+    }
+
+    fn select_ecmp_path_for(
+        flow_id: usize,
+        source_host: usize,
+        sink_host: usize,
+        paths: &[Vec<NodeIndex>],
+    ) -> Vec<NodeIndex> {
         // Use the hash to select a path
-        let index = (self.compute_hash() as usize) % paths.len();
+        let index = (Self::compute_hash_for(flow_id, source_host, sink_host) as usize)
+            % paths.len();
         paths[index].clone()
     }
 
     /// Finds all equal-cost paths using an optimized A* approach.
     fn find_equal_cost_paths(
         &self,
+        start: NodeIndex,
+        end: NodeIndex,
+        shortest_distance: usize,
+    ) -> Vec<Vec<NodeIndex>> {
+        Self::find_equal_cost_paths_in(&self.graph, start, end, shortest_distance)
+    }
+
+    fn find_equal_cost_paths_in(
+        graph: &UnGraph<usize, ()>,
         start: NodeIndex,
         end: NodeIndex,
         shortest_distance: usize,
@@ -146,7 +177,7 @@ impl ECMP {
                 continue;
             }
 
-            for neighbor in self.graph.neighbors(current) {
+            for neighbor in graph.neighbors(current) {
                 if !path.contains(&neighbor) {
                     let new_cost = cost + 1; // Uniform cost
                     if new_cost <= shortest_distance {
@@ -159,6 +190,37 @@ impl ECMP {
         }
 
         paths
+    }
+
+    pub fn compute_route_in(
+        graph: &UnGraph<usize, ()>,
+        flow_id: usize,
+        source_host: usize,
+        sink_host: usize,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Vec<NodeIndex> {
+        let shortest_path = astar(
+            graph,
+            start,
+            |n| n == end,
+            |_| 1, // Uniform cost
+            |_| 0, // Heuristic ignored for uniform cost
+        );
+
+        let shortest_distance = match shortest_path {
+            Some((cost, _)) => cost,
+            None => panic!("No path can be found."),
+        };
+
+        let equal_cost_paths =
+            Self::find_equal_cost_paths_in(graph, start, end, shortest_distance as usize);
+
+        if !equal_cost_paths.is_empty() {
+            Self::select_ecmp_path_for(flow_id, source_host, sink_host, &equal_cost_paths)
+        } else {
+            panic!("No equal-cost path can be found.");
+        }
     }
 }
 
