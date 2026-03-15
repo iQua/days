@@ -65,6 +65,7 @@ This is a throughput-oriented performance target. The command should continue to
 - Discarded: a hybrid small-vector route table for switch FIB lookups slowed the benchmark; the current HashMap path is better here.
 - Kept: specializing shortest-path routing for detected fat-tree topologies with implicit neighbor generation inside an A*-equivalent loop cut warm `wall_s` to `8.73` while keeping benchmark-level outputs in the same observed range. A second warm validation run reached `8.46`.
 - Kept: after the routing fast path landed, increasing the worker search-before-park window from 1ns to `5us` improved warm `wall_s` further to `8.11`.
-- Discarded after the new routing fast path: nearby executor retunes still lost to the `5us` search / `250us` linger combination (`3us`, `4us`, `10us` search windows; `200us` and `300us` linger).
-- Current best is now `04802e5` at `wall_s=8.11`.
+- Kept: making that `5us` search window apply only to hot workers, then shortening the hot-worker linger from `250us` to `200us`, improved the warm best again to `8.01`.
+- Discarded after the new routing fast path: nearby executor retunes still lost to the current best (`3us`, `4us`, `10us` search windows; `150us`, `250us`, and `300us` linger around the hot-worker-only search path).
+- Current best is now `2c04bbf` at `wall_s=8.01`.
 - Next focus: validate and refine the new fat-tree routing fast path more directly, then revisit deeper executor handoff changes only if they are more structural than constant retuning.

@@ -71,7 +71,7 @@ use pool_manager::PoolManager;
 
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
-const COLD_WORKER_SEARCH_DURATION: Duration = Duration::from_nanos(1000);
+const COLD_WORKER_SEARCH_DURATION: Duration = Duration::from_micros(1);
 const HOT_WORKER_SEARCH_DURATION: Duration = Duration::from_micros(5);
 const WORKER_LINGER_DURATION: Duration = Duration::from_micros(200);
 const WORKER_LINGER_SPIN_PHASE: Duration = Duration::from_micros(10);
