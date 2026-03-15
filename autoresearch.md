@@ -55,4 +55,7 @@ This is a throughput-oriented performance target. The command should continue to
 - Prior analysis notes in `ideas/concurrency-perf.md` and `ideas/step-quantization.md` point to two recurring themes:
   - MT speedups depend strongly on how many actions coalesce at the same timestamp
   - per-step executor/barrier overhead can dominate when step count remains very high
-- First task in this session: establish a clean baseline on the current branch, then target the largest remaining runtime counters rather than re-trying already-landed ideas blindly.
+- Warm baseline after setup: `wall_s=10.89`, with logs showing roughly ~2s before flow attachment, ~4s in routing on 500 flows, and ~4.08s in the simulation core.
+- Kept: avoid per-flow network-graph clones in `Flow::compute_path` / `Topology::route_flows`; this cut warm `wall_s` to `10.04` and reduced the routing phase from about 4s to about 2s.
+- Discarded: replacing shortest-path lookup with a custom BFS made the benchmark much faster (`wall_s=7.59`) but materially changed packet totals and delay, so it is not a safe performance-only optimization.
+- Next focus: keep routing semantics stable while reducing remaining setup/runtime overhead, especially flow attachment / switch activation and MT simulation barrier costs.

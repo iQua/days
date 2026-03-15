@@ -1,3 +1,7 @@
 {"type":"config","name":"Optimize exp_tcp_fattree runtime","metricName":"wall_s","metricUnit":"s","bestDirection":"lower"}
 {"run":1,"commit":"6a457db","metric":36.7,"metrics":{},"status":"keep","description":"perf(autoresearch): add exp_tcp_fattree harness and cold-build baseline","timestamp":1773541930433,"segment":0}
 {"run":2,"commit":"d212294","metric":10.89,"metrics":{},"status":"keep","description":"perf(autoresearch): record warm baseline for exp_tcp_fattree","timestamp":1773541952711,"segment":0}
+{"run":3,"commit":"9256440","metric":10.04,"metrics":{},"status":"keep","description":"perf(routing): avoid per-flow graph clones when computing routes","timestamp":1773542091182,"segment":0}
+{"run":4,"commit":"9256440","metric":7.59,"metrics":{},"status":"discard","description":"perf(routing): try BFS shortest-path lookup; faster but changes routing outcomes enough to alter packet totals materially","timestamp":1773542201871,"segment":0}
+{"run":5,"commit":"9256440","metric":0,"metrics":{},"status":"crash","description":"perf(topology): try mut-borrow connect_neighbours; borrow checker rejects moving SimInit through &mut self","timestamp":1773542398277,"segment":0}
+{"run":6,"commit":"9256440","metric":10.02,"metrics":{},"status":"discard","description":"perf(topology): reserve switch/mailbox/output hash maps; tiny gain is within run-to-run noise","timestamp":1773542492675,"segment":0}
