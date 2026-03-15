@@ -84,6 +84,77 @@ impl ShortestPath {
         ShortestPath { graph }
     }
 
+    fn has_fat_tree_layout(
+        graph: &UnGraph<usize, ()>,
+        num_layer_switches: usize,
+        switches_per_pod: usize,
+        num_pods: usize,
+    ) -> bool {
+        let expected_edge_count = num_layer_switches
+            .checked_mul(switches_per_pod)
+            .and_then(|edge_to_agg| edge_to_agg.checked_mul(2));
+        if graph.edge_count() != expected_edge_count.unwrap_or(usize::MAX) {
+            return false;
+        }
+
+        let core_start = 2 * num_layer_switches;
+
+        for edge_id in 0..num_layer_switches {
+            let pod = edge_id / switches_per_pod;
+            let agg_base = num_layer_switches + pod * switches_per_pod;
+
+            for agg_offset in 0..switches_per_pod {
+                if !graph.contains_edge(
+                    NodeIndex::new(edge_id),
+                    NodeIndex::new(agg_base + agg_offset),
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        for agg_id in num_layer_switches..core_start {
+            let agg_rel = agg_id - num_layer_switches;
+            let pod = agg_rel / switches_per_pod;
+            let group = agg_rel % switches_per_pod;
+            let edge_base = pod * switches_per_pod;
+
+            for edge_offset in 0..switches_per_pod {
+                if !graph.contains_edge(
+                    NodeIndex::new(agg_id),
+                    NodeIndex::new(edge_base + edge_offset),
+                ) {
+                    return false;
+                }
+            }
+
+            for core_offset in 0..switches_per_pod {
+                if !graph.contains_edge(
+                    NodeIndex::new(agg_id),
+                    NodeIndex::new(core_start + group * switches_per_pod + core_offset),
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        for core_id in core_start..graph.node_count() {
+            let core_rel = core_id - core_start;
+            let group = core_rel / switches_per_pod;
+
+            for pod in 0..num_pods {
+                if !graph.contains_edge(
+                    NodeIndex::new(core_id),
+                    NodeIndex::new(num_layer_switches + pod * switches_per_pod + group),
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
     fn fat_tree_params(graph: &UnGraph<usize, ()>) -> Option<(usize, usize, usize)> {
         let total_nodes = graph.node_count();
         if total_nodes == 0 || !total_nodes.is_multiple_of(5) {
@@ -98,6 +169,10 @@ impl ShortestPath {
         }
 
         let switches_per_pod = k / 2;
+        if !Self::has_fat_tree_layout(graph, num_layer_switches, switches_per_pod, k) {
+            return None;
+        }
+
         Some((num_layer_switches, switches_per_pod, k))
     }
 
@@ -528,5 +603,27 @@ mod tests {
         let path2 = ecmp.compute_route(start, end);
 
         assert_eq!(path1, path2, "ECMP path selection should be stable");
+    }
+
+    #[test]
+    fn test_shortest_path_custom_five_node_graph_falls_back_from_fat_tree_fast_path() {
+        let graph = UnGraph::<usize, ()>::from_edges([
+            (0_u32, 2_u32),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (3, 4),
+        ]);
+
+        let path = ShortestPath::compute_route_in(&graph, NodeIndex::new(0), NodeIndex::new(1));
+
+        assert_eq!(path.first(), Some(&NodeIndex::new(0)));
+        assert_eq!(path.last(), Some(&NodeIndex::new(1)));
+        assert_eq!(path.len(), 3, "expected a valid 2-hop shortest path");
+
+        for window in path.windows(2) {
+            assert!(graph.contains_edge(window[0], window[1]));
+        }
     }
 }
