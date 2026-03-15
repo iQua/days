@@ -34,3 +34,5 @@
 {"run":33,"commit":"04802e5","metric":8.25,"metrics":{},"status":"discard","description":"perf(executor): retune linger to 200us on top of the 5us search window; slightly worse than 250us","timestamp":1773544764926,"segment":0}
 {"run":34,"commit":"04802e5","metric":8.17,"metrics":{},"status":"discard","description":"perf(executor): retune linger to 300us on top of the 5us search window; slightly worse than 250us","timestamp":1773544806504,"segment":0}
 {"run":35,"commit":"04802e5","metric":8.18,"metrics":{},"status":"discard","description":"perf(executor): try 4us worker search window before parking; still trails the 5us setting","timestamp":1773544847268,"segment":0}
+{"run":36,"commit":"63d432c","metric":8.05,"metrics":{},"status":"keep","description":"perf(executor): give only hot workers the 5us search window before parking","timestamp":1773544913576,"segment":0}
+{"run":37,"commit":"63d432c","metric":8.25,"metrics":{},"status":"discard","description":"perf(executor): extend the hot-worker-only search window to 10us; extra searching hurts throughput","timestamp":1773544949892,"segment":0}
