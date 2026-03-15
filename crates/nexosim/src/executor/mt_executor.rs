@@ -637,7 +637,7 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         // Set how long to spin when searching for a task.
-        const MAX_SEARCH_DURATION: Duration = Duration::from_nanos(1000);
+        const MAX_SEARCH_DURATION: Duration = Duration::from_micros(5);
 
         // Seed a thread RNG with the worker ID.
         let rng = Rng::new(id as u64);
