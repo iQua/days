@@ -64,4 +64,21 @@ It runs the benchmark command, prints output, and emits:
   - `2c04bbf` 200us hot-worker linger
   - `b109311` 1us cold-worker search window
 - New target differs materially because the metric excludes setup/routing time and measures only the simulator-reported elapsed wall-clock time for the run itself.
-- First task for this target: establish a clean baseline on the new benchmark using the log-line metric, then retune only if the new benchmark still benefits.
+- Baseline on this target, using the inherited code from the previous benchmark, is currently `sim_wall_s=9.52`.
+- So far on this target, all tested follow-on changes have been worse than that baseline:
+  - executor constant retunes:
+    - removing hot/cold search windows entirely regressed badly
+    - hot search windows of `4us` and `6us` were worse than `5us`
+    - cold search windows of `500ns`, `750ns`, `900ns`, `1.25us`, and `2us` were all worse than `1us`
+    - hot linger values of `150us` and `250us` were worse than `200us`
+    - a `1us` main-thread spin before parking was worse
+  - simulation scheduling retunes:
+    - accelerated group bundling at `3x` and `20x` threads was worse than the current `10x`
+    - incrementally building bundled executor tasks instead of collecting then rebundling groups did not help
+    - increasing FIFO port `run_batch_size` to `4` did not help
+  - other structural / hot-path ideas:
+    - skipping hot-worker park after a successful linger hit crashed because it violated pool active-bit assumptions
+    - a `u64` fast path for time quantization did not help
+    - avoiding timeout-heap pruning on every TCP ACK did not help
+- Conclusion so far: on this smaller benchmark, the inherited executor tuning from the previous campaign still looks locally optimal among the executor/scheduling retunes tried.
+- Next focus should be structural executor handoff changes with correct pool-state accounting, or deeper inspection of simulation hot paths such as TCP/port scheduling rather than more blind constant sweeps.

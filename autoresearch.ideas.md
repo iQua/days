@@ -1,2 +1,2 @@
-- Explore a more structural MT executor change that reduces per-step handoff overhead without simply lengthening linger time: e.g. adaptive linger/search by recent epoch cadence, or a quiescent-hot state that avoids full park/unpark churn for the configured hot workers.
-- If the new benchmark stops responding to executor tuning, inspect whether the simulation hot path now shifts toward port/wire/TCP scheduling overhead rather than routing/setup overhead.
+- Explore a structural MT executor change that reduces per-step handoff overhead without simply retuning constants: e.g. adaptive linger/search by recent epoch cadence, or a quiescent-hot state that avoids full park/unpark churn while preserving pool active-bit invariants.
+- Inspect simulation hot paths beyond the executor, especially TCP ACK/timer bookkeeping and FIFO port scheduling, since the sim-wall metric excludes routing/setup and nearby executor retunes have all lost.
