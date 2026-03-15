@@ -1,71 +1,67 @@
-# Autoresearch: exp_tcp_fattree runtime
+# Autoresearch: fattree_k32_tcp_f32_mt simulation runtime
 
 ## Objective
-Reduce wall-clock runtime of the `configs/exp_tcp_fattree.toml` workload without changing the benchmark workload itself.
+Reduce the **in-simulator elapsed wall-clock time** of:
 
-The workload is a 2.0s multi-threaded TCP fat-tree simulation:
-- topology: FatTree with `k = 96`
-- 500 TCP flows using shortest-path routing
+`cargo run --release --bin days configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml`
+
+The primary metric is **not** total command wall time. Instead, it is the value reported by the simulator's final log line:
+
+`Elapsed wall-clock time: <x> seconds.`
+
+That excludes routing/setup time and focuses on the simulation core.
+
+Workload details:
+- topology: FatTree with `k = 32`
+- 32 TCP flows using shortest-path routing
+- duration: `10.0s` simulated time
 - fixed 1024-byte packets every 800us
-- 10 Mbps FIFO+RED switch ports
-- current runtime knobs in the config: `threading = "multiple"`, `time_quantum_ns = 102400`, `hot_workers = 2`, `concurrency_level = "accelerated"`
-
-This is a throughput-oriented performance target. The command should continue to complete successfully and produce the same kind of simulation outputs.
+- 100 Mbps FIFO+TailDrop switch ports
+- runtime knobs from config: `threading = "multiple"`, `time_quantum_ns = 20000`, `hot_workers = 2`, `mailbox_capacity = 512`, `concurrency_level = "accelerated"`
 
 ## Metrics
-- **Primary**: wall-clock runtime (`wall_s`, seconds, lower is better)
-- **Secondary**: simulation step count, avg/max groups per step, scheduled fast vs erased events, injected events, executor park/linger counters
+- **Primary**: `sim_wall_s` (seconds, lower is better), extracted from the simulator's final `Elapsed wall-clock time:` log line
+- **Secondary**: `command_real_s` from `/usr/bin/time -p`, and any qualitative observations from logs
 
 ## How to Run
-`./autoresearch.sh` — builds the release binary if needed, runs the benchmark workload, prints simulator perf stats, and emits `METRIC` lines.
+`./autoresearch.sh`
+
+It runs the benchmark command, prints output, and emits:
+- `METRIC sim_wall_s=<number>`
+- `METRIC command_real_s=<number>`
 
 ## Files in Scope
-- `configs/exp_tcp_fattree.toml` — fixed benchmark workload reference; read-only unless benchmark harness maintenance is unavoidable
-- `src/flows/tcp_source.rs` — TCP pacing / send scheduling
-- `src/flows/wire.rs` — propagation-delay scheduling
-- `src/schedulers/port.rs` — FIFO port serialization / batched scheduled sends
-- `src/utils/time.rs` — Days-side time quantization helpers
-- `src/topos/topo.rs` — runtime configuration wiring
-- `crates/nexosim/src/simulation.rs` — simulation stepping hot path and perf counters
-- `crates/nexosim/src/simulation/scheduler.rs` — scheduler queue / time quantization behavior
-- `crates/nexosim/src/executor/mt_executor.rs` — MT executor park/linger/inject behavior
-- `crates/nexosim/src/model/context.rs` — fast scheduling APIs if batching strategy changes
+- `configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml` — fixed benchmark workload reference; read-only unless harness maintenance is necessary
+- `src/flows/route.rs` — shortest-path / ECMP routing implementation
+- `src/flows/flow.rs` — flow path construction
+- `src/topos/topo.rs` — routing setup and runtime configuration wiring
+- `crates/nexosim/src/executor/mt_executor.rs` — MT executor park/linger/search behavior
+- `crates/nexosim/src/simulation.rs` — simulation stepping hot path and task grouping
+- `src/schedulers/port.rs`, `src/flows/wire.rs`, `src/flows/tcp_source.rs` — simulation hot-path scheduling if the new benchmark points there
 
 ## Off Limits
 - Lean proofs under `lean/`
-- Documentation-only changes unrelated to the benchmark harness
-- Broad workload changes that make the benchmark easier instead of making the simulator faster
+- Broad benchmark changes that make the workload easier instead of making the simulator faster
+- Documentation-only churn unrelated to the active benchmark
 - New dependencies unless absolutely required
 
 ## Constraints
-- Keep the benchmark command/workload fixed: `target/release/days configs/exp_tcp_fattree.toml`
-- Prioritize primary metric improvement over secondary metrics
-- Keep edits focused on runtime behavior and low-overhead instrumentation
-- Avoid correctness-risky semantic changes unless the performance win is clear and the change is tightly scoped
+- Keep the benchmark command/workload fixed: `cargo run --release --bin days configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml`
+- Primary metric comes from the simulator's own elapsed-wall-clock log line
+- Do not cheat by suppressing work, changing workload semantics, or biasing the benchmark harness
+- Prefer low-risk runtime changes; correctness-sensitive routing changes need extra scrutiny
 - No manual commits; experiment logging handles commits
 
 ## What's Been Tried
-- Existing branch history already landed several performance-oriented changes before this autoresearch session:
-  - fast-path clone avoidance in port/wire/scheduler scheduling
-  - simulation-step hot-path tuning and injector draining changes in Nexosim
-  - local flush queue overhead reduction
-  - fast-only simulation step specialization
-  - accelerated per-step group bundling
-  - time quantization plumbing (`time_quantum_ns`) and hot workers
-- Prior analysis notes in `ideas/concurrency-perf.md` and `ideas/step-quantization.md` point to two recurring themes:
-  - MT speedups depend strongly on how many actions coalesce at the same timestamp
-  - per-step executor/barrier overhead can dominate when step count remains very high
-- Warm baseline after setup: `wall_s=10.89`, with logs showing roughly ~2s before flow attachment, ~4s in routing on 500 flows, and ~4.08s in the simulation core.
-- Kept: avoid per-flow network-graph clones in `Flow::compute_path` / `Topology::route_flows`; this cut warm `wall_s` to `10.04` and reduced the routing phase from about 4s to about 2s.
-- Discarded: replacing shortest-path lookup with a custom BFS made the benchmark much faster (`wall_s=7.59`) but materially changed packet totals and delay, so it is not a safe performance-only optimization.
-- Discarded: reserving switch/mailbox/output hash maps showed only a tiny apparent gain (`10.02`) that is too close to run-to-run noise to justify keeping.
-- Kept: increasing `WORKER_LINGER_DURATION` from 80us to 250us improved warm `wall_s` to `9.87`; executor linger timeouts fell substantially, although total worker parks did not.
-- Discarded: several nearby executor retunes all lost to the 250us linger setting: 500us linger, 200us linger, 5us/25us spin phases, 2us/5us search windows before parking, a 5us main-thread spin before parking, and activating only one hot worker at run start.
-- Discarded: broader setup-path cleanups also failed to beat the current best, including Vec-backed switch/mailbox storage, skipping non-interactive routing progress setup, removing one topology graph clone between setup and run, routing warning cleanup, and halving the accelerated group-bundling factor from 10x threads to 5x threads.
-- Discarded: a hybrid small-vector route table for switch FIB lookups slowed the benchmark; the current HashMap path is better here.
-- Kept: specializing shortest-path routing for detected fat-tree topologies with implicit neighbor generation inside an A*-equivalent loop cut warm `wall_s` to `8.73` while keeping benchmark-level outputs in the same observed range. A second warm validation run reached `8.46`.
-- Kept: after the routing fast path landed, increasing the worker search-before-park window from 1ns to `5us` improved warm `wall_s` further to `8.11`.
-- Kept: making that `5us` search window apply only to hot workers, then shortening the hot-worker linger from `250us` to `200us`, improved the warm best again to `8.01`.
-- Discarded after the new routing fast path: nearby executor retunes still lost to the current best (`3us`, `4us`, `10us` search windows; `150us`, `250us`, and `300us` linger around the hot-worker-only search path).
-- Current best is now `2c04bbf` at `wall_s=8.01`.
-- Next focus: validate and refine the new fat-tree routing fast path more directly, then revisit deeper executor handoff changes only if they are more structural than constant retuning.
+- Previous autoresearch target (`configs/exp_tcp_fattree.toml`) produced useful transferable ideas:
+  - a fat-tree-specific shortest-path fast path can matter a lot
+  - executor park/search/linger policy also matters materially
+  - many small constant retunes are noise; structural changes win more often
+- The current branch already contains the latest keeps from the previous target:
+  - `38e94c2` fat-tree implicit A*-style routing traversal
+  - `04802e5` 5us worker search-before-park
+  - `63d432c` hot-worker-only 5us search policy
+  - `2c04bbf` 200us hot-worker linger
+  - `b109311` 1us cold-worker search window
+- New target differs materially because the metric excludes setup/routing time and measures only the simulator-reported elapsed wall-clock time for the run itself.
+- First task for this target: establish a clean baseline on the new benchmark using the log-line metric, then retune only if the new benchmark still benefits.

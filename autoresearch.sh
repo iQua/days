@@ -1,25 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-BIN=./target/release/days
-CONFIG=configs/exp_tcp_fattree.toml
-LOG_DIR=logs/exp/tcp_fattree/t10_m1000
+CONFIG=configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml
+LOG_DIR=logs/fattree
 
-cargo build --release --features perf_stats --bin days >/dev/null
 rm -rf "$LOG_DIR"
 
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 
-{ /usr/bin/time -p "$BIN" "$CONFIG"; } >"$out" 2>&1
+{ /usr/bin/time -p cargo run --release --bin days "$CONFIG"; } >"$out" 2>&1
 cat "$out"
 
-wall_s=$(awk '/^real / { print $2 }' "$out" | tail -n1)
-steps=$(grep -o 'steps=[0-9]*' "$out" | tail -n1 | cut -d= -f2 || true)
-avg_groups=$(grep -o 'avg_groups/step=[0-9.]*' "$out" | tail -n1 | cut -d= -f2 || true)
-worker_parks=$(grep -o 'worker_parks=[0-9]*' "$out" | tail -n1 | cut -d= -f2 || true)
+sim_wall_s=$(grep 'Elapsed wall-clock time:' "$out" | tail -n1 | sed -E 's/.*Elapsed wall-clock time: ([0-9.]+) seconds.*/\1/' || true)
+command_real_s=$(awk '/^real / { print $2 }' "$out" | tail -n1)
 
-[ -n "$wall_s" ] && echo "METRIC wall_s=$wall_s"
-[ -n "$steps" ] && echo "METRIC steps=$steps"
-[ -n "$avg_groups" ] && echo "METRIC avg_groups_per_step=$avg_groups"
-[ -n "$worker_parks" ] && echo "METRIC worker_parks=$worker_parks"
+[ -n "$sim_wall_s" ] && echo "METRIC sim_wall_s=$sim_wall_s"
+[ -n "$command_real_s" ] && echo "METRIC command_real_s=$command_real_s"
