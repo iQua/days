@@ -10,9 +10,7 @@ use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
 use serde::Deserialize;
 
-use crate::flows::route::{
-    ECMP, PathFromConfig, Routing, RoutingConfig, RoutingProtocol, ShortestPath,
-};
+use crate::flows::route::{ECMP, PathFromConfig, Routing, RoutingConfig, ShortestPath};
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
@@ -360,14 +358,13 @@ impl Flow {
     /// # Returns
     ///
     /// * A vector of `NodeIndex` representing the path from source to sink.
-    pub fn compute_path(&mut self, graph: UnGraph<usize, ()>) -> Vec<NodeIndex> {
+    pub fn compute_path(&self, graph: &UnGraph<usize, ()>) -> Vec<NodeIndex> {
         match &self.routing {
             Routing::ShortestPath(_) => {
-                // Select a random candidate from all shortest paths
-                let mut routing = ShortestPath::new(graph);
                 let mut path = vec![NodeIndex::new(self.source_id)];
 
-                path.append(&mut routing.compute_route(
+                path.append(&mut ShortestPath::compute_route_in(
+                    graph,
                     NodeIndex::new(self.source_host),
                     NodeIndex::new(self.sink_host),
                 ));
@@ -386,11 +383,13 @@ impl Flow {
                 path
             }
             Routing::ECMP(_) => {
-                // Selects a path using Equal-Cost Multi-Path (ECMP) routing
-                let mut routing = ECMP::new(graph, self.id, self.source_id, self.sink_id);
                 let mut path = vec![NodeIndex::new(self.source_id)];
 
-                path.append(&mut routing.compute_route(
+                path.append(&mut ECMP::compute_route_in(
+                    graph,
+                    self.id,
+                    self.source_host,
+                    self.sink_host,
                     NodeIndex::new(self.source_host),
                     NodeIndex::new(self.sink_host),
                 ));
@@ -440,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_compute_shortest_path() {
-        let mut flow = Flow {
+        let flow = Flow {
             id: 1,
             starts_before: vec![],
             starts_after: vec![],
@@ -459,7 +458,7 @@ mod tests {
 
         let graph = create_graph(&[(0, 1), (1, 2), (2, 3), (0, 3)]);
 
-        let path = flow.compute_path(graph.clone());
+        let path = flow.compute_path(&graph);
 
         // Assuming the shortest path is direct from 0 to 3
         assert_eq!(path.len(), 4); // source_id, nodes en route, sink_id
@@ -469,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_compute_ecmp_path() {
-        let mut flow = Flow {
+        let flow = Flow {
             id: 2,
             starts_before: vec![],
             starts_after: vec![],
@@ -491,7 +490,7 @@ mod tests {
 
         let graph = create_graph(&[(0, 1), (1, 3), (0, 2), (2, 3)]);
 
-        let path = flow.compute_path(graph.clone());
+        let path = flow.compute_path(&graph);
 
         // ECMP may choose either path 0-1-3 or 0-2-3
         assert_eq!(path.len(), 5); // source_id, nodes en route, sink_id
@@ -504,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_compute_path_from_config() {
-        let mut flow = Flow {
+        let flow = Flow {
             id: 3,
             starts_before: vec![],
             starts_after: vec![],
@@ -521,7 +520,7 @@ mod tests {
 
         let graph = create_graph(&[(0, 1), (1, 2), (2, 3), (3, 4)]);
 
-        let path = flow.compute_path(graph.clone());
+        let path = flow.compute_path(&graph);
 
         assert_eq!(path.len(), 5);
         assert_eq!(path[0], NodeIndex::new(0));

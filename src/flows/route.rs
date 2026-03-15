@@ -6,12 +6,48 @@
 //! - Path from configuration: Uses the path that is specified in the configuration.
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 
 use petgraph::algo;
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
+
+#[derive(Copy, Clone, Debug)]
+struct MinScoredNode {
+    score: (usize, usize, usize),
+    node: NodeIndex,
+}
+
+impl PartialEq for MinScoredNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for MinScoredNode {}
+
+impl PartialOrd for MinScoredNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MinScoredNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let a = &self.score;
+        let b = &other.score;
+        if a == b {
+            Ordering::Equal
+        } else if a < b {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub enum RoutingConfig {
@@ -47,13 +83,219 @@ impl ShortestPath {
     pub fn new(graph: UnGraph<usize, ()>) -> ShortestPath {
         ShortestPath { graph }
     }
-}
 
-impl RoutingProtocol for ShortestPath {
-    /// Returns a shortest path between two nodes in the graph using A*.
-    fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
+    fn has_fat_tree_layout(
+        graph: &UnGraph<usize, ()>,
+        num_layer_switches: usize,
+        switches_per_pod: usize,
+        num_pods: usize,
+    ) -> bool {
+        let expected_edge_count = num_layer_switches
+            .checked_mul(switches_per_pod)
+            .and_then(|edge_to_agg| edge_to_agg.checked_mul(2));
+        if graph.edge_count() != expected_edge_count.unwrap_or(usize::MAX) {
+            return false;
+        }
+
+        let core_start = 2 * num_layer_switches;
+
+        for edge_id in 0..num_layer_switches {
+            let pod = edge_id / switches_per_pod;
+            let agg_base = num_layer_switches + pod * switches_per_pod;
+
+            for agg_offset in 0..switches_per_pod {
+                if !graph.contains_edge(
+                    NodeIndex::new(edge_id),
+                    NodeIndex::new(agg_base + agg_offset),
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        for agg_id in num_layer_switches..core_start {
+            let agg_rel = agg_id - num_layer_switches;
+            let pod = agg_rel / switches_per_pod;
+            let group = agg_rel % switches_per_pod;
+            let edge_base = pod * switches_per_pod;
+
+            for edge_offset in 0..switches_per_pod {
+                if !graph.contains_edge(
+                    NodeIndex::new(agg_id),
+                    NodeIndex::new(edge_base + edge_offset),
+                ) {
+                    return false;
+                }
+            }
+
+            for core_offset in 0..switches_per_pod {
+                if !graph.contains_edge(
+                    NodeIndex::new(agg_id),
+                    NodeIndex::new(core_start + group * switches_per_pod + core_offset),
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        for core_id in core_start..graph.node_count() {
+            let core_rel = core_id - core_start;
+            let group = core_rel / switches_per_pod;
+
+            for pod in 0..num_pods {
+                if !graph.contains_edge(
+                    NodeIndex::new(core_id),
+                    NodeIndex::new(num_layer_switches + pod * switches_per_pod + group),
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn fat_tree_params(graph: &UnGraph<usize, ()>) -> Option<(usize, usize, usize)> {
+        let total_nodes = graph.node_count();
+        if total_nodes == 0 || !total_nodes.is_multiple_of(5) {
+            return None;
+        }
+
+        let num_layer_switches = total_nodes.checked_mul(2)? / 5;
+        let doubled = num_layer_switches.checked_mul(2)?;
+        let k = (doubled as f64).sqrt() as usize;
+        if k == 0 || k * k != doubled || !k.is_multiple_of(2) {
+            return None;
+        }
+
+        let switches_per_pod = k / 2;
+        if !Self::has_fat_tree_layout(graph, num_layer_switches, switches_per_pod, k) {
+            return None;
+        }
+
+        Some((num_layer_switches, switches_per_pod, k))
+    }
+
+    fn compute_fat_tree_route_in(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Option<Vec<NodeIndex>> {
+        let (num_layer_switches, switches_per_pod, num_pods) = Self::fat_tree_params(graph)?;
+        let core_start = 2 * num_layer_switches;
+
+        let start_idx = start.index();
+        let end_idx = end.index();
+        if start_idx >= num_layer_switches || end_idx >= num_layer_switches {
+            return None;
+        }
+
+        let node_count = graph.node_count();
+        let mut visit_next = BinaryHeap::new();
+        let mut scores = vec![None; node_count];
+        let mut came_from = vec![usize::MAX; node_count];
+
+        let start_idx = start.index();
+        scores[start_idx] = Some((0, 0, 0));
+        visit_next.push(MinScoredNode {
+            score: (0, 0, 0),
+            node: start,
+        });
+
+        while let Some(MinScoredNode {
+            score: (f, h, g),
+            node,
+        }) = visit_next.pop()
+        {
+            if node == end {
+                let mut path = vec![node];
+                let mut current = node.index();
+                while current != start_idx {
+                    let previous = came_from[current];
+                    if previous == usize::MAX {
+                        break;
+                    }
+                    path.push(NodeIndex::new(previous));
+                    current = previous;
+                }
+                path.reverse();
+                return Some(path);
+            }
+
+            let node_idx = node.index();
+            if let Some((_, _, old_g)) = scores[node_idx] {
+                if old_g < g {
+                    continue;
+                }
+            }
+            scores[node_idx] = Some((f, h, g));
+
+            let mut push_neighbor = |neigh: NodeIndex| {
+                let neigh_g = g + 1;
+                let neigh_score = (neigh_g, 0, neigh_g);
+                let neigh_idx = neigh.index();
+
+                if let Some((_, _, old_neigh_g)) = scores[neigh_idx] {
+                    if neigh_g >= old_neigh_g {
+                        return;
+                    }
+                }
+
+                scores[neigh_idx] = Some(neigh_score);
+                came_from[neigh_idx] = node_idx;
+                visit_next.push(MinScoredNode {
+                    score: neigh_score,
+                    node: neigh,
+                });
+            };
+
+            if node_idx < num_layer_switches {
+                let pod = node_idx / switches_per_pod;
+                let agg_base = num_layer_switches + pod * switches_per_pod;
+                for agg_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(agg_base + agg_offset));
+                }
+            } else if node_idx < core_start {
+                let agg_rel = node_idx - num_layer_switches;
+                let pod = agg_rel / switches_per_pod;
+                let group = agg_rel % switches_per_pod;
+
+                for core_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(
+                        core_start + group * switches_per_pod + core_offset,
+                    ));
+                }
+
+                let edge_base = pod * switches_per_pod;
+                for edge_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(edge_base + edge_offset));
+                }
+            } else {
+                let core_rel = node_idx - core_start;
+                let group = core_rel / switches_per_pod;
+
+                for pod in (0..num_pods).rev() {
+                    push_neighbor(NodeIndex::new(
+                        num_layer_switches + pod * switches_per_pod + group,
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn compute_route_in(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Vec<NodeIndex> {
+        if let Some(path) = Self::compute_fat_tree_route_in(graph, start, end) {
+            return path;
+        }
+
         let path = astar(
-            &self.graph,
+            graph,
             start,
             |n| n == end,
             |_| 1, // Uniform cost
@@ -64,6 +306,13 @@ impl RoutingProtocol for ShortestPath {
             Some((_, path)) => path,
             None => panic!("No path can be found."),
         }
+    }
+}
+
+impl RoutingProtocol for ShortestPath {
+    /// Returns a shortest path between two nodes in the graph using A*.
+    fn compute_route(&mut self, start: NodeIndex, end: NodeIndex) -> Vec<NodeIndex> {
+        Self::compute_route_in(&self.graph, start, end)
     }
 }
 
@@ -111,26 +360,45 @@ impl ECMP {
         }
     }
 
-    fn compute_hash(&self) -> u64 {
+    fn compute_hash_for(flow_id: usize, source_host: usize, sink_host: usize) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
         // Compute a hash value based on flow attributes
-        self.flow_id.hash(&mut hasher);
-        self.source_host.hash(&mut hasher);
-        self.sink_host.hash(&mut hasher);
+        flow_id.hash(&mut hasher);
+        source_host.hash(&mut hasher);
+        sink_host.hash(&mut hasher);
         hasher.finish()
     }
 
     /// Selects one of the equal-cost paths using a hash of flow attributes.
     fn select_ecmp_path(&self, paths: &[Vec<NodeIndex>]) -> Vec<NodeIndex> {
+        Self::select_ecmp_path_for(self.flow_id, self.source_host, self.sink_host, paths)
+    }
+
+    fn select_ecmp_path_for(
+        flow_id: usize,
+        source_host: usize,
+        sink_host: usize,
+        paths: &[Vec<NodeIndex>],
+    ) -> Vec<NodeIndex> {
         // Use the hash to select a path
-        let index = (self.compute_hash() as usize) % paths.len();
+        let index =
+            (Self::compute_hash_for(flow_id, source_host, sink_host) as usize) % paths.len();
         paths[index].clone()
     }
 
     /// Finds all equal-cost paths using an optimized A* approach.
     fn find_equal_cost_paths(
         &self,
+        start: NodeIndex,
+        end: NodeIndex,
+        shortest_distance: usize,
+    ) -> Vec<Vec<NodeIndex>> {
+        Self::find_equal_cost_paths_in(&self.graph, start, end, shortest_distance)
+    }
+
+    fn find_equal_cost_paths_in(
+        graph: &UnGraph<usize, ()>,
         start: NodeIndex,
         end: NodeIndex,
         shortest_distance: usize,
@@ -146,7 +414,7 @@ impl ECMP {
                 continue;
             }
 
-            for neighbor in self.graph.neighbors(current) {
+            for neighbor in graph.neighbors(current) {
                 if !path.contains(&neighbor) {
                     let new_cost = cost + 1; // Uniform cost
                     if new_cost <= shortest_distance {
@@ -159,6 +427,37 @@ impl ECMP {
         }
 
         paths
+    }
+
+    pub fn compute_route_in(
+        graph: &UnGraph<usize, ()>,
+        flow_id: usize,
+        source_host: usize,
+        sink_host: usize,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Vec<NodeIndex> {
+        let shortest_path = astar(
+            graph,
+            start,
+            |n| n == end,
+            |_| 1, // Uniform cost
+            |_| 0, // Heuristic ignored for uniform cost
+        );
+
+        let shortest_distance = match shortest_path {
+            Some((cost, _)) => cost,
+            None => panic!("No path can be found."),
+        };
+
+        let equal_cost_paths =
+            Self::find_equal_cost_paths_in(graph, start, end, shortest_distance as usize);
+
+        if !equal_cost_paths.is_empty() {
+            Self::select_ecmp_path_for(flow_id, source_host, sink_host, &equal_cost_paths)
+        } else {
+            panic!("No equal-cost path can be found.");
+        }
     }
 }
 
@@ -304,5 +603,27 @@ mod tests {
         let path2 = ecmp.compute_route(start, end);
 
         assert_eq!(path1, path2, "ECMP path selection should be stable");
+    }
+
+    #[test]
+    fn test_shortest_path_custom_five_node_graph_falls_back_from_fat_tree_fast_path() {
+        let graph = UnGraph::<usize, ()>::from_edges([
+            (0_u32, 2_u32),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (3, 4),
+        ]);
+
+        let path = ShortestPath::compute_route_in(&graph, NodeIndex::new(0), NodeIndex::new(1));
+
+        assert_eq!(path.first(), Some(&NodeIndex::new(0)));
+        assert_eq!(path.last(), Some(&NodeIndex::new(1)));
+        assert_eq!(path.len(), 3, "expected a valid 2-hop shortest path");
+
+        for window in path.windows(2) {
+            assert!(graph.contains_edge(window[0], window[1]));
+        }
     }
 }
