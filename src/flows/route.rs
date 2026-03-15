@@ -6,12 +6,48 @@
 //! - Path from configuration: Uses the path that is specified in the configuration.
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 
 use petgraph::algo;
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
+
+#[derive(Copy, Clone, Debug)]
+struct MinScoredNode {
+    score: (usize, usize, usize),
+    node: NodeIndex,
+}
+
+impl PartialEq for MinScoredNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for MinScoredNode {}
+
+impl PartialOrd for MinScoredNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MinScoredNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let a = &self.score;
+        let b = &other.score;
+        if a == b {
+            Ordering::Equal
+        } else if a < b {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub enum RoutingConfig {
@@ -48,11 +84,141 @@ impl ShortestPath {
         ShortestPath { graph }
     }
 
+    fn fat_tree_params(graph: &UnGraph<usize, ()>) -> Option<(usize, usize, usize)> {
+        let total_nodes = graph.node_count();
+        if total_nodes == 0 || total_nodes % 5 != 0 {
+            return None;
+        }
+
+        let num_layer_switches = total_nodes.checked_mul(2)? / 5;
+        let doubled = num_layer_switches.checked_mul(2)?;
+        let k = (doubled as f64).sqrt() as usize;
+        if k == 0 || k * k != doubled || k % 2 != 0 {
+            return None;
+        }
+
+        let switches_per_pod = k / 2;
+        Some((num_layer_switches, switches_per_pod, k))
+    }
+
+    fn compute_fat_tree_route_in(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Option<Vec<NodeIndex>> {
+        let (num_layer_switches, switches_per_pod, num_pods) = Self::fat_tree_params(graph)?;
+        let core_start = 2 * num_layer_switches;
+
+        let start_idx = start.index();
+        let end_idx = end.index();
+        if start_idx >= num_layer_switches || end_idx >= num_layer_switches {
+            return None;
+        }
+
+        let node_count = graph.node_count();
+        let mut visit_next = BinaryHeap::new();
+        let mut scores = vec![None; node_count];
+        let mut came_from = vec![usize::MAX; node_count];
+
+        let start_idx = start.index();
+        scores[start_idx] = Some((0, 0, 0));
+        visit_next.push(MinScoredNode {
+            score: (0, 0, 0),
+            node: start,
+        });
+
+        while let Some(MinScoredNode {
+            score: (f, h, g),
+            node,
+        }) = visit_next.pop()
+        {
+            if node == end {
+                let mut path = vec![node];
+                let mut current = node.index();
+                while current != start_idx {
+                    let previous = came_from[current];
+                    if previous == usize::MAX {
+                        break;
+                    }
+                    path.push(NodeIndex::new(previous));
+                    current = previous;
+                }
+                path.reverse();
+                return Some(path);
+            }
+
+            let node_idx = node.index();
+            if let Some((_, _, old_g)) = scores[node_idx] {
+                if old_g < g {
+                    continue;
+                }
+            }
+            scores[node_idx] = Some((f, h, g));
+
+            let mut push_neighbor = |neigh: NodeIndex| {
+                let neigh_g = g + 1;
+                let neigh_score = (neigh_g, 0, neigh_g);
+                let neigh_idx = neigh.index();
+
+                if let Some((_, _, old_neigh_g)) = scores[neigh_idx] {
+                    if neigh_g >= old_neigh_g {
+                        return;
+                    }
+                }
+
+                scores[neigh_idx] = Some(neigh_score);
+                came_from[neigh_idx] = node_idx;
+                visit_next.push(MinScoredNode {
+                    score: neigh_score,
+                    node: neigh,
+                });
+            };
+
+            if node_idx < num_layer_switches {
+                let pod = node_idx / switches_per_pod;
+                let agg_base = num_layer_switches + pod * switches_per_pod;
+                for agg_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(agg_base + agg_offset));
+                }
+            } else if node_idx < core_start {
+                let agg_rel = node_idx - num_layer_switches;
+                let pod = agg_rel / switches_per_pod;
+                let group = agg_rel % switches_per_pod;
+
+                for core_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(
+                        core_start + group * switches_per_pod + core_offset,
+                    ));
+                }
+
+                let edge_base = pod * switches_per_pod;
+                for edge_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(edge_base + edge_offset));
+                }
+            } else {
+                let core_rel = node_idx - core_start;
+                let group = core_rel / switches_per_pod;
+
+                for pod in (0..num_pods).rev() {
+                    push_neighbor(NodeIndex::new(
+                        num_layer_switches + pod * switches_per_pod + group,
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn compute_route_in(
         graph: &UnGraph<usize, ()>,
         start: NodeIndex,
         end: NodeIndex,
     ) -> Vec<NodeIndex> {
+        if let Some(path) = Self::compute_fat_tree_route_in(graph, start, end) {
+            return path;
+        }
+
         let path = astar(
             graph,
             start,

@@ -1,0 +1,2 @@
+- Add a fat-tree-specific shortest-path routine that preserves the current routing choice semantics. A naive BFS was much faster but changed traffic distribution materially, so any specialized router must deliberately match existing tie-breaking.
+- Explore a more structural MT executor change that reduces per-step handoff overhead without simply lengthening linger time: e.g. adaptive linger based on recent epoch cadence, or a quiescent-hot state that avoids full park/unpark churn for the configured hot workers.
