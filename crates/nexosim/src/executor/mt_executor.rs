@@ -71,6 +71,8 @@ use pool_manager::PoolManager;
 
 const BUCKET_SIZE: usize = 128;
 const QUEUE_SIZE: usize = BUCKET_SIZE * 2;
+const COLD_WORKER_SEARCH_DURATION: Duration = Duration::from_nanos(1000);
+const HOT_WORKER_SEARCH_DURATION: Duration = Duration::from_micros(5);
 const WORKER_LINGER_DURATION: Duration = Duration::from_micros(250);
 const WORKER_LINGER_SPIN_PHASE: Duration = Duration::from_micros(10);
 const HOT_WORKER_COUNT: usize = 1;
@@ -636,9 +638,6 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
     };
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Set how long to spin when searching for a task.
-        const MAX_SEARCH_DURATION: Duration = Duration::from_micros(5);
-
         // Seed a thread RNG with the worker ID.
         let rng = Rng::new(id as u64);
 
@@ -753,6 +752,16 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
             }
 
             let mut search_start = Instant::now();
+            let max_search_duration = if id
+                < worker
+                    .executor_context
+                    .hot_worker_count
+                    .load(Ordering::Relaxed)
+            {
+                HOT_WORKER_SEARCH_DURATION
+            } else {
+                COLD_WORKER_SEARCH_DURATION
+            };
 
             // Process the tasks one by one.
             loop {
@@ -802,7 +811,7 @@ fn run_local_worker(worker: &Worker, id: usize, parker: Parker, abort_signal: Si
                             .is_err()
                     }) {
                         // Give up if unsuccessful for too long.
-                        if (Instant::now() - search_start) > MAX_SEARCH_DURATION {
+                        if (Instant::now() - search_start) > max_search_duration {
                             pool_manager.end_worker_search();
                             break;
                         }

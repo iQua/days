@@ -63,6 +63,8 @@ This is a throughput-oriented performance target. The command should continue to
 - Discarded: several nearby executor retunes all lost to the 250us linger setting: 500us linger, 200us linger, 5us/25us spin phases, 2us/5us search windows before parking, a 5us main-thread spin before parking, and activating only one hot worker at run start.
 - Discarded: broader setup-path cleanups also failed to beat the current best, including Vec-backed switch/mailbox storage, skipping non-interactive routing progress setup, removing one topology graph clone between setup and run, routing warning cleanup, and halving the accelerated group-bundling factor from 10x threads to 5x threads.
 - Discarded: a hybrid small-vector route table for switch FIB lookups slowed the benchmark; the current HashMap path is better here.
-- Kept: specializing shortest-path routing for detected fat-tree topologies with implicit neighbor generation inside an A*-equivalent loop cut warm `wall_s` to `8.73` while keeping benchmark-level outputs in the same observed range.
-- Current best is now `38e94c2` at `wall_s=8.73`.
-- Next focus: validate and refine the new fat-tree routing fast path, then revisit deeper executor changes only if routing/setup savings stop moving the total meaningfully.
+- Kept: specializing shortest-path routing for detected fat-tree topologies with implicit neighbor generation inside an A*-equivalent loop cut warm `wall_s` to `8.73` while keeping benchmark-level outputs in the same observed range. A second warm validation run reached `8.46`.
+- Kept: after the routing fast path landed, increasing the worker search-before-park window from 1ns to `5us` improved warm `wall_s` further to `8.11`.
+- Discarded after the new routing fast path: nearby executor retunes still lost to the `5us` search / `250us` linger combination (`3us`, `4us`, `10us` search windows; `200us` and `300us` linger).
+- Current best is now `04802e5` at `wall_s=8.11`.
+- Next focus: validate and refine the new fat-tree routing fast path more directly, then revisit deeper executor handoff changes only if they are more structural than constant retuning.
