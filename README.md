@@ -28,6 +28,8 @@ Alternatively, one can directly visit the [documentation website](https://days.s
 - Rust examples: `cargo run --release --example basic`
 - Inference workload generation:
   `cargo run --release --bin workload-generator -- DeepSeek-671B tests/fixtures/workload_generator/deepseek_default.toml --seq_length 16 --micro_batch 2 --world_size 32 --tensor_model_parallel_size 8 --expert_model_parallel_size 32 --pipeline_model_parallel 1 --phase decode --result_dir ./results/workload`
+- Training workload generation:
+  `cargo run --release --bin training-workload-generator -- --gpu_type A100 --model_name gpt_13B --world_size 128 --tensor_model_parallel_size 8 --pipeline_model_parallel 2 --expert_model_parallel_size 1 --global_batch 128 --micro_batch 1 --num_layers 40 --seq_length 1024 --hidden_size 2048 --vocab_size 32000 --enable_sequence_parallel --use_flash_attn --result_dir ./results/workload`
 
 ## Workload generator (inference)
 
@@ -55,6 +57,20 @@ Current boundary:
 Current limitation:
 
 - Rust generator does not invoke GPU profiling; it consumes existing AIOB profile files.
+
+## Workload generator (training, minimal subset)
+
+`training-workload-generator` rewrites the legacy Python training workload path
+for a scoped, characterization-locked subset:
+
+- Megatron dense training path (`moe_enable=false`).
+- `enable_sequence_parallel=true` path.
+- `aiob_enable=false` path.
+
+Current limitation:
+
+- `moe_enable=true`, `aiob_enable=true`, `enable_sequence_parallel=false`,
+  and DeepSeek training paths are not implemented yet.
 
 ## Tests
 

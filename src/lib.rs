@@ -11,6 +11,7 @@ pub mod l2;
 pub mod schedulers;
 pub mod switches;
 pub mod topos;
+pub mod training_workload_generator;
 pub mod utils;
 pub mod workload_generator;
 
