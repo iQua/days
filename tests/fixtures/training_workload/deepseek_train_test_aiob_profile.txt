@@ -1,0 +1,21 @@
+param_time:
+ time_gpu_min: 0.3
+ time_gpu_avg: 0.4
+Emb:
+ time_gpu_avg: 1.2
+flash_atten:
+ time_gpu_avg: 2.0
+mlp:
+ time_gpu_avg: 3.0
+attention_linear_q_lora:
+ time_gpu_avg: 0.5
+attention_q_column:
+ time_gpu_avg: 0.6
+attention_linear_kv_lora:
+ time_gpu_avg: 0.7
+attention_kv_column:
+ time_gpu_avg: 0.8
+attention_o_row:
+ time_gpu_avg: 0.9
+mlp_moelayer:
+ time_gpu_avg: 4.0
