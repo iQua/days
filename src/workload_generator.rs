@@ -61,6 +61,7 @@ pub struct GeneratorArgs {
     pub micro_batch: u64,
     pub phase: InferencePhase,
     pub aiob_enable: bool,
+    pub aiob_profile: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub enum WorkloadGenError {
     Toml(toml::de::Error),
     UnknownModel(String),
     MissingConfigField(&'static str),
+    MissingAiobProfile(PathBuf),
     InvalidConfig(&'static str),
     Unsupported(&'static str),
 }
@@ -116,6 +118,13 @@ impl std::fmt::Display for WorkloadGenError {
             Self::Toml(err) => write!(f, "toml error: {err}"),
             Self::UnknownModel(name) => write!(f, "invalid model name: {name}"),
             Self::MissingConfigField(key) => write!(f, "missing config field: {key}"),
+            Self::MissingAiobProfile(path) => {
+                write!(
+                    f,
+                    "missing aiob profile: {} (use --aiob_profile or place default file under results/aiob_outputs/)",
+                    path.display()
+                )
+            }
             Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported option: {msg}"),
         }
@@ -141,15 +150,10 @@ pub fn generate_workload_file(
     result_dir: &Path,
     args: &GeneratorArgs,
 ) -> Result<PathBuf, WorkloadGenError> {
-    if args.aiob_enable {
-        return Err(WorkloadGenError::Unsupported(
-            "--aiob-enable path is not implemented in Rust generator yet",
-        ));
-    }
-
     let config_text = fs::read_to_string(config_path)?;
     let config_toml: Value = toml::from_str(&config_text)?;
-    let payload = generate_workload_payload(args, &config_toml, &HashMap::new())?;
+    let compute_cache = load_aiob_compute_cache(args)?;
+    let payload = generate_workload_payload(args, &config_toml, &compute_cache)?;
 
     fs::create_dir_all(result_dir)?;
     let filename = format!(
@@ -434,7 +438,11 @@ fn append_layer_items(
 }
 
 fn get_compute_time(cache: &HashMap<String, u64>, stage: &str) -> u64 {
-    *cache.get(stage).unwrap_or(&1)
+    let key = match stage {
+        "shared_experts" | "dense_mlp" => "mlp",
+        _ => stage,
+    };
+    *cache.get(key).unwrap_or(&1)
 }
 
 fn config_u64(config: &Value, key: &'static str) -> Result<u64, WorkloadGenError> {
@@ -443,6 +451,107 @@ fn config_u64(config: &Value, key: &'static str) -> Result<u64, WorkloadGenError
         .and_then(|v| v.as_integer())
         .and_then(|v| u64::try_from(v).ok())
         .ok_or(WorkloadGenError::MissingConfigField(key))
+}
+
+fn load_aiob_compute_cache(args: &GeneratorArgs) -> Result<HashMap<String, u64>, WorkloadGenError> {
+    if let Some(path) = args.aiob_profile.as_ref() {
+        let content = fs::read_to_string(path)?;
+        return Ok(parse_aiob_compute_cache(&content));
+    }
+
+    let default_path = default_aiob_profile_path(args);
+    if default_path.is_file() {
+        let content = fs::read_to_string(&default_path)?;
+        return Ok(parse_aiob_compute_cache(&content));
+    }
+
+    if args.aiob_enable {
+        return Err(WorkloadGenError::MissingAiobProfile(default_path));
+    }
+
+    Ok(HashMap::new())
+}
+
+fn default_aiob_profile_path(args: &GeneratorArgs) -> PathBuf {
+    let filename = format!(
+        "{}-world_size{}-tp{}-pp{}-ep{}-bpg{}-seq{}-{}.txt",
+        args.model_name,
+        args.world_size,
+        args.tensor_model_parallel_size,
+        args.pipeline_model_parallel,
+        args.expert_model_parallel_size,
+        args.micro_batch,
+        args.seq_length,
+        args.phase.as_str()
+    );
+    PathBuf::from("results").join("aiob_outputs").join(filename)
+}
+
+fn parse_aiob_compute_cache(content: &str) -> HashMap<String, u64> {
+    let mut attention_norm_avg_sum = 0.0_f64;
+    let mut attention_gdn_avg_sum = 0.0_f64;
+    let mut attention_avg_sum = 0.0_f64;
+    let mut mlp_avg_sum = 0.0_f64;
+    let mut moe_norm_avg_sum = 0.0_f64;
+    let mut moe_route_avg_sum = 0.0_f64;
+    let mut moe_expert_sum = 0.0_f64;
+
+    let mut current_section = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed.strip_suffix(':') {
+            if !header.is_empty()
+                && header
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                current_section.clear();
+                current_section.push_str(header);
+            }
+        }
+
+        if let Some(avg_value) = parse_time_gpu_avg_us(trimmed) {
+            if current_section.contains("atten_norm") {
+                attention_norm_avg_sum += avg_value;
+            } else if current_section.contains("gdn") {
+                attention_gdn_avg_sum += avg_value;
+            } else if current_section.contains("atten") {
+                attention_avg_sum += avg_value;
+            } else if current_section.contains("mlp") {
+                mlp_avg_sum += avg_value;
+            } else if current_section.contains("moe_norm") {
+                moe_norm_avg_sum += avg_value;
+            } else if current_section.contains("moe_route") {
+                moe_route_avg_sum += avg_value;
+            } else if current_section.contains("moe") {
+                moe_expert_sum += avg_value;
+            }
+        }
+    }
+
+    let mut cache = HashMap::new();
+    insert_non_zero(&mut cache, "attention_norm", attention_norm_avg_sum);
+    insert_non_zero(&mut cache, "attention_gdn", attention_gdn_avg_sum);
+    insert_non_zero(&mut cache, "attention_layer", attention_avg_sum);
+    insert_non_zero(&mut cache, "mlp", mlp_avg_sum);
+    insert_non_zero(&mut cache, "moe_norm", moe_norm_avg_sum);
+    insert_non_zero(&mut cache, "moe_route", moe_route_avg_sum);
+    insert_non_zero(&mut cache, "moe_expert", moe_expert_sum);
+    cache
+}
+
+fn parse_time_gpu_avg_us(line: &str) -> Option<f64> {
+    let (_, rest) = line.split_once("time_gpu_avg:")?;
+    let token = rest.trim().split_whitespace().next()?.trim_end_matches(',');
+    let avg_ms = token.parse::<f64>().ok()?;
+    Some(avg_ms * 1000.0)
+}
+
+fn insert_non_zero(cache: &mut HashMap<String, u64>, key: &str, total: f64) {
+    let rounded = total.round() as u64;
+    if rounded != 0 {
+        cache.insert(key.to_string(), rounded);
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +569,7 @@ mod tests {
             micro_batch: 2,
             phase,
             aiob_enable: false,
+            aiob_profile: None,
         }
     }
 
@@ -517,7 +627,7 @@ num_experts_per_tok = 10
     }
 
     #[test]
-    fn aiob_flag_is_rejected_in_file_generation() {
+    fn aiob_enable_requires_profile_if_default_is_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("cfg.toml");
         fs::write(
@@ -533,6 +643,44 @@ num_experts_per_tok = 10
         let mut args = base_args("Qwen3-Next-80B", InferencePhase::Decode);
         args.aiob_enable = true;
         let err = generate_workload_file(&cfg_path, tmp.path(), &args).expect_err("must fail");
-        assert!(format!("{err}").contains("--aiob-enable"));
+        assert!(format!("{err}").contains("missing aiob profile"));
+    }
+
+    #[test]
+    fn parse_aiob_cache_matches_python_category_rules() {
+        let cache = parse_aiob_compute_cache(
+            r#"
+atten_norm_kernel:
+time_gpu_avg: 0.5
+gdn_kernel:
+time_gpu_avg: 1.0
+atten_kernel:
+time_gpu_avg: 1.5
+mlp_kernel:
+time_gpu_avg: 2.0
+moe_norm_kernel:
+time_gpu_avg: 2.5
+moe_route_kernel:
+time_gpu_avg: 3.0
+moe_expert_kernel:
+time_gpu_avg: 3.5
+"#,
+        );
+
+        assert_eq!(cache.get("attention_norm"), Some(&500));
+        assert_eq!(cache.get("attention_gdn"), Some(&1000));
+        assert_eq!(cache.get("attention_layer"), Some(&1500));
+        assert_eq!(cache.get("mlp"), Some(&2000));
+        assert_eq!(cache.get("moe_norm"), Some(&2500));
+        assert_eq!(cache.get("moe_route"), Some(&3000));
+        assert_eq!(cache.get("moe_expert"), Some(&3500));
+    }
+
+    #[test]
+    fn dense_and_shared_layers_use_mlp_compute_cache() {
+        let mut cache = HashMap::new();
+        cache.insert("mlp".to_string(), 1234);
+        assert_eq!(get_compute_time(&cache, "dense_mlp"), 1234);
+        assert_eq!(get_compute_time(&cache, "shared_experts"), 1234);
     }
 }

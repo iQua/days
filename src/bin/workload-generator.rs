@@ -28,6 +28,9 @@ struct Cli {
     #[arg(long = "aiob_enable", default_value_t = false)]
     aiob_enable: bool,
 
+    #[arg(long = "aiob_profile")]
+    aiob_profile: Option<PathBuf>,
+
     #[arg(long = "aiob_forward_loops", default_value_t = 1)]
     aiob_forward_loops: u64,
 
@@ -75,6 +78,7 @@ fn main() {
         micro_batch: cli.micro_batch,
         phase: cli.phase.into(),
         aiob_enable: cli.aiob_enable,
+        aiob_profile: cli.aiob_profile,
     };
 
     match generate_workload_file(&cli.config_file, &cli.result_dir, &args) {
