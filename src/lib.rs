@@ -12,6 +12,7 @@ pub mod schedulers;
 pub mod switches;
 pub mod topos;
 pub mod utils;
+pub mod workload_generator;
 
 #[derive(Deserialize)]
 pub struct SeedConfig {

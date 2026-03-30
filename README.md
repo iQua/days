@@ -26,6 +26,27 @@ Alternatively, one can directly visit the [documentation website](https://days.s
 
 - Config-driven runs: `cargo run --release --bin days -- configs/tcp_simple.toml`
 - Rust examples: `cargo run --release --example basic`
+- Inference workload generation:
+  `cargo run --release --bin workload-generator -- DeepSeek-671B tests/fixtures/workload_generator/deepseek_default.toml --seq_length 16 --micro_batch 2 --world_size 32 --tensor_model_parallel_size 8 --expert_model_parallel_size 32 --pipeline_model_parallel 1 --phase decode --result_dir ./results/workload`
+
+## Workload generator (inference)
+
+`workload-generator` rewrites the legacy Python inference workload generation
+logic in Rust for three model families:
+
+- `DeepSeek-*`
+- `Qwen3-Moe-*`
+- `Qwen3-Next-*`
+
+Current boundary:
+
+- Matches legacy output format for `--aiob_enable=false` (default).
+- Produces `.txt` workload files with the same header/row schema.
+- Keeps legacy CLI-style underscore arguments (for example `--seq_length`).
+
+Current limitation:
+
+- `--aiob_enable` path is not implemented yet in Rust.
 
 ## Tests
 

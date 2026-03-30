@@ -1,0 +1,5 @@
+num_layers = 61
+dense_layer = 3
+shared_experts = 1
+hidden_size = 7168
+moe_router_topk = 8
