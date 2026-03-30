@@ -178,3 +178,137 @@ time_gpu_avg: 3.0
         "moe_expert\t-1\t3000\tALLTOALL_EP\t16384\t1\tNONE\t0\t1\tNONE\t0\t100"
     );
 }
+
+#[test]
+fn aiob_profile_is_applied_even_without_aiob_enable_flag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).expect("create output dir");
+
+    let config = tmp.path().join("qwen3_moe_min.toml");
+    fs::write(
+        &config,
+        r#"
+num_hidden_layers = 1
+hidden_size = 4096
+num_experts_per_tok = 8
+"#,
+    )
+    .expect("write config");
+
+    let aiob_profile = tmp.path().join("aiob_profile.txt");
+    fs::write(
+        &aiob_profile,
+        r#"
+atten_kernel:
+time_gpu_avg: 1.5
+"#,
+    )
+    .expect("write aiob profile");
+
+    let mut cmd = cargo_bin_cmd!("workload-generator");
+    cmd.args([
+        "Qwen3-Moe-235B",
+        config.to_str().expect("config path utf8"),
+        "--seq_length",
+        "16",
+        "--micro_batch",
+        "2",
+        "--world_size",
+        "32",
+        "--tensor_model_parallel_size",
+        "8",
+        "--expert_model_parallel_size",
+        "32",
+        "--pipeline_model_parallel",
+        "1",
+        "--phase",
+        "decode",
+        "--aiob_profile",
+        aiob_profile.to_str().expect("aiob profile path utf8"),
+        "--result_dir",
+        out_dir.to_str().expect("out dir utf8"),
+    ]);
+    cmd.assert().success();
+
+    let out_path = out_dir.join("Qwen3-Moe-235B-world_size32-tp8-pp1-ep32-bs2-seq16-decode.txt");
+    let generated = fs::read_to_string(out_path).expect("generated output should be readable");
+    let mut lines = generated.lines();
+    let _header = lines.next().expect("header line");
+    let _count = lines.next().expect("count line");
+    assert_eq!(
+        lines.next().expect("attention_norm row"),
+        "attention_norm\t-1\t1\tNONE\t0\t0\tNONE\t0\t0\tNONE\t0\t100"
+    );
+    assert_eq!(
+        lines.next().expect("attention_layer row"),
+        "attention_layer\t-1\t1500\tALLREDUCE\t16384\t0\tNONE\t0\t0\tNONE\t0\t100"
+    );
+}
+
+#[test]
+fn aiob_enable_uses_default_profile_path_when_present() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).expect("create output dir");
+
+    let config = tmp.path().join("qwen3_moe_min.toml");
+    fs::write(
+        &config,
+        r#"
+num_hidden_layers = 1
+hidden_size = 4096
+num_experts_per_tok = 8
+"#,
+    )
+    .expect("write config");
+
+    let default_profile_dir = tmp.path().join("results").join("aiob_outputs");
+    fs::create_dir_all(&default_profile_dir).expect("create default profile dir");
+    let default_profile_path =
+        default_profile_dir.join("Qwen3-Moe-235B-world_size32-tp8-pp1-ep32-bpg2-seq16-decode.txt");
+    fs::write(
+        &default_profile_path,
+        r#"
+atten_kernel:
+time_gpu_avg: 1.5
+"#,
+    )
+    .expect("write default aiob profile");
+
+    let mut cmd = cargo_bin_cmd!("workload-generator");
+    cmd.current_dir(tmp.path());
+    cmd.args([
+        "Qwen3-Moe-235B",
+        config.to_str().expect("config path utf8"),
+        "--seq_length",
+        "16",
+        "--micro_batch",
+        "2",
+        "--world_size",
+        "32",
+        "--tensor_model_parallel_size",
+        "8",
+        "--expert_model_parallel_size",
+        "32",
+        "--pipeline_model_parallel",
+        "1",
+        "--phase",
+        "decode",
+        "--aiob_enable",
+        "--result_dir",
+        out_dir.to_str().expect("out dir utf8"),
+    ]);
+    cmd.assert().success();
+
+    let out_path = out_dir.join("Qwen3-Moe-235B-world_size32-tp8-pp1-ep32-bs2-seq16-decode.txt");
+    let generated = fs::read_to_string(out_path).expect("generated output should be readable");
+    let mut lines = generated.lines();
+    let _header = lines.next().expect("header line");
+    let _count = lines.next().expect("count line");
+    let _attention_norm = lines.next().expect("attention_norm row");
+    assert_eq!(
+        lines.next().expect("attention_layer row"),
+        "attention_layer\t-1\t1500\tALLREDUCE\t16384\t0\tNONE\t0\t0\tNONE\t0\t100"
+    );
+}
