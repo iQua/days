@@ -1,0 +1,2 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/days /Users/yirenzhao/Desktop/daytone-paper/days/results/evaluation/regression_20260330_174657/run_configs/infer_longctx_prefill_13b_128_a100_20260330_174657.toml`

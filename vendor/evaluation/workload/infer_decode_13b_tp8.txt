@@ -1,0 +1,14 @@
+DISTRIBUTED_INFERENCE model_parallel_NPU_group: 8 ep: 1 pp: 1 vpp: 1 ga: 1 all_gpus: 128
+12
+embedding_lookup      -1 18000   NONE           0        1  NONE 0  1  NONE 0  1
+attn_qkv_0            -1 52000   ALLGATHER      4194304  1  NONE 0  1  NONE 0  1
+attn_out_0            -1 43000   REDUCESCATTER  4194304  1  NONE 0  1  NONE 0  1
+mlp_up_0              -1 64000   ALLGATHER      4194304  1  NONE 0  1  NONE 0  1
+mlp_down_0            -1 49000   REDUCESCATTER  4194304  1  NONE 0  1  NONE 0  1
+attn_qkv_1            -1 52000   ALLGATHER      4194304  1  NONE 0  1  NONE 0  1
+attn_out_1            -1 43000   REDUCESCATTER  4194304  1  NONE 0  1  NONE 0  1
+mlp_up_1              -1 64000   ALLGATHER      4194304  1  NONE 0  1  NONE 0  1
+mlp_down_1            -1 49000   REDUCESCATTER  4194304  1  NONE 0  1  NONE 0  1
+attn_qkv_2            -1 52000   ALLGATHER      4194304  1  NONE 0  1  NONE 0  1
+attn_out_2            -1 43000   REDUCESCATTER  4194304  1  NONE 0  1  NONE 0  1
+lm_head_proj          -1 35000   ALLGATHER      4194304  1  NONE 0  1  NONE 0  1

@@ -1,0 +1,32 @@
+name = "gpt3_13b_128_a100"
+seed = 1000
+duration = 2.0
+report_interval = 0.5
+log_path = "/Users/yirenzhao/Desktop/daytone-paper/days/results/evaluation/regression_20260330_174018/gpt3_13b_128_a100_20260330_174018.logs"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 16
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "TCP"
+flow_count = 128
+
+[collective.traffic]
+initial_delay = 0.0
+size = 50331648
+arr_dist = { type = "Uniform", low = 0.001, high = 0.001 }
+pkt_size_dist = { type = "Uniform", low = 4096, high = 4096 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"

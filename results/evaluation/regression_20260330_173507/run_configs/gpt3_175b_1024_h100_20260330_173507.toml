@@ -1,0 +1,33 @@
+name = "gpt3_175b_1024_h100"
+seed = 1000
+duration = 2.0
+report_interval = 0.5
+log_path = "/Users/yirenzhao/Desktop/daytone-paper/days/results/evaluation/regression_20260330_173507/gpt3_175b_1024_h100_20260330_173507.logs"
+
+[topology]
+category = "Torus"
+
+[topology.torus]
+dim = 2
+n = 32
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "TCP"
+flow_count = 1024
+
+[collective.traffic]
+initial_delay = 0.0
+size = 67108864
+arr_dist = { type = "Uniform", low = 0.001, high = 0.001 }
+pkt_size_dist = { type = "Uniform", low = 4096, high = 4096 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"

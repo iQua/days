@@ -1,0 +1,29 @@
+name = "infer_decode_13b_128_a100"
+seed = 1000
+duration = 2.0
+report_interval = 0.5
+log_path = "/Users/yirenzhao/Desktop/daytone-paper/days/results/evaluation/regression_20260330_174657/infer_decode_13b_128_a100_20260330_174657.logs"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 16
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "PacketDistribution"
+flow_count = 128
+
+[collective.traffic]
+initial_delay = 1.0
+size = 1048576
+arr_dist = { type = "Uniform", low = 3.0, high = 4.0 }
+pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }

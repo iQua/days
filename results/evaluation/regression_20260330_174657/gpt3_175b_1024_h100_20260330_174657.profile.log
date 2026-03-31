@@ -1,0 +1,2 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/days /Users/yirenzhao/Desktop/daytone-paper/days/results/evaluation/regression_20260330_174657/run_configs/gpt3_175b_1024_h100_20260330_174657.toml`

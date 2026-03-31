@@ -1,0 +1,38 @@
+name = "llama_65b_512_h100"
+seed = 1000
+duration = 2.0
+report_interval = 0.5
+log_path = "logs/evaluation/llama_65b_512_h100"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+
+[app_source]
+req_channel_capacity = 128
+chunk_size = 512
+initial_delay = 1
+run_interval = 50
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
+
+[[collective]]
+collective_type = "AllReduce"
+flow_type = "TCP"
+flow_count = 512
+
+[collective.traffic]
+initial_delay = 1.0
+size = 67108864
+arr_dist = { type = "Uniform", low = 3.0, high = 4.0 }
+pkt_size_dist = { type = "Uniform", low = 2000, high = 2500 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
