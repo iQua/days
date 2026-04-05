@@ -65,12 +65,20 @@ impl PacketSwitch {
         self.r_fib.insert(flow_id, next_id);
     }
 
+    /// Runtime-safe FIB installation entrypoint for external simulators.
+    pub async fn install_fib(&mut self, entry: (usize, usize), _cx: &Context<Self>) {
+        self.set_fib(entry.0, entry.1);
+    }
+
+    /// Runtime-safe reverse-FIB installation entrypoint for external simulators.
+    pub async fn install_r_fib(&mut self, entry: (usize, usize), _cx: &Context<Self>) {
+        self.set_r_fib(entry.0, entry.1);
+    }
+
     #[instrument(skip(self, _cx))]
     pub async fn packet_received(&mut self, packet: Packet, _cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
-            use nexosim::time::MonotonicTime;
-
             let global_time = _cx
                 .time()
                 .duration_since(MonotonicTime::EPOCH)
@@ -112,7 +120,13 @@ impl PacketSwitch {
             );
 
             // forwards packets that are not acknowledgments to their corresponding downstream elements
-            let switch_id = self.fib[&packet.flow_id];
+            let Some(switch_id) = self.fib.get(&packet.flow_id).copied() else {
+                debug!(
+                    "PacketSwitch {} missing FIB entry for flow {}",
+                    self.switch_id, packet.flow_id
+                );
+                return;
+            };
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
                 output.send(packet).await;
@@ -124,7 +138,13 @@ impl PacketSwitch {
             );
 
             // forwards acknowledgment packets to their corresponding upstream elements
-            let switch_id = self.r_fib[&packet.flow_id];
+            let Some(switch_id) = self.r_fib.get(&packet.flow_id).copied() else {
+                debug!(
+                    "PacketSwitch {} missing reverse FIB entry for flow {}",
+                    self.switch_id, packet.flow_id
+                );
+                return;
+            };
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
                 output.send(packet).await;

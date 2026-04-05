@@ -21,6 +21,91 @@ pub enum CollectiveType {
     RingAllReduce,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingAllReducePhase {
+    Scatter,
+    Gather,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingAllReduceFlowTemplate {
+    pub phase: RingAllReducePhase,
+    pub rank: usize,
+    pub step: usize,
+    pub source_host: usize,
+    pub sink_host: usize,
+    pub chunk_owner: usize,
+    /// Indices of predecessor flows within the same ring-allreduce template.
+    pub starts_after: Vec<usize>,
+}
+
+pub fn build_ring_allreduce_flow_templates(
+    ring_hosts: &[usize],
+) -> Vec<RingAllReduceFlowTemplate> {
+    let n = ring_hosts.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+
+    let mut flows = Vec::with_capacity(n.saturating_mul(n.saturating_sub(1)).saturating_mul(2));
+    let mut last_scatter: Vec<Option<usize>> = vec![None; n];
+    let mut last_gather: Vec<Option<usize>> = vec![None; n];
+    let mut next_index = 0usize;
+
+    for rank in 0..n {
+        let src = ring_hosts[rank];
+        let dst = ring_hosts[(rank + 1) % n];
+        for step in 1..n {
+            let mut starts_after = Vec::new();
+            if let Some(prev) = last_scatter[rank] {
+                starts_after.push(prev);
+            }
+
+            flows.push(RingAllReduceFlowTemplate {
+                phase: RingAllReducePhase::Scatter,
+                rank,
+                step,
+                source_host: src,
+                sink_host: dst,
+                chunk_owner: (rank + n - step + 1) % n,
+                starts_after,
+            });
+            last_scatter[rank] = Some(next_index);
+            next_index = next_index.saturating_add(1);
+        }
+    }
+
+    for rank in 0..n {
+        let src = ring_hosts[rank];
+        let dst = ring_hosts[(rank + 1) % n];
+        for step in 1..n {
+            let mut starts_after = Vec::new();
+            if let Some(prev) = last_gather[rank] {
+                starts_after.push(prev);
+            }
+            if step == 1 {
+                if let Some(scatter_last) = last_scatter[rank] {
+                    starts_after.push(scatter_last);
+                }
+            }
+
+            flows.push(RingAllReduceFlowTemplate {
+                phase: RingAllReducePhase::Gather,
+                rank,
+                step,
+                source_host: src,
+                sink_host: dst,
+                chunk_owner: (rank + n - step) % n,
+                starts_after,
+            });
+            last_gather[rank] = Some(next_index);
+            next_index = next_index.saturating_add(1);
+        }
+    }
+
+    flows
+}
+
 #[derive(Deserialize, Debug)]
 struct TomlCollective {
     collective_type: CollectiveType,
