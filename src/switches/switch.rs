@@ -120,13 +120,7 @@ impl PacketSwitch {
             );
 
             // forwards packets that are not acknowledgments to their corresponding downstream elements
-            let Some(switch_id) = self.fib.get(&packet.flow_id).copied() else {
-                debug!(
-                    "PacketSwitch {} missing FIB entry for flow {}",
-                    self.switch_id, packet.flow_id
-                );
-                return;
-            };
+            let switch_id = self.fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
                 output.send(packet).await;
@@ -138,13 +132,7 @@ impl PacketSwitch {
             );
 
             // forwards acknowledgment packets to their corresponding upstream elements
-            let Some(switch_id) = self.r_fib.get(&packet.flow_id).copied() else {
-                debug!(
-                    "PacketSwitch {} missing reverse FIB entry for flow {}",
-                    self.switch_id, packet.flow_id
-                );
-                return;
-            };
+            let switch_id = self.r_fib[&packet.flow_id];
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
                 output.send(packet).await;
