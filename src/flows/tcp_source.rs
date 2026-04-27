@@ -624,6 +624,7 @@ impl TCPPacketSource {
             fast_convergence: snap.fast_convergence,
             init_cwnd_bytes: snap.init_cwnd_bytes as u64,
             init_ssthresh_bytes: snap.init_ssthresh_bytes as u64,
+            flight_size_bytes: None,
             cwnd_bytes: snap.cwnd_bytes as u64,
             ssthresh_bytes: snap.ssthresh_bytes as u64,
             w_max_bytes: snap.w_max_bytes as u64,

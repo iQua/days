@@ -34,6 +34,7 @@ structure Row where
   fastConvergence : Bool
   initCwndBytes : Nat
   initSsthreshBytes : Nat
+  flightSizeBytes : Option Nat
   cwndBytes : Nat
   ssthreshBytes : Nat
   wMaxBytes : Nat
@@ -69,6 +70,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
     let fastConvergence ← parseBool (← getField idx fields "fast_convergence")
     let initCwndBytes ← parseNat (← getField idx fields "init_cwnd_bytes")
     let initSsthreshBytes ← parseNat (← getField idx fields "init_ssthresh_bytes")
+    let flightSizeBytes ← parseOpt parseNat (← getOptionalField idx fields "flight_size_bytes")
     let cwndBytes ← parseNat (← getField idx fields "cwnd_bytes")
     let ssthreshBytes ← parseNat (← getField idx fields "ssthresh_bytes")
     let wMaxBytes ← parseNat (← getField idx fields "w_max_bytes")
@@ -89,6 +91,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         fastConvergence
         initCwndBytes
         initSsthreshBytes
+        flightSizeBytes
         cwndBytes
         ssthreshBytes
         wMaxBytes
@@ -210,10 +213,10 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
 
         pure { cwnd' with lastTimeNs := some r.timeNs }
     | Kind.congestion =>
-        let st'' := onCongestion st r.timeNs
+        let st'' := onCongestion st r.timeNs r.flightSizeBytes
         pure { st'' with lastTimeNs := some r.timeNs }
     | Kind.timeout =>
-        let st'' := onTimeout st
+        let st'' := onTimeout st r.flightSizeBytes
         pure { st'' with lastTimeNs := some r.timeNs }
 
   checkSnapshot lineNo st' r

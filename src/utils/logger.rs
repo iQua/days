@@ -84,6 +84,7 @@ pub struct CubicEventRow {
     pub fast_convergence: bool,
     pub init_cwnd_bytes: u64,
     pub init_ssthresh_bytes: u64,
+    pub flight_size_bytes: Option<u64>,
     pub cwnd_bytes: u64,
     pub ssthresh_bytes: u64,
     pub w_max_bytes: u64,

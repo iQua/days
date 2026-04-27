@@ -28,6 +28,15 @@ def getField (idx : Std.HashMap String Nat) (fields : Array String) (name : Stri
       | none => throw s!"row has no column index {i} for {name}"
       | some v => pure v.trim
 
+def getOptionalField (idx : Std.HashMap String Nat) (fields : Array String) (name : String) :
+    Except String String := do
+  match idx.get? name with
+  | none => pure ""
+  | some i =>
+      match fields[i]? with
+      | none => throw s!"row has no column index {i} for {name}"
+      | some v => pure v.trim
+
 def parseNat (s : String) : Except String Nat :=
   match s.toNat? with
   | some n => pure n
@@ -46,4 +55,3 @@ def parseOpt {α : Type} (p : String → Except String α) (s : String) : Except
     some <$> p s
 
 end LeanGuard.Shared
-

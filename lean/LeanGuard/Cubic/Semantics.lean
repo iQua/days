@@ -91,16 +91,20 @@ def cubicUpdate (st : State) (nowNs rttNs : Nat) : State :=
     srtt := srtt
     epochStartNs := some epochStartNs }
 
-def onCongestion (st : State) (nowNs : Nat) : State :=
+def onCongestion (st : State) (nowNs : Nat) (flightSizeBytes : Option Nat := none) : State :=
   let p := st.p
   let beta := ppbToFloat p.betaPpb
   let wMaxCur := st.cwndSegs
+  let flightSizeSegs :=
+    match flightSizeBytes with
+    | some bytes => bytesToSegs bytes p.mssBytes
+    | none => wMaxCur
   let (wMax', wLast') :=
     if p.fastConvergence && st.wLastMaxSegs > 0.0 && wMaxCur < st.wLastMaxSegs then
       (wMaxCur * (1.0 + beta) / 2.0, wMaxCur)
     else
       (wMaxCur, wMaxCur)
-  let reduced := wMaxCur * beta
+  let reduced := flightSizeSegs * beta
   let ssthresh := if reduced < 2.0 then 2.0 else reduced
   let cwnd' := clampCwnd reduced
   { st with
@@ -112,10 +116,14 @@ def onCongestion (st : State) (nowNs : Nat) : State :=
     epochStartNs := some nowNs
     kZero := false }
 
-def onTimeout (st : State) : State :=
+def onTimeout (st : State) (flightSizeBytes : Option Nat := none) : State :=
   let p := st.p
   let beta := ppbToFloat p.betaPpb
-  let reduced := st.cwndSegs * beta
+  let flightSizeSegs :=
+    match flightSizeBytes with
+    | some bytes => bytesToSegs bytes p.mssBytes
+    | none => st.cwndSegs
+  let reduced := flightSizeSegs * beta
   let ssthresh := if reduced < 2.0 then 2.0 else reduced
   { st with
     cwndSegs := 1.0
@@ -126,4 +134,3 @@ def onTimeout (st : State) : State :=
     kZero := true }
 
 end LeanGuard.Cubic.Semantics
-
