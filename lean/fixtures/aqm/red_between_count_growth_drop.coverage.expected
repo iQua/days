@@ -1,0 +1,1 @@
+{"checker":"aqm_check","accept":true,"cover":["red_avg_between","red_probability_hit","red_probability_miss","red_signal_drop"],"stats":{"rows":2,"processed_rows":2}}

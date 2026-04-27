@@ -1,0 +1,2 @@
+time_ns,event_id,kind,endpoint_id,flow_id,acked_segs,rtt_ns,mss_bytes,beta_ppb,c_ppb,tcp_friendly,fast_convergence,init_cwnd_bytes,init_ssthresh_bytes,flight_size_bytes,cwnd_bytes,ssthresh_bytes,w_max_bytes,w_last_max_bytes,epoch_start_ns
+0,1,congestion,1,1,,,1,700000000,400000000,true,true,1000,2000,100,700,700,1000,1000,0

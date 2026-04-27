@@ -46,16 +46,34 @@ structure Event where
   redRandMinPpb : Option Nat
   deriving Repr
 
+abbrev RedKey := Nat × Nat
+
 structure Global where
+  redCounts : Std.HashMap RedKey Nat := {}
   deriving Repr
 
-def ecnMarkAllowed (before after : String) : Bool :=
-  if before == "not_ect" && after == "ce" then false else true
+def isEcnCapable (ecn : String) : Bool :=
+  ecn == "ect0" || ecn == "ect1" || ecn == "ce"
+
+def isValidEcn (ecn : String) : Bool :=
+  ecn == "not_ect" || isEcnCapable ecn
+
+def validEcnTransition (action : Action) (before after : String) : Bool :=
+  isValidEcn before && isValidEcn after &&
+    match action with
+    | Action.markEcn => isEcnCapable before && after == "ce"
+    | Action.enqueue | Action.drop => before == after
 
 def ppbDenom : Nat := 1000000000
 
 def thresholdCap (ppb capacity : Nat) : Nat :=
   (ppb * capacity) / ppbDenom
+
+def mulDiv (a b c : Nat) : Nat :=
+  (a * b) / c
+
+def redThresholdUnits (ppb capacity : Nat) : Nat :=
+  thresholdCap ppb capacity
 
 def queueOverflow (e : Event) : Bool :=
   if e.capacity == 0 then
@@ -74,52 +92,82 @@ def exceedsThreshold (e : Event) (ppb : Nat) : Bool :=
     | CapacityUnit.packets => e.queueLength + 1 > thresholdCap ppb e.capacity
 
 def redProbPpb (e : Event) (minPpb maxPpb maxProbPpb avg : Nat) : Nat :=
-  if maxPpb <= minPpb then
+  let minTh := redThresholdUnits minPpb e.capacity
+  let maxTh := redThresholdUnits maxPpb e.capacity
+  if maxTh <= minTh then
     0
   else
-    let minCap := thresholdCap minPpb e.capacity
-    let diff := if avg > minCap then avg - minCap else 0
-    diff * e.capacity * maxProbPpb / (maxPpb - minPpb)
+    let diff := if avg > minTh then avg - minTh else 0
+    mulDiv maxProbPpb diff (maxTh - minTh)
 
-def redDecisionOk (e : Event) : Bool :=
-  match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
-  | some minPpb, some maxPpb, some maxProbPpb, some avg =>
-      let overMax := exceedsThreshold e maxPpb
-      let overMin := exceedsThreshold e minPpb
-      let maxRandOk := if overMax then e.redRandMaxPpb.isSome else true
-      let maxHit :=
-        match e.redRandMaxPpb with
-        | some r => r <= maxProbPpb
-        | none => false
-      let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
-      let minRandOk := if overMin then e.redRandMinPpb.isSome else true
-      let minHit :=
-        match e.redRandMinPpb with
-        | some r => r <= minProbPpb
-        | none => false
-      let overflow := queueOverflow e
-      let shouldMark := (overMax && maxHit) || (overMin && minHit)
-      if !maxRandOk || !minRandOk then
-        false
-      else if overflow then
-        e.action = Action.drop
-      else
-        match e.strategy with
-        | Strategy.red =>
-            if shouldMark then e.action = Action.drop else e.action = Action.enqueue
-        | Strategy.redEcn =>
-            if shouldMark then
-              (e.action = Action.markEcn || (e.action = Action.drop && e.ecnBefore == "not_ect"))
-            else
-              e.action = Action.enqueue
-        | _ => false
-  | _, _, _, _ => false
+def redPaPpb (pbPpb count : Nat) : Nat :=
+  let scaled := count * pbPpb
+  if scaled >= ppbDenom then
+    ppbDenom
+  else
+    let raw := (pbPpb * ppbDenom) / (ppbDenom - scaled)
+    if raw > ppbDenom then ppbDenom else raw
+
+def redSignalActionOk (e : Event) : Bool :=
+  match e.strategy with
+  | Strategy.red => e.action = Action.drop
+  | Strategy.redEcn =>
+      (e.action = Action.markEcn && isEcnCapable e.ecnBefore) ||
+        (e.action = Action.drop && e.ecnBefore == "not_ect")
+  | _ => false
+
+def redDecisionNextCount (e : Event) (prevCount : Option Nat) : Option (Option Nat) :=
+  if queueOverflow e then
+    if e.action = Action.drop then some prevCount else none
+  else
+    match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
+    | some minPpb, some maxPpb, some avg =>
+        let minTh := redThresholdUnits minPpb e.capacity
+        let maxTh := redThresholdUnits maxPpb e.capacity
+        let thresholdsOk := minTh < maxTh
+        let overMax := thresholdsOk && avg >= maxTh
+        let overMin := thresholdsOk && avg >= minTh
+        if !thresholdsOk then
+          none
+        else if overMax then
+          if redSignalActionOk e then some (some 0) else none
+        else if !overMin then
+          if e.action = Action.enqueue then some none else none
+        else
+          match e.redMaxProbabilityPpb, e.redRandMinPpb with
+          | some maxProbPpb, some r =>
+              let count := match prevCount with | some c => c + 1 | none => 0
+              let pbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
+              let paPpb := redPaPpb pbPpb count
+              if r <= paPpb then
+                if redSignalActionOk e then some (some 0) else none
+              else
+                if e.action = Action.enqueue then some (some count) else none
+          | _, _ => none
+    | _, _, _ => none
+
+def redKey (e : Event) : RedKey :=
+  (e.schedulerId, e.queueId)
+
+def updateRedCount (g : Global) (key : RedKey) (next : Option Nat) : Global :=
+  match next with
+  | some count => { g with redCounts := g.redCounts.insert key count }
+  | none => { g with redCounts := g.redCounts.erase key }
 
 def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
-  LeanGuard.Shared.require lineNo (ecnMarkAllowed e.ecnBefore e.ecnAfter) "invalid ECN mark"
+  let ecnError :=
+    match e.action with
+    | Action.markEcn => "invalid ECN mark"
+    | _ => "invalid ECN transition"
+  LeanGuard.Shared.require lineNo (validEcnTransition e.action e.ecnBefore e.ecnAfter) ecnError
   match e.strategy with
   | Strategy.red | Strategy.redEcn =>
-      LeanGuard.Shared.require lineNo (redDecisionOk e) "missing RED witness"
+      let key := redKey e
+      let next ←
+        match redDecisionNextCount e (g.redCounts.get? key) with
+        | some next => pure next
+        | none => throw s!"line {lineNo}: missing RED witness"
+      pure (updateRedCount g key next)
   | Strategy.tailDrop =>
       let overflow := queueOverflow e
       let ok :=
@@ -128,6 +176,7 @@ def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
         else
           e.action = Action.enqueue
       LeanGuard.Shared.require lineNo ok "invalid TailDrop decision"
+      pure g
   | Strategy.ecnThreshold =>
       let overflow := queueOverflow e
       let threshVal := e.ecnThresholdPpb
@@ -145,6 +194,6 @@ def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
         else
           e.action = Action.enqueue
       LeanGuard.Shared.require lineNo ok "invalid ECN threshold decision"
-  pure g
+      pure g
 
 end LeanGuard.Aqm.Semantics

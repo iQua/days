@@ -5,7 +5,7 @@
 //! of MSS-sized segments, with RFC 8312 default parameters (C=0.4, beta=0.7).
 
 use crate::flows::CubicConfig;
-use crate::flows::cc::{AckEvent, CongestionControl};
+use crate::flows::cc::{AckEvent, CongestionControl, CongestionEvent};
 use std::any::Any;
 
 /// TCP CUBIC congestion control implementation.
@@ -177,7 +177,11 @@ impl TCPCubic {
         self.clamp_cwnd();
     }
 
-    fn on_congestion(&mut self) {
+    fn flight_size_segs(&self, flight_size_bytes: usize) -> f64 {
+        flight_size_bytes as f64 / self.mss as f64
+    }
+
+    fn on_congestion(&mut self, event: CongestionEvent) {
         let w_max = self.cwnd;
         if self.fast_convergence {
             if self.w_last_max > 0.0 && w_max < self.w_last_max {
@@ -192,16 +196,18 @@ impl TCPCubic {
             self.w_max = w_max;
         }
 
-        let reduced = (w_max * self.beta).max(self.min_cwnd);
+        let flight_size = self.flight_size_segs(event.flight_size_bytes);
+        let reduced = (flight_size * self.beta).max(self.min_cwnd);
         self.ssthresh = reduced.max(2.0);
         self.cwnd = reduced;
-        self.epoch_start = None;
+        self.epoch_start = Some(self.quantize_time_s(event.now));
         self.k_zero = false;
         self.clamp_cwnd();
     }
 
-    fn on_timeout(&mut self) {
-        let reduced = (self.cwnd * self.beta).max(self.min_cwnd);
+    fn on_timeout(&mut self, event: CongestionEvent) {
+        let flight_size = self.flight_size_segs(event.flight_size_bytes);
+        let reduced = (flight_size * self.beta).max(self.min_cwnd);
         self.ssthresh = reduced.max(2.0);
         self.cwnd = 1.0;
         self.w_max = 0.0;
@@ -282,7 +288,11 @@ impl CongestionControl for TCPCubic {
     }
 
     fn timer_expired(&mut self) {
-        self.on_timeout();
+        let flight_size_bytes = self.get_cwnd();
+        self.on_timeout(CongestionEvent {
+            now: 0.0,
+            flight_size_bytes,
+        });
     }
 
     fn dupack_over(&mut self) {
@@ -292,7 +302,11 @@ impl CongestionControl for TCPCubic {
     }
 
     fn consecutive_dupacks_received(&mut self) {
-        self.on_congestion();
+        let flight_size_bytes = self.get_cwnd();
+        self.on_congestion(CongestionEvent {
+            now: 0.0,
+            flight_size_bytes,
+        });
     }
 
     fn more_dupacks_received(&mut self) {
@@ -302,7 +316,23 @@ impl CongestionControl for TCPCubic {
     }
 
     fn ecn_marked(&mut self) {
-        self.on_congestion();
+        let flight_size_bytes = self.get_cwnd();
+        self.on_congestion(CongestionEvent {
+            now: 0.0,
+            flight_size_bytes,
+        });
+    }
+
+    fn congestion_event(&mut self, event: CongestionEvent) {
+        self.on_congestion(event);
+    }
+
+    fn ecn_congestion_event(&mut self, event: CongestionEvent) {
+        self.on_congestion(event);
+    }
+
+    fn timeout_event(&mut self, event: CongestionEvent) {
+        self.on_timeout(event);
     }
 
     fn get_cwnd(&self) -> usize {
@@ -372,10 +402,27 @@ mod tests {
     fn test_multiplicative_decrease_beta() {
         let mut cubic = TCPCubic::new();
         cubic.cwnd = 100.0;
-        cubic.on_congestion();
+        cubic.on_congestion(CongestionEvent {
+            now: 1.0,
+            flight_size_bytes: 100 * cubic.mss,
+        });
 
         assert!(approx_eq(cubic.cwnd, 70.0, 1e-6));
         assert!(approx_eq(cubic.ssthresh, 70.0, 1e-6));
+    }
+
+    #[test]
+    fn test_congestion_uses_flight_size_for_backoff() {
+        let mut cubic = TCPCubic::new();
+        cubic.cwnd = 1000.0;
+        cubic.on_congestion(CongestionEvent {
+            now: 1.0,
+            flight_size_bytes: 100 * cubic.mss,
+        });
+
+        assert!(approx_eq(cubic.cwnd, 70.0, 1e-6));
+        assert!(approx_eq(cubic.ssthresh, 70.0, 1e-6));
+        assert!(approx_eq(cubic.w_max, 1000.0, 1e-6));
     }
 
     #[test]
@@ -384,7 +431,10 @@ mod tests {
         cubic.fast_convergence = true;
         cubic.w_last_max = 120.0;
         cubic.cwnd = 80.0;
-        cubic.on_congestion();
+        cubic.on_congestion(CongestionEvent {
+            now: 1.0,
+            flight_size_bytes: 80 * cubic.mss,
+        });
 
         assert!(approx_eq(
             cubic.w_max,
@@ -398,9 +448,12 @@ mod tests {
     fn test_timeout_resets_cwnd() {
         let mut cubic = TCPCubic::new();
         cubic.cwnd = 50.0;
-        cubic.timer_expired();
+        cubic.timeout_event(CongestionEvent {
+            now: 1.0,
+            flight_size_bytes: 10 * cubic.mss,
+        });
         assert!(approx_eq(cubic.cwnd, 1.0, 1e-9));
-        assert!(cubic.ssthresh >= 2.0);
+        assert!(approx_eq(cubic.ssthresh, 7.0, 1e-9));
     }
 
     #[test]

@@ -1,0 +1,2 @@
+time_ns,event_id,kind,scheduler_id,queue_id,packet_id,flow_id,size_bytes,action,capacity,capacity_unit,queue_length,byte_length,ecn_before,ecn_after,drop_strategy,ecn_threshold_ppb,red_min_threshold_ppb,red_max_threshold_ppb,red_max_probability_ppb,red_avg_queue_length,red_rand_max_ppb,red_rand_min_ppb
+0,0,decision,0,0,0,0,100,drop,1000,bytes,0,950,not_ect,not_ect,red,,,,,,,
