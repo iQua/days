@@ -85,24 +85,23 @@ def redProbPpb (e : Event) (minPpb maxPpb maxProbPpb avg : Nat) : Nat :=
     diff * e.capacity * maxProbPpb / (maxPpb - minPpb)
 
 def redDecisionOk (e : Event) : Bool :=
-  match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
-  | some minPpb, some maxPpb, some maxProbPpb, some avg =>
+  match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
+  | some minPpb, some maxPpb, some avg =>
       let overMax := avg >= redThresholdCap maxPpb e.capacity
       let overMin := avg >= redThresholdCap minPpb e.capacity
-      let maxRandOk := if overMax then e.redRandMaxPpb.isSome else true
-      let maxHit :=
-        match e.redRandMaxPpb with
-        | some r => r <= maxProbPpb
-        | none => false
-      let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
-      let minRandOk := if overMin then e.redRandMinPpb.isSome else true
+      let minProbPpb :=
+        match e.redMaxProbabilityPpb with
+        | some maxProbPpb => redProbPpb e minPpb maxPpb maxProbPpb avg
+        | none => 0
+      let maxProbOk := overMax || e.redMaxProbabilityPpb.isSome
+      let minRandOk := if overMin && !overMax then e.redRandMinPpb.isSome else true
       let minHit :=
         match e.redRandMinPpb with
         | some r => r <= minProbPpb
         | none => false
       let overflow := queueOverflow e
-      let shouldMark := (overMax && maxHit) || (overMin && minHit)
-      if !maxRandOk || !minRandOk then
+      let shouldMark := overMax || (overMin && minHit)
+      if !maxProbOk || !minRandOk then
         false
       else if overflow then
         e.action = Action.drop
@@ -116,7 +115,7 @@ def redDecisionOk (e : Event) : Bool :=
             else
               e.action = Action.enqueue
         | _ => false
-  | _, _, _, _ => false
+  | _, _, _ => false
 
 def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
   LeanGuard.Shared.require lineNo (ecnMarkAllowed e.ecnBefore e.ecnAfter) "invalid ECN mark"
