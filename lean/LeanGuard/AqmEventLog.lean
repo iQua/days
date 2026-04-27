@@ -197,8 +197,10 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
         let cov :=
           match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
           | some minPpb, some maxPpb, some avg =>
-              let overMax := avg >= redThresholdCap maxPpb e.capacity
-              let overMin := avg >= redThresholdCap minPpb e.capacity
+              let minTh := redThresholdUnits minPpb e.capacity
+              let maxTh := redThresholdUnits maxPpb e.capacity
+              let overMax := minTh < maxTh && avg >= maxTh
+              let overMin := minTh < maxTh && avg >= minTh
               if overMax then
                 covHit cov "red_over_max"
               else if overMin then
@@ -209,8 +211,10 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
         let cov :=
           match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
           | some minPpb, some maxPpb, some avg =>
-              let overMax := avg >= redThresholdCap maxPpb e.capacity
-              let overMin := avg >= redThresholdCap minPpb e.capacity
+              let minTh := redThresholdUnits minPpb e.capacity
+              let maxTh := redThresholdUnits maxPpb e.capacity
+              let overMax := minTh < maxTh && avg >= maxTh
+              let overMin := minTh < maxTh && avg >= minTh
               let minProbPpb :=
                 match e.redMaxProbabilityPpb with
                 | some maxProbPpb => redProbPpb e minPpb maxPpb maxProbPpb avg
@@ -230,8 +234,10 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
         let cov :=
           match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
           | some minPpb, some maxPpb, some avg =>
-              let overMax := avg >= redThresholdCap maxPpb e.capacity
-              let overMin := avg >= redThresholdCap minPpb e.capacity
+              let minTh := redThresholdUnits minPpb e.capacity
+              let maxTh := redThresholdUnits maxPpb e.capacity
+              let overMax := minTh < maxTh && avg >= maxTh
+              let overMin := minTh < maxTh && avg >= minTh
               if overMax then
                 covHit cov "red_over_max"
               else if overMin then
@@ -242,8 +248,10 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
         let cov :=
           match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
           | some minPpb, some maxPpb, some avg =>
-              let overMax := avg >= redThresholdCap maxPpb e.capacity
-              let overMin := avg >= redThresholdCap minPpb e.capacity
+              let minTh := redThresholdUnits minPpb e.capacity
+              let maxTh := redThresholdUnits maxPpb e.capacity
+              let overMax := minTh < maxTh && avg >= maxTh
+              let overMin := minTh < maxTh && avg >= minTh
               let minProbPpb :=
                 match e.redMaxProbabilityPpb with
                 | some maxProbPpb => redProbPpb e minPpb maxPpb maxProbPpb avg

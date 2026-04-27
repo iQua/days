@@ -60,7 +60,10 @@ def ppbDenom : Nat := 1000000000
 def thresholdCap (ppb capacity : Nat) : Nat :=
   (ppb * capacity) / ppbDenom
 
-def redThresholdCap (ppb capacity : Nat) : Nat :=
+def mulDiv (a b c : Nat) : Nat :=
+  (a * b) / c
+
+def redThresholdUnits (ppb capacity : Nat) : Nat :=
   thresholdCap ppb capacity
 
 def queueOverflow (e : Event) : Bool :=
@@ -80,19 +83,21 @@ def exceedsThreshold (e : Event) (ppb : Nat) : Bool :=
     | CapacityUnit.packets => e.queueLength + 1 > thresholdCap ppb e.capacity
 
 def redProbPpb (e : Event) (minPpb maxPpb maxProbPpb avg : Nat) : Nat :=
-  if maxPpb <= minPpb then
+  let minTh := redThresholdUnits minPpb e.capacity
+  let maxTh := redThresholdUnits maxPpb e.capacity
+  if maxTh <= minTh then
     0
   else
-    let minCap := thresholdCap minPpb e.capacity
-    let diff := if avg > minCap then avg - minCap else 0
-    diff * e.capacity * maxProbPpb / (maxPpb - minPpb)
+    let diff := if avg > minTh then avg - minTh else 0
+    mulDiv maxProbPpb diff (maxTh - minTh)
 
 def redPaPpb (pbPpb count : Nat) : Nat :=
   let scaled := count * pbPpb
   if scaled >= ppbDenom then
     ppbDenom
   else
-    (pbPpb * ppbDenom) / (ppbDenom - scaled)
+    let raw := (pbPpb * ppbDenom) / (ppbDenom - scaled)
+    if raw > ppbDenom then ppbDenom else raw
 
 def redSignalActionOk (e : Event) : Bool :=
   match e.strategy with
@@ -104,10 +109,15 @@ def redSignalActionOk (e : Event) : Bool :=
 def redDecisionNextCount (e : Event) (prevCount : Option Nat) : Option (Option Nat) :=
   match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
   | some minPpb, some maxPpb, some avg =>
-      let overMax := avg >= redThresholdCap maxPpb e.capacity
-      let overMin := avg >= redThresholdCap minPpb e.capacity
+      let minTh := redThresholdUnits minPpb e.capacity
+      let maxTh := redThresholdUnits maxPpb e.capacity
+      let thresholdsOk := minTh < maxTh
+      let overMax := thresholdsOk && avg >= maxTh
+      let overMin := thresholdsOk && avg >= minTh
       let overflow := queueOverflow e
-      if overflow then
+      if !thresholdsOk then
+        none
+      else if overflow then
         if e.action = Action.drop then some prevCount else none
       else if overMax then
         if redSignalActionOk e then some (some 0) else none
