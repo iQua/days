@@ -43,13 +43,39 @@ The checker consumes one `decision` row per packet-arrival decision.
   `maxth` as fractions of `capacity`, in parts per billion.
 - `red_max_probability_ppb` encodes `maxp`, in parts per billion.
 - `red_rand_min_ppb` is the random witness for the between-threshold RED
-  probability decision. It is not used below `minth`, above `maxth`, or for
-  physical overflow.
+  probability decision. It is required only when `minth <= avg < maxth`; it is
+  not used below `minth`, above `maxth`, or for physical overflow.
 - `red_rand_max_ppb` is not required by the original RED algorithm above
-  `maxth`; above `maxth`, signaling is deterministic.
+  `maxth`; above `maxth`, signaling is deterministic. The checker parses the
+  field for trace compatibility but does not use it in RED decisions.
+
+For RED and RED_ECN rows, physical overflow is checked before RED threshold
+fields are required. An overflow `drop` row may omit RED threshold,
+probability, and random-witness fields.
 
 The checker derives RED's `count` state from the accepted trace order. The CSV
 must not be trusted to provide `count`.
+
+## Coverage labels
+
+`aqm_check --coverage-out <path>` reports RED coverage with labels tied to the
+corrected RED model:
+
+- `red_avg_under_min`, `red_avg_between`, and `red_avg_over_max` identify RED
+  regions by comparing the logged EWMA `red_avg_queue_length` with `minth` and
+  `maxth`.
+- `red_probability_hit` and `red_probability_miss` identify between-threshold
+  probabilistic decisions using the same derived `count` state as the checker.
+- `red_overflow_drop` identifies physical-capacity overflow drops, which are
+  separate from RED average-threshold regions.
+- `red_signal_drop` identifies non-ECN RED congestion drops.
+- `red_ecn_signal_mark` and `red_ecn_signal_drop_not_ect` identify RED_ECN
+  congestion signaling for ECN-capable and Not-ECT packets.
+
+Older RED coverage keys such as `red_under_min`, `red_between`, `red_over_max`,
+`red_should_drop`, and `red_should_mark` were intentionally replaced so reports
+do not suggest instantaneous queue-threshold decisions or hide RED_ECN action
+selection.
 
 ## Intentional scope
 
