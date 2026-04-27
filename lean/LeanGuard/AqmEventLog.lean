@@ -193,79 +193,79 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
             covHit cov "mark_non_ecn_packet_drop"
           else
             cov
-  | Strategy.red =>
-      let cov :=
-        match e.redMinThresholdPpb, e.redMaxThresholdPpb with
-        | some minPpb, some maxPpb =>
-            let overMax := exceedsThreshold e maxPpb
-            let overMin := exceedsThreshold e minPpb
-            if overMax then
-              covHit cov "red_over_max"
-            else if overMin then
-              covHit cov "red_between"
-            else
-              covHit cov "red_under_min"
-        | _, _ => cov
-      let cov :=
-        match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
-        | some minPpb, some maxPpb, some maxProbPpb, some avg =>
-            let overMax := exceedsThreshold e maxPpb
-            let overMin := exceedsThreshold e minPpb
-            let maxHit :=
-              match e.redRandMaxPpb with
-              | some r => r <= maxProbPpb
-              | none => false
-            let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
-            let minHit :=
-              match e.redRandMinPpb with
-              | some r => r <= minProbPpb
-              | none => false
-            let shouldMark := (overMax && maxHit) || (overMin && minHit)
-            if shouldMark then
-              covHit cov "red_should_drop"
-            else
-              cov
-        | _, _, _, _ => cov
-      cov
-  | Strategy.redEcn =>
-      let cov :=
-        match e.redMinThresholdPpb, e.redMaxThresholdPpb with
-        | some minPpb, some maxPpb =>
-            let overMax := exceedsThreshold e maxPpb
-            let overMin := exceedsThreshold e minPpb
-            if overMax then
-              covHit cov "red_over_max"
-            else if overMin then
-              covHit cov "red_between"
-            else
-              covHit cov "red_under_min"
-        | _, _ => cov
-      let cov :=
-        match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
-        | some minPpb, some maxPpb, some maxProbPpb, some avg =>
-            let overMax := exceedsThreshold e maxPpb
-            let overMin := exceedsThreshold e minPpb
-            let maxHit :=
-              match e.redRandMaxPpb with
-              | some r => r <= maxProbPpb
-              | none => false
-            let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
-            let minHit :=
-              match e.redRandMinPpb with
-              | some r => r <= minProbPpb
-              | none => false
-            let shouldMark := (overMax && maxHit) || (overMin && minHit)
-            let cov :=
+    | Strategy.red =>
+        let cov :=
+          match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
+          | some minPpb, some maxPpb, some avg =>
+              let overMax := avg >= redThresholdCap maxPpb e.capacity
+              let overMin := avg >= redThresholdCap minPpb e.capacity
+              if overMax then
+                covHit cov "red_over_max"
+              else if overMin then
+                covHit cov "red_between"
+              else
+                covHit cov "red_under_min"
+          | _, _, _ => cov
+        let cov :=
+          match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
+          | some minPpb, some maxPpb, some maxProbPpb, some avg =>
+              let overMax := avg >= redThresholdCap maxPpb e.capacity
+              let overMin := avg >= redThresholdCap minPpb e.capacity
+              let maxHit :=
+                match e.redRandMaxPpb with
+                | some r => r <= maxProbPpb
+                | none => false
+              let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
+              let minHit :=
+                match e.redRandMinPpb with
+                | some r => r <= minProbPpb
+                | none => false
+              let shouldMark := (overMax && maxHit) || (overMin && minHit)
               if shouldMark then
-                covHit cov "red_should_mark"
+                covHit cov "red_should_drop"
               else
                 cov
-            if shouldMark && e.action = Action.drop && e.ecnBefore == "not_ect" then
-              covHit cov "mark_non_ecn_packet_drop"
-            else
-              cov
-        | _, _, _, _ => cov
-      cov
+          | _, _, _, _ => cov
+        cov
+    | Strategy.redEcn =>
+        let cov :=
+          match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
+          | some minPpb, some maxPpb, some avg =>
+              let overMax := avg >= redThresholdCap maxPpb e.capacity
+              let overMin := avg >= redThresholdCap minPpb e.capacity
+              if overMax then
+                covHit cov "red_over_max"
+              else if overMin then
+                covHit cov "red_between"
+              else
+                covHit cov "red_under_min"
+          | _, _, _ => cov
+        let cov :=
+          match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
+          | some minPpb, some maxPpb, some maxProbPpb, some avg =>
+              let overMax := avg >= redThresholdCap maxPpb e.capacity
+              let overMin := avg >= redThresholdCap minPpb e.capacity
+              let maxHit :=
+                match e.redRandMaxPpb with
+                | some r => r <= maxProbPpb
+                | none => false
+              let minProbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
+              let minHit :=
+                match e.redRandMinPpb with
+                | some r => r <= minProbPpb
+                | none => false
+              let shouldMark := (overMax && maxHit) || (overMin && minHit)
+              let cov :=
+                if shouldMark then
+                  covHit cov "red_should_mark"
+                else
+                  cov
+              if shouldMark && e.action = Action.drop && e.ecnBefore == "not_ect" then
+                covHit cov "mark_non_ecn_packet_drop"
+              else
+                cov
+          | _, _, _, _ => cov
+        cov
 
 def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
   let rowsSorted ←

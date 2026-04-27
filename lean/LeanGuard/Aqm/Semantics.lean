@@ -57,6 +57,9 @@ def ppbDenom : Nat := 1000000000
 def thresholdCap (ppb capacity : Nat) : Nat :=
   (ppb * capacity) / ppbDenom
 
+def redThresholdCap (ppb capacity : Nat) : Nat :=
+  thresholdCap ppb capacity
+
 def queueOverflow (e : Event) : Bool :=
   if e.capacity == 0 then
     false
@@ -84,8 +87,8 @@ def redProbPpb (e : Event) (minPpb maxPpb maxProbPpb avg : Nat) : Nat :=
 def redDecisionOk (e : Event) : Bool :=
   match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redMaxProbabilityPpb, e.redAvgQueueLength with
   | some minPpb, some maxPpb, some maxProbPpb, some avg =>
-      let overMax := exceedsThreshold e maxPpb
-      let overMin := exceedsThreshold e minPpb
+      let overMax := avg >= redThresholdCap maxPpb e.capacity
+      let overMin := avg >= redThresholdCap minPpb e.capacity
       let maxRandOk := if overMax then e.redRandMaxPpb.isSome else true
       let maxHit :=
         match e.redRandMaxPpb with
