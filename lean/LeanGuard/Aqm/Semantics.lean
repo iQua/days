@@ -52,8 +52,17 @@ structure Global where
   redCounts : Std.HashMap RedKey Nat := {}
   deriving Repr
 
-def ecnMarkAllowed (before after : String) : Bool :=
-  if before == "not_ect" && after == "ce" then false else true
+def isEcnCapable (ecn : String) : Bool :=
+  ecn == "ect0" || ecn == "ect1" || ecn == "ce"
+
+def isValidEcn (ecn : String) : Bool :=
+  ecn == "not_ect" || isEcnCapable ecn
+
+def validEcnTransition (action : Action) (before after : String) : Bool :=
+  isValidEcn before && isValidEcn after &&
+    match action with
+    | Action.markEcn => isEcnCapable before && after == "ce"
+    | Action.enqueue | Action.drop => before == after
 
 def ppbDenom : Nat := 1000000000
 
@@ -103,7 +112,8 @@ def redSignalActionOk (e : Event) : Bool :=
   match e.strategy with
   | Strategy.red => e.action = Action.drop
   | Strategy.redEcn =>
-      e.action = Action.markEcn || (e.action = Action.drop && e.ecnBefore == "not_ect")
+      (e.action = Action.markEcn && isEcnCapable e.ecnBefore) ||
+        (e.action = Action.drop && e.ecnBefore == "not_ect")
   | _ => false
 
 def redDecisionNextCount (e : Event) (prevCount : Option Nat) : Option (Option Nat) :=
@@ -145,7 +155,11 @@ def updateRedCount (g : Global) (key : RedKey) (next : Option Nat) : Global :=
   | none => { g with redCounts := g.redCounts.erase key }
 
 def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
-  LeanGuard.Shared.require lineNo (ecnMarkAllowed e.ecnBefore e.ecnAfter) "invalid ECN mark"
+  let ecnError :=
+    match e.action with
+    | Action.markEcn => "invalid ECN mark"
+    | _ => "invalid ECN transition"
+  LeanGuard.Shared.require lineNo (validEcnTransition e.action e.ecnBefore e.ecnAfter) ecnError
   match e.strategy with
   | Strategy.red | Strategy.redEcn =>
       let key := redKey e
