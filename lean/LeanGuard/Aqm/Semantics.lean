@@ -117,34 +117,34 @@ def redSignalActionOk (e : Event) : Bool :=
   | _ => false
 
 def redDecisionNextCount (e : Event) (prevCount : Option Nat) : Option (Option Nat) :=
-  match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
-  | some minPpb, some maxPpb, some avg =>
-      let minTh := redThresholdUnits minPpb e.capacity
-      let maxTh := redThresholdUnits maxPpb e.capacity
-      let thresholdsOk := minTh < maxTh
-      let overMax := thresholdsOk && avg >= maxTh
-      let overMin := thresholdsOk && avg >= minTh
-      let overflow := queueOverflow e
-      if !thresholdsOk then
-        none
-      else if overflow then
-        if e.action = Action.drop then some prevCount else none
-      else if overMax then
-        if redSignalActionOk e then some (some 0) else none
-      else if !overMin then
-        if e.action = Action.enqueue then some none else none
-      else
-        match e.redMaxProbabilityPpb, e.redRandMinPpb with
-        | some maxProbPpb, some r =>
-            let count := match prevCount with | some c => c + 1 | none => 0
-            let pbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
-            let paPpb := redPaPpb pbPpb count
-            if r <= paPpb then
-              if redSignalActionOk e then some (some 0) else none
-            else
-              if e.action = Action.enqueue then some (some count) else none
-        | _, _ => none
-  | _, _, _ => none
+  if queueOverflow e then
+    if e.action = Action.drop then some prevCount else none
+  else
+    match e.redMinThresholdPpb, e.redMaxThresholdPpb, e.redAvgQueueLength with
+    | some minPpb, some maxPpb, some avg =>
+        let minTh := redThresholdUnits minPpb e.capacity
+        let maxTh := redThresholdUnits maxPpb e.capacity
+        let thresholdsOk := minTh < maxTh
+        let overMax := thresholdsOk && avg >= maxTh
+        let overMin := thresholdsOk && avg >= minTh
+        if !thresholdsOk then
+          none
+        else if overMax then
+          if redSignalActionOk e then some (some 0) else none
+        else if !overMin then
+          if e.action = Action.enqueue then some none else none
+        else
+          match e.redMaxProbabilityPpb, e.redRandMinPpb with
+          | some maxProbPpb, some r =>
+              let count := match prevCount with | some c => c + 1 | none => 0
+              let pbPpb := redProbPpb e minPpb maxPpb maxProbPpb avg
+              let paPpb := redPaPpb pbPpb count
+              if r <= paPpb then
+                if redSignalActionOk e then some (some 0) else none
+              else
+                if e.action = Action.enqueue then some (some count) else none
+          | _, _ => none
+    | _, _, _ => none
 
 def redKey (e : Event) : RedKey :=
   (e.schedulerId, e.queueId)
