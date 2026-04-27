@@ -13,7 +13,7 @@ use nexosim::ports::Output;
 
 use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::bbr::TCPBBR;
-use crate::flows::cc::{AckEvent, CCAlgorithm, CongestionControl, RateSample};
+use crate::flows::cc::{AckEvent, CCAlgorithm, CongestionControl, CongestionEvent, RateSample};
 use crate::flows::cubic::TCPCubic;
 use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::{EcnField, Packet};
@@ -368,12 +368,22 @@ impl TCPPacketSource {
         if self.ecn_enabled && ack.ece {
             self.pending_ecn_marked = true;
             if !self.ecn_reduction_in_flight {
-                self.congestion_control.ecn_marked();
+                let flight_size_bytes = self.bytes_in_flight();
+                self.congestion_control
+                    .ecn_congestion_event(CongestionEvent {
+                        now,
+                        flight_size_bytes,
+                    });
                 self.ecn_reduction_in_flight = true;
                 self.cwr_pending = true;
-                self.note_cubic_congestion_time(now);
                 #[cfg(feature = "lean")]
-                self.log_cubic_event(CubicEventKind::Congestion, None, None, now);
+                self.log_cubic_event(
+                    CubicEventKind::Congestion,
+                    None,
+                    None,
+                    now,
+                    Some(flight_size_bytes),
+                );
             }
         } else if !ack.ece {
             self.ecn_reduction_in_flight = false;
@@ -385,6 +395,8 @@ impl TCPPacketSource {
             if self.dupack > 0 {
                 self.congestion_control.dupack_over();
                 self.dupack = 0;
+                #[cfg(feature = "lean")]
+                self.log_cubic_event(CubicEventKind::RecoveryExit, None, None, now, None);
             }
         }
 
@@ -396,10 +408,19 @@ impl TCPPacketSource {
                     .map(|pkt| pkt.size)
                     .unwrap_or(self.mss);
                 self.pending_lost_bytes = self.pending_lost_bytes.saturating_add(loss_size);
-                self.congestion_control.consecutive_dupacks_received();
-                self.note_cubic_congestion_time(now);
+                let flight_size_bytes = self.bytes_in_flight();
+                self.congestion_control.congestion_event(CongestionEvent {
+                    now,
+                    flight_size_bytes,
+                });
                 #[cfg(feature = "lean")]
-                self.log_cubic_event(CubicEventKind::Congestion, None, None, now);
+                self.log_cubic_event(
+                    CubicEventKind::Congestion,
+                    None,
+                    None,
+                    now,
+                    Some(flight_size_bytes),
+                );
             }
 
             if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
@@ -541,7 +562,13 @@ impl TCPPacketSource {
                 let acked_segs = acked_bytes.saturating_add(self.mss.saturating_sub(1)) / self.mss;
                 let rtt_ns = to_ns(sample_rtt);
                 let rtt_s = (rtt_ns as f64) * 1e-9;
-                self.log_cubic_event(CubicEventKind::Ack, Some(acked_segs), Some(rtt_s), now);
+                self.log_cubic_event(
+                    CubicEventKind::Ack,
+                    Some(acked_segs),
+                    Some(rtt_s),
+                    now,
+                    None,
+                );
             }
             self.pending_lost_bytes = 0;
             self.pending_ecn_marked = false;
@@ -582,14 +609,8 @@ impl TCPPacketSource {
         self.last_ack + self.congestion_control.get_cwnd()
     }
 
-    fn note_cubic_congestion_time(&mut self, now: f64) {
-        if let Some(cubic) = self
-            .congestion_control
-            .as_any_mut()
-            .downcast_mut::<TCPCubic>()
-        {
-            cubic.note_congestion_time(now);
-        }
+    fn bytes_in_flight(&self) -> usize {
+        self.sent_packets.values().map(|packet| packet.size).sum()
     }
 
     #[cfg(feature = "lean")]
@@ -599,6 +620,7 @@ impl TCPPacketSource {
         acked_segs: Option<usize>,
         rtt_s: Option<f64>,
         now: f64,
+        flight_size_bytes: Option<usize>,
     ) {
         let cubic = match self
             .congestion_control
@@ -624,7 +646,7 @@ impl TCPPacketSource {
             fast_convergence: snap.fast_convergence,
             init_cwnd_bytes: snap.init_cwnd_bytes as u64,
             init_ssthresh_bytes: snap.init_ssthresh_bytes as u64,
-            flight_size_bytes: None,
+            flight_size_bytes: flight_size_bytes.map(|v| v as u64),
             cwnd_bytes: snap.cwnd_bytes as u64,
             ssthresh_bytes: snap.ssthresh_bytes as u64,
             w_max_bytes: snap.w_max_bytes as u64,
@@ -722,9 +744,19 @@ impl TCPPacketSource {
                     self.pending_lost_bytes = self.pending_lost_bytes.saturating_add(lost_pkt.size);
                 }
 
-                self.congestion_control.timer_expired();
+                let flight_size_bytes = self.bytes_in_flight();
+                self.congestion_control.timeout_event(CongestionEvent {
+                    now,
+                    flight_size_bytes,
+                });
                 #[cfg(feature = "lean")]
-                self.log_cubic_event(CubicEventKind::Timeout, None, None, packet_timeout.timeout);
+                self.log_cubic_event(
+                    CubicEventKind::Timeout,
+                    None,
+                    None,
+                    now,
+                    Some(flight_size_bytes),
+                );
 
                 // retransmits the segment
                 let resent_pkt = self

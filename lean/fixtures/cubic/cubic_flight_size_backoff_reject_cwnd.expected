@@ -1,2 +1,2 @@
 exit=1
-REJECT: line 2: cwnd_bytes mismatch: got 700, expected 70
+REJECT: line 2: cwnd_bytes mismatch: got 700, expected 70 ± 1

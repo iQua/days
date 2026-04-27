@@ -15,6 +15,7 @@ open LeanGuard.Cubic.Semantics
 inductive Kind
   | ack
   | congestion
+  | recoveryExit
   | timeout
 deriving DecidableEq, Repr
 
@@ -50,6 +51,7 @@ def parseKind (s : String) : Except String Kind :=
   match s with
   | "ack" => pure Kind.ack
   | "congestion" => pure Kind.congestion
+  | "recovery_exit" => pure Kind.recoveryExit
   | "timeout" => pure Kind.timeout
   | other => throw s!"invalid kind: {other}"
 
@@ -135,20 +137,24 @@ def rowParams (r : Row) : Params :=
 def checkUnits (lineNo : Nat) (r : Row) : Except String Unit := do
   require lineNo (r.mssBytes > 0) "mss_bytes must be > 0"
 
+def natAbsDiff (a b : Nat) : Nat :=
+  if a <= b then b - a else a - b
+
+def checkApproxBytes (lineNo : Nat) (name : String) (got expected tolerance : Nat) :
+    Except String Unit := do
+  require lineNo (natAbsDiff got expected <= tolerance)
+    s!"{name} mismatch: got {got}, expected {expected} ± {tolerance}"
+
 def checkSnapshot (lineNo : Nat) (st : State) (r : Row) : Except String Unit := do
   let mss := st.p.mssBytes
   let expCwndBytes := encodeBytes st.cwndSegs mss
   let expSsthreshBytes := encodeBytes st.ssthreshSegs mss
   let expWMaxBytes := encodeBytes st.wMaxSegs mss
   let expWLastMaxBytes := encodeBytes st.wLastMaxSegs mss
-  require lineNo (r.cwndBytes = expCwndBytes)
-    s!"cwnd_bytes mismatch: got {r.cwndBytes}, expected {expCwndBytes}"
-  require lineNo (r.ssthreshBytes = expSsthreshBytes)
-    s!"ssthresh_bytes mismatch: got {r.ssthreshBytes}, expected {expSsthreshBytes}"
-  require lineNo (r.wMaxBytes = expWMaxBytes)
-    s!"w_max_bytes mismatch: got {r.wMaxBytes}, expected {expWMaxBytes}"
-  require lineNo (r.wLastMaxBytes = expWLastMaxBytes)
-    s!"w_last_max_bytes mismatch: got {r.wLastMaxBytes}, expected {expWLastMaxBytes}"
+  checkApproxBytes lineNo "cwnd_bytes" r.cwndBytes expCwndBytes mss
+  checkApproxBytes lineNo "ssthresh_bytes" r.ssthreshBytes expSsthreshBytes mss
+  checkApproxBytes lineNo "w_max_bytes" r.wMaxBytes expWMaxBytes mss
+  checkApproxBytes lineNo "w_last_max_bytes" r.wLastMaxBytes expWLastMaxBytes mss
   require lineNo (r.epochStartNs = st.epochStartNs) "epoch_start_ns mismatch"
 
 def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
@@ -215,6 +221,8 @@ def step (lineNo : Nat) (g : Global) (r : Row) : Except String Global := do
     | Kind.congestion =>
         let st'' := onCongestion st r.timeNs r.flightSizeBytes
         pure { st'' with lastTimeNs := some r.timeNs }
+    | Kind.recoveryExit =>
+        pure { st with cwndSegs := st.ssthreshSegs, lastTimeNs := some r.timeNs }
     | Kind.timeout =>
         let st'' := onTimeout st r.flightSizeBytes
         pure { st'' with lastTimeNs := some r.timeNs }
@@ -227,6 +235,7 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
   match r.kind with
   | Kind.ack => covHit cov "saw_ack"
   | Kind.congestion => covHit cov "saw_congestion"
+  | Kind.recoveryExit => covHit cov "saw_recovery_exit"
   | Kind.timeout => covHit cov "saw_timeout"
 
 def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do

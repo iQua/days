@@ -59,6 +59,13 @@ impl AckEvent {
     }
 }
 
+/// A congestion signal with the sender-side flight size at the time of reaction.
+#[derive(Clone, Copy, Debug)]
+pub struct CongestionEvent {
+    pub now: f64,
+    pub flight_size_bytes: usize,
+}
+
 /// The congestion control algorithms.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub enum CCAlgorithm {
@@ -79,6 +86,15 @@ pub trait CongestionControl {
     fn consecutive_dupacks_received(&mut self);
     fn more_dupacks_received(&mut self);
     fn ecn_marked(&mut self) {}
+    fn congestion_event(&mut self, _event: CongestionEvent) {
+        self.consecutive_dupacks_received();
+    }
+    fn ecn_congestion_event(&mut self, _event: CongestionEvent) {
+        self.ecn_marked();
+    }
+    fn timeout_event(&mut self, _event: CongestionEvent) {
+        self.timer_expired();
+    }
     fn get_cwnd(&self) -> usize;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;

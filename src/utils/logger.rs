@@ -64,6 +64,7 @@ pub struct PfcEventRow {
 pub enum CubicEventKind {
     Ack,
     Congestion,
+    RecoveryExit,
     Timeout,
 }
 

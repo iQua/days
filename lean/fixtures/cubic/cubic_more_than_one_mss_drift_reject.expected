@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 2: cwnd_bytes mismatch: got 36353, expected 35840 ± 512
