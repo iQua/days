@@ -1160,7 +1160,9 @@ impl Simulation {
         // Run the executor is necessary.
         if has_events {
             if !spawn_futs.is_empty() {
-                if !use_bundling {
+                if !use_bundling || spawn_futs.len() <= 1 {
+                    // When only 0 or 1 futures, skip bundling to avoid
+                    // unnecessary SeqFuture and Box::pin overhead per step.
                     self.executor.spawn_and_forget_batch(spawn_futs);
                 } else {
                     let mut bundled =
