@@ -1,0 +1,27 @@
+# Minimal deterministic AQM trace used by the LeanGuard CI workflow.
+
+seed = 1000
+edges = [[0, 1]]
+hosts = [0, 1]
+duration = 0.1
+threading = "single"
+log_path = "logs/ci/leanguard_aqm"
+
+[switch]
+port_rate = 8000000
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_id = 0
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+priority = 0
+
+[flow.traffic]
+initial_delay = 0.0
+size = 1000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
