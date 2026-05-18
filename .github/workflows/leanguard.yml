@@ -1,0 +1,193 @@
+name: LeanGuard Protocol Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lean-fixtures:
+    name: Lean checker fixtures
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Lean toolchain and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            lean/.lake
+          key: ${{ runner.os }}-lean-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.lean', 'lean/lake-manifest.json', 'lean/**/*.lean') }}
+          restore-keys: |
+            ${{ runner.os }}-lean-
+
+      - name: Install elan
+        run: |
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Build all LeanGuard checkers
+        run: |
+          cd lean
+          lake build \
+            dcqcn_check \
+            pfc_check \
+            cubic_check \
+            drr_check \
+            wfq_check \
+            aqm_check \
+            aqm_dcqcn_check
+
+      - name: Run AQM fixture checks
+        run: bash lean/scripts/run-aqm-fixtures.sh
+
+      - name: Run AQM coverage fixture checks
+        run: bash lean/scripts/run-aqm-coverage-fixtures.sh
+
+      - name: Run CUBIC fixture checks
+        run: bash lean/scripts/run-cubic-fixtures.sh
+
+      - name: List LeanGuard checker binaries
+        run: ls -l lean/.lake/build/bin/*_check
+
+      - name: Upload LeanGuard checker binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: leanguard-checkers
+          path: lean/.lake/build/bin/*_check
+          if-no-files-found: error
+
+  protocol-traces:
+    name: ${{ matrix.protocol }} trace certificate
+    runs-on: ubuntu-latest
+    needs: lean-fixtures
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protocol: aqm
+            config: configs/ci/leanguard_aqm.toml
+            features: lean
+            checkers: aqm_check
+          - protocol: dcqcn
+            config: configs/ci/leanguard_dcqcn.toml
+            features: dcqcn,l2_pfc,lean
+            checkers: aqm_check,dcqcn_check,aqm_dcqcn_check
+          - protocol: pfc
+            config: configs/ci/leanguard_pfc.toml
+            features: l2_pfc,lean
+            checkers: pfc_check,aqm_check
+          - protocol: cubic
+            config: configs/ci/leanguard_cubic.toml
+            features: lean
+            checkers: aqm_check,cubic_check
+          - protocol: drr
+            config: configs/ci/leanguard_drr.toml
+            features: lean
+            checkers: aqm_check,drr_check
+          - protocol: wfq
+            config: configs/ci/leanguard_wfq.toml
+            features: lean
+            checkers: aqm_check,wfq_check
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-leanguard-${{ matrix.protocol }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-leanguard-${{ matrix.protocol }}-
+            ${{ runner.os }}-cargo-leanguard-
+            ${{ runner.os }}-cargo-
+
+      - name: Download LeanGuard checker binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: leanguard-checkers
+          path: lean/.lake/build/bin
+
+      - name: Make checker binaries executable
+        run: chmod +x lean/.lake/build/bin/*_check
+
+      - name: Run Days and LeanGuard checkers
+        env:
+          SUMMARY_PATH: leanguard-${{ matrix.protocol }}.json
+        run: |
+          set +e
+          cargo run --features "${{ matrix.features }}" --bin leanguard-run -- \
+            --config "${{ matrix.config }}" \
+            --checker-dir lean/.lake/build/bin \
+            > "$SUMMARY_PATH"
+          status=$?
+          set -e
+          cat "$SUMMARY_PATH"
+          exit "$status"
+
+      - name: Verify expected checkers accepted
+        env:
+          SUMMARY_PATH: leanguard-${{ matrix.protocol }}.json
+          EXPECTED_CHECKERS: ${{ matrix.checkers }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          summary_path = os.environ["SUMMARY_PATH"]
+          expected = [name for name in os.environ["EXPECTED_CHECKERS"].split(",") if name]
+
+          with open(summary_path, "r", encoding="utf-8") as handle:
+              summary = json.load(handle)
+
+          if not summary.get("accept"):
+              print(json.dumps(summary, indent=2), file=sys.stderr)
+              raise SystemExit("LeanGuard run did not accept the trace certificate")
+
+          results = {result["checker"]: result for result in summary.get("checker_results", [])}
+          missing = [checker for checker in expected if checker not in results]
+          rejected = [
+              checker
+              for checker in expected
+              if checker in results and results[checker].get("status") != "accept"
+          ]
+
+          if missing or rejected:
+              print(json.dumps(summary, indent=2), file=sys.stderr)
+              if missing:
+                  print(f"Missing expected checkers: {missing}", file=sys.stderr)
+              if rejected:
+                  print(f"Expected checkers did not accept: {rejected}", file=sys.stderr)
+              raise SystemExit(1)
+
+          print("Accepted checkers: " + ", ".join(expected))
+          PY
+
+      - name: Upload LeanGuard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leanguard-${{ matrix.protocol }}
+          path: |
+            leanguard-${{ matrix.protocol }}.json
+            logs/ci/
+          if-no-files-found: ignore

@@ -1,0 +1,38 @@
+# Minimal deterministic PFC trace used by the LeanGuard CI workflow.
+
+seed = 42
+edges = [[0, 1]]
+hosts = [0, 1]
+duration = 0.5
+threading = "single"
+log_path = "logs/ci/leanguard_pfc"
+
+[switch]
+port_rate = 1000000
+capacity = 50
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+xoff = [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
+xon = [500, 500, 500, 500, 500, 500, 500, 500]
+pause_quanta = [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
+buffer_capacity = [20000, 20000, 20000, 20000, 20000, 20000, 20000, 20000]
+refresh_interval = 0.0002
+drain_interval = 0.000001
+
+[[flow]]
+flow_id = 0
+flow_type = "PacketDistribution"
+priority = 3
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.1
+size = 9000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 9000, high = 9000 }
