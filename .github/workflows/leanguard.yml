@@ -39,7 +39,14 @@ jobs:
       - name: Build all LeanGuard checkers
         run: |
           cd lean
-          lake build
+          lake build \
+            dcqcn_check \
+            pfc_check \
+            cubic_check \
+            drr_check \
+            wfq_check \
+            aqm_check \
+            aqm_dcqcn_check
 
       - name: Run AQM fixture checks
         run: bash lean/scripts/run-aqm-fixtures.sh
@@ -49,6 +56,9 @@ jobs:
 
       - name: Run CUBIC fixture checks
         run: bash lean/scripts/run-cubic-fixtures.sh
+
+      - name: List LeanGuard checker binaries
+        run: ls -l lean/.lake/build/bin/*_check
 
       - name: Upload LeanGuard checker binaries
         uses: actions/upload-artifact@v4
