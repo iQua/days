@@ -5,6 +5,7 @@ import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
 import LeanGuard.Shared.Numeric
 import LeanGuard.Shared.Coverage
+import LeanGuard.Shared.TraceSpec
 import LeanGuard.Cubic.Semantics
 
 namespace LeanGuard.CubicEventLog
@@ -238,31 +239,78 @@ def recordCover (cov : CoverageState) (r : Row) : CoverageState :=
   | Kind.recoveryExit => covHit cov "saw_recovery_exit"
   | Kind.timeout => covHit cov "saw_timeout"
 
-def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
-  let rowsSorted ←
-    match canonicalizeRows rows key (fun r => r.srcLine) with
-    | .ok rs => pure rs
-    | .error e => throw (e, {})
+structure ReplayState where
+  g : Global := {}
+  lastKey : Option (Nat × Nat) := none
+deriving Repr
 
-  let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
-      (cov : CoverageState) : CheckOutcome := do
-    match rows with
-    | [] => pure cov
-    | r :: rs => do
-        let cov := covTick cov
-        let cov := recordCover cov r
-        match prevKey with
-        | none => pure ()
-        | some pk =>
-            match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
-            | .ok _ => pure ()
-            | .error e => throw (e, cov)
-        let g' ←
-          match step r.srcLine g r with
-          | .ok g' => pure g'
-          | .error e => throw (e, cov)
-        go g' (some (key r)) rs cov
-  go {} none rowsSorted {}
+def stepRow (s : ReplayState) (r : Row) : Except String ReplayState := do
+  match s.lastKey with
+  | none => pure ()
+  | some pk => require r.srcLine (keyLt pk (key r)) "global key went backwards"
+  let g' ← step r.srcLine s.g r
+  pure { g := g', lastKey := some (key r) }
+
+def traceSpec : TraceSpec :=
+  { Row := Row
+    State := ReplayState
+    init := {}
+    step := stepRow }
+
+def observeCoverage (cov : CoverageState) (_s : ReplayState) (r : Row) : CoverageState :=
+  recordCover (covTick cov) r
+
+def replayCanonicalRowsWithCoverage (rows : List Row) (cov : CoverageState) :
+    Except (String × CoverageState) (ReplayState × CoverageState) :=
+  TraceSpec.replayWithObserverM traceSpec observeCoverage traceSpec.init rows cov
+
+theorem replayCanonicalRowsWithCoverage_sound {rows : List Row} {cov : CoverageState}
+    {s : ReplayState} {cov' : CoverageState} :
+    replayCanonicalRowsWithCoverage rows cov = .ok (s, cov') →
+      TraceSpec.Replay traceSpec traceSpec.init rows s := by
+  intro h
+  exact TraceSpec.replayWithObserverM_sound traceSpec observeCoverage h
+
+theorem replayCanonicalRows_preserves
+    {Inv : ReplayState → Prop}
+    (hstep : ∀ {s r s'}, Inv s → traceSpec.step s r = .ok s' → Inv s')
+    {rows : List Row} {s : ReplayState} :
+    TraceSpec.replayM traceSpec traceSpec.init rows = .ok s →
+      Inv traceSpec.init → Inv s := by
+  intro h hs
+  exact TraceSpec.replayM_preserves traceSpec hstep h hs
+
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome :=
+  match canonicalizeRows rows key (fun r => r.srcLine) with
+  | .error e => .error (e, {})
+  | .ok rowsSorted =>
+      match replayCanonicalRowsWithCoverage rowsSorted {} with
+      | .error err => .error err
+      | .ok (_, cov) => .ok cov
+
+theorem checkRowsWithCoverage_sound {rows : List Row} {cov : CoverageState} :
+    checkRowsWithCoverage rows = .ok cov →
+      ∃ rowsSorted s,
+        canonicalizeRows rows key (fun r => r.srcLine) = .ok rowsSorted ∧
+        TraceSpec.Replay traceSpec traceSpec.init rowsSorted s := by
+  intro h
+  unfold checkRowsWithCoverage at h
+  cases hcanon : canonicalizeRows rows key (fun r => r.srcLine) with
+  | error e =>
+      simp [hcanon] at h
+  | ok rowsSorted =>
+      simp [hcanon] at h
+      cases hrun : replayCanonicalRowsWithCoverage rowsSorted {} with
+      | error err =>
+          simp [hrun] at h
+      | ok pair =>
+          rcases pair with ⟨s, cov'⟩
+          simp [hrun] at h
+          exact
+            ⟨ rowsSorted
+            , s
+            , by simp
+            , replayCanonicalRowsWithCoverage_sound hrun ⟩
 
 def checkRows (rows : List Row) : Except String Unit := do
   match checkRowsWithCoverage rows with
