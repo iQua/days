@@ -96,6 +96,28 @@ theorem replayWithObserverM_sound
           simp [hstep] at h
           exact Replay.cons hstep (ih h)
 
+/--
+Coverage observation cannot change the verdict: instrumented replay agrees
+with plain replay on acceptance, the final replay state, and the error
+message — the observer only threads the coverage component.
+-/
+theorem replayWithObserverM_agrees
+    (observe : CoverageState → spec.State → spec.Row → CoverageState)
+    (s : spec.State) (rows : List spec.Row) (cov : CoverageState) :
+    Except.mapError Prod.fst
+        ((replayWithObserverM spec observe s rows cov).map Prod.fst) =
+      replayM spec s rows := by
+  induction rows generalizing s cov with
+  | nil =>
+      simp [replayWithObserverM, replayM, Except.map, Except.mapError]
+  | cons r rs ih =>
+      simp only [replayWithObserverM, replayM]
+      cases hstep : spec.step s r with
+      | error e =>
+          simp [Except.map, Except.mapError]
+      | ok s1 =>
+          exact ih s1 (observe cov s r)
+
 theorem Replay.preserves
     {Inv : spec.State → Prop}
     (hstep : ∀ {s r s'}, Inv s → spec.step s r = .ok s' → Inv s')
