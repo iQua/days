@@ -1,0 +1,1 @@
+{"checker":"drr_check","accept":true,"cover":["scanSteps_gt_0","size_lt_deficit","wraparound_updates_deficits"],"stats":{"rows":2,"processed_rows":2}}

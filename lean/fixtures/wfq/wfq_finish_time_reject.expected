@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 2: finish_time_ns mismatch: got 2000000, expected 1000000

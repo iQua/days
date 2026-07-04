@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 3: deficit_bytes mismatch: got 501, expected 500

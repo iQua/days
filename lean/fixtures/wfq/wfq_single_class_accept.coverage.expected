@@ -1,0 +1,1 @@
+{"checker":"wfq_check","accept":true,"cover":["enqueue_when_empty","queue_becomes_empty_after_depart","schedule_nonempty"],"stats":{"rows":3,"processed_rows":3}}

@@ -1,0 +1,3 @@
+time_ns,event_id,kind,scheduler_id,class_count,batch_id,packet_id,flow_id,class_id,size_bytes,quantum_bytes,deficit_bytes,rate_bps,current_queue,scan_steps,departure_time_ns
+0,0,enqueue,1,1,,0,0,1,1000,1500,0,8000000,0,0,
+0,1,schedule,1,1,1,0,0,0,1000,1500,500,8000000,0,1,1000000
