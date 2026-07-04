@@ -4,6 +4,7 @@ import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 import LeanGuard.Shared.Key
 import LeanGuard.Shared.Coverage
+import LeanGuard.Shared.TraceSpec
 import LeanGuard.Wfq.Semantics
 
 namespace LeanGuard.WfqEventLog
@@ -106,21 +107,11 @@ def toEvent (r : Row) : Event :=
       finishTimeNs := r.finishTimeNs
       departureTimeNs := r.departureTimeNs }
 
-def listContains (xs : List Nat) (x : Nat) : Bool :=
-    match xs with
-    | [] => false
-    | y :: ys => if x = y then true else listContains ys x
-
-def recordCover (cov : CoverageState) (g : Global) (r : Row)
-    (seenClasses : List Nat) : CoverageState × List Nat :=
+def recordCover (cov : CoverageState) (g : Global) (r : Row) : CoverageState :=
     let st := g.schedulers.getD r.schedulerId {}
-    let seenClasses :=
-        if listContains seenClasses r.classId then
-            seenClasses
-        else
-            r.classId :: seenClasses
+    let cov := covSeen cov r.classId
     let cov :=
-        if seenClasses.length >= 2 then
+        if cov.seen.size >= 2 then
             covHit cov "class_count_ge_2"
         else
             cov
@@ -172,33 +163,80 @@ def recordCover (cov : CoverageState) (g : Global) (r : Row)
                     covHit cov "queue_becomes_empty_after_depart"
                 else
                     cov
-    (cov, seenClasses)
+    cov
 
-def checkRowsWithCoverage (rows : List Row) : CheckOutcome := do
-    let rowsSorted ←
-        match canonicalizeRows rows key (fun r => r.srcLine) with
-        | .ok rs => pure rs
-        | .error e => throw (e, {})
+structure ReplayState where
+  g : Global := {}
+  lastKey : Option (Nat × Nat) := none
+deriving Repr
 
-    let rec go (g : Global) (prevKey : Option (Nat × Nat)) (rows : List Row)
-        (cov : CoverageState) (seenClasses : List Nat) : CheckOutcome := do
-        match rows with
-        | [] => pure cov
-        | r :: rs => do
-            let cov := covTick cov
-            let (cov, seenClasses) := recordCover cov g r seenClasses
-            match prevKey with
-            | none => pure ()
-            | some pk =>
-                match require r.srcLine (keyLt pk (key r)) "global key went backwards" with
-                | .ok _ => pure ()
-                | .error e => throw (e, cov)
-            let g' ←
-                match step r.srcLine g (toEvent r) with
-                | .ok g' => pure g'
-                | .error e => throw (e, cov)
-            go g' (some (key r)) rs cov seenClasses
-    go {} none rowsSorted {} []
+def stepRow (s : ReplayState) (r : Row) : Except String ReplayState := do
+  match s.lastKey with
+  | none => pure ()
+  | some pk => require r.srcLine (keyLt pk (key r)) "global key went backwards"
+  let g' ← step r.srcLine s.g (toEvent r)
+  pure { g := g', lastKey := some (key r) }
+
+def traceSpec : TraceSpec :=
+  { Row := Row
+    State := ReplayState
+    init := {}
+    step := stepRow }
+
+def observeCoverage (cov : CoverageState) (s : ReplayState) (r : Row) : CoverageState :=
+  recordCover (covTick cov) s.g r
+
+def replayCanonicalRowsWithCoverage (rows : List Row) (cov : CoverageState) :
+    Except (String × CoverageState) (ReplayState × CoverageState) :=
+  TraceSpec.replayWithObserverM traceSpec observeCoverage traceSpec.init rows cov
+
+theorem replayCanonicalRowsWithCoverage_sound {rows : List Row} {cov : CoverageState}
+    {s : ReplayState} {cov' : CoverageState} :
+    replayCanonicalRowsWithCoverage rows cov = .ok (s, cov') →
+      TraceSpec.Replay traceSpec traceSpec.init rows s := by
+  intro h
+  exact TraceSpec.replayWithObserverM_sound traceSpec observeCoverage h
+
+theorem replayCanonicalRows_preserves
+    {Inv : ReplayState → Prop}
+    (hstep : ∀ {s r s'}, Inv s → traceSpec.step s r = .ok s' → Inv s')
+    {rows : List Row} {s : ReplayState} :
+    TraceSpec.replayM traceSpec traceSpec.init rows = .ok s →
+      Inv traceSpec.init → Inv s := by
+  intro h hs
+  exact TraceSpec.replayM_preserves traceSpec hstep h hs
+
+def checkRowsWithCoverage (rows : List Row) : CheckOutcome :=
+  match canonicalizeRows rows key (fun r => r.srcLine) with
+  | .error e => .error (e, {})
+  | .ok rowsSorted =>
+      match replayCanonicalRowsWithCoverage rowsSorted {} with
+      | .error err => .error err
+      | .ok (_, cov) => .ok cov
+
+theorem checkRowsWithCoverage_sound {rows : List Row} {cov : CoverageState} :
+    checkRowsWithCoverage rows = .ok cov →
+      ∃ rowsSorted s,
+        canonicalizeRows rows key (fun r => r.srcLine) = .ok rowsSorted ∧
+        TraceSpec.Replay traceSpec traceSpec.init rowsSorted s := by
+  intro h
+  unfold checkRowsWithCoverage at h
+  cases hcanon : canonicalizeRows rows key (fun r => r.srcLine) with
+  | error e =>
+      simp [hcanon] at h
+  | ok rowsSorted =>
+      simp [hcanon] at h
+      cases hrun : replayCanonicalRowsWithCoverage rowsSorted {} with
+      | error err =>
+          simp [hrun] at h
+      | ok pair =>
+          rcases pair with ⟨s, cov'⟩
+          simp [hrun] at h
+          exact
+            ⟨ rowsSorted
+            , s
+            , by simp
+            , replayCanonicalRowsWithCoverage_sound hrun ⟩
 
 def checkRows (rows : List Row) : Except String Unit := do
     match checkRowsWithCoverage rows with

@@ -5,6 +5,7 @@ namespace LeanGuard.Shared
 structure CoverageState where
   points : Std.HashSet String := {}
   processedRows : Nat := 0
+  seen : Std.HashSet Nat := {}
   deriving Repr
 
 abbrev CheckOutcome := Except (String × CoverageState) CoverageState
@@ -23,13 +24,21 @@ def covHit (cov : CoverageState) (point : String) : CoverageState :=
   { cov with points := cov.points.insert point }
 
 
+/-- Record a distinct numeric id in the observer's scratch set. Observational only:
+    `seen` is never serialized (see `covList`/`CoverageReport.toJson`) and only threads
+    cross-row coverage bookkeeping for observers that need it (e.g. WFQ distinct classes). -/
+def covSeen (cov : CoverageState) (n : Nat) : CoverageState :=
+  { cov with seen := cov.seen.insert n }
+
+
 def covTick (cov : CoverageState) : CoverageState :=
   { cov with processedRows := cov.processedRows + 1 }
 
 
 def covMerge (a b : CoverageState) : CoverageState :=
   let points := b.points.toList.foldl (fun acc p => acc.insert p) a.points
-  { points := points, processedRows := a.processedRows + b.processedRows }
+  let seen := b.seen.toList.foldl (fun acc n => acc.insert n) a.seen
+  { points := points, processedRows := a.processedRows + b.processedRows, seen := seen }
 
 
 def stringLt (a b : String) : Bool :=
