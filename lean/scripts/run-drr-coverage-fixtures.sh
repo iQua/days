@@ -9,7 +9,7 @@ lake build drr_check
 status=0
 for expected in fixtures/drr/*.coverage.expected; do
   csv="${expected%.coverage.expected}.csv"
-  tmp="$(mktemp)"
+  tmp="$(mktemp -p .)"
   if .lake/build/bin/drr_check --coverage-out "$tmp" "$csv" >/dev/null 2>&1; then
     actual_exit=0
   else

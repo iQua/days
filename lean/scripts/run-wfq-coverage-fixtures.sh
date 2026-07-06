@@ -9,7 +9,7 @@ lake build wfq_check
 status=0
 for expected in fixtures/wfq/*.coverage.expected; do
   csv="${expected%.coverage.expected}.csv"
-  tmp="$(mktemp)"
+  tmp="$(mktemp -p .)"
   if .lake/build/bin/wfq_check --coverage-out "$tmp" "$csv" >/dev/null 2>&1; then
     actual_exit=0
   else
