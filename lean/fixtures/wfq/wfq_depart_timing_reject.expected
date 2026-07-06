@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 4: departure_time_ns must equal time_ns on depart

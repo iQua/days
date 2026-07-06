@@ -4,13 +4,13 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root/lean"
 
-lake build aqm_check
+lake build drr_check
 
 status=0
-for expected in fixtures/aqm/*.coverage.expected; do
+for expected in fixtures/drr/*.coverage.expected; do
   csv="${expected%.coverage.expected}.csv"
   tmp="$(mktemp -p .)"
-  if .lake/build/bin/aqm_check --coverage-out "$tmp" "$csv" >/dev/null 2>&1; then
+  if .lake/build/bin/drr_check --coverage-out "$tmp" "$csv" >/dev/null 2>&1; then
     actual_exit=0
   else
     actual_exit=$?

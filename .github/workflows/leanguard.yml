@@ -57,6 +57,18 @@ jobs:
       - name: Run CUBIC fixture checks
         run: bash lean/scripts/run-cubic-fixtures.sh
 
+      - name: Run DRR fixture checks
+        run: bash lean/scripts/run-drr-fixtures.sh
+
+      - name: Run DRR coverage fixture checks
+        run: bash lean/scripts/run-drr-coverage-fixtures.sh
+
+      - name: Run WFQ fixture checks
+        run: bash lean/scripts/run-wfq-fixtures.sh
+
+      - name: Run WFQ coverage fixture checks
+        run: bash lean/scripts/run-wfq-coverage-fixtures.sh
+
       - name: List LeanGuard checker binaries
         run: ls -l lean/.lake/build/bin/*_check
 
