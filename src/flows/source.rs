@@ -161,6 +161,13 @@ impl PacketSource {
         }
     }
 
+    #[cfg(feature = "migration_ledger")]
+    pub fn set_migration_node_id(&mut self, node_id: usize) {
+        if let PacketSource::DistPacketSource(source) = self {
+            source.set_migration_node_id(node_id);
+        }
+    }
+
     #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
         #[cfg(test)]

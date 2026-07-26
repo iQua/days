@@ -1,0 +1,49 @@
+schema_version = 1
+id = "P01-T1-frozen-baseline"
+phase = "P01"
+task = "T1"
+kind = "golden"
+description = "Stage-1 retirement budget, corpus boundaries, timing characterization, and small canonical Nexosim ledger/digest goldens"
+command = ["cargo", "test", "--features", "test,migration_ledger"]
+tool_version = "cargo 1.96.0 (30a34c682 2026-05-25)"
+schema = "days-executor-p01-t1-stage1-v1"
+tags = [
+    "baseline-characterization",
+    "comparison-boundaries",
+    "deterministic-ledger",
+    "premeasurement-budget",
+    "terminal-digest",
+    "time-policy",
+]
+
+[[artifacts]]
+path = "docs/days-executor/budgets/retirement-budget.toml"
+content_hash = "sha256:fa0cf005ff0c47389cde97237e20a8a674e6d0f2b12961726f3032eb383fe925"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/retirement-corpus.toml"
+content_hash = "sha256:4a3d3c94b8beb42825e6faf8c7ab5757a22585db843c29a27d874adc0eca04d7"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/quantize-after-characterization.toml"
+content_hash = "sha256:8c25f840c9a0ae91e81501708dec9e6687982dead4b967f1c4c2957c7b57c817"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/quantize-after-characterization.md"
+content_hash = "sha256:b9a249849a399ce0a8a29e60eefce0696964b53ec23ee620124b0b7d30a2a6c2"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/explicit-ledger-sample.csv"
+content_hash = "sha256:3f65cc8c97ba3203d0938da9748a60fb80b8a1bb831b83f89d5e6dd11575d7bf"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/explicit-terminal-digest.csv"
+content_hash = "sha256:ed4f4e2da2e81a9c9a9e5949fa442e7fcfbe1249f9916dd905e5b24a91d9f9ff"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/explicit-sources-default.csv"
+content_hash = "sha256:00d23709a6faa7a39d3446bf77da4f92cd8f5996c7fc577657921bcd86c86386"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/explicit-sinks-default.csv"
+content_hash = "sha256:0bc275b4edd99e41fb442da008781966b6df8b2591a896f275f8f3b01e12f62c"

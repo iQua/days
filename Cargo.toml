@@ -20,6 +20,7 @@ l2 = []
 l2_pfc = ["l2"]
 dcqcn = []
 lean = []
+migration_ledger = []
 perf_stats = ["nexosim/perf_stats"]
 
 [dependencies]

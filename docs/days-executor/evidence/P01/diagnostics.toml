@@ -16,7 +16,7 @@ summary = "Metadata is not valid TOML, has an unknown field, a missing required 
 code = "DAYS-AUDIT-0003"
 slug = "phase-metadata-schema-version"
 severity = "error"
-summary = "Unsupported `schema_version` in any of the three schemas"
+summary = "Unsupported `schema_version` in any versioned schema"
 
 [[diagnostics]]
 code = "DAYS-AUDIT-0004"

@@ -246,6 +246,13 @@ impl PacketSink {
         }
     }
 
+    #[cfg(feature = "migration_ledger")]
+    pub fn set_migration_node_id(&mut self, node_id: usize) {
+        if let PacketSink::BasicPacketSink(sink) = self {
+            sink.set_migration_node_id(node_id);
+        }
+    }
+
     pub fn statistics(&mut self) -> &mut Output<PacketStatistics> {
         match self {
             PacketSink::BasicPacketSink(sink) => sink.statistics.borrow_mut(),

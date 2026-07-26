@@ -1182,7 +1182,7 @@ fn check_declared_budgets(
                 continue;
             }
         };
-        match parse_budget_manifest(&contents) {
+        match parse_budget_manifest(&contents, repo_root) {
             Ok(_) => {}
             Err(error) => {
                 emit_schema_error(diagnostics, &budget.path, error, "DAYS-AUDIT-0011");

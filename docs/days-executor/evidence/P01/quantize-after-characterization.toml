@@ -1,0 +1,314 @@
+schema_version = 1
+policy = "legacy-f64-absolute-deadline"
+
+# This is the finite exact-ledger domain exercised by the P01 migration corpus.
+# The test checks every integer-nanosecond base in the inclusive interval.
+[aligned_exact_domain]
+comparison_boundary = "exact-ledger"
+quantum_ns = 1
+packet_size_bytes = 1000
+rate_bits_per_second = 1_000_000_000
+raw_delta_ns = 8000
+min_base_ns = 0
+max_base_ns_inclusive = 2_000_000
+
+[[case]]
+id = "quantum-disabled-fractional-5-5ns"
+classification = "semantic-migration"
+quantum_ns = 0
+packet_size_bytes = 11
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 11
+delta_ns_denominator = 2
+expected_output_ps = 5500
+
+[[case]]
+id = "quantum-1ns-fractional-5-5ns"
+classification = "semantic-migration"
+quantum_ns = 1
+packet_size_bytes = 11
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 11
+delta_ns_denominator = 2
+expected_output_ns = 6
+
+[[case]]
+id = "quantum-disabled-whole-10ns"
+classification = "aligned-exact"
+quantum_ns = 0
+packet_size_bytes = 20
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 10
+delta_ns_denominator = 1
+expected_output_ns = 10
+
+[[case]]
+id = "quantum-edge-10ns"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 20
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 10
+delta_ns_denominator = 1
+expected_output_ns = 10
+
+[[case]]
+id = "quantum-edge-20ns"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 20
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 10
+base_ns_denominator = 1
+delta_ns_numerator = 10
+delta_ns_denominator = 1
+expected_output_ns = 20
+
+[[case]]
+id = "base-residue-0-of-10"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 10
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 5
+delta_ns_denominator = 1
+expected_output_ns = 10
+independent_quantized_duration_sum_ns = 10
+
+[[case]]
+id = "base-residue-4-of-10"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 10
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 4
+base_ns_denominator = 1
+delta_ns_numerator = 5
+delta_ns_denominator = 1
+expected_output_ns = 10
+independent_quantized_duration_sum_ns = 14
+
+[[case]]
+id = "base-residue-5-of-10"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 10
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 5
+base_ns_denominator = 1
+delta_ns_numerator = 5
+delta_ns_denominator = 1
+expected_output_ns = 10
+independent_quantized_duration_sum_ns = 15
+
+[[case]]
+id = "base-residue-6-of-10"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 10
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 6
+base_ns_denominator = 1
+delta_ns_numerator = 5
+delta_ns_denominator = 1
+expected_output_ns = 20
+independent_quantized_duration_sum_ns = 16
+
+[[case]]
+id = "base-residue-9-of-10"
+classification = "aligned-exact"
+quantum_ns = 10
+packet_size_bytes = 10
+rate_bits_per_second = 16_000_000_000
+base_ns_numerator = 9
+base_ns_denominator = 1
+delta_ns_numerator = 5
+delta_ns_denominator = 1
+expected_output_ns = 20
+independent_quantized_duration_sum_ns = 19
+
+[[case]]
+id = "sub-ns-disabled-0-25ns"
+classification = "semantic-migration"
+quantum_ns = 0
+packet_size_bytes = 1
+rate_bits_per_second = 32_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 1
+delta_ns_denominator = 4
+expected_output_ps = 250
+
+[[case]]
+id = "sub-ns-quantum-1ns-rounds-zero"
+classification = "semantic-migration"
+quantum_ns = 1
+packet_size_bytes = 1
+rate_bits_per_second = 32_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 1
+delta_ns_denominator = 4
+expected_output_ns = 0
+
+[[case]]
+id = "sub-ns-quantum-1ns-0-4ns-rounds-zero"
+classification = "semantic-migration"
+quantum_ns = 1
+packet_size_bytes = 1
+rate_bits_per_second = 20_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 2
+delta_ns_denominator = 5
+expected_output_ns = 0
+
+[[case]]
+id = "sub-ns-quantum-1ns-0-8ns-rounds-one"
+classification = "semantic-migration"
+quantum_ns = 1
+packet_size_bytes = 1
+rate_bits_per_second = 10_000_000_000
+base_ns_numerator = 0
+base_ns_denominator = 1
+delta_ns_numerator = 4
+delta_ns_denominator = 5
+expected_output_ns = 1
+
+[[case]]
+id = "large-time-1e18ns-loses-1ns-disabled"
+classification = "semantic-migration"
+quantum_ns = 0
+packet_size_bytes = 1
+rate_bits_per_second = 8_000_000_000
+base_ns_numerator = 1_000_000_000_000_000_000
+base_ns_denominator = 1
+delta_ns_numerator = 1
+delta_ns_denominator = 1
+expected_output_ns = 1_000_000_000_000_000_000
+
+[[case]]
+id = "large-time-1e18ns-loses-1ns-quantum-1ns"
+classification = "semantic-migration"
+quantum_ns = 1
+packet_size_bytes = 1
+rate_bits_per_second = 8_000_000_000
+base_ns_numerator = 1_000_000_000_000_000_000
+base_ns_denominator = 1
+delta_ns_numerator = 1
+delta_ns_denominator = 1
+expected_output_ns = 1_000_000_000_000_000_128
+
+[[repeated_fractional_ns]]
+id = "5-5ns-quantum-disabled"
+classification = "semantic-migration"
+quantum_ns = 0
+packet_size_bytes = 11
+rate_bits_per_second = 16_000_000_000
+raw_delta_ns_numerator = 11
+raw_delta_ns_denominator = 2
+independent_rounded_duration_ns = 6
+
+[[repeated_fractional_ns.sample]]
+services = 1
+absolute_deadline_ps = 5500
+independent_duration_sum_ps = 6000
+divergence_ps = 500
+
+[[repeated_fractional_ns.sample]]
+services = 2
+absolute_deadline_ps = 11000
+independent_duration_sum_ps = 12000
+divergence_ps = 1000
+
+[[repeated_fractional_ns.sample]]
+services = 3
+absolute_deadline_ps = 16500
+independent_duration_sum_ps = 18000
+divergence_ps = 1500
+
+[[repeated_fractional_ns.sample]]
+services = 5
+absolute_deadline_ps = 27500
+independent_duration_sum_ps = 30000
+divergence_ps = 2500
+
+[[repeated_fractional_ns.sample]]
+services = 10
+absolute_deadline_ps = 55000
+independent_duration_sum_ps = 60000
+divergence_ps = 5000
+
+[[repeated_fractional_ns.sample]]
+services = 20
+absolute_deadline_ps = 110000
+independent_duration_sum_ps = 120000
+divergence_ps = 10000
+
+[[repeated_fractional_ns.sample]]
+services = 100
+absolute_deadline_ps = 550000
+independent_duration_sum_ps = 600000
+divergence_ps = 50000
+
+[[repeated_fractional_ns]]
+id = "5-5ns-quantum-1ns"
+classification = "semantic-migration"
+quantum_ns = 1
+packet_size_bytes = 11
+rate_bits_per_second = 16_000_000_000
+raw_delta_ns_numerator = 11
+raw_delta_ns_denominator = 2
+independent_rounded_duration_ns = 6
+
+[[repeated_fractional_ns.sample]]
+services = 1
+absolute_deadline_ps = 6000
+independent_duration_sum_ps = 6000
+divergence_ps = 0
+
+[[repeated_fractional_ns.sample]]
+services = 2
+absolute_deadline_ps = 12000
+independent_duration_sum_ps = 12000
+divergence_ps = 0
+
+[[repeated_fractional_ns.sample]]
+services = 3
+absolute_deadline_ps = 18000
+independent_duration_sum_ps = 18000
+divergence_ps = 0
+
+[[repeated_fractional_ns.sample]]
+services = 5
+absolute_deadline_ps = 30000
+independent_duration_sum_ps = 30000
+divergence_ps = 0
+
+[[repeated_fractional_ns.sample]]
+services = 10
+absolute_deadline_ps = 60000
+independent_duration_sum_ps = 60000
+divergence_ps = 0
+
+[[repeated_fractional_ns.sample]]
+services = 20
+absolute_deadline_ps = 120000
+independent_duration_sum_ps = 120000
+divergence_ps = 0
+
+[[repeated_fractional_ns.sample]]
+services = 100
+absolute_deadline_ps = 600000
+independent_duration_sum_ps = 600000
+divergence_ps = 0

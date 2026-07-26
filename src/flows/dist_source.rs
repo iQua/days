@@ -18,6 +18,10 @@ use crate::flows::source::PacketSourceReport;
 use crate::flows::{DistributionInfo, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
+#[cfg(feature = "migration_ledger")]
+use crate::utils::logger::{
+    MigrationLedgerRow, MigrationModelKind, MigrationTransitionKind, migration_time_to_ns,
+};
 use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
@@ -36,6 +40,10 @@ pub struct DistPacketSource {
     sent_size: usize,
     sent_size_in_period: usize,
     rng: SmallRng,
+    #[cfg(feature = "migration_ledger")]
+    migration_node_id: Option<usize>,
+    #[cfg(feature = "migration_ledger")]
+    migration_sequence: u64,
 
     pub output: Output<Packet>,
     pub ui_output: Output<FlowFinishMsg>,
@@ -63,6 +71,10 @@ impl DistPacketSource {
             sent_size: 0,
             sent_size_in_period: 0,
             rng,
+            #[cfg(feature = "migration_ledger")]
+            migration_node_id: None,
+            #[cfg(feature = "migration_ledger")]
+            migration_sequence: 0,
             output: Output::default(),
             ui_output: Output::default(),
             report_start_time: 0.0,
@@ -77,6 +89,37 @@ impl DistPacketSource {
         debug!(
             "DistPacketSource {} of flow {} sent packet {} ({} bytes) at time {:.3}. {} packets sent.",
             self.endpoint_id, self.flow_id, packet.packet_id, packet.size, now, self.packets_sent,
+        );
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    pub fn set_migration_node_id(&mut self, node_id: usize) {
+        self.migration_node_id = Some(node_id);
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    fn log_migration_emission(&mut self, packet: &Packet, now: f64) {
+        let Some(node_id) = self.migration_node_id else {
+            return;
+        };
+        let model_sequence = self.migration_sequence;
+        self.migration_sequence += 1;
+        CsvLogger::try_log_report(
+            Report::MigrationLedgerRow(MigrationLedgerRow {
+                time_ns: migration_time_to_ns(now),
+                model_kind: MigrationModelKind::Source,
+                transition: MigrationTransitionKind::SourceEmit,
+                node_id: node_id as u64,
+                peer_node_id: None,
+                flow_id: packet.flow_id as u64,
+                packet_id: packet.packet_id as u64,
+                model_sequence,
+                size_bytes: packet.size as u64,
+                queue_occupancy_packets: None,
+                queue_occupancy_bytes: None,
+                departure_time_ns: None,
+            }),
+            ReportTiming::InProgress,
         );
     }
 
@@ -146,6 +189,8 @@ impl DistPacketSource {
     pub async fn send_packet(&mut self, now: f64) -> f64 {
         let (packet, interval) = self.produce_packet(now);
 
+        #[cfg(feature = "migration_ledger")]
+        self.log_migration_emission(&packet, now);
         self.output.send(packet.clone()).await;
         self.packet_sent(&packet, now);
 

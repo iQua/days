@@ -1,9 +1,9 @@
 # Days Executor audit and evidence contract
 
-This document defines the version 1 audit and evidence contract for the Days
-Executor program. The contract is enforced by the Rust `xtask` package without
-changing the Days simulator, its configuration, its command-line interface, or
-its default behavior.
+This document defines the audit and evidence contract for the Days Executor
+program. The contract is enforced by the Rust `xtask` package without changing
+the Days simulator, its configuration, its command-line interface, or its
+default behavior.
 
 ## Commands
 
@@ -120,9 +120,19 @@ The machine-readable registry golden is
 
 ## Common validation rules
 
-All versioned manifests are TOML and use `schema_version = 1`. Version 0, version
-2, and every other version are rejected separately from malformed TOML. Schema
-records deny unknown fields, so a misspelled key cannot be silently ignored.
+All versioned manifests are TOML. Each document kind accepts exactly the
+version in this table:
+
+| Document kind | Supported `schema_version` |
+| --- | --- |
+| Phase metadata | 1 |
+| Evidence manifest | 1 |
+| Dependency baseline | 1 |
+| Budget manifest | 2 |
+
+Version 0 and every version not listed for that document kind are rejected
+separately from malformed TOML. Schema records deny unknown fields, so a
+misspelled key cannot be silently ignored.
 
 Every hash field is a string with the exact form
 `sha256:<64 lowercase hexadecimal characters>`. Hashes are computed over the
@@ -298,16 +308,37 @@ selection.
 
 | Field | Type | Presence | Rule |
 | --- | --- | --- | --- |
-| `schema_version` | integer | required | Must equal 1. |
+| `schema_version` | integer | required | Must equal 2. |
 | `id` | string | required | Stable budget identifier. |
 | `phase` | string | required | Owning phase identifier. |
 | `frozen_at` | string | required | ISO-8601 calendar date in `YYYY-MM-DD` form. |
 | `description` | string | required | Human-readable purpose and scope. |
+| `platform` | table | required | Named measurement hardware, operating system, and toolchain. |
+| `method` | table | required | Frozen warmup, repetition, statistic, and confidence method. |
+| `corpus` | array of corpus tables | required | Non-empty exact workload set and comparison boundaries. |
 | `thresholds` | array of threshold tables | required | Admission or comparison thresholds. |
+| `waiver` | table | required | Public approving role and mandatory pre-cutover review policy. |
 
 Each `thresholds` table requires string fields `name`, `metric`, `comparison`,
 and `unit`, plus a numeric `value`. `comparison` is one of `<`, `<=`, `>`,
 `>=`, or `==`.
+
+The `platform` table requires non-empty `name`, `cpu`, `os_build`, and
+`toolchain` strings. The `method` table requires non-negative integer
+`warmups`, integer `repetitions` of at least 1, and non-empty `statistic` and
+`confidence_rule` strings.
+
+Each `corpus` table requires a repository-relative `path`, its canonical
+`sha256:<64 lowercase hexadecimal characters>` `content_hash`, and a
+`comparison_boundary` equal to `exact-ledger`, `terminal-observation`, or
+`semantic-migration`. Parsing a budget resolves every corpus path inside the
+repository, requires it to be a regular file, and verifies its exact bytes
+against `content_hash`.
+
+The `waiver` table requires a non-empty `approving_role`. Its `policy` must be
+exactly `A waiver must be a reviewed manifest change made before the cutover
+decision.` This makes the authority and timing rule part of the frozen,
+machine-checked budget rather than post-measurement prose.
 
 The budget manifest's `frozen_at` field remains a descriptive ISO date. The
 content and temporal Git binding deliberately lives outside that blob in the

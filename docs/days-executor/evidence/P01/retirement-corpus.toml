@@ -1,0 +1,45 @@
+schema_version = 1
+id = "P01-retirement-corpus"
+phase = "P01"
+task = "T1"
+description = "Frozen stage-1 corpus and comparison boundaries for Nexosim retirement"
+
+[[fixtures]]
+path = "configs/migration/explicit.toml"
+content_hash = "sha256:fb71cc87dc7f0b3e3055ece1495f173f10156f9aecbd8345befcf4bbbbaffa03"
+comparison_boundary = "exact-ledger"
+model_scope = "v1-open-loop-udp"
+required_features = ["migration_ledger"]
+command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/explicit.toml"]
+
+[[fixtures]]
+path = "configs/migration/torus.toml"
+content_hash = "sha256:b4ae6460ee3bfc84b23e28ce73e96bd6408d46eba04d69152a4479dfffb7bf0a"
+comparison_boundary = "exact-ledger"
+model_scope = "v1-open-loop-udp"
+required_features = ["migration_ledger"]
+command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/torus.toml"]
+
+[[fixtures]]
+path = "configs/migration/fattree.toml"
+content_hash = "sha256:21e7fe2749ea114a46f6caec65aa8a7413e41cb6e2a418a53dd4439aa430d38b"
+comparison_boundary = "exact-ledger"
+model_scope = "v1-open-loop-udp"
+required_features = ["migration_ledger"]
+command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/fattree.toml"]
+
+[[fixtures]]
+path = "configs/tcp_simple.toml"
+content_hash = "sha256:28d6a1e4fbafc37eca41c499302b543077c25401610abec7df33f467366b4247"
+comparison_boundary = "terminal-observation"
+model_scope = "out-of-scope-tcp"
+required_features = ["migration_ledger"]
+command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/tcp_simple.toml"]
+
+[[fixtures]]
+path = "configs/ci/leanguard_dcqcn.toml"
+content_hash = "sha256:eda40aa3a9d6e49034072b67ac48d33c44c26157988401cd01d7b2ca1732a098"
+comparison_boundary = "terminal-observation"
+model_scope = "out-of-scope-dcqcn-pfc"
+required_features = ["migration_ledger", "l2_pfc", "dcqcn"]
+command = ["cargo", "run", "--quiet", "--features", "migration_ledger,l2_pfc,dcqcn", "--bin", "days", "--", "configs/ci/leanguard_dcqcn.toml"]

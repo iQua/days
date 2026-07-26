@@ -5,14 +5,17 @@ title = "Audit and evidence contract"
 design_note = "docs/days-executor/phases/P01-audit-and-baseline.md"
 depends_on = []
 external_depends_on = []
-features = ["test"]
+features = ["test", "migration_ledger"]
 platforms = ["linux-x86_64", "macos-aarch64"]
 semantic_changes = []
-api_changes = []
+api_changes = [
+    "Add the off-by-default migration_ledger Cargo feature for migration characterization",
+]
 trust_boundary_change = false
 proof_changing = false
 out_of_scope = [
-    "T1 frozen baseline characterization",
+    "Stage-2 budget, measurement, and archive commit bindings",
+    "Scenario-local semantic tuple IDs",
     "creating the executor directory",
     "Lean toolchain invocation",
     "GPU backends",
@@ -29,6 +32,16 @@ evidence = ["docs/days-executor/evidence/P01/t0-evidence.toml"]
 path = "xtask/tests/phase_audit_mutations.rs"
 name = "malformed_phase_metadata_is_rejected"
 
+[[tasks]]
+id = "T1"
+title = "Freeze the Nexosim retirement baseline"
+depends_on = ["T0"]
+evidence = ["docs/days-executor/evidence/P01/t1-evidence.toml"]
+
+[tasks.red_test]
+path = "tests/migration_ledger.rs"
+name = "supported_nexosim_st_model_exposes_complete_ledger_and_terminal_digest"
+
 [[test_commands]]
 platform = "linux-x86_64"
 features = []
@@ -42,6 +55,12 @@ argv = ["cargo", "test", "--features", "test"]
 deterministic = true
 
 [[test_commands]]
+platform = "linux-x86_64"
+features = ["test", "migration_ledger"]
+argv = ["cargo", "test", "--features", "test,migration_ledger"]
+deterministic = true
+
+[[test_commands]]
 platform = "macos-aarch64"
 features = []
 argv = ["cargo", "test", "--workspace"]
@@ -51,4 +70,10 @@ deterministic = true
 platform = "macos-aarch64"
 features = ["test"]
 argv = ["cargo", "test", "--features", "test"]
+deterministic = true
+
+[[test_commands]]
+platform = "macos-aarch64"
+features = ["test", "migration_ledger"]
+argv = ["cargo", "test", "--features", "test,migration_ledger"]
 deterministic = true

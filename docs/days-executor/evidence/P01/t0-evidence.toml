@@ -11,8 +11,8 @@ tags = []
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P01/diagnostics.toml"
-content_hash = "sha256:528350aa4dae96ecd95b98abb4dd052634c7f8ed42fee5e77d7ef7709656d964"
+content_hash = "sha256:42c9d63ea770743a73e4e8b4cf7292d6326418cc748563890304a8c9ad7ce377"
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P01/mutation-corpus.toml"
-content_hash = "sha256:91b3814035c6dd21bc269123b3c1f024f897900d0e48ac999cee7372af2c3019"
+content_hash = "sha256:ef986c504bbf0fbfabb2754c9e686f63c889653eb684b52292a593cd13f866ee"

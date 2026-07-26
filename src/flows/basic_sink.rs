@@ -11,6 +11,10 @@ use crate::flows::packet::Packet;
 use crate::flows::sink::{PacketSinkReport, PacketStatistics};
 use crate::next_endpoint_id;
 use crate::utils::logger::CsvLogger;
+#[cfg(feature = "migration_ledger")]
+use crate::utils::logger::{
+    MigrationLedgerRow, MigrationModelKind, MigrationTransitionKind, migration_time_to_ns,
+};
 use crate::utils::logger::{Report, ReportTiming};
 
 #[derive(Debug)]
@@ -37,6 +41,10 @@ pub struct BasicPacketSink {
     received_sizes: usize,
     queueing_delay_mean: f64,
     one_way_delay_mean: f64,
+    #[cfg(feature = "migration_ledger")]
+    migration_node_id: Option<usize>,
+    #[cfg(feature = "migration_ledger")]
+    migration_sequence: u64,
 }
 
 impl BasicPacketSink {
@@ -56,7 +64,42 @@ impl BasicPacketSink {
             received_sizes: 0,
             queueing_delay_mean: 0.0,
             one_way_delay_mean: 0.0,
+            #[cfg(feature = "migration_ledger")]
+            migration_node_id: None,
+            #[cfg(feature = "migration_ledger")]
+            migration_sequence: 0,
         }
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    pub fn set_migration_node_id(&mut self, node_id: usize) {
+        self.migration_node_id = Some(node_id);
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    fn log_migration_reception(&mut self, packet: &Packet, now: f64) {
+        let Some(node_id) = self.migration_node_id else {
+            return;
+        };
+        let model_sequence = self.migration_sequence;
+        self.migration_sequence += 1;
+        CsvLogger::try_log_report(
+            Report::MigrationLedgerRow(MigrationLedgerRow {
+                time_ns: migration_time_to_ns(now),
+                model_kind: MigrationModelKind::Sink,
+                transition: MigrationTransitionKind::SinkReceive,
+                node_id: node_id as u64,
+                peer_node_id: None,
+                flow_id: packet.flow_id as u64,
+                packet_id: packet.packet_id as u64,
+                model_sequence,
+                size_bytes: packet.size as u64,
+                queue_occupancy_packets: None,
+                queue_occupancy_bytes: None,
+                departure_time_ns: None,
+            }),
+            ReportTiming::InProgress,
+        );
     }
 
     pub fn update_report_stats(&mut self, packet: &Packet, now: f64) {
@@ -100,6 +143,8 @@ impl BasicPacketSink {
 
         self.packet_statistics.update(&packet, now);
         self.update_report_stats(&packet, now);
+        #[cfg(feature = "migration_ledger")]
+        self.log_migration_reception(&packet, now);
 
         if packet.last_packet {
             self.notify_pending_sources(now).await;

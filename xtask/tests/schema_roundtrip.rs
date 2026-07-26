@@ -1,3 +1,6 @@
+use std::fs;
+
+use tempfile::TempDir;
 use xtask::schema::{
     SchemaError, parse_budget_manifest, parse_dependency_baseline, parse_evidence_manifest,
     parse_phase_metadata,
@@ -111,11 +114,28 @@ content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef012345678
 "#;
 
 const BUDGET: &str = r#"
-schema_version = 1
+schema_version = 2
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
 description = "Fixture budget"
+
+[platform]
+name = "fixture-host"
+cpu = "fixture-cpu"
+os_build = "fixture-os-build"
+toolchain = "rustc 1.96.0; cargo 1.96.0"
+
+[method]
+warmups = 1
+repetitions = 3
+statistic = "median"
+confidence_rule = "accept the median of three repetitions"
+
+[[corpus]]
+path = "configs/migration/fixture.toml"
+content_hash = "sha256:0fef1d82942d5aad23789ecc85955e882b15de59c2ede2cb1e1cf4b920e497c9"
+comparison_boundary = "exact-ledger"
 
 [[thresholds]]
 name = "runtime"
@@ -123,6 +143,10 @@ metric = "seconds"
 comparison = "<="
 value = 1.0
 unit = "s"
+
+[waiver]
+approving_role = "executor program owner"
+policy = "A waiver must be a reviewed manifest change made before the cutover decision."
 "#;
 
 const BASELINE: &str = r#"
@@ -176,10 +200,11 @@ fn evidence_schema_round_trips() {
 
 #[test]
 fn budget_schema_round_trips() {
-    let value = parse_budget_manifest(BUDGET).expect("valid budget");
+    let root = budget_repo();
+    let value = parse_budget_manifest(BUDGET, root.path()).expect("valid budget");
     let encoded = toml::to_string_pretty(&value).expect("serialize budget");
     assert_eq!(
-        parse_budget_manifest(&encoded).expect("parse budget"),
+        parse_budget_manifest(&encoded, root.path()).expect("parse budget"),
         value
     );
 }
@@ -196,11 +221,15 @@ fn baseline_schema_round_trips() {
 
 #[test]
 fn unknown_fields_are_rejected() {
+    let root = budget_repo();
     assert_malformed(parse_phase_metadata(&format!("unknown = true\n{PHASE}")));
     assert_malformed(parse_evidence_manifest(&format!(
         "unknown = true\n{EVIDENCE}"
     )));
-    assert_malformed(parse_budget_manifest(&format!("unknown = true\n{BUDGET}")));
+    assert_malformed(parse_budget_manifest(
+        &format!("unknown = true\n{BUDGET}"),
+        root.path(),
+    ));
     assert_malformed(parse_dependency_baseline(&format!(
         "unknown = true\n{BASELINE}"
     )));
@@ -208,6 +237,7 @@ fn unknown_fields_are_rejected() {
 
 #[test]
 fn missing_required_fields_are_rejected() {
+    let root = budget_repo();
     assert_malformed(parse_phase_metadata(
         &PHASE.replace("title = \"Fixture\"\n", ""),
     ));
@@ -216,6 +246,11 @@ fn missing_required_fields_are_rejected() {
     ));
     assert_malformed(parse_budget_manifest(
         &BUDGET.replace("description = \"Fixture budget\"\n", ""),
+        root.path(),
+    ));
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace("cpu = \"fixture-cpu\"\n", ""),
+        root.path(),
     ));
     assert_malformed(parse_dependency_baseline(
         &BASELINE.replace("allowed_licenses = [\"MIT\", \"Apache-2.0\"]\n", ""),
@@ -235,11 +270,14 @@ fn unsupported_schema_versions_are_distinct() {
             version,
         );
         assert_unsupported(
-            parse_budget_manifest(&with_version(BUDGET, version)),
+            parse_dependency_baseline(&with_version(BASELINE, version)),
             version,
         );
+    }
+    let root = budget_repo();
+    for version in [0, 1, 3] {
         assert_unsupported(
-            parse_dependency_baseline(&with_version(BASELINE, version)),
+            parse_budget_manifest(&with_version(BUDGET, version), root.path()),
             version,
         );
     }
@@ -324,14 +362,155 @@ fn evidence_without_artifacts_is_rejected_for_every_kind() {
 
 #[test]
 fn budget_without_thresholds_is_rejected() {
-    let without_thresholds = format!(
-        "{}thresholds = []\n",
-        BUDGET
-            .split("[[thresholds]]")
-            .next()
-            .expect("budget prefix")
+    let root = budget_repo();
+    let without_thresholds = BUDGET.replace(
+        r#"[[thresholds]]
+name = "runtime"
+metric = "seconds"
+comparison = "<="
+value = 1.0
+unit = "s"
+
+"#,
+        "",
     );
-    assert_malformed(parse_budget_manifest(&without_thresholds));
+    assert_malformed(parse_budget_manifest(&without_thresholds, root.path()));
+}
+
+#[test]
+fn empty_platform_fields_are_rejected() {
+    let root = budget_repo();
+    for (valid, empty) in [
+        ("name = \"fixture-host\"", "name = \"\""),
+        ("cpu = \"fixture-cpu\"", "cpu = \"\""),
+        ("os_build = \"fixture-os-build\"", "os_build = \"\""),
+        (
+            "toolchain = \"rustc 1.96.0; cargo 1.96.0\"",
+            "toolchain = \"\"",
+        ),
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(valid, empty),
+            root.path(),
+        ));
+    }
+}
+
+#[test]
+fn zero_repetitions_are_rejected() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace("repetitions = 3", "repetitions = 0"),
+        root.path(),
+    ));
+}
+
+#[test]
+fn empty_corpus_is_rejected() {
+    let root = budget_repo();
+    let empty = BUDGET
+        .replace(
+            "description = \"Fixture budget\"\n",
+            "description = \"Fixture budget\"\ncorpus = []\n",
+        )
+        .replace(
+            r#"[[corpus]]
+path = "configs/migration/fixture.toml"
+content_hash = "sha256:0fef1d82942d5aad23789ecc85955e882b15de59c2ede2cb1e1cf4b920e497c9"
+comparison_boundary = "exact-ledger"
+
+"#,
+            "",
+        );
+    assert_malformed(parse_budget_manifest(&empty, root.path()));
+}
+
+#[test]
+fn malformed_corpus_hash_is_rejected() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "sha256:0fef1d82942d5aad23789ecc85955e882b15de59c2ede2cb1e1cf4b920e497c9",
+            "sha256:not-a-hash",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn missing_corpus_path_is_rejected() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "configs/migration/fixture.toml",
+            "configs/migration/missing.toml",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn mismatched_corpus_content_is_rejected() {
+    let root = budget_repo();
+    fs::write(
+        root.path().join("configs/migration/fixture.toml"),
+        "changed corpus\n",
+    )
+    .expect("mutate corpus");
+    assert_malformed(parse_budget_manifest(BUDGET, root.path()));
+}
+
+#[test]
+fn invalid_comparison_boundary_is_rejected() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "comparison_boundary = \"exact-ledger\"",
+            "comparison_boundary = \"full\"",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn empty_waiver_role_is_rejected() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "approving_role = \"executor program owner\"",
+            "approving_role = \"\"",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn weakened_waiver_policy_is_rejected() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "A waiver must be a reviewed manifest change made before the cutover decision.",
+            "Waivers can be approved later.",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn empty_method_descriptions_are_rejected() {
+    let root = budget_repo();
+    for (valid, empty) in [
+        ("statistic = \"median\"", "statistic = \"\""),
+        (
+            "confidence_rule = \"accept the median of three repetitions\"",
+            "confidence_rule = \"\"",
+        ),
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(valid, empty),
+            root.path(),
+        ));
+    }
 }
 
 #[test]
@@ -364,11 +543,11 @@ fn legacy_archive_url_field_is_rejected() {
 }
 
 fn with_version(document: &str, version: i64) -> String {
-    document.replacen(
-        "schema_version = 1",
-        &format!("schema_version = {version}"),
-        1,
-    )
+    let declared = document
+        .lines()
+        .find(|line| line.starts_with("schema_version = "))
+        .expect("schema version");
+    document.replacen(declared, &format!("schema_version = {version}"), 1)
 }
 
 fn assert_malformed<T>(result: Result<T, SchemaError>) {
@@ -385,8 +564,19 @@ fn assert_unsupported<T>(result: Result<T, SchemaError>, expected: i64) {
     assert!(
         matches!(
             result,
-            Err(SchemaError::UnsupportedVersion { found }) if found == expected
+            Err(SchemaError::UnsupportedVersion { found, .. }) if found == expected
         ),
         "expected unsupported schema_version {expected}"
     );
+}
+
+fn budget_repo() -> TempDir {
+    let root = tempfile::tempdir().expect("create budget repository");
+    fs::create_dir_all(root.path().join("configs/migration")).expect("create corpus directory");
+    fs::write(
+        root.path().join("configs/migration/fixture.toml"),
+        "fixture corpus\n",
+    )
+    .expect("write corpus");
+    root
 }

@@ -55,7 +55,7 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         code: "DAYS-AUDIT-0003",
         slug: "phase-metadata-schema-version",
         severity: Severity::Error,
-        summary: "Unsupported `schema_version` in any of the three schemas",
+        summary: "Unsupported `schema_version` in any versioned schema",
     },
     DiagnosticDefinition {
         code: "DAYS-AUDIT-0004",

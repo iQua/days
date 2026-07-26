@@ -1,0 +1,65 @@
+schema_version = 2
+id = "days-executor-retirement"
+phase = "P01"
+frozen_at = "2026-07-26"
+description = """
+Premeasurement admission budget for replacing Nexosim with Days Executor. This
+manifest freezes the complete stage-1 corpus, named measurement host, sampling
+method, comparison thresholds, and waiver authority. It contains no measured
+result.
+"""
+
+[platform]
+name = "developer-apple-silicon-mac"
+cpu = "Apple M5 Max, 18 cores (6 Super and 12 Performance)"
+os_build = "macOS 27.0, build 26A5388g"
+toolchain = "rustc 1.96.0 (ac68faa20 2026-05-25); cargo 1.96.0 (30a34c682 2026-05-25); aarch64-apple-darwin"
+
+[method]
+warmups = 3
+repetitions = 15
+statistic = "Per-workload median wall time; corpus score is the geometric mean of candidate-to-best-exact-Nexosim-CPU throughput ratios."
+confidence_rule = "Use a deterministic 10000-resample paired bootstrap with a two-sided 95 percent confidence interval. Admission requires the geometric-mean lower bound to meet its threshold and each workload's median regression to meet its threshold."
+
+[[corpus]]
+path = "configs/migration/explicit.toml"
+content_hash = "sha256:fb71cc87dc7f0b3e3055ece1495f173f10156f9aecbd8345befcf4bbbbaffa03"
+comparison_boundary = "exact-ledger"
+
+[[corpus]]
+path = "configs/migration/torus.toml"
+content_hash = "sha256:b4ae6460ee3bfc84b23e28ce73e96bd6408d46eba04d69152a4479dfffb7bf0a"
+comparison_boundary = "exact-ledger"
+
+[[corpus]]
+path = "configs/migration/fattree.toml"
+content_hash = "sha256:21e7fe2749ea114a46f6caec65aa8a7413e41cb6e2a418a53dd4439aa430d38b"
+comparison_boundary = "exact-ledger"
+
+[[corpus]]
+path = "configs/tcp_simple.toml"
+content_hash = "sha256:28d6a1e4fbafc37eca41c499302b543077c25401610abec7df33f467366b4247"
+comparison_boundary = "terminal-observation"
+
+[[corpus]]
+path = "configs/ci/leanguard_dcqcn.toml"
+content_hash = "sha256:eda40aa3a9d6e49034072b67ac48d33c44c26157988401cd01d7b2ca1732a098"
+comparison_boundary = "terminal-observation"
+
+[[thresholds]]
+name = "geometric_mean_no_regression"
+metric = "Lower 95 percent confidence bound of the geometric mean of candidate-to-best-exact-Nexosim-CPU throughput ratios"
+comparison = ">="
+value = 1.0
+unit = "ratio"
+
+[[thresholds]]
+name = "per_workload_regression"
+metric = "Candidate median wall-time regression versus the best exact Nexosim CPU mode for each workload"
+comparison = "<="
+value = 20.0
+unit = "percent"
+
+[waiver]
+approving_role = "Days project maintainer with merge authority"
+policy = "A waiver must be a reviewed manifest change made before the cutover decision."

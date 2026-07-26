@@ -68,20 +68,14 @@ license = "AGPL-3.0-only"
         );
         write(&root, "audit/red.rs", "fn red_fixture() {}\n");
 
-        let budget = r#"schema_version = 1
-id = "p90-fixture-budget"
-phase = "P90"
-frozen_at = "2026-07-26"
-description = "Synthetic audit budget"
-
-[[thresholds]]
-name = "fixture"
-metric = "wall-time"
-comparison = "<="
-value = 1.0
-unit = "second"
-"#;
-        write(&root, "docs/days-executor/budgets/p90-fixture.toml", budget);
+        let corpus = "fixture corpus\n";
+        write(&root, "configs/migration/p90-fixture.toml", corpus);
+        let budget = budget_manifest(&sha256_bytes(corpus.as_bytes()));
+        write(
+            &root,
+            "docs/days-executor/budgets/p90-fixture.toml",
+            &budget,
+        );
         let budget_hash = sha256_bytes(budget.as_bytes());
 
         let golden = "fixture golden\n";
@@ -207,6 +201,45 @@ deterministic = true
 path = "docs/days-executor/budgets/p90-fixture.toml"
 content_hash = "{budget_hash}"
 frozen_at_commit = "{frozen_commit}"
+"#
+    )
+}
+
+fn budget_manifest(corpus_hash: &str) -> String {
+    format!(
+        r#"schema_version = 2
+id = "p90-fixture-budget"
+phase = "P90"
+frozen_at = "2026-07-26"
+description = "Synthetic audit budget"
+
+[platform]
+name = "fixture-host"
+cpu = "fixture-cpu"
+os_build = "fixture-os-build"
+toolchain = "rustc 1.96.0; cargo 1.96.0"
+
+[method]
+warmups = 1
+repetitions = 3
+statistic = "median"
+confidence_rule = "accept the median of three repetitions"
+
+[[corpus]]
+path = "configs/migration/p90-fixture.toml"
+content_hash = "{corpus_hash}"
+comparison_boundary = "exact-ledger"
+
+[[thresholds]]
+name = "fixture"
+metric = "wall-time"
+comparison = "<="
+value = 1.0
+unit = "second"
+
+[waiver]
+approving_role = "executor program owner"
+policy = "A waiver must be a reviewed manifest change made before the cutover decision."
 "#
     )
 }
@@ -799,7 +832,7 @@ fn malformed_budget_manifest_is_rejected() {
     write(
         fixture.root(),
         "docs/days-executor/budgets/p90-fixture.toml",
-        "schema_version = 1\n",
+        "schema_version = 2\n",
     );
     assert_code_message(&fixture.audit(), "DAYS-AUDIT-0011", "TOML");
 }
@@ -844,6 +877,38 @@ fn budget_recommitted_after_measurement_is_rejected() {
     });
     mutate(&fixture.measurement_path(), |value| {
         value.replace(&old_hash, &new_hash)
+    });
+
+    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "is not an ancestor");
+}
+
+#[test]
+fn retirement_budget_edited_after_measurement_is_rejected() {
+    let fixture = Fixture::new();
+    let budget_path = fixture
+        .root()
+        .join("docs/days-executor/budgets/p90-fixture.toml");
+    let old_hash = file_hash(&budget_path);
+    mutate(&budget_path, |value| {
+        value.replace("value = 1.0", "value = 1.1")
+    });
+    run(
+        fixture.root(),
+        &["add", "docs/days-executor/budgets/p90-fixture.toml"],
+    );
+    run(
+        fixture.root(),
+        &["commit", "-q", "-m", "Edit retirement threshold after run"],
+    );
+    let edited_hash = file_hash(&budget_path);
+    let edited_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
+    fixture.mutate_phase(|value| {
+        value
+            .replace(&old_hash, &edited_hash)
+            .replace(&fixture.frozen_commit, &edited_commit)
+    });
+    mutate(&fixture.measurement_path(), |value| {
+        value.replace(&old_hash, &edited_hash)
     });
 
     assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "is not an ancestor");
@@ -1138,16 +1203,40 @@ fn task_without_evidence_is_rejected() {
 #[test]
 fn budget_without_thresholds_is_rejected() {
     let fixture = Fixture::new();
+    let corpus_hash = sha256_bytes(b"fixture corpus\n");
     write(
         fixture.root(),
         "docs/days-executor/budgets/p90-fixture.toml",
-        r#"schema_version = 1
+        &format!(
+            r#"schema_version = 2
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
 description = "Synthetic audit budget"
 thresholds = []
-"#,
+
+[platform]
+name = "fixture-host"
+cpu = "fixture-cpu"
+os_build = "fixture-os-build"
+toolchain = "rustc 1.96.0; cargo 1.96.0"
+
+[method]
+warmups = 1
+repetitions = 3
+statistic = "median"
+confidence_rule = "accept the median of three repetitions"
+
+[[corpus]]
+path = "configs/migration/p90-fixture.toml"
+content_hash = "{corpus_hash}"
+comparison_boundary = "exact-ledger"
+
+[waiver]
+approving_role = "executor program owner"
+policy = "A waiver must be a reviewed manifest change made before the cutover decision."
+"#
+        ),
     );
     assert_code(&fixture.audit(), "DAYS-AUDIT-0011");
 }

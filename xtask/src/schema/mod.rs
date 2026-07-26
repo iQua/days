@@ -6,10 +6,14 @@ mod evidence;
 mod phase;
 
 use std::fmt;
-use std::path::{Component, Path};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 pub use baseline::{DependencyBaseline, DependencyKind, DirectDependency};
-pub use budget::{BudgetManifest, BudgetThreshold};
+pub use budget::{
+    BudgetCorpusEntry, BudgetManifest, BudgetMethod, BudgetPlatform, BudgetThreshold, BudgetWaiver,
+    ComparisonBoundary, REQUIRED_WAIVER_POLICY,
+};
 pub use evidence::{EvidenceArtifact, EvidenceKind, EvidenceManifest};
 pub use phase::{Backend, BudgetReference, PhaseMetadata, PhaseTask, RedTest, TestCommand};
 use serde::de::{self, Visitor};
@@ -18,13 +22,15 @@ use thiserror::Error;
 
 use crate::hash::is_sha256;
 
-/// The only schema version supported by this implementation.
+/// A schema version supported by this implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchemaVersion(u32);
 
 impl SchemaVersion {
     /// Schema version 1.
     pub const V1: Self = Self(1);
+    /// Schema version 2.
+    pub const V2: Self = Self(2);
 
     /// Returns the integer form stored in TOML.
     pub const fn get(self) -> u32 {
@@ -52,17 +58,17 @@ impl<'de> Deserialize<'de> for SchemaVersion {
             type Value = SchemaVersion;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("integer schema_version = 1")
+                formatter.write_str("integer schema_version = 1 or 2")
             }
 
             fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                if value == i64::from(SchemaVersion::V1.get()) {
-                    Ok(SchemaVersion::V1)
-                } else {
-                    Err(E::custom(format!("unsupported schema_version {value}")))
+                match value {
+                    value if value == i64::from(SchemaVersion::V1.get()) => Ok(SchemaVersion::V1),
+                    value if value == i64::from(SchemaVersion::V2.get()) => Ok(SchemaVersion::V2),
+                    _ => Err(E::custom(format!("unsupported schema_version {value}"))),
                 }
             }
 
@@ -70,10 +76,10 @@ impl<'de> Deserialize<'de> for SchemaVersion {
             where
                 E: de::Error,
             {
-                if value == u64::from(SchemaVersion::V1.get()) {
-                    Ok(SchemaVersion::V1)
-                } else {
-                    Err(E::custom(format!("unsupported schema_version {value}")))
+                match value {
+                    value if value == u64::from(SchemaVersion::V1.get()) => Ok(SchemaVersion::V1),
+                    value if value == u64::from(SchemaVersion::V2.get()) => Ok(SchemaVersion::V2),
+                    _ => Err(E::custom(format!("unsupported schema_version {value}"))),
                 }
             }
         }
@@ -86,10 +92,12 @@ impl<'de> Deserialize<'de> for SchemaVersion {
 #[derive(Debug, Error)]
 pub enum SchemaError {
     /// The document declares a schema version this implementation cannot read.
-    #[error("unsupported schema_version {found}; expected 1")]
+    #[error("unsupported schema_version {found}; expected {expected}")]
     UnsupportedVersion {
         /// The unsupported integer found in the document.
         found: i64,
+        /// The schema version accepted for this document kind.
+        expected: u32,
     },
     /// The document is not valid TOML or does not match the schema shape.
     #[error("malformed metadata: {0}")]
@@ -107,45 +115,54 @@ pub enum SchemaError {
 
 /// Parses and validates phase metadata.
 pub fn parse_phase_metadata(input: &str) -> Result<PhaseMetadata, SchemaError> {
-    parse_validated(input, PhaseMetadata::validate)
+    parse_validated(input, SchemaVersion::V1, PhaseMetadata::validate)
 }
 
 /// Parses and validates an evidence manifest.
 pub fn parse_evidence_manifest(input: &str) -> Result<EvidenceManifest, SchemaError> {
-    parse_validated(input, EvidenceManifest::validate)
+    parse_validated(input, SchemaVersion::V1, EvidenceManifest::validate)
 }
 
 /// Parses and validates a budget manifest.
-pub fn parse_budget_manifest(input: &str) -> Result<BudgetManifest, SchemaError> {
-    parse_validated(input, BudgetManifest::validate)
+pub fn parse_budget_manifest(input: &str, repo_root: &Path) -> Result<BudgetManifest, SchemaError> {
+    parse_validated(input, SchemaVersion::V2, |manifest| {
+        BudgetManifest::validate(manifest, repo_root)
+    })
 }
 
 /// Parses and validates the direct-dependency and license baseline.
 pub fn parse_dependency_baseline(input: &str) -> Result<DependencyBaseline, SchemaError> {
-    parse_validated(input, DependencyBaseline::validate)
+    parse_validated(input, SchemaVersion::V1, DependencyBaseline::validate)
 }
 
 fn parse_validated<T>(
     input: &str,
+    expected_version: SchemaVersion,
     validate: impl FnOnce(&T) -> Result<(), SchemaError>,
 ) -> Result<T, SchemaError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    reject_unsupported_version(input)?;
+    reject_unsupported_version(input, expected_version)?;
     let document = toml::from_str(input)?;
     validate(&document)?;
     Ok(document)
 }
 
-fn reject_unsupported_version(input: &str) -> Result<(), SchemaError> {
+fn reject_unsupported_version(
+    input: &str,
+    expected_version: SchemaVersion,
+) -> Result<(), SchemaError> {
     let document: toml::Value = toml::from_str(input)?;
     if let Some(version) = document
         .get("schema_version")
         .and_then(toml::Value::as_integer)
     {
-        if version != i64::from(SchemaVersion::V1.get()) {
-            return Err(SchemaError::UnsupportedVersion { found: version });
+        if version != i64::from(expected_version.get()) {
+            return Err(SchemaError::UnsupportedVersion {
+                found: version,
+                expected: expected_version.get(),
+            });
         }
     }
     Ok(())
@@ -203,6 +220,38 @@ fn validate_repo_path(field: &str, value: &str) -> Result<(), SchemaError> {
         ));
     }
     Ok(())
+}
+
+fn validate_repo_file(repo_root: &Path, field: &str, value: &str) -> Result<PathBuf, SchemaError> {
+    let canonical_root = repo_root.canonicalize().map_err(|error| {
+        invalid(
+            field,
+            &format!(
+                "cannot resolve repository root `{}`: {error}",
+                repo_root.display()
+            ),
+        )
+    })?;
+    let candidate = repo_root.join(value);
+    let canonical = candidate.canonicalize().map_err(|error| {
+        invalid(
+            field,
+            &format!("must name an existing repository file: {error}"),
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(invalid(field, "must resolve inside the repository"));
+    }
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        invalid(
+            field,
+            &format!("must name a readable repository file: {error}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid(field, "must name a regular repository file"));
+    }
+    Ok(canonical)
 }
 
 fn invalid(field: &str, detail: &str) -> SchemaError {
