@@ -1,0 +1,121 @@
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(about = "Repository tooling for the Days Executor program")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Audit and reproduce every declared phase.
+    AllPhases {
+        /// Repository root; discovered by walking upward when omitted.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Permit one network-enabled cargo metadata retry per phase audit.
+        #[arg(long)]
+        allow_network: bool,
+    },
+    /// Audit one phase's metadata, evidence, and repository policy.
+    PhaseAudit {
+        /// Phase identifier such as P01.
+        phase: String,
+        /// Repository root; discovered by walking upward when omitted.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Permit one network-enabled cargo metadata retry.
+        #[arg(long)]
+        allow_network: bool,
+    },
+    /// Reproduce the commands declared for the host platform.
+    Reproduce {
+        /// Phase identifier such as P01.
+        #[arg(long)]
+        phase: String,
+        /// Repository root; discovered by walking upward when omitted.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+    },
+    /// Print or rewrite the direct-dependency and license baseline.
+    DependencyBaseline {
+        /// Rewrite docs/days-executor/dependency-baseline.toml.
+        #[arg(long)]
+        write: bool,
+        /// Repository root; discovered by walking upward when omitted.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+    },
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(error) => {
+            eprintln!("xtask: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
+    let current = std::env::current_dir()?;
+    match cli.command {
+        Command::AllPhases {
+            repo_root,
+            allow_network,
+        } => {
+            let root = repo_root.map_or_else(|| xtask::discover_repo_root(&current), Ok)?;
+            let mut passed = true;
+            for phase in xtask::audit::phase_ids(&root)? {
+                let audit = xtask::audit::phase_audit(&root, &phase, allow_network);
+                for diagnostic in &audit.diagnostics {
+                    println!("{diagnostic}");
+                }
+                passed &= !audit.has_errors();
+
+                let reproduction = xtask::reproduce::reproduce(&root, &phase);
+                for diagnostic in &reproduction.diagnostics {
+                    println!("{diagnostic}");
+                }
+                passed &= !reproduction.has_errors();
+            }
+            Ok(passed)
+        }
+        Command::PhaseAudit {
+            phase,
+            repo_root,
+            allow_network,
+        } => {
+            let root = repo_root.map_or_else(|| xtask::discover_repo_root(&current), Ok)?;
+            let report = xtask::audit::phase_audit(&root, &phase, allow_network);
+            for diagnostic in &report.diagnostics {
+                println!("{diagnostic}");
+            }
+            Ok(!report.has_errors())
+        }
+        Command::Reproduce { phase, repo_root } => {
+            let root = repo_root.map_or_else(|| xtask::discover_repo_root(&current), Ok)?;
+            let report = xtask::reproduce::reproduce(&root, &phase);
+            for diagnostic in &report.diagnostics {
+                println!("{diagnostic}");
+            }
+            Ok(!report.has_errors())
+        }
+        Command::DependencyBaseline { write, repo_root } => {
+            let root = repo_root.map_or_else(|| xtask::discover_repo_root(&current), Ok)?;
+            let rendered = xtask::dependency_baseline::render(&root)?;
+            if write {
+                xtask::dependency_baseline::write(&root, &rendered)?;
+            } else {
+                print!("{rendered}");
+            }
+            Ok(true)
+        }
+    }
+}

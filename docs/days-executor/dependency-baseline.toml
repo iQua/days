@@ -1,0 +1,241 @@
+schema_version = 1
+allowed_licenses = [
+    "(MIT OR Apache-2.0) AND Unicode-3.0",
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 OR BSL-1.0",
+    "Apache-2.0 OR MIT",
+    "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+    "Apache-2.0/MIT",
+    "MIT",
+    "MIT OR Apache-2.0",
+    "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+    "MIT/Apache-2.0",
+    "Unlicense OR MIT",
+    "Unlicense/MIT",
+    "Zlib",
+]
+
+[[direct_dependencies]]
+package = "days"
+name = "assert_cmd"
+version = "2"
+source = "crates.io"
+kind = "dev"
+
+[[direct_dependencies]]
+package = "days"
+name = "clap"
+version = "4.5"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "csv"
+version = "1.4"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "env_logger"
+version = "0.11"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "futures"
+version = "0.3"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "futures-executor"
+version = "0.3"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "indicatif"
+version = "0.18"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "indicatif-log-bridge"
+version = "0.2"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "log"
+version = "0.4"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "nexosim"
+version = "1.0.0"
+source = "path:crates/nexosim"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "num_cpus"
+version = "1.17"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "once_cell"
+version = "1"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "parking_lot"
+version = "0.12"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "petgraph"
+version = "0.8"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "predicates"
+version = "3"
+source = "crates.io"
+kind = "dev"
+
+[[direct_dependencies]]
+package = "days"
+name = "rand"
+version = "0.10"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "rand_distr"
+version = "0.6"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "serde"
+version = "1.0"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "serde_json"
+version = "1.0"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "tachyonix"
+version = "0.3"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "tempfile"
+version = "3"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "thiserror"
+version = "2"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "toml"
+version = "1"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "tracing"
+version = "0.1"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "days"
+name = "tracing-subscriber"
+version = "0.3"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "clap"
+version = "4.5"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "serde"
+version = "1.0"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "serde_json"
+version = "1.0"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "sha2"
+version = "0.10"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "tempfile"
+version = "3"
+source = "crates.io"
+kind = "dev"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "thiserror"
+version = "2"
+source = "crates.io"
+kind = "normal"
+
+[[direct_dependencies]]
+package = "xtask"
+name = "toml"
+version = "1"
+source = "crates.io"
+kind = "normal"

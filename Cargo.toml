@@ -1,3 +1,7 @@
+[workspace]
+members = ["xtask"]
+resolver = "2"
+
 [package]
 name = "days"
 version = "0.4.3"

@@ -1,0 +1,18 @@
+schema_version = 1
+id = "P01-T0-evidence"
+phase = "P01"
+task = "T0"
+kind = "golden"
+description = "Compiled diagnostic registry and T0 mutation corpus"
+command = ["cargo", "test", "--package", "xtask"]
+tool_version = "cargo 1.96.0"
+schema = "days-executor/evidence/v1"
+tags = []
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/diagnostics.toml"
+content_hash = "sha256:528350aa4dae96ecd95b98abb4dd052634c7f8ed42fee5e77d7ef7709656d964"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/mutation-corpus.toml"
+content_hash = "sha256:91b3814035c6dd21bc269123b3c1f024f897900d0e48ac999cee7372af2c3019"
