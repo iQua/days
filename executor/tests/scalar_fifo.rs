@@ -70,11 +70,11 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             },
             PacketDescriptor {
                 id: P2,
-                size_bytes: 3,
+                size_bytes: 2,
             },
             PacketDescriptor {
                 id: P3,
-                size_bytes: 1,
+                size_bytes: 2,
             },
         ],
         links: vec![LinkDescriptor {
@@ -111,19 +111,26 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
           serialization = ceil(8*6*10^9 / 3*10^9) = 16 ns
           start 8, departure 24, arrival 24+2 = 26
 
-      P2: 3 B arrives at t=9, after P1 started, so it cannot displace P1
-          serialization = 8 ns
-          start 24, departure 32, arrival 32+2 = 34
+      P2: 2 B arrives at t=9, after P1 started, so it cannot displace P1
+          serialization = ceil(8*2*10^9 / 3*10^9) = 6 ns
+          start 24, departure 30, arrival 30+2 = 32
 
-      P3: 1 B arrives at t=10
-          serialization = ceil(8*1*10^9 / 3*10^9) = 3 ns
-          start 32, departure 35, arrival 35+2 = 37
+      P3: 2 B arrives at t=10
+          serialization = 6 ns
+          start 30, departure 36, arrival 36+2 = 38
 
-    Thus service starts are [0, 8, 24, 32]. P1's source arrival at t=2 and
+    Thus service starts are [0, 8, 24, 30]. P1's source arrival at t=2 and
     P1's remote arrival at t=26 both land strictly between service starts.
     The switch queue has capacity two: P0 and P1 are admitted, then P2 is
-    TailDropped at t=34. The exclusive stop is t=37, leaving only P3's
-    RemoteArrival at the boundary.
+    TailDropped at t=32. The exclusive stop is t=37, leaving only P3's
+    RemoteArrival at t=38.
+
+    A regressed eager selector at t=24 would reserve P2 and P3 together:
+      P2 cumulative deadline = 24 + ceil(8*2*10^9 / 3*10^9) = 30
+      P3 cumulative deadline = 24 + ceil(8*4*10^9 / 3*10^9) = 35
+    Correct one-at-a-time selection instead rounds each 2 B interval to 6 ns,
+    so P3 departs at 30+6 = 36. The old 3 B/1 B pair did not discriminate:
+    its independent 8+3 ns equalled its cumulative ceil(8*4/3)=11 ns.
 
     Initial origin sequences are 0..3. Deterministic child emission assigns:
       ready0=4, complete0=5, remote0=6,
@@ -168,11 +175,11 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             },
             PacketDeparture {
                 payload: P2,
-                time_ns: 32,
+                time_ns: 30,
             },
             PacketDeparture {
                 payload: P3,
-                time_ns: 35,
+                time_ns: 36,
             },
         ]
     );
@@ -191,7 +198,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             },
             PacketArrivalObservation {
                 payload: P2,
-                time_ns: 34,
+                time_ns: 32,
                 disposition: ArrivalDisposition::Dropped,
             },
         ]
@@ -200,7 +207,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
         result.pending_events,
         vec![Event {
             key: EventKey {
-                time_ns: 37,
+                time_ns: 38,
                 phase: event_phase(EventKind::RemoteArrival),
                 origin_node: HOST,
                 origin_seq: 15,
