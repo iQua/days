@@ -44,6 +44,78 @@ fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
 }
 
 #[test]
+fn configured_duration_stops_packets_that_start_after_the_boundary() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "stop-time.toml",
+        r#"
+seed = 1
+duration = 1.0
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 8_000_000_000
+capacity = 1
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+initial_delay = 2.0
+size = 1
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+"#,
+    );
+
+    let image = compile_config(path).expect("supported scenario should lower");
+    assert_eq!(image.stop_time_ns, 1_000_000_000);
+    validate(&image, Backend::Scalar).expect("lowered image should validate");
+    let result = run_scalar(&image, u64::MAX).expect("lowered image should run");
+
+    assert_eq!(
+        result
+            .arrivals
+            .iter()
+            .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
+            .count(),
+        0,
+        "a packet starting after the configured duration must not be delivered"
+    );
+}
+
+#[test]
+fn fractional_nanosecond_simulation_duration_is_rejected() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "fractional-duration.toml",
+        r#"
+seed = 1
+duration = 0.0000000015
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 8_000
+capacity = 1
+discipline = "FIFO"
+drop = "TailDrop"
+"#,
+    );
+
+    let error = compile_config(path).expect_err("fractional-nanosecond duration should reject");
+    assert_eq!(
+        error.to_string(),
+        "unsupported simulation duration `0.0000000015`; Days executor v1 requires an integer number of nanoseconds"
+    );
+}
+
+#[test]
 fn reordered_source_collections_lower_to_byte_identical_mixed_images() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let first_path = write_config(
@@ -463,6 +535,7 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     assert_eq!(first.flows.len(), 8);
     assert_eq!(first.packets.len(), 12_000);
     assert_eq!(first.initial_events.len(), 12_000);
+    assert_eq!(first.stop_time_ns, 1_500_000_000_000);
     assert_eq!(
         first
             .switch_states
@@ -484,6 +557,22 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     );
     validate(&first, Backend::Cpu { workers: 4 })
         .expect("zero propagation with positive serialization is parallel-safe");
+    validate(&first, Backend::Scalar).expect("baseline image should validate for scalar execution");
+    let result = run_scalar(&first, u64::MAX).expect("baseline image should run to completion");
+    assert!(
+        result
+            .pending_events
+            .iter()
+            .all(|event| event.key.time_ns >= first.stop_time_ns),
+        "baseline execution should drain every event before its configured duration"
+    );
+    assert!(
+        result
+            .host_states
+            .iter()
+            .any(|state| state.received_packets > 0),
+        "baseline execution should deliver traffic before its configured duration"
+    );
 }
 
 #[test]

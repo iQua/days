@@ -12,6 +12,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
     let switch = NodeId(20);
     let link = LinkId(30);
     let image = SimulationImage {
+        stop_time_ns: u64::MAX,
         nodes: vec![
             NodeDescriptor {
                 id: host,

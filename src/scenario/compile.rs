@@ -48,6 +48,7 @@ impl From<IdError> for CompileError {
 #[derive(Debug, Deserialize)]
 struct SourceConfig {
     seed: Option<u64>,
+    duration: Option<f64>,
     switch: SourceSwitch,
     link: Option<SourceLink>,
     time_quantum_ns: Option<u64>,
@@ -199,6 +200,7 @@ pub fn compile_config(path: impl AsRef<Path>) -> Result<SimulationImage, Compile
 
 struct SupportedModel {
     seed: u64,
+    stop_time_ns: u64,
     rate_bps: u64,
     queue_capacity_packets: u64,
     propagation_ns: u64,
@@ -211,6 +213,7 @@ impl SupportedModel {
         let seed = source
             .seed
             .ok_or_else(|| CompileError::Invalid("`seed` is missing".to_owned()))?;
+        let stop_time_ns = seconds_to_ns(source.duration.unwrap_or(1500.0), "simulation duration")?;
         let rate_bps = parse_rate(source.switch.port_rate.as_ref())?;
 
         let discipline = source
@@ -289,6 +292,7 @@ impl SupportedModel {
 
         Ok(Self {
             seed,
+            stop_time_ns,
             rate_bps,
             queue_capacity_packets: source.switch.capacity,
             propagation_ns: link.propagation_ns.unwrap_or(0),
@@ -882,6 +886,7 @@ fn lower(
         .collect::<Result<Vec<_>, CompileError>>()?;
 
     Ok(SimulationImage {
+        stop_time_ns: model.stop_time_ns,
         nodes,
         host_states,
         switch_states,

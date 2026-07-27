@@ -17,6 +17,7 @@ const PACKET: PayloadId = PayloadId(0);
 
 fn valid_image() -> SimulationImage {
     SimulationImage {
+        stop_time_ns: u64::MAX,
         nodes: vec![
             NodeDescriptor {
                 id: SOURCE,

@@ -36,6 +36,7 @@ fn source_arrival(time_ns: u64, origin_seq: u64, payload: PayloadId) -> Event {
 
 fn image() -> SimulationImage {
     SimulationImage {
+        stop_time_ns: u64::MAX,
         nodes: vec![
             NodeDescriptor {
                 id: SOURCE,

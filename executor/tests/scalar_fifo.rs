@@ -33,6 +33,7 @@ fn source_arrival(time_ns: u64, origin_seq: u64, payload: PayloadId) -> Event {
 #[test]
 fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
     let image = SimulationImage {
+        stop_time_ns: u64::MAX,
         nodes: vec![
             NodeDescriptor {
                 id: HOST,

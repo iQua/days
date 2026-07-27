@@ -190,9 +190,11 @@ impl From<TimeError> for ExecutionError {
     }
 }
 
-/// Runs the canonical scalar executor up to, but not including, `stop_time_ns`.
+/// Runs the canonical scalar executor up to the earlier exclusive boundary supplied by the image
+/// or `stop_time_ns`.
 pub fn run_scalar(image: &SimulationImage, stop_time_ns: u64) -> Result<RunResult, ExecutionError> {
-    ScalarExecutor::new(image)?.run(stop_time_ns)
+    let effective_stop_time_ns = stop_time_ns.min(image.stop_time_ns);
+    ScalarExecutor::new(image)?.run(effective_stop_time_ns)
 }
 
 struct ScalarExecutor<'image> {
