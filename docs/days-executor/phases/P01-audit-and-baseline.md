@@ -119,11 +119,12 @@ threshold. P23 selects the faster median Nexosim mode per workload, with ST as
 the exact-tie winner, before applying the frozen admission statistic. The
 budget contains no measured value.
 
-The stage-2a amendment remains intentionally absent from the phase metadata's
-`[[budgets]]` array. No `frozen_at_commit`, `run_commit`, or `days_gpu_commit`
-exists yet. The owner commits this amendment as F2. P01 then records baselines
-at F2 in commit A, and commit B adds the budget, measurement, and archive
-bindings. This sequence preserves T0's fail-closed ancestry checks.
+The owner froze the final budget and corpus at commit
+`3c13ad4c8e32b7f8affad7e991c1a46586125fe7` (F3). Commit
+`6b4b8a6ea1e795b7fda50cb4910d9d00dc6493ca` (A), a strict descendant of F3,
+contains the baseline records. The phase metadata binds the F3 budget bytes,
+and `nexosim-baseline-measurement.toml` binds the seven commit-A artifacts.
+This ordering satisfies T0's strict-ancestry check.
 
 ### Corpus and comparison boundaries
 
@@ -193,10 +194,50 @@ flush. The existing elapsed log remains unchanged. The runner measures
 `end_to_end` around the complete child process and records both values.
 
 Calibration was authorized but not used for this committed benchmark corpus.
-No timing selected corpus membership or changed a config value. The F2 runner
-will enforce the frozen 5 ms sample floor; its observed margin is not yet
-measured. The complete paths, hashes, commands, roles, modes, and boundaries
-are in `docs/days-executor/evidence/P01/retirement-corpus.toml`.
+No timing selected corpus membership or changed a config value. The F3 runner
+enforced the frozen 5 ms sample floor. The smallest recorded primary sample was
+20.440958 ms, so no sample failed the floor. The complete paths, hashes,
+commands, roles, modes, and boundaries are in
+`docs/days-executor/evidence/P01/retirement-corpus.toml`.
+
+### Measured Nexosim reference
+
+P01 ran three unrecorded warmup rounds and fifteen recorded rounds in manifest
+order. Timed runs used `cargo build --locked --release --bin days` without
+`migration_ledger`. Correctness runs used the diagnostic feature and recorded
+no wall-time result. Every performance sample reached 1500.0 simulated seconds
+and recorded one effective thread for ST or eighteen for MT.
+
+The table reports seconds as median `[minimum, maximum]` across the fifteen
+recorded samples:
+
+| Workload | Mode | `sim_execution` | `end_to_end` |
+| --- | --- | ---: | ---: |
+| k4/f8 | ST | 0.020637416 [0.020440958, 0.021007375] | 0.024702500 [0.024295000, 0.025419042] |
+| k4/f8 | MT | 0.151459833 [0.149931250, 0.160485875] | 0.155970250 [0.154498250, 0.164683541] |
+| k8/f64 | ST | 0.202448375 [0.196561625, 0.204402375] | 0.208347959 [0.200876084, 0.210197792] |
+| k8/f64 | MT | 0.434011542 [0.425276541, 0.474826250] | 0.440528500 [0.431730334, 0.481116500] |
+| k16/f512 | ST | 1.880578541 [1.755074542, 2.010002584] | 1.905630292 [1.778508125, 2.035526250] |
+| k16/f512 | MT | 1.945811083 [1.933370875, 2.242102334] | 1.976358750 [1.963363459, 2.273613208] |
+| k32/f4096 | ST | 17.386321625 [15.331194875, 19.189513625] | 18.615065084 [16.517648833, 20.418935791] |
+| k32/f4096 | MT | 7.994751958 [7.333259875, 9.334476458] | 9.262936375 [8.557429875, 10.604367791] |
+
+The primary medians put MT 7.3 times behind ST at k4/f8 and 2.1 times behind
+at k8/f64. The modes are close at k16/f512, where ST has the lower median. MT
+becomes 2.2 times faster at k32/f4096. The crossover therefore lies between
+k16/f512 and k32/f4096.
+
+Applying the frozen P23 rule to these reference medians selects ST for k4/f8,
+k8/f64, and k16/f512, and MT for k32/f4096. The result confirms why the rule
+selects a mode per workload: assuming MT wins would choose the slower reference
+for three of four workloads. P01 records this implication but evaluates no
+admission threshold.
+
+The checked-in samples, summary, and five terminal digests total less than
+24 KB. The generated transition ledgers range from 4.5 KB to 78.6 KB, and the
+captured process output is 155 KB. None warrants a separate `days-gpu` archive,
+so P01 declares no archive evidence and keeps one content-addressed source for
+the measured records.
 
 ### RED prerequisite and coverage boundary
 
@@ -297,10 +338,9 @@ for this fixture.
 Small characterization tables, a ledger sample, a complete small terminal
 digest, feature-off aggregate goldens, the complete 13-entry corpus inventory,
 and the budget live under `docs/days-executor/evidence/P01/` and are
-checksummed by `t1-evidence.toml`. The superseded uncommitted `days-gpu`
-evidence tree is absent. A later stage regenerates raw artifacts and adds the
-formal archive and measurement manifests after both repositories contain
-immutable commits.
+checksummed by `t1-evidence.toml`. The measurement manifest cites the seven
+baseline artifacts at commit A and the budget frozen at F3. P01 has no archive
+manifest because the raw outputs did not warrant a separate repository.
 
 ### Migration and exclusions
 

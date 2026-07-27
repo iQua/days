@@ -1,0 +1,45 @@
+schema_version = 1
+id = "P01-T1-nexosim-baseline"
+phase = "P01"
+task = "T1"
+kind = "measurement"
+description = "Absolute Nexosim ST and MT timing samples plus untimed correctness terminal digests collected under the frozen retirement method"
+command = ["/private/tmp/t1_f3_runner", "finalize"]
+tool_version = "t1-f3-runner/v1 compiled with rustc 1.96.0 (ac68faa20 2026-05-25)"
+schema = "days-executor/nexosim-baseline/v1"
+tags = [
+    "absolute-nexosim-baseline",
+    "frozen-method",
+    "terminal-digest",
+]
+budget = "docs/days-executor/budgets/retirement-budget.toml"
+budget_hash = "sha256:e22a9e8ddcfe1af20c9fac486341ef12aca3016048f4f343ff2752b4bec9ed7c"
+run_commit = "6b4b8a6ea1e795b7fda50cb4910d9d00dc6493ca"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/nexosim-baseline-samples.csv"
+content_hash = "sha256:730607357ac998b1cf6ee6e03c0878e7c776b2d1517d99e53e72bc7b7ffa872c"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/nexosim-baseline-summary.csv"
+content_hash = "sha256:d253f88f7fa4f87527056ce9ae39b8e6ff14a69d7a4ab06c5dab00431265a2dd"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/migration-explicit-terminal-digest.csv"
+content_hash = "sha256:ed4f4e2da2e81a9c9a9e5949fa442e7fcfbe1249f9916dd905e5b24a91d9f9ff"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/migration-torus-terminal-digest.csv"
+content_hash = "sha256:c13c1b4083d008f920ededcd1b26fab36791c22d30e723b06c8ce0f060727866"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/migration-fattree-k4-terminal-digest.csv"
+content_hash = "sha256:19ff23aca37de678f28b6384f866e7c5fea461ffc1b559a2fac6daf071fadaaa"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/tcp-simple-terminal-digest.csv"
+content_hash = "sha256:8ab82b937a1f36ab9d7d203e5468a14fc921d79490a0566c168ad58e72b78593"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines/leanguard-dcqcn-terminal-digest.csv"
+content_hash = "sha256:a48193f843ab60af9b3bc7f778c7332fd6193a28ac29434d9c2caba2c8bc6585"

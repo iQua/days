@@ -16,13 +16,17 @@ api_changes = [
 trust_boundary_change = false
 proof_changing = false
 out_of_scope = [
-    "Stage-2 budget, measurement, and archive commit bindings",
     "Scenario-local semantic tuple IDs",
     "creating the executor directory",
     "Lean toolchain invocation",
     "GPU backends",
 ]
 selectable_backends = []
+
+[[budgets]]
+path = "docs/days-executor/budgets/retirement-budget.toml"
+content_hash = "sha256:e22a9e8ddcfe1af20c9fac486341ef12aca3016048f4f343ff2752b4bec9ed7c"
+frozen_at_commit = "3c13ad4c8e32b7f8affad7e991c1a46586125fe7"
 
 [[tasks]]
 id = "T0"
@@ -38,7 +42,10 @@ name = "malformed_phase_metadata_is_rejected"
 id = "T1"
 title = "Freeze the Nexosim retirement baseline"
 depends_on = ["T0"]
-evidence = ["docs/days-executor/evidence/P01/t1-evidence.toml"]
+evidence = [
+    "docs/days-executor/evidence/P01/t1-evidence.toml",
+    "docs/days-executor/evidence/P01/nexosim-baseline-measurement.toml",
+]
 
 [tasks.red_test]
 path = "tests/migration_ledger.rs"
