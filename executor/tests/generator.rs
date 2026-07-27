@@ -129,6 +129,32 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
     }
 }
 
+fn feedback_image() -> SimulationImage {
+    let mut image = image(GeneratorStatus::Blocked, 2, 0);
+    image.initial_packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: 1,
+        kind: days_executor::PacketKind::Feedback,
+    });
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 1,
+            phase: event_phase(EventKind::RemoteArrival),
+            origin_node: SINK,
+            origin_seq: 0,
+        },
+        target: SOURCE,
+        kind: EventKind::RemoteArrival,
+        payload: PayloadId(1),
+    });
+    image
+        .channels
+        .push(RemoteChannel::for_packet_link(image.links[1], 1).expect("reverse delay must fit"));
+    image.host_states[1].next_origin_seq = 1;
+    image
+}
+
 #[test]
 fn constant_generator_allocates_unique_node_local_payloads() {
     assert_ne!(
@@ -202,28 +228,7 @@ fn blocked_generator_is_valid_without_a_scheduled_event() {
 
 #[test]
 fn ordinary_remote_arrival_routes_feedback_to_the_source_generator() {
-    let mut image = image(GeneratorStatus::Blocked, 2, 0);
-    image.initial_packets.push(PacketDescriptor {
-        id: PayloadId(1),
-        flow: FLOW,
-        size_bytes: 1,
-        kind: days_executor::PacketKind::Feedback,
-    });
-    image.initial_events.push(Event {
-        key: EventKey {
-            time_ns: 1,
-            phase: event_phase(EventKind::RemoteArrival),
-            origin_node: SINK,
-            origin_seq: 0,
-        },
-        target: SOURCE,
-        kind: EventKind::RemoteArrival,
-        payload: PayloadId(1),
-    });
-    image
-        .channels
-        .push(RemoteChannel::for_packet_link(image.links[1], 1).expect("reverse delay must fit"));
-    image.host_states[1].next_origin_seq = 1;
+    let image = feedback_image();
 
     validate(&image, Backend::Scalar).expect("feedback must be representable in an accepted image");
     let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
@@ -237,6 +242,65 @@ fn ordinary_remote_arrival_routes_feedback_to_the_source_generator() {
     assert_eq!(result.summary.feedback_packets, 1);
     assert_eq!(result.summary.sourced_packets, 0);
     assert_eq!(result.arrivals[0].disposition, ArrivalDisposition::Feedback);
+}
+
+#[test]
+fn scheduled_generator_payload_reuse_is_rejected() {
+    let mut image = image(GeneratorStatus::Scheduled, 3, 2);
+    let generator = &mut image.host_states[0].generators[0];
+    generator.packets_emitted = 1;
+    generator.bytes_emitted = 1;
+    generator.next_emission.departure_time_ns = 2;
+    image.initial_events[0].key.time_ns = 2;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("a consumed payload identity must not be scheduled again");
+    assert_eq!(
+        error.to_string(),
+        "flow FlowId(0) scheduled payload PayloadId(0) sequence 0 was already consumed; generator has emitted 1 packets"
+    );
+}
+
+#[test]
+fn feedback_without_a_source_generator_is_rejected() {
+    let mut image = feedback_image();
+    image.host_states[0].generators.clear();
+    image.channels.remove(0);
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("feedback without source-owned generator state must reject");
+    assert_eq!(
+        error.to_string(),
+        "feedback packet PayloadId(1) for flow FlowId(0) has no generator at source node NodeId(0)"
+    );
+}
+
+#[test]
+fn pending_feedback_arrivals_are_reserved_against_generator_state() {
+    let mut image = feedback_image();
+    image.host_states[0].generators[0].feedback.arrivals = u64::MAX;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("pending feedback must not overflow generator state");
+    assert_eq!(
+        error.to_string(),
+        "node NodeId(0) flow FlowId(0) generator feedback arrivals 18446744073709551615 overflows with 1 pending feedback arrivals"
+    );
+}
+
+#[test]
+fn preloaded_data_payload_must_have_source_provenance() {
+    let mut image = image(GeneratorStatus::Scheduled, 1, 1);
+    image.host_states[0].generators.clear();
+    image.initial_packets[0].id = PayloadId(1);
+    image.initial_events[0].payload = PayloadId(1);
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("preloaded data must use its source node payload residue");
+    assert_eq!(
+        error.to_string(),
+        "data packet PayloadId(1) for flow FlowId(0) is not allocated by source node NodeId(0)"
+    );
 }
 
 #[test]

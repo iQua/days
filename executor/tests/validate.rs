@@ -402,7 +402,7 @@ fn channels_must_match_emissions_and_certified_bounds() {
 fn channel_bounds_use_the_minimum_delay_across_packets_on_the_link() {
     let mut image = valid_image();
     image.initial_packets.push(PacketDescriptor {
-        id: PayloadId(1),
+        id: PayloadId(3),
         flow: FLOW,
         size_bytes: 100,
         kind: days_executor::PacketKind::Data,
@@ -449,7 +449,7 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
         reverse_route: vec![],
     });
     image.initial_packets.push(PacketDescriptor {
-        id: PayloadId(1),
+        id: PayloadId(2),
         flow: FlowId(1),
         size_bytes: 1,
         kind: days_executor::PacketKind::Data,
@@ -479,7 +479,7 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
         },
         target: SINK,
         kind: EventKind::PacketArrival,
-        payload: PayloadId(1),
+        payload: PayloadId(2),
     });
     image.host_states[1].next_origin_seq = 1;
 

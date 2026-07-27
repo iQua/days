@@ -567,7 +567,14 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                         flow.id
                     )));
                 }
-                validate_scheduled_payload_sequence(image, owner, state, packet.id, flow.id)?;
+                validate_scheduled_payload_sequence(
+                    image,
+                    owner,
+                    state,
+                    packet.id,
+                    flow.id,
+                    generator.packets_emitted,
+                )?;
             } else if generator.next_emission.status == GeneratorStatus::Stopped {
                 let expected_departure = constant
                     .interval_ns
@@ -653,6 +660,7 @@ fn validate_scheduled_payload_sequence(
     state: &crate::HostState,
     payload: PayloadId,
     flow: crate::FlowId,
+    packets_emitted: u64,
 ) -> Result<(), ValidationError> {
     let node_count = u64::try_from(image.nodes.len()).unwrap_or(u64::MAX);
     let offset = payload.0.checked_sub(owner.id.0).ok_or_else(|| {
@@ -672,6 +680,11 @@ fn validate_scheduled_payload_sequence(
         return Err(ValidationError::new(format!(
             "flow {flow:?} scheduled payload {payload:?} sequence {sequence} is not below node {:?} next payload sequence {}",
             owner.id, state.next_payload_seq
+        )));
+    }
+    if sequence < packets_emitted {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} scheduled payload {payload:?} sequence {sequence} was already consumed; generator has emitted {packets_emitted} packets"
         )));
     }
     Ok(())
@@ -694,6 +707,21 @@ fn validate_packets_and_derive_delays(
                 packet.id, packet.flow
             ))
         })?;
+        if packet.kind == PacketKind::Feedback {
+            let source =
+                node(image, flow.source).expect("flow validation established the source node");
+            let state = &image.host_states[source.state_slot as usize];
+            if !state
+                .generators
+                .iter()
+                .any(|generator| generator.flow == flow.id)
+            {
+                return Err(ValidationError::new(format!(
+                    "feedback packet {:?} for flow {:?} has no generator at source node {:?}",
+                    packet.id, flow.id, flow.source
+                )));
+            }
+        }
         let mut cumulative_delay = 0_u64;
         for link_id in packet_route(flow, packet.kind) {
             let link = link(image, *link_id).expect("validated flow route names an existing link");
@@ -1555,6 +1583,15 @@ fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationEr
                     state.received_packets,
                     received,
                 )?;
+                for generator in &state.generators {
+                    let pending = work.feedback_by_flow[generator.flow.0 as usize];
+                    if generator.feedback.arrivals.checked_add(pending).is_none() {
+                        return Err(ValidationError::new(format!(
+                            "node {:?} flow {:?} generator feedback arrivals {} overflows with {pending} pending feedback arrivals",
+                            owner.id, generator.flow, generator.feedback.arrivals
+                        )));
+                    }
+                }
             }
             NodeKind::Switch => {
                 let state = &image.switch_states[owner.state_slot as usize];
@@ -1754,6 +1791,13 @@ fn validate_payload_sequences(
         for packet in &image.initial_packets {
             let owner = packet.id.0 % node_count;
             let sequence = packet.id.0 / node_count;
+            let flow = flow(image, packet.flow).expect("packet validation established the flow");
+            if packet.kind == PacketKind::Data && owner != flow.source.0 {
+                return Err(ValidationError::new(format!(
+                    "data packet {:?} for flow {:?} is not allocated by source node {:?}",
+                    packet.id, flow.id, flow.source
+                )));
+            }
             if let Some(payloads) = payload_sequences_by_owner.get_mut(owner as usize) {
                 payloads.push((sequence, packet.id));
             }
