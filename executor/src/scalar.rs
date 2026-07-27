@@ -34,7 +34,7 @@ pub struct PacketArrivalObservation {
     pub disposition: ArrivalDisposition,
 }
 
-/// Complete normalized scalar state at the exclusive stop boundary.
+/// Complete normalized scalar state after reaching a configured endpoint or execution horizon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunResult {
     pub host_states: Vec<HostState>,
@@ -190,11 +190,16 @@ impl From<TimeError> for ExecutionError {
     }
 }
 
-/// Runs the canonical scalar executor up to the earlier exclusive boundary supplied by the image
-/// or `stop_time_ns`.
-pub fn run_scalar(image: &SimulationImage, stop_time_ns: u64) -> Result<RunResult, ExecutionError> {
-    let effective_stop_time_ns = stop_time_ns.min(image.stop_time_ns);
-    ScalarExecutor::new(image)?.run(effective_stop_time_ns)
+/// Runs the canonical scalar executor through the image's inclusive simulation stop.
+///
+/// `exclusive_horizon_ns` optionally limits a partial run to events strictly before that horizon.
+/// The horizon is a safety boundary, unlike the scenario endpoint, so the two comparisons remain
+/// intentionally distinct.
+pub fn run_scalar(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+) -> Result<RunResult, ExecutionError> {
+    ScalarExecutor::new(image)?.run(exclusive_horizon_ns)
 }
 
 struct ScalarExecutor<'image> {
@@ -225,12 +230,11 @@ impl<'image> ScalarExecutor<'image> {
         })
     }
 
-    fn run(mut self, stop_time_ns: u64) -> Result<RunResult, ExecutionError> {
-        while self
-            .events
-            .first_key_value()
-            .is_some_and(|(key, _)| key.time_ns < stop_time_ns)
-        {
+    fn run(mut self, exclusive_horizon_ns: Option<u64>) -> Result<RunResult, ExecutionError> {
+        while self.events.first_key_value().is_some_and(|(key, _)| {
+            key.time_ns <= self.image.stop_time_ns
+                && exclusive_horizon_ns.is_none_or(|horizon_ns| key.time_ns < horizon_ns)
+        }) {
             let (_, event) = self
                 .events
                 .pop_first()

@@ -133,7 +133,7 @@ impl RemoteChannel {
 /// One immutable semantic image containing every host and switch logical process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimulationImage {
-    /// Exclusive configured simulation boundary in integer nanoseconds.
+    /// Inclusive configured simulation endpoint in integer nanoseconds.
     pub stop_time_ns: u64,
     pub nodes: Vec<NodeDescriptor>,
     pub host_states: Vec<HostState>,

@@ -143,7 +143,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
     Thus service starts are [0, 8, 24, 30]. P1's source arrival at t=2 and
     P1's remote arrival at t=26 both land strictly between service starts.
     The switch queue has capacity two: P0 and P1 are admitted, then P2 is
-    TailDropped at t=32. The exclusive stop is t=37, leaving only P3's
+    TailDropped at t=32. The exclusive execution horizon is t=37, leaving only P3's
     RemoteArrival at t=38.
 
     A regressed eager selector at t=24 would reserve P2 and P3 together:
@@ -159,7 +159,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
       ready2=10, complete2=11, remote2=12,
       ready3=13, complete3=14, remote3=15.
     */
-    let result = run_scalar(&image, 37).expect("the hand-built image must execute");
+    let result = run_scalar(&image, Some(37)).expect("the hand-built image must execute");
 
     assert_eq!(
         result.host_states,

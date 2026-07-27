@@ -187,7 +187,7 @@ fn switch_fifo_selects_one_packet_per_tx_ready_and_reaches_the_sink() {
     correct independently rounded intervals from cumulative serialization,
     which would depart P2 at 19 ns.
     */
-    let result = run_scalar(&image(), 27).expect("the complete path must execute");
+    let result = run_scalar(&image(), Some(27)).expect("the complete path must execute");
 
     assert_eq!(
         result.departures,

@@ -75,7 +75,7 @@ pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
     let image = compile_config(path).expect("supported scenario should lower");
     assert_eq!(image.stop_time_ns, 1_000_000_000);
     validate(&image, Backend::Scalar).expect("lowered image should validate");
-    let result = run_scalar(&image, u64::MAX).expect("lowered image should run");
+    let result = run_scalar(&image, None).expect("lowered image should run");
 
     assert_eq!(
         result
@@ -336,7 +336,7 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
     validate(&first, Backend::Scalar).expect("lowered image should validate for scalar");
     validate(&first, Backend::Cpu { workers: 2 })
         .expect("positive bounds should validate for a parallel backend");
-    let result = run_scalar(&first, u64::MAX).expect("lowered image should run end to end");
+    let result = run_scalar(&first, None).expect("lowered image should run end to end");
     assert!(result.pending_events.is_empty());
     assert!(
         result
@@ -558,13 +558,13 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     validate(&first, Backend::Cpu { workers: 4 })
         .expect("zero propagation with positive serialization is parallel-safe");
     validate(&first, Backend::Scalar).expect("baseline image should validate for scalar execution");
-    let result = run_scalar(&first, u64::MAX).expect("baseline image should run to completion");
+    let result = run_scalar(&first, None).expect("baseline image should run to completion");
     assert!(
         result
             .pending_events
             .iter()
-            .all(|event| event.key.time_ns >= first.stop_time_ns),
-        "baseline execution should drain every event before its configured duration"
+            .all(|event| event.key.time_ns > first.stop_time_ns),
+        "baseline execution should drain every event through its configured duration"
     );
     assert!(
         result
@@ -617,7 +617,7 @@ pkt_size_dist = { type = "Uniform", low = 2, high = 2 }
     validate(&image, Backend::Cpu { workers: 2 })
         .expect("serialization plus propagation gives positive lookahead");
 
-    let result = run_scalar(&image, 16).expect("lowered image should reach the sink");
+    let result = run_scalar(&image, Some(16)).expect("lowered image should reach the sink");
     assert_eq!(
         result.departures,
         vec![
