@@ -15,6 +15,13 @@ pub struct NodeId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LinkId(pub u64);
 
+/// Stable identifier for one semantic traffic flow.
+///
+/// Scenario lowering assigns this after sorting canonical flow keys.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FlowId(pub u64);
+
 /// Stable identifier for an event payload.
 ///
 /// The identifier is fixed-width; payload storage remains outside the persistent event record.

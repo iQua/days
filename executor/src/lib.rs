@@ -9,10 +9,10 @@ pub mod model;
 pub mod scalar;
 pub mod time;
 
-pub use event::{Event, EventKey, EventKind, LinkId, NodeId, PayloadId, event_phase};
+pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
-    HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, RemoteChannel, SimulationImage,
-    SwitchState, default_propagation_ns,
+    FlowDescriptor, HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, RemoteChannel,
+    SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
 };
 pub use model::{NodeKind, SchedulerKind, TransitionHandler, resolve_transition};
 pub use scalar::{

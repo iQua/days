@@ -1,14 +1,16 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    ArrivalDisposition, Event, EventKey, EventKind, HostState, LinkDescriptor, LinkId,
-    NodeDescriptor, NodeId, NodeKind, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
-    PayloadId, RemoteChannel, SchedulerKind, SimulationImage, SwitchState, event_phase, run_scalar,
+    ArrivalDisposition, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
+    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketArrivalObservation,
+    PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind, SimulationImage,
+    SwitchQueueState, SwitchState, event_phase, run_scalar,
 };
 
 const HOST: NodeId = NodeId(10);
 const SWITCH: NodeId = NodeId(20);
 const LINK: LinkId = LinkId(30);
+const FLOW: FlowId = FlowId(40);
 const P0: PayloadId = PayloadId(0);
 const P1: PayloadId = PayloadId(1);
 const P2: PayloadId = PayloadId(2);
@@ -53,27 +55,40 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             departed_packets: 0,
         }],
         switch_states: vec![SwitchState {
-            scheduler: SchedulerKind::Fifo,
-            queue_capacity_packets: 2,
-            queue: VecDeque::new(),
+            queues: vec![SwitchQueueState {
+                egress_link: None,
+                scheduler: SchedulerKind::Fifo,
+                queue_capacity_packets: 2,
+                queue: VecDeque::new(),
+            }],
             arrived_packets: 0,
             dropped_packets: 0,
+        }],
+        flows: vec![FlowDescriptor {
+            id: FLOW,
+            source: HOST,
+            target: SWITCH,
+            route: vec![LINK],
         }],
         packets: vec![
             PacketDescriptor {
                 id: P0,
+                flow: FLOW,
                 size_bytes: 3,
             },
             PacketDescriptor {
                 id: P1,
+                flow: FLOW,
                 size_bytes: 6,
             },
             PacketDescriptor {
                 id: P2,
+                flow: FLOW,
                 size_bytes: 2,
             },
             PacketDescriptor {
                 id: P3,
+                flow: FLOW,
                 size_bytes: 2,
             },
         ],
@@ -155,9 +170,12 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
     assert_eq!(
         result.switch_states,
         vec![SwitchState {
-            scheduler: SchedulerKind::Fifo,
-            queue_capacity_packets: 2,
-            queue: VecDeque::from([P0, P1]),
+            queues: vec![SwitchQueueState {
+                egress_link: None,
+                scheduler: SchedulerKind::Fifo,
+                queue_capacity_packets: 2,
+                queue: VecDeque::from([P0, P1]),
+            }],
             arrived_packets: 3,
             dropped_packets: 1,
         }]

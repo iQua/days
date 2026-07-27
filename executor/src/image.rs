@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    Event, EventKind, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind, TimeError,
+    Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind, TimeError,
     link_arrival_time_ns,
 };
 
@@ -34,15 +34,32 @@ pub struct HostState {
     pub departed_packets: u64,
 }
 
-/// Switch-owned FIFO/TailDrop state.
+/// One switch-owned FIFO/TailDrop egress queue.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SwitchState {
+pub struct SwitchQueueState {
+    /// `None` is used only by terminal hand-built fixtures whose flow ends at the switch.
+    pub egress_link: Option<LinkId>,
     pub scheduler: SchedulerKind,
     /// Maximum queued packets. A value of zero denotes an unbounded queue.
     pub queue_capacity_packets: u64,
     pub queue: VecDeque<PayloadId>,
+}
+
+/// Switch-owned state containing one queue per directed egress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwitchState {
+    pub queues: Vec<SwitchQueueState>,
     pub arrived_packets: u64,
     pub dropped_packets: u64,
+}
+
+/// Stable endpoints and canonical directed route for one open-loop flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowDescriptor {
+    pub id: FlowId,
+    pub source: NodeId,
+    pub target: NodeId,
+    pub route: Vec<LinkId>,
 }
 
 /// Immutable packet data referenced by a persistent event payload.
@@ -50,6 +67,7 @@ pub struct SwitchState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketDescriptor {
     pub id: PayloadId,
+    pub flow: FlowId,
     pub size_bytes: u64,
 }
 
@@ -89,6 +107,7 @@ pub struct SimulationImage {
     pub nodes: Vec<NodeDescriptor>,
     pub host_states: Vec<HostState>,
     pub switch_states: Vec<SwitchState>,
+    pub flows: Vec<FlowDescriptor>,
     pub packets: Vec<PacketDescriptor>,
     pub links: Vec<LinkDescriptor>,
     pub channels: Vec<RemoteChannel>,

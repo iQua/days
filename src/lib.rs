@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub mod flows;
 #[cfg(feature = "l2")]
 pub mod l2;
+pub mod scenario;
 pub mod schedulers;
 pub mod switches;
 pub mod topos;

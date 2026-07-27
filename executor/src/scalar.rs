@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Event, EventKey, EventKind, HostState, LinkId, NodeDescriptor, NodeId, NodeKind, PayloadId,
-    SimulationImage, SwitchState, TimeError, TransitionHandler, event_phase, resolve_transition,
+    Event, EventKey, EventKind, FlowId, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
+    PayloadId, SimulationImage, SwitchState, TimeError, TransitionHandler, event_phase,
+    resolve_transition,
 };
 
 /// Whether a packet arrival entered the finite switch FIFO.
@@ -68,6 +69,15 @@ pub enum ExecutionError {
         actual_source: NodeId,
     },
     UnknownPacket(PayloadId),
+    UnknownFlow(FlowId),
+    FlowRouteMiss {
+        flow: FlowId,
+        node: NodeId,
+    },
+    MissingSwitchQueue {
+        node: NodeId,
+        egress_link: Option<LinkId>,
+    },
     HostAlreadyTransmitting(NodeId),
     UnexpectedTxComplete {
         node: NodeId,
@@ -114,6 +124,17 @@ impl fmt::Display for ExecutionError {
                 "link {link:?} source is {actual_source:?}, expected {expected_source:?}"
             ),
             Self::UnknownPacket(payload) => write!(formatter, "unknown packet {payload:?}"),
+            Self::UnknownFlow(flow) => write!(formatter, "unknown flow {flow:?}"),
+            Self::FlowRouteMiss { flow, node } => {
+                write!(
+                    formatter,
+                    "flow {flow:?} has no route step at node {node:?}"
+                )
+            }
+            Self::MissingSwitchQueue { node, egress_link } => write!(
+                formatter,
+                "switch {node:?} has no queue for egress link {egress_link:?}"
+            ),
             Self::HostAlreadyTransmitting(node) => {
                 write!(
                     formatter,
@@ -380,6 +401,7 @@ impl<'image> ScalarExecutor<'image> {
         event: Event,
     ) -> Result<(), ExecutionError> {
         self.packet_size(event.payload)?;
+        let egress_link = self.packet_egress_at(event.payload, node.id)?;
 
         let disposition = {
             let state = self.switch_state_mut(node)?;
@@ -388,15 +410,23 @@ impl<'image> ScalarExecutor<'image> {
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
 
-            let queue_len = u64::try_from(state.queue.len()).unwrap_or(u64::MAX);
-            if state.queue_capacity_packets != 0 && queue_len >= state.queue_capacity_packets {
+            let queue = state
+                .queues
+                .iter_mut()
+                .find(|queue| queue.egress_link == egress_link)
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link,
+                })?;
+            let queue_len = u64::try_from(queue.queue.len()).unwrap_or(u64::MAX);
+            if queue.queue_capacity_packets != 0 && queue_len >= queue.queue_capacity_packets {
                 state.dropped_packets = state
                     .dropped_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 ArrivalDisposition::Dropped
             } else {
-                state.queue.push_back(event.payload);
+                queue.queue.push_back(event.payload);
                 ArrivalDisposition::Admitted
             }
         };
@@ -498,5 +528,38 @@ impl<'image> ScalarExecutor<'image> {
             .find(|packet| packet.id == id)
             .map(|packet| packet.size_bytes)
             .ok_or(ExecutionError::UnknownPacket(id))
+    }
+
+    fn packet_egress_at(
+        &self,
+        payload: PayloadId,
+        node: NodeId,
+    ) -> Result<Option<LinkId>, ExecutionError> {
+        let packet = self
+            .image
+            .packets
+            .iter()
+            .find(|packet| packet.id == payload)
+            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        let flow = self
+            .image
+            .flows
+            .iter()
+            .find(|flow| flow.id == packet.flow)
+            .ok_or(ExecutionError::UnknownFlow(packet.flow))?;
+
+        for link_id in &flow.route {
+            let link = self.link(*link_id)?;
+            if link.source == node {
+                return Ok(Some(link.id));
+            }
+        }
+        if flow.target == node {
+            return Ok(None);
+        }
+        Err(ExecutionError::FlowRouteMiss {
+            flow: flow.id,
+            node,
+        })
     }
 }
