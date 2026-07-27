@@ -207,7 +207,7 @@ frozen_at_commit = "{frozen_commit}"
 
 fn budget_manifest(corpus_hash: &str) -> String {
     format!(
-        r#"schema_version = 2
+        r#"schema_version = 3
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
@@ -218,24 +218,49 @@ name = "fixture-host"
 cpu = "fixture-cpu"
 os_build = "fixture-os-build"
 toolchain = "rustc 1.96.0; cargo 1.96.0"
+expected_num_cpus = 8
+mt_thread_count_source = "std::thread::available_parallelism"
 
 [method]
 warmups = 1
 repetitions = 3
-statistic = "median"
-confidence_rule = "accept the median of three repetitions"
+build_profile = "release"
+cargo_flags = ["--release", "--locked"]
+sim_execution_boundary = "std::time::Instant around simulator execution only"
+end_to_end_boundary = "process invocation through process exit"
+minimum_sample_wall_time_seconds = 1.0
+effective_simulation_duration_seconds = 0.002
+effective_simulation_duration_source = "top-level duration"
+sample_simulated_end_time_rule = "must equal effective duration"
+sample_effective_thread_count_rule = "must equal the mode thread count"
+run_order = "corpus order, then ST followed by MT"
+pairing_order = "pair repetition i within each workload and mode"
+resampling_algorithm = "paired bootstrap with 10000 resamples"
+resampling_prng = "ChaCha8Rng"
+resampling_seed = 1776
+st_mode = "nexosim-st"
+mt_mode = "nexosim-mt"
+best_exact_mode_rule = "lowest median sim_execution among exact Nexosim CPU modes"
 
-[[corpus]]
-path = "configs/migration/p90-fixture.toml"
-content_hash = "{corpus_hash}"
-comparison_boundary = "exact-ledger"
+[admission]
+evaluated_at = "P23"
+statistic = "geometric mean of paired throughput ratios"
+confidence_rule = "two-sided 95 percent paired-bootstrap interval"
 
-[[thresholds]]
+[[admission.thresholds]]
 name = "fixture"
 metric = "wall-time"
 comparison = "<="
 value = 1.0
 unit = "second"
+
+[[corpus]]
+path = "configs/migration/p90-fixture.toml"
+content_hash = "{corpus_hash}"
+comparison_boundary = "exact-ledger"
+workload = "p90-fixture"
+mode = "nexosim-st"
+role = "correctness"
 
 [waiver]
 approving_role = "executor program owner"
@@ -832,7 +857,7 @@ fn malformed_budget_manifest_is_rejected() {
     write(
         fixture.root(),
         "docs/days-executor/budgets/p90-fixture.toml",
-        "schema_version = 2\n",
+        "schema_version = 3\n",
     );
     assert_code_message(&fixture.audit(), "DAYS-AUDIT-0011", "TOML");
 }
@@ -1208,29 +1233,54 @@ fn budget_without_thresholds_is_rejected() {
         fixture.root(),
         "docs/days-executor/budgets/p90-fixture.toml",
         &format!(
-            r#"schema_version = 2
+            r#"schema_version = 3
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
 description = "Synthetic audit budget"
-thresholds = []
 
 [platform]
 name = "fixture-host"
 cpu = "fixture-cpu"
 os_build = "fixture-os-build"
 toolchain = "rustc 1.96.0; cargo 1.96.0"
+expected_num_cpus = 8
+mt_thread_count_source = "std::thread::available_parallelism"
 
 [method]
 warmups = 1
 repetitions = 3
-statistic = "median"
-confidence_rule = "accept the median of three repetitions"
+build_profile = "release"
+cargo_flags = ["--release", "--locked"]
+sim_execution_boundary = "std::time::Instant around simulator execution only"
+end_to_end_boundary = "process invocation through process exit"
+minimum_sample_wall_time_seconds = 1.0
+effective_simulation_duration_seconds = 0.002
+effective_simulation_duration_source = "top-level duration"
+sample_simulated_end_time_rule = "must equal effective duration"
+sample_effective_thread_count_rule = "must equal the mode thread count"
+run_order = "corpus order, then ST followed by MT"
+pairing_order = "pair repetition i within each workload and mode"
+resampling_algorithm = "paired bootstrap with 10000 resamples"
+resampling_prng = "ChaCha8Rng"
+resampling_seed = 1776
+st_mode = "nexosim-st"
+mt_mode = "nexosim-mt"
+best_exact_mode_rule = "lowest median sim_execution among exact Nexosim CPU modes"
+
+[admission]
+evaluated_at = "P23"
+statistic = "geometric mean of paired throughput ratios"
+confidence_rule = "two-sided 95 percent paired-bootstrap interval"
+thresholds = []
 
 [[corpus]]
 path = "configs/migration/p90-fixture.toml"
 content_hash = "{corpus_hash}"
 comparison_boundary = "exact-ledger"
+workload = "p90-fixture"
+mode = "nexosim-st"
+role = "correctness"
 
 [waiver]
 approving_role = "executor program owner"

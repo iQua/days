@@ -2,12 +2,15 @@ schema_version = 1
 id = "P01-retirement-corpus"
 phase = "P01"
 task = "T1"
-description = "Frozen stage-1 corpus and comparison boundaries for Nexosim retirement"
+description = "Frozen correctness and performance corpus with comparison boundaries for Nexosim retirement"
 
 [[fixtures]]
 path = "configs/migration/explicit.toml"
 content_hash = "sha256:fb71cc87dc7f0b3e3055ece1495f173f10156f9aecbd8345befcf4bbbbaffa03"
 comparison_boundary = "exact-ledger"
+workload = "migration-explicit"
+mode = "st"
+role = "correctness"
 model_scope = "v1-open-loop-udp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/explicit.toml"]
@@ -16,6 +19,9 @@ command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin",
 path = "configs/migration/torus.toml"
 content_hash = "sha256:b4ae6460ee3bfc84b23e28ce73e96bd6408d46eba04d69152a4479dfffb7bf0a"
 comparison_boundary = "exact-ledger"
+workload = "migration-torus"
+mode = "st"
+role = "correctness"
 model_scope = "v1-open-loop-udp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/torus.toml"]
@@ -24,6 +30,9 @@ command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin",
 path = "configs/migration/fattree.toml"
 content_hash = "sha256:21e7fe2749ea114a46f6caec65aa8a7413e41cb6e2a418a53dd4439aa430d38b"
 comparison_boundary = "exact-ledger"
+workload = "migration-fattree-k4"
+mode = "st"
+role = "correctness"
 model_scope = "v1-open-loop-udp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/fattree.toml"]
@@ -32,6 +41,9 @@ command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin",
 path = "configs/tcp_simple.toml"
 content_hash = "sha256:28d6a1e4fbafc37eca41c499302b543077c25401610abec7df33f467366b4247"
 comparison_boundary = "terminal-observation"
+workload = "tcp-simple"
+mode = "default"
+role = "correctness"
 model_scope = "out-of-scope-tcp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/tcp_simple.toml"]
@@ -40,6 +52,97 @@ command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin",
 path = "configs/ci/leanguard_dcqcn.toml"
 content_hash = "sha256:eda40aa3a9d6e49034072b67ac48d33c44c26157988401cd01d7b2ca1732a098"
 comparison_boundary = "terminal-observation"
+workload = "leanguard-dcqcn"
+mode = "st"
+role = "correctness"
 model_scope = "out-of-scope-dcqcn-pfc"
 required_features = ["migration_ledger", "l2_pfc", "dcqcn"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger,l2_pfc,dcqcn", "--bin", "days", "--", "configs/ci/leanguard_dcqcn.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k4_f8_st.toml"
+content_hash = "sha256:20dad2e66b919d260a10cdba51b2eeaac96b7fc0809eec911cc6b292f2014b01"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k4-f8"
+mode = "st"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k4_f8_st.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k4_f8_mt.toml"
+content_hash = "sha256:bb97e07e6cdee3f74e3ea6cc5c8580a7b37bfb02ac8dcbd514c27f3132b14342"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k4-f8"
+mode = "mt"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k4_f8_mt.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k8_f64_st.toml"
+content_hash = "sha256:4fe5a19739003da395cee199cfb74559f291ec68e51dd464112e8bdbf20c4ea9"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k8-f64"
+mode = "st"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k8_f64_st.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k8_f64_mt.toml"
+content_hash = "sha256:13ef8537a9ad233e5991181adcc76ecbaa2dd268ffa2dc32bc866e04abe79609"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k8-f64"
+mode = "mt"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k8_f64_mt.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k16_f512_st.toml"
+content_hash = "sha256:e6e7638248632faa49213794d6080fb8a3b1db5a80cb71e9016434de098f4996"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k16-f512"
+mode = "st"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k16_f512_st.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k16_f512_mt.toml"
+content_hash = "sha256:78bacf8456f88c8e6ec5c601407cbfb49199c64c2b1ce1dc342e96060d7f7008"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k16-f512"
+mode = "mt"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k16_f512_mt.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k32_f4096_st.toml"
+content_hash = "sha256:ac33dba5b89db689911069cdd9838a6d329087280c7dd4ff48d202fdcf9c9e51"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k32-f4096"
+mode = "st"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k32_f4096_st.toml"]
+
+[[fixtures]]
+path = "configs/benchmarks/baseline/fattree_k32_f4096_mt.toml"
+content_hash = "sha256:cdf623023ab49bf973689cd2d031240282583b0590921306f98a94552d56229a"
+comparison_boundary = "terminal-observation"
+workload = "fattree-k32-f4096"
+mode = "mt"
+role = "performance"
+model_scope = "v1-open-loop-udp"
+required_features = []
+command = ["target/release/days", "configs/benchmarks/baseline/fattree_k32_f4096_mt.toml"]

@@ -18,11 +18,11 @@ tags = [
 
 [[artifacts]]
 path = "docs/days-executor/budgets/retirement-budget.toml"
-content_hash = "sha256:fa0cf005ff0c47389cde97237e20a8a674e6d0f2b12961726f3032eb383fe925"
+content_hash = "sha256:ac6b4ac040043053b407e5d77a694d2869413b84295c18eabdbe1c8a86c2cdaa"
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P01/retirement-corpus.toml"
-content_hash = "sha256:4a3d3c94b8beb42825e6faf8c7ab5757a22585db843c29a27d874adc0eca04d7"
+content_hash = "sha256:b01e9a142a597bf99f0d2dce61490aaeab77379a59ac036d7b2aef1b9904ae98"
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P01/quantize-after-characterization.toml"

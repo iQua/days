@@ -128,7 +128,7 @@ version in this table:
 | Phase metadata | 1 |
 | Evidence manifest | 1 |
 | Dependency baseline | 1 |
-| Budget manifest | 2 |
+| Budget manifest | 3 |
 
 Version 0 and every version not listed for that document kind are rejected
 separately from malformed TOML. Schema records deny unknown fields, so a
@@ -308,31 +308,47 @@ selection.
 
 | Field | Type | Presence | Rule |
 | --- | --- | --- | --- |
-| `schema_version` | integer | required | Must equal 2. |
+| `schema_version` | integer | required | Must equal 3. |
 | `id` | string | required | Stable budget identifier. |
 | `phase` | string | required | Owning phase identifier. |
 | `frozen_at` | string | required | ISO-8601 calendar date in `YYYY-MM-DD` form. |
 | `description` | string | required | Human-readable purpose and scope. |
-| `platform` | table | required | Named measurement hardware, operating system, and toolchain. |
-| `method` | table | required | Frozen warmup, repetition, statistic, and confidence method. |
-| `corpus` | array of corpus tables | required | Non-empty exact workload set and comparison boundaries. |
-| `thresholds` | array of threshold tables | required | Admission or comparison thresholds. |
+| `platform` | table | required | Named hardware, operating system, toolchain, and expected platform probe. |
+| `method` | table | required | Frozen build, sampling, timing, observation, ordering, and resampling method. |
+| `admission` | table | required | P23 statistic, confidence rule, and non-empty threshold set. |
+| `corpus` | array of corpus tables | required | Non-empty hashed workload set with independent purpose and comparison fields. |
 | `waiver` | table | required | Public approving role and mandatory pre-cutover review policy. |
 
-Each `thresholds` table requires string fields `name`, `metric`, `comparison`,
-and `unit`, plus a numeric `value`. `comparison` is one of `<`, `<=`, `>`,
-`>=`, or `==`.
+The `platform` table requires the existing non-empty `name`, `cpu`, `os_build`,
+and `toolchain` strings. It also requires an integer `expected_num_cpus` of at
+least 1 and a non-empty `mt_thread_count_source`. The runner records each
+sample's effective thread count and rejects an MT sample whose observed value
+differs from `expected_num_cpus`.
 
-The `platform` table requires non-empty `name`, `cpu`, `os_build`, and
-`toolchain` strings. The `method` table requires non-negative integer
-`warmups`, integer `repetitions` of at least 1, and non-empty `statistic` and
-`confidence_rule` strings.
+The `method` table requires non-negative integer `warmups` and integer
+`repetitions` of at least 1. It pins a non-empty build profile and Cargo flag
+array; primary `sim_execution` and secondary `end_to_end` boundaries; a
+positive finite sample wall-time floor; and a positive finite effective
+simulation duration. Non-empty rules identify the duration source, require
+each sample to record its simulated end time and effective thread count, and
+define run and pairing order. The method also pins the resampling algorithm,
+PRNG and seed, ST and MT names, and the P23 rule that selects the best exact
+Nexosim CPU mode. Schema validation checks the declared floor's shape and
+value. The later measurement runner checks observed samples against it.
+
+The `admission` table requires `evaluated_at = "P23"` and non-empty `statistic`
+and `confidence_rule` strings. Its non-empty `thresholds` array contains tables
+with string fields `name`, `metric`, `comparison`, and `unit`, plus a numeric
+`value`. `comparison` is one of `<`, `<=`, `>`, `>=`, or `==`. P01 records
+absolute Nexosim references and evaluates no admission threshold.
 
 Each `corpus` table requires a repository-relative `path`, its canonical
-`sha256:<64 lowercase hexadecimal characters>` `content_hash`, and a
-`comparison_boundary` equal to `exact-ledger`, `terminal-observation`, or
-`semantic-migration`. Parsing a budget resolves every corpus path inside the
-repository, requires it to be a regular file, and verifies its exact bytes
+`sha256:<64 lowercase hexadecimal characters>` `content_hash`, non-empty
+`workload` and `mode` strings, and a `role` equal to `correctness` or
+`performance`. `comparison_boundary` independently equals `exact-ledger`,
+`terminal-observation`, or `semantic-migration`; validation imposes no
+cross-field rule between role and boundary. Parsing resolves every corpus path
+inside the repository, requires a regular file, and verifies its exact bytes
 against `content_hash`.
 
 The `waiver` table requires a non-empty `approving_role`. Its `policy` must be

@@ -11,8 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 pub use baseline::{DependencyBaseline, DependencyKind, DirectDependency};
 pub use budget::{
-    BudgetCorpusEntry, BudgetManifest, BudgetMethod, BudgetPlatform, BudgetThreshold, BudgetWaiver,
-    ComparisonBoundary, REQUIRED_WAIVER_POLICY,
+    BudgetAdmission, BudgetCorpusEntry, BudgetManifest, BudgetMethod, BudgetPlatform,
+    BudgetThreshold, BudgetWaiver, ComparisonBoundary, CorpusRole, REQUIRED_WAIVER_POLICY,
 };
 pub use evidence::{EvidenceArtifact, EvidenceKind, EvidenceManifest};
 pub use phase::{Backend, BudgetReference, PhaseMetadata, PhaseTask, RedTest, TestCommand};
@@ -29,8 +29,8 @@ pub struct SchemaVersion(u32);
 impl SchemaVersion {
     /// Schema version 1.
     pub const V1: Self = Self(1);
-    /// Schema version 2.
-    pub const V2: Self = Self(2);
+    /// Schema version 3.
+    pub const V3: Self = Self(3);
 
     /// Returns the integer form stored in TOML.
     pub const fn get(self) -> u32 {
@@ -58,7 +58,7 @@ impl<'de> Deserialize<'de> for SchemaVersion {
             type Value = SchemaVersion;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("integer schema_version = 1 or 2")
+                formatter.write_str("integer schema_version = 1 or 3")
             }
 
             fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
@@ -67,7 +67,7 @@ impl<'de> Deserialize<'de> for SchemaVersion {
             {
                 match value {
                     value if value == i64::from(SchemaVersion::V1.get()) => Ok(SchemaVersion::V1),
-                    value if value == i64::from(SchemaVersion::V2.get()) => Ok(SchemaVersion::V2),
+                    value if value == i64::from(SchemaVersion::V3.get()) => Ok(SchemaVersion::V3),
                     _ => Err(E::custom(format!("unsupported schema_version {value}"))),
                 }
             }
@@ -78,7 +78,7 @@ impl<'de> Deserialize<'de> for SchemaVersion {
             {
                 match value {
                     value if value == u64::from(SchemaVersion::V1.get()) => Ok(SchemaVersion::V1),
-                    value if value == u64::from(SchemaVersion::V2.get()) => Ok(SchemaVersion::V2),
+                    value if value == u64::from(SchemaVersion::V3.get()) => Ok(SchemaVersion::V3),
                     _ => Err(E::custom(format!("unsupported schema_version {value}"))),
                 }
             }
@@ -125,7 +125,7 @@ pub fn parse_evidence_manifest(input: &str) -> Result<EvidenceManifest, SchemaEr
 
 /// Parses and validates a budget manifest.
 pub fn parse_budget_manifest(input: &str, repo_root: &Path) -> Result<BudgetManifest, SchemaError> {
-    parse_validated(input, SchemaVersion::V2, |manifest| {
+    parse_validated(input, SchemaVersion::V3, |manifest| {
         BudgetManifest::validate(manifest, repo_root)
     })
 }

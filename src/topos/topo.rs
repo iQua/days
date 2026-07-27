@@ -1518,6 +1518,11 @@ impl Topology {
                 error!("Simulation stopped early: {err}");
             }
         }
+        let sim_execution_elapsed = timer.elapsed();
+        info!(
+            "Simulation execution wall-clock time: {:.9} seconds.",
+            sim_execution_elapsed.as_secs_f64()
+        );
 
         if let Some(stats) = wall_sampler.as_mut().and_then(|s| s.stop()) {
             info!(
@@ -1571,6 +1576,13 @@ mod tests {
         assert_eq!(
             first,
             b"switch_register,10\nswitch_register,20\nswitch_register,30\n"
+        );
+    }
+
+    #[test]
+    fn default_simulation_duration_is_pinned_to_1500_seconds() {
+        assert!(
+            include_str!("topo.rs").contains("let duration = ui_config.duration.unwrap_or(1500.);")
         );
     }
 

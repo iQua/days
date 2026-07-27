@@ -114,7 +114,7 @@ content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef012345678
 "#;
 
 const BUDGET: &str = r#"
-schema_version = 2
+schema_version = 3
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
@@ -125,24 +125,49 @@ name = "fixture-host"
 cpu = "fixture-cpu"
 os_build = "fixture-os-build"
 toolchain = "rustc 1.96.0; cargo 1.96.0"
+expected_num_cpus = 8
+mt_thread_count_source = "std::thread::available_parallelism"
 
 [method]
 warmups = 1
 repetitions = 3
-statistic = "median"
-confidence_rule = "accept the median of three repetitions"
+build_profile = "release"
+cargo_flags = ["--release", "--locked"]
+sim_execution_boundary = "std::time::Instant around sim.step_until only"
+end_to_end_boundary = "process invocation through process exit"
+minimum_sample_wall_time_seconds = 1.0
+effective_simulation_duration_seconds = 0.002
+effective_simulation_duration_source = "top-level duration or topology duration"
+sample_simulated_end_time_rule = "must equal the effective simulation duration"
+sample_effective_thread_count_rule = "ST uses one; MT uses expected_num_cpus"
+run_order = "corpus order, then ST followed by MT"
+pairing_order = "pair repetition i within each workload and mode"
+resampling_algorithm = "paired bootstrap with 10000 resamples"
+resampling_prng = "ChaCha8Rng"
+resampling_seed = 1776
+st_mode = "nexosim-st"
+mt_mode = "nexosim-mt"
+best_exact_mode_rule = "lowest median sim_execution among exact Nexosim CPU modes"
 
-[[corpus]]
-path = "configs/migration/fixture.toml"
-content_hash = "sha256:0fef1d82942d5aad23789ecc85955e882b15de59c2ede2cb1e1cf4b920e497c9"
-comparison_boundary = "exact-ledger"
+[admission]
+evaluated_at = "P23"
+statistic = "geometric mean of paired throughput ratios"
+confidence_rule = "two-sided 95 percent paired-bootstrap interval"
 
-[[thresholds]]
+[[admission.thresholds]]
 name = "runtime"
 metric = "seconds"
 comparison = "<="
 value = 1.0
 unit = "s"
+
+[[corpus]]
+path = "configs/migration/fixture.toml"
+content_hash = "sha256:0fef1d82942d5aad23789ecc85955e882b15de59c2ede2cb1e1cf4b920e497c9"
+comparison_boundary = "exact-ledger"
+workload = "fixture"
+mode = "nexosim-st"
+role = "correctness"
 
 [waiver]
 approving_role = "executor program owner"
@@ -263,7 +288,7 @@ fn missing_required_fields_are_rejected() {
 
 #[test]
 fn unsupported_schema_versions_are_distinct() {
-    for version in [0, 2] {
+    for version in [0, 2, 3] {
         assert_unsupported(parse_phase_metadata(&with_version(PHASE, version)), version);
         assert_unsupported(
             parse_evidence_manifest(&with_version(EVIDENCE, version)),
@@ -275,7 +300,7 @@ fn unsupported_schema_versions_are_distinct() {
         );
     }
     let root = budget_repo();
-    for version in [0, 1, 3] {
+    for version in [0, 1, 2, 4] {
         assert_unsupported(
             parse_budget_manifest(&with_version(BUDGET, version), root.path()),
             version,
@@ -363,18 +388,18 @@ fn evidence_without_artifacts_is_rejected_for_every_kind() {
 #[test]
 fn budget_without_thresholds_is_rejected() {
     let root = budget_repo();
-    let without_thresholds = BUDGET.replace(
-        r#"[[thresholds]]
+    let threshold = r#"[[admission.thresholds]]
 name = "runtime"
 metric = "seconds"
 comparison = "<="
 value = 1.0
 unit = "s"
 
-"#,
-        "",
-    );
+"#;
+    let without_thresholds = BUDGET.replace(threshold, "");
+    let empty_thresholds = BUDGET.replace(threshold, "thresholds = []\n\n");
     assert_malformed(parse_budget_manifest(&without_thresholds, root.path()));
+    assert_malformed(parse_budget_manifest(&empty_thresholds, root.path()));
 }
 
 #[test]
@@ -388,6 +413,10 @@ fn empty_platform_fields_are_rejected() {
             "toolchain = \"rustc 1.96.0; cargo 1.96.0\"",
             "toolchain = \"\"",
         ),
+        (
+            "mt_thread_count_source = \"std::thread::available_parallelism\"",
+            "mt_thread_count_source = \"\"",
+        ),
     ] {
         assert_malformed(parse_budget_manifest(
             &BUDGET.replace(valid, empty),
@@ -397,12 +426,145 @@ fn empty_platform_fields_are_rejected() {
 }
 
 #[test]
+fn platform_cpu_count_is_required_and_positive() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace("expected_num_cpus = 8\n", ""),
+        root.path(),
+    ));
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace("expected_num_cpus = 8", "expected_num_cpus = 0"),
+        root.path(),
+    ));
+}
+
+#[test]
 fn zero_repetitions_are_rejected() {
     let root = budget_repo();
     assert_malformed(parse_budget_manifest(
         &BUDGET.replace("repetitions = 3", "repetitions = 0"),
         root.path(),
     ));
+}
+
+#[test]
+fn required_method_fields_cannot_be_removed() {
+    let root = budget_repo();
+    for required in [
+        "build_profile = \"release\"\n",
+        "cargo_flags = [\"--release\", \"--locked\"]\n",
+        "sim_execution_boundary = \"std::time::Instant around sim.step_until only\"\n",
+        "end_to_end_boundary = \"process invocation through process exit\"\n",
+        "minimum_sample_wall_time_seconds = 1.0\n",
+        "effective_simulation_duration_seconds = 0.002\n",
+        "effective_simulation_duration_source = \"top-level duration or topology duration\"\n",
+        "sample_simulated_end_time_rule = \"must equal the effective simulation duration\"\n",
+        "sample_effective_thread_count_rule = \"ST uses one; MT uses expected_num_cpus\"\n",
+        "run_order = \"corpus order, then ST followed by MT\"\n",
+        "pairing_order = \"pair repetition i within each workload and mode\"\n",
+        "resampling_algorithm = \"paired bootstrap with 10000 resamples\"\n",
+        "resampling_prng = \"ChaCha8Rng\"\n",
+        "resampling_seed = 1776\n",
+        "st_mode = \"nexosim-st\"\n",
+        "mt_mode = \"nexosim-mt\"\n",
+        "best_exact_mode_rule = \"lowest median sim_execution among exact Nexosim CPU modes\"\n",
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(required, ""),
+            root.path(),
+        ));
+    }
+}
+
+#[test]
+fn method_strings_and_cargo_flags_cannot_be_empty() {
+    let root = budget_repo();
+    for valid in [
+        "build_profile = \"release\"",
+        "sim_execution_boundary = \"std::time::Instant around sim.step_until only\"",
+        "end_to_end_boundary = \"process invocation through process exit\"",
+        "effective_simulation_duration_source = \"top-level duration or topology duration\"",
+        "sample_simulated_end_time_rule = \"must equal the effective simulation duration\"",
+        "sample_effective_thread_count_rule = \"ST uses one; MT uses expected_num_cpus\"",
+        "run_order = \"corpus order, then ST followed by MT\"",
+        "pairing_order = \"pair repetition i within each workload and mode\"",
+        "resampling_algorithm = \"paired bootstrap with 10000 resamples\"",
+        "resampling_prng = \"ChaCha8Rng\"",
+        "st_mode = \"nexosim-st\"",
+        "mt_mode = \"nexosim-mt\"",
+        "best_exact_mode_rule = \"lowest median sim_execution among exact Nexosim CPU modes\"",
+    ] {
+        let field = valid.split(" = ").next().expect("field name");
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(valid, &format!("{field} = \"\"")),
+            root.path(),
+        ));
+    }
+    for invalid in [
+        "cargo_flags = []",
+        "cargo_flags = [\"\"]",
+        "cargo_flags = [\"--release\", \"\"]",
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace("cargo_flags = [\"--release\", \"--locked\"]", invalid),
+            root.path(),
+        ));
+    }
+}
+
+#[test]
+fn declared_time_values_must_be_positive_and_finite() {
+    let root = budget_repo();
+    for field in [
+        "minimum_sample_wall_time_seconds",
+        "effective_simulation_duration_seconds",
+    ] {
+        let valid = if field == "minimum_sample_wall_time_seconds" {
+            "1.0"
+        } else {
+            "0.002"
+        };
+        for invalid in ["0.0", "-1.0", "nan", "inf"] {
+            assert_malformed(parse_budget_manifest(
+                &BUDGET.replace(
+                    &format!("{field} = {valid}"),
+                    &format!("{field} = {invalid}"),
+                ),
+                root.path(),
+            ));
+        }
+    }
+}
+
+#[test]
+fn admission_fields_are_required_and_validated() {
+    let root = budget_repo();
+    for required in [
+        "evaluated_at = \"P23\"\n",
+        "statistic = \"geometric mean of paired throughput ratios\"\n",
+        "confidence_rule = \"two-sided 95 percent paired-bootstrap interval\"\n",
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(required, ""),
+            root.path(),
+        ));
+    }
+    for (valid, invalid) in [
+        ("evaluated_at = \"P23\"", "evaluated_at = \"P01\""),
+        (
+            "statistic = \"geometric mean of paired throughput ratios\"",
+            "statistic = \"\"",
+        ),
+        (
+            "confidence_rule = \"two-sided 95 percent paired-bootstrap interval\"",
+            "confidence_rule = \"\"",
+        ),
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(valid, invalid),
+            root.path(),
+        ));
+    }
 }
 
 #[test]
@@ -418,6 +580,9 @@ fn empty_corpus_is_rejected() {
 path = "configs/migration/fixture.toml"
 content_hash = "sha256:0fef1d82942d5aad23789ecc85955e882b15de59c2ede2cb1e1cf4b920e497c9"
 comparison_boundary = "exact-ledger"
+workload = "fixture"
+mode = "nexosim-st"
+role = "correctness"
 
 "#,
             "",
@@ -473,6 +638,61 @@ fn invalid_comparison_boundary_is_rejected() {
 }
 
 #[test]
+fn corpus_identity_and_role_are_required_and_validated_independently() {
+    let root = budget_repo();
+    for required in [
+        "workload = \"fixture\"\n",
+        "mode = \"nexosim-st\"\n",
+        "role = \"correctness\"\n",
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(required, ""),
+            root.path(),
+        ));
+    }
+    for (valid, invalid) in [
+        ("workload = \"fixture\"", "workload = \"\""),
+        ("mode = \"nexosim-st\"", "mode = \"\""),
+        ("role = \"correctness\"", "role = \"ledger-equality\""),
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(valid, invalid),
+            root.path(),
+        ));
+    }
+    parse_budget_manifest(
+        &BUDGET.replace("role = \"correctness\"", "role = \"performance\""),
+        root.path(),
+    )
+    .expect("independently valid performance role");
+}
+
+#[test]
+fn nested_unknown_fields_are_rejected() {
+    let root = budget_repo();
+    for budget in [
+        BUDGET.replace(
+            "expected_num_cpus = 8",
+            "expected_num_cpus = 8\nunknown_platform = true",
+        ),
+        BUDGET.replace(
+            "build_profile = \"release\"",
+            "build_profile = \"release\"\nunknown_method = true",
+        ),
+        BUDGET.replace(
+            "evaluated_at = \"P23\"",
+            "evaluated_at = \"P23\"\nunknown_admission = true",
+        ),
+        BUDGET.replace(
+            "workload = \"fixture\"",
+            "workload = \"fixture\"\nunknown_corpus = true",
+        ),
+    ] {
+        assert_malformed(parse_budget_manifest(&budget, root.path()));
+    }
+}
+
+#[test]
 fn empty_waiver_role_is_rejected() {
     let root = budget_repo();
     assert_malformed(parse_budget_manifest(
@@ -497,12 +717,15 @@ fn weakened_waiver_policy_is_rejected() {
 }
 
 #[test]
-fn empty_method_descriptions_are_rejected() {
+fn empty_admission_descriptions_are_rejected() {
     let root = budget_repo();
     for (valid, empty) in [
-        ("statistic = \"median\"", "statistic = \"\""),
         (
-            "confidence_rule = \"accept the median of three repetitions\"",
+            "statistic = \"geometric mean of paired throughput ratios\"",
+            "statistic = \"\"",
+        ),
+        (
+            "confidence_rule = \"two-sided 95 percent paired-bootstrap interval\"",
             "confidence_rule = \"\"",
         ),
     ] {

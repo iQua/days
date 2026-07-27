@@ -102,27 +102,38 @@ remain unchanged.
 ### Budget schema repair and stage boundary
 
 T0's budget schema could not represent the machine-checkable inputs required by
-the plan. T1 upgrades only the budget schema to version 2, adding reusable
-platform, method, corpus, threshold, and waiver sections. It validates corpus
-paths and hashes against repository bytes and rejects missing platform fields,
-zero repetitions, empty corpus or thresholds, malformed or mismatched hashes,
-and an empty waiver authority. Phase, evidence, dependency-baseline, and trace
-schemas remain at version 1.
+the plan. T1 upgrades only the budget schema to version 3. The schema separates
+the common measurement method from the P23 admission rule and adds structured
+platform, corpus-role, workload, and mode fields. It validates corpus paths and
+hashes against repository bytes. It also rejects incomplete methods, empty
+corpora or thresholds, malformed hashes, and an empty waiver authority. Phase,
+evidence, dependency-baseline, and trace schemas remain at version 1.
 
 `docs/days-executor/budgets/retirement-budget.toml` freezes the developer's
 Apple M5 Max, macOS build `26A5388g`, Rust 1.96.0 toolchain, three warmups,
 fifteen repetitions, the paired-bootstrap confidence rule, the no-regression
 geometric-mean threshold, the 20 percent per-workload limit, and maintainer
-waiver authority. It contains no measured value.
+waiver authority. The method applies to P01 reference collection and P23
+candidate runs. P01 records absolute Nexosim measurements and evaluates no
+threshold. P23 selects the faster median Nexosim mode per workload, with ST as
+the exact-tie winner, before applying the frozen admission statistic. The
+budget contains no measured value.
 
-This is stage 1. The budget file is parsed and golden-checked but is
-intentionally absent from the phase metadata's `[[budgets]]` array. No
-`frozen_at_commit`, `run_commit`, or `days_gpu_commit` exists yet. Stage 2 adds
-those bindings after the stage-1 commit exists, then reruns measurements from
-that descendant commit. This preserves T0's fail-closed ancestry checks without
-inventing self-referential provenance.
+The stage-2a amendment remains intentionally absent from the phase metadata's
+`[[budgets]]` array. No `frozen_at_commit`, `run_commit`, or `days_gpu_commit`
+exists yet. The owner commits this amendment as F2. P01 then records baselines
+at F2 in commit A, and commit B adds the budget, measurement, and archive
+bindings. This sequence preserves T0's fail-closed ancestry checks.
 
 ### Corpus and comparison boundaries
+
+The corpus role and comparison boundary are independent axes. `role` records
+why a fixture exists: `correctness` or `performance`. `comparison_boundary`
+records the strongest comparison the fixture admits. A collapsed enum would
+permit `role = "ledger-equality"` beside
+`comparison_boundary = "terminal-observation"`, a contradictory state that
+would need a cross-field rule. The orthogonal encoding cannot express that
+contradiction.
 
 The three exact-ledger fixtures under `configs/migration/` use single-threaded
 Nexosim, FIFO/TailDrop, one-nanosecond quantization, fixed seed 1000, constant
@@ -141,8 +152,45 @@ No RED decision appears in the exact corpus.
 `configs/tcp_simple.toml` and `configs/ci/leanguard_dcqcn.toml` are explicitly
 `terminal-observation`. Their full transition ordering is outside v1 lowering,
 but their source/port/sink terminal state exercises the digest mechanism. The
-complete paths, content hashes, feature sets, commands, and boundaries are in
-`docs/days-executor/evidence/P01/retirement-corpus.toml`.
+five entries have `role = "correctness"`.
+
+The performance role uses eight tracked configs from the existing benchmark
+suite. The fixed order is:
+
+- `fattree_k4_f8_st.toml`, then `fattree_k4_f8_mt.toml`;
+- `fattree_k8_f64_st.toml`, then `fattree_k8_f64_mt.toml`;
+- `fattree_k16_f512_st.toml`, then `fattree_k16_f512_mt.toml`;
+- `fattree_k32_f4096_st.toml`, then `fattree_k32_f4096_mt.toml`.
+
+All eight configs use fixed seed 1000, FIFO/TailDrop, and open-loop packet
+distributions. Their strongest frozen boundary is `terminal-observation`; a
+performance-length run does not claim full-key ledger equality. The files
+remain byte-identical to commit `cfdcfcb`.
+
+The benchmark configs omit top-level `duration`. The language default at
+`src/topos/topo.rs:416` supplies an effective simulation duration of 1500.0
+seconds. `default_simulation_duration_is_pinned_to_1500_seconds` guards that
+source default. Each later measurement record captures the logged simulated
+end time, and the runner rejects a value other than 1500.0 seconds.
+
+The MT configs also omit `num_threads`. Nexosim therefore takes
+`num_cpus::get()` at `src/topos/topo.rs:447`; the named platform declares an
+expected value of 18. Each sample records the effective thread count already
+reported by Days, and the runner rejects an MT sample whose count differs from
+18. The method records implicit inputs and enforces them instead of editing
+hashed benchmark artifacts.
+
+The instrumentation added in this amendment captures `timer.elapsed()`
+immediately after `sim.step_until` returns. This `sim_execution` boundary
+excludes concurrency-sampler shutdown, statistics collection, and logger
+flush. The existing elapsed log remains unchanged. The runner measures
+`end_to_end` around the complete child process and records both values.
+
+Calibration was authorized but not used for this committed benchmark corpus.
+No timing selected corpus membership or changed a config value. The F2 runner
+will enforce the frozen 5 ms sample floor; its observed margin is not yet
+measured. The complete paths, hashes, commands, roles, modes, and boundaries
+are in `docs/days-executor/evidence/P01/retirement-corpus.toml`.
 
 ### Legacy `quantize_after` boundary
 
@@ -204,12 +252,12 @@ requires both feature-on and feature-off `switches.csv` files to remain empty
 for this fixture.
 
 Small characterization tables, a ledger sample, a complete small terminal
-digest, feature-off aggregate goldens, corpus inventory, and budget live under
-`docs/days-executor/evidence/P01/` and are checksummed by
-`t1-evidence.toml`. Stage-1 raw ledgers and digests are present in
-`days-gpu/evidence/P01/` with content hashes but no commit citation. Stage 2
-will add the formal archive and measurement manifests after both repositories
-contain immutable commits.
+digest, feature-off aggregate goldens, the complete 13-entry corpus inventory,
+and the budget live under `docs/days-executor/evidence/P01/` and are
+checksummed by `t1-evidence.toml`. The superseded uncommitted `days-gpu`
+evidence tree is absent. A later stage regenerates raw artifacts and adds the
+formal archive and measurement manifests after both repositories contain
+immutable commits.
 
 ### Migration and exclusions
 
