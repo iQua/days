@@ -18,7 +18,3 @@ docs/site/**
 
 # Leanguard
 leanguard_corpus/**
-
-# Days Executor generated and GPU inspection trees
-target/gpu-inspect/
-target/days-executor-generated/

@@ -11,11 +11,6 @@ use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;
 use crate::next_switch_id;
-#[cfg(feature = "migration_ledger")]
-use crate::utils::logger::{
-    CsvLogger, MigrationLedgerRow, MigrationModelKind, MigrationTransitionKind, Report,
-    ReportTiming, migration_time_to_ns,
-};
 
 pub struct PacketSwitch {
     switch_id: usize,
@@ -35,10 +30,6 @@ pub struct PacketSwitch {
     /// senders for sending inbound packets to outbound ports
     /// switch_id -> outputs to downstream schedulers or endpoints
     pub outputs: HashMap<usize, Output<Packet>>,
-    #[cfg(feature = "migration_ledger")]
-    migration_node_id: Option<usize>,
-    #[cfg(feature = "migration_ledger")]
-    migration_sequence: u64,
 }
 
 impl PacketSwitch {
@@ -59,10 +50,6 @@ impl PacketSwitch {
             packets_received: 0,
             outputs,
             time: 0.0, // Initialize local simulation time
-            #[cfg(feature = "migration_ledger")]
-            migration_node_id: None,
-            #[cfg(feature = "migration_ledger")]
-            migration_sequence: 0,
         }
     }
 
@@ -76,42 +63,6 @@ impl PacketSwitch {
 
     pub fn set_r_fib(&mut self, flow_id: usize, next_id: usize) {
         self.r_fib.insert(flow_id, next_id);
-    }
-
-    #[cfg(feature = "migration_ledger")]
-    pub fn set_migration_node_id(&mut self, node_id: usize) {
-        self.migration_node_id = Some(node_id);
-    }
-
-    #[cfg(feature = "migration_ledger")]
-    pub fn migration_node_id(&self) -> Option<usize> {
-        self.migration_node_id
-    }
-
-    #[cfg(feature = "migration_ledger")]
-    fn log_migration_forward(&mut self, packet: &Packet) {
-        let Some(node_id) = self.migration_node_id else {
-            return;
-        };
-        let model_sequence = self.migration_sequence;
-        self.migration_sequence += 1;
-        CsvLogger::try_log_report(
-            Report::MigrationLedgerRow(MigrationLedgerRow {
-                time_ns: migration_time_to_ns(self.time),
-                model_kind: MigrationModelKind::Switch,
-                transition: MigrationTransitionKind::SwitchForward,
-                node_id: node_id as u64,
-                peer_node_id: None,
-                flow_id: packet.flow_id as u64,
-                packet_id: packet.packet_id as u64,
-                model_sequence,
-                size_bytes: packet.size as u64,
-                queue_occupancy_packets: None,
-                queue_occupancy_bytes: None,
-                departure_time_ns: None,
-            }),
-            ReportTiming::InProgress,
-        );
     }
 
     #[instrument(skip(self, _cx))]
@@ -162,8 +113,6 @@ impl PacketSwitch {
 
             // forwards packets that are not acknowledgments to their corresponding downstream elements
             let switch_id = self.fib[&packet.flow_id];
-            #[cfg(feature = "migration_ledger")]
-            self.log_migration_forward(&packet);
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
                 output.send(packet).await;
@@ -176,8 +125,6 @@ impl PacketSwitch {
 
             // forwards acknowledgment packets to their corresponding upstream elements
             let switch_id = self.r_fib[&packet.flow_id];
-            #[cfg(feature = "migration_ledger")]
-            self.log_migration_forward(&packet);
 
             if let Some(output) = self.outputs.get_mut(&switch_id) {
                 output.send(packet).await;
