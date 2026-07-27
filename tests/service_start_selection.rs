@@ -13,6 +13,7 @@ use nexosim::time::MonotonicTime;
 use days::flows::packet::Packet;
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::drr::DRRServer;
+use days::schedulers::port::Port;
 use days::schedulers::wrr::WRRServer;
 
 struct ScriptedPacketSource {
@@ -47,14 +48,18 @@ impl Model for ScriptedPacketSource {
         registry
     }
 
-    async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
-        for packet in &self.packets {
-            cx.schedule_event(
-                Duration::from_secs_f64(packet.time),
-                &Self::EMIT_SID,
-                packet.clone(),
-            )
-            .unwrap();
+    async fn init(mut self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
+        for packet in std::mem::take(&mut self.packets) {
+            if packet.time == 0.0 {
+                self.emit(packet, cx).await;
+            } else {
+                cx.schedule_event(
+                    Duration::from_secs_f64(packet.time),
+                    &Self::EMIT_SID,
+                    packet,
+                )
+                .unwrap();
+            }
         }
         self.into()
     }
@@ -88,6 +93,58 @@ fn assert_only_capacity_valid_packets_departed(mut reader: impl EventSinkReader<
             "packet {packet_id} departed at {actual}, expected {expected}"
         );
     }
+}
+
+#[test]
+fn fifo_rounding_does_not_delay_future_service_starts() {
+    let mut packets: Vec<_> = (0..20)
+        .map(|packet_id| Packet::new(64, packet_id, 0, 0.0))
+        .collect();
+    packets.push(Packet::new(1_280, 20, 0, 101e-9));
+
+    let mut source = ScriptedPacketSource::new(packets);
+    let mut scheduler = Port::new(
+        100e9,
+        1_280,
+        CapacityUnit::Bytes,
+        DropStrategy::TailDrop,
+        0.0,
+    );
+    let source_mbox = Mailbox::new();
+    let scheduler_mbox = Mailbox::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
+
+    source
+        .output
+        .connect(Port::packet_received, &scheduler_mbox);
+    scheduler.output.connect_sink(writer);
+
+    let t0 = MonotonicTime::EPOCH;
+    let mut sim = SimInit::with_num_threads(1)
+        .add_model(source, source_mbox, "Source")
+        .add_model(scheduler, scheduler_mbox, "FIFO")
+        .init(t0)
+        .unwrap();
+
+    sim.step_until(t0 + Duration::from_nanos(300)).unwrap();
+
+    let mut observed = Vec::new();
+    while let Some(packet) = reader.try_read() {
+        observed.push((
+            packet.packet_id,
+            Duration::from_secs_f64(packet.time).as_nanos(),
+        ));
+    }
+
+    let mut expected: Vec<_> = (0..20)
+        .map(|packet_id| (packet_id, (packet_id as u128 + 1) * 5))
+        .collect();
+    expected.push((20, 203));
+
+    assert_eq!(
+        observed, expected,
+        "the backlog must depart by 100 ns so the 101 ns arrival is admitted"
+    );
 }
 
 #[test]
