@@ -11,6 +11,7 @@
 !docs/days-executor/evidence/P01/explicit-terminal-digest.csv
 !docs/days-executor/evidence/P01/explicit-sources-default.csv
 !docs/days-executor/evidence/P01/explicit-sinks-default.csv
+!docs/days-executor/evidence/P01/baselines/*.csv
 logs/**
 
 # RepoPrompt
