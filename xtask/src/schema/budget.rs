@@ -241,7 +241,7 @@ impl BudgetResolvedDefault {
 pub struct BudgetAdmission {
     /// Phase at which admission is evaluated.
     pub evaluated_at: String,
-    /// Statistic computed from paired candidate and baseline measurements.
+    /// Statistic computed from independent candidate and baseline measurements.
     pub statistic: String,
     /// Confidence or noise-tolerance rule.
     pub confidence_rule: String,

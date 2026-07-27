@@ -18,6 +18,7 @@ struct RetirementCorpus {
 struct CorpusFixture {
     path: String,
     comparison_boundary: String,
+    workload: String,
     ledger_path: Option<String>,
     ledger_hash: Option<String>,
 }
@@ -54,6 +55,24 @@ fn exact_ledger_fixtures() -> Vec<ExactLedgerFixture> {
         .fixtures
         .into_iter()
         .filter(|fixture| fixture.comparison_boundary == "exact-ledger")
+        .collect::<Vec<_>>();
+    let mut declared = exact
+        .iter()
+        .map(|fixture| (fixture.workload.as_str(), fixture.path.as_str()))
+        .collect::<Vec<_>>();
+    declared.sort_unstable();
+    let mut expected = vec![
+        ("migration-explicit", "configs/migration/explicit.toml"),
+        ("migration-torus", "configs/migration/torus.toml"),
+        ("migration-fattree-k4", "configs/migration/fattree.toml"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        declared, expected,
+        "{RETIREMENT_CORPUS_PATH} exact-ledger fixture set changed"
+    );
+    exact
+        .into_iter()
         .map(|fixture| {
             let ledger_path = fixture.ledger_path.unwrap_or_else(|| {
                 panic!("{} declares exact-ledger without ledger_path", fixture.path)
@@ -81,12 +100,7 @@ fn exact_ledger_fixtures() -> Vec<ExactLedgerFixture> {
                 golden,
             }
         })
-        .collect::<Vec<_>>();
-    assert!(
-        !exact.is_empty(),
-        "{RETIREMENT_CORPUS_PATH} must declare at least one exact-ledger fixture"
-    );
-    exact
+        .collect()
 }
 
 fn run_fixture(root: &Path, name: &str, config_path: &str, configured_log_path: &str) -> PathBuf {

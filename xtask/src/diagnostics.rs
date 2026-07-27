@@ -193,7 +193,7 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         code: "DAYS-AUDIT-0026",
         slug: "budget-freeze-invalid",
         severity: Severity::Error,
-        summary: "A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites an artifact not introduced after the freeze",
+        summary: "A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites a measurement artifact path without an adding commit after the freeze",
     },
     DiagnosticDefinition {
         code: "DAYS-AUDIT-0027",

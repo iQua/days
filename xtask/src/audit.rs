@@ -1602,7 +1602,15 @@ fn check_measurement_artifact_introduction(
         let subject = format!("{evidence_path} artifacts[{index}]");
         match git(
             repo_root,
-            &["log", "--diff-filter=A", "--format=%H", &range, "--", path],
+            &[
+                "--literal-pathspecs",
+                "log",
+                "--diff-filter=A",
+                "--format=%H",
+                &range,
+                "--",
+                path,
+            ],
         ) {
             Ok(output) if output.status.success() => {
                 if output.stdout.is_empty() {
@@ -1611,7 +1619,7 @@ fn check_measurement_artifact_introduction(
                         "DAYS-AUDIT-0026",
                         &subject,
                         format!(
-                            "measurement artifact {path} was not introduced after frozen_at_commit {frozen_at_commit} and by run_commit {run_commit}"
+                            "measurement artifact path {path} has no adding commit after frozen_at_commit {frozen_at_commit} and by run_commit {run_commit}"
                         ),
                     );
                 }
@@ -1621,7 +1629,7 @@ fn check_measurement_artifact_introduction(
                 "DAYS-AUDIT-0026",
                 &subject,
                 format!(
-                    "cannot determine when measurement artifact {path} was introduced: {}",
+                    "cannot inspect adding commits for measurement artifact path {path}: {}",
                     output_text(&output)
                 ),
             ),
@@ -1630,7 +1638,7 @@ fn check_measurement_artifact_introduction(
                 "DAYS-AUDIT-0026",
                 &subject,
                 format!(
-                    "cannot determine when measurement artifact {path} was introduced: {error}"
+                    "cannot inspect adding commits for measurement artifact path {path}: {error}"
                 ),
             ),
         }

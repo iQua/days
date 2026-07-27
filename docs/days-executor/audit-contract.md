@@ -111,7 +111,7 @@ Information diagnostics use the same format and never affect the exit status.
 | `DAYS-AUDIT-0023` | `reproduce-command-failed` | error | A declared reproduce test command exited non-zero. |
 | `DAYS-AUDIT-0024` | `reproduce-no-host-command` | error | No declared reproduce test command matches the host platform. |
 | `DAYS-AUDIT-0025` | `audit-internal-error` | error | An audit check attempted to emit an unknown diagnostic code. |
-| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites an artifact not introduced after the freeze. |
+| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites a measurement artifact path without an adding commit after the freeze. |
 | `DAYS-AUDIT-0027` | `measurement-evidence-invalid` | error | Measurement evidence omits its required binding, a declared budget has no citing measurement, or a required consumer does not reuse the exact frozen budget identity. |
 | `DAYS-AUDIT-0028` | `archive-check-skipped` | info | Archive verification was skipped because the `days-gpu` repository is unavailable. |
 
@@ -238,6 +238,10 @@ parents from `run_commit` must reach the freeze. Equality is rejected because
 it means the measurement was committed together with the budget. Every
 measurement artifact path must have an adding commit within
 `(frozen_at_commit, run_commit]`; an identical blob at the freeze is rejected.
+The adding-commit check proves pathname appearance, not content origination.
+A rename into the declared pathname or a delete followed by a re-add can
+satisfy it. Independently, the audit checks the declared blob hash at
+`run_commit`.
 An uncommitted budget, unknown or unreachable commit, missing path, ambiguous
 history, or different budget bytes fails closed.
 
@@ -276,8 +280,8 @@ Each `artifacts` table uses these fields:
 
 A golden artifact's hash must match its checked-in file. A measurement
 artifact must be readable from `run_commit` with `git cat-file`, its hash must
-match that committed blob, and its path must have been introduced within the
-audited post-freeze range. Golden and measurement artifacts must not carry
+match that committed blob, and its pathname must have an adding commit within
+the audited post-freeze range. Golden and measurement artifacts must not carry
 archive-only provenance. An archive artifact must carry every archive-only
 field. URL fields are not part of the version 1 archive contract.
 
@@ -308,8 +312,8 @@ the current budget bytes with `content_hash`, compares the budget blob at the
 phase metadata's `frozen_at_commit` with that same hash, and requires a strict,
 merge-free, first-parent history to the measurement's `run_commit`. Equal
 commits are rejected as a measurement committed together with its budget.
-Every measurement path must be added in that range and must not contain the
-same bytes at the freeze.
+Every measurement pathname must have an adding commit in that range and must
+not contain the same bytes at the freeze.
 
 This guarantee is tamper-evident against published history, not tamper-proof
 against an author before publication. A coherent local rewrite can construct a
@@ -585,7 +589,10 @@ and the commit containing those exact bytes. Every measurement record embeds
 the budget path, its exact hash, and the measured code's `run_commit`. The
 audit verifies that the freeze commit contains the recorded bytes, reaches the
 run commit through a strict merge-free first-parent range, and that every
-measurement artifact is introduced in that range with its declared content.
+measurement artifact pathname has an adding commit in that range. Separately,
+the blob at `run_commit` must match the declared hash, and identical bytes at
+the freeze are rejected. The adding-commit check does not prove where the
+content originated.
 Equality fails because the measurement would have been committed together with
 the budget. The result is tamper-evident against published history. Preventing
 a coherent pre-publication rewrite requires an external published or signed

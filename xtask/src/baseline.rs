@@ -61,7 +61,7 @@ pub fn collect(repo_root: &Path, output_dir: &Path) -> Result<(), String> {
         parse_budget_manifest(&budget_input, repo_root).map_err(|error| error.to_string())?;
     validate_output_path(repo_root, output_dir)?;
     let preflight = preflight(repo_root, &budget)?;
-    prepare_output_dir(output_dir, &preflight.fixtures)?;
+    prepare_output_dir(output_dir)?;
 
     collect_correctness(repo_root, output_dir, &budget, &preflight.fixtures)?;
     let build = build_timed_binary(repo_root, output_dir, &budget, preflight.feature_probe)?;
@@ -293,7 +293,7 @@ fn expected_fixture_command(fixture: &RetirementCorpusFixture) -> Vec<String> {
     }
 }
 
-fn prepare_output_dir(output_dir: &Path, fixtures: &[Fixture]) -> Result<(), String> {
+fn prepare_output_dir(output_dir: &Path) -> Result<(), String> {
     if !output_dir.exists() {
         fs::create_dir_all(output_dir).map_err(display_io)?;
         return Ok(());
@@ -306,40 +306,15 @@ fn prepare_output_dir(output_dir: &Path, fixtures: &[Fixture]) -> Result<(), Str
         ));
     }
 
-    let expected: Vec<String> = fixtures
-        .iter()
-        .filter(|fixture| fixture.role == CorpusRole::Correctness)
-        .map(digest_name)
-        .collect();
-    let mut present = BTreeSet::new();
-    for entry in fs::read_dir(output_dir).map_err(display_io)? {
-        let entry = entry.map_err(display_io)?;
-        let entry_metadata = fs::symlink_metadata(entry.path()).map_err(display_io)?;
-        if entry_metadata.file_type().is_symlink()
-            || !entry_metadata.is_file()
-            || entry_metadata.len() == 0
-        {
-            return Err(format!(
-                "partial baseline output is not a nonempty regular file: {}",
-                entry.path().display()
-            ));
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "partial baseline output name is not UTF-8".to_owned())?;
-        present.insert(name);
-    }
-    if present.len() >= expected.len() {
+    if fs::read_dir(output_dir)
+        .map_err(display_io)?
+        .next()
+        .transpose()
+        .map_err(display_io)?
+        .is_some()
+    {
         return Err(format!(
-            "existing baseline output does not prove a pre-timing strict prefix: {}",
-            output_dir.display()
-        ));
-    }
-    let prefix: BTreeSet<String> = expected.into_iter().take(present.len()).collect();
-    if present != prefix {
-        return Err(format!(
-            "existing baseline output is not the ordered correctness prefix: {}",
+            "baseline output directory must be empty: {}",
             output_dir.display()
         ));
     }
@@ -963,10 +938,13 @@ fn parse_cfg_features(text: &str) -> BTreeSet<String> {
 }
 
 fn verify_timed_features(features: &BTreeSet<String>) -> Result<(), String> {
-    if features.contains(MIGRATION_LEDGER_FEATURE) {
-        Err("timed feature probe enabled migration_ledger".to_owned())
-    } else {
+    if features.is_empty() {
         Ok(())
+    } else {
+        Err(format!(
+            "timed feature probe enabled Cargo features: {}",
+            features.iter().cloned().collect::<Vec<_>>().join(",")
+        ))
     }
 }
 
@@ -1160,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn correctness_resume_does_not_overwrite_an_existing_digest() {
+    fn copy_nonempty_does_not_overwrite_an_existing_file() {
         let repo = TempDir::new().expect("temporary repository");
         let source = repo.path().join("source.csv");
         let destination = repo.path().join("destination.csv");
@@ -1237,25 +1215,18 @@ mod tests {
     }
 
     #[test]
-    fn partial_output_requires_an_ordered_correctness_prefix() {
+    fn existing_partial_output_is_rejected() {
         let root = repository_root();
         let budget = frozen_budget();
         let fixtures = resolve_fixtures(&root, &budget).expect("resolve frozen corpus");
         let output = TempDir::new().expect("temporary output");
-        let correctness: Vec<_> = fixtures
+        let first = fixtures
             .iter()
-            .filter(|fixture| fixture.role == CorpusRole::Correctness)
-            .collect();
-
-        for fixture in correctness.iter().take(4) {
-            fs::write(output.path().join(digest_name(fixture)), "digest\n")
-                .expect("write prefix digest");
-        }
-        prepare_output_dir(output.path(), &fixtures).expect("accept strict prefix");
-
-        fs::write(output.path().join(digest_name(correctness[4])), "digest\n")
-            .expect("write complete correctness set");
-        assert!(prepare_output_dir(output.path(), &fixtures).is_err());
+            .find(|fixture| fixture.role == CorpusRole::Correctness)
+            .expect("correctness fixture");
+        fs::write(output.path().join(digest_name(first)), "digest\n")
+            .expect("write partial output");
+        assert!(prepare_output_dir(output.path()).is_err());
     }
 
     #[test]
@@ -1271,6 +1242,7 @@ mod tests {
         assert!(features.contains("l2"));
         assert!(features.contains("migration_ledger"));
         assert!(verify_timed_features(&features).is_err());
+        assert!(verify_timed_features(&parse_cfg_features("feature=\"l2\"\n")).is_err());
         assert!(verify_timed_features(&parse_cfg_features("unix\n")).is_ok());
     }
 

@@ -156,6 +156,11 @@ test_function = "measurement_artifact_precomputed_at_freeze_is_rejected"
 expected_code = "DAYS-AUDIT-0026"
 
 [[mutations]]
+fault_class = "measurement artifact path with glob metacharacters"
+test_function = "measurement_artifact_pathspec_is_literal"
+expected_code = "DAYS-AUDIT-0026"
+
+[[mutations]]
 fault_class = "merge commit in freeze-to-measurement history"
 test_function = "merge_in_measurement_history_is_rejected"
 expected_code = "DAYS-AUDIT-0026"

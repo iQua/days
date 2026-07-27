@@ -1053,12 +1053,68 @@ fn measurement_artifact_precomputed_at_freeze_is_rejected() {
     assert_code_message(
         &report,
         "DAYS-AUDIT-0026",
-        "was not introduced after frozen_at_commit",
+        "has no adding commit after frozen_at_commit",
     );
     assert_code_message(
         &report,
         "DAYS-AUDIT-0026",
         "already had identical content at frozen_at_commit",
+    );
+}
+
+#[test]
+fn measurement_artifact_pathspec_is_literal() {
+    let fixture = Fixture::new();
+    let literal_path = "docs/days-executor/evidence/P90/measurement[1].txt";
+    write(fixture.root(), literal_path, "before measurement\n");
+    run(fixture.root(), &["add", literal_path]);
+    run(
+        fixture.root(),
+        &["commit", "-q", "-m", "Freeze literal-path fixture"],
+    );
+    let frozen_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
+
+    write(fixture.root(), literal_path, "after measurement\n");
+    write(
+        fixture.root(),
+        "docs/days-executor/evidence/P90/measurement1.txt",
+        "glob decoy\n",
+    );
+    run(
+        fixture.root(),
+        &[
+            "add",
+            literal_path,
+            "docs/days-executor/evidence/P90/measurement1.txt",
+        ],
+    );
+    run(
+        fixture.root(),
+        &["commit", "-q", "-m", "Record literal-path measurement"],
+    );
+    let run_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
+    let artifact_hash = file_hash(&fixture.root().join(literal_path));
+    let old_artifact_hash = file_hash(
+        &fixture
+            .root()
+            .join("docs/days-executor/evidence/P90/measurement.txt"),
+    );
+
+    fixture.mutate_phase(|value| value.replace(&fixture.frozen_commit, &frozen_commit));
+    mutate(&fixture.measurement_path(), |value| {
+        value
+            .replace(&fixture.measurement_commit, &run_commit)
+            .replace(
+                "docs/days-executor/evidence/P90/measurement.txt",
+                literal_path,
+            )
+            .replace(&old_artifact_hash, &artifact_hash)
+    });
+
+    assert_code_message(
+        &fixture.audit(),
+        "DAYS-AUDIT-0026",
+        "has no adding commit after frozen_at_commit",
     );
 }
 

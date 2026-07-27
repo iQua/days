@@ -131,13 +131,13 @@ but its measurement manifest is no longer live task evidence. It is superseded
 because review required budget schema and method changes and because its
 recorded producer, `/private/tmp/t1_f3_runner`, was not reproducible from the
 repository. The A2 records under `baselines-v2` are authoritative for the F4
-budget. New paths let the audit prove each artifact was introduced after the
-freeze. B2 will bind the result after the owner commits A2; P01 does not guess
-that commit SHA.
+budget. Their paths have adding commits in the audited post-freeze range. B2
+binds the F4 freeze at `332dac931f7c63848315df13c9aba13f8bb2386f` to the A2
+run at `ba99ec5fe917d1017bf821043ffc7e9407514106`.
 
 The checked-in `cargo xtask nexosim-baseline collect` runner is the only
 producer for A2. It builds timed Days with the exact frozen Cargo flags, asks
-`rustc --print cfg` for the feature set, and rejects `migration_ledger`. It
+`rustc --print cfg` for the feature set, and requires that set to be empty. It
 records the binary SHA-256 and toolchain in a build record. It executes the
 frozen warmups, repetitions, manifest order, duration guard, thread-count
 guard, and wall-time floor. A separate untimed `perf_stats` build obtains the
@@ -286,8 +286,8 @@ flush. The existing elapsed log remains unchanged. The runner measures
 
 Calibration was authorized but not used for this committed benchmark corpus.
 No timing selected corpus membership or changed a config value. The F3 runner
-enforced the frozen 5 ms sample floor. The smallest recorded primary sample was
-20.440958 ms, so no sample failed the floor. The complete paths, hashes,
+and the A2 runner enforced the frozen 5 ms sample floor. No recorded sample
+failed it. The complete paths, hashes,
 commands, roles, modes, and boundaries are in
 `docs/days-executor/evidence/P01/retirement-corpus.toml`.
 
@@ -335,67 +335,26 @@ Applying the frozen rule selects:
 | k16/f512 | ST | 3,751,102 | 2,148,077.144567 |
 | k32/f4096 | MT | 21,600,888 | 3,020,905.080055 |
 
-The medians changed from the superseded record as follows. Negative percentages
-mean the A2 run completed faster:
+The authoritative A2 selection keeps ST for k4/f8, k8/f64, and k16/f512, and
+selects accelerated MT for k32/f4096. The superseded F3 freeze
+`3c13ad4c8e32b7f8affad7e991c1a46586125fe7` and A run
+`6b4b8a6ea1e795b7fda50cb4910d9d00dc6493ca` remain on disk for provenance, but
+their untracked producer did not verify timed features. Those figures are not
+live evidence and must not be cited.
 
-| Workload | Mode | `sim_execution` old → A2 | Delta | `end_to_end` old → A2 | Delta |
-| --- | --- | ---: | ---: | ---: | ---: |
-| k4/f8 | ST | 0.020637416 → 0.020691875 | +0.264% | 0.024702500 → 0.023660583 | -4.218% |
-| k4/f8 | MT | 0.151459833 → 0.152690417 | +0.812% | 0.155970250 → 0.155797583 | -0.111% |
-| k8/f64 | ST | 0.202448375 → 0.196256958 | -3.058% | 0.208347959 → 0.199970834 | -4.021% |
-| k8/f64 | MT | 0.434011542 → 0.426733583 | -1.677% | 0.440528500 → 0.431526583 | -2.043% |
-| k16/f512 | ST | 1.880578541 → 1.746260375 | -7.142% | 1.905630292 → 1.768118458 | -7.216% |
-| k16/f512 | MT | 1.945811083 → 1.936089708 | -0.500% | 1.976358750 → 1.964281458 | -0.611% |
-| k32/f4096 | ST | 17.386321625 → 14.452573792 | -16.874% | 18.615065084 → 15.622496417 | -16.076% |
-| k32/f4096 | MT | 7.994751958 → 7.150468958 | -10.560% | 9.262936375 → 8.368827041 | -9.653% |
+Across the eight primary medians, six fell while both k4 modes rose, and the
+superseded and current runs differ by up to about twenty percent at the largest
+workload. Non-uniform and non-monotone per-event deltas and tighter spreads
+rule out extra measurement instrumentation; the discrepancy is attributable
+to background CPU load on the developer laptop. A future phase may re-measure
+the baseline on a quiet machine if it needs tighter absolute numbers.
 
-The crossover remains between k16/f512 and k32/f4096, a shift of zero measured
-workload steps. The MT/ST primary ratio at k16 rose from `1.034687486` to
-`1.108706202`; ST remains selected. At k32 it rose from `0.459829982` to
-`0.494754018`; MT remains selected, with the ST/MT speed ratio decreasing from
-`2.174716828` to `2.021206425`.
-
-The ranking held: ST remains the selected configuration for k4/f8, k8/f64,
-and k16/f512, while accelerated MT remains selected for k32/f4096. The
-superseded run overstated absolute cost, most visibly by 16.874 percent for
-k32 ST and 10.560 percent for k32 MT. It got the selected modes right but
-cannot serve as an absolute baseline.
-
-### Superseded F3/A Nexosim reference
-
-The following F3/A record is retained unchanged for traceability and is not the
-authoritative result for the forthcoming F4 budget. P01 ran three unrecorded
-warmup rounds and fifteen recorded rounds in manifest
-order. Timed runs used `cargo build --locked --release --bin days` without
-`migration_ledger`. Correctness runs used the diagnostic feature and recorded
-no wall-time result. Every performance sample reached 1500.0 simulated seconds
-and recorded one effective thread for ST or eighteen for MT.
-
-The table reports seconds as median `[minimum, maximum]` across the fifteen
-recorded samples:
-
-| Workload | Mode | `sim_execution` | `end_to_end` |
-| --- | --- | ---: | ---: |
-| k4/f8 | ST | 0.020637416 [0.020440958, 0.021007375] | 0.024702500 [0.024295000, 0.025419042] |
-| k4/f8 | MT | 0.151459833 [0.149931250, 0.160485875] | 0.155970250 [0.154498250, 0.164683541] |
-| k8/f64 | ST | 0.202448375 [0.196561625, 0.204402375] | 0.208347959 [0.200876084, 0.210197792] |
-| k8/f64 | MT | 0.434011542 [0.425276541, 0.474826250] | 0.440528500 [0.431730334, 0.481116500] |
-| k16/f512 | ST | 1.880578541 [1.755074542, 2.010002584] | 1.905630292 [1.778508125, 2.035526250] |
-| k16/f512 | MT | 1.945811083 [1.933370875, 2.242102334] | 1.976358750 [1.963363459, 2.273613208] |
-| k32/f4096 | ST | 17.386321625 [15.331194875, 19.189513625] | 18.615065084 [16.517648833, 20.418935791] |
-| k32/f4096 | MT | 7.994751958 [7.333259875, 9.334476458] | 9.262936375 [8.557429875, 10.604367791] |
-
-The primary medians put MT 7.3 times behind ST at k4/f8 and 2.1 times behind
-at k8/f64. The modes are close at k16/f512, where ST has the lower median. MT
-becomes 2.2 times faster at k32/f4096. The crossover therefore lies between
-k16/f512 and k32/f4096.
-
-Applying the then-frozen rule to these reference medians selects ST for k4/f8,
-k8/f64, and k16/f512, and MT for k32/f4096. The result confirms why the rule
-selects a mode per workload: assuming MT wins would choose the slower reference
-for three of four workloads. P01 records this implication but evaluates no
-admission threshold. The comparison is between the ST and accelerated-MT
-configurations described above, not a pure threading contrast.
+Before the owner identified the load, any variance study would have preceded
+any threshold choice. Choosing a threshold and then measuring what the
+apparatus can resolve would repeat the ordering failure this phase prevents:
+freeze discipline applied to the wrong quantity is still a freeze violation.
+The study became unnecessary once the load source was established, and no
+threshold moved.
 
 The checked-in samples, summary, and five terminal digests total less than
 24 KB. The generated transition ledgers range from 4.5 KB to 78.6 KB, and the
@@ -502,9 +461,12 @@ for this fixture.
 Small characterization tables, a ledger sample, a complete small terminal
 digest, feature-off aggregate goldens, the complete 13-entry corpus inventory,
 and the budget live under `docs/days-executor/evidence/P01/` and are
-checksummed by `t1-evidence.toml`. The measurement manifest cites the seven
-baseline artifacts at commit A and the budget frozen at F3. P01 has no archive
-manifest because the raw outputs did not warrant a separate repository.
+checksummed by `t1-evidence.toml`. The live
+`nexosim-baseline-measurement-v2.toml` manifest cites nine `baselines-v2`
+artifacts at run commit `ba99ec5fe917d1017bf821043ffc7e9407514106`
+against the budget frozen at `332dac931f7c63848315df13c9aba13f8bb2386f`.
+P01 has no archive manifest because the raw outputs did not warrant a separate
+repository.
 
 ### Migration and exclusions
 
