@@ -92,7 +92,6 @@ fn main() {
         CapacityUnit::Packets,
         DropStrategy::RedEcn,
         0.0,
-        None,
     );
 
     let mut sink = PacketSink::new(&source);

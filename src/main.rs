@@ -16,6 +16,11 @@ fn main() {
 
     let path = args[1].clone();
 
+    if let Err(error) = days::validate_config(&path) {
+        eprintln!("Simulation failed: {error}");
+        std::process::exit(1);
+    }
+
     // builds an EnvFilter that reads the RUST_LOG environment variable, defaulting to `info` if
     // not set
 
@@ -35,5 +40,8 @@ fn main() {
         env_logger::init_from_env(env);
     }
 
-    days::run_simulation_from_config(&path).expect("Simulation failed");
+    if let Err(error) = days::run_simulation_from_config(&path) {
+        eprintln!("Simulation failed: {error}");
+        std::process::exit(1);
+    }
 }

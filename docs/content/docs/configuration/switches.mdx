@@ -38,12 +38,14 @@ Supported values:
 
 | Discipline | Scheduler model | Extra required fields |
 |---|---|---|
-| `FIFO` | `Port` | _optional_: `run_batch_size` |
-| `DRR` | `DRRServer` | `weights`, _optional_: `run_batch_size` |
-| `WRR` | `WRRServer` | `weights`, _optional_: `run_batch_size` |
+| `FIFO` | `Port` | none |
+| `DRR` | `DRRServer` | `weights` |
+| `WRR` | `WRRServer` | `weights` |
 | `WFQ` | `WFQServer` | `weights` |
 | `SP` | `SPServer` | `priorities` |
 | `VirtualClock` | `VirtualClockServer` | `vticks` |
+
+Schedulers inspect their queue and select at most one packet whenever link service can start. Packets arriving before the next service start are therefore visible to the next scheduling decision.
 
 ## `switch.drop`
 
@@ -71,14 +73,6 @@ Occupancy fraction used by `drop = "ECN_THRESHOLD"`.
 - Type: `f64` (fraction in `[0, 1]`)
 - Default: `0.8`
 - Meaning (with packet capacity): if `queue_len + 1 > floor(ecn_threshold * capacity)`, the scheduler returns `MarkEcn`.
-
-## `switch.run_batch_size` (optional, FIFO/DRR/WRR)
-
-Maximum number of packets the FIFO (`Port`), DRR (`DRRServer`), or WRR (`WRRServer`) schedulers pre-schedule per invocation.
-
-- Type: `usize`
-- Default: `64`
-- Notes: batching amortizes event queue contention. FIFO always schedules up to this many packets in queue order. DRR batches only consecutive transmissions from the currently serviced class to preserve fairness across classes. WRR batches multiple packets from a single class (up to its weight) so other classes are considered between batches just as in the classic algorithm. Values `< 1` are coerced to `1`.
 
 ## `switch.weights` (required for DRR/WRR/WFQ)
 

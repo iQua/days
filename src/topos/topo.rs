@@ -107,7 +107,6 @@ pub struct SwitchConfig {
     discipline: SchedulingDiscipline,
     drop: DropStrategy,
     ecn_threshold: Option<f64>,
-    run_batch_size: Option<usize>,
     weights: Option<Vec<usize>>,
     priorities: Option<Vec<usize>>,
     vticks: Option<Vec<f64>>,
@@ -391,6 +390,8 @@ impl Topology {
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
+        crate::validate_config(config_path).unwrap_or_else(|error| panic!("{error}"));
+
         // reads the configuration
         let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
@@ -938,7 +939,6 @@ impl Topology {
                     ecn_threshold,
                     weights.clone(),
                 );
-                drr_server.set_run_batch_size(self.switch_config.run_batch_size);
                 #[cfg(feature = "l2_pfc")]
                 {
                     let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
@@ -967,7 +967,6 @@ impl Topology {
                     CapacityUnit::Packets,
                     drop_strategy.clone(),
                     ecn_threshold,
-                    self.switch_config.run_batch_size,
                 );
                 #[cfg(feature = "l2_pfc")]
                 {
@@ -1130,7 +1129,6 @@ impl Topology {
                     ecn_threshold,
                     weights.clone(),
                 );
-                wrr_server.set_run_batch_size(self.switch_config.run_batch_size);
                 #[cfg(feature = "l2_pfc")]
                 {
                     let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
@@ -1569,7 +1567,6 @@ mod ring_allreduce_serialization_tests {
             // If your DropStrategy variant name differs, change it here
             drop: DropStrategy::TailDrop,
             ecn_threshold: None,
-            run_batch_size: None,
             weights: None,
             priorities: None,
             vticks: None,

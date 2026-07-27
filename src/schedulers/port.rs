@@ -72,8 +72,6 @@ pub struct Port {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
-    run_batch_size: usize,
-    run_schedule_scratch: Vec<(Duration, ())>,
     scheduled_departures: VecDeque<Packet>,
 
     /// a vector of packets that have been sent out, only used for unit testing
@@ -85,15 +83,12 @@ impl Port {
     const SEND_SCHEDULED_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
 
-    const DEFAULT_RUN_BATCH_SIZE: usize = 1;
-
     pub fn new(
         rate: f64,
         capacity: usize,
         capacity_unit: CapacityUnit,
         drop_strategy: DropStrategy,
         ecn_threshold: f64,
-        run_batch_size: Option<usize>,
     ) -> Port {
         let scheduler_id = next_scheduler_id();
         let ecn_threshold = if ecn_threshold > 0.0 {
@@ -101,10 +96,6 @@ impl Port {
         } else {
             DEFAULT_ECN_THRESHOLD
         };
-        let run_batch_size = run_batch_size
-            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
-            .max(1);
-
         let packet_drop: Box<dyn PacketDrop + Send + Sync> = match drop_strategy {
             DropStrategy::TailDrop => Box::new(TailDrop::new(capacity, capacity_unit)),
             DropStrategy::RED => Box::new(RED::new(
@@ -149,9 +140,7 @@ impl Port {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
-            run_batch_size,
-            run_schedule_scratch: Vec::with_capacity(run_batch_size),
-            scheduled_departures: VecDeque::with_capacity(run_batch_size),
+            scheduled_departures: VecDeque::new(),
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -409,38 +398,27 @@ impl Port {
                 return;
             }
 
-            self.run_schedule_scratch.clear();
-            let mut service_start = run_time;
+            let Some(mut packet) = self.queue.pop_front() else {
+                return;
+            };
 
-            for _ in 0..self.run_batch_size {
-                let Some(mut packet) = self.queue.pop_front() else {
-                    break;
-                };
+            packet.queueing_delay_update(run_time);
+            let timeout = packet.size as f64 * 8.0 / self.rate;
+            let departure_time = quantize_after(run_time, timeout);
+            packet.departure_update(departure_time);
 
-                packet.queueing_delay_update(service_start);
-                let timeout = packet.size as f64 * 8.0 / self.rate;
-                let departure_time = quantize_after(service_start, timeout);
-                packet.departure_update(departure_time);
+            self.packet_sent(departure_time, &packet);
 
-                self.packet_sent(departure_time, &packet);
-
-                let delay = (departure_time - run_time).max(0.0);
-                self.scheduled_departures.push_back(packet);
-                self.run_schedule_scratch
-                    .push((Duration::from_secs_f64(delay), ()));
-
-                self.in_flight += 1;
-                service_start = departure_time;
-            }
-
-            if !self.run_schedule_scratch.is_empty() {
-                cx.schedule_event_batch_fast_in_place(
-                    &mut self.run_schedule_scratch,
-                    &Self::SEND_SCHEDULED_SID,
-                    Self::send_scheduled,
-                )
-                .unwrap();
-            }
+            let delay = (departure_time - run_time).max(0.0);
+            self.scheduled_departures.push_back(packet);
+            self.in_flight = 1;
+            cx.schedule_event_fast(
+                Duration::from_secs_f64(delay),
+                &Self::SEND_SCHEDULED_SID,
+                Self::send_scheduled,
+                (),
+            )
+            .unwrap();
         }
     }
 
@@ -449,17 +427,15 @@ impl Port {
         let run_time = quantize_time(now);
         self.time = run_time;
 
-        let mut service_start = run_time;
-        while let Some(mut packet) = self.queue.pop_front() {
-            packet.queueing_delay_update(service_start);
+        if let Some(mut packet) = self.queue.pop_front() {
+            packet.queueing_delay_update(run_time);
             let timeout = packet.size as f64 * 8.0 / self.rate;
-            let departure_time = quantize_after(service_start, timeout);
+            let departure_time = quantize_after(run_time, timeout);
             packet.departure_update(departure_time);
 
             self.busy_until = departure_time;
             self.sent_packets.push(packet.clone());
             self.update_stats_on_packet_forwarded(&packet);
-            service_start = departure_time;
         }
     }
 
@@ -560,25 +536,25 @@ impl Model for Port {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn drain(port: &mut Port, mut service_start: f64) {
+        while !port.queue.is_empty() {
+            port.test_run(service_start);
+            service_start = port.busy_until;
+        }
+    }
     use crate::flows::packet::EcnField;
 
     #[test]
     fn test_fifo_ordering() {
-        let mut port = Port::new(
-            1e6,
-            10,
-            CapacityUnit::Packets,
-            DropStrategy::TailDrop,
-            0.0,
-            None,
-        );
+        let mut port = Port::new(1e6, 10, CapacityUnit::Packets, DropStrategy::TailDrop, 0.0);
 
         for i in 0..3 {
             let packet = Packet::new(100, i, 0, 0.0);
             port.on_packet_received(packet);
         }
 
-        port.test_run(0.0);
+        drain(&mut port, 0.0);
 
         let sent_ids: Vec<usize> = port.sent_packets.iter().map(|p| p.packet_id).collect();
         assert_eq!(sent_ids, vec![0, 1, 2]);
@@ -586,14 +562,7 @@ mod tests {
 
     #[test]
     fn test_queue_overflow() {
-        let mut port = Port::new(
-            1e6,
-            2,
-            CapacityUnit::Packets,
-            DropStrategy::TailDrop,
-            0.0,
-            None,
-        );
+        let mut port = Port::new(1e6, 2, CapacityUnit::Packets, DropStrategy::TailDrop, 0.0);
 
         for i in 0..3 {
             let packet = Packet::new(100, i, 0, 0.0);
@@ -612,7 +581,6 @@ mod tests {
             CapacityUnit::Packets,
             DropStrategy::EcnThreshold,
             0.8,
-            None,
         );
 
         for i in 0..8 {

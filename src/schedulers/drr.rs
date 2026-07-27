@@ -105,8 +105,6 @@ pub struct DRRServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
-    run_batch_size: usize,
-    run_schedule_scratch: Vec<(Duration, ())>,
     scheduled_departures: VecDeque<Packet>,
     in_flight: usize,
 
@@ -127,8 +125,6 @@ pub struct DRRServer {
 impl DRRServer {
     const SEND_AND_RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
-
-    const DEFAULT_RUN_BATCH_SIZE: usize = 1;
 
     pub fn new(
         rate: f64,
@@ -210,28 +206,12 @@ impl DRRServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
-            run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
-            run_schedule_scratch: Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE),
-            scheduled_departures: VecDeque::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE),
+            scheduled_departures: VecDeque::new(),
             in_flight: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
             #[cfg(feature = "lean")]
             next_batch_id: 0,
-        }
-    }
-
-    pub fn set_run_batch_size(&mut self, run_batch_size: Option<usize>) {
-        self.run_batch_size = run_batch_size
-            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
-            .max(1);
-        if self.run_schedule_scratch.capacity() < self.run_batch_size {
-            self.run_schedule_scratch
-                .reserve(self.run_batch_size - self.run_schedule_scratch.capacity());
-        }
-        if self.scheduled_departures.capacity() < self.run_batch_size {
-            self.scheduled_departures
-                .reserve(self.run_batch_size - self.scheduled_departures.capacity());
         }
     }
 
@@ -484,7 +464,6 @@ impl DRRServer {
     /// Retrieves the next packet to transmit along with its class and departure time.
     fn next_departure(
         &mut self,
-        class_limit: Option<usize>,
         service_start: f64,
         batch_id: Option<u64>,
     ) -> Option<(usize, Packet, f64)> {
@@ -496,12 +475,6 @@ impl DRRServer {
         loop {
             if self.packets_waiting == 0 {
                 return None;
-            }
-
-            if let Some(limit) = class_limit {
-                if self.current_queue != limit {
-                    return None;
-                }
             }
 
             if let Some(packet) = self.queues[self.current_queue].front().cloned() {
@@ -546,17 +519,11 @@ impl DRRServer {
                     return Some((class_id, outbound, departure_time));
                 }
 
-                if class_limit.is_some() {
-                    return None;
-                } else {
-                    #[cfg(feature = "lean")]
-                    {
-                        scan_steps += 1;
-                    }
-                    self.next_queue();
+                #[cfg(feature = "lean")]
+                {
+                    scan_steps += 1;
                 }
-            } else if class_limit.is_some() {
-                return None;
+                self.next_queue();
             } else {
                 #[cfg(feature = "lean")]
                 {
@@ -590,9 +557,6 @@ impl DRRServer {
             return;
         }
 
-        self.run_schedule_scratch.clear();
-        let mut service_start = run_time;
-        let mut visit_class: Option<usize> = None;
         #[cfg(feature = "lean")]
         let batch_id = {
             self.next_batch_id += 1;
@@ -601,47 +565,32 @@ impl DRRServer {
         #[cfg(not(feature = "lean"))]
         let batch_id: Option<u64> = None;
 
-        for _ in 0..self.run_batch_size {
-            let Some((class_id, packet, departure_time)) =
-                self.next_departure(visit_class, service_start, batch_id)
-            else {
-                break;
-            };
+        let Some((_class_id, packet, departure_time)) = self.next_departure(run_time, batch_id)
+        else {
+            return;
+        };
 
-            if visit_class.is_none() {
-                visit_class = Some(class_id);
-            }
-
-            let delay = (departure_time - run_time).max(0.0);
-            self.scheduled_departures.push_back(packet);
-            self.run_schedule_scratch
-                .push((Duration::from_secs_f64(delay), ()));
-            self.in_flight += 1;
-            service_start = departure_time;
-        }
-
-        if !self.run_schedule_scratch.is_empty() {
-            cx.schedule_event_batch_fast_in_place(
-                &mut self.run_schedule_scratch,
-                &Self::SEND_AND_RUN_SID,
-                Self::send_and_run,
-            )
-            .unwrap();
-        }
+        let delay = (departure_time - run_time).max(0.0);
+        self.scheduled_departures.push_back(packet);
+        self.in_flight = 1;
+        cx.schedule_event_fast(
+            Duration::from_secs_f64(delay),
+            &Self::SEND_AND_RUN_SID,
+            Self::send_and_run,
+            (),
+        )
+        .unwrap();
     }
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        let run_time = quantize_time(now);
-        self.time = run_time;
+        let service_start = quantize_time(now);
+        self.time = service_start;
 
-        let mut service_start = run_time;
-        while let Some((_, packet, departure_time)) = self.next_departure(None, service_start, None)
-        {
+        if let Some((_, packet, _departure_time)) = self.next_departure(service_start, None) {
             let outbound = packet;
             self.sent_packets.push(outbound.clone());
             self.update_stats_on_packet_forwarded(&outbound);
-            service_start = departure_time;
         }
     }
 
@@ -745,6 +694,13 @@ mod tests {
     use crate::schedulers::drop::{CapacityUnit, DropStrategy};
     use std::sync::Arc;
 
+    fn drain(drr: &mut DRRServer, mut service_start: f64) {
+        while drr.packets_waiting > 0 {
+            drr.test_run(service_start);
+            service_start = drr.busy_until;
+        }
+    }
+
     #[test]
     fn test_single_packet() {
         // tests sending a single packet through the DRRServer.
@@ -769,7 +725,7 @@ mod tests {
         assert_eq!(drr.packets_received, 1);
 
         // runs the scheduler
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         // since the server is not busy, it should schedule the packet immediately
         assert!(drr.busy_until > 0.0);
@@ -809,7 +765,7 @@ mod tests {
         assert_eq!(drr.packets_received, 4);
 
         // runs the scheduler
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         // packets should be sent in the actual order
         assert_eq!(drr.sent_packets.len(), 4);
@@ -912,7 +868,7 @@ mod tests {
         drr.on_packet_received(packet2.clone());
 
         // runs the scheduler
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         // checks that packets are scheduled fairly (tags should reflect arrival times)
         let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
@@ -937,7 +893,7 @@ mod tests {
         drr.on_packet_received(packet.clone());
 
         // runs the scheduler
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
         // checks that time_packet_sent is correct
         assert!(drr.busy_until > 0.0);
     }
@@ -995,7 +951,7 @@ mod tests {
         drr.on_packet_received(large_packet);
         drr.on_packet_received(small_packet);
 
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
         assert_eq!(sent_packet_ids, vec![2, 1]);
@@ -1030,7 +986,7 @@ mod tests {
         assert_eq!((drr.flow_classes)(3), 0);
 
         // runs the scheduler
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         // adjusts expected packet send order
         let sent_packet_ids: Vec<usize> = drr.sent_packets.iter().map(|p| p.packet_id).collect();
@@ -1064,7 +1020,7 @@ mod tests {
             drr.on_packet_received(packet2);
         }
 
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         // counts packets sent from each flow
         let flow0_packets = drr.sent_packets.iter().filter(|p| p.flow_id == 0).count();
@@ -1107,7 +1063,7 @@ mod tests {
             arrival_time += arrival_interval;
         }
 
-        drr.test_run(0.0);
+        drain(&mut drr, 0.0);
 
         // calculates bytes sent per flow
         let bytes: Vec<usize> = (0..3)

@@ -88,8 +88,6 @@ pub struct WRRServer {
     forwarded_sizes: usize,
     throughput_mean: f64,
     queueing_delay_mean: f64,
-    run_batch_size: usize,
-    run_schedule_scratch: Vec<(Duration, ())>,
     scheduled_departures: VecDeque<Packet>,
     in_flight: usize,
 
@@ -101,8 +99,6 @@ pub struct WRRServer {
 impl WRRServer {
     const SEND_AND_RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
-
-    const DEFAULT_RUN_BATCH_SIZE: usize = 1;
 
     pub fn new(
         rate: f64,
@@ -179,26 +175,10 @@ impl WRRServer {
             forwarded_sizes: 0,
             throughput_mean: 0.0,
             queueing_delay_mean: 0.0,
-            run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
-            run_schedule_scratch: Vec::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE),
-            scheduled_departures: VecDeque::with_capacity(Self::DEFAULT_RUN_BATCH_SIZE),
+            scheduled_departures: VecDeque::new(),
             in_flight: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
-        }
-    }
-
-    pub fn set_run_batch_size(&mut self, run_batch_size: Option<usize>) {
-        self.run_batch_size = run_batch_size
-            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
-            .max(1);
-        if self.run_schedule_scratch.capacity() < self.run_batch_size {
-            self.run_schedule_scratch
-                .reserve(self.run_batch_size - self.run_schedule_scratch.capacity());
-        }
-        if self.scheduled_departures.capacity() < self.run_batch_size {
-            self.scheduled_departures
-                .reserve(self.run_batch_size - self.scheduled_departures.capacity());
         }
     }
 
@@ -394,23 +374,13 @@ impl WRRServer {
         }
     }
 
-    fn next_departure(
-        &mut self,
-        visit_class: Option<usize>,
-        service_start: f64,
-    ) -> Option<(usize, Packet, f64)> {
+    fn next_departure(&mut self, service_start: f64) -> Option<(usize, Packet, f64)> {
         loop {
             if self.packets_waiting == 0 {
                 return None;
             }
 
             let current = self.current_queue;
-
-            if let Some(expected) = visit_class {
-                if current != expected {
-                    return None;
-                }
-            }
 
             if !self.queues[current].is_empty()
                 && self.packets_sent_in_round[current] < self.weights[current]
@@ -443,10 +413,6 @@ impl WRRServer {
 
             self.packets_sent_in_round[current] = 0;
             self.current_queue = (current + 1) % self.queues.len();
-
-            if visit_class.is_some() {
-                return None;
-            }
         }
     }
 
@@ -473,49 +439,29 @@ impl WRRServer {
             return;
         }
 
-        self.run_schedule_scratch.clear();
-        let mut service_start = run_time;
-        let mut visit_class = None;
+        let Some((_class_id, packet, departure_time)) = self.next_departure(run_time) else {
+            return;
+        };
 
-        for _ in 0..self.run_batch_size {
-            let Some((class_id, packet, departure_time)) =
-                self.next_departure(visit_class, service_start)
-            else {
-                break;
-            };
-
-            if visit_class.is_none() {
-                visit_class = Some(class_id);
-            }
-
-            let delay = (departure_time - run_time).max(0.0);
-            self.scheduled_departures.push_back(packet);
-            self.run_schedule_scratch
-                .push((Duration::from_secs_f64(delay), ()));
-            self.in_flight += 1;
-            service_start = departure_time;
-        }
-
-        if !self.run_schedule_scratch.is_empty() {
-            cx.schedule_event_batch_fast_in_place(
-                &mut self.run_schedule_scratch,
-                &Self::SEND_AND_RUN_SID,
-                Self::send_and_run,
-            )
-            .unwrap();
-        }
+        let delay = (departure_time - run_time).max(0.0);
+        self.scheduled_departures.push_back(packet);
+        self.in_flight = 1;
+        cx.schedule_event_fast(
+            Duration::from_secs_f64(delay),
+            &Self::SEND_AND_RUN_SID,
+            Self::send_and_run,
+            (),
+        )
+        .unwrap();
     }
 
     #[cfg(test)]
     pub fn test_run(&mut self, now: f64) {
-        let mut service_start = quantize_time(now);
+        let service_start = quantize_time(now);
         self.time = service_start;
-        while let Some((_class_id, packet, departure_time)) =
-            self.next_departure(None, service_start)
-        {
+        if let Some((_class_id, packet, _departure_time)) = self.next_departure(service_start) {
             self.sent_packets.push(packet.clone());
             self.update_stats_on_packet_forwarded(&packet);
-            service_start = departure_time;
         }
     }
 
@@ -620,6 +566,13 @@ mod tests {
     use crate::schedulers::drop::{CapacityUnit, DropStrategy};
     use std::sync::Arc;
 
+    fn drain(wrr: &mut WRRServer, mut service_start: f64) {
+        while wrr.packets_waiting > 0 {
+            wrr.test_run(service_start);
+            service_start = wrr.busy_until;
+        }
+    }
+
     #[test]
     fn test_single_packet() {
         let mut wrr = WRRServer::new(
@@ -638,7 +591,7 @@ mod tests {
         assert_eq!(wrr.queues[0].len(), 1);
         assert_eq!(wrr.packets_received, 1);
 
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         assert!(wrr.busy_until > 0.0);
         assert_eq!(wrr.sent_packets.len(), 1);
@@ -667,7 +620,7 @@ mod tests {
         wrr.on_packet_received(packet3);
         wrr.on_packet_received(packet4);
 
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         // Check that packets are sent according to weights
         assert_eq!(wrr.sent_packets.len(), 4);
@@ -732,7 +685,7 @@ mod tests {
             arrival_time += arrival_interval;
         }
 
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         // calculates bytes sent per flow
         let bytes: Vec<usize> = (0..3)
@@ -837,7 +790,7 @@ mod tests {
         }
 
         // runs the WRR at time = 0.0
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         // splits sent packets into rounds (each round sends 6 packets)
         let mut rounds: Vec<Vec<usize>> = vec![vec![], vec![]];
@@ -936,7 +889,7 @@ mod tests {
             wrr.on_packet_received(packet2);
         }
 
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         // counts packets in second phase
         let phase2_packets = wrr
@@ -977,7 +930,7 @@ mod tests {
         wrr.on_packet_received(packet1);
         wrr.on_packet_received(packet2);
 
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         // Should skip empty queue (flow 1) and maintain weight proportions
         // for non-empty queues
@@ -1002,7 +955,7 @@ mod tests {
         let packet = Packet::new(12, 1, 0, 0.0);
         wrr.on_packet_received(packet);
 
-        wrr.test_run(0.0);
+        drain(&mut wrr, 0.0);
 
         // Transmission time should be (12 * 8) / 1000 = 0.096 seconds
         assert!((wrr.busy_until - 0.096).abs() < 1e-6);

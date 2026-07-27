@@ -28,16 +28,11 @@ pub struct Wire {
     rng: SmallRng,
 
     pub output: Output<Packet>,
-    pending_departures: VecDeque<Packet>,
     scheduled_departures: VecDeque<Packet>,
-    run_batch_size: usize,
-    schedule_scratch: Vec<(Duration, ())>,
 }
 
 impl Wire {
     const FORWARD_SCHEDULED_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
-
-    const DEFAULT_RUN_BATCH_SIZE: usize = 1;
 
     pub fn new(wire_id: usize, delay_dist: DistributionInfo) -> Wire {
         let seed = get_seed();
@@ -54,17 +49,8 @@ impl Wire {
             delay_dist,
             rng,
             output: Output::default(),
-            pending_departures: VecDeque::new(),
             scheduled_departures: VecDeque::new(),
-            run_batch_size: Self::DEFAULT_RUN_BATCH_SIZE,
-            schedule_scratch: Vec::new(),
         }
-    }
-
-    pub fn set_run_batch_size(&mut self, run_batch_size: Option<usize>) {
-        self.run_batch_size = run_batch_size
-            .unwrap_or(Self::DEFAULT_RUN_BATCH_SIZE)
-            .max(1);
     }
 
     #[instrument(skip(self, cx))]
@@ -112,47 +98,17 @@ impl Wire {
         packet.departure_update(arrival_time);
 
         if arrival_time > now {
-            self.pending_departures.push_back(packet);
-            self.schedule_departures(now, cx);
-        } else {
-            self.forward_packet(packet).await;
-        }
-    }
-
-    fn schedule_departures(&mut self, now: f64, cx: &Context<Self>) {
-        if self.pending_departures.is_empty() {
-            return;
-        }
-
-        if self.schedule_scratch.capacity() < self.run_batch_size {
-            self.schedule_scratch
-                .reserve(self.run_batch_size - self.schedule_scratch.capacity());
-        }
-
-        self.schedule_scratch.clear();
-        while let Some(packet) = self.pending_departures.pop_front() {
-            let delay = (packet.time - now).max(0.0);
+            let delay = (arrival_time - now).max(0.0);
             self.scheduled_departures.push_back(packet);
-            self.schedule_scratch
-                .push((Duration::from_secs_f64(delay), ()));
-
-            if self.schedule_scratch.len() == self.run_batch_size {
-                cx.schedule_event_batch_fast_in_place(
-                    &mut self.schedule_scratch,
-                    &Self::FORWARD_SCHEDULED_SID,
-                    Self::forward_scheduled,
-                )
-                .unwrap();
-            }
-        }
-
-        if !self.schedule_scratch.is_empty() {
-            cx.schedule_event_batch_fast_in_place(
-                &mut self.schedule_scratch,
+            cx.schedule_event_fast(
+                Duration::from_secs_f64(delay),
                 &Self::FORWARD_SCHEDULED_SID,
                 Self::forward_scheduled,
+                (),
             )
             .unwrap();
+        } else {
+            self.forward_packet(packet).await;
         }
     }
 

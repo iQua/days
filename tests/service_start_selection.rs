@@ -102,8 +102,6 @@ fn drr_does_not_free_future_service_capacity_early() {
         0.0,
         vec![1, 1],
     );
-    scheduler.set_run_batch_size(Some(2));
-
     let source_mbox = Mailbox::new();
     let scheduler_mbox = Mailbox::new();
     let (writer, reader) = event_queue(SinkState::Enabled);
@@ -136,8 +134,6 @@ fn wrr_does_not_free_future_service_capacity_early() {
         0.0,
         vec![1, 2],
     );
-    scheduler.set_run_batch_size(Some(2));
-
     let source_mbox = Mailbox::new();
     let scheduler_mbox = Mailbox::new();
     let (writer, reader) = event_queue(SinkState::Enabled);

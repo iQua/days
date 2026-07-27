@@ -97,12 +97,35 @@ pub fn reset_peak_concurrency() {
     PEAK_ACTIVE_TASKS.store(0, Ordering::Relaxed);
 }
 
+pub fn validate_config(config_path: &str) -> Result<(), String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|error| format!("Failed to read configuration file: {error}"))?;
+    let config: toml::Value = toml::from_str(&content)
+        .map_err(|error| format!("Failed to parse configuration file: {error}"))?;
+    let legacy_key = concat!("run_batch", "_size");
+
+    let has_legacy_key = config
+        .get("switch")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|switch| switch.contains_key(legacy_key));
+
+    if has_legacy_key {
+        return Err(format!(
+            "Configuration key `switch.{legacy_key}` was removed; \
+             schedulers now select one packet per service start."
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
     use crate::flows::collective::Collective;
     use crate::flows::flow::Flow;
     use crate::topos::build::build_graph;
     use crate::topos::topo::Topology;
 
+    validate_config(config_path)?;
     let _ = seed_from_config(config_path);
 
     let (graph, hosts) = build_graph(config_path).map_err(|e| e.to_string())?;

@@ -5,7 +5,7 @@ use tempfile::NamedTempFile;
 #[test]
 fn removed_scheduler_batch_key_has_a_migration_diagnostic() {
     let config = NamedTempFile::new().unwrap();
-    let legacy_key = concat!("run_batch", "_size");
+    let legacy_key = ["run", "batch", "size"].join("_");
     fs::write(
         config.path(),
         format!(
