@@ -1469,7 +1469,10 @@ impl Topology {
         let timer = std::time::Instant::now();
 
         // starts the simulation
-        match sim.step_until(Duration::from_secs_f64(duration)) {
+        let stepping_timer = std::time::Instant::now();
+        let step_result = sim.step_until(Duration::from_secs_f64(duration));
+        let stepping_elapsed = stepping_timer.elapsed();
+        match step_result {
             Ok(()) => {}
             Err(err) => {
                 error!("Simulation stopped early: {err}");
@@ -1495,6 +1498,14 @@ impl Topology {
             sim.time()
                 .duration_since(MonotonicTime::EPOCH)
                 .as_secs_f64()
+        );
+        info!(
+            "Nexosim step_until wall-clock time: {:.9} seconds.",
+            stepping_elapsed.as_secs_f64()
+        );
+        info!(
+            "Nexosim total wall-clock time: {:.9} seconds.",
+            elapsed.as_secs_f64()
         );
         info!(
             "Elapsed wall-clock time: {:.3} seconds.",
