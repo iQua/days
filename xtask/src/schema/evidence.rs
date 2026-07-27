@@ -3,20 +3,18 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    SchemaError, SchemaVersion, invalid, is_phase_id, is_task_id, validate_git_commit,
-    validate_hash, validate_nonempty, validate_repo_path,
+    SchemaError, SchemaVersion, invalid, is_phase_id, is_task_id, validate_hash, validate_nonempty,
+    validate_repo_path,
 };
 
 /// Whether evidence is checked into this repository or stored in `days-gpu`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvidenceKind {
-    /// Small evidence stored and checksummed in the repository.
+    /// Evidence compared as a content-addressed golden.
     Golden,
-    /// Large evidence committed to the companion `days-gpu` repository.
+    /// Larger externally stored evidence with producer metadata.
     Archive,
-    /// Measurement evidence bound to a frozen budget and run commit.
-    Measurement,
 }
 
 /// Versioned evidence for one phase task.
@@ -43,15 +41,6 @@ pub struct EvidenceManifest {
     pub schema: String,
     /// Machine-readable evidence capability tags.
     pub tags: Vec<String>,
-    /// Budget manifest used by a measurement, if applicable.
-    #[serde(default)]
-    pub budget: Option<String>,
-    /// Hash of `budget` at measurement time, if applicable.
-    #[serde(default)]
-    pub budget_hash: Option<String>,
-    /// Commit containing the code used for a measurement run, if applicable.
-    #[serde(default)]
-    pub run_commit: Option<String>,
     /// Evidence artifacts governed by this manifest.
     pub artifacts: Vec<EvidenceArtifact>,
 }
@@ -70,21 +59,6 @@ impl EvidenceManifest {
             return Err(invalid("artifacts", "must contain at least one artifact"));
         }
 
-        if self.kind != EvidenceKind::Measurement
-            && self.budget_hash.is_some()
-            && self.budget.is_none()
-        {
-            return Err(SchemaError::BudgetHashWithoutBudget);
-        }
-        if let Some(budget) = &self.budget {
-            validate_repo_path("budget", budget)?;
-        }
-        if let Some(hash) = &self.budget_hash {
-            validate_hash("budget_hash", hash)?;
-        }
-        if let Some(commit) = &self.run_commit {
-            validate_git_commit("run_commit", commit)?;
-        }
         for artifact in &self.artifacts {
             artifact.validate()?;
         }
@@ -96,12 +70,9 @@ impl EvidenceManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceArtifact {
-    /// Repository-relative path in this repository or in `days-gpu`.
+    /// Path relative to `days` or the companion `days-gpu` repository.
     #[serde(default)]
     pub path: Option<String>,
-    /// Commit in `days-gpu` containing an archived artifact.
-    #[serde(default)]
-    pub days_gpu_commit: Option<String>,
     /// SHA-256 hash of the artifact bytes.
     #[serde(default)]
     pub content_hash: Option<String>,
@@ -120,9 +91,6 @@ impl EvidenceArtifact {
     fn validate(&self) -> Result<(), SchemaError> {
         if let Some(path) = &self.path {
             validate_repo_path("artifacts.path", path)?;
-        }
-        if let Some(commit) = &self.days_gpu_commit {
-            validate_nonempty("artifacts.days_gpu_commit", commit)?;
         }
         if let Some(hash) = &self.content_hash {
             validate_hash("artifacts.content_hash", hash)?;

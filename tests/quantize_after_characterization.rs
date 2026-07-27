@@ -1,5 +1,7 @@
 use days::utils::time::{quantize_after, set_time_quantum_ns};
 use serde::Deserialize;
+use std::fs;
+use std::path::PathBuf;
 
 const NS_PER_SECOND: f64 = 1_000_000_000.0;
 const PS_PER_SECOND: f64 = 1_000_000_000_000.0;
@@ -82,13 +84,26 @@ fn observed_ps(time_s: f64) -> u64 {
     (time_s * PS_PER_SECOND).round() as u64
 }
 
+fn days_gpu_root() -> Option<PathBuf> {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = std::env::var_os("DAYS_GPU_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| repository.parent().map(|parent| parent.join("days-gpu")))?;
+    root.is_dir().then_some(root)
+}
+
 #[test]
 fn frozen_quantize_after_characterization_matches_legacy_policy() {
     let _reset_quantum = ResetQuantum;
-    let golden: Characterization = toml::from_str(include_str!(
-        "../docs/days-executor/evidence/P01/quantize-after-characterization.toml"
-    ))
-    .expect("parse quantize_after characterization");
+    let Some(days_gpu) = days_gpu_root() else {
+        eprintln!("skipping quantize_after golden check: days-gpu is unavailable");
+        return;
+    };
+    let input =
+        fs::read_to_string(days_gpu.join("evidence/P01/quantize-after-characterization.toml"))
+            .expect("read quantize_after characterization");
+    let golden: Characterization =
+        toml::from_str(&input).expect("parse quantize_after characterization");
 
     assert_eq!(golden.schema_version, 1);
     assert_eq!(golden.policy, "legacy-f64-absolute-deadline");

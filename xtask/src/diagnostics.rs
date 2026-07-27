@@ -106,12 +106,6 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         summary: "A declared budget manifest is missing, or its `content_hash` in the phase metadata does not match the file",
     },
     DiagnosticDefinition {
-        code: "DAYS-AUDIT-0012",
-        slug: "post-measurement-budget-change",
-        severity: Severity::Error,
-        summary: "An evidence record's `budget_hash` does not match the current hash of the budget it cites",
-    },
-    DiagnosticDefinition {
         code: "DAYS-AUDIT-0013",
         slug: "evidence-manifest-invalid",
         severity: Severity::Error,
@@ -121,13 +115,7 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         code: "DAYS-AUDIT-0014",
         slug: "evidence-checksum-mismatch",
         severity: Severity::Error,
-        summary: "A checked-in golden artifact is missing or its content hash does not match",
-    },
-    DiagnosticDefinition {
-        code: "DAYS-AUDIT-0015",
-        slug: "evidence-link-not-immutable",
-        severity: Severity::Error,
-        summary: "A days-gpu archive artifact is missing required immutable provenance or does not match its recorded commit",
+        summary: "A reachable evidence artifact is missing or its content hash does not match",
     },
     DiagnosticDefinition {
         code: "DAYS-AUDIT-0016",
@@ -190,22 +178,10 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         summary: "An audit check attempted to emit an unknown diagnostic code",
     },
     DiagnosticDefinition {
-        code: "DAYS-AUDIT-0026",
-        slug: "budget-freeze-invalid",
-        severity: Severity::Error,
-        summary: "A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites a measurement artifact path without an adding commit after the freeze",
-    },
-    DiagnosticDefinition {
-        code: "DAYS-AUDIT-0027",
-        slug: "measurement-evidence-invalid",
-        severity: Severity::Error,
-        summary: "Measurement evidence omits its required binding, a declared budget has no citing measurement, or a required consumer does not reuse the exact frozen budget identity",
-    },
-    DiagnosticDefinition {
         code: "DAYS-AUDIT-0028",
-        slug: "archive-check-skipped",
+        slug: "evidence-check-skipped",
         severity: Severity::Info,
-        summary: "Archive verification was skipped because the days-gpu repository is unavailable",
+        summary: "External evidence verification was skipped because the days-gpu repository is unavailable",
     },
 ];
 

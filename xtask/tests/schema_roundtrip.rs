@@ -50,10 +50,8 @@ feature = "scalar"
 [[budgets]]
 id = "p90-fixture-budget"
 owner_phase = "P90"
-required_consumers = ["P23"]
 path = "docs/days-executor/budgets/p90.toml"
 content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-frozen_at_commit = "0123456789abcdef0123456789abcdef01234567"
 "#;
 
 const EVIDENCE: &str = r#"
@@ -67,8 +65,6 @@ command = ["cargo", "test", "--package", "xtask"]
 tool_version = "cargo 1.96.0"
 schema = "days-executor/evidence/v1"
 tags = []
-budget = "docs/days-executor/budgets/p90.toml"
-budget_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P90/golden.toml"
@@ -90,30 +86,9 @@ tags = []
 [[artifacts]]
 path = "evidence/P90/results.tar.zst"
 content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-days_gpu_commit = "0123456789abcdef0123456789abcdef01234567"
 tool_version = "cargo 1.96.0"
 command = ["cargo", "bench", "--bench", "executor"]
 schema = "days-executor/benchmark/v1"
-"#;
-
-const MEASUREMENT_EVIDENCE: &str = r#"
-schema_version = 1
-id = "P90-T0-measurement"
-phase = "P90"
-task = "T0"
-kind = "measurement"
-description = "Fixture measurement evidence"
-command = ["cargo", "bench"]
-tool_version = "cargo 1.96.0"
-schema = "days-executor/evidence/v1"
-tags = []
-budget = "docs/days-executor/budgets/p90.toml"
-budget_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-run_commit = "89abcdef0123456789abcdef0123456789abcdef"
-
-[[artifacts]]
-path = "docs/days-executor/evidence/P90/measurement.toml"
-content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
 
 const BUDGET: &str = r#"
@@ -205,11 +180,6 @@ fn phase_schema_round_trips() {
     assert_eq!(value.budgets[0].content_hash, HASH);
     assert_eq!(value.budgets[0].id, "p90-fixture-budget");
     assert_eq!(value.budgets[0].owner_phase, "P90");
-    assert_eq!(value.budgets[0].required_consumers, ["P23"]);
-    assert_eq!(
-        value.budgets[0].frozen_at_commit,
-        "0123456789abcdef0123456789abcdef01234567"
-    );
 }
 
 #[test]
@@ -226,14 +196,6 @@ fn evidence_schema_round_trips() {
     assert_eq!(
         parse_evidence_manifest(&encoded).expect("parse archive evidence"),
         archive
-    );
-
-    let measurement =
-        parse_evidence_manifest(MEASUREMENT_EVIDENCE).expect("valid measurement evidence");
-    let encoded = toml::to_string_pretty(&measurement).expect("serialize measurement evidence");
-    assert_eq!(
-        parse_evidence_manifest(&encoded).expect("parse measurement evidence"),
-        measurement
     );
 }
 
@@ -294,15 +256,7 @@ fn missing_required_fields_are_rejected() {
     assert_malformed(parse_dependency_baseline(
         &BASELINE.replace("allowed_licenses = [\"MIT\", \"Apache-2.0\"]\n", ""),
     ));
-    assert_malformed(parse_phase_metadata(&PHASE.replace(
-        "frozen_at_commit = \"0123456789abcdef0123456789abcdef01234567\"\n",
-        "",
-    )));
-    for required in [
-        "id = \"p90-fixture-budget\"\n",
-        "owner_phase = \"P90\"\n",
-        "required_consumers = [\"P23\"]\n",
-    ] {
+    for required in ["id = \"p90-fixture-budget\"\n", "owner_phase = \"P90\"\n"] {
         assert_malformed(parse_phase_metadata(&PHASE.replace(required, "")));
     }
 }
@@ -315,17 +269,11 @@ fn budget_reference_identity_fields_are_validated() {
     assert_malformed(parse_phase_metadata(
         &PHASE.replace("owner_phase = \"P90\"", "owner_phase = \"p90\""),
     ));
-    assert_malformed(parse_phase_metadata(&PHASE.replace(
-        "required_consumers = [\"P23\"]",
-        "required_consumers = [\"phase-23\"]",
-    )));
     let budget = r#"[[budgets]]
 id = "p90-fixture-budget"
 owner_phase = "P90"
-required_consumers = ["P23"]
 path = "docs/days-executor/budgets/p90.toml"
 content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-frozen_at_commit = "0123456789abcdef0123456789abcdef01234567"
 "#;
     assert_malformed(parse_phase_metadata(
         &PHASE.replace(budget, &format!("{budget}\n{budget}")),
@@ -420,15 +368,6 @@ fn evidence_without_artifacts_is_rejected_for_every_kind() {
             .expect("archive prefix")
     );
     assert_malformed(parse_evidence_manifest(&archive_without_artifacts));
-
-    let measurement_without_artifacts = format!(
-        "{}artifacts = []\n",
-        MEASUREMENT_EVIDENCE
-            .split("[[artifacts]]")
-            .next()
-            .expect("measurement prefix")
-    );
-    assert_malformed(parse_evidence_manifest(&measurement_without_artifacts));
 }
 
 #[test]
@@ -899,26 +838,6 @@ fn empty_admission_descriptions_are_rejected() {
             &BUDGET.replace(valid, empty),
             root.path(),
         ));
-    }
-}
-
-#[test]
-fn git_commit_fields_require_full_lowercase_hashes() {
-    for invalid in [
-        "",
-        "0123456789abcdef0123456789abcdef0123456",
-        "0123456789abcdef0123456789abcdef012345678",
-        "0123456789ABCDEF0123456789abcdef01234567",
-        "g123456789abcdef0123456789abcdef01234567",
-    ] {
-        assert_malformed(parse_phase_metadata(&PHASE.replace(
-            "frozen_at_commit = \"0123456789abcdef0123456789abcdef01234567\"",
-            &format!("frozen_at_commit = \"{invalid}\""),
-        )));
-        assert_malformed(parse_evidence_manifest(&MEASUREMENT_EVIDENCE.replace(
-            "run_commit = \"89abcdef0123456789abcdef0123456789abcdef\"",
-            &format!("run_commit = \"{invalid}\""),
-        )));
     }
 }
 

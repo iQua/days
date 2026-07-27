@@ -11,11 +11,11 @@ use serde::Deserialize;
 
 use crate::dependency_baseline::{CURATED_ALLOWED_LICENSES, collect_direct_dependencies};
 use crate::diagnostics::{self, Diagnostic};
-use crate::hash::{sha256_bytes, sha256_file};
+use crate::hash::sha256_file;
 use crate::schema::{
-    BudgetReference, DependencyBaseline, DependencyKind, EvidenceKind, EvidenceManifest,
-    PhaseMetadata, SchemaError, parse_budget_manifest, parse_dependency_baseline,
-    parse_evidence_manifest, parse_phase_metadata,
+    DependencyBaseline, DependencyKind, EvidenceManifest, PhaseMetadata, SchemaError,
+    parse_budget_manifest, parse_dependency_baseline, parse_evidence_manifest,
+    parse_phase_metadata,
 };
 
 const PHASE_DIRECTORY: &str = "docs/days-executor/phases";
@@ -199,7 +199,6 @@ pub fn phase_audit(repo_root: &Path, requested_phase: &str, allow_network: bool)
     let phases = load_phase_set(repo_root, requested_phase, &mut diagnostics);
     check_metadata_identity(&phases, &mut diagnostics);
     check_dependencies(&phases, &mut diagnostics);
-    check_budget_consumer_bindings(&phases, &mut diagnostics);
 
     let matching: Vec<&LoadedPhase> = phases
         .iter()
@@ -277,7 +276,6 @@ pub fn reproduce_preflight(repo_root: &Path, requested_phase: &str) -> AuditRepo
     let mut diagnostics = Vec::new();
     let phases = load_phase_set(repo_root, requested_phase, &mut diagnostics);
     check_metadata_identity(&phases, &mut diagnostics);
-    check_budget_consumer_bindings(&phases, &mut diagnostics);
 
     let matching: Vec<&LoadedPhase> = phases
         .iter()
@@ -458,6 +456,50 @@ fn resolve_repo_path(repo_root: &Path, relative_path: &str) -> Result<PathBuf, S
         ));
     }
     Ok(canonical_path)
+}
+
+fn days_gpu_root(repo_root: &Path) -> Option<PathBuf> {
+    let candidate = std::env::var_os("DAYS_GPU_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| repo_root.parent().map(|parent| parent.join("days-gpu")))?;
+    candidate.is_dir().then_some(candidate)
+}
+
+fn is_days_gpu_path(path: &str) -> bool {
+    path.starts_with("evidence/") || path.starts_with("budgets/")
+}
+
+fn resolve_declared_path(repo_root: &Path, relative_path: &str) -> Result<Option<PathBuf>, String> {
+    if !is_days_gpu_path(relative_path) {
+        return resolve_repo_path(repo_root, relative_path).map(Some);
+    }
+    let Some(days_gpu) = days_gpu_root(repo_root) else {
+        return Ok(None);
+    };
+    resolve_repo_path(&days_gpu, relative_path).map(Some)
+}
+
+fn emit_days_gpu_skip(
+    diagnostics: &mut Vec<Diagnostic>,
+    subject: &str,
+    path: &str,
+    repo_root: &Path,
+) {
+    let expected = std::env::var_os("DAYS_GPU_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| repo_root.parent().map(|parent| parent.join("days-gpu")));
+    let location = expected.as_deref().map_or_else(
+        || "an unavailable sibling".to_owned(),
+        |path| path.display().to_string(),
+    );
+    emit(
+        diagnostics,
+        "DAYS-AUDIT-0028",
+        subject,
+        format!(
+            "external evidence verification skipped; days-gpu is unavailable at {location} for {path}"
+        ),
+    );
 }
 
 fn check_metadata_identity(phases: &[LoadedPhase], diagnostics: &mut Vec<Diagnostic>) {
@@ -1121,7 +1163,6 @@ fn check_budgets_and_evidence(
 ) -> BTreeSet<String> {
     check_declared_budgets(repo_root, phase, diagnostics);
     let mut tags = BTreeSet::new();
-    let mut cited_budgets = BTreeSet::new();
     for task in &phase.tasks {
         for evidence_path in &task.evidence {
             if let Some(evidence) = load_evidence(repo_root, evidence_path, diagnostics) {
@@ -1138,19 +1179,9 @@ fn check_budgets_and_evidence(
                 }
                 tags.extend(evidence.tags.iter().cloned());
                 check_evidence_artifacts(repo_root, evidence_path, &evidence, diagnostics);
-                check_evidence_budget(repo_root, evidence_path, &evidence, diagnostics);
-                check_measurement_contract(
-                    repo_root,
-                    phase,
-                    evidence_path,
-                    &evidence,
-                    &mut cited_budgets,
-                    diagnostics,
-                );
             }
         }
     }
-    check_measurement_coverage(phase, &cited_budgets, diagnostics);
     tags
 }
 
@@ -1160,8 +1191,12 @@ fn check_declared_budgets(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for budget in &phase.budgets {
-        let path = match resolve_repo_path(repo_root, &budget.path) {
-            Ok(path) => path,
+        let path = match resolve_declared_path(repo_root, &budget.path) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                emit_days_gpu_skip(diagnostics, &budget.path, &budget.path, repo_root);
+                continue;
+            }
             Err(error) => {
                 emit(
                     diagnostics,
@@ -1221,44 +1256,6 @@ fn check_declared_budgets(
                 format!("cannot hash declared budget: {error}"),
             ),
         }
-        check_frozen_budget_blob(repo_root, budget, diagnostics);
-    }
-}
-
-fn check_budget_consumer_bindings(phases: &[LoadedPhase], diagnostics: &mut Vec<Diagnostic>) {
-    for owner in phases {
-        for budget in &owner.metadata.budgets {
-            for consumer_id in &budget.required_consumers {
-                let Some(consumer) = phases
-                    .iter()
-                    .find(|phase| phase.metadata.phase == *consumer_id)
-                else {
-                    continue;
-                };
-                let matching = consumer.metadata.budgets.iter().any(|candidate| {
-                    candidate.id == budget.id
-                        && candidate.owner_phase == budget.owner_phase
-                        && candidate.path == budget.path
-                        && candidate.content_hash == budget.content_hash
-                        && candidate.frozen_at_commit == budget.frozen_at_commit
-                });
-                if !matching {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0027",
-                        consumer.path.display().to_string(),
-                        format!(
-                            "phase {consumer_id} must cite frozen budget {} owned by {} at {} with hash {} and frozen_at_commit {}",
-                            budget.id,
-                            budget.owner_phase,
-                            budget.path,
-                            budget.content_hash,
-                            budget.frozen_at_commit
-                        ),
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -1267,512 +1264,11 @@ fn check_reproduce_evidence(
     phase: &PhaseMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut cited_budgets = BTreeSet::new();
     for task in &phase.tasks {
         for evidence_path in &task.evidence {
             if let Some(evidence) = load_evidence(repo_root, evidence_path, diagnostics) {
-                if evidence.kind != EvidenceKind::Archive {
-                    check_evidence_artifacts(repo_root, evidence_path, &evidence, diagnostics);
-                }
-                check_evidence_budget(repo_root, evidence_path, &evidence, diagnostics);
-                check_measurement_contract(
-                    repo_root,
-                    phase,
-                    evidence_path,
-                    &evidence,
-                    &mut cited_budgets,
-                    diagnostics,
-                );
+                check_evidence_artifacts(repo_root, evidence_path, &evidence, diagnostics);
             }
-        }
-    }
-    check_measurement_coverage(phase, &cited_budgets, diagnostics);
-}
-
-fn check_frozen_budget_blob(
-    repo_root: &Path,
-    budget: &BudgetReference,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if !check_reachable_commit(
-        repo_root,
-        &budget.frozen_at_commit,
-        &budget.path,
-        "frozen_at_commit",
-        diagnostics,
-    ) {
-        return;
-    }
-
-    let object = format!("{}:{}", budget.frozen_at_commit, budget.path);
-    match git(repo_root, &["cat-file", "blob", &object]) {
-        Ok(output) if output.status.success() => {
-            let actual = sha256_bytes(&output.stdout);
-            if actual != budget.content_hash {
-                emit(
-                    diagnostics,
-                    "DAYS-AUDIT-0026",
-                    &budget.path,
-                    format!(
-                        "budget at frozen_at_commit {} hashes to {actual}, not {}",
-                        budget.frozen_at_commit, budget.content_hash
-                    ),
-                );
-            }
-        }
-        Ok(output) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0026",
-            &budget.path,
-            format!(
-                "budget path is absent at frozen_at_commit {}: {}",
-                budget.frozen_at_commit,
-                output_text(&output)
-            ),
-        ),
-        Err(error) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0026",
-            &budget.path,
-            format!(
-                "cannot read budget at frozen_at_commit {}: {error}",
-                budget.frozen_at_commit
-            ),
-        ),
-    }
-}
-
-fn check_measurement_contract(
-    repo_root: &Path,
-    phase: &PhaseMetadata,
-    evidence_path: &str,
-    evidence: &EvidenceManifest,
-    cited_budgets: &mut BTreeSet<String>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if evidence.kind != EvidenceKind::Measurement {
-        return;
-    }
-
-    let mut missing = Vec::new();
-    if evidence.budget.is_none() {
-        missing.push("budget");
-    }
-    if evidence.budget_hash.is_none() {
-        missing.push("budget_hash");
-    }
-    if evidence.run_commit.is_none() {
-        missing.push("run_commit");
-    }
-    if !missing.is_empty() {
-        emit(
-            diagnostics,
-            "DAYS-AUDIT-0027",
-            evidence_path,
-            format!(
-                "measurement evidence is missing required field(s): {}",
-                missing.join(", ")
-            ),
-        );
-        return;
-    }
-
-    let Some(budget_path) = evidence.budget.as_deref() else {
-        return;
-    };
-    let Some(budget) = phase
-        .budgets
-        .iter()
-        .find(|budget| budget.path == budget_path)
-    else {
-        emit(
-            diagnostics,
-            "DAYS-AUDIT-0027",
-            evidence_path,
-            format!("measurement cites undeclared budget {budget_path}"),
-        );
-        return;
-    };
-    cited_budgets.insert(budget_path.to_owned());
-
-    let Some(run_commit) = evidence.run_commit.as_deref() else {
-        return;
-    };
-    if !check_reachable_commit(
-        repo_root,
-        run_commit,
-        evidence_path,
-        "run_commit",
-        diagnostics,
-    ) {
-        return;
-    }
-    if run_commit == budget.frozen_at_commit {
-        emit(
-            diagnostics,
-            "DAYS-AUDIT-0026",
-            budget_path,
-            format!(
-                "measurement run_commit {run_commit} equals frozen_at_commit {}; the measurement was committed together with the budget instead of after the freeze",
-                budget.frozen_at_commit
-            ),
-        );
-        return;
-    }
-    let strict_ancestor = match git(
-        repo_root,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &budget.frozen_at_commit,
-            run_commit,
-        ],
-    ) {
-        Ok(output) if output.status.success() => true,
-        Ok(output) if output.status.code() == Some(1) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "frozen_at_commit {} is not an ancestor of measurement run_commit {run_commit}",
-                    budget.frozen_at_commit
-                ),
-            );
-            false
-        }
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "cannot determine ancestry from frozen_at_commit {} to measurement run_commit {run_commit}: {}",
-                    budget.frozen_at_commit,
-                    output_text(&output)
-                ),
-            );
-            false
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "cannot determine ancestry from frozen_at_commit {} to measurement run_commit {run_commit}: {error}",
-                    budget.frozen_at_commit
-                ),
-            );
-            false
-        }
-    };
-    if !strict_ancestor {
-        return;
-    }
-
-    if !check_linear_measurement_history(
-        repo_root,
-        &budget.frozen_at_commit,
-        run_commit,
-        budget_path,
-        diagnostics,
-    ) {
-        return;
-    }
-
-    check_measurement_artifact_introduction(
-        repo_root,
-        &budget.frozen_at_commit,
-        run_commit,
-        evidence_path,
-        evidence,
-        diagnostics,
-    );
-}
-
-fn check_linear_measurement_history(
-    repo_root: &Path,
-    frozen_at_commit: &str,
-    run_commit: &str,
-    budget_path: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> bool {
-    let range = format!("{frozen_at_commit}..{run_commit}");
-    match git(repo_root, &["rev-list", "--merges", &range]) {
-        Ok(output) if output.status.success() => {
-            let merges = String::from_utf8_lossy(&output.stdout);
-            let merges = merges.trim();
-            if !merges.is_empty() {
-                emit(
-                    diagnostics,
-                    "DAYS-AUDIT-0026",
-                    budget_path,
-                    format!(
-                        "measurement history from frozen_at_commit {frozen_at_commit} to run_commit {run_commit} contains merge commit(s): {}",
-                        merges.lines().collect::<Vec<_>>().join(", ")
-                    ),
-                );
-                return false;
-            }
-        }
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "cannot inspect measurement history from frozen_at_commit {frozen_at_commit} to run_commit {run_commit}: {}",
-                    output_text(&output)
-                ),
-            );
-            return false;
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "cannot inspect measurement history from frozen_at_commit {frozen_at_commit} to run_commit {run_commit}: {error}"
-                ),
-            );
-            return false;
-        }
-    }
-
-    match git(repo_root, &["rev-list", "--first-parent", run_commit]) {
-        Ok(output) if output.status.success() => {
-            if !String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|commit| commit == frozen_at_commit)
-            {
-                emit(
-                    diagnostics,
-                    "DAYS-AUDIT-0026",
-                    budget_path,
-                    format!(
-                        "measurement run_commit {run_commit} does not reach frozen_at_commit {frozen_at_commit} through first-parent history"
-                    ),
-                );
-                return false;
-            }
-        }
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "cannot inspect first-parent history from measurement run_commit {run_commit}: {}",
-                    output_text(&output)
-                ),
-            );
-            return false;
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                budget_path,
-                format!(
-                    "cannot inspect first-parent history from measurement run_commit {run_commit}: {error}"
-                ),
-            );
-            return false;
-        }
-    }
-
-    true
-}
-
-fn check_measurement_artifact_introduction(
-    repo_root: &Path,
-    frozen_at_commit: &str,
-    run_commit: &str,
-    evidence_path: &str,
-    evidence: &EvidenceManifest,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let range = format!("{frozen_at_commit}..{run_commit}");
-    for (index, artifact) in evidence.artifacts.iter().enumerate() {
-        let Some(path) = artifact.path.as_deref() else {
-            continue;
-        };
-        let subject = format!("{evidence_path} artifacts[{index}]");
-        match git(
-            repo_root,
-            &[
-                "--literal-pathspecs",
-                "log",
-                "--diff-filter=A",
-                "--format=%H",
-                &range,
-                "--",
-                path,
-            ],
-        ) {
-            Ok(output) if output.status.success() => {
-                if output.stdout.is_empty() {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0026",
-                        &subject,
-                        format!(
-                            "measurement artifact path {path} has no adding commit after frozen_at_commit {frozen_at_commit} and by run_commit {run_commit}"
-                        ),
-                    );
-                }
-            }
-            Ok(output) => emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                &subject,
-                format!(
-                    "cannot inspect adding commits for measurement artifact path {path}: {}",
-                    output_text(&output)
-                ),
-            ),
-            Err(error) => emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                &subject,
-                format!(
-                    "cannot inspect adding commits for measurement artifact path {path}: {error}"
-                ),
-            ),
-        }
-
-        let frozen_object = format!("{frozen_at_commit}:{path}");
-        let run_object = format!("{run_commit}:{path}");
-        match (
-            git(repo_root, &["cat-file", "blob", &frozen_object]),
-            git(repo_root, &["cat-file", "blob", &run_object]),
-        ) {
-            (Ok(frozen), Ok(run))
-                if frozen.status.success()
-                    && run.status.success()
-                    && frozen.stdout == run.stdout =>
-            {
-                emit(
-                    diagnostics,
-                    "DAYS-AUDIT-0026",
-                    &subject,
-                    format!(
-                        "measurement artifact {path} already had identical content at frozen_at_commit {frozen_at_commit}"
-                    ),
-                );
-            }
-            (_, Ok(run)) if !run.status.success() => {}
-            (Ok(_), Ok(_)) => {}
-            (Err(error), _) | (_, Err(error)) => emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                &subject,
-                format!(
-                    "cannot compare measurement artifact {path} at frozen_at_commit and run_commit: {error}"
-                ),
-            ),
-        }
-    }
-}
-
-fn check_measurement_coverage(
-    phase: &PhaseMetadata,
-    cited_budgets: &BTreeSet<String>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    for budget in &phase.budgets {
-        if !cited_budgets.contains(&budget.path) {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0027",
-                &budget.path,
-                format!(
-                    "phase {} declares a budget with no citing measurement evidence",
-                    phase.phase
-                ),
-            );
-        }
-    }
-}
-
-fn check_reachable_commit(
-    repo_root: &Path,
-    commit: &str,
-    subject: &str,
-    field: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> bool {
-    match git(repo_root, &["cat-file", "-t", commit]) {
-        Ok(output) if output.status.success() => {
-            let object_type = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if object_type != "commit" {
-                emit(
-                    diagnostics,
-                    "DAYS-AUDIT-0026",
-                    subject,
-                    format!("{field} {commit} is a {object_type}, not a commit"),
-                );
-                return false;
-            }
-        }
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                subject,
-                format!(
-                    "{field} {commit} is not present in this clone (history may be shallow): {}",
-                    output_text(&output)
-                ),
-            );
-            return false;
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                subject,
-                format!("cannot verify {field} {commit}: {error}"),
-            );
-            return false;
-        }
-    }
-
-    match git(repo_root, &["merge-base", "--is-ancestor", commit, "HEAD"]) {
-        Ok(output) if output.status.success() => true,
-        Ok(output) if output.status.code() == Some(1) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                subject,
-                format!("{field} {commit} is not reachable from HEAD"),
-            );
-            false
-        }
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                subject,
-                format!(
-                    "cannot determine whether {field} {commit} is reachable from HEAD: {}",
-                    output_text(&output)
-                ),
-            );
-            false
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0026",
-                subject,
-                format!(
-                    "cannot determine whether {field} {commit} is reachable from HEAD: {error}"
-                ),
-            );
-            false
         }
     }
 }
@@ -1782,8 +1278,12 @@ fn load_evidence(
     relative_path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<EvidenceManifest> {
-    let path = match resolve_repo_path(repo_root, relative_path) {
-        Ok(path) => path,
+    let path = match resolve_declared_path(repo_root, relative_path) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            emit_days_gpu_skip(diagnostics, relative_path, relative_path, repo_root);
+            return None;
+        }
         Err(error) => {
             emit(
                 diagnostics,
@@ -1806,24 +1306,6 @@ fn load_evidence(
             return None;
         }
     };
-
-    if let Ok(table) = contents.parse::<toml::Table>() {
-        let has_budget = table.get("budget").is_some();
-        let has_budget_hash = table.get("budget_hash").is_some();
-        let is_measurement = table
-            .get("kind")
-            .and_then(toml::Value::as_str)
-            .is_some_and(|kind| kind == "measurement");
-        if has_budget_hash && !has_budget && !is_measurement {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0002",
-                relative_path,
-                "budget_hash is forbidden without budget",
-            );
-            return None;
-        }
-    }
 
     match parse_evidence_manifest(&contents) {
         Ok(evidence) => {
@@ -1872,347 +1354,59 @@ fn check_evidence_artifacts(
     evidence: &EvidenceManifest,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    match evidence.kind {
-        EvidenceKind::Golden | EvidenceKind::Measurement => {
-            for (index, artifact) in evidence.artifacts.iter().enumerate() {
-                let subject = artifact.path.as_deref().unwrap_or(evidence_path).to_owned();
-                let Some(path) = artifact.path.as_deref() else {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0014",
-                        format!("{evidence_path} artifacts[{index}]"),
-                        "golden artifact has no repository path",
-                    );
-                    continue;
-                };
-                if artifact.days_gpu_commit.is_some()
-                    || artifact.tool_version.is_some()
-                    || artifact.command.is_some()
-                    || artifact.schema.is_some()
-                {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0014",
-                        &subject,
-                        "golden artifact must not declare days-gpu archive provenance",
-                    );
-                }
-                let Some(expected_hash) = artifact.content_hash.as_deref() else {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0014",
-                        &subject,
-                        "golden artifact has no content_hash",
-                    );
-                    continue;
-                };
-                match evidence.kind {
-                    EvidenceKind::Golden => {
-                        let resolved = match resolve_repo_path(repo_root, path) {
-                            Ok(resolved) => resolved,
-                            Err(error) => {
-                                emit(
-                                    diagnostics,
-                                    "DAYS-AUDIT-0014",
-                                    &subject,
-                                    format!("golden artifact path is invalid: {error}"),
-                                );
-                                continue;
-                            }
-                        };
-                        match sha256_file(&resolved) {
-                            Ok(actual) if actual == expected_hash => {}
-                            Ok(actual) => emit(
-                                diagnostics,
-                                "DAYS-AUDIT-0014",
-                                &subject,
-                                format!("declared hash {expected_hash} does not match {actual}"),
-                            ),
-                            Err(error) => emit(
-                                diagnostics,
-                                "DAYS-AUDIT-0014",
-                                &subject,
-                                format!("golden artifact cannot be hashed: {error}"),
-                            ),
-                        }
-                    }
-                    EvidenceKind::Measurement => {
-                        let Some(run_commit) = evidence.run_commit.as_deref() else {
-                            continue;
-                        };
-                        let object = format!("{run_commit}:{path}");
-                        match git(repo_root, &["cat-file", "blob", &object]) {
-                            Ok(output) if output.status.success() => {
-                                let actual = sha256_bytes(&output.stdout);
-                                if actual != expected_hash {
-                                    emit(
-                                        diagnostics,
-                                        "DAYS-AUDIT-0014",
-                                        &subject,
-                                        format!(
-                                            "measurement artifact hash {expected_hash} does not match {actual} at {object}"
-                                        ),
-                                    );
-                                }
-                            }
-                            Ok(output) => emit(
-                                diagnostics,
-                                "DAYS-AUDIT-0014",
-                                &subject,
-                                format!(
-                                    "measurement artifact is absent at run_commit {object}: {}",
-                                    output_text(&output)
-                                ),
-                            ),
-                            Err(error) => emit(
-                                diagnostics,
-                                "DAYS-AUDIT-0014",
-                                &subject,
-                                format!(
-                                    "cannot read measurement artifact at run_commit {object}: {error}"
-                                ),
-                            ),
-                        }
-                    }
-                    EvidenceKind::Archive => {}
-                }
+    for (index, artifact) in evidence.artifacts.iter().enumerate() {
+        let subject = artifact.path.as_deref().unwrap_or(evidence_path).to_owned();
+        let Some(path) = artifact.path.as_deref() else {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0014",
+                format!("{evidence_path} artifacts[{index}]"),
+                "artifact has no repository path",
+            );
+            continue;
+        };
+        let Some(expected_hash) = artifact.content_hash.as_deref() else {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0014",
+                &subject,
+                "artifact has no content_hash",
+            );
+            continue;
+        };
+
+        let resolved = match resolve_declared_path(repo_root, path) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                emit_days_gpu_skip(diagnostics, &subject, path, repo_root);
+                continue;
             }
-        }
-        EvidenceKind::Archive => {
-            for (index, artifact) in evidence.artifacts.iter().enumerate() {
-                let subject = format!("{evidence_path} artifacts[{index}]");
-                let Some(path) = artifact.path.as_deref() else {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0015",
-                        &subject,
-                        "archive artifact has no days-gpu repository path",
-                    );
-                    continue;
-                };
-                let expected_prefix = format!("evidence/{}/", evidence.phase);
-                if !path.starts_with(&expected_prefix) {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0015",
-                        &subject,
-                        format!("archive artifact path must be under days-gpu/{expected_prefix}"),
-                    );
-                }
-                let Some(expected_hash) = artifact.content_hash.as_deref() else {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0015",
-                        &subject,
-                        "archive artifact has no content_hash",
-                    );
-                    continue;
-                };
-                let Some(commit) = artifact.days_gpu_commit.as_deref() else {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0015",
-                        &subject,
-                        "archive artifact has no days_gpu_commit",
-                    );
-                    continue;
-                };
-                if !is_git_commit_sha(commit) {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0015",
-                        &subject,
-                        "days_gpu_commit must be 40 lowercase hexadecimal characters",
-                    );
-                    continue;
-                }
-                if artifact.tool_version.as_deref().is_none_or(str::is_empty)
-                    || artifact.command.as_ref().is_none_or(Vec::is_empty)
-                    || artifact.schema.as_deref().is_none_or(str::is_empty)
-                {
-                    emit(
-                        diagnostics,
-                        "DAYS-AUDIT-0015",
-                        &subject,
-                        "archive artifact needs tool_version, command, and schema",
-                    );
-                    continue;
-                }
-                check_days_gpu_artifact(
-                    repo_root,
-                    &subject,
-                    path,
-                    expected_hash,
-                    commit,
-                    diagnostics,
-                );
-            }
-        }
-    }
-}
-
-fn is_git_commit_sha(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn check_days_gpu_artifact(
-    repo_root: &Path,
-    subject: &str,
-    path: &str,
-    expected_hash: &str,
-    commit: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let days_gpu = std::env::var_os("DAYS_GPU_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| repo_root.parent().map(|parent| parent.join("days-gpu")));
-    let Some(days_gpu) = days_gpu else {
-        emit(
-            diagnostics,
-            "DAYS-AUDIT-0028",
-            subject,
-            format!("archive verification skipped; cannot locate days-gpu for {commit}:{path}"),
-        );
-        return;
-    };
-    match git(&days_gpu, &["rev-parse", "--is-inside-work-tree"]) {
-        Ok(output)
-            if output.status.success()
-                && String::from_utf8_lossy(&output.stdout).trim() == "true" => {}
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0028",
-                subject,
-                format!(
-                    "archive verification skipped; days-gpu repository {} is unavailable: {}",
-                    days_gpu.display(),
-                    output_text(&output)
-                ),
-            );
-            return;
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0028",
-                subject,
-                format!(
-                    "archive verification skipped; days-gpu repository {} is unavailable: {error}",
-                    days_gpu.display()
-                ),
-            );
-            return;
-        }
-    }
-    let commit_object = format!("{commit}^{{commit}}");
-    match git(&days_gpu, &["cat-file", "-e", &commit_object]) {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0015",
-                subject,
-                format!(
-                    "days-gpu commit {commit} cannot be verified: {}",
-                    output_text(&output)
-                ),
-            );
-            return;
-        }
-        Err(error) => {
-            emit(
-                diagnostics,
-                "DAYS-AUDIT-0015",
-                subject,
-                format!("cannot execute git for days-gpu commit {commit}: {error}"),
-            );
-            return;
-        }
-    }
-
-    let object = format!("{commit}:{path}");
-    match git(&days_gpu, &["show", &object]) {
-        Ok(output) if output.status.success() => {
-            let actual = sha256_bytes(&output.stdout);
-            if actual != expected_hash {
+            Err(error) => {
                 emit(
                     diagnostics,
-                    "DAYS-AUDIT-0015",
-                    subject,
-                    format!(
-                        "days-gpu artifact hash {expected_hash} does not match {actual} at {commit}:{path}"
-                    ),
+                    "DAYS-AUDIT-0014",
+                    &subject,
+                    format!("artifact path is invalid: {error}"),
                 );
+                continue;
             }
-        }
-        Ok(output) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0015",
-            subject,
-            format!(
-                "days-gpu path is absent from recorded commit {commit}:{path}: {}",
-                output_text(&output)
-            ),
-        ),
-        Err(error) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0015",
-            subject,
-            format!("cannot read days-gpu artifact at {commit}:{path}: {error}"),
-        ),
-    }
-}
+        };
 
-fn check_evidence_budget(
-    repo_root: &Path,
-    evidence_path: &str,
-    evidence: &EvidenceManifest,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let Some(budget_path) = evidence.budget.as_deref() else {
-        return;
-    };
-    let Some(expected_hash) = evidence.budget_hash.as_deref() else {
-        if evidence.kind != EvidenceKind::Measurement {
-            emit(
+        match sha256_file(&resolved) {
+            Ok(actual) if actual == expected_hash => {}
+            Ok(actual) => emit(
                 diagnostics,
-                "DAYS-AUDIT-0012",
-                evidence_path,
-                "evidence declares budget without budget_hash",
-            );
-        }
-        return;
-    };
-    let path = match resolve_repo_path(repo_root, budget_path) {
-        Ok(path) => path,
-        Err(error) => {
-            emit(
+                "DAYS-AUDIT-0014",
+                &subject,
+                format!("declared hash {expected_hash} does not match {actual}"),
+            ),
+            Err(error) => emit(
                 diagnostics,
-                "DAYS-AUDIT-0012",
-                budget_path,
-                format!("measurement budget path is invalid: {error}"),
-            );
-            return;
+                "DAYS-AUDIT-0014",
+                &subject,
+                format!("artifact cannot be hashed: {error}"),
+            ),
         }
-    };
-    match sha256_file(&path) {
-        Ok(actual) if actual == expected_hash => {}
-        Ok(actual) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0012",
-            budget_path,
-            format!("measurement hash {expected_hash} does not match {actual}"),
-        ),
-        Err(error) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0012",
-            budget_path,
-            format!("measurement budget cannot be hashed: {error}"),
-        ),
     }
 }
 

@@ -1,7 +1,0 @@
-model_kind,node_id,peer_node_id,flow_id,packets_sent,bytes_sent,packets_enqueued,packets_dropped,packets_forwarded,final_queue_occupancy_packets,final_queue_occupancy_bytes,packets_received,bytes_received,final_time_ns
-source,0,,0,200,200000,0,0,0,0,0,0,0,199000
-switch,0,,,0,202688,0,0,242,0,0,0,0,1617024
-switch,1,,,0,202688,0,0,242,0,0,0,0,1616000
-port,0,1,,0,0,200,0,200,0,0,0,0,1600000
-port,1,0,,0,0,42,0,42,0,0,0,0,1616512
-sink,1,,0,0,0,0,0,0,0,0,200,200000,200000000

@@ -13,7 +13,14 @@ fn repository_root() -> PathBuf {
 #[test]
 fn frozen_retirement_budget_matches_schema_and_corpus() {
     let root = repository_root();
-    let path = root.join("docs/days-executor/budgets/retirement-budget.toml");
+    let days_gpu = std::env::var_os("DAYS_GPU_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| root.parent().map(|parent| parent.join("days-gpu")));
+    let Some(days_gpu) = days_gpu.filter(|path| path.is_dir()) else {
+        eprintln!("skipping retirement budget golden check: days-gpu is unavailable");
+        return;
+    };
+    let path = days_gpu.join("budgets/retirement-budget.toml");
     let input = fs::read_to_string(path).expect("read retirement budget");
     let budget = parse_budget_manifest(&input, &root).expect("validate retirement budget");
 

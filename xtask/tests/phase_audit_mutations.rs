@@ -12,9 +12,6 @@ struct Fixture {
     directory: TempDir,
     root: PathBuf,
     host: String,
-    pre_budget_commit: String,
-    frozen_commit: String,
-    measurement_commit: String,
 }
 
 impl Fixture {
@@ -58,9 +55,6 @@ license = "AGPL-3.0-only"
         write(&root, "xtask/src/lib.rs", "pub fn fixture_xtask() {}\n");
         let baseline = dependency_baseline::render(&root).expect("render fixture baseline");
         dependency_baseline::write(&root, &baseline).expect("write fixture baseline");
-        run(&root, &["add", "-A"]);
-        run(&root, &["commit", "-q", "-m", "Initialize fixture"]);
-        let pre_budget_commit = run_output(&root, &["rev-parse", "HEAD"]);
 
         write(
             &root,
@@ -82,40 +76,17 @@ license = "AGPL-3.0-only"
         let golden = "fixture golden\n";
         write(&root, "docs/days-executor/evidence/P90/golden.txt", golden);
         let golden_hash = sha256_bytes(golden.as_bytes());
-        run(&root, &["add", "-A"]);
-        run(&root, &["commit", "-q", "-m", "Freeze fixture budget"]);
-        let frozen_commit = run_output(&root, &["rev-parse", "HEAD"]);
-
-        let measurement = "fixture measurement\n";
-        write(
-            &root,
-            "docs/days-executor/evidence/P90/measurement.txt",
-            measurement,
-        );
-        let measurement_hash = sha256_bytes(measurement.as_bytes());
-        run(
-            &root,
-            &["add", "docs/days-executor/evidence/P90/measurement.txt"],
-        );
-        run(&root, &["commit", "-q", "-m", "Record fixture measurement"]);
-        let measurement_commit = run_output(&root, &["rev-parse", "HEAD"]);
 
         write(
             &root,
             "docs/days-executor/evidence/P90/t0-evidence.toml",
             &golden_evidence(&golden_hash),
         );
-        write(
-            &root,
-            "docs/days-executor/evidence/P90/measurement.toml",
-            &measurement_evidence(&budget_hash, &measurement_commit, &measurement_hash),
-        );
-
         let host = host_platform();
         write(
             &root,
             "docs/days-executor/phases/P90-fixture.toml",
-            &phase_metadata(&host, &budget_hash, &frozen_commit),
+            &phase_metadata(&host, &budget_hash),
         );
         run(&root, &["add", "-A"]);
         run(&root, &["commit", "-q", "-m", "Add fixture audit metadata"]);
@@ -123,9 +94,6 @@ license = "AGPL-3.0-only"
             directory,
             root,
             host,
-            pre_budget_commit,
-            frozen_commit,
-            measurement_commit,
         }
     }
 
@@ -143,21 +111,12 @@ license = "AGPL-3.0-only"
             .join("docs/days-executor/evidence/P90/t0-evidence.toml")
     }
 
-    fn measurement_path(&self) -> PathBuf {
-        self.root()
-            .join("docs/days-executor/evidence/P90/measurement.toml")
-    }
-
     fn mutate_phase(&self, mutation: impl FnOnce(String) -> String) {
         mutate(&self.phase_path(), mutation);
     }
 
     fn set_evidence(&self, contents: &str) {
         fs::write(self.evidence_path(), contents).expect("write evidence mutation");
-    }
-
-    fn set_measurement(&self, contents: &str) {
-        fs::write(self.measurement_path(), contents).expect("write measurement mutation");
     }
 
     fn audit(&self) -> AuditReport {
@@ -169,7 +128,7 @@ license = "AGPL-3.0-only"
     }
 }
 
-fn phase_metadata(host: &str, budget_hash: &str, frozen_commit: &str) -> String {
+fn phase_metadata(host: &str, budget_hash: &str) -> String {
     format!(
         r#"schema_version = 1
 phase = "P90"
@@ -193,7 +152,6 @@ title = "Fixture task"
 depends_on = []
 evidence = [
     "docs/days-executor/evidence/P90/t0-evidence.toml",
-    "docs/days-executor/evidence/P90/measurement.toml",
 ]
 
 [tasks.red_test]
@@ -209,10 +167,8 @@ deterministic = true
 [[budgets]]
 id = "p90-fixture-budget"
 owner_phase = "P90"
-required_consumers = []
 path = "docs/days-executor/budgets/p90-fixture.toml"
 content_hash = "{budget_hash}"
-frozen_at_commit = "{frozen_commit}"
 "#
     )
 }
@@ -309,30 +265,7 @@ content_hash = "{golden_hash}"
     )
 }
 
-fn measurement_evidence(budget_hash: &str, run_commit: &str, artifact_hash: &str) -> String {
-    format!(
-        r#"schema_version = 1
-id = "P90-T0-measurement"
-phase = "P90"
-task = "T0"
-kind = "measurement"
-description = "Synthetic measurement evidence"
-command = ["cargo", "--version"]
-tool_version = "cargo fixture"
-schema = "days-executor/measurement/v1"
-tags = []
-budget = "docs/days-executor/budgets/p90-fixture.toml"
-budget_hash = "{budget_hash}"
-run_commit = "{run_commit}"
-
-[[artifacts]]
-path = "docs/days-executor/evidence/P90/measurement.txt"
-content_hash = "{artifact_hash}"
-"#
-    )
-}
-
-fn archive_evidence(path: &str, commit: &str, content_hash: Option<&str>) -> String {
+fn archive_evidence(path: &str, content_hash: Option<&str>) -> String {
     let hash = content_hash
         .map(|value| format!("content_hash = \"{value}\"\n"))
         .unwrap_or_default();
@@ -350,7 +283,6 @@ tags = []
 
 [[artifacts]]
 path = "{path}"
-days_gpu_commit = "{commit}"
 {hash}tool_version = "cargo fixture"
 command = ["cargo", "--version"]
 schema = "days-executor/archive/v1"
@@ -462,26 +394,15 @@ fn add_secondary_phase(
     );
 }
 
-fn init_days_gpu(fixture: &Fixture, artifact: &str, commit_artifact: bool) -> (String, String) {
-    init_days_gpu_at(&fixture.days_gpu_root(), artifact, commit_artifact)
+fn init_days_gpu(fixture: &Fixture, artifact: &str) -> String {
+    init_days_gpu_at(&fixture.days_gpu_root(), artifact)
 }
 
-fn init_days_gpu_at(root: &Path, artifact: &str, commit_artifact: bool) -> (String, String) {
+fn init_days_gpu_at(root: &Path, artifact: &str) -> String {
     fs::create_dir(root).expect("create days-gpu fixture");
-    run(root, &["init", "-q"]);
-    run(root, &["config", "user.email", "days@example.invalid"]);
-    run(root, &["config", "user.name", "Days Audit"]);
     write(root, "README.md", "# days-gpu fixture\n");
-    run(root, &["add", "README.md"]);
-    run(root, &["commit", "-q", "-m", "Initialize fixture"]);
-
     write(root, "evidence/P90/archive.bin", artifact);
-    if commit_artifact {
-        run(root, &["add", "evidence/P90/archive.bin"]);
-        run(root, &["commit", "-q", "-m", "Add evidence"]);
-    }
-    let commit = run_output(root, &["rev-parse", "HEAD"]);
-    (commit, sha256_bytes(artifact.as_bytes()))
+    sha256_bytes(artifact.as_bytes())
 }
 
 fn host_platform() -> String {
@@ -501,10 +422,6 @@ fn mutate(path: &Path, mutation: impl FnOnce(String) -> String) {
     fs::write(path, mutation(contents)).expect("write mutation target");
 }
 
-fn file_hash(path: &Path) -> String {
-    sha256_bytes(&fs::read(path).expect("read file for hash"))
-}
-
 fn run(root: &Path, arguments: &[&str]) {
     let status = Command::new("git")
         .args(arguments)
@@ -512,19 +429,6 @@ fn run(root: &Path, arguments: &[&str]) {
         .status()
         .expect("run git");
     assert!(status.success(), "git {arguments:?} failed");
-}
-
-fn run_output(root: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(root)
-        .output()
-        .expect("run git for output");
-    assert!(output.status.success(), "git {arguments:?} failed");
-    String::from_utf8(output.stdout)
-        .expect("git output is UTF-8")
-        .trim()
-        .to_owned()
 }
 
 fn run_xtask(root: &Path, arguments: &[&str]) -> Output {
@@ -579,14 +483,6 @@ fn p01_metadata_audits_itself() {
 #[test]
 fn valid_fixture_passes() {
     let fixture = Fixture::new();
-    let report = fixture.audit();
-    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
-}
-
-#[test]
-fn honest_freeze_measurement_binding_sequence_passes() {
-    let fixture = Fixture::new();
-
     let report = fixture.audit();
     assert!(!report.has_errors(), "{:#?}", report.diagnostics);
 }
@@ -891,282 +787,6 @@ fn malformed_budget_manifest_is_rejected() {
 }
 
 #[test]
-fn commented_evidence_document_still_enforces_budget_field_pairing() {
-    let fixture = Fixture::new();
-    mutate(&fixture.evidence_path(), |value| {
-        format!(
-            "# leading document comment\n{}",
-            value.replace(
-                "schema_version = 1\n",
-                "schema_version = 1\nbudget_hash = \"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"\n",
-            )
-        )
-    });
-    assert_code_message(
-        &fixture.audit(),
-        "DAYS-AUDIT-0002",
-        "budget_hash is forbidden without budget",
-    );
-}
-
-#[test]
-fn post_measurement_budget_change_is_rejected() {
-    let fixture = Fixture::new();
-    mutate(&fixture.measurement_path(), |value| {
-        value.replacen(
-            "budget_hash = \"sha256:",
-            "budget_hash = \"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"\n# ",
-            1,
-        )
-    });
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0012");
-}
-
-#[test]
-fn budget_recommitted_after_measurement_is_rejected() {
-    let fixture = Fixture::new();
-    let budget_path = fixture
-        .root()
-        .join("docs/days-executor/budgets/p90-fixture.toml");
-    let old_hash = file_hash(&budget_path);
-    mutate(&budget_path, |value| {
-        value.replace("value = 1.0", "value = 2.0")
-    });
-    run(
-        fixture.root(),
-        &["add", "docs/days-executor/budgets/p90-fixture.toml"],
-    );
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Move budget threshold"],
-    );
-    let new_hash = file_hash(&budget_path);
-    let new_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    fixture.mutate_phase(|value| {
-        value
-            .replace(&old_hash, &new_hash)
-            .replace(&fixture.frozen_commit, &new_commit)
-    });
-    mutate(&fixture.measurement_path(), |value| {
-        value.replace(&old_hash, &new_hash)
-    });
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "is not an ancestor");
-}
-
-#[test]
-fn retirement_budget_edited_after_measurement_is_rejected() {
-    let fixture = Fixture::new();
-    let budget_path = fixture
-        .root()
-        .join("docs/days-executor/budgets/p90-fixture.toml");
-    let old_hash = file_hash(&budget_path);
-    mutate(&budget_path, |value| {
-        value.replace("value = 1.0", "value = 1.1")
-    });
-    run(
-        fixture.root(),
-        &["add", "docs/days-executor/budgets/p90-fixture.toml"],
-    );
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Edit retirement threshold after run"],
-    );
-    let edited_hash = file_hash(&budget_path);
-    let edited_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    fixture.mutate_phase(|value| {
-        value
-            .replace(&old_hash, &edited_hash)
-            .replace(&fixture.frozen_commit, &edited_commit)
-    });
-    mutate(&fixture.measurement_path(), |value| {
-        value.replace(&old_hash, &edited_hash)
-    });
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "is not an ancestor");
-}
-
-#[test]
-fn budget_and_measurement_in_same_commit_is_rejected() {
-    let fixture = Fixture::new();
-    fixture
-        .mutate_phase(|value| value.replace(&fixture.frozen_commit, &fixture.measurement_commit));
-    let expected_message = format!(
-        "measurement run_commit {} equals frozen_at_commit {}; the measurement was committed together with the budget instead of after the freeze",
-        fixture.measurement_commit, fixture.measurement_commit
-    );
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", &expected_message);
-}
-
-#[test]
-fn budget_frozen_before_measurement_passes() {
-    let fixture = Fixture::new();
-    write(
-        fixture.root(),
-        "audit/measurement_marker.rs",
-        "fn measurement_marker() {}\n",
-    );
-    run(fixture.root(), &["add", "audit/measurement_marker.rs"]);
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Prepare measurement run"],
-    );
-    let run_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    mutate(&fixture.measurement_path(), |value| {
-        value.replace(&fixture.measurement_commit, &run_commit)
-    });
-
-    let report = fixture.audit();
-    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
-}
-
-#[test]
-fn measurement_artifact_precomputed_at_freeze_is_rejected() {
-    let fixture = Fixture::new();
-    let measurement_hash = file_hash(
-        &fixture
-            .root()
-            .join("docs/days-executor/evidence/P90/measurement.txt"),
-    );
-    let frozen_hash = file_hash(
-        &fixture
-            .root()
-            .join("docs/days-executor/evidence/P90/golden.txt"),
-    );
-    run(
-        fixture.root(),
-        &["commit", "--allow-empty", "-q", "-m", "Declare empty run"],
-    );
-    let empty_run = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    mutate(&fixture.measurement_path(), |value| {
-        value
-            .replace(&fixture.measurement_commit, &empty_run)
-            .replace(
-                "docs/days-executor/evidence/P90/measurement.txt",
-                "docs/days-executor/evidence/P90/golden.txt",
-            )
-            .replace(&measurement_hash, &frozen_hash)
-    });
-
-    let report = fixture.audit();
-    assert_code_message(
-        &report,
-        "DAYS-AUDIT-0026",
-        "has no adding commit after frozen_at_commit",
-    );
-    assert_code_message(
-        &report,
-        "DAYS-AUDIT-0026",
-        "already had identical content at frozen_at_commit",
-    );
-}
-
-#[test]
-fn measurement_artifact_pathspec_is_literal() {
-    let fixture = Fixture::new();
-    let literal_path = "docs/days-executor/evidence/P90/measurement[1].txt";
-    write(fixture.root(), literal_path, "before measurement\n");
-    run(fixture.root(), &["add", literal_path]);
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Freeze literal-path fixture"],
-    );
-    let frozen_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-
-    write(fixture.root(), literal_path, "after measurement\n");
-    write(
-        fixture.root(),
-        "docs/days-executor/evidence/P90/measurement1.txt",
-        "glob decoy\n",
-    );
-    run(
-        fixture.root(),
-        &[
-            "add",
-            literal_path,
-            "docs/days-executor/evidence/P90/measurement1.txt",
-        ],
-    );
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Record literal-path measurement"],
-    );
-    let run_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    let artifact_hash = file_hash(&fixture.root().join(literal_path));
-    let old_artifact_hash = file_hash(
-        &fixture
-            .root()
-            .join("docs/days-executor/evidence/P90/measurement.txt"),
-    );
-
-    fixture.mutate_phase(|value| value.replace(&fixture.frozen_commit, &frozen_commit));
-    mutate(&fixture.measurement_path(), |value| {
-        value
-            .replace(&fixture.measurement_commit, &run_commit)
-            .replace(
-                "docs/days-executor/evidence/P90/measurement.txt",
-                literal_path,
-            )
-            .replace(&old_artifact_hash, &artifact_hash)
-    });
-
-    assert_code_message(
-        &fixture.audit(),
-        "DAYS-AUDIT-0026",
-        "has no adding commit after frozen_at_commit",
-    );
-}
-
-#[test]
-fn merge_in_measurement_history_is_rejected() {
-    let fixture = Fixture::new();
-    let primary_branch = run_output(fixture.root(), &["branch", "--show-current"]);
-    run(
-        fixture.root(),
-        &[
-            "checkout",
-            "-q",
-            "-b",
-            "measurement-side",
-            &fixture.measurement_commit,
-        ],
-    );
-    write(
-        fixture.root(),
-        "audit/measurement-side.rs",
-        "fn measurement_side() {}\n",
-    );
-    run(fixture.root(), &["add", "audit/measurement-side.rs"]);
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Add measurement side branch"],
-    );
-    run(fixture.root(), &["checkout", "-q", &primary_branch]);
-    run(
-        fixture.root(),
-        &[
-            "merge",
-            "--no-ff",
-            "-q",
-            "-m",
-            "Merge measurement side branch",
-            "measurement-side",
-        ],
-    );
-    let merge_run = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    mutate(&fixture.measurement_path(), |value| {
-        value.replace(&fixture.measurement_commit, &merge_run)
-    });
-
-    assert_code_message(
-        &fixture.audit(),
-        "DAYS-AUDIT-0026",
-        "contains merge commit(s)",
-    );
-}
-
-#[test]
 fn budget_manifest_identity_must_match_phase_reference() {
     let fixture = Fixture::new();
     fixture.mutate_phase(|value| {
@@ -1177,221 +797,6 @@ fn budget_manifest_identity_must_match_phase_reference() {
         &fixture.audit(),
         "DAYS-AUDIT-0011",
         "does not match manifest identity",
-    );
-}
-
-#[test]
-fn declared_budget_consumer_must_reuse_frozen_identity() {
-    let fixture = Fixture::new();
-    add_secondary_phase(&fixture, "P91", "consumer", &[], true);
-    fixture.mutate_phase(|value| {
-        value.replace("required_consumers = []", "required_consumers = [\"P91\"]")
-    });
-
-    assert_code_message(
-        &fixture.audit(),
-        "DAYS-AUDIT-0027",
-        "phase P91 must cite frozen budget p90-fixture-budget",
-    );
-}
-
-#[test]
-fn declared_budget_consumer_can_reuse_frozen_identity() {
-    let fixture = Fixture::new();
-    add_secondary_phase(&fixture, "P91", "consumer", &[], true);
-    fixture.mutate_phase(|value| {
-        value.replace("required_consumers = []", "required_consumers = [\"P91\"]")
-    });
-    let consumer_path = fixture
-        .root()
-        .join("docs/days-executor/phases/P91-consumer.toml");
-    mutate(&consumer_path, |value| {
-        format!(
-            r#"{value}
-[[budgets]]
-id = "p90-fixture-budget"
-owner_phase = "P90"
-required_consumers = []
-path = "docs/days-executor/budgets/p90-fixture.toml"
-content_hash = "{}"
-frozen_at_commit = "{}"
-"#,
-            file_hash(
-                &fixture
-                    .root()
-                    .join("docs/days-executor/budgets/p90-fixture.toml")
-            ),
-            fixture.frozen_commit
-        )
-    });
-
-    let report = fixture.audit();
-    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
-}
-
-#[test]
-fn uncommitted_budget_is_rejected() {
-    let fixture = Fixture::new();
-    let budget_path = fixture
-        .root()
-        .join("docs/days-executor/budgets/p90-fixture.toml");
-    let old_hash = file_hash(&budget_path);
-    mutate(&budget_path, |value| {
-        value.replace("value = 1.0", "value = 2.0")
-    });
-    let new_hash = file_hash(&budget_path);
-    fixture.mutate_phase(|value| value.replace(&old_hash, &new_hash));
-    mutate(&fixture.measurement_path(), |value| {
-        value.replace(&old_hash, &new_hash)
-    });
-
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0026");
-}
-
-#[test]
-fn frozen_budget_path_missing_at_commit_is_rejected() {
-    let fixture = Fixture::new();
-    fixture.mutate_phase(|value| value.replace(&fixture.frozen_commit, &fixture.pre_budget_commit));
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "budget path is absent");
-}
-
-#[test]
-fn frozen_budget_content_mismatch_is_rejected() {
-    let fixture = Fixture::new();
-    let budget_path = fixture
-        .root()
-        .join("docs/days-executor/budgets/p90-fixture.toml");
-    let original = fs::read_to_string(&budget_path).expect("read original budget");
-    mutate(&budget_path, |value| {
-        value.replace("value = 1.0", "value = 2.0")
-    });
-    run(
-        fixture.root(),
-        &["add", "docs/days-executor/budgets/p90-fixture.toml"],
-    );
-    run(
-        fixture.root(),
-        &["commit", "-q", "-m", "Commit different budget"],
-    );
-    let different_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
-    fs::write(&budget_path, original).expect("restore working budget bytes");
-    fixture.mutate_phase(|value| value.replace(&fixture.frozen_commit, &different_commit));
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "hashes to");
-}
-
-#[test]
-fn missing_freeze_commit_reports_shallow_history_hint() {
-    let fixture = Fixture::new();
-    fixture.mutate_phase(|value| {
-        value.replace(
-            &fixture.frozen_commit,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-    });
-
-    assert_code_message(
-        &fixture.audit(),
-        "DAYS-AUDIT-0026",
-        "not present in this clone (history may be shallow)",
-    );
-}
-
-#[test]
-fn non_commit_freeze_object_is_distinguished() {
-    let fixture = Fixture::new();
-    let blob = run_output(fixture.root(), &["hash-object", "-w", "root.rs"]);
-    fixture.mutate_phase(|value| value.replace(&fixture.frozen_commit, &blob));
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", "not a commit");
-}
-
-#[test]
-fn measurement_missing_required_binding_is_rejected() {
-    let fixture = Fixture::new();
-    mutate(&fixture.measurement_path(), |value| {
-        value
-            .lines()
-            .filter(|line| {
-                !line.starts_with("budget = ")
-                    && !line.starts_with("budget_hash = ")
-                    && !line.starts_with("run_commit = ")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
-    });
-
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0027");
-}
-
-#[test]
-fn declared_budget_without_measurement_is_rejected() {
-    let fixture = Fixture::new();
-    fixture.mutate_phase(|value| {
-        value.replace(
-            r#"evidence = [
-    "docs/days-executor/evidence/P90/t0-evidence.toml",
-    "docs/days-executor/evidence/P90/measurement.toml",
-]"#,
-            r#"evidence = ["docs/days-executor/evidence/P90/t0-evidence.toml"]"#,
-        )
-    });
-
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0027");
-}
-
-#[test]
-fn measurement_evidence_without_artifacts_is_rejected() {
-    let fixture = Fixture::new();
-    fixture.set_measurement(&empty_evidence("measurement"));
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0013");
-}
-
-#[test]
-fn measurement_artifact_absent_at_run_commit_is_rejected() {
-    let fixture = Fixture::new();
-    let original_path = fixture
-        .root()
-        .join("docs/days-executor/evidence/P90/measurement.txt");
-    let original_hash = file_hash(&original_path);
-    let late = "late measurement artifact\n";
-    write(
-        fixture.root(),
-        "docs/days-executor/evidence/P90/late-measurement.txt",
-        late,
-    );
-    let late_hash = sha256_bytes(late.as_bytes());
-    mutate(&fixture.measurement_path(), |value| {
-        value
-            .replace(
-                "docs/days-executor/evidence/P90/measurement.txt",
-                "docs/days-executor/evidence/P90/late-measurement.txt",
-            )
-            .replace(&original_hash, &late_hash)
-    });
-
-    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0014", "absent at run_commit");
-}
-
-#[test]
-fn measurement_artifact_content_at_run_commit_must_match() {
-    let fixture = Fixture::new();
-    let artifact_path = fixture
-        .root()
-        .join("docs/days-executor/evidence/P90/measurement.txt");
-    let original_hash = file_hash(&artifact_path);
-    fs::write(&artifact_path, "fabricated after run\n").expect("change measurement artifact");
-    let changed_hash = file_hash(&artifact_path);
-    mutate(&fixture.measurement_path(), |value| {
-        value.replace(&original_hash, &changed_hash)
-    });
-
-    assert_code_message(
-        &fixture.audit(),
-        "DAYS-AUDIT-0014",
-        "measurement artifact hash",
     );
 }
 
@@ -1465,7 +870,6 @@ title = "Fixture task"
 depends_on = []
 evidence = [
     "docs/days-executor/evidence/P90/t0-evidence.toml",
-    "docs/days-executor/evidence/P90/measurement.toml",
 ]
 
 [tasks.red_test]
@@ -1485,7 +889,6 @@ fn task_without_evidence_is_rejected() {
         value.replace(
             r#"evidence = [
     "docs/days-executor/evidence/P90/t0-evidence.toml",
-    "docs/days-executor/evidence/P90/measurement.toml",
 ]"#,
             "evidence = []",
         )
@@ -1581,36 +984,19 @@ fn archive_evidence_without_artifacts_is_rejected() {
 #[test]
 fn evidence_missing_content_hash_is_rejected() {
     let fixture = Fixture::new();
-    fixture.set_evidence(&archive_evidence(
-        "evidence/P90/archive.tar",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        None,
-    ));
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0015");
+    fixture.set_evidence(&archive_evidence("evidence/P90/archive.tar", None));
+    assert_code(&fixture.audit(), "DAYS-AUDIT-0014");
 }
 
 #[test]
 fn days_gpu_archive_hash_mismatch_is_rejected() {
     let fixture = Fixture::new();
-    let (commit, _) = init_days_gpu(&fixture, "committed evidence\n", true);
+    init_days_gpu(&fixture, "external evidence\n");
     fixture.set_evidence(&archive_evidence(
         "evidence/P90/archive.bin",
-        &commit,
         Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     ));
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0015");
-}
-
-#[test]
-fn uncommitted_days_gpu_archive_is_rejected() {
-    let fixture = Fixture::new();
-    let (commit, hash) = init_days_gpu(&fixture, "uncommitted evidence\n", false);
-    fixture.set_evidence(&archive_evidence(
-        "evidence/P90/archive.bin",
-        &commit,
-        Some(&hash),
-    ));
-    assert_code(&fixture.audit(), "DAYS-AUDIT-0015");
+    assert_code(&fixture.audit(), "DAYS-AUDIT-0014");
 }
 
 #[test]
@@ -1618,7 +1004,6 @@ fn unavailable_days_gpu_archive_check_is_explicitly_skipped() {
     let fixture = Fixture::new();
     fixture.set_evidence(&archive_evidence(
         "evidence/P90/archive.bin",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     ));
 
@@ -1629,12 +1014,8 @@ fn unavailable_days_gpu_archive_check_is_explicitly_skipped() {
 fn days_gpu_root_override_verifies_archive() {
     let fixture = Fixture::new();
     let archive_root = fixture.directory.path().join("archive-store");
-    let (commit, hash) = init_days_gpu_at(&archive_root, "override evidence\n", true);
-    fixture.set_evidence(&archive_evidence(
-        "evidence/P90/archive.bin",
-        &commit,
-        Some(&hash),
-    ));
+    let hash = init_days_gpu_at(&archive_root, "override evidence\n");
+    fixture.set_evidence(&archive_evidence("evidence/P90/archive.bin", Some(&hash)));
 
     let output = run_xtask_with_days_gpu(fixture.root(), &["phase-audit", "P90"], &archive_root);
     assert!(

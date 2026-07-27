@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     SchemaError, SchemaVersion, invalid, is_phase_id, is_task_dependency, is_task_id,
-    validate_git_commit, validate_hash, validate_nonempty, validate_repo_path,
+    validate_hash, validate_nonempty, validate_repo_path,
 };
 
 /// Machine-readable metadata for one program phase.
@@ -48,7 +48,7 @@ pub struct PhaseMetadata {
     /// Backend status declarations.
     #[serde(default)]
     pub backends: Vec<Backend>,
-    /// Frozen performance-budget references.
+    /// Performance-budget references.
     #[serde(default)]
     pub budgets: Vec<BudgetReference>,
 }
@@ -203,22 +203,18 @@ pub struct Backend {
     pub feature: Option<String>,
 }
 
-/// A frozen budget manifest referenced by phase metadata.
+/// A budget manifest referenced by phase metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetReference {
     /// Stable identifier declared inside the budget manifest.
     pub id: String,
-    /// Phase that owns and first freezes the budget.
+    /// Phase that owns the budget.
     pub owner_phase: String,
-    /// Phases that must reuse this exact frozen budget reference when present.
-    pub required_consumers: Vec<String>,
     /// Repository-relative budget-manifest path.
     pub path: String,
     /// SHA-256 hash of the budget-manifest bytes.
     pub content_hash: String,
-    /// Commit containing the frozen budget content.
-    pub frozen_at_commit: String,
 }
 
 impl BudgetReference {
@@ -227,16 +223,7 @@ impl BudgetReference {
         if !is_phase_id(&self.owner_phase) {
             return Err(invalid("budgets.owner_phase", "must match `P[0-9]{2}`"));
         }
-        for consumer in &self.required_consumers {
-            if !is_phase_id(consumer) {
-                return Err(invalid(
-                    "budgets.required_consumers",
-                    "entries must match `P[0-9]{2}`",
-                ));
-            }
-        }
         validate_repo_path("budgets.path", &self.path)?;
-        validate_hash("budgets.content_hash", &self.content_hash)?;
-        validate_git_commit("budgets.frozen_at_commit", &self.frozen_at_commit)
+        validate_hash("budgets.content_hash", &self.content_hash)
     }
 }

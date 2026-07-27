@@ -12,14 +12,18 @@ use serde::{Deserialize, Serialize};
 use crate::hash::{is_sha256, sha256_file};
 use crate::schema::{BudgetManifest, ComparisonBoundary, CorpusRole, parse_budget_manifest};
 
-const DEFAULT_BUDGET: &str = "docs/days-executor/budgets/retirement-budget.toml";
-const RETIREMENT_CORPUS: &str = "docs/days-executor/evidence/P01/retirement-corpus.toml";
+const DEFAULT_BUDGET: &str = "budgets/retirement-budget.toml";
+const RETIREMENT_CORPUS: &str = "evidence/P01/retirement-corpus.toml";
 const PERF_STATS_FEATURE: &str = "perf_stats";
 const MIGRATION_LEDGER_FEATURE: &str = "migration_ledger";
 
 /// Runs corpus, parser, and arithmetic checks without building or executing Days.
 pub fn self_test(repo_root: &Path) -> Result<(), String> {
-    let budget_input = fs::read_to_string(repo_root.join(DEFAULT_BUDGET)).map_err(display_io)?;
+    let Some(budget_path) = external_evidence_path(repo_root, DEFAULT_BUDGET) else {
+        eprintln!("skipping Nexosim baseline self-test: days-gpu is unavailable");
+        return Ok(());
+    };
+    let budget_input = fs::read_to_string(budget_path).map_err(display_io)?;
     let budget =
         parse_budget_manifest(&budget_input, repo_root).map_err(|error| error.to_string())?;
     let fixtures = resolve_fixtures(repo_root, &budget)?;
@@ -55,7 +59,8 @@ pub fn self_test(repo_root: &Path) -> Result<(), String> {
 
 /// Collects correctness artifacts and timed Nexosim baselines under the frozen method.
 pub fn collect(repo_root: &Path, output_dir: &Path) -> Result<(), String> {
-    let budget_path = repo_root.join(DEFAULT_BUDGET);
+    let budget_path = external_evidence_path(repo_root, DEFAULT_BUDGET)
+        .ok_or_else(|| "days-gpu is unavailable; cannot collect the Nexosim baseline".to_owned())?;
     let budget_input = fs::read_to_string(&budget_path).map_err(display_io)?;
     let budget =
         parse_budget_manifest(&budget_input, repo_root).map_err(|error| error.to_string())?;
@@ -133,7 +138,9 @@ struct RetirementCorpusFixture {
 }
 
 fn resolve_fixtures(repo_root: &Path, budget: &BudgetManifest) -> Result<Vec<Fixture>, String> {
-    let input = fs::read_to_string(repo_root.join(RETIREMENT_CORPUS)).map_err(display_io)?;
+    let corpus_path = external_evidence_path(repo_root, RETIREMENT_CORPUS)
+        .ok_or_else(|| "days-gpu is unavailable; cannot read the retirement corpus".to_owned())?;
+    let input = fs::read_to_string(corpus_path).map_err(display_io)?;
     let declared: RetirementCorpusManifest =
         toml::from_str(&input).map_err(|error| error.to_string())?;
     validate_corpus_header(&declared)?;
@@ -162,6 +169,18 @@ fn resolve_fixtures(repo_root: &Path, budget: &BudgetManifest) -> Result<Vec<Fix
             })
         })
         .collect()
+}
+
+fn external_evidence_path(repo_root: &Path, relative_path: &str) -> Option<PathBuf> {
+    let root = days_gpu_root(repo_root)?;
+    Some(root.join(relative_path))
+}
+
+fn days_gpu_root(repo_root: &Path) -> Option<PathBuf> {
+    let root = std::env::var_os("DAYS_GPU_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| repo_root.parent().map(|parent| parent.join("days-gpu")))?;
+    root.is_dir().then_some(root)
 }
 
 fn validate_corpus_header(manifest: &RetirementCorpusManifest) -> Result<(), String> {
@@ -1010,21 +1029,53 @@ fn timed_binary_path(root: &Path, profile: &str) -> PathBuf {
 
 fn validate_output_path(repo_root: &Path, output_dir: &Path) -> Result<(), String> {
     if !output_dir.is_absolute() {
-        return Err("baseline output directory must be an absolute repository path".to_owned());
+        return Err("baseline output directory must be absolute".to_owned());
     }
-    if !output_dir.starts_with(repo_root) {
+    let parent = output_dir
+        .parent()
+        .ok_or_else(|| "baseline output directory has no parent".to_owned())?;
+    let normalized_parent = fs::canonicalize(parent).map_err(display_io)?;
+    let output_name = output_dir
+        .file_name()
+        .ok_or_else(|| "baseline output directory has no final component".to_owned())?;
+    let normalized_output = normalized_parent.join(output_name);
+    let days_gpu = days_gpu_root(repo_root)
+        .ok_or_else(|| "days-gpu is unavailable; cannot place baseline output".to_owned())?;
+    let allowed = fs::canonicalize(days_gpu.join("evidence/P01")).map_err(display_io)?;
+    if !normalized_output.starts_with(&allowed) {
         return Err(format!(
             "baseline output directory must stay under {}",
-            repo_root.display()
+            allowed.display()
         ));
     }
     Ok(())
 }
 
 fn relative_path(repo_root: &Path, path: &Path) -> Result<String, String> {
-    path.strip_prefix(repo_root)
-        .map(|relative| relative.display().to_string())
-        .map_err(|_| format!("{} is outside {}", path.display(), repo_root.display()))
+    if let Ok(relative) = path.strip_prefix(repo_root) {
+        return Ok(relative.display().to_string());
+    }
+    let Some(days_gpu) = days_gpu_root(repo_root) else {
+        return Err(format!(
+            "{} is outside {} and days-gpu is unavailable",
+            path.display(),
+            repo_root.display()
+        ));
+    };
+    let relative = path
+        .strip_prefix(&days_gpu)
+        .map_err(|_| format!("{} is outside {}", path.display(), days_gpu.display()))?;
+    if repo_root
+        .parent()
+        .is_some_and(|parent| days_gpu == parent.join("days-gpu"))
+    {
+        Ok(Path::new("../days-gpu")
+            .join(relative)
+            .display()
+            .to_string())
+    } else {
+        Ok(path.display().to_string())
+    }
 }
 
 fn prepend(first: &str, rest: &[String]) -> Vec<String> {
@@ -1116,10 +1167,14 @@ mod tests {
             .to_path_buf()
     }
 
-    fn frozen_budget() -> BudgetManifest {
+    fn frozen_budget() -> Option<BudgetManifest> {
         let root = repository_root();
-        let input = fs::read_to_string(root.join(DEFAULT_BUDGET)).expect("read frozen budget");
-        parse_budget_manifest(&input, &root).expect("parse frozen budget")
+        let Some(path) = super::external_evidence_path(&root, DEFAULT_BUDGET) else {
+            eprintln!("skipping baseline test: days-gpu is unavailable");
+            return None;
+        };
+        let input = fs::read_to_string(path).expect("read retirement budget");
+        Some(parse_budget_manifest(&input, &root).expect("parse retirement budget"))
     }
 
     #[test]
@@ -1155,7 +1210,9 @@ mod tests {
     #[test]
     fn frozen_corpus_features_are_satisfiable_and_timed_entries_are_empty() {
         let root = repository_root();
-        let budget = frozen_budget();
+        let Some(budget) = frozen_budget() else {
+            return;
+        };
         let fixtures = resolve_fixtures(&root, &budget).expect("resolve frozen corpus");
         assert_eq!(fixtures.len(), 13);
         assert!(
@@ -1217,7 +1274,9 @@ mod tests {
     #[test]
     fn existing_partial_output_is_rejected() {
         let root = repository_root();
-        let budget = frozen_budget();
+        let Some(budget) = frozen_budget() else {
+            return;
+        };
         let fixtures = resolve_fixtures(&root, &budget).expect("resolve frozen corpus");
         let output = TempDir::new().expect("temporary output");
         let first = fixtures

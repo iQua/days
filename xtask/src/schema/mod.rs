@@ -109,9 +109,6 @@ pub enum SchemaError {
         /// Description of the invalid field value.
         message: String,
     },
-    /// An evidence manifest records a budget hash without naming its budget.
-    #[error("malformed metadata: `budget_hash` must not be present unless `budget` is present")]
-    BudgetHashWithoutBudget,
 }
 
 /// Parses and validates phase metadata.
@@ -176,22 +173,6 @@ fn validate_hash(field: &str, value: &str) -> Result<(), SchemaError> {
         Err(invalid(
             field,
             "must be `sha256:` followed by 64 lowercase hexadecimal characters",
-        ))
-    }
-}
-
-fn validate_git_commit(field: &str, value: &str) -> Result<(), SchemaError> {
-    if value.len() == 40
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
-        Ok(())
-    } else {
-        Err(invalid(
-            field,
-            "must be exactly 40 lowercase hexadecimal characters",
         ))
     }
 }

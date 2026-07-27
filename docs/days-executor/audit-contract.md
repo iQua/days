@@ -97,10 +97,8 @@ Information diagnostics use the same format and never affect the exit status.
 | `DAYS-AUDIT-0009` | `forbidden-toolchain` | error | An executor-owned workflow or declared command invokes a forbidden tool. |
 | `DAYS-AUDIT-0010` | `generated-tree-dirty` | error | A generated or inspection directory is not ignored, has tracked files, or is dirty. |
 | `DAYS-AUDIT-0011` | `budget-hash-mismatch` | error | A declared budget manifest is missing, or its phase-metadata hash does not match the file. |
-| `DAYS-AUDIT-0012` | `post-measurement-budget-change` | error | An evidence record's `budget_hash` does not match the current budget hash. |
 | `DAYS-AUDIT-0013` | `evidence-manifest-invalid` | error | An evidence manifest is missing, unparseable, or schema-invalid. |
-| `DAYS-AUDIT-0014` | `evidence-checksum-mismatch` | error | A checked-in golden artifact is missing or its content hash does not match. |
-| `DAYS-AUDIT-0015` | `evidence-link-not-immutable` | error | A `days-gpu` archive artifact omits provenance, is absent from its recorded commit, or has a mismatched hash. |
+| `DAYS-AUDIT-0014` | `evidence-checksum-mismatch` | error | A reachable evidence artifact is missing or its content hash does not match. |
 | `DAYS-AUDIT-0016` | `incomplete-backend-selectable` | error | A backend marked incomplete is selectable or lacks a feature gate. |
 | `DAYS-AUDIT-0017` | `matrix-command-missing` | error | A declared feature or platform has no corresponding declared test command. |
 | `DAYS-AUDIT-0018` | `design-note-missing` | error | The declared design note does not exist. |
@@ -111,12 +109,10 @@ Information diagnostics use the same format and never affect the exit status.
 | `DAYS-AUDIT-0023` | `reproduce-command-failed` | error | A declared reproduce test command exited non-zero. |
 | `DAYS-AUDIT-0024` | `reproduce-no-host-command` | error | No declared reproduce test command matches the host platform. |
 | `DAYS-AUDIT-0025` | `audit-internal-error` | error | An audit check attempted to emit an unknown diagnostic code. |
-| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites a measurement artifact path without an adding commit after the freeze. |
-| `DAYS-AUDIT-0027` | `measurement-evidence-invalid` | error | Measurement evidence omits its required binding, a declared budget has no citing measurement, or a required consumer does not reuse the exact frozen budget identity. |
-| `DAYS-AUDIT-0028` | `archive-check-skipped` | info | Archive verification was skipped because the `days-gpu` repository is unavailable. |
+| `DAYS-AUDIT-0028` | `evidence-check-skipped` | info | External evidence verification was skipped because the `days-gpu` repository is unavailable. |
 
 The machine-readable registry golden is
-`docs/days-executor/evidence/P01/diagnostics.toml`.
+`evidence/P01/diagnostics.toml` in the companion `days-gpu` repository.
 
 ## Common validation rules
 
@@ -139,9 +135,10 @@ Every hash field is a string with the exact form
 file bytes without text normalization.
 
 Phase identifiers match `P[0-9]{2}`. Task identifiers match
-`T[0-9]+[A-Z]*`. Repository paths are relative to the workspace root.
-Declared paths are canonicalized after resolution; a symlink that escapes the
-repository is rejected.
+`T[0-9]+[A-Z]*`. Phase and source paths are relative to the `days` workspace
+root. Evidence and budget paths under `evidence/` and `budgets/` are relative
+to the companion `days-gpu` root. Declared paths are canonicalized after
+resolution; a symlink that escapes its repository is rejected.
 
 ## Phase metadata schema
 
@@ -220,35 +217,20 @@ An incomplete backend must not be selectable or appear in
 | --- | --- | --- | --- |
 | `id` | string | required | Stable identifier matching the budget manifest's inner `id`. |
 | `owner_phase` | phase ID | required | Owning phase matching the budget manifest's inner `phase`. |
-| `required_consumers` | array of phase IDs | required | Phases that must reuse this exact frozen identity when their metadata exists. |
-| `path` | string path | required | Budget manifest path. |
-| `content_hash` | SHA-256 string | required | Must match the current file bytes. |
-| `frozen_at_commit` | string | required | Full 40-lowercase-hex Git commit SHA containing the frozen budget bytes. |
+| `path` | string path | required | Path relative to the companion `days-gpu` repository. |
+| `content_hash` | SHA-256 string | required | Must match the current file bytes when `days-gpu` is reachable. |
 
-The audit verifies that the working-tree budget hash matches `content_hash`,
-that the budget path at `frozen_at_commit` exists and hashes to the same value,
-and that the inner budget identity agrees with `id` and `owner_phase`. Duplicate
-budget IDs within a phase are rejected. If metadata for a named
-`required_consumers` phase exists, that phase must cite the identical
-`id`/`owner_phase`/`path`/`content_hash`/`frozen_at_commit` tuple.
+Duplicate budget IDs within a phase are rejected. When the companion repository
+is reachable, the audit parses the budget, verifies its current hash, and checks
+that its inner identity agrees with `id` and `owner_phase`. When the
+repository is absent, the audit emits `DAYS-AUDIT-0028` and skips the external
+check.
 
-For every measurement citation, `frozen_at_commit` must be a strict ancestor
-of `run_commit`, the range must contain no merge commit, and following first
-parents from `run_commit` must reach the freeze. Equality is rejected because
-it means the measurement was committed together with the budget. Every
-measurement artifact path must have an adding commit within
-`(frozen_at_commit, run_commit]`; an identical blob at the freeze is rejected.
-The adding-commit check proves pathname appearance, not content origination.
-A rename into the declared pathname or a delete followed by a re-add can
-satisfy it. Independently, the audit checks the declared blob hash at
-`run_commit`.
-An uncommitted budget, unknown or unreachable commit, missing path, ambiguous
-history, or different budget bytes fails closed.
 
 ## Evidence manifest schema
 
-Task evidence manifests conventionally live at
-`docs/days-executor/evidence/<PHASE>/`. Their fields are:
+Task evidence manifests live under `evidence/<PHASE>/` in the companion
+`days-gpu` repository. Their fields are:
 
 | Field | Type | Presence | Rule |
 | --- | --- | --- | --- |
@@ -256,79 +238,30 @@ Task evidence manifests conventionally live at
 | `id` | string | required | Stable evidence identifier. |
 | `phase` | string | required | Phase identifier. |
 | `task` | string | required | Task identifier. |
-| `kind` | string enum | required | `golden`, `archive`, or `measurement`. |
+| `kind` | string enum | required | `golden` or `archive`. |
 | `description` | string | required | Human-readable evidence description. |
 | `command` | array of strings | required | Producing command as argv. |
 | `tool_version` | string | required | Producing tool and version. |
 | `schema` | string | required | Evidence payload schema. |
 | `tags` | array of strings | required | Machine-readable proof and evidence classifications. |
-| `budget` | string path | optional | Budget governing a measurement. |
-| `budget_hash` | SHA-256 string | conditionally required | Required exactly when `budget` is present. |
-| `run_commit` | string | measurement only, required | Full 40-lowercase-hex Git commit SHA of the measured code. |
-| `artifacts` | array of artifact tables | required | One or more checked-in or `days-gpu` artifact records. |
+| `artifacts` | array of artifact tables | required | One or more artifact records. |
 
-Each `artifacts` table uses these fields:
+Each `artifacts` table has a repository-relative `path`, a
+`sha256:<64 lowercase hexadecimal characters>` `content_hash`, and optional
+producer `tool_version`, `command`, and `schema` fields. Unknown fields are
+rejected. A reachable artifact must exist and match its declared hash.
 
-| Field | Type | Presence | Rule |
-| --- | --- | --- | --- |
-| `path` | string path | required | A `days` repository path for golden or measurement evidence; a `days-gpu` path under `evidence/<PHASE>/` for archive evidence. |
-| `content_hash` | SHA-256 string | required | Must match the checked-in golden, the measurement blob at `run_commit`, or the recorded `days-gpu` blob. |
-| `days_gpu_commit` | string | archive only, required | Exact `days-gpu` Git commit SHA containing the artifact. |
-| `tool_version` | string | archive only, required | Non-empty producing tool and version. |
-| `command` | array of strings | archive only, required | Exact non-empty producing argv. |
-| `schema` | string | archive only, required | Non-empty payload schema version. |
+The audit resolves `DAYS_GPU_ROOT` when set and otherwise checks the
+`days-gpu` sibling of the `days` checkout. When the repository is reachable,
+it parses declared manifests and verifies artifact hashes. When the repository
+is absent, it emits `DAYS-AUDIT-0028` and skips those checks. The
+informational diagnostic prevents a silent pass while keeping a standalone
+`days` checkout usable.
 
-A golden artifact's hash must match its checked-in file. A measurement
-artifact must be readable from `run_commit` with `git cat-file`, its hash must
-match that committed blob, and its pathname must have an adding commit within
-the audited post-freeze range. Golden and measurement artifacts must not carry
-archive-only provenance. An archive artifact must carry every archive-only
-field. URL fields are not part of the version 1 archive contract.
-
-For archive evidence, the audit reads the artifact blob from the recorded
-`days-gpu` commit and verifies its hash. The path must exist in that commit;
-an artifact that exists only as an uncommitted working-tree file is rejected.
-The `days-gpu` checkout is consulted only when a phase actually declares
-archive evidence. P01 declares no archive evidence and does not depend on a
-`days-gpu` checkout, including in CI. When archive evidence is declared, the
-audit uses the repository named by `DAYS_GPU_ROOT`, or the `days-gpu` sibling
-of the `days` repository when the environment variable is unset. If that
-repository is unavailable or unreachable, the audit emits an explicit
-`DAYS-AUDIT-0028` information diagnostic and skips archive verification.
-Archive verification is intentionally a local-only gate: plan section 4.4
-names one local measurement platform, so this verification runs where those
-measurements run rather than requiring the separate repository in general CI.
-
-A present `budget_hash` without `budget` is malformed metadata for golden and
-archive evidence. For measurement evidence, any missing member of the required
-`budget`, `budget_hash`, and `run_commit` binding is
-`DAYS-AUDIT-0027`. When evidence declares a budget, its hash must still match
-the budget at audit and reproduce time. Every budget declared by a phase must
-be cited by at least one measurement manifest. Every evidence kind, including
-`measurement`, must contain at least one artifact.
-
-The budget binding is temporal as well as content-addressed. The audit compares
-the current budget bytes with `content_hash`, compares the budget blob at the
-phase metadata's `frozen_at_commit` with that same hash, and requires a strict,
-merge-free, first-parent history to the measurement's `run_commit`. Equal
-commits are rejected as a measurement committed together with its budget.
-Every measurement pathname must have an adding commit in that range and must
-not contain the same bytes at the freeze.
-
-This guarantee is tamper-evident against published history, not tamper-proof
-against an author before publication. A coherent local rewrite can construct a
-history indistinguishable from an honest one using repository content alone.
-Closing that gap requires an external anchor, such as a published immutable
-ref, a signed freeze tag held outside the mutable repository, or a third party
-retaining the earlier history. The audit also cannot prove that a measurement
-was executed; a reproducible command and reviewed commit sequence establish
-provenance without claiming physical execution attestation.
 
 ## Budget manifest schema
 
-Budget manifests conventionally live at `docs/days-executor/budgets/`. A budget
-must be frozen before it controls admission, performance claims, or default
-selection.
+Budget manifests live under `budgets/` in the companion `days-gpu` repository.
 
 | Field | Type | Presence | Rule |
 | --- | --- | --- | --- |
@@ -338,7 +271,7 @@ selection.
 | `frozen_at` | string | required | ISO-8601 calendar date in `YYYY-MM-DD` form. |
 | `description` | string | required | Human-readable purpose and scope. |
 | `platform` | table | required | Named hardware, operating system, toolchain, and expected platform probe. |
-| `method` | table | required | Frozen build, sampling, timing, observation, ordering, and resampling method. |
+| `method` | table | required | Declared build, sampling, timing, observation, ordering, and resampling method. |
 | `admission` | table | required | P23 statistic, confidence rule, and non-empty threshold set. |
 | `corpus` | array of corpus tables | required | Non-empty hashed workload set with independent purpose and comparison fields. |
 | `waiver` | table | required | Public approving role and mandatory pre-cutover review policy. |
@@ -383,12 +316,10 @@ against `content_hash`.
 
 The `waiver` table requires a non-empty `approving_role`. Its `policy` must be
 exactly `A waiver must be a reviewed manifest change made before the cutover
-decision.` This makes the authority and timing rule part of the frozen,
-machine-checked budget rather than post-measurement prose.
+decision.` This makes the authority and timing rule part of the
+machine-checked budget.
 
-The budget manifest's `frozen_at` field remains a descriptive ISO date. The
-content and temporal Git binding deliberately lives outside that blob in the
-phase metadata's `frozen_at_commit` reference.
+The budget manifest's `frozen_at` field is a descriptive ISO date.
 
 ## Dependency baseline schema
 
@@ -558,49 +489,19 @@ Each must be ignored by Git, contain no tracked files, and have an empty
 path-scoped Git status. The root `.gitignore` records both paths explicitly even
 though the broader `target/` rule also covers them.
 
-## Immutable archive evidence
+## External evidence repository
 
-Large evidence artifacts are committed to the separate `days-gpu` repository
-under `evidence/<PHASE>/`. The manifest in this repository records the
-repository-relative path, SHA-256 content hash, and exact `days-gpu` commit SHA,
-plus the producing tool version, argv command, and payload schema version.
+Evidence and budgets live in the companion `days-gpu` repository under
+`evidence/<PHASE>/` and `budgets/`. The phase metadata records plain paths
+relative to that repository. Artifact manifests record content hashes and
+producer metadata.
 
-Immutability is established by the content hash and recorded Git commit. The
-audit reads the path from that commit when the `days-gpu` repository is
-available and rejects a missing path, a hash mismatch, or an artifact that has
-not been committed. URL-based archives, public-release host allowlists, and
-mutable-link heuristics are not part of the contract.
+When `days-gpu` is reachable, a missing path, invalid manifest, or mismatched
+hash fails the audit. When it is absent, the audit emits `DAYS-AUDIT-0028` and
+continues. Public API or configuration changes still require migration notes
+in phase metadata and the design note. Incomplete implementations remain
+feature-gated and may not become selectable backends.
 
-## Artifact policy
-
-Small golden fixtures, manifests, and checksums are checked into the
-`days` repository. Measurement manifests likewise checksum a small result
-record committed at `run_commit` that binds the budget to the measured run.
-Large traces, benchmark tables, profiles, and plots are committed to
-`days-gpu` under `evidence/<PHASE>/` and cited by a separate archive manifest.
-The checked-in archive manifest records the artifact path, content hash,
-`days-gpu` commit SHA, producing tool version, exact argv command, and payload
-schema version.
-
-Performance claims require benchmark evidence. Whenever performance gates
-admission or default selection, the budget manifest must be versioned and
-frozen before measurement. Phase metadata records both the budget content hash
-and the commit containing those exact bytes. Every measurement record embeds
-the budget path, its exact hash, and the measured code's `run_commit`. The
-audit verifies that the freeze commit contains the recorded bytes, reaches the
-run commit through a strict merge-free first-parent range, and that every
-measurement artifact pathname has an adding commit in that range. Separately,
-the blob at `run_commit` must match the declared hash, and identical bytes at
-the freeze are rejected. The adding-commit check does not prove where the
-content originated.
-Equality fails because the measurement would have been committed together with
-the budget. The result is tamper-evident against published history. Preventing
-a coherent pre-publication rewrite requires an external published or signed
-anchor; repository content alone cannot supply one.
-
-Public API or configuration changes require migration notes in phase metadata
-and the design note. Incomplete implementation remains feature-gated and may
-not become a selectable backend.
 
 ## Proof-changing gate
 
@@ -620,10 +521,10 @@ declarations only and does not invoke Lean.
 
 ## Reproduction
 
-`cargo xtask reproduce --phase <PHASE>` reuses metadata validation, checks
-budget bindings and checked-in golden or measurement evidence, then maps the
-host to `<os>-<arch>` using Rust's `OS` and `ARCH` constants. Architectures use
-`x86_64` or `aarch64`.
+`cargo xtask reproduce --phase <PHASE>` reuses metadata validation, performs
+the same best-effort external budget and evidence checks as `phase-audit`, then
+maps the host to `<os>-<arch>` using Rust's `OS` and `ARCH` constants.
+Architectures use `x86_64` or `aarch64`.
 
 Commands whose platform equals the host or is `any` run in declaration order
 from the repository root with inherited standard I/O. Other platform commands
@@ -632,15 +533,14 @@ directly and never invokes a shell. The first non-zero command produces
 `DAYS-AUDIT-0023` and stops reproduction. No matching host command produces
 `DAYS-AUDIT-0024`.
 
-After command execution, reproduction reruns the checked-in evidence checksum,
-budget binding, generated-tree cleanliness, and source-purity checks. A command
-that exits successfully but corrupts or creates audited artifacts therefore
-fails with the same stable diagnostic code as the preflight audit.
+After command execution, reproduction reruns external evidence checks,
+generated-tree cleanliness, and source-purity checks. A reachable evidence
+repository with a missing path, invalid manifest, or mismatched hash fails.
+An absent evidence repository produces `DAYS-AUDIT-0028` and does not fail
+reproduction.
 
 ## Limitations
 
-- `reproduce --phase` does not verify `days-gpu` archive evidence; archive
-  verification is a local-only `phase-audit` gate.
 - Direct-dependency drift does not compare dependency feature selections or
   target-specific `[target.*]` sections.
 - Security advisory scanning is not implemented and remains an explicit

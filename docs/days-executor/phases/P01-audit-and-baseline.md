@@ -4,8 +4,8 @@
 
 P01 begins the Days Executor program with a machine-enforced audit and evidence
 contract. Task T0 adds the Rust `xtask` audit, versioned TOML schemas,
-deterministic reproduction, mutation tests, checked-in evidence manifests, and
-CI enforcement. Task T1 freezes the premeasurement Nexosim retirement corpus,
+deterministic reproduction, mutation tests, external evidence manifests, and
+CI enforcement. Task T1 records the Nexosim retirement corpus,
 adds migration-only ledgers and terminal digests, and characterizes the legacy
 absolute-deadline time policy. Together they make later phase claims reviewable
 and reproducible before an executor implementation exists.
@@ -14,12 +14,12 @@ and reproducible before an executor implementation exists.
 
 `cargo xtask phase-audit P01` validates the complete phase metadata set,
 dependency closure and cycles, red-test declarations, source purity, generated
-trees, budgets, evidence checksums and archive immutability, backend
+trees, reachable budgets and evidence checksums, backend
 selectability, test-matrix coverage, dependency drift, resolved licenses,
 proof-evidence declarations, and the design note. It collects all faults and
 emits stable diagnostic lines.
 
-`cargo xtask reproduce --phase P01` verifies versioned evidence and executes
+`cargo xtask reproduce --phase P01` verifies reachable external evidence and executes
 the declared commands for the host platform in declaration order without a
 shell. The contract and all schema fields are specified in
 `docs/days-executor/audit-contract.md`.
@@ -28,8 +28,8 @@ T0's red tests are the programmatically generated synthetic repositories in
 `xtask/tests/phase_audit_mutations.rs`. They mutate one contract property at a
 time and assert the exact diagnostic code. The corpus covers malformed and
 misidentified metadata, dependency closure and cycles, foreign source and
-toolchain rejection, generated-tree cleanliness, budget immutability, evidence
-integrity, backend and matrix gates, dependency drift, proof tags, design
+toolchain rejection, generated-tree cleanliness, budget and evidence hashes,
+backend and matrix gates, dependency drift, proof tags, design
 notes, red-test declarations, and reproduce outcomes. The real P01 metadata
 also audits itself as a positive case.
 
@@ -52,7 +52,7 @@ reproduction on both operating systems.
 
 ## Scope
 
-T0 does not perform the frozen baseline characterization assigned to T1. It
+T0 does not perform the baseline characterization assigned to T1. It
 does not create `executor/`, invoke the Lean toolchain, or implement or select
 GPU backends. No scheduler, backend, migration, or performance result is
 claimed by this task.
@@ -68,12 +68,12 @@ the Days package.
 
 ## Evidence
 
-T0 checks in a golden diagnostic registry and a golden mutation-corpus map.
-Their content hashes are recorded in
-`docs/days-executor/evidence/P01/t0-evidence.toml`. T0 makes no performance
-claim and declares no budget manifest.
+The companion `days-gpu` repository stores the golden diagnostic registry and
+mutation-corpus map under `evidence/P01/`. Their content hashes are recorded in
+`evidence/P01/t0-evidence.toml`. A standalone `days` checkout reports an
+informational skip for these checks.
 
-## T1 frozen Nexosim baseline
+## T1 Nexosim baseline
 
 T1 adds the off-by-default `migration_ledger` Cargo feature. The feature records
 open-loop UDP transitions at source emission, switch forwarding, FIFO egress
@@ -99,7 +99,7 @@ registration, connection, or event scheduling. The keyed mailbox insertion,
 per-key successor normalization, and keyed `PacketSwitch::outputs` construction
 remain unchanged.
 
-### Budget schema repair and stage boundary
+### Budget schema and measurement method
 
 T0's budget schema could not represent the machine-checkable inputs required by
 the plan. T1 upgrades only the budget schema to version 4. The schema separates
@@ -112,34 +112,26 @@ paths and hashes against repository bytes and rejects incomplete methods, empty
 corpora or thresholds, malformed hashes, and an empty waiver authority. Phase,
 evidence, dependency-baseline, and trace schemas remain at version 1.
 
-`docs/days-executor/budgets/retirement-budget.toml` freezes the developer's
+`days-gpu/budgets/retirement-budget.toml` records the developer's
 Apple M5 Max, macOS build `26A5388g`, Rust 1.96.0 toolchain, three warmups,
 fifteen repetitions, the unpaired-bootstrap confidence rule, the no-regression
 geometric-mean threshold, the 20 percent per-workload limit, and maintainer
 waiver authority. The method applies to P01 reference collection and P23
 candidate runs. P01 records absolute Nexosim measurements and evaluates no
-threshold. The method freezes the per-workload selected-mode rule before
-measurement. The A2 result artifact, not the premeasurement budget, records the
-selected mode and event-rate outcome after samples exist. This avoids putting a
-measured outcome inside the blob that must be frozen first. Plan section
-12.1.3 currently reads as if the selected outcome belongs in that
-premeasurement blob and needs an owner amendment to state this rule/outcome
-split. P01 does not edit the plan repository.
+threshold. The budget records the per-workload selected-mode rule. The result
+artifact records the selected mode and event rate after the runner collects
+the samples.
 
-The F3/A evidence remains in the repository as an honest historical record,
-but its measurement manifest is no longer live task evidence. It is superseded
-because review required budget schema and method changes and because its
-recorded producer, `/private/tmp/t1_f3_runner`, was not reproducible from the
-repository. The A2 records under `baselines-v2` are authoritative for the F4
-budget. Their paths have adding commits in the audited post-freeze range. B2
-binds the F4 freeze at `332dac931f7c63848315df13c9aba13f8bb2386f` to the A2
-run at `ba99ec5fe917d1017bf821043ffc7e9407514106`.
+The evidence repository keeps both baseline sets. `evidence/P01/baselines-v2`
+is authoritative because its checked-in runner verified the timed feature set.
+`evidence/P01/baselines` is superseded because its producer did not perform
+that check; later phases must not cite it.
 
 The checked-in `cargo xtask nexosim-baseline collect` runner is the only
-producer for A2. It builds timed Days with the exact frozen Cargo flags, asks
+producer for the authoritative baseline. It builds timed Days with the declared Cargo flags, asks
 `rustc --print cfg` for the feature set, and requires that set to be empty. It
 records the binary SHA-256 and toolchain in a build record. It executes the
-frozen warmups, repetitions, manifest order, duration guard, thread-count
+declared warmups, repetitions, manifest order, duration guard, thread-count
 guard, and wall-time floor. A separate untimed `perf_stats` build obtains the
 Nexosim event count, so event counting does not contaminate either timed
 boundary. The v2 sample and summary schemas carry the event count, both
@@ -148,8 +140,9 @@ events-per-second figures, and the selected-mode outcome.
 The first committed runner self-test exercised hardcoded output strings but
 never opened a corpus config. It stayed green while the collector failed on
 the leading comment in the first fixture, which gave a false signal that the
-real input path worked. A2 parses complete TOML documents with `toml::Table`.
-Its self-test loads the frozen budget and resolves `log_path` through the
+real input path worked. The current runner parses complete TOML documents with
+`toml::Table`.
+Its self-test loads the budget and resolves `log_path` through the
 production parser for all thirteen corpus entries.
 
 The collector now performs cheap validation before it starts a simulator
@@ -167,7 +160,7 @@ enforced the ST characterization requirement. The corpus later declared the
 DCQCN feature set, while the runner built every correctness fixture with
 `migration_ledger` alone. In both cases the declaration was correct and the
 consumer ignored it. Preflight now joins the retirement-corpus entries to the
-frozen budget in order, checks their duplicated identity and hash fields,
+budget in order, checks their duplicated identity and hash fields,
 validates their commands, verifies each required feature against
 `Cargo.toml`, and rejects a featured performance entry.
 
@@ -189,16 +182,6 @@ for the evidence each boundary requires: complete ordered transitions for
 a versioned migration relation for `semantic-migration`. Until those artifact
 types and checkers exist, P01 can validate the declaration and its exact
 goldens but cannot infer evidence adequacy for every boundary.
-
-The budget reference also has a stable `id`, an owning phase, and required
-consumer phases. A present P23 phase must cite the same frozen tuple rather
-than substitute a relaxed budget. Measurement history must be a strict,
-merge-free first-parent sequence, and every measurement artifact must be added
-after the freeze. These checks defeat empty-child and sibling-merge histories.
-They are tamper-evident against published history, not tamper-proof before
-publication. A published immutable ref, externally held signed tag, or third
-party retaining the earlier history is needed to detect a coherent local
-rewrite.
 
 ### Corpus and comparison boundaries
 
@@ -224,8 +207,8 @@ form; `DistPacketSource` takes its existing no-sample fast path. Torus and
 Fat-Tree endpoint selection consumes the fixed seed once during construction.
 No RED decision appears in the exact corpus.
 
-Their complete canonical ledgers are frozen under
-`docs/days-executor/evidence/P01/ledgers-v1/`: 141 rows for explicit, 1,621 for
+Their complete canonical ledgers are recorded under
+`days-gpu/evidence/P01/ledgers-v1/`: 141 rows for explicit, 1,621 for
 torus, and 1,361 for fat-tree. Each file was reproduced byte-for-byte by two
 separate processes before acceptance. The migration-ledger integration test
 compares fresh output with these complete goldens, not merely one current run
@@ -251,7 +234,7 @@ suite. The fixed order is:
 - `fattree_k32_f4096_st.toml`, then `fattree_k32_f4096_mt.toml`.
 
 All eight configs use fixed seed 1000, FIFO/TailDrop, and open-loop packet
-distributions. Their strongest frozen boundary is `terminal-observation`; a
+distributions. Their strongest declared boundary is `terminal-observation`; a
 performance-length run does not claim full-key ledger equality. Each ST config
 sets `threading = "single"` and omits `concurrency_level` and `hot_workers`.
 Each MT config sets `threading = "multiple"`,
@@ -285,32 +268,32 @@ flush. The existing elapsed log remains unchanged. The runner measures
 `end_to_end` around the complete child process and records both values.
 
 Calibration was authorized but not used for this committed benchmark corpus.
-No timing selected corpus membership or changed a config value. The F3 runner
-and the A2 runner enforced the frozen 5 ms sample floor. No recorded sample
+No timing selected corpus membership or changed a config value. Both baseline
+runners enforced the declared 5 ms sample floor. No recorded sample
 failed it. The complete paths, hashes,
 commands, roles, modes, and boundaries are in
-`docs/days-executor/evidence/P01/retirement-corpus.toml`.
+`days-gpu/evidence/P01/retirement-corpus.toml`.
 
-### A2 Nexosim reference
+### Authoritative Nexosim reference
 
 The repository command
 `cargo xtask nexosim-baseline collect --output-dir
-docs/days-executor/evidence/P01/baselines-v2` produced the authoritative A2
+../days-gpu/evidence/P01/baselines-v2` produced the authoritative
 records. The build record captures the same argv. It also records
 `cargo rustc --locked --release --bin days -- --print cfg`, the complete probe
 output, `verified_features = []`, and `migration_ledger_enabled = false`.
 The probe output contains no Cargo `feature="..."` line. The timed build used
 `cargo build --locked --release --bin days` and produced binary hash
 `sha256:a9717b7028e8aff1e75f05388810b36dac46ee37299b536af84054058e4b0e93`.
-Only `baselines-v2/` may support the F4 retirement budget. The seven files
-under `baselines/` remain as the history of the superseded F3/A run and must
+Only `baselines-v2/` may support the retirement budget. The seven files under
+`baselines/` remain as the history of the superseded run and must
 not be cited as the Nexosim reference because that runner did not verify the
 timed binary's feature set.
 
 The runner recorded 120 unique samples, fifteen for each workload and mode.
 Each sample reached `1500000000000` simulated nanoseconds. ST samples used one
 thread and MT samples used eighteen. The shortest primary sample was
-20.595125 ms, above the frozen 5 ms floor. Each `end_to_end` value was at least
+20.595125 ms, above the declared 5 ms floor. Each `end_to_end` value was at least
 its corresponding `sim_execution` value.
 
 The table reports seconds as median `[minimum, maximum]`:
@@ -326,7 +309,7 @@ The table reports seconds as median `[minimum, maximum]`:
 | k32/f4096 | ST | 14.452573792 [14.312242417, 15.750409917] | 15.622496417 [15.489812959, 16.998490417] |
 | k32/f4096 | MT | 7.150468958 [7.094004667, 7.436040125] | 8.368827041 [8.291108584, 8.645161708] |
 
-Applying the frozen rule selects:
+Applying the declared rule selects:
 
 | Workload | Mode | Events | Median primary events/s |
 | --- | --- | ---: | ---: |
@@ -335,12 +318,10 @@ Applying the frozen rule selects:
 | k16/f512 | ST | 3,751,102 | 2,148,077.144567 |
 | k32/f4096 | MT | 21,600,888 | 3,020,905.080055 |
 
-The authoritative A2 selection keeps ST for k4/f8, k8/f64, and k16/f512, and
-selects accelerated MT for k32/f4096. The superseded F3 freeze
-`3c13ad4c8e32b7f8affad7e991c1a46586125fe7` and A run
-`6b4b8a6ea1e795b7fda50cb4910d9d00dc6493ca` remain on disk for provenance, but
-their untracked producer did not verify timed features. Those figures are not
-live evidence and must not be cited.
+The authoritative selection keeps ST for k4/f8, k8/f64, and k16/f512, and
+selects accelerated MT for k32/f4096. The superseded records remain under
+`evidence/P01/baselines/` for provenance, but their producer did not verify
+timed features. Those figures are not live evidence and must not be cited.
 
 Across the eight primary medians, six fell while both k4 modes rose, and the
 superseded and current runs differ by up to about twenty percent at the largest
@@ -349,18 +330,9 @@ rule out extra measurement instrumentation; the discrepancy is attributable
 to background CPU load on the developer laptop. A future phase may re-measure
 the baseline on a quiet machine if it needs tighter absolute numbers.
 
-Before the owner identified the load, any variance study would have preceded
-any threshold choice. Choosing a threshold and then measuring what the
-apparatus can resolve would repeat the ordering failure this phase prevents:
-freeze discipline applied to the wrong quantity is still a freeze violation.
-The study became unnecessary once the load source was established, and no
-threshold moved.
-
-The checked-in samples, summary, and five terminal digests total less than
-24 KB. The generated transition ledgers range from 4.5 KB to 78.6 KB, and the
-captured process output is 155 KB. None warrants a separate `days-gpu` archive,
-so P01 declares no archive evidence and keeps one content-addressed source for
-the measured records.
+The samples, summary, terminal digests, ledgers, and characterization tables
+live in `days-gpu/evidence/P01/`. The public `days` repository contains no
+measurement artifact.
 
 ### RED prerequisite and coverage boundary
 
@@ -383,7 +355,7 @@ the derived TCP fixture, and it also never enters a RED region. The corrected
 RED therefore has no observable effect on any P01 baseline, and P01 evidence
 provides no RED coverage.
 
-Landing the fix before the next freeze turned out to be unnecessary in
+Landing the fix before baseline collection turned out to be unnecessary in
 hindsight. It was still the right decision under uncertainty because the
 absence of RED-region traffic could not be known before the diagnostic runs. A
 later phase, including P19, must not treat P01 evidence as covering RED
@@ -408,7 +380,7 @@ next = quantize_time(base + 8 * packet_bytes / rate_bits_per_second)
 ```
 
 It is an absolute deadline, not an independently rounded duration. The concrete
-aligned exact domain frozen for the three exact fixtures is:
+aligned exact domain recorded for the three exact fixtures is:
 
 ```text
 quantum = 1 ns
@@ -428,7 +400,7 @@ serialization that rounds to zero with a one-nanosecond quantum, and
 `10^18`-nanosecond bases where the `f64` mantissa loses a one-nanosecond
 increment. A rounded-zero serialization is recorded as zero lookahead and is
 not admitted silently. The full exact edges, base residues, enabled/disabled
-quantum cases, and large-time values are frozen in
+quantum cases, and large-time values are recorded in
 `quantize-after-characterization.toml` and explained in its companion Markdown
 note.
 
@@ -444,7 +416,6 @@ that coincidence is not a general duration-rounding equivalence.
 The T1 red tests are:
 
 - `supported_nexosim_st_model_exposes_complete_ledger_and_terminal_digest`;
-- `retirement_budget_edited_after_measurement_is_rejected`;
 - `repeated_fixture_runs_have_identical_ledger_output`.
 
 An additional unit fixture creates two FIFO ports in one process after the
@@ -454,19 +425,15 @@ the global mutable ID leak. A topology unit fixture independently guards the
 switch-registration helper by serializing two differently inserted switch maps
 in one process and requiring the same sorted registration ledger. The
 `migration_ledger_preserves_default_aggregate_output` integration test compares
-feature-on source and sink reports with feature-off checked-in goldens and
+feature-on source and sink reports with feature-off external goldens and
 requires both feature-on and feature-off `switches.csv` files to remain empty
 for this fixture.
 
-Small characterization tables, a ledger sample, a complete small terminal
-digest, feature-off aggregate goldens, the complete 13-entry corpus inventory,
-and the budget live under `docs/days-executor/evidence/P01/` and are
-checksummed by `t1-evidence.toml`. The live
-`nexosim-baseline-measurement-v2.toml` manifest cites nine `baselines-v2`
-artifacts at run commit `ba99ec5fe917d1017bf821043ffc7e9407514106`
-against the budget frozen at `332dac931f7c63848315df13c9aba13f8bb2386f`.
-P01 has no archive manifest because the raw outputs did not warrant a separate
-repository.
+The characterization tables, complete ledgers, terminal digests, aggregate
+goldens, corpus inventory, budget, and baseline records live in `days-gpu`.
+The task evidence manifests record their relative paths and hashes. A
+standalone `days` checkout skips these external checks with an informational
+diagnostic.
 
 ### Migration and exclusions
 

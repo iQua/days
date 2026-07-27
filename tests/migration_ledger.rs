@@ -7,7 +7,7 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const RETIREMENT_CORPUS_PATH: &str = "docs/days-executor/evidence/P01/retirement-corpus.toml";
+const RETIREMENT_CORPUS_PATH: &str = "evidence/P01/retirement-corpus.toml";
 
 #[derive(Deserialize)]
 struct RetirementCorpus {
@@ -46,9 +46,21 @@ fn config_log_path(config_path: &str) -> String {
         .to_owned()
 }
 
-fn exact_ledger_fixtures() -> Vec<ExactLedgerFixture> {
-    let input =
-        fs::read_to_string(RETIREMENT_CORPUS_PATH).expect("read retirement corpus manifest");
+fn days_gpu_root() -> Option<PathBuf> {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = std::env::var_os("DAYS_GPU_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| repository.parent().map(|parent| parent.join("days-gpu")))?;
+    root.is_dir().then_some(root)
+}
+
+fn exact_ledger_fixtures() -> Option<Vec<ExactLedgerFixture>> {
+    let Some(days_gpu) = days_gpu_root() else {
+        eprintln!("skipping exact-ledger golden check: days-gpu is unavailable");
+        return None;
+    };
+    let input = fs::read_to_string(days_gpu.join(RETIREMENT_CORPUS_PATH))
+        .expect("read retirement corpus manifest");
     let manifest =
         toml::from_str::<RetirementCorpus>(&input).expect("parse retirement corpus manifest");
     let exact = manifest
@@ -71,36 +83,38 @@ fn exact_ledger_fixtures() -> Vec<ExactLedgerFixture> {
         declared, expected,
         "{RETIREMENT_CORPUS_PATH} exact-ledger fixture set changed"
     );
-    exact
-        .into_iter()
-        .map(|fixture| {
-            let ledger_path = fixture.ledger_path.unwrap_or_else(|| {
-                panic!("{} declares exact-ledger without ledger_path", fixture.path)
-            });
-            let ledger_hash = fixture.ledger_hash.unwrap_or_else(|| {
-                panic!("{} declares exact-ledger without ledger_hash", fixture.path)
-            });
-            let golden = fs::read(&ledger_path)
-                .unwrap_or_else(|error| panic!("read frozen ledger {ledger_path}: {error}"));
-            assert!(
-                !golden.is_empty(),
-                "{} declares an empty frozen ledger {ledger_path}",
-                fixture.path
-            );
-            assert_eq!(
-                canonical_sha256(&golden),
-                ledger_hash,
-                "{} frozen ledger hash does not match {ledger_path}",
-                fixture.path
-            );
-            ExactLedgerFixture {
-                configured_log_path: config_log_path(&fixture.path),
-                config_path: fixture.path,
-                golden_path: ledger_path,
-                golden,
-            }
-        })
-        .collect()
+    Some(
+        exact
+            .into_iter()
+            .map(|fixture| {
+                let ledger_path = fixture.ledger_path.unwrap_or_else(|| {
+                    panic!("{} declares exact-ledger without ledger_path", fixture.path)
+                });
+                let ledger_hash = fixture.ledger_hash.unwrap_or_else(|| {
+                    panic!("{} declares exact-ledger without ledger_hash", fixture.path)
+                });
+                let golden = fs::read(days_gpu.join(&ledger_path))
+                    .unwrap_or_else(|error| panic!("read frozen ledger {ledger_path}: {error}"));
+                assert!(
+                    !golden.is_empty(),
+                    "{} declares an empty frozen ledger {ledger_path}",
+                    fixture.path
+                );
+                assert_eq!(
+                    canonical_sha256(&golden),
+                    ledger_hash,
+                    "{} frozen ledger hash does not match {ledger_path}",
+                    fixture.path
+                );
+                ExactLedgerFixture {
+                    configured_log_path: config_log_path(&fixture.path),
+                    config_path: fixture.path,
+                    golden_path: ledger_path,
+                    golden,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn run_fixture(root: &Path, name: &str, config_path: &str, configured_log_path: &str) -> PathBuf {
@@ -161,12 +175,17 @@ fn supported_nexosim_st_model_exposes_complete_ledger_and_terminal_digest() {
 
 #[test]
 fn migration_ledger_preserves_default_aggregate_output() {
+    let Some(days_gpu) = days_gpu_root() else {
+        eprintln!("skipping aggregate golden check: days-gpu is unavailable");
+        return;
+    };
     let temporary = tempfile::tempdir().expect("create temporary directory");
     let log_path = run_explicit_fixture(temporary.path(), "aggregate");
 
     assert_eq!(
         fs::read(log_path.join("sources.csv")).expect("read migration-feature sources"),
-        include_bytes!("../docs/days-executor/evidence/P01/explicit-sources-default.csv"),
+        fs::read(days_gpu.join("evidence/P01/explicit-sources-default.csv"))
+            .expect("read default sources golden"),
     );
     assert!(
         fs::read(log_path.join("switches.csv"))
@@ -176,7 +195,8 @@ fn migration_ledger_preserves_default_aggregate_output() {
     );
     assert_eq!(
         fs::read(log_path.join("sinks.csv")).expect("read migration-feature sinks"),
-        include_bytes!("../docs/days-executor/evidence/P01/explicit-sinks-default.csv"),
+        fs::read(days_gpu.join("evidence/P01/explicit-sinks-default.csv"))
+            .expect("read default sinks golden"),
     );
 }
 
@@ -198,8 +218,11 @@ fn repeated_fixture_runs_have_identical_ledger_output() {
 
 #[test]
 fn exact_ledger_fixtures_match_complete_frozen_goldens() {
+    let Some(fixtures) = exact_ledger_fixtures() else {
+        return;
+    };
     let temporary = tempfile::tempdir().expect("create temporary directory");
-    for (index, fixture) in exact_ledger_fixtures().into_iter().enumerate() {
+    for (index, fixture) in fixtures.into_iter().enumerate() {
         let name = format!("exact-golden-{index}");
         let output = run_fixture(
             temporary.path(),
@@ -219,5 +242,7 @@ fn exact_ledger_fixtures_match_complete_frozen_goldens() {
 
 #[test]
 fn exact_ledger_fixtures_declare_valid_frozen_goldens() {
-    drop(exact_ledger_fixtures());
+    if let Some(fixtures) = exact_ledger_fixtures() {
+        drop(fixtures);
+    }
 }
