@@ -3,9 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use days_executor::{
-    Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId,
+    Backend, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId,
     NodeDescriptor, NodeKind, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    SimulationImage, SwitchQueueState, SwitchState, event_phase, validate,
 };
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
@@ -190,7 +190,11 @@ pub fn compile_config(path: impl AsRef<Path>) -> Result<SimulationImage, Compile
     let model = SupportedModel::from_source(source)?;
     let (graph, hosts) = build_graph(path_str)?;
 
-    lower(model, &graph, hosts)
+    let image = lower(model, &graph, hosts)?;
+    validate(&image, Backend::Scalar).map_err(|error| {
+        CompileError::Invalid(format!("lowered image failed validation: {error}"))
+    })?;
+    Ok(image)
 }
 
 struct SupportedModel {
@@ -793,6 +797,7 @@ fn lower(
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,
                 departed_packets: 0,
+                received_packets: 0,
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
@@ -807,10 +812,14 @@ fn lower(
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: model.queue_capacity_packets,
                     queue: VecDeque::new(),
+                    in_service: None,
+                    tx_ready_pending: false,
                 })
                 .collect(),
+            next_origin_seq: 0,
             arrived_packets: 0,
             dropped_packets: 0,
+            departed_packets: 0,
         })
         .collect();
     let packets = inputs
@@ -820,7 +829,7 @@ fn lower(
             flow: FlowId(flow_ids[&input.key.flow]),
             size_bytes: input.size_bytes,
         })
-        .collect();
+        .collect::<Vec<_>>();
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
@@ -831,17 +840,46 @@ fn lower(
             propagation_ns: model.propagation_ns,
         })
         .collect::<Vec<_>>();
-    let channels = ids
-        .links()
-        .map(|(key, link)| RemoteChannel {
-            source: ids.node(key.source),
-            target: ids.node(key.target),
-            link,
-            event_kind: EventKind::RemoteArrival,
-            // T8 derives and validates serialization-plus-propagation bounds.
-            min_delay_ns: 0,
+    let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
+    for packet in &packets {
+        let flow = flow_descriptors
+            .get(packet.flow.0 as usize)
+            .ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "packet {:?} references missing flow {:?}",
+                    packet.id, packet.flow
+                ))
+            })?;
+        for link_id in &flow.route {
+            let link = links.get(link_id.0 as usize).ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "flow {:?} references missing link {link_id:?}",
+                    flow.id
+                ))
+            })?;
+            link.delay_ns(packet.size_bytes).map_err(|error| {
+                CompileError::Invalid(format!(
+                    "link {link_id:?} delay overflows for packet {:?}: {error}",
+                    packet.id
+                ))
+            })?;
+            min_packet_size_by_link
+                .entry(*link_id)
+                .and_modify(|size| *size = (*size).min(packet.size_bytes))
+                .or_insert(packet.size_bytes);
+        }
+    }
+    let channels = min_packet_size_by_link
+        .into_iter()
+        .map(|(link_id, min_packet_size_bytes)| {
+            let link = links[link_id.0 as usize];
+            RemoteChannel::for_packet_link(link, min_packet_size_bytes).map_err(|error| {
+                CompileError::Invalid(format!(
+                    "failed to derive channel for link {link_id:?}: {error}"
+                ))
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, CompileError>>()?;
 
     Ok(SimulationImage {
         nodes,

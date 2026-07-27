@@ -53,6 +53,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             next_origin_seq: 4,
             sourced_packets: 0,
             departed_packets: 0,
+            received_packets: 0,
         }],
         switch_states: vec![SwitchState {
             queues: vec![SwitchQueueState {
@@ -60,9 +61,13 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 2,
                 queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
             }],
+            next_origin_seq: 0,
             arrived_packets: 0,
             dropped_packets: 0,
+            departed_packets: 0,
         }],
         flows: vec![FlowDescriptor {
             id: FLOW,
@@ -165,6 +170,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             next_origin_seq: 16,
             sourced_packets: 4,
             departed_packets: 4,
+            received_packets: 0,
         }]
     );
     assert_eq!(
@@ -175,9 +181,13 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 2,
                 queue: VecDeque::from([P0, P1]),
+                in_service: None,
+                tx_ready_pending: false,
             }],
+            next_origin_seq: 0,
             arrived_packets: 3,
             dropped_packets: 1,
+            departed_packets: 0,
         }]
     );
     assert_eq!(

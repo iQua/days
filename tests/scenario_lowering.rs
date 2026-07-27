@@ -1,8 +1,12 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
 use days::scenario::compile_config;
-use days_executor::{EventKind, FlowId, LinkId, NodeId, NodeKind, run_scalar};
+use days_executor::{
+    ArrivalDisposition, Backend, EventKind, FlowId, LinkId, NodeId, NodeKind,
+    PacketArrivalObservation, PacketDeparture, PayloadId, SimulationImage, run_scalar, validate,
+};
 use tempfile::TempDir;
 
 fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
@@ -11,6 +15,32 @@ fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
     path.to_str()
         .expect("temporary path should be valid UTF-8")
         .to_owned()
+}
+
+fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
+    let mut delays = BTreeMap::<LinkId, u64>::new();
+    for packet in &image.packets {
+        let flow = image
+            .flows
+            .iter()
+            .find(|flow| flow.id == packet.flow)
+            .expect("lowered packet flow must exist");
+        for link_id in &flow.route {
+            let link = image
+                .links
+                .iter()
+                .find(|link| link.id == *link_id)
+                .expect("lowered route link must exist");
+            let delay = link
+                .delay_ns(packet.size_bytes)
+                .expect("lowered channel arithmetic must fit");
+            delays
+                .entry(*link_id)
+                .and_modify(|minimum| *minimum = (*minimum).min(delay))
+                .or_insert(delay);
+        }
+    }
+    delays
 }
 
 #[test]
@@ -188,7 +218,15 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
             && first.nodes.iter().any(|node| node.kind == NodeKind::Switch),
         "lowering must return one heterogeneous semantic image"
     );
-    assert_eq!(first.channels.len(), first.links.len());
+    let certified = certified_delays(&first);
+    assert_eq!(
+        first
+            .channels
+            .iter()
+            .map(|channel| (channel.link, channel.min_delay_ns))
+            .collect::<BTreeMap<_, _>>(),
+        certified
+    );
     assert!(
         first
             .switch_states
@@ -200,21 +238,48 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
         first
             .channels
             .iter()
-            .all(|channel| channel.min_delay_ns == 0),
-        "T7 must leave channel-bound derivation to T8"
+            .all(|channel| channel.min_delay_ns > 17),
+        "positive serialization must be added to constant propagation"
+    );
+    assert!(
+        first
+            .channels
+            .iter()
+            .map(|channel| channel.min_delay_ns)
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1,
+        "route-specific packet sizes should produce distinct certified bounds"
     );
     assert!(
         first
             .initial_events
             .iter()
             .all(|event| event.kind == EventKind::PacketArrival),
-        "T7 must not derive switch TxReady events"
+        "TxReady must be generated only at the actual service decision point"
     );
     assert_eq!(first.packets.len(), 11);
     assert_eq!(first.initial_events.len(), 11);
 
-    run_scalar(&first, u64::MAX)
-        .expect("T7 output should execute through currently implemented ingress handling");
+    validate(&first, Backend::Scalar).expect("lowered image should validate for scalar");
+    validate(&first, Backend::Cpu { workers: 2 })
+        .expect("positive bounds should validate for a parallel backend");
+    let result = run_scalar(&first, u64::MAX).expect("lowered image should run end to end");
+    assert!(result.pending_events.is_empty());
+    assert!(
+        result
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .all(|queue| queue.in_service.is_none() && !queue.tx_ready_pending)
+    );
+    assert!(
+        result
+            .host_states
+            .iter()
+            .any(|state| state.received_packets > 0),
+        "at least one packet must reach a sink host"
+    );
 }
 
 #[test]
@@ -387,7 +452,14 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     assert_eq!(first.switch_states.len(), 20);
     assert_eq!(first.nodes.len(), 28);
     assert_eq!(first.links.len(), 80);
-    assert_eq!(first.channels.len(), 80);
+    assert_eq!(
+        first
+            .channels
+            .iter()
+            .map(|channel| (channel.link, channel.min_delay_ns))
+            .collect::<BTreeMap<_, _>>(),
+        certified_delays(&first)
+    );
     assert_eq!(first.flows.len(), 8);
     assert_eq!(first.packets.len(), 12_000);
     assert_eq!(first.initial_events.len(), 12_000);
@@ -402,6 +474,115 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     assert!(
         first.links.iter().all(|link| link.propagation_ns == 0),
         "propagation defaults to zero"
+    );
+    assert!(
+        first
+            .channels
+            .iter()
+            .all(|channel| channel.min_delay_ns > 0),
+        "positive serialization supplies lookahead when propagation is zero"
+    );
+    validate(&first, Backend::Cpu { workers: 4 })
+        .expect("zero propagation with positive serialization is parallel-safe");
+}
+
+#[test]
+fn a_lowered_packet_runs_through_both_switches_to_its_sink() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "end-to-end.toml",
+        r#"
+seed = 1
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 8_000_000_000
+capacity = 4
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 3
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+initial_delay = 0.0
+size = 2
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 2, high = 2 }
+"#,
+    );
+
+    let image = compile_config(path).expect("supported scenario should lower");
+    assert_eq!(image.flows[0].route.len(), 3);
+    assert!(
+        image
+            .channels
+            .iter()
+            .all(|channel| channel.min_delay_ns == 5)
+    );
+    validate(&image, Backend::Cpu { workers: 2 })
+        .expect("serialization plus propagation gives positive lookahead");
+
+    let result = run_scalar(&image, 16).expect("lowered image should reach the sink");
+    assert_eq!(
+        result.departures,
+        vec![
+            PacketDeparture {
+                payload: PayloadId(0),
+                time_ns: 2,
+            },
+            PacketDeparture {
+                payload: PayloadId(0),
+                time_ns: 7,
+            },
+            PacketDeparture {
+                payload: PayloadId(0),
+                time_ns: 12,
+            },
+        ]
+    );
+    assert_eq!(
+        result.arrivals,
+        vec![
+            PacketArrivalObservation {
+                payload: PayloadId(0),
+                time_ns: 5,
+                disposition: ArrivalDisposition::Admitted,
+            },
+            PacketArrivalObservation {
+                payload: PayloadId(0),
+                time_ns: 10,
+                disposition: ArrivalDisposition::Admitted,
+            },
+            PacketArrivalObservation {
+                payload: PayloadId(0),
+                time_ns: 15,
+                disposition: ArrivalDisposition::Delivered,
+            },
+        ]
+    );
+    assert!(result.pending_events.is_empty());
+    assert_eq!(
+        result
+            .host_states
+            .iter()
+            .map(|state| state.received_packets)
+            .sum::<u64>(),
+        1
+    );
+    assert!(
+        result
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .all(|queue| {
+                queue.queue.is_empty() && queue.in_service.is_none() && !queue.tx_ready_pending
+            })
     );
 }
 
@@ -499,7 +680,7 @@ seed = 1
 edges = [[0, 1]]
 hosts = [0, 1]
 [switch]
-port_rate = 8_000
+port_rate = 9223372036854775807
 capacity = 1
 discipline = "FIFO"
 drop = "TailDrop"

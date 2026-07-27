@@ -32,6 +32,7 @@ pub struct HostState {
     pub next_origin_seq: u64,
     pub sourced_packets: u64,
     pub departed_packets: u64,
+    pub received_packets: u64,
 }
 
 /// One switch-owned FIFO/TailDrop egress queue.
@@ -43,14 +44,21 @@ pub struct SwitchQueueState {
     /// Maximum queued packets. A value of zero denotes an unbounded queue.
     pub queue_capacity_packets: u64,
     pub queue: VecDeque<PayloadId>,
+    /// Packet committed to the non-preemptive transmission currently in progress.
+    pub in_service: Option<PayloadId>,
+    /// Whether this queue already owns a future `TxReady` decision point.
+    pub tx_ready_pending: bool,
 }
 
 /// Switch-owned state containing one queue per directed egress.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwitchState {
     pub queues: Vec<SwitchQueueState>,
+    /// One deterministic child-emission sequence shared by every queue owned by this node.
+    pub next_origin_seq: u64,
     pub arrived_packets: u64,
     pub dropped_packets: u64,
+    pub departed_packets: u64,
 }
 
 /// Stable endpoints and canonical directed route for one open-loop flow.
@@ -83,6 +91,11 @@ pub struct LinkDescriptor {
 }
 
 impl LinkDescriptor {
+    /// Computes serialization plus propagation without an absolute start time.
+    pub fn delay_ns(&self, bytes: u64) -> Result<u64, TimeError> {
+        link_arrival_time_ns(0, bytes, self.rate_bps, self.propagation_ns)
+    }
+
     /// Computes packet arrival using this link's constant rate and propagation delay.
     pub fn arrival_time_ns(&self, start_time_ns: u64, bytes: u64) -> Result<u64, TimeError> {
         link_arrival_time_ns(start_time_ns, bytes, self.rate_bps, self.propagation_ns)
@@ -99,6 +112,22 @@ pub struct RemoteChannel {
     pub link: LinkId,
     pub event_kind: EventKind,
     pub min_delay_ns: u64,
+}
+
+impl RemoteChannel {
+    /// Constructs the canonical packet channel for a link and its admitted minimum packet size.
+    pub fn for_packet_link(
+        link: LinkDescriptor,
+        min_packet_size_bytes: u64,
+    ) -> Result<Self, TimeError> {
+        Ok(Self {
+            source: link.source,
+            target: link.target,
+            link: link.id,
+            event_kind: EventKind::RemoteArrival,
+            min_delay_ns: link.delay_ns(min_packet_size_bytes)?,
+        })
+    }
 }
 
 /// One immutable semantic image containing every host and switch logical process.

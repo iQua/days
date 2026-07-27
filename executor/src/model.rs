@@ -17,6 +17,10 @@ pub enum NodeKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerKind {
     Fifo = 0,
+    /// Reserved closed-model value for the later SP phase.
+    StaticPriority = 1,
+    /// Reserved closed-model value for the later WFQ phase.
+    WeightedFairQueue = 2,
 }
 
 /// Symbolic transition selected by `(NodeKind, EventKind)`.

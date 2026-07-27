@@ -8,6 +8,7 @@ pub mod image;
 pub mod model;
 pub mod scalar;
 pub mod time;
+pub mod validate;
 
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
@@ -20,3 +21,4 @@ pub use scalar::{
     run_scalar,
 };
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
+pub use validate::{Backend, ValidationError, validate};

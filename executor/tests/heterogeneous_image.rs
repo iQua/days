@@ -32,6 +32,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
             next_origin_seq: 0,
             sourced_packets: 0,
             departed_packets: 0,
+            received_packets: 0,
         }],
         switch_states: vec![SwitchState {
             queues: vec![SwitchQueueState {
@@ -39,9 +40,13 @@ fn one_image_contains_host_and_switch_state_arenas() {
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 64,
                 queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
             }],
+            next_origin_seq: 0,
             arrived_packets: 0,
             dropped_packets: 0,
+            departed_packets: 0,
         }],
         flows: Vec::new(),
         packets: Vec::new(),

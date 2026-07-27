@@ -10,11 +10,12 @@ use crate::{
     resolve_transition,
 };
 
-/// Whether a packet arrival entered the finite switch FIFO.
+/// Outcome of one remote packet arrival at a switch queue or sink host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArrivalDisposition {
     Admitted,
     Dropped,
+    Delivered,
 }
 
 /// One completed non-preemptive transmission.
@@ -46,8 +47,8 @@ pub struct RunResult {
 
 /// Failure while executing an assumed-accepted image.
 ///
-/// T8 adds full image validation. These errors keep the scalar oracle from panicking when a
-/// hand-built T6 image violates a transition's immediate preconditions.
+/// Callers validate serialized or externally constructed images before execution. These errors
+/// retain checked runtime arithmetic and immediate transition preconditions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionError {
     DuplicateEventKey(EventKey),
@@ -79,6 +80,10 @@ pub enum ExecutionError {
         egress_link: Option<LinkId>,
     },
     HostAlreadyTransmitting(NodeId),
+    SwitchAlreadyTransmitting {
+        node: NodeId,
+        link: LinkId,
+    },
     UnexpectedTxComplete {
         node: NodeId,
         expected: Option<PayloadId>,
@@ -141,13 +146,17 @@ impl fmt::Display for ExecutionError {
                     "host {node:?} received TxReady while transmitting"
                 )
             }
+            Self::SwitchAlreadyTransmitting { node, link } => write!(
+                formatter,
+                "switch {node:?} received TxReady while link {link:?} is transmitting"
+            ),
             Self::UnexpectedTxComplete {
                 node,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "host {node:?} completed {actual:?}, expected {expected:?}"
+                "node {node:?} completed {actual:?}, expected {expected:?}"
             ),
             Self::CounterOverflow(node) => {
                 write!(formatter, "state counter overflow at node {node:?}")
@@ -250,14 +259,10 @@ impl<'image> ScalarExecutor<'image> {
             TransitionHandler::HostPacketArrival => self.host_packet_arrival(node, event),
             TransitionHandler::HostTxReady => self.host_tx_ready(node, event),
             TransitionHandler::HostTxComplete => self.host_tx_complete(node, event),
+            TransitionHandler::HostRemoteArrival => self.host_remote_arrival(node, event),
+            TransitionHandler::SwitchTxReady => self.switch_tx_ready(node, event),
+            TransitionHandler::SwitchTxComplete => self.switch_tx_complete(node, event),
             TransitionHandler::SwitchRemoteArrival => self.switch_remote_arrival(node, event),
-            TransitionHandler::HostRemoteArrival
-            | TransitionHandler::SwitchTxReady
-            | TransitionHandler::SwitchTxComplete => Err(ExecutionError::UnsupportedTransition {
-                node: node.id,
-                kind: node.kind,
-                event_kind: event.kind,
-            }),
         }
     }
 
@@ -403,7 +408,7 @@ impl<'image> ScalarExecutor<'image> {
         self.packet_size(event.payload)?;
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
 
-        let disposition = {
+        let (disposition, schedule_ready) = {
             let state = self.switch_state_mut(node)?;
             state.arrived_packets = state
                 .arrived_packets
@@ -424,10 +429,16 @@ impl<'image> ScalarExecutor<'image> {
                     .dropped_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                ArrivalDisposition::Dropped
+                (ArrivalDisposition::Dropped, false)
             } else {
                 queue.queue.push_back(event.payload);
-                ArrivalDisposition::Admitted
+                let schedule_ready = queue.egress_link.is_some()
+                    && queue.in_service.is_none()
+                    && !queue.tx_ready_pending;
+                if schedule_ready {
+                    queue.tx_ready_pending = true;
+                }
+                (ArrivalDisposition::Admitted, schedule_ready)
             }
         };
 
@@ -436,6 +447,177 @@ impl<'image> ScalarExecutor<'image> {
             time_ns: event.key.time_ns,
             disposition,
         });
+
+        if schedule_ready {
+            self.emit_from_switch(
+                node,
+                event,
+                node.id,
+                EventKind::TxReady,
+                event.payload,
+                event.key.time_ns,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn host_remote_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+    ) -> Result<(), ExecutionError> {
+        let flow = self.packet_flow(event.payload)?;
+        if flow.target != node.id {
+            return Err(ExecutionError::FlowRouteMiss {
+                flow: flow.id,
+                node: node.id,
+            });
+        }
+
+        let state = self.host_state_mut(node)?;
+        state.received_packets = state
+            .received_packets
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        self.arrivals.push(PacketArrivalObservation {
+            payload: event.payload,
+            time_ns: event.key.time_ns,
+            disposition: ArrivalDisposition::Delivered,
+        });
+        Ok(())
+    }
+
+    fn switch_tx_ready(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+    ) -> Result<(), ExecutionError> {
+        let egress_link = self.packet_egress_at(event.payload, node.id)?;
+        let Some(egress_link) = egress_link else {
+            return Err(ExecutionError::MissingSwitchQueue {
+                node: node.id,
+                egress_link: None,
+            });
+        };
+
+        let payload = {
+            let state = self.switch_state_mut(node)?;
+            let queue = state
+                .queues
+                .iter_mut()
+                .find(|queue| queue.egress_link == Some(egress_link))
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link: Some(egress_link),
+                })?;
+            queue.tx_ready_pending = false;
+            if queue.in_service.is_some() {
+                return Err(ExecutionError::SwitchAlreadyTransmitting {
+                    node: node.id,
+                    link: egress_link,
+                });
+            }
+
+            let Some(payload) = queue.queue.pop_front() else {
+                return Ok(());
+            };
+            queue.in_service = Some(payload);
+            payload
+        };
+
+        let link = self.link(egress_link)?;
+        if link.source != node.id {
+            return Err(ExecutionError::LinkSourceMismatch {
+                link: link.id,
+                expected_source: node.id,
+                actual_source: link.source,
+            });
+        }
+        let arrival_time_ns =
+            link.arrival_time_ns(event.key.time_ns, self.packet_size(payload)?)?;
+        let departure_time_ns = arrival_time_ns
+            .checked_sub(link.propagation_ns)
+            .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+
+        self.emit_from_switch(
+            node,
+            event,
+            node.id,
+            EventKind::TxComplete,
+            payload,
+            departure_time_ns,
+        )?;
+        self.emit_from_switch(
+            node,
+            event,
+            link.target,
+            EventKind::RemoteArrival,
+            payload,
+            arrival_time_ns,
+        )
+    }
+
+    fn switch_tx_complete(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+    ) -> Result<(), ExecutionError> {
+        let egress_link = self.packet_egress_at(event.payload, node.id)?;
+        let Some(egress_link) = egress_link else {
+            return Err(ExecutionError::MissingSwitchQueue {
+                node: node.id,
+                egress_link: None,
+            });
+        };
+
+        let next_payload = {
+            let state = self.switch_state_mut(node)?;
+            let queue = state
+                .queues
+                .iter_mut()
+                .find(|queue| queue.egress_link == Some(egress_link))
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link: Some(egress_link),
+                })?;
+            if queue.in_service != Some(event.payload) {
+                return Err(ExecutionError::UnexpectedTxComplete {
+                    node: node.id,
+                    expected: queue.in_service,
+                    actual: event.payload,
+                });
+            }
+            queue.in_service = None;
+
+            let next_payload = queue.queue.front().copied();
+            let schedule_payload = if next_payload.is_some() && !queue.tx_ready_pending {
+                queue.tx_ready_pending = true;
+                next_payload
+            } else {
+                None
+            };
+            state.departed_packets = state
+                .departed_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            schedule_payload
+        };
+
+        self.departures.push(PacketDeparture {
+            payload: event.payload,
+            time_ns: event.key.time_ns,
+        });
+
+        if let Some(payload) = next_payload {
+            self.emit_from_switch(
+                node,
+                event,
+                node.id,
+                EventKind::TxReady,
+                payload,
+                event.key.time_ns,
+            )?;
+        }
         Ok(())
     }
 
@@ -456,18 +638,56 @@ impl<'image> ScalarExecutor<'image> {
                 .ok_or(ExecutionError::OriginSequenceOverflow(origin.id))?;
             origin_seq
         };
-        let child = Event {
-            key: EventKey {
-                time_ns,
-                phase: event_phase(kind),
-                origin_node: origin.id,
-                origin_seq,
+        self.insert_child(
+            parent,
+            Event {
+                key: EventKey {
+                    time_ns,
+                    phase: event_phase(kind),
+                    origin_node: origin.id,
+                    origin_seq,
+                },
+                target,
+                kind,
+                payload,
             },
-            target,
-            kind,
-            payload,
-        };
+        )
+    }
 
+    fn emit_from_switch(
+        &mut self,
+        origin: NodeDescriptor,
+        parent: Event,
+        target: NodeId,
+        kind: EventKind,
+        payload: PayloadId,
+        time_ns: u64,
+    ) -> Result<(), ExecutionError> {
+        let origin_seq = {
+            let state = self.switch_state_mut(origin)?;
+            let origin_seq = state.next_origin_seq;
+            state.next_origin_seq = origin_seq
+                .checked_add(1)
+                .ok_or(ExecutionError::OriginSequenceOverflow(origin.id))?;
+            origin_seq
+        };
+        self.insert_child(
+            parent,
+            Event {
+                key: EventKey {
+                    time_ns,
+                    phase: event_phase(kind),
+                    origin_node: origin.id,
+                    origin_seq,
+                },
+                target,
+                kind,
+                payload,
+            },
+        )
+    }
+
+    fn insert_child(&mut self, parent: Event, child: Event) -> Result<(), ExecutionError> {
         if child.key <= parent.key {
             return Err(ExecutionError::NonMonotoneChild {
                 parent: parent.key,
@@ -478,6 +698,20 @@ impl<'image> ScalarExecutor<'image> {
             return Err(ExecutionError::DuplicateEventKey(child.key));
         }
         Ok(())
+    }
+
+    fn packet_flow(&self, payload: PayloadId) -> Result<&crate::FlowDescriptor, ExecutionError> {
+        let packet = self
+            .image
+            .packets
+            .iter()
+            .find(|packet| packet.id == payload)
+            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        self.image
+            .flows
+            .iter()
+            .find(|flow| flow.id == packet.flow)
+            .ok_or(ExecutionError::UnknownFlow(packet.flow))
     }
 
     fn node(&self, id: NodeId) -> Result<NodeDescriptor, ExecutionError> {
