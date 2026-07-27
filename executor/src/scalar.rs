@@ -707,25 +707,13 @@ impl<'image> ScalarExecutor<'image> {
     }
 
     fn packet_flow(&self, payload: PayloadId) -> Result<&crate::FlowDescriptor, ExecutionError> {
-        let packet = self
-            .image
-            .packets
-            .iter()
-            .find(|packet| packet.id == payload)
-            .ok_or(ExecutionError::UnknownPacket(payload))?;
-        self.image
-            .flows
-            .iter()
-            .find(|flow| flow.id == packet.flow)
-            .ok_or(ExecutionError::UnknownFlow(packet.flow))
+        let packet = self.packet(payload)?;
+        self.flow(packet.flow)
     }
 
     fn node(&self, id: NodeId) -> Result<NodeDescriptor, ExecutionError> {
-        self.image
-            .nodes
-            .iter()
+        indexed_lookup(&self.image.nodes, id.0, |node| node.id == id)
             .copied()
-            .find(|node| node.id == id)
             .ok_or(ExecutionError::UnknownNode(id))
     }
 
@@ -753,21 +741,23 @@ impl<'image> ScalarExecutor<'image> {
     }
 
     fn link(&self, id: LinkId) -> Result<crate::LinkDescriptor, ExecutionError> {
-        self.image
-            .links
-            .iter()
+        indexed_lookup(&self.image.links, id.0, |link| link.id == id)
             .copied()
-            .find(|link| link.id == id)
             .ok_or(ExecutionError::UnknownLink(id))
     }
 
     fn packet_size(&self, id: PayloadId) -> Result<u64, ExecutionError> {
-        self.image
-            .packets
-            .iter()
-            .find(|packet| packet.id == id)
-            .map(|packet| packet.size_bytes)
+        Ok(self.packet(id)?.size_bytes)
+    }
+
+    fn packet(&self, id: PayloadId) -> Result<&crate::PacketDescriptor, ExecutionError> {
+        indexed_lookup(&self.image.packets, id.0, |packet| packet.id == id)
             .ok_or(ExecutionError::UnknownPacket(id))
+    }
+
+    fn flow(&self, id: FlowId) -> Result<&crate::FlowDescriptor, ExecutionError> {
+        indexed_lookup(&self.image.flows, id.0, |flow| flow.id == id)
+            .ok_or(ExecutionError::UnknownFlow(id))
     }
 
     fn packet_egress_at(
@@ -775,18 +765,8 @@ impl<'image> ScalarExecutor<'image> {
         payload: PayloadId,
         node: NodeId,
     ) -> Result<Option<LinkId>, ExecutionError> {
-        let packet = self
-            .image
-            .packets
-            .iter()
-            .find(|packet| packet.id == payload)
-            .ok_or(ExecutionError::UnknownPacket(payload))?;
-        let flow = self
-            .image
-            .flows
-            .iter()
-            .find(|flow| flow.id == packet.flow)
-            .ok_or(ExecutionError::UnknownFlow(packet.flow))?;
+        let packet = self.packet(payload)?;
+        let flow = self.flow(packet.flow)?;
 
         for link_id in &flow.route {
             let link = self.link(*link_id)?;
@@ -802,4 +782,15 @@ impl<'image> ScalarExecutor<'image> {
             node,
         })
     }
+}
+
+fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> Option<&T> {
+    let indexed = usize::try_from(id)
+        .ok()
+        .and_then(|index| table.get(index))
+        .filter(|descriptor| matches_id(descriptor));
+
+    // Validated images always return above. The fallback preserves `run_scalar` behavior and
+    // checked `Unknown*` errors for legacy hand-built callers that intentionally skip validation.
+    indexed.or_else(|| table.iter().find(|descriptor| matches_id(descriptor)))
 }

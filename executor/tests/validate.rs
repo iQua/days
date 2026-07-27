@@ -197,6 +197,48 @@ fn node_link_and_event_ids_must_be_unique_and_in_range() {
 }
 
 #[test]
+fn descriptor_ids_must_match_their_dense_table_indices() {
+    let mut nodes = valid_image();
+    nodes.nodes.swap(0, 1);
+    assert_eq!(
+        rejection(&nodes, Backend::Scalar),
+        "node ID NodeId(1) at descriptor 0 does not match dense table index 0"
+    );
+
+    let mut links = valid_image();
+    links.links.swap(0, 1);
+    assert_eq!(
+        rejection(&links, Backend::Scalar),
+        "link ID LinkId(1) at descriptor 0 does not match dense table index 0"
+    );
+
+    let mut flows = valid_image();
+    flows.flows.push(FlowDescriptor {
+        id: FlowId(1),
+        source: SOURCE,
+        target: SINK,
+        route: vec![SOURCE_LINK, SWITCH_LINK],
+    });
+    flows.flows.swap(0, 1);
+    assert_eq!(
+        rejection(&flows, Backend::Scalar),
+        "flow ID FlowId(1) at descriptor 0 does not match dense table index 0"
+    );
+
+    let mut packets = valid_image();
+    packets.packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: 2,
+    });
+    packets.packets.swap(0, 1);
+    assert_eq!(
+        rejection(&packets, Backend::Scalar),
+        "packet ID PayloadId(1) at descriptor 0 does not match dense table index 0"
+    );
+}
+
+#[test]
 fn every_role_state_slot_has_exactly_one_owner() {
     let mut invalid = valid_image();
     invalid.nodes[0].state_slot = 2;

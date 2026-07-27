@@ -106,6 +106,12 @@ fn validate_node_ids(image: &SimulationImage) -> Result<(), ValidationError> {
                 node.id
             )));
         }
+        if node.id.0 != index as u64 {
+            return Err(ValidationError::new(format!(
+                "node ID {:?} at descriptor {index} does not match dense table index {index}",
+                node.id
+            )));
+        }
     }
     Ok(())
 }
@@ -123,6 +129,12 @@ fn validate_link_ids(image: &SimulationImage) -> Result<(), ValidationError> {
         if link.id.0 >= count {
             return Err(ValidationError::new(format!(
                 "link ID {:?} at descriptor {index} is outside dense range 0..{count}",
+                link.id
+            )));
+        }
+        if link.id.0 != index as u64 {
+            return Err(ValidationError::new(format!(
+                "link ID {:?} at descriptor {index} does not match dense table index {index}",
                 link.id
             )));
         }
@@ -146,6 +158,12 @@ fn validate_flow_ids(image: &SimulationImage) -> Result<(), ValidationError> {
                 flow.id
             )));
         }
+        if flow.id.0 != index as u64 {
+            return Err(ValidationError::new(format!(
+                "flow ID {:?} at descriptor {index} does not match dense table index {index}",
+                flow.id
+            )));
+        }
     }
     Ok(())
 }
@@ -163,6 +181,12 @@ fn validate_packet_ids(image: &SimulationImage) -> Result<(), ValidationError> {
         if packet.id.0 >= count {
             return Err(ValidationError::new(format!(
                 "packet ID {:?} at descriptor {index} is outside dense range 0..{count}",
+                packet.id
+            )));
+        }
+        if packet.id.0 != index as u64 {
+            return Err(ValidationError::new(format!(
+                "packet ID {:?} at descriptor {index} does not match dense table index {index}",
                 packet.id
             )));
         }
