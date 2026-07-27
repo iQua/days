@@ -82,7 +82,7 @@ fn test_red_ecn_marks_ce_in_simulation() {
     std::fs::write(seed_file.path(), "seed = 1\n").expect("Failed to write seed file");
     let _ = seed_from_config(seed_file.path().to_str().unwrap());
 
-    let mut source = EcnBurstSource::new(0, 512, 30);
+    let mut source = EcnBurstSource::new(0, 512, 2_000);
     let mut port = Port::new(
         100_000.0, // 100 kbps to build queue
         5,         // small queue
@@ -106,7 +106,7 @@ fn test_red_ecn_marks_ce_in_simulation() {
         .init(t0)
         .expect("Failed to initialize ECN integration simulation");
 
-    let _ = sim.step_until(Duration::from_secs_f64(1.0));
+    let _ = sim.step_until(Duration::from_secs_f64(2.0));
 
     let mut saw_ce = false;
     while let Some(pkt) = sink_slot.next() {
