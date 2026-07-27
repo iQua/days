@@ -348,6 +348,25 @@ fn channels_must_match_emissions_and_certified_bounds() {
 }
 
 #[test]
+fn channel_bounds_use_the_minimum_delay_across_packets_on_the_link() {
+    let mut image = valid_image();
+    image.packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: 100,
+    });
+
+    validate(&image, Backend::Scalar)
+        .expect("the two-nanosecond bound must cover every packet on the link");
+
+    image.channels[0].min_delay_ns = 100;
+    assert_eq!(
+        rejection(&image, Backend::Scalar),
+        "channel 0 declares min_delay_ns 100, exceeding derived bound 2 for link LinkId(0)"
+    );
+}
+
+#[test]
 fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
     let mut image = valid_image();
     image.packets[0].size_bytes = 100;
@@ -527,5 +546,33 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
     assert_eq!(
         rejection(&counter, Backend::Scalar),
         "node NodeId(0) counter sourced_packets value 18446744073709551615 overflows with remaining upper bound 1"
+    );
+}
+
+#[test]
+fn initial_event_keys_must_be_strictly_ascending() {
+    let mut image = valid_image();
+    image.packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: 2,
+    });
+    image.initial_events[0].key.time_ns = 1;
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::PacketArrival),
+            origin_node: SOURCE,
+            origin_seq: 1,
+        },
+        target: SOURCE,
+        kind: EventKind::PacketArrival,
+        payload: PayloadId(1),
+    });
+    image.host_states[0].next_origin_seq = 2;
+
+    assert_eq!(
+        rejection(&image, Backend::Scalar),
+        "initial event 1 key EventKey { time_ns: 0, phase: 0, origin_node: NodeId(0), origin_seq: 1 } does not advance previous key EventKey { time_ns: 1, phase: 0, origin_node: NodeId(0), origin_seq: 0 }"
     );
 }
