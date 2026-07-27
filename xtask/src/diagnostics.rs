@@ -193,7 +193,7 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         code: "DAYS-AUDIT-0026",
         slug: "budget-freeze-invalid",
         severity: Severity::Error,
-        summary: "A budget freeze commit is missing or unverifiable, contains different budget content, or is not an ancestor of its measurement commit",
+        summary: "A budget freeze commit is missing or unverifiable, contains different budget content, or does not strictly precede its measurement commit",
     },
     DiagnosticDefinition {
         code: "DAYS-AUDIT-0027",

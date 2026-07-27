@@ -111,7 +111,7 @@ Information diagnostics use the same format and never affect the exit status.
 | `DAYS-AUDIT-0023` | `reproduce-command-failed` | error | A declared reproduce test command exited non-zero. |
 | `DAYS-AUDIT-0024` | `reproduce-no-host-command` | error | No declared reproduce test command matches the host platform. |
 | `DAYS-AUDIT-0025` | `audit-internal-error` | error | An audit check attempted to emit an unknown diagnostic code. |
-| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze commit is missing or unverifiable, contains different budget content, or is not an ancestor of its measurement commit. |
+| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze commit is missing or unverifiable, contains different budget content, or does not strictly precede its measurement commit. Equality means the measurement was committed together with the budget and is rejected. |
 | `DAYS-AUDIT-0027` | `measurement-evidence-invalid` | error | Measurement evidence omits its required budget, budget hash, or run commit, or a declared budget has no citing measurement. |
 | `DAYS-AUDIT-0028` | `archive-check-skipped` | info | Archive verification was skipped because the `days-gpu` repository is unavailable. |
 
@@ -224,10 +224,12 @@ An incomplete backend must not be selectable or appear in
 
 The audit verifies that the working-tree budget hash matches `content_hash`,
 that the budget path at `frozen_at_commit` exists and hashes to the same value,
-and that `frozen_at_commit` is an ancestor of or equal to every measurement
-`run_commit` that cites the budget. An uncommitted budget, an unknown or
-unreachable commit, a path absent at that commit, an indeterminate ancestry
-result, or different budget bytes at that commit fails closed.
+and that `frozen_at_commit` is a strict ancestor of every measurement
+`run_commit` that cites the budget. Equality is rejected because it means the
+measurement was committed together with the budget instead of after the
+freeze. An uncommitted budget, an unknown or unreachable commit, a path absent
+at that commit, an indeterminate ancestry result, or different budget bytes at
+that commit fails closed.
 
 ## Evidence manifest schema
 
@@ -293,8 +295,9 @@ be cited by at least one measurement manifest. Every evidence kind, including
 The budget binding is temporal as well as content-addressed. The audit compares
 the current budget bytes with `content_hash`, compares the budget blob at the
 phase metadata's `frozen_at_commit` with that same hash, and verifies that
-`frozen_at_commit` is an ancestor of or equal to the measurement's
-`run_commit`. It also reads every measurement artifact from `run_commit` and
+`frozen_at_commit` is a strict ancestor of the measurement's `run_commit`.
+Equal commits are rejected as a measurement committed together with its
+budget. The audit also reads every measurement artifact from `run_commit` and
 checks the committed blob against the artifact hash. These checks mechanically
 enforce content equality and commit ordering; they do not prove that a
 measurement was executed. Any actual rerun rests on reviewed commit sequencing,
@@ -558,10 +561,12 @@ frozen before measurement. Phase metadata records both the budget content hash
 and the commit containing those exact bytes. Every measurement record embeds
 the budget path, its exact hash, and the measured code's `run_commit`. The
 audit verifies that the freeze commit contains the recorded bytes and is an
-ancestor of or equal to the run commit, and that measurement artifacts are
-present with their declared content at that run commit. These are commit
-content and ordering checks; whether a measurement was actually rerun depends
-on reviewed commit sequencing rather than machine verification by the audit.
+strict ancestor of the run commit, and that measurement artifacts are present
+with their declared content at that run commit. Equality fails because the
+measurement would have been committed together with the budget. These are
+commit content and ordering checks; whether a measurement was actually rerun
+depends on reviewed commit sequencing rather than machine verification by the
+audit.
 
 Public API or configuration changes require migration notes in phase metadata
 and the design note. Incomplete implementation remains feature-gated and may

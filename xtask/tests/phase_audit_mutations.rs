@@ -14,6 +14,7 @@ struct Fixture {
     host: String,
     pre_budget_commit: String,
     frozen_commit: String,
+    measurement_commit: String,
 }
 
 impl Fixture {
@@ -81,6 +82,10 @@ license = "AGPL-3.0-only"
         let golden = "fixture golden\n";
         write(&root, "docs/days-executor/evidence/P90/golden.txt", golden);
         let golden_hash = sha256_bytes(golden.as_bytes());
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-q", "-m", "Freeze fixture budget"]);
+        let frozen_commit = run_output(&root, &["rev-parse", "HEAD"]);
+
         let measurement = "fixture measurement\n";
         write(
             &root,
@@ -88,9 +93,12 @@ license = "AGPL-3.0-only"
             measurement,
         );
         let measurement_hash = sha256_bytes(measurement.as_bytes());
-        run(&root, &["add", "-A"]);
-        run(&root, &["commit", "-q", "-m", "Freeze fixture budget"]);
-        let frozen_commit = run_output(&root, &["rev-parse", "HEAD"]);
+        run(
+            &root,
+            &["add", "docs/days-executor/evidence/P90/measurement.txt"],
+        );
+        run(&root, &["commit", "-q", "-m", "Record fixture measurement"]);
+        let measurement_commit = run_output(&root, &["rev-parse", "HEAD"]);
 
         write(
             &root,
@@ -100,7 +108,7 @@ license = "AGPL-3.0-only"
         write(
             &root,
             "docs/days-executor/evidence/P90/measurement.toml",
-            &measurement_evidence(&budget_hash, &frozen_commit, &measurement_hash),
+            &measurement_evidence(&budget_hash, &measurement_commit, &measurement_hash),
         );
 
         let host = host_platform();
@@ -117,6 +125,7 @@ license = "AGPL-3.0-only"
             host,
             pre_budget_commit,
             frozen_commit,
+            measurement_commit,
         }
     }
 
@@ -940,6 +949,19 @@ fn retirement_budget_edited_after_measurement_is_rejected() {
 }
 
 #[test]
+fn budget_and_measurement_in_same_commit_is_rejected() {
+    let fixture = Fixture::new();
+    fixture
+        .mutate_phase(|value| value.replace(&fixture.frozen_commit, &fixture.measurement_commit));
+    let expected_message = format!(
+        "measurement run_commit {} equals frozen_at_commit {}; the measurement was committed together with the budget instead of after the freeze",
+        fixture.measurement_commit, fixture.measurement_commit
+    );
+
+    assert_code_message(&fixture.audit(), "DAYS-AUDIT-0026", &expected_message);
+}
+
+#[test]
 fn budget_frozen_before_measurement_passes() {
     let fixture = Fixture::new();
     write(
@@ -954,7 +976,7 @@ fn budget_frozen_before_measurement_passes() {
     );
     let run_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
     mutate(&fixture.measurement_path(), |value| {
-        value.replace(&fixture.frozen_commit, &run_commit)
+        value.replace(&fixture.measurement_commit, &run_commit)
     });
 
     let report = fixture.audit();

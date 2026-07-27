@@ -1356,6 +1356,18 @@ fn check_measurement_contract(
     ) {
         return;
     }
+    if run_commit == budget.frozen_at_commit {
+        emit(
+            diagnostics,
+            "DAYS-AUDIT-0026",
+            budget_path,
+            format!(
+                "measurement run_commit {run_commit} equals frozen_at_commit {}; the measurement was committed together with the budget instead of after the freeze",
+                budget.frozen_at_commit
+            ),
+        );
+        return;
+    }
     match git(
         repo_root,
         &[

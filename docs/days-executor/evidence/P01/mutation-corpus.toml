@@ -126,6 +126,11 @@ test_function = "retirement_budget_edited_after_measurement_is_rejected"
 expected_code = "DAYS-AUDIT-0026"
 
 [[mutations]]
+fault_class = "measurement committed together with budget"
+test_function = "budget_and_measurement_in_same_commit_is_rejected"
+expected_code = "DAYS-AUDIT-0026"
+
+[[mutations]]
 fault_class = "uncommitted budget content"
 test_function = "uncommitted_budget_is_rejected"
 expected_code = "DAYS-AUDIT-0026"

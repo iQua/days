@@ -154,7 +154,7 @@ summary = "An audit check attempted to emit an unknown diagnostic code"
 code = "DAYS-AUDIT-0026"
 slug = "budget-freeze-invalid"
 severity = "error"
-summary = "A budget freeze commit is missing or unverifiable, contains different budget content, or is not an ancestor of its measurement commit"
+summary = "A budget freeze commit is missing or unverifiable, contains different budget content, or does not strictly precede its measurement commit"
 
 [[diagnostics]]
 code = "DAYS-AUDIT-0027"
