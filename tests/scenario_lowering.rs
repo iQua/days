@@ -6,7 +6,7 @@ use days::scenario::compile_config;
 use days_executor::{
     ArrivalDisposition, Backend, EventKind, FlowId, LinkId, NodeId, NodeKind, ObservationMode,
     PacketArrivalObservation, PacketDeparture, PayloadId, SimulationImage, run_scalar,
-    run_scalar_with_observations, validate,
+    run_scalar_rounds, run_scalar_with_observations, validate,
 };
 use tempfile::TempDir;
 
@@ -685,6 +685,12 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
         .expect("zero propagation with positive serialization is parallel-safe");
     validate(&first, Backend::Scalar).expect("baseline image should validate for scalar execution");
     let result = run_scalar(&first, None).expect("baseline image should run to completion");
+    let round_run =
+        run_scalar_rounds(&first, None).expect("baseline image should run by safe-horizon rounds");
+    assert_eq!(
+        round_run.result, result,
+        "round execution must match the complete global-priority-queue state"
+    );
     assert_eq!(result.summary.sourced_packets, 12_000);
     assert_eq!(result.summary.sourced_bytes, 12_000_000);
     assert_eq!(result.summary.received_packets, 11_992);

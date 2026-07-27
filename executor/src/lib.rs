@@ -6,6 +6,7 @@
 pub mod event;
 pub mod image;
 pub mod model;
+pub mod safe_horizon;
 pub mod scalar;
 pub mod time;
 pub mod validate;
@@ -18,6 +19,10 @@ pub use image::{
     ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
 };
 pub use model::{NodeKind, SchedulerKind, TransitionHandler, resolve_transition};
+pub use safe_horizon::{
+    LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
+    run_scalar_rounds_with_observations,
+};
 pub use scalar::{
     ArrivalDisposition, ExecutionError, ObservationMode, PacketArrivalObservation, PacketDeparture,
     RunResult, RunSummary, run_scalar, run_scalar_with_observations,

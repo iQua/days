@@ -135,6 +135,15 @@ pub enum ExecutionError {
     },
     CounterOverflow(NodeId),
     OriginSequenceOverflow(NodeId),
+    NonPositiveLookahead,
+    RemoteEventBeforeHorizon {
+        key: EventKey,
+        exclusive_horizon_ns: u128,
+    },
+    EventBelowHorizonAfterDrain {
+        key: EventKey,
+        exclusive_horizon_ns: u128,
+    },
     NonMonotoneChild {
         parent: EventKey,
         child: EventKey,
@@ -234,6 +243,27 @@ impl fmt::Display for ExecutionError {
             Self::OriginSequenceOverflow(node) => {
                 write!(formatter, "origin sequence overflow at node {node:?}")
             }
+            Self::NonPositiveLookahead => {
+                write!(
+                    formatter,
+                    "safe-horizon execution requires every declared channel delay to be positive"
+                )
+            }
+            Self::RemoteEventBeforeHorizon {
+                key,
+                exclusive_horizon_ns,
+            } => write!(
+                formatter,
+                "remote event {key:?} precedes exclusive safe horizon {exclusive_horizon_ns}"
+            ),
+            Self::EventBelowHorizonAfterDrain {
+                key,
+                exclusive_horizon_ns,
+            } => write!(
+                formatter,
+                "LP still has event {key:?} below exclusive safe horizon \
+                 {exclusive_horizon_ns} after its drain"
+            ),
             Self::NonMonotoneChild { parent, child } => {
                 write!(
                     formatter,
@@ -278,20 +308,38 @@ pub fn run_scalar_with_observations(
     exclusive_horizon_ns: Option<u64>,
     observation_mode: ObservationMode,
 ) -> Result<RunResult, ExecutionError> {
-    ScalarExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
+    let mut transitions = TransitionState::new(image, observation_mode)?;
+    let mut events = initial_event_queue(image)?;
+    let mut children = Vec::new();
+
+    while events.first_key_value().is_some_and(|(key, _)| {
+        key.time_ns <= image.stop_time_ns
+            && exclusive_horizon_ns.is_none_or(|horizon_ns| key.time_ns < horizon_ns)
+    }) {
+        let (_, event) = events
+            .pop_first()
+            .expect("first_key_value established a pending event");
+        transitions.dispatch(event, &mut children)?;
+        for child in children.drain(..) {
+            if events.insert(child.key, child).is_some() {
+                return Err(ExecutionError::DuplicateEventKey(child.key));
+            }
+        }
+    }
+
+    Ok(transitions.finish(events.into_values().collect()))
 }
 
-struct ScalarExecutor<'image> {
+pub(crate) struct TransitionState<'image> {
     image: &'image SimulationImage,
-    events: BTreeMap<EventKey, Event>,
     host_states: Vec<HostState>,
     switch_states: Vec<SwitchState>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
     observation_mode: ObservationMode,
     summary: RunSummary,
     observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
-    departures: Vec<PacketDeparture>,
-    arrivals: Vec<PacketArrivalObservation>,
+    departures: Vec<(EventKey, PacketDeparture)>,
+    arrivals: Vec<(EventKey, PacketArrivalObservation)>,
 }
 
 #[derive(Clone, Copy)]
@@ -302,18 +350,19 @@ struct ResidentPacket {
     terminal: bool,
 }
 
-impl<'image> ScalarExecutor<'image> {
-    fn new(
+#[derive(Clone, Copy)]
+struct ChildEmission {
+    target: NodeId,
+    kind: EventKind,
+    payload: PayloadId,
+    time_ns: u64,
+}
+
+impl<'image> TransitionState<'image> {
+    pub(crate) fn new(
         image: &'image SimulationImage,
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
-        let mut events = BTreeMap::new();
-        for event in image.initial_events.iter().copied() {
-            if events.insert(event.key, event).is_some() {
-                return Err(ExecutionError::DuplicateEventKey(event.key));
-            }
-        }
-
         let mut packets = BTreeMap::new();
         for descriptor in image.initial_packets.iter().copied() {
             if packets
@@ -354,7 +403,6 @@ impl<'image> ScalarExecutor<'image> {
 
         Ok(Self {
             image,
-            events,
             host_states: image.host_states.clone(),
             switch_states: image.switch_states.clone(),
             packets,
@@ -366,37 +414,40 @@ impl<'image> ScalarExecutor<'image> {
         })
     }
 
-    fn run(mut self, exclusive_horizon_ns: Option<u64>) -> Result<RunResult, ExecutionError> {
-        while self.events.first_key_value().is_some_and(|(key, _)| {
-            key.time_ns <= self.image.stop_time_ns
-                && exclusive_horizon_ns.is_none_or(|horizon_ns| key.time_ns < horizon_ns)
-        }) {
-            let (_, event) = self
-                .events
-                .pop_first()
-                .expect("first_key_value established a pending event");
-            self.dispatch(event)?;
-        }
-
+    pub(crate) fn finish(mut self, pending_events: Vec<Event>) -> RunResult {
         let resident_packets = self
             .packets
             .into_values()
             .map(|packet| packet.descriptor)
             .collect();
         let observed_packets = self.observed_packets.into_values().collect();
-        Ok(RunResult {
+        self.departures.sort_unstable_by_key(|(key, _)| *key);
+        self.arrivals.sort_unstable_by_key(|(key, _)| *key);
+        RunResult {
             host_states: self.host_states,
             switch_states: self.switch_states,
             summary: self.summary,
             resident_packets,
             observed_packets,
-            departures: self.departures,
-            arrivals: self.arrivals,
-            pending_events: self.events.into_values().collect(),
-        })
+            departures: self
+                .departures
+                .into_iter()
+                .map(|(_, departure)| departure)
+                .collect(),
+            arrivals: self
+                .arrivals
+                .into_iter()
+                .map(|(_, arrival)| arrival)
+                .collect(),
+            pending_events,
+        }
     }
 
-    fn dispatch(&mut self, event: Event) -> Result<(), ExecutionError> {
+    pub(crate) fn dispatch(
+        &mut self,
+        event: Event,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
         let node = self.node(event.target)?;
         let handler = resolve_transition(node.kind, event.kind).ok_or(
             ExecutionError::UnsupportedTransition {
@@ -407,13 +458,15 @@ impl<'image> ScalarExecutor<'image> {
         )?;
 
         match handler {
-            TransitionHandler::HostPacketArrival => self.host_packet_arrival(node, event),
-            TransitionHandler::HostTxReady => self.host_tx_ready(node, event),
-            TransitionHandler::HostTxComplete => self.host_tx_complete(node, event),
-            TransitionHandler::HostRemoteArrival => self.host_remote_arrival(node, event),
-            TransitionHandler::SwitchTxReady => self.switch_tx_ready(node, event),
-            TransitionHandler::SwitchTxComplete => self.switch_tx_complete(node, event),
-            TransitionHandler::SwitchRemoteArrival => self.switch_remote_arrival(node, event),
+            TransitionHandler::HostPacketArrival => self.host_packet_arrival(node, event, children),
+            TransitionHandler::HostTxReady => self.host_tx_ready(node, event, children),
+            TransitionHandler::HostTxComplete => self.host_tx_complete(node, event, children),
+            TransitionHandler::HostRemoteArrival => self.host_remote_arrival(node, event, children),
+            TransitionHandler::SwitchTxReady => self.switch_tx_ready(node, event, children),
+            TransitionHandler::SwitchTxComplete => self.switch_tx_complete(node, event, children),
+            TransitionHandler::SwitchRemoteArrival => {
+                self.switch_remote_arrival(node, event, children)
+            }
         }
     }
 
@@ -421,6 +474,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
         let owns_generator = self
@@ -433,7 +487,7 @@ impl<'image> ScalarExecutor<'image> {
                     .any(|generator| generator.flow == packet.flow)
             });
         if !owns_generator {
-            return self.host_preloaded_packet_arrival(node, event);
+            return self.host_preloaded_packet_arrival(node, event, children);
         }
         self.set_source_time(event.payload, event.key.time_ns)?;
         let (next_packet, next_departure_ns, schedule_ready) = {
@@ -553,20 +607,26 @@ impl<'image> ScalarExecutor<'image> {
             self.emit_from_host(
                 node,
                 event,
-                node.id,
-                EventKind::PacketArrival,
-                next_packet.id,
-                next_departure_ns.expect("a produced packet has a departure"),
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacketArrival,
+                    payload: next_packet.id,
+                    time_ns: next_departure_ns.expect("a produced packet has a departure"),
+                },
+                children,
             )?;
         }
         if schedule_ready {
             self.emit_from_host(
                 node,
                 event,
-                node.id,
-                EventKind::TxReady,
-                event.payload,
-                event.key.time_ns,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload: event.payload,
+                    time_ns: event.key.time_ns,
+                },
+                children,
             )?;
         }
 
@@ -577,6 +637,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
         self.set_source_time(event.payload, event.key.time_ns)?;
@@ -599,16 +660,24 @@ impl<'image> ScalarExecutor<'image> {
             self.emit_from_host(
                 node,
                 event,
-                node.id,
-                EventKind::TxReady,
-                event.payload,
-                event.key.time_ns,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload: event.payload,
+                    time_ns: event.key.time_ns,
+                },
+                children,
             )?;
         }
         Ok(())
     }
 
-    fn host_tx_ready(&mut self, node: NodeDescriptor, event: Event) -> Result<(), ExecutionError> {
+    fn host_tx_ready(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
         let (egress_link, payload) = {
             let state = self.host_state_mut(node)?;
             state.tx_ready_pending = false;
@@ -643,18 +712,24 @@ impl<'image> ScalarExecutor<'image> {
         self.emit_from_host(
             node,
             event,
-            node.id,
-            EventKind::TxComplete,
-            payload,
-            departure_time_ns,
+            ChildEmission {
+                target: node.id,
+                kind: EventKind::TxComplete,
+                payload,
+                time_ns: departure_time_ns,
+            },
+            children,
         )?;
         self.emit_from_host(
             node,
             event,
-            link.target,
-            EventKind::RemoteArrival,
-            payload,
-            arrival_time_ns,
+            ChildEmission {
+                target: link.target,
+                kind: EventKind::RemoteArrival,
+                payload,
+                time_ns: arrival_time_ns,
+            },
+            children,
         )
     }
 
@@ -662,6 +737,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let schedule_ready = {
             let state = self.host_state_mut(node)?;
@@ -688,17 +764,20 @@ impl<'image> ScalarExecutor<'image> {
         };
 
         let packet = self.packet(event.payload)?;
-        self.record_departure(node.id, packet, event.key.time_ns)?;
+        self.record_departure(node.id, packet, event.key)?;
         self.finish_transmission(node.id, event.payload)?;
 
         if schedule_ready {
             self.emit_from_host(
                 node,
                 event,
-                node.id,
-                EventKind::TxReady,
-                event.payload,
-                event.key.time_ns,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload: event.payload,
+                    time_ns: event.key.time_ns,
+                },
+                children,
             )?;
         }
 
@@ -709,6 +788,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
@@ -747,7 +827,7 @@ impl<'image> ScalarExecutor<'image> {
             }
         };
 
-        self.record_arrival(node.id, packet, event.key.time_ns, disposition)?;
+        self.record_arrival(node.id, packet, event.key, disposition)?;
         if disposition == ArrivalDisposition::Dropped {
             self.mark_terminal(event.payload)?;
         }
@@ -756,10 +836,13 @@ impl<'image> ScalarExecutor<'image> {
             self.emit_from_switch(
                 node,
                 event,
-                node.id,
-                EventKind::TxReady,
-                event.payload,
-                event.key.time_ns,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload: event.payload,
+                    time_ns: event.key.time_ns,
+                },
+                children,
             )?;
         }
         Ok(())
@@ -769,6 +852,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
         let (flow_id, flow_source, flow_target) = {
@@ -808,10 +892,10 @@ impl<'image> ScalarExecutor<'image> {
                 (ArrivalDisposition::Delivered, GeneratorFeedbackAction::None)
             }
         };
-        self.record_arrival(node.id, packet, event.key.time_ns, disposition)?;
+        self.record_arrival(node.id, packet, event.key, disposition)?;
         self.mark_terminal(event.payload)?;
         if let GeneratorFeedbackAction::Emit { flow, size_bytes } = feedback_action {
-            self.emit_feedback_driven_packet(node, event, flow, size_bytes)?;
+            self.emit_feedback_driven_packet(node, event, flow, size_bytes, children)?;
         }
         Ok(())
     }
@@ -820,6 +904,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
         let Some(egress_link) = egress_link else {
@@ -872,18 +957,24 @@ impl<'image> ScalarExecutor<'image> {
         self.emit_from_switch(
             node,
             event,
-            node.id,
-            EventKind::TxComplete,
-            payload,
-            departure_time_ns,
+            ChildEmission {
+                target: node.id,
+                kind: EventKind::TxComplete,
+                payload,
+                time_ns: departure_time_ns,
+            },
+            children,
         )?;
         self.emit_from_switch(
             node,
             event,
-            link.target,
-            EventKind::RemoteArrival,
-            payload,
-            arrival_time_ns,
+            ChildEmission {
+                target: link.target,
+                kind: EventKind::RemoteArrival,
+                payload,
+                time_ns: arrival_time_ns,
+            },
+            children,
         )
     }
 
@@ -891,6 +982,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeDescriptor,
         event: Event,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
         let Some(egress_link) = egress_link else {
@@ -934,17 +1026,20 @@ impl<'image> ScalarExecutor<'image> {
         };
 
         let packet = self.packet(event.payload)?;
-        self.record_departure(node.id, packet, event.key.time_ns)?;
+        self.record_departure(node.id, packet, event.key)?;
         self.finish_transmission(node.id, event.payload)?;
 
         if let Some(payload) = next_payload {
             self.emit_from_switch(
                 node,
                 event,
-                node.id,
-                EventKind::TxReady,
-                payload,
-                event.key.time_ns,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
+                    time_ns: event.key.time_ns,
+                },
+                children,
             )?;
         }
         Ok(())
@@ -954,10 +1049,8 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         origin: NodeDescriptor,
         parent: Event,
-        target: NodeId,
-        kind: EventKind,
-        payload: PayloadId,
-        time_ns: u64,
+        emission: ChildEmission,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let origin_seq = {
             let state = self.host_state_mut(origin)?;
@@ -967,19 +1060,20 @@ impl<'image> ScalarExecutor<'image> {
                 .ok_or(ExecutionError::OriginSequenceOverflow(origin.id))?;
             origin_seq
         };
-        self.insert_child(
+        Self::insert_child(
             parent,
             Event {
                 key: EventKey {
-                    time_ns,
-                    phase: event_phase(kind),
+                    time_ns: emission.time_ns,
+                    phase: event_phase(emission.kind),
                     origin_node: origin.id,
                     origin_seq,
                 },
-                target,
-                kind,
-                payload,
+                target: emission.target,
+                kind: emission.kind,
+                payload: emission.payload,
             },
+            children,
         )
     }
 
@@ -987,10 +1081,8 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         origin: NodeDescriptor,
         parent: Event,
-        target: NodeId,
-        kind: EventKind,
-        payload: PayloadId,
-        time_ns: u64,
+        emission: ChildEmission,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let origin_seq = {
             let state = self.switch_state_mut(origin)?;
@@ -1000,32 +1092,35 @@ impl<'image> ScalarExecutor<'image> {
                 .ok_or(ExecutionError::OriginSequenceOverflow(origin.id))?;
             origin_seq
         };
-        self.insert_child(
+        Self::insert_child(
             parent,
             Event {
                 key: EventKey {
-                    time_ns,
-                    phase: event_phase(kind),
+                    time_ns: emission.time_ns,
+                    phase: event_phase(emission.kind),
                     origin_node: origin.id,
                     origin_seq,
                 },
-                target,
-                kind,
-                payload,
+                target: emission.target,
+                kind: emission.kind,
+                payload: emission.payload,
             },
+            children,
         )
     }
 
-    fn insert_child(&mut self, parent: Event, child: Event) -> Result<(), ExecutionError> {
+    fn insert_child(
+        parent: Event,
+        child: Event,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
         if child.key <= parent.key {
             return Err(ExecutionError::NonMonotoneChild {
                 parent: parent.key,
                 child: child.key,
             });
         }
-        if self.events.insert(child.key, child).is_some() {
-            return Err(ExecutionError::DuplicateEventKey(child.key));
-        }
+        children.push(child);
         Ok(())
     }
 
@@ -1189,6 +1284,7 @@ impl<'image> ScalarExecutor<'image> {
         parent: Event,
         flow: FlowId,
         size_bytes: u64,
+        children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let (payload, schedule_ready) = {
@@ -1222,10 +1318,13 @@ impl<'image> ScalarExecutor<'image> {
             self.emit_from_host(
                 node,
                 parent,
-                node.id,
-                EventKind::TxReady,
-                payload,
-                parent.key.time_ns,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
+                    time_ns: parent.key.time_ns,
+                },
+                children,
             )?;
         }
         Ok(())
@@ -1245,16 +1344,19 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeId,
         packet: PacketDescriptor,
-        time_ns: u64,
+        event_key: EventKey,
     ) -> Result<(), ExecutionError> {
         self.observe_packet(packet);
         add_summary(&mut self.summary.departed_packets, 1, node)?;
         add_summary(&mut self.summary.departed_bytes, packet.size_bytes, node)?;
         if self.observation_mode == ObservationMode::Full {
-            self.departures.push(PacketDeparture {
-                payload: packet.id,
-                time_ns,
-            });
+            self.departures.push((
+                event_key,
+                PacketDeparture {
+                    payload: packet.id,
+                    time_ns: event_key.time_ns,
+                },
+            ));
         }
         Ok(())
     }
@@ -1263,7 +1365,7 @@ impl<'image> ScalarExecutor<'image> {
         &mut self,
         node: NodeId,
         packet: PacketDescriptor,
-        time_ns: u64,
+        event_key: EventKey,
         disposition: ArrivalDisposition,
     ) -> Result<(), ExecutionError> {
         self.observe_packet(packet);
@@ -1288,11 +1390,14 @@ impl<'image> ScalarExecutor<'image> {
         add_summary(packets, 1, node)?;
         add_summary(bytes, packet.size_bytes, node)?;
         if self.observation_mode == ObservationMode::Full {
-            self.arrivals.push(PacketArrivalObservation {
-                payload: packet.id,
-                time_ns,
-                disposition,
-            });
+            self.arrivals.push((
+                event_key,
+                PacketArrivalObservation {
+                    payload: packet.id,
+                    time_ns: event_key.time_ns,
+                    disposition,
+                },
+            ));
         }
         Ok(())
     }
@@ -1370,6 +1475,18 @@ fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> O
     // Validated images always return above. The fallback preserves `run_scalar` behavior and
     // checked `Unknown*` errors for legacy hand-built callers that intentionally skip validation.
     indexed.or_else(|| table.iter().find(|descriptor| matches_id(descriptor)))
+}
+
+fn initial_event_queue(
+    image: &SimulationImage,
+) -> Result<BTreeMap<EventKey, Event>, ExecutionError> {
+    let mut events = BTreeMap::new();
+    for event in image.initial_events.iter().copied() {
+        if events.insert(event.key, event).is_some() {
+            return Err(ExecutionError::DuplicateEventKey(event.key));
+        }
+    }
+    Ok(events)
 }
 
 fn allocate_payload_id(source: NodeId, node_count: u64, sequence: u64) -> Option<PayloadId> {
