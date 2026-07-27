@@ -619,3 +619,73 @@ fn initial_event_keys_must_be_strictly_ascending() {
         "initial event 1 key EventKey { time_ns: 0, phase: 0, origin_node: NodeId(0), origin_seq: 1 } does not advance previous key EventKey { time_ns: 1, phase: 0, origin_node: NodeId(0), origin_seq: 0 }"
     );
 }
+
+#[test]
+fn remote_arrivals_require_a_channel_on_the_payload_route() {
+    let mut valid = valid_image();
+    valid.initial_events[0].kind = EventKind::RemoteArrival;
+    valid.initial_events[0].key.origin_node = SWITCH;
+    valid.initial_events[0].target = SINK;
+    valid.switch_states[0].next_origin_seq = 1;
+    validate(&valid, Backend::Scalar).expect("the route channel should admit the remote arrival");
+
+    let mut missing = valid_image();
+    missing.initial_events[0].kind = EventKind::RemoteArrival;
+    missing.initial_events[0].target = SINK;
+    assert_eq!(
+        rejection(&missing, Backend::Scalar),
+        "RemoteArrival event 0 from NodeId(0) to NodeId(2) has no declared route channel for payload PayloadId(0)"
+    );
+}
+
+#[test]
+fn completion_diagnostics_preserve_initial_event_payload_order() {
+    let mut image = valid_image();
+    image.packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: 2,
+    });
+    image.initial_events[0].kind = EventKind::TxComplete;
+    image.initial_events[0].key.phase = event_phase(EventKind::TxComplete);
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::TxComplete),
+            origin_node: SOURCE,
+            origin_seq: 1,
+        },
+        target: SOURCE,
+        kind: EventKind::TxComplete,
+        payload: PayloadId(1),
+    });
+    image.host_states[0].in_service = Some(PACKET);
+    image.host_states[0].next_origin_seq = 2;
+
+    assert_eq!(
+        rejection(&image, Backend::Scalar),
+        "node NodeId(0) egress None in-service payload is Some(PayloadId(0)), but matching TxComplete payloads are [PayloadId(0), PayloadId(1)]"
+    );
+}
+
+#[test]
+fn aggregate_packet_counts_retain_counter_and_sequence_diagnostics() {
+    let mut counter = valid_image();
+    counter.packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: 2,
+    });
+    counter.host_states[0].sourced_packets = u64::MAX - 1;
+    assert_eq!(
+        rejection(&counter, Backend::Scalar),
+        "node NodeId(0) counter sourced_packets value 18446744073709551614 overflows with remaining upper bound 2"
+    );
+
+    let mut sequence = valid_image();
+    sequence.host_states[0].next_origin_seq = u64::MAX - 2;
+    assert_eq!(
+        rejection(&sequence, Backend::Scalar),
+        "node NodeId(0) origin sequence space overflows while reserving 3 generated events"
+    );
+}

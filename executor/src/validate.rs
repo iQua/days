@@ -85,8 +85,8 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_events(image)?;
     validate_global_time_capacity(image)?;
     validate_service_event_consistency(image)?;
-    validate_counters(image)?;
-    validate_origin_sequences(image)?;
+    let packet_counts_by_flow = validate_counters(image)?;
+    validate_origin_sequences(image, &packet_counts_by_flow)?;
     Ok(())
 }
 
@@ -655,6 +655,18 @@ fn validate_channels(
 }
 
 fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
+    let declared_route_channels = image
+        .channels
+        .iter()
+        .map(|channel| {
+            (
+                channel.source,
+                channel.target,
+                channel.event_kind,
+                channel.link,
+            )
+        })
+        .collect::<BTreeSet<_>>();
     let mut keys = BTreeSet::new();
     let mut semantic_events = BTreeSet::new();
     let mut previous = None;
@@ -764,11 +776,13 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                 }
             }
             EventKind::RemoteArrival => {
-                if !image.channels.iter().any(|channel| {
-                    channel.source == origin.id
-                        && channel.target == event.target
-                        && channel.event_kind == EventKind::RemoteArrival
-                        && flow.route.contains(&channel.link)
+                if !flow.route.iter().any(|link_id| {
+                    declared_route_channels.contains(&(
+                        origin.id,
+                        event.target,
+                        EventKind::RemoteArrival,
+                        *link_id,
+                    ))
                 }) {
                     return Err(ValidationError::new(format!(
                         "RemoteArrival event {index} from {:?} to {:?} has no declared route channel for payload {:?}",
@@ -868,19 +882,38 @@ fn validate_global_time_capacity(image: &SimulationImage) -> Result<(), Validati
 }
 
 fn validate_service_event_consistency(image: &SimulationImage) -> Result<(), ValidationError> {
+    let mut service_events = BTreeMap::<(NodeId, Option<LinkId>), ServiceEvents>::new();
+    for event in &image.initial_events {
+        if !matches!(event.kind, EventKind::TxReady | EventKind::TxComplete) {
+            continue;
+        }
+        let owner = node(image, event.target).expect("event validation established the target");
+        let egress = match owner.kind {
+            NodeKind::Host => None,
+            NodeKind::Switch => Some(
+                event_egress(image, event)
+                    .expect("event validation established switch egress ownership"),
+            ),
+        };
+        let events = service_events.entry((owner.id, egress)).or_default();
+        match event.kind {
+            EventKind::TxReady => events.ready_count += 1,
+            EventKind::TxComplete => events.completions.push(event.payload),
+            EventKind::PacketArrival | EventKind::RemoteArrival => unreachable!(),
+        }
+    }
+
     for owner in image
         .nodes
         .iter()
         .filter(|node| node.kind == NodeKind::Host)
     {
         let state = &image.host_states[owner.state_slot as usize];
-        let ready_count = image
-            .initial_events
-            .iter()
-            .filter(|event| event.target == owner.id && event.kind == EventKind::TxReady)
-            .count();
+        let events = service_events.get(&(owner.id, None));
+        let ready_count = events.map_or(0, |events| events.ready_count);
+        let completions = events.map_or(&[][..], |events| events.completions.as_slice());
         validate_ready_flag(owner.id, None, state.tx_ready_pending, ready_count)?;
-        validate_completion_state(image, owner.id, None, state.in_service)?;
+        validate_completion_state(owner.id, None, state.in_service, completions)?;
     }
 
     for owner in image
@@ -893,20 +926,20 @@ fn validate_service_event_consistency(image: &SimulationImage) -> Result<(), Val
             let egress = queue
                 .egress_link
                 .expect("owned service-state validation requires an egress");
-            let ready_count = image
-                .initial_events
-                .iter()
-                .filter(|event| {
-                    event.target == owner.id
-                        && event.kind == EventKind::TxReady
-                        && event_egress(image, event) == Some(egress)
-                })
-                .count();
+            let events = service_events.get(&(owner.id, Some(egress)));
+            let ready_count = events.map_or(0, |events| events.ready_count);
+            let completions = events.map_or(&[][..], |events| events.completions.as_slice());
             validate_ready_flag(owner.id, Some(egress), queue.tx_ready_pending, ready_count)?;
-            validate_completion_state(image, owner.id, Some(egress), queue.in_service)?;
+            validate_completion_state(owner.id, Some(egress), queue.in_service, completions)?;
         }
     }
     validate_unique_mutable_payloads(image)
+}
+
+#[derive(Default)]
+struct ServiceEvents {
+    ready_count: usize,
+    completions: Vec<PayloadId>,
 }
 
 fn validate_ready_flag(
@@ -929,29 +962,17 @@ fn validate_ready_flag(
 }
 
 fn validate_completion_state(
-    image: &SimulationImage,
     owner: NodeId,
     egress: Option<LinkId>,
     in_service: Option<PayloadId>,
+    completions: &[PayloadId],
 ) -> Result<(), ValidationError> {
-    let completions = image
-        .initial_events
-        .iter()
-        .filter(|event| {
-            event.target == owner
-                && event.kind == EventKind::TxComplete
-                && egress.is_none_or(|link| event_egress(image, event) == Some(link))
-        })
-        .collect::<Vec<_>>();
     match in_service {
-        Some(payload) if completions.len() == 1 && completions[0].payload == payload => Ok(()),
+        Some(payload) if completions == [payload] => Ok(()),
         None if completions.is_empty() => Ok(()),
         _ => Err(ValidationError::new(format!(
             "node {owner:?} egress {egress:?} in-service payload is {in_service:?}, but matching TxComplete payloads are {:?}",
             completions
-                .iter()
-                .map(|event| event.payload)
-                .collect::<Vec<_>>()
         ))),
     }
 }
@@ -1008,13 +1029,36 @@ fn record_mutable_payload(
     Ok(())
 }
 
-fn validate_counters(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_counters(image: &SimulationImage) -> Result<Vec<u64>, ValidationError> {
+    let mut packet_counts_by_flow = vec![0_u64; image.flows.len()];
+    for packet in &image.packets {
+        let count = &mut packet_counts_by_flow[packet.flow.0 as usize];
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| ValidationError::new("packet count exceeds the u64 counter domain"))?;
+    }
+
+    let mut sourced_by_node = vec![0_u64; image.nodes.len()];
+    let mut received_by_node = vec![0_u64; image.nodes.len()];
+    let mut traversing_by_node = vec![0_u64; image.nodes.len()];
+    for (flow, packet_count) in image.flows.iter().zip(&packet_counts_by_flow) {
+        add_packet_count(&mut sourced_by_node[flow.source.0 as usize], *packet_count)?;
+        add_packet_count(&mut received_by_node[flow.target.0 as usize], *packet_count)?;
+        for link_id in &flow.route {
+            let route_link = link(image, *link_id).expect("flow validation established the link");
+            add_packet_count(
+                &mut traversing_by_node[route_link.source.0 as usize],
+                *packet_count,
+            )?;
+        }
+    }
+
     for owner in &image.nodes {
         match owner.kind {
             NodeKind::Host => {
                 let state = &image.host_states[owner.state_slot as usize];
-                let sourced = packet_count(image, |flow| flow.source == owner.id)?;
-                let received = packet_count(image, |flow| flow.target == owner.id)?;
+                let sourced = sourced_by_node[owner.id.0 as usize];
+                let received = received_by_node[owner.id.0 as usize];
                 check_counter(owner.id, "sourced_packets", state.sourced_packets, sourced)?;
                 check_counter(
                     owner.id,
@@ -1031,9 +1075,7 @@ fn validate_counters(image: &SimulationImage) -> Result<(), ValidationError> {
             }
             NodeKind::Switch => {
                 let state = &image.switch_states[owner.state_slot as usize];
-                let traversing = packet_count(image, |flow| {
-                    flow_route_contains_source(image, flow, owner.id)
-                })?;
+                let traversing = traversing_by_node[owner.id.0 as usize];
                 check_counter(
                     owner.id,
                     "arrived_packets",
@@ -1055,22 +1097,14 @@ fn validate_counters(image: &SimulationImage) -> Result<(), ValidationError> {
             }
         }
     }
-    Ok(())
+    Ok(packet_counts_by_flow)
 }
 
-fn packet_count(
-    image: &SimulationImage,
-    predicate: impl Fn(&FlowDescriptor) -> bool,
-) -> Result<u64, ValidationError> {
-    image
-        .packets
-        .iter()
-        .filter(|packet| flow(image, packet.flow).is_some_and(&predicate))
-        .try_fold(0_u64, |count, _| {
-            count
-                .checked_add(1)
-                .ok_or_else(|| ValidationError::new("packet count exceeds the u64 counter domain"))
-        })
+fn add_packet_count(total: &mut u64, count: u64) -> Result<(), ValidationError> {
+    *total = total
+        .checked_add(count)
+        .ok_or_else(|| ValidationError::new("packet count exceeds the u64 counter domain"))?;
+    Ok(())
 }
 
 fn check_counter(
@@ -1087,13 +1121,23 @@ fn check_counter(
     Ok(())
 }
 
-fn validate_origin_sequences(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_origin_sequences(
+    image: &SimulationImage,
+    packet_counts_by_flow: &[u64],
+) -> Result<(), ValidationError> {
     let mut maximum = BTreeMap::<NodeId, u64>::new();
     for event in &image.initial_events {
         maximum
             .entry(event.key.origin_node)
             .and_modify(|value| *value = (*value).max(event.key.origin_seq))
             .or_insert(event.key.origin_seq);
+    }
+    let mut transmissions_by_node = vec![0_u128; image.nodes.len()];
+    for (flow, packet_count) in image.flows.iter().zip(packet_counts_by_flow) {
+        for link_id in &flow.route {
+            let route_link = link(image, *link_id).expect("flow validation established the link");
+            transmissions_by_node[route_link.source.0 as usize] += u128::from(*packet_count);
+        }
     }
     for node in &image.nodes {
         let next = match node.kind {
@@ -1108,7 +1152,8 @@ fn validate_origin_sequences(image: &SimulationImage) -> Result<(), ValidationEr
                 )));
             }
         }
-        let generated = possible_generated_events(image, node.id)?;
+        let generated =
+            possible_generated_events(node.id, transmissions_by_node[node.id.0 as usize])?;
         if next.checked_add(generated).is_none() {
             return Err(ValidationError::new(format!(
                 "node {:?} origin sequence space overflows while reserving {generated} generated events",
@@ -1128,31 +1173,10 @@ fn possible_emission_links(image: &SimulationImage) -> BTreeSet<LinkId> {
         .collect()
 }
 
-fn possible_generated_events(
-    image: &SimulationImage,
-    source: NodeId,
-) -> Result<u64, ValidationError> {
-    let transmissions = image
-        .packets
-        .iter()
-        .filter_map(|packet| {
-            flow(image, packet.flow).map(|flow| {
-                flow.route
-                    .iter()
-                    .filter(|link_id| {
-                        link(image, **link_id).is_some_and(|link| link.source == source)
-                    })
-                    .count()
-            })
-        })
-        .try_fold(0_u64, |total, count| {
-            let count = u64::try_from(count).map_err(|_| {
-                ValidationError::new(format!("node {source:?} generated-event count exceeds u64"))
-            })?;
-            total.checked_add(count).ok_or_else(|| {
-                ValidationError::new(format!("node {source:?} generated-event count exceeds u64"))
-            })
-        })?;
+fn possible_generated_events(source: NodeId, transmissions: u128) -> Result<u64, ValidationError> {
+    let transmissions = u64::try_from(transmissions).map_err(|_| {
+        ValidationError::new(format!("node {source:?} generated-event count exceeds u64"))
+    })?;
     transmissions.checked_mul(3).ok_or_else(|| {
         ValidationError::new(format!("node {source:?} generated-event count exceeds u64"))
     })
@@ -1184,17 +1208,29 @@ fn event_egress(image: &SimulationImage, event: &crate::Event) -> Option<LinkId>
 }
 
 fn node(image: &SimulationImage, id: NodeId) -> Option<&NodeDescriptor> {
-    image.nodes.iter().find(|node| node.id == id)
+    image
+        .nodes
+        .get(usize::try_from(id.0).ok()?)
+        .filter(|node| node.id == id)
 }
 
 fn link(image: &SimulationImage, id: LinkId) -> Option<&LinkDescriptor> {
-    image.links.iter().find(|link| link.id == id)
+    image
+        .links
+        .get(usize::try_from(id.0).ok()?)
+        .filter(|link| link.id == id)
 }
 
 fn flow(image: &SimulationImage, id: crate::FlowId) -> Option<&FlowDescriptor> {
-    image.flows.iter().find(|flow| flow.id == id)
+    image
+        .flows
+        .get(usize::try_from(id.0).ok()?)
+        .filter(|flow| flow.id == id)
 }
 
 fn packet(image: &SimulationImage, id: PayloadId) -> Option<&crate::PacketDescriptor> {
-    image.packets.iter().find(|packet| packet.id == id)
+    image
+        .packets
+        .get(usize::try_from(id.0).ok()?)
+        .filter(|packet| packet.id == id)
 }

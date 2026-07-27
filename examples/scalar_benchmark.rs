@@ -1,9 +1,7 @@
 use std::{env, error::Error, time::Instant};
 
 use days::scenario::compile_config;
-use days_executor::{
-    ArrivalDisposition, Backend, RunResult, SimulationImage, run_scalar, validate,
-};
+use days_executor::{ArrivalDisposition, RunResult, SimulationImage, run_scalar};
 
 fn processed_event_count(image: &SimulationImage, result: &RunResult) -> u64 {
     let initial_origin_seq = image
@@ -53,7 +51,6 @@ fn packet_size(image: &SimulationImage, payload: days_executor::PayloadId) -> u6
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args().nth(1).ok_or("usage: scalar_benchmark CONFIG")?;
     let image = compile_config(&path)?;
-    validate(&image, Backend::Scalar)?;
 
     let timer = Instant::now();
     let result = run_scalar(&image, None)?;
