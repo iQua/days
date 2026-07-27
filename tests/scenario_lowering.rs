@@ -21,8 +21,8 @@ fn reordered_source_collections_lower_to_byte_identical_mixed_images() {
         "first.toml",
         r#"
 seed = 7
-edges = [[2, 0], [0, 1]]
-hosts = [2, 1]
+edges = [[3, 1], [1, 0], [3, 2], [2, 0]]
+hosts = [3, 2, 1, 0]
 
 [switch]
 port_rate = 8_000_000_000
@@ -35,7 +35,7 @@ propagation_ns = 17
 
 [[flow]]
 flow_type = "PacketDistribution"
-graph = [[2, 1]]
+graph = [[3, 0]]
 [flow.traffic]
 initial_delay = 0.0
 size = 6
@@ -44,12 +44,30 @@ pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
 
 [[flow]]
 flow_type = "PacketDistribution"
-graph = [[1, 2]]
+graph = [[0, 3]]
 [flow.traffic]
 initial_delay = 0.000000002
 size = 4
 arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
 pkt_size_dist = { type = "Uniform", low = 2, high = 2 }
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 2
+[flow_set.traffic]
+initial_delay = 0.000000005
+size = 8
+arr_dist = { type = "Uniform", low = 0.000000002, high = 0.000000002 }
+pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 3
+[flow_set.traffic]
+initial_delay = 0.000000007
+size = 5
+arr_dist = { type = "Uniform", low = 0.000000003, high = 0.000000003 }
+pkt_size_dist = { type = "Uniform", low = 5, high = 5 }
 "#,
     );
     let second_path = write_config(
@@ -57,8 +75,8 @@ pkt_size_dist = { type = "Uniform", low = 2, high = 2 }
         "second.toml",
         r#"
 seed = 7
-edges = [[1, 0], [0, 2]]
-hosts = [1, 2]
+edges = [[0, 2], [2, 3], [0, 1], [1, 3]]
+hosts = [0, 1, 2, 3]
 
 [switch]
 port_rate = 8_000_000_000
@@ -71,7 +89,7 @@ propagation_ns = 17
 
 [[flow]]
 flow_type = "PacketDistribution"
-graph = [[1, 2]]
+graph = [[0, 3]]
 [flow.traffic]
 initial_delay = 0.000000002
 size = 4
@@ -80,12 +98,30 @@ pkt_size_dist = { type = "Uniform", low = 2, high = 2 }
 
 [[flow]]
 flow_type = "PacketDistribution"
-graph = [[2, 1]]
+graph = [[3, 0]]
 [flow.traffic]
 initial_delay = 0.0
 size = 6
 arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
 pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 3
+[flow_set.traffic]
+initial_delay = 0.000000007
+size = 5
+arr_dist = { type = "Uniform", low = 0.000000003, high = 0.000000003 }
+pkt_size_dist = { type = "Uniform", low = 5, high = 5 }
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 2
+[flow_set.traffic]
+initial_delay = 0.000000005
+size = 8
+arr_dist = { type = "Uniform", low = 0.000000002, high = 0.000000002 }
+pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
 "#,
     );
 
@@ -100,27 +136,31 @@ pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
     );
     assert_eq!(
         first.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
-        vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)]
+        (0..8).map(NodeId).collect::<Vec<_>>()
     );
     assert_eq!(
         first.links.iter().map(|link| link.id).collect::<Vec<_>>(),
-        (0..8).map(LinkId).collect::<Vec<_>>()
+        (0..16).map(LinkId).collect::<Vec<_>>()
     );
     assert_eq!(
         first.flows.iter().map(|flow| flow.id).collect::<Vec<_>>(),
-        vec![FlowId(0), FlowId(1)]
+        (0..7).map(FlowId).collect::<Vec<_>>()
     );
     assert_eq!(
         first
             .flows
             .iter()
             .map(|flow| (flow.source, flow.target))
+            .take(2)
             .collect::<Vec<_>>(),
-        vec![(NodeId(0), NodeId(1)), (NodeId(1), NodeId(0))]
+        vec![(NodeId(0), NodeId(3)), (NodeId(3), NodeId(0))]
     );
     assert!(
-        first.flows.iter().all(|flow| flow.route.len() == 4),
-        "each flow retains both host access links and the canonical two-hop switch path"
+        first
+            .flows
+            .iter()
+            .all(|flow| (3..=4).contains(&flow.route.len())),
+        "each flow retains both host access links and its canonical shortest switch path"
     );
     assert_eq!(
         first
@@ -129,7 +169,7 @@ pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
             .filter(|node| node.kind == NodeKind::Host)
             .map(|node| node.state_slot)
             .collect::<Vec<_>>(),
-        vec![0, 1]
+        vec![0, 1, 2, 3]
     );
     assert_eq!(
         first
@@ -138,7 +178,7 @@ pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
             .filter(|node| node.kind == NodeKind::Switch)
             .map(|node| node.state_slot)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![0, 1, 2, 3]
     );
 
     assert!(!first.host_states.is_empty());
@@ -153,7 +193,7 @@ pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
         first
             .switch_states
             .iter()
-            .all(|state| state.queues.len() == 2),
+            .all(|state| state.queues.len() == 3),
         "each switch owns one FIFO/TailDrop queue per directed egress"
     );
     assert!(
@@ -170,6 +210,8 @@ pkt_size_dist = { type = "Uniform", low = 3, high = 3 }
             .all(|event| event.kind == EventKind::PacketArrival),
         "T7 must not derive switch TxReady events"
     );
+    assert_eq!(first.packets.len(), 11);
+    assert_eq!(first.initial_events.len(), 11);
 
     run_scalar(&first, u64::MAX)
         .expect("T7 output should execute through currently implemented ingress handling");
