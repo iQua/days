@@ -149,7 +149,13 @@ form; `DistPacketSource` takes its existing no-sample fast path. Torus and
 Fat-Tree endpoint selection consumes the fixed seed once during construction.
 No RED decision appears in the exact corpus.
 
-`configs/tcp_simple.toml` and `configs/ci/leanguard_dcqcn.toml` are explicitly
+`configs/migration/tcp_simple_st.toml` is a mechanical copy of
+`configs/tcp_simple.toml`. The copy adds only `threading = "single"` and
+`num_threads = 1`. The original config omits both fields, so `SimInit::new()`
+uses the platform's 18-thread default. Plan sections 5.4 and 15 exclude that
+mode from ST characterization evidence because thread scheduling affects it.
+
+The derived TCP fixture and `configs/ci/leanguard_dcqcn.toml` are
 `terminal-observation`. Their full transition ordering is outside v1 lowering,
 but their source/port/sink terminal state exercises the digest mechanism. The
 five entries have `role = "correctness"`.
@@ -191,6 +197,43 @@ No timing selected corpus membership or changed a config value. The F2 runner
 will enforce the frozen 5 ms sample floor; its observed margin is not yet
 measured. The complete paths, hashes, commands, roles, modes, and boundaries
 are in `docs/days-executor/evidence/P01/retirement-corpus.toml`.
+
+### RED prerequisite and coverage boundary
+
+The corrected RED implementation lands separately as a prerequisite; P01
+consumes it rather than implementing it. Diagnostic runs before the split
+summed `packets_dropped` across canonical terminal-digest port rows. They were
+not baseline measurements:
+
+| Config | Drops before | Drops after | Maximum final queue occupancy | Capacity | `min_abs` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `configs/simple.toml` | 0 | 0 | 0 | 100 | 70 |
+| `configs/torus.toml` | 0 | 0 | 0 | 100 | 70 |
+| `configs/fattree.toml` | 0 | 0 | 2 | 100 | 70 |
+| `configs/tcp_simple.toml` | 0 | 0 | 0 | 100 | 70 |
+
+Zero to zero is not evidence that the RED fix is correct. It is evidence that
+these four configs are not RED workloads at all: none approaches the minimum
+RED threshold. The only P01 corpus entry within RED's nominal blast radius is
+the derived TCP fixture, and it also never enters a RED region. The corrected
+RED therefore has no observable effect on any P01 baseline, and P01 evidence
+provides no RED coverage.
+
+Landing the fix before the next freeze turned out to be unnecessary in
+hindsight. It was still the right decision under uncertainty because the
+absence of RED-region traffic could not be known before the diagnostic runs. A
+later phase, including P19, must not treat P01 evidence as covering RED
+behavior.
+
+The TCP ST digest is nonempty, byte-stable across two child processes, and
+unchanged across the old and corrected RED implementations. It records one
+source row with 5 packets and 2560 bytes, two port rows totaling 16 enqueues, 0
+drops, and 16 forwards, and one sink row with 8 packets and 4096 bytes.
+Aggregate endpoint reports and generic port hooks cover this terminal state.
+The transition ledger still does not claim complete TCP source/sink
+transitions; that remains P19 work. The fixture therefore keeps the
+`terminal-observation` boundary. A digest stable only because it was empty
+would not be evidence.
 
 ### Legacy `quantize_after` boundary
 
@@ -265,7 +308,7 @@ immutable commits.
 runtime backend and is absent from default features. Removing the feature
 restores the prior output-file set and instrumentation-free model layouts.
 
-T1 deliberately does not reset or replace process-global IDs, introduce
-scenario tuple IDs, sort nodes/edges/flows/routes, add `executor/`, change time
-arithmetic, change scheduler behavior, or edit `crates/nexosim`. Those items
-belong to later tasks.
+T1 does not implement RED corrections, reset or replace process-global IDs,
+introduce scenario tuple IDs, sort nodes/edges/flows/routes, add `executor/`,
+change time arithmetic, or edit `crates/nexosim`. Those items belong to
+separate or later changes.

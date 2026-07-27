@@ -7,7 +7,9 @@ depends_on = []
 external_depends_on = []
 features = ["test", "migration_ledger"]
 platforms = ["linux-x86_64", "macos-aarch64"]
-semantic_changes = []
+semantic_changes = [
+    "Consume the separately landed RED correctness prerequisite; P01 evidence does not exercise or cover RED behavior",
+]
 api_changes = [
     "Add the off-by-default migration_ledger Cargo feature for migration characterization",
 ]

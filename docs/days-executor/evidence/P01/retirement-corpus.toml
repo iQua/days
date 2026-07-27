@@ -38,15 +38,15 @@ required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/fattree.toml"]
 
 [[fixtures]]
-path = "configs/tcp_simple.toml"
-content_hash = "sha256:28d6a1e4fbafc37eca41c499302b543077c25401610abec7df33f467366b4247"
+path = "configs/migration/tcp_simple_st.toml"
+content_hash = "sha256:87aedfd7761147b5612781b41099e6f841f45973c24d9305115e89753cbee112"
 comparison_boundary = "terminal-observation"
 workload = "tcp-simple"
-mode = "default"
+mode = "st"
 role = "correctness"
 model_scope = "out-of-scope-tcp"
 required_features = ["migration_ledger"]
-command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/tcp_simple.toml"]
+command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/tcp_simple_st.toml"]
 
 [[fixtures]]
 path = "configs/ci/leanguard_dcqcn.toml"
