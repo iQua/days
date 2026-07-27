@@ -58,6 +58,43 @@ The switch config also supports:
 
 - `switch.ecn_threshold`: a fraction in `[0, 1]` used by `ECN_THRESHOLD` (default: `0.8`)
 
+### RED conformance
+
+The implementation follows the detailed algorithm in
+[Floyd and Jacobson 1993](https://www.icir.org/floyd/papers/early.pdf). The
+maintenance rule is: correct what is defective in what is already written;
+defer what requires new inputs the drop path does not receive.
+
+The conformance audit corrected five defects:
+
+| Defect | Old behavior | Corrected behavior |
+| --- | --- | --- |
+| EWMA truncation | Integer division made `2^-9` equal zero. | RED retains fractional state and applies `avg += (sample - avg) * 2^-9`. |
+| Normal probability scale | The expression multiplied by capacity twice. | `p_b = max_p * (avg - min_abs) / (max_abs - min_abs)`. |
+| Region selection | Instantaneous occupancy selected the RED region. | The averaged occupancy selects the region. |
+| Maximum region | RED sampled against `max_p` above `max_abs`. | RED takes a certain drop or ECN-mark action at or above `max_abs`, without a draw. |
+| Byte-mode units | RED averaged packet count and compared it with byte thresholds. | Byte mode averages byte occupancy; packet mode averages packet occupancy. |
+
+The fifth defect is independent of region selection. Comparing packet count
+with byte thresholds used incommensurable quantities. The audit found it while
+making average-based byte-region selection dimensionally valid.
+
+The audit enumerated three Floyd-Jacobson mechanisms:
+
+| Mechanism | Status | Prerequisite |
+| --- | --- | --- |
+| Count-based spacing | Implemented. RED uses `p_a = p_b / (1 - count * p_b)`, resets `count` after a congestion action, and sets `count = -1` below `min_abs`. | No new drop-path input. |
+| Idle-period decay | Deferred deviation. RED does not apply `avg = (1 - w)^m * avg` while the queue is idle. | The scheduler/drop lifecycle must provide queue-idle time and define `m`. |
+| Byte-mode packet-size weighting | Deferred deviation. RED does not apply `p_b *= packet_size / maximum_packet_size`. | The drop API or configuration must declare a maximum packet size. |
+
+For count-based spacing, RED clamps `p_a` to 1 when
+`count * p_b >= 1`. This guard covers the zero denominator at the singularity
+and negative denominators beyond it. The focused audit found no other missing
+Floyd-Jacobson mechanism.
+
+`RED_ECN` uses the same arithmetic and count state. A threshold action marks an
+ECN-capable packet; physical capacity overflow still drops it.
+
 ## PFC integration (queue state)
 
 When built with `--features l2_pfc` and run with `link.mode="Pfc"`, schedulers expose a shared `QueueState` (`src/schedulers/state.rs`) that tracks current queued bytes/packets. This is used by the PFC ingress port to decide whether a packet can be forwarded downstream without causing drops.
