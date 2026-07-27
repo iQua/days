@@ -42,6 +42,11 @@ use crate::schedulers::wrr::WRRServer;
 use crate::switches::SchedulingDiscipline;
 use crate::switches::switch::PacketSwitch;
 use crate::utils::logger::CsvLogger;
+#[cfg(feature = "migration_ledger")]
+use crate::utils::logger::{
+    MigrationFlowMappingRow, MigrationPortMappingRow, MigrationSwitchMappingRow, Report,
+    ReportTiming,
+};
 use crate::utils::time::set_time_quantum_ns;
 use crate::utils::tracing::start_wall_clock_concurrency_sampler;
 use crate::utils::ui::UserInterface;
@@ -56,6 +61,14 @@ type OutputStateMap = HashMap<usize, HashMap<usize, Arc<QueueState>>>;
 type OutputStates = Arc<RwLock<OutputStateMap>>;
 
 use crate::flows::app_source::AppDataSource;
+
+fn switches_in_registration_order(
+    switches: HashMap<usize, PacketSwitch>,
+) -> Vec<(usize, PacketSwitch)> {
+    let mut switches: Vec<_> = switches.into_iter().collect();
+    switches.sort_by_key(|(switch_id, _)| *switch_id);
+    switches
+}
 
 #[derive(Deserialize)]
 pub struct UIConfig {
@@ -400,7 +413,7 @@ impl Topology {
 
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-        let duration = ui_config.duration.unwrap_or(1500.);
+        let duration = simulation_duration(ui_config.duration);
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -543,14 +556,26 @@ impl Topology {
         for (_, switch) in self.switches.iter() {
             let switch_mbox: Mailbox<PacketSwitch> = Mailbox::with_capacity(self.mailbox_capacity);
             self.switch_mailboxes.insert(switch.id(), switch_mbox);
+            #[cfg(feature = "migration_ledger")]
+            if let Some(node_id) = switch.migration_node_id() {
+                CsvLogger::try_log_report(
+                    Report::MigrationSwitchMappingRow(MigrationSwitchMappingRow {
+                        node_id: node_id as u64,
+                    }),
+                    ReportTiming::InProgress,
+                );
+            }
         }
     }
 
     fn init_switches() -> HashMap<usize, PacketSwitch> {
         let mut switches: HashMap<usize, PacketSwitch> = HashMap::new();
 
-        for _ in 0..num_switches() {
-            let switch = PacketSwitch::new(HashMap::new(), HashMap::new());
+        for _topology_id in 0..num_switches() {
+            #[allow(unused_mut)]
+            let mut switch = PacketSwitch::new(HashMap::new(), HashMap::new());
+            #[cfg(feature = "migration_ledger")]
+            switch.set_migration_node_id(_topology_id);
             switches.insert(switch.id(), switch);
         }
 
@@ -961,6 +986,17 @@ impl Topology {
                     ecn_threshold,
                     self.switch_config.run_batch_size,
                 );
+                #[cfg(feature = "migration_ledger")]
+                {
+                    port.set_migration_endpoints(upstream_id, downstream_id);
+                    CsvLogger::try_log_report(
+                        Report::MigrationPortMappingRow(MigrationPortMappingRow {
+                            upstream_node_id: upstream_id as u64,
+                            downstream_node_id: downstream_id as u64,
+                        }),
+                        ReportTiming::InProgress,
+                    );
+                }
                 #[cfg(feature = "l2_pfc")]
                 {
                     let state = QueueState::new(self.switch_config.capacity, CapacityUnit::Packets);
@@ -1228,6 +1264,19 @@ impl Topology {
 
             // creates a new packet sink
             let mut sink = PacketSink::new(&source);
+            #[cfg(feature = "migration_ledger")]
+            {
+                source.set_migration_node_id(flow.source_host);
+                sink.set_migration_node_id(flow.sink_host);
+                CsvLogger::try_log_report(
+                    Report::MigrationFlowMappingRow(MigrationFlowMappingRow {
+                        flow_id: flow.id as u64,
+                        source_node_id: flow.source_host as u64,
+                        sink_node_id: flow.sink_host as u64,
+                    }),
+                    ReportTiming::InProgress,
+                );
+            }
             // records the PacketSink id for adding it as the end of the flow's
             // path in later construction of the path in Flow::compute_path()
             flow.sink_id = sink.id();
@@ -1390,7 +1439,7 @@ impl Topology {
             self.switches.len(),
         );
 
-        for (_, switch) in self.switches {
+        for (_, switch) in switches_in_registration_order(self.switches) {
             let switch_mbox = self.switch_mailboxes.remove(&switch.id()).unwrap();
             self.sim_init = self.sim_init.add_model(switch, switch_mbox, "Switch");
         }
@@ -1469,6 +1518,11 @@ impl Topology {
                 error!("Simulation stopped early: {err}");
             }
         }
+        let sim_execution_elapsed = timer.elapsed();
+        info!(
+            "Simulation execution wall-clock time: {:.9} seconds.",
+            sim_execution_elapsed.as_secs_f64()
+        );
 
         if let Some(stats) = wall_sampler.as_mut().and_then(|s| s.stop()) {
             info!(
@@ -1497,9 +1551,45 @@ impl Topology {
     }
 }
 
+const DEFAULT_SIMULATION_DURATION_SECONDS: f64 = 1500.0;
+
+fn simulation_duration(configured_duration: Option<f64>) -> f64 {
+    configured_duration.unwrap_or(DEFAULT_SIMULATION_DURATION_SECONDS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registration_ledger(keys: [usize; 3]) -> Vec<u8> {
+        let mut switches = HashMap::new();
+        for key in keys {
+            switches.insert(key, PacketSwitch::new(HashMap::new(), HashMap::new()));
+        }
+
+        switches_in_registration_order(switches)
+            .into_iter()
+            .flat_map(|(key, _)| format!("switch_register,{key}\n").into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn switch_registration_order_is_stable_across_in_process_fixtures() {
+        let first = registration_ledger([30, 10, 20]);
+        let second = registration_ledger([20, 30, 10]);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            b"switch_register,10\nswitch_register,20\nswitch_register,30\n"
+        );
+    }
+
+    #[test]
+    fn default_simulation_duration_is_pinned_to_1500_seconds() {
+        assert_eq!(simulation_duration(None), 1500.0);
+        assert_eq!(simulation_duration(Some(42.0)), 42.0);
+    }
 
     #[test]
     fn test_init_switches() {

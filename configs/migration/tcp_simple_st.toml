@@ -1,0 +1,32 @@
+# An example configuration file for using TCP in a simple topology with two
+# hosts.
+
+seed = 1000
+threading = "single"
+num_threads = 1
+edges = [[0, 1]]
+hosts = [0, 1]
+report_interval = 2.0
+duration = 10.0
+log_path = "logs/tcp_simple"
+
+[switch]
+port_rate = 4096
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+drop = "RED"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[0, 1]]
+routing = "ECMP"
+
+[flow.traffic]
+initial_delay = 0.0
+size = 3000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+
+[flow.traffic.tcp]
+cc_algorithm = "TCPReno"

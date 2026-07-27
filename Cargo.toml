@@ -1,3 +1,7 @@
+[workspace]
+members = ["xtask"]
+resolver = "2"
+
 [package]
 name = "days"
 version = "0.4.3"
@@ -16,6 +20,7 @@ l2 = []
 l2_pfc = ["l2"]
 dcqcn = []
 lean = []
+migration_ledger = []
 perf_stats = ["nexosim/perf_stats"]
 
 [dependencies]
@@ -49,3 +54,4 @@ nexosim = { path = "crates/nexosim" }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+sha2 = "0.10"

@@ -22,6 +22,10 @@ use crate::schedulers::drop::{
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
+#[cfg(feature = "migration_ledger")]
+use crate::utils::logger::{
+    MigrationLedgerRow, MigrationModelKind, MigrationTransitionKind, migration_time_to_ns,
+};
 
 #[cfg(feature = "lean")]
 use crate::schedulers::drop::DropDecision;
@@ -75,6 +79,10 @@ pub struct Port {
     run_batch_size: usize,
     run_schedule_scratch: Vec<(Duration, ())>,
     scheduled_departures: VecDeque<Packet>,
+    #[cfg(feature = "migration_ledger")]
+    migration_endpoints: Option<(usize, usize)>,
+    #[cfg(feature = "migration_ledger")]
+    migration_sequence: u64,
 
     /// a vector of packets that have been sent out, only used for unit testing
     #[cfg(test)]
@@ -152,6 +160,10 @@ impl Port {
             run_batch_size,
             run_schedule_scratch: Vec::with_capacity(run_batch_size),
             scheduled_departures: VecDeque::with_capacity(run_batch_size),
+            #[cfg(feature = "migration_ledger")]
+            migration_endpoints: None,
+            #[cfg(feature = "migration_ledger")]
+            migration_sequence: 0,
             #[cfg(test)]
             sent_packets: Vec::new(),
         }
@@ -163,6 +175,48 @@ impl Port {
 
     pub fn set_queue_state(&mut self, state: std::sync::Arc<QueueState>) {
         self.queue_state = Some(state);
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    pub fn set_migration_endpoints(&mut self, upstream_id: usize, downstream_id: usize) {
+        self.migration_endpoints = Some((upstream_id, downstream_id));
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    fn migration_queue_bytes(&self) -> u64 {
+        self.queue.iter().map(|packet| packet.size as u64).sum()
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    fn log_migration_transition(
+        &mut self,
+        transition: MigrationTransitionKind,
+        packet: &Packet,
+        time: f64,
+        departure_time: Option<f64>,
+    ) {
+        let Some((upstream_id, downstream_id)) = self.migration_endpoints else {
+            return;
+        };
+        let model_sequence = self.migration_sequence;
+        self.migration_sequence += 1;
+        CsvLogger::try_log_report(
+            Report::MigrationLedgerRow(MigrationLedgerRow {
+                time_ns: migration_time_to_ns(time),
+                model_kind: MigrationModelKind::Port,
+                transition,
+                node_id: upstream_id as u64,
+                peer_node_id: Some(downstream_id as u64),
+                flow_id: packet.flow_id as u64,
+                packet_id: packet.packet_id as u64,
+                model_sequence,
+                size_bytes: packet.size as u64,
+                queue_occupancy_packets: Some(self.queue.len() as u64),
+                queue_occupancy_bytes: Some(self.migration_queue_bytes()),
+                departure_time_ns: departure_time.map(migration_time_to_ns),
+            }),
+            ReportTiming::InProgress,
+        );
     }
 
     #[cfg(feature = "lean")]
@@ -217,6 +271,13 @@ impl Port {
             DropAction::Drop => {
                 #[cfg(feature = "lean")]
                 self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
+                #[cfg(feature = "migration_ledger")]
+                self.log_migration_transition(
+                    MigrationTransitionKind::EgressDrop,
+                    &packet,
+                    packet.time,
+                    None,
+                );
                 self.packets_dropped += 1;
                 return;
             }
@@ -229,6 +290,13 @@ impl Port {
                         DropAction::Drop,
                         &decision,
                         ecn_before,
+                    );
+                    #[cfg(feature = "migration_ledger")]
+                    self.log_migration_transition(
+                        MigrationTransitionKind::EgressDrop,
+                        &packet,
+                        packet.time,
+                        None,
                     );
                     self.packets_dropped += 1;
                     return;
@@ -244,6 +312,16 @@ impl Port {
 
         self.update_stats_on_packet_received(&packet);
         self.queue.push_back(packet);
+        #[cfg(feature = "migration_ledger")]
+        {
+            let packet = self.queue.back().expect("packet was just enqueued").clone();
+            self.log_migration_transition(
+                MigrationTransitionKind::EgressEnqueue,
+                &packet,
+                packet.time,
+                None,
+            );
+        }
     }
 
     #[instrument(skip(self, cx))]
@@ -275,6 +353,13 @@ impl Port {
             DropAction::Drop => {
                 #[cfg(feature = "lean")]
                 self.log_aqm_event(packet.time, &packet, drop_action, &decision, ecn_before);
+                #[cfg(feature = "migration_ledger")]
+                self.log_migration_transition(
+                    MigrationTransitionKind::EgressDrop,
+                    &packet,
+                    packet.time,
+                    None,
+                );
                 self.packets_dropped += 1;
                 debug!(
                     "Port {} dropped packet {} from flow {} at time {:.8e}",
@@ -291,6 +376,13 @@ impl Port {
                         DropAction::Drop,
                         &decision,
                         ecn_before,
+                    );
+                    #[cfg(feature = "migration_ledger")]
+                    self.log_migration_transition(
+                        MigrationTransitionKind::EgressDrop,
+                        &packet,
+                        packet.time,
+                        None,
                     );
                     self.packets_dropped += 1;
                     debug!(
@@ -324,6 +416,16 @@ impl Port {
 
         let packet_time = packet.time;
         self.queue.push_back(packet);
+        #[cfg(feature = "migration_ledger")]
+        {
+            let packet = self.queue.back().expect("packet was just enqueued").clone();
+            self.log_migration_transition(
+                MigrationTransitionKind::EgressEnqueue,
+                &packet,
+                packet.time,
+                None,
+            );
+        }
 
         if packet_time >= self.busy_until && self.in_flight == 0 {
             self.run(packet_time, cx).await;
@@ -333,6 +435,13 @@ impl Port {
     #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
+        #[cfg(feature = "migration_ledger")]
+        self.log_migration_transition(
+            MigrationTransitionKind::EgressDeparture,
+            &packet,
+            packet.time,
+            None,
+        );
         self.update_stats_on_packet_forwarded(&packet);
         self.output.send(packet).await;
     }
@@ -420,6 +529,13 @@ impl Port {
                 packet.queueing_delay_update(service_start);
                 let timeout = packet.size as f64 * 8.0 / self.rate;
                 let departure_time = quantize_after(service_start, timeout);
+                #[cfg(feature = "migration_ledger")]
+                self.log_migration_transition(
+                    MigrationTransitionKind::EgressDequeue,
+                    &packet,
+                    service_start,
+                    Some(departure_time),
+                );
                 packet.departure_update(departure_time);
 
                 self.packet_sent(departure_time, &packet);
@@ -454,10 +570,24 @@ impl Port {
             packet.queueing_delay_update(service_start);
             let timeout = packet.size as f64 * 8.0 / self.rate;
             let departure_time = quantize_after(service_start, timeout);
+            #[cfg(feature = "migration_ledger")]
+            self.log_migration_transition(
+                MigrationTransitionKind::EgressDequeue,
+                &packet,
+                service_start,
+                Some(departure_time),
+            );
             packet.departure_update(departure_time);
 
             self.busy_until = departure_time;
             self.sent_packets.push(packet.clone());
+            #[cfg(feature = "migration_ledger")]
+            self.log_migration_transition(
+                MigrationTransitionKind::EgressDeparture,
+                &packet,
+                departure_time,
+                None,
+            );
             self.update_stats_on_packet_forwarded(&packet);
             service_start = departure_time;
         }
@@ -561,6 +691,49 @@ impl Model for Port {
 mod tests {
     use super::*;
     use crate::flows::packet::EcnField;
+
+    #[cfg(feature = "migration_ledger")]
+    fn migration_fixture_ledger() -> Vec<u8> {
+        CsvLogger::clear_migration_ledger_for_test();
+        let mut port = Port::new(
+            8_000_000_000.0,
+            2,
+            CapacityUnit::Packets,
+            DropStrategy::TailDrop,
+            0.0,
+            None,
+        );
+        port.set_migration_endpoints(7, 11);
+        for packet_id in 0..4 {
+            port.on_packet_received(Packet::new(1000, packet_id, 3, 0.0));
+        }
+        port.test_run(0.0);
+        CsvLogger::migration_ledger_bytes_for_test()
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    #[test]
+    fn same_fixture_twice_in_process_has_identical_ledger() {
+        let output = tempfile::tempdir().expect("create migration logger directory");
+        CsvLogger::initialize_migration_test_logger(
+            output.path().to_str().expect("UTF-8 temporary path"),
+        );
+
+        let first = migration_fixture_ledger();
+        let second = migration_fixture_ledger();
+
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+        let ledger = std::str::from_utf8(&first).expect("migration ledger is UTF-8 CSV");
+        for transition in [
+            "egress_enqueue",
+            "egress_drop",
+            "egress_dequeue",
+            "egress_departure",
+        ] {
+            assert!(ledger.contains(transition), "missing {transition}");
+        }
+    }
 
     #[test]
     fn test_fifo_ordering() {

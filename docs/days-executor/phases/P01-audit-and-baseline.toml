@@ -1,0 +1,90 @@
+schema_version = 1
+phase = "P01"
+name = "audit-and-baseline"
+title = "Audit and evidence contract"
+design_note = "docs/days-executor/phases/P01-audit-and-baseline.md"
+depends_on = []
+external_depends_on = []
+features = ["test", "migration_ledger"]
+platforms = ["linux-x86_64", "macos-aarch64"]
+semantic_changes = [
+    "Consume the separately landed RED correctness prerequisite; P01 evidence does not exercise or cover RED behavior",
+    "Sort switch registration by topology switch key before SimInit::add_model so same-time tie-breaking is deterministic",
+]
+api_changes = [
+    "Add the off-by-default migration_ledger Cargo feature for migration characterization",
+]
+trust_boundary_change = false
+proof_changing = false
+out_of_scope = [
+    "Scenario-local semantic tuple IDs",
+    "creating the executor directory",
+    "Lean toolchain invocation",
+    "GPU backends",
+]
+selectable_backends = []
+
+[[budgets]]
+id = "days-executor-retirement"
+owner_phase = "P01"
+path = "budgets/retirement-budget.toml"
+content_hash = "sha256:e7dfbb6957cc7ae396f331af70209f43b70545ba7d946f6cb74ad0f1646b0ba3"
+
+[[tasks]]
+id = "T0"
+title = "Implement the audit and evidence contract"
+depends_on = []
+evidence = ["evidence/P01/t0-evidence.toml"]
+
+[tasks.red_test]
+path = "xtask/tests/phase_audit_mutations.rs"
+name = "malformed_phase_metadata_is_rejected"
+
+[[tasks]]
+id = "T1"
+title = "Record the Nexosim retirement baseline"
+depends_on = ["T0"]
+evidence = [
+    "evidence/P01/t1-evidence.toml",
+    "evidence/P01/nexosim-baseline-measurement-v2.toml",
+]
+
+[tasks.red_test]
+path = "tests/migration_ledger.rs"
+name = "supported_nexosim_st_model_exposes_complete_ledger_and_terminal_digest"
+
+[[test_commands]]
+platform = "linux-x86_64"
+features = []
+argv = ["cargo", "test", "--workspace"]
+deterministic = true
+
+[[test_commands]]
+platform = "linux-x86_64"
+features = ["test"]
+argv = ["cargo", "test", "--features", "test"]
+deterministic = true
+
+[[test_commands]]
+platform = "linux-x86_64"
+features = ["test", "migration_ledger"]
+argv = ["cargo", "test", "--features", "test,migration_ledger"]
+deterministic = true
+
+[[test_commands]]
+platform = "macos-aarch64"
+features = []
+argv = ["cargo", "test", "--workspace"]
+deterministic = true
+
+[[test_commands]]
+platform = "macos-aarch64"
+features = ["test"]
+argv = ["cargo", "test", "--features", "test"]
+deterministic = true
+
+[[test_commands]]
+platform = "macos-aarch64"
+features = ["test", "migration_ledger"]
+argv = ["cargo", "test", "--features", "test,migration_ledger"]
+deterministic = true

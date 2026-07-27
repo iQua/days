@@ -5,6 +5,8 @@ use csv::WriterBuilder;
 use log::info;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "migration_ledger")]
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 #[cfg(feature = "lean")]
@@ -23,6 +25,99 @@ use crate::flows::packet::EcnField;
 #[cfg(feature = "lean")]
 use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategyKind};
 use crate::utils::trace_manifest;
+
+#[cfg(feature = "migration_ledger")]
+pub fn migration_time_to_ns(time_s: f64) -> u64 {
+    (time_s.max(0.0) * 1e9).round() as u64
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationModelKind {
+    Source,
+    Switch,
+    Port,
+    Sink,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationTransitionKind {
+    SourceEmit,
+    SwitchForward,
+    EgressEnqueue,
+    EgressDrop,
+    EgressDequeue,
+    EgressDeparture,
+    SinkReceive,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct MigrationLedgerRow {
+    pub time_ns: u64,
+    pub model_kind: MigrationModelKind,
+    pub transition: MigrationTransitionKind,
+    pub node_id: u64,
+    pub peer_node_id: Option<u64>,
+    pub flow_id: u64,
+    pub packet_id: u64,
+    pub model_sequence: u64,
+    pub size_bytes: u64,
+    pub queue_occupancy_packets: Option<u64>,
+    pub queue_occupancy_bytes: Option<u64>,
+    pub departure_time_ns: Option<u64>,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Debug)]
+pub struct MigrationFlowMappingRow {
+    pub flow_id: u64,
+    pub source_node_id: u64,
+    pub sink_node_id: u64,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Debug)]
+pub struct MigrationPortMappingRow {
+    pub upstream_node_id: u64,
+    pub downstream_node_id: u64,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Debug)]
+pub struct MigrationSwitchMappingRow {
+    pub node_id: u64,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct MigrationTerminalStateRow {
+    pub model_kind: MigrationModelKind,
+    pub node_id: u64,
+    pub peer_node_id: Option<u64>,
+    pub flow_id: Option<u64>,
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_enqueued: u64,
+    pub packets_dropped: u64,
+    pub packets_forwarded: u64,
+    pub final_queue_occupancy_packets: u64,
+    pub final_queue_occupancy_bytes: u64,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub final_time_ns: u64,
+}
+
+#[cfg(feature = "migration_ledger")]
+#[derive(Clone, Debug, Default)]
+struct MigrationEndpointState {
+    packets: u64,
+    bytes: u64,
+    final_time_ns: u64,
+}
 
 #[derive(Deserialize)]
 struct LogConfig {
@@ -292,6 +387,14 @@ pub enum Report {
     PacketSourceReport(PacketSourceReport),
     SchedulerReport(SchedulerReport),
     PacketSinkReport(PacketSinkReport),
+    #[cfg(feature = "migration_ledger")]
+    MigrationLedgerRow(MigrationLedgerRow),
+    #[cfg(feature = "migration_ledger")]
+    MigrationFlowMappingRow(MigrationFlowMappingRow),
+    #[cfg(feature = "migration_ledger")]
+    MigrationPortMappingRow(MigrationPortMappingRow),
+    #[cfg(feature = "migration_ledger")]
+    MigrationSwitchMappingRow(MigrationSwitchMappingRow),
     #[cfg(feature = "l2_pfc")]
     PfcPortReport(PfcPortReport),
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -320,6 +423,18 @@ struct SharedState {
     source_reports: Vec<PacketSourceReport>,
     scheduler_reports: Vec<SchedulerReport>,
     sink_reports: Vec<PacketSinkReport>,
+    #[cfg(feature = "migration_ledger")]
+    migration_ledger: Vec<MigrationLedgerRow>,
+    #[cfg(feature = "migration_ledger")]
+    migration_flow_mappings: BTreeMap<u64, (u64, u64)>,
+    #[cfg(feature = "migration_ledger")]
+    migration_port_mappings: BTreeMap<(u64, u64), ()>,
+    #[cfg(feature = "migration_ledger")]
+    migration_switch_mappings: BTreeMap<u64, ()>,
+    #[cfg(feature = "migration_ledger")]
+    migration_source_states: BTreeMap<u64, MigrationEndpointState>,
+    #[cfg(feature = "migration_ledger")]
+    migration_sink_states: BTreeMap<u64, MigrationEndpointState>,
     #[cfg(feature = "l2_pfc")]
     pfc_reports: Vec<PfcPortReport>,
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -342,6 +457,10 @@ enum ElementType {
     Source,
     Scheduler,
     Sink,
+    #[cfg(feature = "migration_ledger")]
+    MigrationLedger,
+    #[cfg(feature = "migration_ledger")]
+    MigrationTerminalDigest,
     #[cfg(feature = "l2_pfc")]
     Pfc,
     #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -447,6 +566,10 @@ impl CsvLogger {
         // Create output files
         #[allow(unused_mut)]
         let mut elements = vec!["sources", "switches", "sinks"];
+        #[cfg(feature = "migration_ledger")]
+        elements.push("migration_ledger");
+        #[cfg(feature = "migration_ledger")]
+        elements.push("migration_terminal_digest");
         #[cfg(feature = "l2_pfc")]
         elements.push("pfc");
         #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -523,13 +646,58 @@ impl CsvLogger {
 
         match report {
             Report::PacketSourceReport(report) => {
+                #[cfg(feature = "migration_ledger")]
+                {
+                    let terminal = state
+                        .migration_source_states
+                        .entry(report.flow_id as u64)
+                        .or_default();
+                    terminal.packets += report.sent_packets as u64;
+                    terminal.bytes += report.packet_sizes as u64;
+                    terminal.final_time_ns = terminal
+                        .final_time_ns
+                        .max(migration_time_to_ns(report.end_time));
+                }
                 state.source_reports.push(report);
             }
             Report::SchedulerReport(report) => {
                 state.scheduler_reports.push(report);
             }
             Report::PacketSinkReport(report) => {
+                #[cfg(feature = "migration_ledger")]
+                {
+                    let terminal = state
+                        .migration_sink_states
+                        .entry(report.flow_id as u64)
+                        .or_default();
+                    terminal.packets += report.received_packets as u64;
+                    terminal.bytes += report.received_sizes as u64;
+                    terminal.final_time_ns = terminal
+                        .final_time_ns
+                        .max(migration_time_to_ns(report.end_time));
+                }
                 state.sink_reports.push(report);
+            }
+            #[cfg(feature = "migration_ledger")]
+            Report::MigrationLedgerRow(row) => {
+                state.migration_ledger.push(row);
+            }
+            #[cfg(feature = "migration_ledger")]
+            Report::MigrationFlowMappingRow(mapping) => {
+                state.migration_flow_mappings.insert(
+                    mapping.flow_id,
+                    (mapping.source_node_id, mapping.sink_node_id),
+                );
+            }
+            #[cfg(feature = "migration_ledger")]
+            Report::MigrationPortMappingRow(mapping) => {
+                state
+                    .migration_port_mappings
+                    .insert((mapping.upstream_node_id, mapping.downstream_node_id), ());
+            }
+            #[cfg(feature = "migration_ledger")]
+            Report::MigrationSwitchMappingRow(mapping) => {
+                state.migration_switch_mappings.insert(mapping.node_id, ());
             }
             #[cfg(feature = "l2_pfc")]
             Report::PfcPortReport(report) => {
@@ -596,6 +764,17 @@ impl CsvLogger {
             ElementType::Source => format!("{}sources.csv", self.log_path.get().unwrap()),
             ElementType::Scheduler => format!("{}switches.csv", self.log_path.get().unwrap()),
             ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap()),
+            #[cfg(feature = "migration_ledger")]
+            ElementType::MigrationLedger => {
+                format!("{}migration_ledger.csv", self.log_path.get().unwrap())
+            }
+            #[cfg(feature = "migration_ledger")]
+            ElementType::MigrationTerminalDigest => {
+                format!(
+                    "{}migration_terminal_digest.csv",
+                    self.log_path.get().unwrap()
+                )
+            }
             #[cfg(feature = "l2_pfc")]
             ElementType::Pfc => format!("{}pfc.csv", self.log_path.get().unwrap()),
             #[cfg(all(feature = "lean", feature = "l2_pfc"))]
@@ -640,6 +819,285 @@ impl CsvLogger {
             .map_err(|e| format!("Failed to flush CSV writer for {}: {}", csv_file_name, e))?;
 
         Ok(())
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    fn migration_terminal_rows(state: &SharedState) -> Vec<MigrationTerminalStateRow> {
+        let mut rows = BTreeMap::new();
+
+        for node_id in state.migration_switch_mappings.keys() {
+            rows.insert(
+                (MigrationModelKind::Switch, *node_id, None, None),
+                MigrationTerminalStateRow {
+                    model_kind: MigrationModelKind::Switch,
+                    node_id: *node_id,
+                    peer_node_id: None,
+                    flow_id: None,
+                    packets_sent: 0,
+                    bytes_sent: 0,
+                    packets_enqueued: 0,
+                    packets_dropped: 0,
+                    packets_forwarded: 0,
+                    final_queue_occupancy_packets: 0,
+                    final_queue_occupancy_bytes: 0,
+                    packets_received: 0,
+                    bytes_received: 0,
+                    final_time_ns: 0,
+                },
+            );
+        }
+
+        for (upstream_node_id, downstream_node_id) in state.migration_port_mappings.keys() {
+            rows.insert(
+                (
+                    MigrationModelKind::Port,
+                    *upstream_node_id,
+                    Some(*downstream_node_id),
+                    None,
+                ),
+                MigrationTerminalStateRow {
+                    model_kind: MigrationModelKind::Port,
+                    node_id: *upstream_node_id,
+                    peer_node_id: Some(*downstream_node_id),
+                    flow_id: None,
+                    packets_sent: 0,
+                    bytes_sent: 0,
+                    packets_enqueued: 0,
+                    packets_dropped: 0,
+                    packets_forwarded: 0,
+                    final_queue_occupancy_packets: 0,
+                    final_queue_occupancy_bytes: 0,
+                    packets_received: 0,
+                    bytes_received: 0,
+                    final_time_ns: 0,
+                },
+            );
+        }
+
+        for (flow_id, (source_node_id, sink_node_id)) in &state.migration_flow_mappings {
+            for (model_kind, node_id) in [
+                (MigrationModelKind::Source, *source_node_id),
+                (MigrationModelKind::Sink, *sink_node_id),
+            ] {
+                rows.insert(
+                    (model_kind, node_id, None, Some(*flow_id)),
+                    MigrationTerminalStateRow {
+                        model_kind,
+                        node_id,
+                        peer_node_id: None,
+                        flow_id: Some(*flow_id),
+                        packets_sent: 0,
+                        bytes_sent: 0,
+                        packets_enqueued: 0,
+                        packets_dropped: 0,
+                        packets_forwarded: 0,
+                        final_queue_occupancy_packets: 0,
+                        final_queue_occupancy_bytes: 0,
+                        packets_received: 0,
+                        bytes_received: 0,
+                        final_time_ns: 0,
+                    },
+                );
+            }
+        }
+
+        for (flow_id, endpoint) in &state.migration_source_states {
+            if let Some((source_node_id, _)) = state.migration_flow_mappings.get(flow_id) {
+                rows.insert(
+                    (
+                        MigrationModelKind::Source,
+                        *source_node_id,
+                        None,
+                        Some(*flow_id),
+                    ),
+                    MigrationTerminalStateRow {
+                        model_kind: MigrationModelKind::Source,
+                        node_id: *source_node_id,
+                        peer_node_id: None,
+                        flow_id: Some(*flow_id),
+                        packets_sent: endpoint.packets,
+                        bytes_sent: endpoint.bytes,
+                        packets_enqueued: 0,
+                        packets_dropped: 0,
+                        packets_forwarded: 0,
+                        final_queue_occupancy_packets: 0,
+                        final_queue_occupancy_bytes: 0,
+                        packets_received: 0,
+                        bytes_received: 0,
+                        final_time_ns: endpoint.final_time_ns,
+                    },
+                );
+            }
+        }
+
+        for (flow_id, endpoint) in &state.migration_sink_states {
+            if let Some((_, sink_node_id)) = state.migration_flow_mappings.get(flow_id) {
+                rows.insert(
+                    (
+                        MigrationModelKind::Sink,
+                        *sink_node_id,
+                        None,
+                        Some(*flow_id),
+                    ),
+                    MigrationTerminalStateRow {
+                        model_kind: MigrationModelKind::Sink,
+                        node_id: *sink_node_id,
+                        peer_node_id: None,
+                        flow_id: Some(*flow_id),
+                        packets_sent: 0,
+                        bytes_sent: 0,
+                        packets_enqueued: 0,
+                        packets_dropped: 0,
+                        packets_forwarded: 0,
+                        final_queue_occupancy_packets: 0,
+                        final_queue_occupancy_bytes: 0,
+                        packets_received: endpoint.packets,
+                        bytes_received: endpoint.bytes,
+                        final_time_ns: endpoint.final_time_ns,
+                    },
+                );
+            }
+        }
+
+        for event in &state.migration_ledger {
+            match event.model_kind {
+                MigrationModelKind::Source | MigrationModelKind::Sink => {}
+                MigrationModelKind::Switch => {
+                    let row = rows
+                        .entry((MigrationModelKind::Switch, event.node_id, None, None))
+                        .or_insert_with(|| MigrationTerminalStateRow {
+                            model_kind: MigrationModelKind::Switch,
+                            node_id: event.node_id,
+                            peer_node_id: None,
+                            flow_id: None,
+                            packets_sent: 0,
+                            bytes_sent: 0,
+                            packets_enqueued: 0,
+                            packets_dropped: 0,
+                            packets_forwarded: 0,
+                            final_queue_occupancy_packets: 0,
+                            final_queue_occupancy_bytes: 0,
+                            packets_received: 0,
+                            bytes_received: 0,
+                            final_time_ns: 0,
+                        });
+                    if event.transition == MigrationTransitionKind::SwitchForward {
+                        row.packets_forwarded += 1;
+                        row.bytes_sent += event.size_bytes;
+                    }
+                    row.final_time_ns = row.final_time_ns.max(event.time_ns);
+                }
+                MigrationModelKind::Port => {
+                    let row = rows
+                        .entry((
+                            MigrationModelKind::Port,
+                            event.node_id,
+                            event.peer_node_id,
+                            None,
+                        ))
+                        .or_insert_with(|| MigrationTerminalStateRow {
+                            model_kind: MigrationModelKind::Port,
+                            node_id: event.node_id,
+                            peer_node_id: event.peer_node_id,
+                            flow_id: None,
+                            packets_sent: 0,
+                            bytes_sent: 0,
+                            packets_enqueued: 0,
+                            packets_dropped: 0,
+                            packets_forwarded: 0,
+                            final_queue_occupancy_packets: 0,
+                            final_queue_occupancy_bytes: 0,
+                            packets_received: 0,
+                            bytes_received: 0,
+                            final_time_ns: 0,
+                        });
+                    match event.transition {
+                        MigrationTransitionKind::EgressEnqueue => {
+                            row.packets_enqueued += 1;
+                            row.final_queue_occupancy_packets += 1;
+                            row.final_queue_occupancy_bytes += event.size_bytes;
+                        }
+                        MigrationTransitionKind::EgressDrop => {
+                            row.packets_dropped += 1;
+                        }
+                        MigrationTransitionKind::EgressDeparture => {
+                            row.packets_forwarded += 1;
+                            row.final_queue_occupancy_packets =
+                                row.final_queue_occupancy_packets.saturating_sub(1);
+                            row.final_queue_occupancy_bytes = row
+                                .final_queue_occupancy_bytes
+                                .saturating_sub(event.size_bytes);
+                        }
+                        MigrationTransitionKind::SourceEmit
+                        | MigrationTransitionKind::SwitchForward
+                        | MigrationTransitionKind::EgressDequeue
+                        | MigrationTransitionKind::SinkReceive => {}
+                    }
+                    row.final_time_ns = row.final_time_ns.max(event.time_ns);
+                }
+            }
+        }
+
+        rows.into_values().collect()
+    }
+
+    #[cfg(feature = "migration_ledger")]
+    fn write_migration_outputs(&self, state: &mut SharedState) {
+        let terminal_rows = Self::migration_terminal_rows(state);
+        if !state.migration_ledger.is_empty() {
+            let mut ledger = std::mem::take(&mut state.migration_ledger);
+            ledger.sort();
+            self.write_to_csv(ElementType::MigrationLedger, &ledger)
+                .expect("Error writing migration ledger to CSV");
+        }
+
+        if !terminal_rows.is_empty() {
+            self.write_to_csv(ElementType::MigrationTerminalDigest, &terminal_rows)
+                .expect("Error writing migration terminal digest to CSV");
+        }
+        state.migration_flow_mappings.clear();
+        state.migration_port_mappings.clear();
+        state.migration_switch_mappings.clear();
+        state.migration_source_states.clear();
+        state.migration_sink_states.clear();
+    }
+
+    #[cfg(all(test, feature = "migration_ledger"))]
+    pub(crate) fn initialize_migration_test_logger(log_path: &str) {
+        let logger = Self::get_instance();
+        if logger.log_path.get().is_none() {
+            logger
+                .init(log_path)
+                .expect("initialize migration test logger");
+        }
+    }
+
+    #[cfg(all(test, feature = "migration_ledger"))]
+    pub(crate) fn clear_migration_ledger_for_test() {
+        Self::get_instance()
+            .shared_state
+            .write()
+            .migration_ledger
+            .clear();
+    }
+
+    #[cfg(all(test, feature = "migration_ledger"))]
+    pub(crate) fn migration_ledger_bytes_for_test() -> Vec<u8> {
+        let mut rows = Self::get_instance()
+            .shared_state
+            .read()
+            .migration_ledger
+            .clone();
+        rows.sort();
+        let mut writer = WriterBuilder::new().from_writer(Vec::new());
+        for row in rows {
+            writer
+                .serialize(row)
+                .expect("serialize migration ledger row");
+        }
+        writer
+            .into_inner()
+            .expect("finish migration ledger serialization")
     }
 
     #[cfg(feature = "test")]
@@ -840,6 +1298,9 @@ impl CsvLogger {
                 .expect("Error writing DCQCN events to CSV");
         }
 
+        #[cfg(feature = "migration_ledger")]
+        self.write_migration_outputs(&mut state);
+
         let total_packets = self.total_packets.load(Ordering::SeqCst);
         let avg_delay = if total_packets > 0 {
             state.total_delay / total_packets as f64
@@ -881,6 +1342,10 @@ impl CsvLogger {
 
     fn trace_manifest_candidates() -> &'static [&'static str] {
         &[
+            #[cfg(feature = "migration_ledger")]
+            "migration_ledger.csv",
+            #[cfg(feature = "migration_ledger")]
+            "migration_terminal_digest.csv",
             #[cfg(feature = "lean")]
             "aqm_events.csv",
             #[cfg(feature = "lean")]
