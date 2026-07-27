@@ -24,6 +24,14 @@ out_of_scope = [
 ]
 selectable_backends = []
 
+[[budgets]]
+id = "days-executor-retirement"
+owner_phase = "P01"
+required_consumers = ["P23"]
+path = "docs/days-executor/budgets/retirement-budget.toml"
+content_hash = "sha256:e7dfbb6957cc7ae396f331af70209f43b70545ba7d946f6cb74ad0f1646b0ba3"
+frozen_at_commit = "332dac931f7c63848315df13c9aba13f8bb2386f"
+
 [[tasks]]
 id = "T0"
 title = "Implement the audit and evidence contract"
@@ -40,6 +48,7 @@ title = "Freeze the Nexosim retirement baseline"
 depends_on = ["T0"]
 evidence = [
     "docs/days-executor/evidence/P01/t1-evidence.toml",
+    "docs/days-executor/evidence/P01/nexosim-baseline-measurement-v2.toml",
 ]
 
 [tasks.red_test]

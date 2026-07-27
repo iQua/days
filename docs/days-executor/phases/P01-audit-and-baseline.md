@@ -171,15 +171,24 @@ frozen budget in order, checks their duplicated identity and hash fields,
 validates their commands, verifies each required feature against
 `Cargo.toml`, and rejects a featured performance entry.
 
-Some declarations still have limited enforcement. `model_scope` remains a
-nonempty description. The runner checks that `comparison_boundary` matches the
-budget enum, but no audit proves that a produced artifact supports that
-boundary. The runner validates each optional `ledger_path` and `ledger_hash`
-as a pair, while `tests/migration_ledger.rs` still hardcodes the three golden
-paths with `include_bytes!`. The ledger comparisons are real, but the test
-does not consume those manifest fields. P01 records that coupling as later
-audit work because changing the golden test is separate from the A2 runner
-repair.
+A declaration that no consumer reads is a latent falsehood. A declaration
+that a related check appears to enforce is worse because reviewers read it as
+verified. P01 now assigns each corpus declaration an explicit status:
+
+| Field | Status |
+| --- | --- |
+| `required_features` | The runner checks each feature against `Cargo.toml`, builds each correctness fixture with its declared set, and rejects a performance fixture that declares any feature. |
+| `ledger_path` / `ledger_hash` | The runner validates the pair. The complete-ledger integration test now reads the pair from the manifest, verifies the golden hash, and compares fresh output with those bytes. |
+| `comparison_boundary` | The runner checks that the value matches the budget enum. No audit proves that produced evidence supports the declared boundary. |
+| `model_scope` | The runner requires a nonempty value and otherwise treats it as descriptive. |
+
+P07 must close the named **comparison-boundary evidence gap** when it defines
+the executable certificate checkers. The blocker is a machine-readable rule
+for the evidence each boundary requires: complete ordered transitions for
+`exact-ledger`, declared terminal projections for `terminal-observation`, and
+a versioned migration relation for `semantic-migration`. Until those artifact
+types and checkers exist, P01 can validate the declaration and its exact
+goldens but cannot infer evidence adequacy for every boundary.
 
 The budget reference also has a stable `id`, an owning phase, and required
 consumer phases. A present P23 phase must cite the same frozen tuple rather
@@ -293,6 +302,10 @@ output, `verified_features = []`, and `migration_ledger_enabled = false`.
 The probe output contains no Cargo `feature="..."` line. The timed build used
 `cargo build --locked --release --bin days` and produced binary hash
 `sha256:a9717b7028e8aff1e75f05388810b36dac46ee37299b536af84054058e4b0e93`.
+Only `baselines-v2/` may support the F4 retirement budget. The seven files
+under `baselines/` remain as the history of the superseded F3/A run and must
+not be cited as the Nexosim reference because that runner did not verify the
+timed binary's feature set.
 
 The runner recorded 120 unique samples, fifteen for each workload and mode.
 Each sample reached `1500000000000` simulated nanoseconds. ST samples used one
@@ -341,6 +354,12 @@ workload steps. The MT/ST primary ratio at k16 rose from `1.034687486` to
 `1.108706202`; ST remains selected. At k32 it rose from `0.459829982` to
 `0.494754018`; MT remains selected, with the ST/MT speed ratio decreasing from
 `2.174716828` to `2.021206425`.
+
+The ranking held: ST remains the selected configuration for k4/f8, k8/f64,
+and k16/f512, while accelerated MT remains selected for k32/f4096. The
+superseded run overstated absolute cost, most visibly by 16.874 percent for
+k32 ST and 10.560 percent for k32 MT. It got the selected modes right but
+cannot serve as an absolute baseline.
 
 ### Superseded F3/A Nexosim reference
 

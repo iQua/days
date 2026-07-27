@@ -1,0 +1,55 @@
+schema_version = 1
+id = "P01-T1-nexosim-baseline-v2"
+phase = "P01"
+task = "T1"
+kind = "measurement"
+description = "Authoritative absolute Nexosim ST and accelerated-MT timing samples, selected-mode outcomes, build provenance, and untimed correctness terminal digests collected under the F4 retirement method"
+command = ["cargo", "xtask", "nexosim-baseline", "collect", "--output-dir", "docs/days-executor/evidence/P01/baselines-v2"]
+tool_version = "xtask 0.1.0 nexosim-baseline at ba99ec5fe917d1017bf821043ffc7e9407514106"
+schema = "days-executor/nexosim-baseline/v2"
+tags = [
+    "absolute-nexosim-baseline",
+    "build-provenance",
+    "frozen-method",
+    "selected-mode-outcome",
+    "terminal-digest",
+]
+budget = "docs/days-executor/budgets/retirement-budget.toml"
+budget_hash = "sha256:e7dfbb6957cc7ae396f331af70209f43b70545ba7d946f6cb74ad0f1646b0ba3"
+run_commit = "ba99ec5fe917d1017bf821043ffc7e9407514106"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/nexosim-baseline-build.toml"
+content_hash = "sha256:82ee58663ede80172858c4b01f85587844e482bf7a2658605e3f32a22a6b2c6e"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/nexosim-baseline-samples.csv"
+content_hash = "sha256:8a8b71c8d8d7edb20d2136a7bf9437ecb7853eab27ee7ac17ca0010e3df574a5"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/nexosim-baseline-summary.csv"
+content_hash = "sha256:17319e354914b8c4c0864e027e5a62990ffcd21154e17bdb932144cceb1a0a75"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/nexosim-baseline-selected-modes.csv"
+content_hash = "sha256:77d52783d2416ca37a5ed264caa8b13af70e1c23b801ef906efc269cec592a99"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/migration-explicit-terminal-digest.csv"
+content_hash = "sha256:ed4f4e2da2e81a9c9a9e5949fa442e7fcfbe1249f9916dd905e5b24a91d9f9ff"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/migration-torus-terminal-digest.csv"
+content_hash = "sha256:c13c1b4083d008f920ededcd1b26fab36791c22d30e723b06c8ce0f060727866"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/migration-fattree-k4-terminal-digest.csv"
+content_hash = "sha256:19ff23aca37de678f28b6384f866e7c5fea461ffc1b559a2fac6daf071fadaaa"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/tcp-simple-terminal-digest.csv"
+content_hash = "sha256:8ab82b937a1f36ab9d7d203e5468a14fc921d79490a0566c168ad58e72b78593"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/baselines-v2/leanguard-dcqcn-terminal-digest.csv"
+content_hash = "sha256:a48193f843ab60af9b3bc7f778c7332fd6193a28ac29434d9c2caba2c8bc6585"

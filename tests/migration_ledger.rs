@@ -4,6 +4,90 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+const RETIREMENT_CORPUS_PATH: &str = "docs/days-executor/evidence/P01/retirement-corpus.toml";
+
+#[derive(Deserialize)]
+struct RetirementCorpus {
+    fixtures: Vec<CorpusFixture>,
+}
+
+#[derive(Deserialize)]
+struct CorpusFixture {
+    path: String,
+    comparison_boundary: String,
+    ledger_path: Option<String>,
+    ledger_hash: Option<String>,
+}
+
+struct ExactLedgerFixture {
+    config_path: String,
+    configured_log_path: String,
+    golden_path: String,
+    golden: Vec<u8>,
+}
+
+fn canonical_sha256(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn config_log_path(config_path: &str) -> String {
+    let input = fs::read_to_string(config_path).expect("read exact-ledger fixture config");
+    let document = input
+        .parse::<toml::Table>()
+        .expect("parse exact-ledger fixture config as TOML document");
+    document
+        .get("log_path")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{config_path} must declare a top-level log_path"))
+        .to_owned()
+}
+
+fn exact_ledger_fixtures() -> Vec<ExactLedgerFixture> {
+    let input =
+        fs::read_to_string(RETIREMENT_CORPUS_PATH).expect("read retirement corpus manifest");
+    let manifest =
+        toml::from_str::<RetirementCorpus>(&input).expect("parse retirement corpus manifest");
+    let exact = manifest
+        .fixtures
+        .into_iter()
+        .filter(|fixture| fixture.comparison_boundary == "exact-ledger")
+        .map(|fixture| {
+            let ledger_path = fixture.ledger_path.unwrap_or_else(|| {
+                panic!("{} declares exact-ledger without ledger_path", fixture.path)
+            });
+            let ledger_hash = fixture.ledger_hash.unwrap_or_else(|| {
+                panic!("{} declares exact-ledger without ledger_hash", fixture.path)
+            });
+            let golden = fs::read(&ledger_path)
+                .unwrap_or_else(|error| panic!("read frozen ledger {ledger_path}: {error}"));
+            assert!(
+                !golden.is_empty(),
+                "{} declares an empty frozen ledger {ledger_path}",
+                fixture.path
+            );
+            assert_eq!(
+                canonical_sha256(&golden),
+                ledger_hash,
+                "{} frozen ledger hash does not match {ledger_path}",
+                fixture.path
+            );
+            ExactLedgerFixture {
+                configured_log_path: config_log_path(&fixture.path),
+                config_path: fixture.path,
+                golden_path: ledger_path,
+                golden,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !exact.is_empty(),
+        "{RETIREMENT_CORPUS_PATH} must declare at least one exact-ledger fixture"
+    );
+    exact
+}
 
 fn run_fixture(root: &Path, name: &str, config_path: &str, configured_log_path: &str) -> PathBuf {
     let log_path = root.join(name);
@@ -101,34 +185,25 @@ fn repeated_fixture_runs_have_identical_ledger_output() {
 #[test]
 fn exact_ledger_fixtures_match_complete_frozen_goldens() {
     let temporary = tempfile::tempdir().expect("create temporary directory");
-    for (name, config, configured_log_path, golden) in [
-        (
-            "explicit-golden",
-            "configs/migration/explicit.toml",
-            "logs/migration/explicit",
-            include_bytes!("../docs/days-executor/evidence/P01/ledgers-v1/explicit-ledger.csv")
-                .as_slice(),
-        ),
-        (
-            "torus-golden",
-            "configs/migration/torus.toml",
-            "logs/migration/torus",
-            include_bytes!("../docs/days-executor/evidence/P01/ledgers-v1/torus-ledger.csv")
-                .as_slice(),
-        ),
-        (
-            "fattree-golden",
-            "configs/migration/fattree.toml",
-            "logs/migration/fattree",
-            include_bytes!("../docs/days-executor/evidence/P01/ledgers-v1/fattree-ledger.csv")
-                .as_slice(),
-        ),
-    ] {
-        let output = run_fixture(temporary.path(), name, config, configured_log_path);
+    for (index, fixture) in exact_ledger_fixtures().into_iter().enumerate() {
+        let name = format!("exact-golden-{index}");
+        let output = run_fixture(
+            temporary.path(),
+            &name,
+            &fixture.config_path,
+            &fixture.configured_log_path,
+        );
         assert_eq!(
             fs::read(output.join("migration_ledger.csv")).expect("read complete ledger"),
-            golden,
-            "{config} diverged from its complete frozen ledger"
+            fixture.golden,
+            "{} diverged from its complete frozen ledger {}",
+            fixture.config_path,
+            fixture.golden_path
         );
     }
+}
+
+#[test]
+fn exact_ledger_fixtures_declare_valid_frozen_goldens() {
+    drop(exact_ledger_fixtures());
 }
