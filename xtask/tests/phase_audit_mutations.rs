@@ -891,6 +891,25 @@ fn malformed_budget_manifest_is_rejected() {
 }
 
 #[test]
+fn commented_evidence_document_still_enforces_budget_field_pairing() {
+    let fixture = Fixture::new();
+    mutate(&fixture.evidence_path(), |value| {
+        format!(
+            "# leading document comment\n{}",
+            value.replace(
+                "schema_version = 1\n",
+                "schema_version = 1\nbudget_hash = \"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"\n",
+            )
+        )
+    });
+    assert_code_message(
+        &fixture.audit(),
+        "DAYS-AUDIT-0002",
+        "budget_hash is forbidden without budget",
+    );
+}
+
+#[test]
 fn post_measurement_budget_change_is_rejected() {
     let fixture = Fixture::new();
     mutate(&fixture.measurement_path(), |value| {

@@ -6,6 +6,11 @@ test_function = "malformed_phase_metadata_is_rejected"
 expected_code = "DAYS-AUDIT-0002"
 
 [[mutations]]
+fault_class = "commented evidence document bypasses budget field pairing"
+test_function = "commented_evidence_document_still_enforces_budget_field_pairing"
+expected_code = "DAYS-AUDIT-0002"
+
+[[mutations]]
 fault_class = "missing phase metadata field"
 test_function = "phase_metadata_missing_required_field_is_rejected"
 expected_code = "DAYS-AUDIT-0002"

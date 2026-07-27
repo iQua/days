@@ -139,7 +139,8 @@ fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         }
         Command::NexosimBaseline { command } => match command {
             NexosimBaselineCommand::SelfTest => {
-                xtask::baseline::self_test()?;
+                let root = xtask::discover_repo_root(&current)?;
+                xtask::baseline::self_test(&root)?;
                 Ok(true)
             }
             NexosimBaselineCommand::Collect {

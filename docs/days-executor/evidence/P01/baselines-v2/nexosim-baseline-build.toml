@@ -1,0 +1,82 @@
+schema_version = 1
+collector_command = [
+    "cargo",
+    "xtask",
+    "nexosim-baseline",
+    "collect",
+    "--output-dir",
+    "docs/days-executor/evidence/P01/baselines-v2",
+]
+timed_build_command = [
+    "cargo",
+    "build",
+    "--locked",
+    "--release",
+    "--bin",
+    "days",
+]
+feature_probe_command = [
+    "cargo",
+    "rustc",
+    "--locked",
+    "--release",
+    "--bin",
+    "days",
+    "--",
+    "--print",
+    "cfg",
+]
+feature_probe_output = [
+    'panic="unwind"',
+    'target_abi=""',
+    'target_arch="aarch64"',
+    'target_endian="little"',
+    'target_env=""',
+    'target_family="unix"',
+    'target_feature="aes"',
+    'target_feature="crc"',
+    'target_feature="dit"',
+    'target_feature="dotprod"',
+    'target_feature="dpb"',
+    'target_feature="dpb2"',
+    'target_feature="fcma"',
+    'target_feature="fhm"',
+    'target_feature="flagm"',
+    'target_feature="fp16"',
+    'target_feature="frintts"',
+    'target_feature="jsconv"',
+    'target_feature="lor"',
+    'target_feature="lse"',
+    'target_feature="neon"',
+    'target_feature="paca"',
+    'target_feature="pacg"',
+    'target_feature="pan"',
+    'target_feature="pmuv3"',
+    'target_feature="ras"',
+    'target_feature="rcpc"',
+    'target_feature="rcpc2"',
+    'target_feature="rdm"',
+    'target_feature="sb"',
+    'target_feature="sha2"',
+    'target_feature="sha3"',
+    'target_feature="ssbs"',
+    'target_feature="vh"',
+    'target_has_atomic="128"',
+    'target_has_atomic="16"',
+    'target_has_atomic="32"',
+    'target_has_atomic="64"',
+    'target_has_atomic="8"',
+    'target_has_atomic="ptr"',
+    'target_os="macos"',
+    'target_pointer_width="64"',
+    'target_vendor="apple"',
+    "unix",
+]
+verified_features = []
+migration_ledger_enabled = false
+timed_binary = "target/release/days"
+timed_binary_hash = "sha256:a9717b7028e8aff1e75f05388810b36dac46ee37299b536af84054058e4b0e93"
+rustc_version = "rustc 1.96.0 (ac68faa20 2026-05-25)"
+cargo_version = "cargo 1.96.0 (30a34c682 2026-05-25)"
+event_count_definition = "Nexosim perf_stats `actions`: scheduled events, scheduled queries, and injected events processed by step_until"
+event_counter_feature = "perf_stats"

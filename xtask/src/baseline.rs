@@ -7,17 +7,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::hash::sha256_file;
-use crate::schema::{BudgetManifest, CorpusRole, parse_budget_manifest};
+use crate::hash::{is_sha256, sha256_file};
+use crate::schema::{BudgetManifest, ComparisonBoundary, CorpusRole, parse_budget_manifest};
 
 const DEFAULT_BUDGET: &str = "docs/days-executor/budgets/retirement-budget.toml";
+const RETIREMENT_CORPUS: &str = "docs/days-executor/evidence/P01/retirement-corpus.toml";
 const PERF_STATS_FEATURE: &str = "perf_stats";
 const MIGRATION_LEDGER_FEATURE: &str = "migration_ledger";
 
-/// Runs parser and arithmetic checks without building or executing Days.
-pub fn self_test() -> Result<(), String> {
+/// Runs corpus, parser, and arithmetic checks without building or executing Days.
+pub fn self_test(repo_root: &Path) -> Result<(), String> {
+    let budget_input = fs::read_to_string(repo_root.join(DEFAULT_BUDGET)).map_err(display_io)?;
+    let budget =
+        parse_budget_manifest(&budget_input, repo_root).map_err(|error| error.to_string())?;
+    let fixtures = resolve_fixtures(repo_root, &budget)?;
+    if fixtures.len() != budget.corpus.len() {
+        return Err(format!(
+            "resolved {} of {} corpus configs",
+            fixtures.len(),
+            budget.corpus.len()
+        ));
+    }
+
     let output = "\
 [INFO] Starting simulation with single threading (1 thread(s)).
 [INFO] Simulation execution wall-clock time: 0.021000001 seconds.
@@ -47,22 +60,16 @@ pub fn collect(repo_root: &Path, output_dir: &Path) -> Result<(), String> {
     let budget =
         parse_budget_manifest(&budget_input, repo_root).map_err(|error| error.to_string())?;
     validate_output_path(repo_root, output_dir)?;
-    if output_dir.exists() {
-        return Err(format!(
-            "output directory already exists: {}",
-            output_dir.display()
-        ));
-    }
-    fs::create_dir_all(output_dir).map_err(display_io)?;
+    let preflight = preflight(repo_root, &budget)?;
+    prepare_output_dir(output_dir, &preflight.fixtures)?;
 
-    let fixtures = fixtures(&budget);
-    collect_correctness(repo_root, output_dir, &budget, &fixtures)?;
-    let build = build_timed_binary(repo_root, &budget)?;
-    let event_counts = collect_event_counts(repo_root, &budget, &fixtures)?;
+    collect_correctness(repo_root, output_dir, &budget, &preflight.fixtures)?;
+    let build = build_timed_binary(repo_root, output_dir, &budget, preflight.feature_probe)?;
+    let event_counts = collect_event_counts(repo_root, &budget, &preflight.fixtures)?;
     let samples = collect_timing(
         repo_root,
         &budget,
-        &fixtures,
+        &preflight.fixtures,
         &event_counts,
         &build.binary_hash,
     )?;
@@ -93,20 +100,269 @@ struct Fixture {
     workload: String,
     mode: String,
     config: String,
+    log_path: String,
+    required_features: Vec<String>,
     role: CorpusRole,
 }
 
-fn fixtures(budget: &BudgetManifest) -> Vec<Fixture> {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementCorpusManifest {
+    schema_version: u32,
+    id: String,
+    phase: String,
+    task: String,
+    description: String,
+    fixtures: Vec<RetirementCorpusFixture>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementCorpusFixture {
+    path: String,
+    content_hash: String,
+    comparison_boundary: ComparisonBoundary,
+    workload: String,
+    mode: String,
+    role: CorpusRole,
+    model_scope: String,
+    required_features: Vec<String>,
+    command: Vec<String>,
+    ledger_path: Option<String>,
+    ledger_hash: Option<String>,
+}
+
+fn resolve_fixtures(repo_root: &Path, budget: &BudgetManifest) -> Result<Vec<Fixture>, String> {
+    let input = fs::read_to_string(repo_root.join(RETIREMENT_CORPUS)).map_err(display_io)?;
+    let declared: RetirementCorpusManifest =
+        toml::from_str(&input).map_err(|error| error.to_string())?;
+    validate_corpus_header(&declared)?;
+    if declared.fixtures.len() != budget.corpus.len() {
+        return Err(format!(
+            "retirement corpus declares {} fixtures; budget declares {}",
+            declared.fixtures.len(),
+            budget.corpus.len()
+        ));
+    }
+
+    let cargo_features = declared_cargo_features(repo_root)?;
     budget
         .corpus
         .iter()
-        .map(|entry| Fixture {
-            workload: entry.workload.clone(),
-            mode: entry.mode.clone(),
-            config: entry.path.clone(),
-            role: entry.role,
+        .zip(&declared.fixtures)
+        .map(|(budget_entry, declared_entry)| {
+            validate_declared_fixture(budget_entry, declared_entry, &cargo_features)?;
+            Ok(Fixture {
+                workload: budget_entry.workload.clone(),
+                mode: budget_entry.mode.clone(),
+                config: budget_entry.path.clone(),
+                log_path: config_log_path(repo_root, &budget_entry.path)?,
+                required_features: declared_entry.required_features.clone(),
+                role: budget_entry.role,
+            })
         })
         .collect()
+}
+
+fn validate_corpus_header(manifest: &RetirementCorpusManifest) -> Result<(), String> {
+    if manifest.schema_version != 1
+        || manifest.id != "P01-retirement-corpus"
+        || manifest.phase != "P01"
+        || manifest.task != "T1"
+        || manifest.description.trim().is_empty()
+    {
+        return Err("retirement corpus header does not match P01 T1".to_owned());
+    }
+    Ok(())
+}
+
+fn declared_cargo_features(repo_root: &Path) -> Result<BTreeSet<String>, String> {
+    let input = fs::read_to_string(repo_root.join("Cargo.toml")).map_err(display_io)?;
+    let table = input
+        .parse::<toml::Table>()
+        .map_err(|error| error.to_string())?;
+    let features = table
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "workspace Cargo.toml has no [features] table".to_owned())?;
+    Ok(features.keys().cloned().collect())
+}
+
+fn validate_declared_fixture(
+    budget: &crate::schema::BudgetCorpusEntry,
+    declared: &RetirementCorpusFixture,
+    cargo_features: &BTreeSet<String>,
+) -> Result<(), String> {
+    if declared.path != budget.path
+        || declared.content_hash != budget.content_hash
+        || declared.comparison_boundary != budget.comparison_boundary
+        || declared.workload != budget.workload
+        || declared.mode != budget.mode
+        || declared.role != budget.role
+    {
+        return Err(format!(
+            "retirement corpus fixture {} does not match the frozen budget entry",
+            declared.path
+        ));
+    }
+    if declared.model_scope.trim().is_empty() {
+        return Err(format!("{} has an empty model_scope", declared.path));
+    }
+    validate_fixture_features(
+        &declared.path,
+        &declared.mode,
+        declared.role,
+        &declared.required_features,
+        cargo_features,
+    )?;
+
+    let expected_command = expected_fixture_command(declared);
+    if declared.command != expected_command {
+        return Err(format!(
+            "{} command does not match its role, path, and required_features",
+            declared.path
+        ));
+    }
+    match (&declared.ledger_path, &declared.ledger_hash) {
+        (Some(path), Some(hash)) if !path.is_empty() && is_sha256(hash) => {}
+        (None, None) => {}
+        _ => {
+            return Err(format!(
+                "{} ledger_path and ledger_hash must form a valid pair",
+                declared.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixture_features(
+    path: &str,
+    mode: &str,
+    role: CorpusRole,
+    required_features: &[String],
+    cargo_features: &BTreeSet<String>,
+) -> Result<(), String> {
+    let feature_set: BTreeSet<&str> = required_features.iter().map(String::as_str).collect();
+    if feature_set.len() != required_features.len()
+        || required_features.iter().any(String::is_empty)
+    {
+        return Err(format!("{path} has empty or duplicate required_features"));
+    }
+    for feature in required_features {
+        if !cargo_features.contains(feature) {
+            return Err(format!(
+                "{path} requires undeclared Cargo feature {feature}"
+            ));
+        }
+    }
+    match role {
+        CorpusRole::Correctness => {
+            if mode != "st" || !feature_set.contains(MIGRATION_LEDGER_FEATURE) {
+                return Err(format!(
+                    "{path} correctness evidence requires mode st and migration_ledger"
+                ));
+            }
+        }
+        CorpusRole::Performance => {
+            if !required_features.is_empty() {
+                return Err(format!(
+                    "{} performance entry declares features {:?}; timed builds must remain feature-free",
+                    path, required_features
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_fixture_command(fixture: &RetirementCorpusFixture) -> Vec<String> {
+    match fixture.role {
+        CorpusRole::Correctness => vec![
+            "cargo".to_owned(),
+            "run".to_owned(),
+            "--quiet".to_owned(),
+            "--features".to_owned(),
+            fixture.required_features.join(","),
+            "--bin".to_owned(),
+            "days".to_owned(),
+            "--".to_owned(),
+            fixture.path.clone(),
+        ],
+        CorpusRole::Performance => vec!["target/release/days".to_owned(), fixture.path.clone()],
+    }
+}
+
+fn prepare_output_dir(output_dir: &Path, fixtures: &[Fixture]) -> Result<(), String> {
+    if !output_dir.exists() {
+        fs::create_dir_all(output_dir).map_err(display_io)?;
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(output_dir).map_err(display_io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "baseline output path is not a regular directory: {}",
+            output_dir.display()
+        ));
+    }
+
+    let expected: Vec<String> = fixtures
+        .iter()
+        .filter(|fixture| fixture.role == CorpusRole::Correctness)
+        .map(digest_name)
+        .collect();
+    let mut present = BTreeSet::new();
+    for entry in fs::read_dir(output_dir).map_err(display_io)? {
+        let entry = entry.map_err(display_io)?;
+        let entry_metadata = fs::symlink_metadata(entry.path()).map_err(display_io)?;
+        if entry_metadata.file_type().is_symlink()
+            || !entry_metadata.is_file()
+            || entry_metadata.len() == 0
+        {
+            return Err(format!(
+                "partial baseline output is not a nonempty regular file: {}",
+                entry.path().display()
+            ));
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "partial baseline output name is not UTF-8".to_owned())?;
+        present.insert(name);
+    }
+    if present.len() >= expected.len() {
+        return Err(format!(
+            "existing baseline output does not prove a pre-timing strict prefix: {}",
+            output_dir.display()
+        ));
+    }
+    let prefix: BTreeSet<String> = expected.into_iter().take(present.len()).collect();
+    if present != prefix {
+        return Err(format!(
+            "existing baseline output is not the ordered correctness prefix: {}",
+            output_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn digest_name(fixture: &Fixture) -> String {
+    format!("{}-terminal-digest.csv", fixture.workload)
+}
+
+#[derive(Debug)]
+struct Preflight {
+    fixtures: Vec<Fixture>,
+    feature_probe: FeatureProbe,
+}
+
+fn preflight(repo_root: &Path, budget: &BudgetManifest) -> Result<Preflight, String> {
+    let fixtures = resolve_fixtures(repo_root, budget)?;
+    let feature_probe = probe_timed_features(repo_root, budget)?;
+    Ok(Preflight {
+        fixtures,
+        feature_probe,
+    })
 }
 
 #[derive(Debug)]
@@ -131,8 +387,10 @@ struct Sample {
 #[derive(Debug, Serialize)]
 struct BuildRecord {
     schema_version: u32,
+    collector_command: Vec<String>,
     timed_build_command: Vec<String>,
     feature_probe_command: Vec<String>,
+    feature_probe_output: Vec<String>,
     verified_features: Vec<String>,
     migration_ledger_enabled: bool,
     timed_binary: String,
@@ -149,10 +407,6 @@ fn collect_correctness(
     budget: &BudgetManifest,
     fixtures: &[Fixture],
 ) -> Result<(), String> {
-    let mut args = budget.method.cargo_flags.clone();
-    args.extend(["--features".to_owned(), MIGRATION_LEDGER_FEATURE.to_owned()]);
-    run_checked(repo_root, "cargo", &prepend("build", &args))?;
-
     for fixture in fixtures
         .iter()
         .filter(|fixture| fixture.role == CorpusRole::Correctness)
@@ -163,6 +417,8 @@ fn collect_correctness(
                 fixture.config, fixture.mode
             ));
         }
+        let args = correctness_build_args(budget, fixture);
+        run_checked(repo_root, "cargo", &prepend("build", &args))?;
         let output = run_checked(
             repo_root,
             &timed_binary_path(repo_root, &budget.method.build_profile)
@@ -179,15 +435,21 @@ fn collect_correctness(
             ));
         }
 
-        let log_path = config_log_path(repo_root, &fixture.config)?;
-        let source = repo_root.join(log_path);
-        let digest_name = format!("{}-terminal-digest.csv", fixture.workload);
+        let source = repo_root.join(&fixture.log_path);
         copy_nonempty(
             &source.join("migration_terminal_digest.csv"),
-            &output_dir.join(digest_name),
+            &output_dir.join(digest_name(fixture)),
         )?;
     }
     Ok(())
+}
+
+fn correctness_build_args(budget: &BudgetManifest, fixture: &Fixture) -> Vec<String> {
+    let mut args = budget.method.cargo_flags.clone();
+    if !fixture.required_features.is_empty() {
+        args.extend(["--features".to_owned(), fixture.required_features.join(",")]);
+    }
+    args
 }
 
 #[derive(Debug)]
@@ -196,15 +458,38 @@ struct TimedBuild {
     binary_hash: String,
 }
 
-fn build_timed_binary(repo_root: &Path, budget: &BudgetManifest) -> Result<TimedBuild, String> {
+#[derive(Debug)]
+struct FeatureProbe {
+    command: Vec<String>,
+    output: Vec<String>,
+    features: BTreeSet<String>,
+}
+
+fn probe_timed_features(repo_root: &Path, budget: &BudgetManifest) -> Result<FeatureProbe, String> {
     reject_feature_flags(&budget.method.cargo_flags)?;
 
     let mut probe_args = prepend("rustc", &budget.method.cargo_flags);
     probe_args.extend(["--".to_owned(), "--print".to_owned(), "cfg".to_owned()]);
     let probe = run_checked(repo_root, "cargo", &probe_args)?;
-    let features = parse_cfg_features(&String::from_utf8_lossy(&probe.stdout));
+    let output: Vec<String> = String::from_utf8_lossy(&probe.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let features = parse_cfg_features(&output.join("\n"));
     verify_timed_features(&features)?;
+    Ok(FeatureProbe {
+        command: prepend("cargo", &probe_args),
+        output,
+        features,
+    })
+}
 
+fn build_timed_binary(
+    repo_root: &Path,
+    output_dir: &Path,
+    budget: &BudgetManifest,
+    feature_probe: FeatureProbe,
+) -> Result<TimedBuild, String> {
     let build_args = prepend("build", &budget.method.cargo_flags);
     run_checked(repo_root, "cargo", &build_args)?;
     let binary = timed_binary_path(repo_root, &budget.method.build_profile);
@@ -214,9 +499,18 @@ fn build_timed_binary(repo_root: &Path, budget: &BudgetManifest) -> Result<Timed
 
     let record = BuildRecord {
         schema_version: 1,
+        collector_command: vec![
+            "cargo".to_owned(),
+            "xtask".to_owned(),
+            "nexosim-baseline".to_owned(),
+            "collect".to_owned(),
+            "--output-dir".to_owned(),
+            relative_path(repo_root, output_dir)?,
+        ],
         timed_build_command: prepend("cargo", &build_args),
-        feature_probe_command: prepend("cargo", &probe_args),
-        verified_features: features.into_iter().collect(),
+        feature_probe_command: feature_probe.command,
+        feature_probe_output: feature_probe.output,
+        verified_features: feature_probe.features.into_iter().collect(),
         migration_ledger_enabled: false,
         timed_binary: relative_path(repo_root, &binary)?,
         timed_binary_hash: binary_hash.clone(),
@@ -429,7 +723,7 @@ fn write_samples(
     samples: &[Sample],
     selections: &BTreeMap<String, String>,
 ) -> Result<(), String> {
-    let mut file = File::create(path).map_err(display_io)?;
+    let mut file = create_new_file(path)?;
     writeln!(
         file,
         "schema_version,workload,mode,selected_mode,repetition,config_path,event_count,sim_execution_ns,sim_execution_events_per_second,end_to_end_ns,end_to_end_events_per_second,simulated_end_time_ns,effective_thread_count,binary_sha256"
@@ -467,7 +761,7 @@ fn write_summary(
     selections: &BTreeMap<String, String>,
     repetitions: usize,
 ) -> Result<(), String> {
-    let mut file = File::create(path).map_err(display_io)?;
+    let mut file = create_new_file(path)?;
     writeln!(
         file,
         "schema_version,workload,mode,selected_mode,sample_count,event_count,sim_execution_median_ns,sim_execution_min_ns,sim_execution_max_ns,sim_execution_median_events_per_second,end_to_end_median_ns,end_to_end_min_ns,end_to_end_max_ns,end_to_end_median_events_per_second"
@@ -530,7 +824,7 @@ fn write_selections(
     samples: &[Sample],
     selections: &BTreeMap<String, String>,
 ) -> Result<(), String> {
-    let mut file = File::create(path).map_err(display_io)?;
+    let mut file = create_new_file(path)?;
     writeln!(
         file,
         "schema_version,workload,selected_mode,selection_timing_boundary,event_count,median_wall_time_ns,median_events_per_second"
@@ -560,7 +854,8 @@ fn write_selections(
 
 fn write_build_record(path: &Path, build: &TimedBuild) -> Result<(), String> {
     let contents = toml::to_string_pretty(&build.record).map_err(|error| error.to_string())?;
-    fs::write(path, contents).map_err(display_io)
+    let mut file = create_new_file(path)?;
+    file.write_all(contents.as_bytes()).map_err(display_io)
 }
 
 fn parse_run_output(text: &str, expected_mode: &str) -> Result<ParsedRun, String> {
@@ -690,10 +985,10 @@ fn reject_feature_flags(flags: &[String]) -> Result<(), String> {
 
 fn config_log_path(repo_root: &Path, config: &str) -> Result<String, String> {
     let input = fs::read_to_string(repo_root.join(config)).map_err(display_io)?;
-    let value = input
-        .parse::<toml::Value>()
+    let table = input
+        .parse::<toml::Table>()
         .map_err(|error| error.to_string())?;
-    value
+    table
         .get("log_path")
         .and_then(toml::Value::as_str)
         .map(str::to_owned)
@@ -761,12 +1056,36 @@ fn prepend(first: &str, rest: &[String]) -> Vec<String> {
 }
 
 fn copy_nonempty(source: &Path, destination: &Path) -> Result<(), String> {
-    let size = fs::metadata(source).map_err(display_io)?.len();
-    if size == 0 {
+    let source_bytes = fs::read(source).map_err(display_io)?;
+    if source_bytes.is_empty() {
         return Err(format!("{} is empty", source.display()));
     }
-    fs::copy(source, destination).map_err(display_io)?;
-    Ok(())
+    if destination.exists() {
+        let destination_bytes = fs::read(destination).map_err(display_io)?;
+        return if source_bytes == destination_bytes {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} differs from regenerated {}",
+                destination.display(),
+                source.display()
+            ))
+        };
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(display_io)?;
+    file.write_all(&source_bytes).map_err(display_io)
+}
+
+fn create_new_file(path: &Path) -> Result<File, String> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(display_io)
 }
 
 fn display_io(error: io::Error) -> String {
@@ -801,13 +1120,147 @@ impl Drop for TemporaryTargetDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        decimal_seconds_to_ns, parse_action_count, parse_cfg_features, self_test,
+        DEFAULT_BUDGET, config_log_path, copy_nonempty, correctness_build_args,
+        decimal_seconds_to_ns, digest_name, parse_action_count, parse_cfg_features,
+        prepare_output_dir, resolve_fixtures, self_test, validate_fixture_features,
         verify_timed_features,
     };
+    use crate::schema::{BudgetManifest, CorpusRole, parse_budget_manifest};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn repository_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has a workspace parent")
+            .to_path_buf()
+    }
+
+    fn frozen_budget() -> BudgetManifest {
+        let root = repository_root();
+        let input = fs::read_to_string(root.join(DEFAULT_BUDGET)).expect("read frozen budget");
+        parse_budget_manifest(&input, &root).expect("parse frozen budget")
+    }
+
+    #[test]
+    fn config_log_path_parses_a_document_with_a_leading_comment() {
+        let repo = TempDir::new().expect("temporary repository");
+        fs::write(
+            repo.path().join("fixture.toml"),
+            "# corpus fixture\nlog_path = \"logs/test\"\n",
+        )
+        .expect("write fixture");
+
+        assert_eq!(
+            config_log_path(repo.path(), "fixture.toml").expect("parse TOML document"),
+            "logs/test"
+        );
+    }
+
+    #[test]
+    fn correctness_resume_does_not_overwrite_an_existing_digest() {
+        let repo = TempDir::new().expect("temporary repository");
+        let source = repo.path().join("source.csv");
+        let destination = repo.path().join("destination.csv");
+        fs::write(&source, "new digest\n").expect("write source");
+        fs::write(&destination, "existing digest\n").expect("write destination");
+
+        assert!(copy_nonempty(&source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(destination).expect("read destination"),
+            "existing digest\n"
+        );
+    }
+
+    #[test]
+    fn frozen_corpus_features_are_satisfiable_and_timed_entries_are_empty() {
+        let root = repository_root();
+        let budget = frozen_budget();
+        let fixtures = resolve_fixtures(&root, &budget).expect("resolve frozen corpus");
+        assert_eq!(fixtures.len(), 13);
+        assert!(
+            fixtures
+                .iter()
+                .filter(|fixture| fixture.role == CorpusRole::Performance)
+                .all(|fixture| fixture.required_features.is_empty())
+        );
+
+        let dcqcn = fixtures
+            .iter()
+            .find(|fixture| fixture.workload == "leanguard-dcqcn")
+            .expect("DCQCN fixture");
+        assert_eq!(
+            dcqcn.required_features,
+            ["migration_ledger", "l2_pfc", "dcqcn"]
+        );
+        assert_eq!(
+            correctness_build_args(&budget, dcqcn),
+            [
+                "--locked",
+                "--release",
+                "--bin",
+                "days",
+                "--features",
+                "migration_ledger,l2_pfc,dcqcn",
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_unknown_and_performance_features() {
+        let available: BTreeSet<String> = ["migration_ledger", "dcqcn"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            validate_fixture_features(
+                "correctness.toml",
+                "st",
+                CorpusRole::Correctness,
+                &["migration_ledger".to_owned(), "missing".to_owned()],
+                &available,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fixture_features(
+                "performance.toml",
+                "st",
+                CorpusRole::Performance,
+                &["migration_ledger".to_owned()],
+                &available,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_output_requires_an_ordered_correctness_prefix() {
+        let root = repository_root();
+        let budget = frozen_budget();
+        let fixtures = resolve_fixtures(&root, &budget).expect("resolve frozen corpus");
+        let output = TempDir::new().expect("temporary output");
+        let correctness: Vec<_> = fixtures
+            .iter()
+            .filter(|fixture| fixture.role == CorpusRole::Correctness)
+            .collect();
+
+        for fixture in correctness.iter().take(4) {
+            fs::write(output.path().join(digest_name(fixture)), "digest\n")
+                .expect("write prefix digest");
+        }
+        prepare_output_dir(output.path(), &fixtures).expect("accept strict prefix");
+
+        fs::write(output.path().join(digest_name(correctness[4])), "digest\n")
+            .expect("write complete correctness set");
+        assert!(prepare_output_dir(output.path(), &fixtures).is_err());
+    }
 
     #[test]
     fn baseline_runner_self_test_passes() {
-        self_test().expect("baseline runner self-test");
+        self_test(&repository_root()).expect("baseline runner self-test");
     }
 
     #[test]

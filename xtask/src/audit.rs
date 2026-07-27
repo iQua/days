@@ -1799,10 +1799,10 @@ fn load_evidence(
         }
     };
 
-    if let Ok(value) = contents.parse::<toml::Value>() {
-        let has_budget = value.get("budget").is_some();
-        let has_budget_hash = value.get("budget_hash").is_some();
-        let is_measurement = value
+    if let Ok(table) = contents.parse::<toml::Table>() {
+        let has_budget = table.get("budget").is_some();
+        let has_budget_hash = table.get("budget_hash").is_some();
+        let is_measurement = table
             .get("kind")
             .and_then(toml::Value::as_str)
             .is_some_and(|kind| kind == "measurement");

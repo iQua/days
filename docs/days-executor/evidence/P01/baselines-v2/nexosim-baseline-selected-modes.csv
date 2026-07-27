@@ -1,0 +1,5 @@
+schema_version,workload,selected_mode,selection_timing_boundary,event_count,median_wall_time_ns,median_events_per_second
+1,fattree-k16-f512,st,sim_execution,3751102,1746260375,2148077.144567
+1,fattree-k32-f4096,mt,sim_execution,21600888,7150468958,3020905.080055
+1,fattree-k4-f8,st,sim_execution,54072,20691875,2613199.625457
+1,fattree-k8-f64,st,sim_execution,467852,196256958,2383874.715922

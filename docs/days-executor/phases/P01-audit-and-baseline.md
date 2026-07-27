@@ -130,10 +130,10 @@ The F3/A evidence remains in the repository as an honest historical record,
 but its measurement manifest is no longer live task evidence. It is superseded
 because review required budget schema and method changes and because its
 recorded producer, `/private/tmp/t1_f3_runner`, was not reproducible from the
-repository. A future F4 freeze will be followed by an A2 measurement at new
-`baselines-v2` paths and a B2 binding. New paths let the audit prove each
-artifact was introduced after the freeze. No commit SHA is guessed before
-those commits exist.
+repository. The A2 records under `baselines-v2` are authoritative for the F4
+budget. New paths let the audit prove each artifact was introduced after the
+freeze. B2 will bind the result after the owner commits A2; P01 does not guess
+that commit SHA.
 
 The checked-in `cargo xtask nexosim-baseline collect` runner is the only
 producer for A2. It builds timed Days with the exact frozen Cargo flags, asks
@@ -144,6 +144,42 @@ guard, and wall-time floor. A separate untimed `perf_stats` build obtains the
 Nexosim event count, so event counting does not contaminate either timed
 boundary. The v2 sample and summary schemas carry the event count, both
 events-per-second figures, and the selected-mode outcome.
+
+The first committed runner self-test exercised hardcoded output strings but
+never opened a corpus config. It stayed green while the collector failed on
+the leading comment in the first fixture, which gave a false signal that the
+real input path worked. A2 parses complete TOML documents with `toml::Table`.
+Its self-test loads the frozen budget and resolves `log_path` through the
+production parser for all thirteen corpus entries.
+
+The collector now performs cheap validation before it starts a simulator
+process. It parses the budget, validates the new output path, resolves every
+corpus config and `log_path`, rejects feature-bearing timed Cargo flags, and
+runs the timed feature probe. It creates the output directory after those
+checks pass. The remaining order is correctness collection, a clean timed
+build, untimed event counting, three warmup rounds, fifteen recorded rounds,
+and artifact emission. The timed build follows correctness because the
+correctness build enables `migration_ledger` in the shared release target.
+
+P01 names a second runner failure class: declared-but-unenforced metadata. The
+corpus carried `mode = "default"` for the original TCP entry, but no tool
+enforced the ST characterization requirement. The corpus later declared the
+DCQCN feature set, while the runner built every correctness fixture with
+`migration_ledger` alone. In both cases the declaration was correct and the
+consumer ignored it. Preflight now joins the retirement-corpus entries to the
+frozen budget in order, checks their duplicated identity and hash fields,
+validates their commands, verifies each required feature against
+`Cargo.toml`, and rejects a featured performance entry.
+
+Some declarations still have limited enforcement. `model_scope` remains a
+nonempty description. The runner checks that `comparison_boundary` matches the
+budget enum, but no audit proves that a produced artifact supports that
+boundary. The runner validates each optional `ledger_path` and `ledger_hash`
+as a pair, while `tests/migration_ledger.rs` still hardcodes the three golden
+paths with `include_bytes!`. The ledger comparisons are real, but the test
+does not consume those manifest fields. P01 records that coupling as later
+audit work because changing the golden test is separate from the A2 runner
+repair.
 
 The budget reference also has a stable `id`, an owning phase, and required
 consumer phases. A present P23 phase must cite the same frozen tuple rather
@@ -245,6 +281,66 @@ enforced the frozen 5 ms sample floor. The smallest recorded primary sample was
 20.440958 ms, so no sample failed the floor. The complete paths, hashes,
 commands, roles, modes, and boundaries are in
 `docs/days-executor/evidence/P01/retirement-corpus.toml`.
+
+### A2 Nexosim reference
+
+The repository command
+`cargo xtask nexosim-baseline collect --output-dir
+docs/days-executor/evidence/P01/baselines-v2` produced the authoritative A2
+records. The build record captures the same argv. It also records
+`cargo rustc --locked --release --bin days -- --print cfg`, the complete probe
+output, `verified_features = []`, and `migration_ledger_enabled = false`.
+The probe output contains no Cargo `feature="..."` line. The timed build used
+`cargo build --locked --release --bin days` and produced binary hash
+`sha256:a9717b7028e8aff1e75f05388810b36dac46ee37299b536af84054058e4b0e93`.
+
+The runner recorded 120 unique samples, fifteen for each workload and mode.
+Each sample reached `1500000000000` simulated nanoseconds. ST samples used one
+thread and MT samples used eighteen. The shortest primary sample was
+20.595125 ms, above the frozen 5 ms floor. Each `end_to_end` value was at least
+its corresponding `sim_execution` value.
+
+The table reports seconds as median `[minimum, maximum]`:
+
+| Workload | Mode | `sim_execution` | `end_to_end` |
+| --- | --- | ---: | ---: |
+| k4/f8 | ST | 0.020691875 [0.020595125, 0.021001833] | 0.023660583 [0.023467000, 0.024032500] |
+| k4/f8 | MT | 0.152690417 [0.151515375, 0.153556000] | 0.155797583 [0.154507542, 0.156479750] |
+| k8/f64 | ST | 0.196256958 [0.195395625, 0.197306791] | 0.199970834 [0.199019583, 0.201502792] |
+| k8/f64 | MT | 0.426733583 [0.424715916, 0.436690833] | 0.431526583 [0.429198209, 0.441502167] |
+| k16/f512 | ST | 1.746260375 [1.733728041, 1.775687875] | 1.768118458 [1.755817334, 1.797556750] |
+| k16/f512 | MT | 1.936089708 [1.918802292, 1.993304958] | 1.964281458 [1.946003875, 2.021970542] |
+| k32/f4096 | ST | 14.452573792 [14.312242417, 15.750409917] | 15.622496417 [15.489812959, 16.998490417] |
+| k32/f4096 | MT | 7.150468958 [7.094004667, 7.436040125] | 8.368827041 [8.291108584, 8.645161708] |
+
+Applying the frozen rule selects:
+
+| Workload | Mode | Events | Median primary events/s |
+| --- | --- | ---: | ---: |
+| k4/f8 | ST | 54,072 | 2,613,199.625457 |
+| k8/f64 | ST | 467,852 | 2,383,874.715922 |
+| k16/f512 | ST | 3,751,102 | 2,148,077.144567 |
+| k32/f4096 | MT | 21,600,888 | 3,020,905.080055 |
+
+The medians changed from the superseded record as follows. Negative percentages
+mean the A2 run completed faster:
+
+| Workload | Mode | `sim_execution` old → A2 | Delta | `end_to_end` old → A2 | Delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| k4/f8 | ST | 0.020637416 → 0.020691875 | +0.264% | 0.024702500 → 0.023660583 | -4.218% |
+| k4/f8 | MT | 0.151459833 → 0.152690417 | +0.812% | 0.155970250 → 0.155797583 | -0.111% |
+| k8/f64 | ST | 0.202448375 → 0.196256958 | -3.058% | 0.208347959 → 0.199970834 | -4.021% |
+| k8/f64 | MT | 0.434011542 → 0.426733583 | -1.677% | 0.440528500 → 0.431526583 | -2.043% |
+| k16/f512 | ST | 1.880578541 → 1.746260375 | -7.142% | 1.905630292 → 1.768118458 | -7.216% |
+| k16/f512 | MT | 1.945811083 → 1.936089708 | -0.500% | 1.976358750 → 1.964281458 | -0.611% |
+| k32/f4096 | ST | 17.386321625 → 14.452573792 | -16.874% | 18.615065084 → 15.622496417 | -16.076% |
+| k32/f4096 | MT | 7.994751958 → 7.150468958 | -10.560% | 9.262936375 → 8.368827041 | -9.653% |
+
+The crossover remains between k16/f512 and k32/f4096, a shift of zero measured
+workload steps. The MT/ST primary ratio at k16 rose from `1.034687486` to
+`1.108706202`; ST remains selected. At k32 it rose from `0.459829982` to
+`0.494754018`; MT remains selected, with the ST/MT speed ratio decreasing from
+`2.174716828` to `2.021206425`.
 
 ### Superseded F3/A Nexosim reference
 
