@@ -207,6 +207,9 @@ argv = ["cargo", "--version"]
 deterministic = true
 
 [[budgets]]
+id = "p90-fixture-budget"
+owner_phase = "P90"
+required_consumers = []
 path = "docs/days-executor/budgets/p90-fixture.toml"
 content_hash = "{budget_hash}"
 frozen_at_commit = "{frozen_commit}"
@@ -216,7 +219,7 @@ frozen_at_commit = "{frozen_commit}"
 
 fn budget_manifest(corpus_hash: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
@@ -251,6 +254,11 @@ st_mode = "nexosim-st"
 mt_mode = "nexosim-mt"
 best_exact_mode_rule = "lowest median sim_execution among exact Nexosim CPU modes"
 
+[[method.resolved_defaults]]
+name = "mailbox-capacity"
+value = "16 entries"
+source = "src/topos/topo.rs"
+
 [admission]
 evaluated_at = "P23"
 statistic = "geometric mean of paired throughput ratios"
@@ -259,9 +267,12 @@ confidence_rule = "two-sided 95 percent paired-bootstrap interval"
 [[admission.thresholds]]
 name = "fixture"
 metric = "wall-time"
+metric_kind = "wall-time"
 comparison = "<="
 value = 1.0
 unit = "second"
+applies_to = "p90-fixture"
+timing_boundary = "sim_execution"
 
 [[corpus]]
 path = "configs/migration/p90-fixture.toml"
@@ -573,6 +584,14 @@ fn valid_fixture_passes() {
 }
 
 #[test]
+fn honest_freeze_measurement_binding_sequence_passes() {
+    let fixture = Fixture::new();
+
+    let report = fixture.audit();
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+}
+
+#[test]
 fn malformed_phase_metadata_is_rejected() {
     let fixture = Fixture::new();
     fs::write(fixture.phase_path(), "schema_version = [").expect("truncate metadata");
@@ -866,7 +885,7 @@ fn malformed_budget_manifest_is_rejected() {
     write(
         fixture.root(),
         "docs/days-executor/budgets/p90-fixture.toml",
-        "schema_version = 3\n",
+        "schema_version = 4\n",
     );
     assert_code_message(&fixture.audit(), "DAYS-AUDIT-0011", "TOML");
 }
@@ -977,6 +996,158 @@ fn budget_frozen_before_measurement_passes() {
     let run_commit = run_output(fixture.root(), &["rev-parse", "HEAD"]);
     mutate(&fixture.measurement_path(), |value| {
         value.replace(&fixture.measurement_commit, &run_commit)
+    });
+
+    let report = fixture.audit();
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+}
+
+#[test]
+fn measurement_artifact_precomputed_at_freeze_is_rejected() {
+    let fixture = Fixture::new();
+    let measurement_hash = file_hash(
+        &fixture
+            .root()
+            .join("docs/days-executor/evidence/P90/measurement.txt"),
+    );
+    let frozen_hash = file_hash(
+        &fixture
+            .root()
+            .join("docs/days-executor/evidence/P90/golden.txt"),
+    );
+    run(
+        fixture.root(),
+        &["commit", "--allow-empty", "-q", "-m", "Declare empty run"],
+    );
+    let empty_run = run_output(fixture.root(), &["rev-parse", "HEAD"]);
+    mutate(&fixture.measurement_path(), |value| {
+        value
+            .replace(&fixture.measurement_commit, &empty_run)
+            .replace(
+                "docs/days-executor/evidence/P90/measurement.txt",
+                "docs/days-executor/evidence/P90/golden.txt",
+            )
+            .replace(&measurement_hash, &frozen_hash)
+    });
+
+    let report = fixture.audit();
+    assert_code_message(
+        &report,
+        "DAYS-AUDIT-0026",
+        "was not introduced after frozen_at_commit",
+    );
+    assert_code_message(
+        &report,
+        "DAYS-AUDIT-0026",
+        "already had identical content at frozen_at_commit",
+    );
+}
+
+#[test]
+fn merge_in_measurement_history_is_rejected() {
+    let fixture = Fixture::new();
+    let primary_branch = run_output(fixture.root(), &["branch", "--show-current"]);
+    run(
+        fixture.root(),
+        &[
+            "checkout",
+            "-q",
+            "-b",
+            "measurement-side",
+            &fixture.measurement_commit,
+        ],
+    );
+    write(
+        fixture.root(),
+        "audit/measurement-side.rs",
+        "fn measurement_side() {}\n",
+    );
+    run(fixture.root(), &["add", "audit/measurement-side.rs"]);
+    run(
+        fixture.root(),
+        &["commit", "-q", "-m", "Add measurement side branch"],
+    );
+    run(fixture.root(), &["checkout", "-q", &primary_branch]);
+    run(
+        fixture.root(),
+        &[
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "Merge measurement side branch",
+            "measurement-side",
+        ],
+    );
+    let merge_run = run_output(fixture.root(), &["rev-parse", "HEAD"]);
+    mutate(&fixture.measurement_path(), |value| {
+        value.replace(&fixture.measurement_commit, &merge_run)
+    });
+
+    assert_code_message(
+        &fixture.audit(),
+        "DAYS-AUDIT-0026",
+        "contains merge commit(s)",
+    );
+}
+
+#[test]
+fn budget_manifest_identity_must_match_phase_reference() {
+    let fixture = Fixture::new();
+    fixture.mutate_phase(|value| {
+        value.replace("id = \"p90-fixture-budget\"", "id = \"different-budget\"")
+    });
+
+    assert_code_message(
+        &fixture.audit(),
+        "DAYS-AUDIT-0011",
+        "does not match manifest identity",
+    );
+}
+
+#[test]
+fn declared_budget_consumer_must_reuse_frozen_identity() {
+    let fixture = Fixture::new();
+    add_secondary_phase(&fixture, "P91", "consumer", &[], true);
+    fixture.mutate_phase(|value| {
+        value.replace("required_consumers = []", "required_consumers = [\"P91\"]")
+    });
+
+    assert_code_message(
+        &fixture.audit(),
+        "DAYS-AUDIT-0027",
+        "phase P91 must cite frozen budget p90-fixture-budget",
+    );
+}
+
+#[test]
+fn declared_budget_consumer_can_reuse_frozen_identity() {
+    let fixture = Fixture::new();
+    add_secondary_phase(&fixture, "P91", "consumer", &[], true);
+    fixture.mutate_phase(|value| {
+        value.replace("required_consumers = []", "required_consumers = [\"P91\"]")
+    });
+    let consumer_path = fixture
+        .root()
+        .join("docs/days-executor/phases/P91-consumer.toml");
+    mutate(&consumer_path, |value| {
+        format!(
+            r#"{value}
+[[budgets]]
+id = "p90-fixture-budget"
+owner_phase = "P90"
+required_consumers = []
+path = "docs/days-executor/budgets/p90-fixture.toml"
+content_hash = "{}"
+frozen_at_commit = "{}"
+"#,
+            file_hash(
+                &fixture
+                    .root()
+                    .join("docs/days-executor/budgets/p90-fixture.toml")
+            ),
+            fixture.frozen_commit
+        )
     });
 
     let report = fixture.audit();
@@ -1255,7 +1426,7 @@ fn budget_without_thresholds_is_rejected() {
         fixture.root(),
         "docs/days-executor/budgets/p90-fixture.toml",
         &format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
@@ -1289,6 +1460,11 @@ resampling_seed = 1776
 st_mode = "nexosim-st"
 mt_mode = "nexosim-mt"
 best_exact_mode_rule = "lowest median sim_execution among exact Nexosim CPU modes"
+
+[[method.resolved_defaults]]
+name = "mailbox-capacity"
+value = "16 entries"
+source = "src/topos/topo.rs"
 
 [admission]
 evaluated_at = "P23"

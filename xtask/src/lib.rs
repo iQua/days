@@ -4,6 +4,7 @@
 //! `docs/days-executor/audit-contract.md` at the workspace root.
 
 pub mod audit;
+pub mod baseline;
 pub mod dependency_baseline;
 pub mod diagnostics;
 pub mod hash;

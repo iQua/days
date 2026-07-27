@@ -1,5 +1,6 @@
 //! Performance-budget manifest schema.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ pub const REQUIRED_WAIVER_POLICY: &str =
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetManifest {
-    /// Schema version. Only version 3 is accepted.
+    /// Schema version. Only version 4 is accepted.
     pub schema_version: SchemaVersion,
     /// Stable budget identifier.
     pub id: String,
@@ -55,13 +56,13 @@ impl BudgetManifest {
         validate_nonempty("description", &self.description)?;
         self.platform.validate()?;
         self.method.validate()?;
-        self.admission.validate()?;
         if self.corpus.is_empty() {
             return Err(invalid("corpus", "must contain at least one entry"));
         }
         for entry in &self.corpus {
             entry.validate(repo_root)?;
         }
+        self.admission.validate(&self.corpus)?;
         self.waiver.validate()?;
         Ok(())
     }
@@ -143,6 +144,8 @@ pub struct BudgetMethod {
     pub mt_mode: String,
     /// Rule selecting the best exact Nexosim CPU mode.
     pub best_exact_mode_rule: String,
+    /// Implicit configuration values that affect the declared measurement.
+    pub resolved_defaults: Vec<BudgetResolvedDefault>,
 }
 
 impl BudgetMethod {
@@ -191,7 +194,44 @@ impl BudgetMethod {
         validate_nonempty("method.resampling_prng", &self.resampling_prng)?;
         validate_nonempty("method.st_mode", &self.st_mode)?;
         validate_nonempty("method.mt_mode", &self.mt_mode)?;
-        validate_nonempty("method.best_exact_mode_rule", &self.best_exact_mode_rule)
+        validate_nonempty("method.best_exact_mode_rule", &self.best_exact_mode_rule)?;
+        if self.resolved_defaults.is_empty() {
+            return Err(invalid(
+                "method.resolved_defaults",
+                "must contain at least one resolved default",
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for default in &self.resolved_defaults {
+            default.validate()?;
+            if !names.insert(&default.name) {
+                return Err(invalid(
+                    "method.resolved_defaults.name",
+                    &format!("duplicate resolved default `{}`", default.name),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One configuration input inherited from production code rather than corpus bytes.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetResolvedDefault {
+    /// Stable name of the implicit input.
+    pub name: String,
+    /// Exact resolved value and unit.
+    pub value: String,
+    /// Production source location and expression.
+    pub source: String,
+}
+
+impl BudgetResolvedDefault {
+    fn validate(&self) -> Result<(), SchemaError> {
+        validate_nonempty("method.resolved_defaults.name", &self.name)?;
+        validate_nonempty("method.resolved_defaults.value", &self.value)?;
+        validate_nonempty("method.resolved_defaults.source", &self.source)
     }
 }
 
@@ -210,7 +250,7 @@ pub struct BudgetAdmission {
 }
 
 impl BudgetAdmission {
-    fn validate(&self) -> Result<(), SchemaError> {
+    fn validate(&self, corpus: &[BudgetCorpusEntry]) -> Result<(), SchemaError> {
         if self.evaluated_at != "P23" {
             return Err(invalid("admission.evaluated_at", "must equal `P23`"));
         }
@@ -223,7 +263,7 @@ impl BudgetAdmission {
             ));
         }
         for threshold in &self.thresholds {
-            threshold.validate()?;
+            threshold.validate(corpus)?;
         }
         Ok(())
     }
@@ -300,6 +340,12 @@ pub struct BudgetThreshold {
     pub name: String,
     /// Metric being bounded.
     pub metric: String,
+    /// Machine-readable class used to validate timing-boundary requirements.
+    pub metric_kind: ThresholdMetricKind,
+    /// Corpus-level scope or the stable identifier of one workload.
+    pub applies_to: String,
+    /// Wall-time scope used by a timing metric.
+    pub timing_boundary: Option<TimingBoundary>,
     /// Comparison operator.
     pub comparison: String,
     /// Numeric comparison value.
@@ -309,9 +355,36 @@ pub struct BudgetThreshold {
 }
 
 impl BudgetThreshold {
-    fn validate(&self) -> Result<(), SchemaError> {
+    fn validate(&self, corpus: &[BudgetCorpusEntry]) -> Result<(), SchemaError> {
         validate_nonempty("admission.thresholds.name", &self.name)?;
         validate_nonempty("admission.thresholds.metric", &self.metric)?;
+        validate_nonempty("admission.thresholds.applies_to", &self.applies_to)?;
+        if self.applies_to != "corpus"
+            && !corpus.iter().any(|entry| entry.workload == self.applies_to)
+        {
+            return Err(invalid(
+                "admission.thresholds.applies_to",
+                &format!(
+                    "must equal `corpus` or name a workload present in the corpus; found `{}`",
+                    self.applies_to
+                ),
+            ));
+        }
+        match (self.metric_kind.is_timing(), self.timing_boundary) {
+            (true, None) => {
+                return Err(invalid(
+                    "admission.thresholds.timing_boundary",
+                    "is required for wall-time and throughput metrics",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(invalid(
+                    "admission.thresholds.timing_boundary",
+                    "must be absent for byte and count metrics",
+                ));
+            }
+            _ => {}
+        }
         if !matches!(self.comparison.as_str(), "<" | "<=" | ">" | ">=" | "==") {
             return Err(invalid(
                 "admission.thresholds.comparison",
@@ -323,6 +396,36 @@ impl BudgetThreshold {
         }
         validate_nonempty("admission.thresholds.unit", &self.unit)
     }
+}
+
+/// Machine-readable threshold metric class.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThresholdMetricKind {
+    /// Elapsed wall-clock duration, including compile latency.
+    WallTime,
+    /// Work completed per unit of wall-clock duration.
+    Throughput,
+    /// Byte-valued memory or storage quantity.
+    Bytes,
+    /// Integer-valued capacity or cardinality.
+    Count,
+}
+
+impl ThresholdMetricKind {
+    fn is_timing(self) -> bool {
+        matches!(self, Self::WallTime | Self::Throughput)
+    }
+}
+
+/// Wall-time scope selected by one timing threshold.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingBoundary {
+    /// Simulator execution loop only.
+    SimExecution,
+    /// Whole declared measurement command.
+    EndToEnd,
 }
 
 /// Reviewed authority and policy for threshold exceptions.

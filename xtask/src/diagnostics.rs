@@ -193,13 +193,13 @@ pub static REGISTRY: &[DiagnosticDefinition] = &[
         code: "DAYS-AUDIT-0026",
         slug: "budget-freeze-invalid",
         severity: Severity::Error,
-        summary: "A budget freeze commit is missing or unverifiable, contains different budget content, or does not strictly precede its measurement commit",
+        summary: "A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites an artifact not introduced after the freeze",
     },
     DiagnosticDefinition {
         code: "DAYS-AUDIT-0027",
         slug: "measurement-evidence-invalid",
         severity: Severity::Error,
-        summary: "Measurement evidence omits its required budget, budget hash, or run commit, or a declared budget has no citing measurement",
+        summary: "Measurement evidence omits its required binding, a declared budget has no citing measurement, or a required consumer does not reuse the exact frozen budget identity",
     },
     DiagnosticDefinition {
         code: "DAYS-AUDIT-0028",

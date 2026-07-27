@@ -413,7 +413,7 @@ impl Topology {
 
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-        let duration = ui_config.duration.unwrap_or(1500.);
+        let duration = simulation_duration(ui_config.duration);
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -1551,6 +1551,12 @@ impl Topology {
     }
 }
 
+const DEFAULT_SIMULATION_DURATION_SECONDS: f64 = 1500.0;
+
+fn simulation_duration(configured_duration: Option<f64>) -> f64 {
+    configured_duration.unwrap_or(DEFAULT_SIMULATION_DURATION_SECONDS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,9 +1587,8 @@ mod tests {
 
     #[test]
     fn default_simulation_duration_is_pinned_to_1500_seconds() {
-        assert!(
-            include_str!("topo.rs").contains("let duration = ui_config.duration.unwrap_or(1500.);")
-        );
+        assert_eq!(simulation_duration(None), 1500.0);
+        assert_eq!(simulation_duration(Some(42.0)), 42.0);
     }
 
     #[test]

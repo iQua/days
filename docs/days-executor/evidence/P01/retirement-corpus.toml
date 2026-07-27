@@ -14,6 +14,8 @@ role = "correctness"
 model_scope = "v1-open-loop-udp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/explicit.toml"]
+ledger_path = "docs/days-executor/evidence/P01/ledgers-v1/explicit-ledger.csv"
+ledger_hash = "sha256:6cf117e0373e4fa2b6fb7f4897c81be8cf22f7257d67a8f62a72e69313d32b7e"
 
 [[fixtures]]
 path = "configs/migration/torus.toml"
@@ -25,6 +27,8 @@ role = "correctness"
 model_scope = "v1-open-loop-udp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/torus.toml"]
+ledger_path = "docs/days-executor/evidence/P01/ledgers-v1/torus-ledger.csv"
+ledger_hash = "sha256:616e30ae5bb6f610921fadcb577c689baf5f71c5e38639eedb45fad5e2045c5e"
 
 [[fixtures]]
 path = "configs/migration/fattree.toml"
@@ -36,6 +40,8 @@ role = "correctness"
 model_scope = "v1-open-loop-udp"
 required_features = ["migration_ledger"]
 command = ["cargo", "run", "--quiet", "--features", "migration_ledger", "--bin", "days", "--", "configs/migration/fattree.toml"]
+ledger_path = "docs/days-executor/evidence/P01/ledgers-v1/fattree-ledger.csv"
+ledger_hash = "sha256:89f725ad3103c66fbf33c64112d25947732768695861a606981c7b994ab39f65"
 
 [[fixtures]]
 path = "configs/migration/tcp_simple_st.toml"

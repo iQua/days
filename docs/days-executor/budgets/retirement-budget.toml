@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 id = "days-executor-retirement"
 phase = "P01"
 frozen_at = "2026-07-26"
@@ -27,33 +27,109 @@ sim_execution_boundary = "Primary std::time::Instant starts immediately before s
 end_to_end_boundary = "Secondary std::time::Instant in the runner starts before spawning target/release/days and stops after child exit. It includes process startup, configuration parsing, topology construction, simulation, concurrency-sampler shutdown, statistics collection, logger flush, and process teardown."
 minimum_sample_wall_time_seconds = 0.005
 effective_simulation_duration_seconds = 1500.0
-effective_simulation_duration_source = "UIConfig.duration defaults through ui_config.duration.unwrap_or(1500.) at src/topos/topo.rs:416 because the performance corpus files omit top-level duration"
+effective_simulation_duration_source = "UIConfig.duration resolves through simulation_duration at src/topos/topo.rs:416 to DEFAULT_SIMULATION_DURATION_SECONDS at src/topos/topo.rs:1554-1557 because the performance corpus files omit top-level duration"
 sample_simulated_end_time_rule = "Every measurement record captures the logged effective simulated end time; the runner rejects a value unequal to 1500.0 seconds."
 sample_effective_thread_count_rule = "Every measurement record captures the logged effective thread count. The runner requires 1 for ST and rejects MT unless the observed num_cpus::get() result equals platform.expected_num_cpus."
 run_order = "Correctness entries are not timed. Run three unrecorded warmup rounds, then fifteen recorded rounds. Within each round run performance entries in manifest order: k4 ST, k4 MT, k8 ST, k8 MT, k16 ST, k16 MT, k32 ST, k32 MT."
-pairing_order = "P01 records ST and MT repetition i for each workload without selecting a winner. At P23 pair candidate repetition i with repetition i of the selected Nexosim reference mode for that workload; never reorder samples by observed value."
-resampling_algorithm = "At P23 perform 10000 paired bootstrap resamples. For each workload sample fifteen paired repetition indices with replacement, compute the median candidate-to-reference throughput ratio, then compute the corpus geometric mean. The two-sided 95 percent interval uses one-based sorted resample ranks 250 and 9750."
-resampling_prng = "SplitMix64 with 64-bit wrapping arithmetic; choose each paired index as next_u64 modulo 15"
+pairing_order = "Repetition index records acquisition order only and is not a paired experimental unit. P23 compares independent candidate and reference samples without pairing historical ordinal indices or reordering either sample set by observed value."
+resampling_algorithm = "At P23 perform 10000 unpaired bootstrap resamples. For each workload independently sample fifteen candidate indices and fifteen selected-reference indices with replacement, compute their median sim_execution wall times and the resulting throughput ratio, then compute the corpus geometric mean. The two-sided 95 percent interval uses one-based sorted resample ranks 250 and 9750."
+resampling_prng = "SplitMix64 with 64-bit wrapping arithmetic; draw every candidate and reference index independently as next_u64 modulo 15"
 resampling_seed = 2026072601
-st_mode = "Nexosim ST: threading = single; observed effective thread count must be 1"
-mt_mode = "Nexosim MT: threading = multiple; num_threads is absent from the corpus and resolves through num_cpus::get(); observed effective thread count must equal platform.expected_num_cpus"
-best_exact_mode_rule = "Evaluated at P23 only: for each workload select the exact Nexosim CPU mode, ST or MT, with the lower median primary sim_execution wall time across the fifteen P01 samples; break an exact median tie in favor of ST. P01 records both modes and makes no selection."
+st_mode = "Nexosim ST configuration: threading = single; concurrency_level and hot_workers are absent; observed effective thread count must be 1"
+mt_mode = "Nexosim MT accelerated configuration: threading = multiple; concurrency_level = accelerated; hot_workers = 2; num_threads is absent and resolves through num_cpus::get(); observed effective thread count must equal platform.expected_num_cpus"
+best_exact_mode_rule = "Applied when the immutable P01 result is recorded: for each workload select the declared ST configuration or differently tuned MT accelerated configuration with the lower median primary sim_execution wall time across the fifteen samples; break an exact median tie in favor of ST. This is not a pure threading contrast. The budget freezes only this rule; the postmeasurement artifact records the selected mode and events-per-second outcome."
+
+[[method.resolved_defaults]]
+name = "mailbox-capacity"
+value = "16 entries, capped at usize::MAX / 2 + 1"
+source = "src/topos/topo.rs:405-412; mailbox_capacity absent from every performance corpus file"
+
+[[method.resolved_defaults]]
+name = "time-quantum"
+value = "disabled (None)"
+source = "src/topos/topo.rs:489-493; time_quantum_ns absent from every performance corpus file"
+
+[[method.resolved_defaults]]
+name = "user-interface-schedule"
+value = "duration 1.0 simulated second; interval 0.01 simulated second; periodic UI events scheduled"
+source = "src/utils/ui.rs:31-38 and 96-112; UI duration and ui_interval absent from every performance corpus file"
+
+[[method.resolved_defaults]]
+name = "periodic-reporting"
+value = "disabled during the 1500.0-second run by interval f64::MAX"
+source = "src/utils/logger.rs:540-554; report_interval absent from every performance corpus file"
+
+[[method.resolved_defaults]]
+name = "link-mode"
+value = "none"
+source = "src/topos/topo.rs:515-519; link configuration absent from every performance corpus file"
+
+[[method.resolved_defaults]]
+name = "fifo-run-batch-size"
+value = "1 packet"
+source = "src/schedulers/port.rs:92-96; compile-time FIFO scheduler default"
+
+[[method.resolved_defaults]]
+name = "routing"
+value = "shortest-path"
+source = "src/flows/flow.rs:139-157; routing absent from every performance corpus flow"
+
+[[method.resolved_defaults]]
+name = "flow-priority"
+value = "0"
+source = "src/flows/flow.rs:116-123; priority absent from every performance corpus flow"
 
 [admission]
 evaluated_at = "P23"
-statistic = "Per-workload median wall time; corpus score is the geometric mean of candidate-to-best-exact-Nexosim-CPU throughput ratios."
-confidence_rule = "Use a deterministic 10000-resample paired bootstrap with a two-sided 95 percent confidence interval. Admission requires the geometric-mean lower bound to meet its threshold and each workload's median regression to meet its threshold."
+statistic = "Per-workload independent-sample median sim_execution wall time; corpus score is the geometric mean of candidate-to-selected-exact-Nexosim-configuration throughput ratios."
+confidence_rule = "Use the frozen deterministic 10000-resample unpaired bootstrap with a two-sided 95 percent confidence interval. Admission requires the geometric-mean lower bound to meet its threshold and each workload's median regression to meet its threshold."
 
 [[admission.thresholds]]
 name = "geometric_mean_no_regression"
 metric = "Lower 95 percent confidence bound of the geometric mean of candidate-to-best-exact-Nexosim-CPU throughput ratios"
+metric_kind = "throughput"
+applies_to = "corpus"
+timing_boundary = "sim_execution"
 comparison = ">="
 value = 1.0
 unit = "ratio"
 
 [[admission.thresholds]]
-name = "per_workload_regression"
-metric = "Candidate median wall-time regression versus the best exact Nexosim CPU mode for each workload"
+name = "fattree_k4_f8_regression"
+metric = "Candidate median wall-time regression versus the selected exact Nexosim configuration"
+metric_kind = "wall-time"
+applies_to = "fattree-k4-f8"
+timing_boundary = "sim_execution"
+comparison = "<="
+value = 20.0
+unit = "percent"
+
+[[admission.thresholds]]
+name = "fattree_k8_f64_regression"
+metric = "Candidate median wall-time regression versus the selected exact Nexosim configuration"
+metric_kind = "wall-time"
+applies_to = "fattree-k8-f64"
+timing_boundary = "sim_execution"
+comparison = "<="
+value = 20.0
+unit = "percent"
+
+[[admission.thresholds]]
+name = "fattree_k16_f512_regression"
+metric = "Candidate median wall-time regression versus the selected exact Nexosim configuration"
+metric_kind = "wall-time"
+applies_to = "fattree-k16-f512"
+timing_boundary = "sim_execution"
+comparison = "<="
+value = 20.0
+unit = "percent"
+
+[[admission.thresholds]]
+name = "fattree_k32_f4096_regression"
+metric = "Candidate median wall-time regression versus the selected exact Nexosim configuration"
+metric_kind = "wall-time"
+applies_to = "fattree-k32-f4096"
+timing_boundary = "sim_execution"
 comparison = "<="
 value = 20.0
 unit = "percent"

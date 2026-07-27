@@ -17,7 +17,7 @@ fn frozen_retirement_budget_matches_schema_and_corpus() {
     let input = fs::read_to_string(path).expect("read retirement budget");
     let budget = parse_budget_manifest(&input, &root).expect("validate retirement budget");
 
-    assert_eq!(budget.schema_version.get(), 3);
+    assert_eq!(budget.schema_version.get(), 4);
     assert_eq!(budget.corpus.len(), 13);
     assert_eq!(budget.method.warmups, 3);
     assert_eq!(budget.method.repetitions, 15);
@@ -61,6 +61,9 @@ fn frozen_retirement_budget_matches_schema_and_corpus() {
             .admission
             .thresholds
             .iter()
-            .any(|threshold| threshold.name == "per_workload_regression")
+            .filter(|threshold| threshold.name.starts_with("fattree_"))
+            .count()
+            == 4
     );
+    assert_eq!(budget.method.resolved_defaults.len(), 8);
 }

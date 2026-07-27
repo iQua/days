@@ -50,6 +50,26 @@ enum Command {
         #[arg(long)]
         repo_root: Option<PathBuf>,
     },
+    /// Collect the frozen P01 Nexosim correctness and performance baseline.
+    NexosimBaseline {
+        #[command(subcommand)]
+        command: NexosimBaselineCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NexosimBaselineCommand {
+    /// Exercise the runner's parsers without building or running Days.
+    SelfTest,
+    /// Run the frozen method and write new versioned artifacts.
+    Collect {
+        /// New output directory below the repository root.
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Repository root; discovered by walking upward when omitted.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -117,5 +137,24 @@ fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             }
             Ok(true)
         }
+        Command::NexosimBaseline { command } => match command {
+            NexosimBaselineCommand::SelfTest => {
+                xtask::baseline::self_test()?;
+                Ok(true)
+            }
+            NexosimBaselineCommand::Collect {
+                output_dir,
+                repo_root,
+            } => {
+                let root = repo_root.map_or_else(|| xtask::discover_repo_root(&current), Ok)?;
+                let output = if output_dir.is_absolute() {
+                    output_dir
+                } else {
+                    root.join(output_dir)
+                };
+                xtask::baseline::collect(&root, &output)?;
+                Ok(true)
+            }
+        },
     }
 }

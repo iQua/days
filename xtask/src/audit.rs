@@ -199,6 +199,7 @@ pub fn phase_audit(repo_root: &Path, requested_phase: &str, allow_network: bool)
     let phases = load_phase_set(repo_root, requested_phase, &mut diagnostics);
     check_metadata_identity(&phases, &mut diagnostics);
     check_dependencies(&phases, &mut diagnostics);
+    check_budget_consumer_bindings(&phases, &mut diagnostics);
 
     let matching: Vec<&LoadedPhase> = phases
         .iter()
@@ -276,6 +277,7 @@ pub fn reproduce_preflight(repo_root: &Path, requested_phase: &str) -> AuditRepo
     let mut diagnostics = Vec::new();
     let phases = load_phase_set(repo_root, requested_phase, &mut diagnostics);
     check_metadata_identity(&phases, &mut diagnostics);
+    check_budget_consumer_bindings(&phases, &mut diagnostics);
 
     let matching: Vec<&LoadedPhase> = phases
         .iter()
@@ -1183,7 +1185,19 @@ fn check_declared_budgets(
             }
         };
         match parse_budget_manifest(&contents, repo_root) {
-            Ok(_) => {}
+            Ok(manifest) => {
+                if manifest.id != budget.id || manifest.phase != budget.owner_phase {
+                    emit(
+                        diagnostics,
+                        "DAYS-AUDIT-0011",
+                        &budget.path,
+                        format!(
+                            "declared budget identity {} owned by {} does not match manifest identity {} owned by {}",
+                            budget.id, budget.owner_phase, manifest.id, manifest.phase
+                        ),
+                    );
+                }
+            }
             Err(error) => {
                 emit_schema_error(diagnostics, &budget.path, error, "DAYS-AUDIT-0011");
                 continue;
@@ -1208,6 +1222,43 @@ fn check_declared_budgets(
             ),
         }
         check_frozen_budget_blob(repo_root, budget, diagnostics);
+    }
+}
+
+fn check_budget_consumer_bindings(phases: &[LoadedPhase], diagnostics: &mut Vec<Diagnostic>) {
+    for owner in phases {
+        for budget in &owner.metadata.budgets {
+            for consumer_id in &budget.required_consumers {
+                let Some(consumer) = phases
+                    .iter()
+                    .find(|phase| phase.metadata.phase == *consumer_id)
+                else {
+                    continue;
+                };
+                let matching = consumer.metadata.budgets.iter().any(|candidate| {
+                    candidate.id == budget.id
+                        && candidate.owner_phase == budget.owner_phase
+                        && candidate.path == budget.path
+                        && candidate.content_hash == budget.content_hash
+                        && candidate.frozen_at_commit == budget.frozen_at_commit
+                });
+                if !matching {
+                    emit(
+                        diagnostics,
+                        "DAYS-AUDIT-0027",
+                        consumer.path.display().to_string(),
+                        format!(
+                            "phase {consumer_id} must cite frozen budget {} owned by {} at {} with hash {} and frozen_at_commit {}",
+                            budget.id,
+                            budget.owner_phase,
+                            budget.path,
+                            budget.content_hash,
+                            budget.frozen_at_commit
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1368,7 +1419,7 @@ fn check_measurement_contract(
         );
         return;
     }
-    match git(
+    let strict_ancestor = match git(
         repo_root,
         &[
             "merge-base",
@@ -1377,35 +1428,244 @@ fn check_measurement_contract(
             run_commit,
         ],
     ) {
-        Ok(output) if output.status.success() => {}
-        Ok(output) if output.status.code() == Some(1) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0026",
-            budget_path,
-            format!(
-                "frozen_at_commit {} is not an ancestor of measurement run_commit {run_commit}",
-                budget.frozen_at_commit
+        Ok(output) if output.status.success() => true,
+        Ok(output) if output.status.code() == Some(1) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "frozen_at_commit {} is not an ancestor of measurement run_commit {run_commit}",
+                    budget.frozen_at_commit
+                ),
+            );
+            false
+        }
+        Ok(output) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "cannot determine ancestry from frozen_at_commit {} to measurement run_commit {run_commit}: {}",
+                    budget.frozen_at_commit,
+                    output_text(&output)
+                ),
+            );
+            false
+        }
+        Err(error) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "cannot determine ancestry from frozen_at_commit {} to measurement run_commit {run_commit}: {error}",
+                    budget.frozen_at_commit
+                ),
+            );
+            false
+        }
+    };
+    if !strict_ancestor {
+        return;
+    }
+
+    if !check_linear_measurement_history(
+        repo_root,
+        &budget.frozen_at_commit,
+        run_commit,
+        budget_path,
+        diagnostics,
+    ) {
+        return;
+    }
+
+    check_measurement_artifact_introduction(
+        repo_root,
+        &budget.frozen_at_commit,
+        run_commit,
+        evidence_path,
+        evidence,
+        diagnostics,
+    );
+}
+
+fn check_linear_measurement_history(
+    repo_root: &Path,
+    frozen_at_commit: &str,
+    run_commit: &str,
+    budget_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let range = format!("{frozen_at_commit}..{run_commit}");
+    match git(repo_root, &["rev-list", "--merges", &range]) {
+        Ok(output) if output.status.success() => {
+            let merges = String::from_utf8_lossy(&output.stdout);
+            let merges = merges.trim();
+            if !merges.is_empty() {
+                emit(
+                    diagnostics,
+                    "DAYS-AUDIT-0026",
+                    budget_path,
+                    format!(
+                        "measurement history from frozen_at_commit {frozen_at_commit} to run_commit {run_commit} contains merge commit(s): {}",
+                        merges.lines().collect::<Vec<_>>().join(", ")
+                    ),
+                );
+                return false;
+            }
+        }
+        Ok(output) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "cannot inspect measurement history from frozen_at_commit {frozen_at_commit} to run_commit {run_commit}: {}",
+                    output_text(&output)
+                ),
+            );
+            return false;
+        }
+        Err(error) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "cannot inspect measurement history from frozen_at_commit {frozen_at_commit} to run_commit {run_commit}: {error}"
+                ),
+            );
+            return false;
+        }
+    }
+
+    match git(repo_root, &["rev-list", "--first-parent", run_commit]) {
+        Ok(output) if output.status.success() => {
+            if !String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|commit| commit == frozen_at_commit)
+            {
+                emit(
+                    diagnostics,
+                    "DAYS-AUDIT-0026",
+                    budget_path,
+                    format!(
+                        "measurement run_commit {run_commit} does not reach frozen_at_commit {frozen_at_commit} through first-parent history"
+                    ),
+                );
+                return false;
+            }
+        }
+        Ok(output) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "cannot inspect first-parent history from measurement run_commit {run_commit}: {}",
+                    output_text(&output)
+                ),
+            );
+            return false;
+        }
+        Err(error) => {
+            emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                budget_path,
+                format!(
+                    "cannot inspect first-parent history from measurement run_commit {run_commit}: {error}"
+                ),
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
+fn check_measurement_artifact_introduction(
+    repo_root: &Path,
+    frozen_at_commit: &str,
+    run_commit: &str,
+    evidence_path: &str,
+    evidence: &EvidenceManifest,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let range = format!("{frozen_at_commit}..{run_commit}");
+    for (index, artifact) in evidence.artifacts.iter().enumerate() {
+        let Some(path) = artifact.path.as_deref() else {
+            continue;
+        };
+        let subject = format!("{evidence_path} artifacts[{index}]");
+        match git(
+            repo_root,
+            &["log", "--diff-filter=A", "--format=%H", &range, "--", path],
+        ) {
+            Ok(output) if output.status.success() => {
+                if output.stdout.is_empty() {
+                    emit(
+                        diagnostics,
+                        "DAYS-AUDIT-0026",
+                        &subject,
+                        format!(
+                            "measurement artifact {path} was not introduced after frozen_at_commit {frozen_at_commit} and by run_commit {run_commit}"
+                        ),
+                    );
+                }
+            }
+            Ok(output) => emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                &subject,
+                format!(
+                    "cannot determine when measurement artifact {path} was introduced: {}",
+                    output_text(&output)
+                ),
             ),
-        ),
-        Ok(output) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0026",
-            budget_path,
-            format!(
-                "cannot determine ancestry from frozen_at_commit {} to measurement run_commit {run_commit}: {}",
-                budget.frozen_at_commit,
-                output_text(&output)
+            Err(error) => emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                &subject,
+                format!(
+                    "cannot determine when measurement artifact {path} was introduced: {error}"
+                ),
             ),
-        ),
-        Err(error) => emit(
-            diagnostics,
-            "DAYS-AUDIT-0026",
-            budget_path,
-            format!(
-                "cannot determine ancestry from frozen_at_commit {} to measurement run_commit {run_commit}: {error}",
-                budget.frozen_at_commit
+        }
+
+        let frozen_object = format!("{frozen_at_commit}:{path}");
+        let run_object = format!("{run_commit}:{path}");
+        match (
+            git(repo_root, &["cat-file", "blob", &frozen_object]),
+            git(repo_root, &["cat-file", "blob", &run_object]),
+        ) {
+            (Ok(frozen), Ok(run))
+                if frozen.status.success()
+                    && run.status.success()
+                    && frozen.stdout == run.stdout =>
+            {
+                emit(
+                    diagnostics,
+                    "DAYS-AUDIT-0026",
+                    &subject,
+                    format!(
+                        "measurement artifact {path} already had identical content at frozen_at_commit {frozen_at_commit}"
+                    ),
+                );
+            }
+            (_, Ok(run)) if !run.status.success() => {}
+            (Ok(_), Ok(_)) => {}
+            (Err(error), _) | (_, Err(error)) => emit(
+                diagnostics,
+                "DAYS-AUDIT-0026",
+                &subject,
+                format!(
+                    "cannot compare measurement artifact {path} at frozen_at_commit and run_commit: {error}"
+                ),
             ),
-        ),
+        }
     }
 }
 

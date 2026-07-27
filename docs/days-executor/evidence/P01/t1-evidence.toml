@@ -18,11 +18,23 @@ tags = [
 
 [[artifacts]]
 path = "docs/days-executor/budgets/retirement-budget.toml"
-content_hash = "sha256:e22a9e8ddcfe1af20c9fac486341ef12aca3016048f4f343ff2752b4bec9ed7c"
+content_hash = "sha256:e7dfbb6957cc7ae396f331af70209f43b70545ba7d946f6cb74ad0f1646b0ba3"
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P01/retirement-corpus.toml"
-content_hash = "sha256:cd3dcbe950730e0cc0c79bffbfa1f4ddf66941b85c0bf551bbdfb2d015f344d7"
+content_hash = "sha256:4e5d6c94db0bd5bcbfd602a943d131fc4388afb5474fa8506ac1b931941f6f13"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/ledgers-v1/explicit-ledger.csv"
+content_hash = "sha256:6cf117e0373e4fa2b6fb7f4897c81be8cf22f7257d67a8f62a72e69313d32b7e"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/ledgers-v1/torus-ledger.csv"
+content_hash = "sha256:616e30ae5bb6f610921fadcb577c689baf5f71c5e38639eedb45fad5e2045c5e"
+
+[[artifacts]]
+path = "docs/days-executor/evidence/P01/ledgers-v1/fattree-ledger.csv"
+content_hash = "sha256:89f725ad3103c66fbf33c64112d25947732768695861a606981c7b994ab39f65"
 
 [[artifacts]]
 path = "docs/days-executor/evidence/P01/quantize-after-characterization.toml"

@@ -77,8 +77,17 @@ impl PhaseMetadata {
         for command in &self.test_commands {
             command.validate()?;
         }
-        for budget in &self.budgets {
+        for (index, budget) in self.budgets.iter().enumerate() {
             budget.validate()?;
+            if self.budgets[..index]
+                .iter()
+                .any(|prior| prior.id == budget.id)
+            {
+                return Err(invalid(
+                    "budgets.id",
+                    "must be unique within phase metadata",
+                ));
+            }
         }
 
         Ok(())
@@ -198,6 +207,12 @@ pub struct Backend {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetReference {
+    /// Stable identifier declared inside the budget manifest.
+    pub id: String,
+    /// Phase that owns and first freezes the budget.
+    pub owner_phase: String,
+    /// Phases that must reuse this exact frozen budget reference when present.
+    pub required_consumers: Vec<String>,
     /// Repository-relative budget-manifest path.
     pub path: String,
     /// SHA-256 hash of the budget-manifest bytes.
@@ -208,6 +223,18 @@ pub struct BudgetReference {
 
 impl BudgetReference {
     fn validate(&self) -> Result<(), SchemaError> {
+        validate_nonempty("budgets.id", &self.id)?;
+        if !is_phase_id(&self.owner_phase) {
+            return Err(invalid("budgets.owner_phase", "must match `P[0-9]{2}`"));
+        }
+        for consumer in &self.required_consumers {
+            if !is_phase_id(consumer) {
+                return Err(invalid(
+                    "budgets.required_consumers",
+                    "entries must match `P[0-9]{2}`",
+                ));
+            }
+        }
         validate_repo_path("budgets.path", &self.path)?;
         validate_hash("budgets.content_hash", &self.content_hash)?;
         validate_git_commit("budgets.frozen_at_commit", &self.frozen_at_commit)

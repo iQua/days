@@ -9,6 +9,7 @@ features = ["test", "migration_ledger"]
 platforms = ["linux-x86_64", "macos-aarch64"]
 semantic_changes = [
     "Consume the separately landed RED correctness prerequisite; P01 evidence does not exercise or cover RED behavior",
+    "Sort switch registration by topology switch key before SimInit::add_model so same-time tie-breaking is deterministic",
 ]
 api_changes = [
     "Add the off-by-default migration_ledger Cargo feature for migration characterization",
@@ -22,11 +23,6 @@ out_of_scope = [
     "GPU backends",
 ]
 selectable_backends = []
-
-[[budgets]]
-path = "docs/days-executor/budgets/retirement-budget.toml"
-content_hash = "sha256:e22a9e8ddcfe1af20c9fac486341ef12aca3016048f4f343ff2752b4bec9ed7c"
-frozen_at_commit = "3c13ad4c8e32b7f8affad7e991c1a46586125fe7"
 
 [[tasks]]
 id = "T0"
@@ -44,7 +40,6 @@ title = "Freeze the Nexosim retirement baseline"
 depends_on = ["T0"]
 evidence = [
     "docs/days-executor/evidence/P01/t1-evidence.toml",
-    "docs/days-executor/evidence/P01/nexosim-baseline-measurement.toml",
 ]
 
 [tasks.red_test]

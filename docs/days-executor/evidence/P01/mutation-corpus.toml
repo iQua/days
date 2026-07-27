@@ -146,6 +146,26 @@ test_function = "frozen_budget_content_mismatch_is_rejected"
 expected_code = "DAYS-AUDIT-0026"
 
 [[mutations]]
+fault_class = "measurement artifact precomputed at freeze with empty run child"
+test_function = "measurement_artifact_precomputed_at_freeze_is_rejected"
+expected_code = "DAYS-AUDIT-0026"
+
+[[mutations]]
+fault_class = "merge commit in freeze-to-measurement history"
+test_function = "merge_in_measurement_history_is_rejected"
+expected_code = "DAYS-AUDIT-0026"
+
+[[mutations]]
+fault_class = "budget reference identity differs from manifest"
+test_function = "budget_manifest_identity_must_match_phase_reference"
+expected_code = "DAYS-AUDIT-0011"
+
+[[mutations]]
+fault_class = "required consumer substitutes a different frozen budget identity"
+test_function = "declared_budget_consumer_must_reuse_frozen_identity"
+expected_code = "DAYS-AUDIT-0027"
+
+[[mutations]]
 fault_class = "measurement missing required binding"
 test_function = "measurement_missing_required_binding_is_rejected"
 expected_code = "DAYS-AUDIT-0027"

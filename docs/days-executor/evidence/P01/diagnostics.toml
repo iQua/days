@@ -154,13 +154,13 @@ summary = "An audit check attempted to emit an unknown diagnostic code"
 code = "DAYS-AUDIT-0026"
 slug = "budget-freeze-invalid"
 severity = "error"
-summary = "A budget freeze commit is missing or unverifiable, contains different budget content, or does not strictly precede its measurement commit"
+summary = "A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites an artifact not introduced after the freeze"
 
 [[diagnostics]]
 code = "DAYS-AUDIT-0027"
 slug = "measurement-evidence-invalid"
 severity = "error"
-summary = "Measurement evidence omits its required budget, budget hash, or run commit, or a declared budget has no citing measurement"
+summary = "Measurement evidence omits its required binding, a declared budget has no citing measurement, or a required consumer does not reuse the exact frozen budget identity"
 
 [[diagnostics]]
 code = "DAYS-AUDIT-0028"

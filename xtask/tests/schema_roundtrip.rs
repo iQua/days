@@ -48,6 +48,9 @@ selectable = true
 feature = "scalar"
 
 [[budgets]]
+id = "p90-fixture-budget"
+owner_phase = "P90"
+required_consumers = ["P23"]
 path = "docs/days-executor/budgets/p90.toml"
 content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 frozen_at_commit = "0123456789abcdef0123456789abcdef01234567"
@@ -114,7 +117,7 @@ content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef012345678
 "#;
 
 const BUDGET: &str = r#"
-schema_version = 3
+schema_version = 4
 id = "p90-fixture-budget"
 phase = "P90"
 frozen_at = "2026-07-26"
@@ -149,6 +152,11 @@ st_mode = "nexosim-st"
 mt_mode = "nexosim-mt"
 best_exact_mode_rule = "lowest median sim_execution among exact Nexosim CPU modes"
 
+[[method.resolved_defaults]]
+name = "mailbox-capacity"
+value = "16 entries"
+source = "src/topos/topo.rs"
+
 [admission]
 evaluated_at = "P23"
 statistic = "geometric mean of paired throughput ratios"
@@ -157,6 +165,9 @@ confidence_rule = "two-sided 95 percent paired-bootstrap interval"
 [[admission.thresholds]]
 name = "runtime"
 metric = "seconds"
+metric_kind = "wall-time"
+applies_to = "fixture"
+timing_boundary = "sim_execution"
 comparison = "<="
 value = 1.0
 unit = "s"
@@ -192,6 +203,9 @@ fn phase_schema_round_trips() {
     let encoded = toml::to_string_pretty(&value).expect("serialize phase");
     assert_eq!(parse_phase_metadata(&encoded).expect("parse phase"), value);
     assert_eq!(value.budgets[0].content_hash, HASH);
+    assert_eq!(value.budgets[0].id, "p90-fixture-budget");
+    assert_eq!(value.budgets[0].owner_phase, "P90");
+    assert_eq!(value.budgets[0].required_consumers, ["P23"]);
     assert_eq!(
         value.budgets[0].frozen_at_commit,
         "0123456789abcdef0123456789abcdef01234567"
@@ -284,6 +298,38 @@ fn missing_required_fields_are_rejected() {
         "frozen_at_commit = \"0123456789abcdef0123456789abcdef01234567\"\n",
         "",
     )));
+    for required in [
+        "id = \"p90-fixture-budget\"\n",
+        "owner_phase = \"P90\"\n",
+        "required_consumers = [\"P23\"]\n",
+    ] {
+        assert_malformed(parse_phase_metadata(&PHASE.replace(required, "")));
+    }
+}
+
+#[test]
+fn budget_reference_identity_fields_are_validated() {
+    assert_malformed(parse_phase_metadata(
+        &PHASE.replace("id = \"p90-fixture-budget\"", "id = \"\""),
+    ));
+    assert_malformed(parse_phase_metadata(
+        &PHASE.replace("owner_phase = \"P90\"", "owner_phase = \"p90\""),
+    ));
+    assert_malformed(parse_phase_metadata(&PHASE.replace(
+        "required_consumers = [\"P23\"]",
+        "required_consumers = [\"phase-23\"]",
+    )));
+    let budget = r#"[[budgets]]
+id = "p90-fixture-budget"
+owner_phase = "P90"
+required_consumers = ["P23"]
+path = "docs/days-executor/budgets/p90.toml"
+content_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+frozen_at_commit = "0123456789abcdef0123456789abcdef01234567"
+"#;
+    assert_malformed(parse_phase_metadata(
+        &PHASE.replace(budget, &format!("{budget}\n{budget}")),
+    ));
 }
 
 #[test]
@@ -300,7 +346,7 @@ fn unsupported_schema_versions_are_distinct() {
         );
     }
     let root = budget_repo();
-    for version in [0, 1, 2, 4] {
+    for version in [0, 1, 2, 3, 5] {
         assert_unsupported(
             parse_budget_manifest(&with_version(BUDGET, version), root.path()),
             version,
@@ -391,6 +437,9 @@ fn budget_without_thresholds_is_rejected() {
     let threshold = r#"[[admission.thresholds]]
 name = "runtime"
 metric = "seconds"
+metric_kind = "wall-time"
+applies_to = "fixture"
+timing_boundary = "sim_execution"
 comparison = "<="
 value = 1.0
 unit = "s"
@@ -513,6 +562,34 @@ fn method_strings_and_cargo_flags_cannot_be_empty() {
 }
 
 #[test]
+fn resolved_defaults_are_required_and_validated() {
+    let root = budget_repo();
+    let table = r#"[[method.resolved_defaults]]
+name = "mailbox-capacity"
+value = "16 entries"
+source = "src/topos/topo.rs"
+
+"#;
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(table, ""),
+        root.path(),
+    ));
+    for (valid, empty) in [
+        ("name = \"mailbox-capacity\"", "name = \"\""),
+        ("value = \"16 entries\"", "value = \"\""),
+        ("source = \"src/topos/topo.rs\"", "source = \"\""),
+    ] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(valid, empty),
+            root.path(),
+        ));
+    }
+
+    let duplicate = format!("{BUDGET}\n{table}");
+    assert_malformed(parse_budget_manifest(&duplicate, root.path()));
+}
+
+#[test]
 fn declared_time_values_must_be_positive_and_finite() {
     let root = budget_repo();
     for field in [
@@ -565,6 +642,95 @@ fn admission_fields_are_required_and_validated() {
             root.path(),
         ));
     }
+}
+
+#[test]
+fn threshold_metric_kind_is_required_and_typed() {
+    let root = budget_repo();
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace("metric_kind = \"wall-time\"\n", ""),
+        root.path(),
+    ));
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "metric_kind = \"wall-time\"",
+            "metric_kind = \"elapsed-ish\"",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn timing_metrics_require_a_valid_timing_boundary() {
+    let root = budget_repo();
+    for metric_kind in ["wall-time", "throughput"] {
+        let input = BUDGET
+            .replace(
+                "metric_kind = \"wall-time\"",
+                &format!("metric_kind = \"{metric_kind}\""),
+            )
+            .replace("timing_boundary = \"sim_execution\"\n", "");
+        assert_malformed(parse_budget_manifest(&input, root.path()));
+    }
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace(
+            "timing_boundary = \"sim_execution\"",
+            "timing_boundary = \"statistics_and_flush\"",
+        ),
+        root.path(),
+    ));
+}
+
+#[test]
+fn non_timing_metrics_forbid_a_timing_boundary() {
+    let root = budget_repo();
+    for metric_kind in ["bytes", "count"] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(
+                "metric_kind = \"wall-time\"",
+                &format!("metric_kind = \"{metric_kind}\""),
+            ),
+            root.path(),
+        ));
+    }
+}
+
+#[test]
+fn non_timing_metrics_are_valid_without_a_timing_boundary() {
+    let root = budget_repo();
+    for metric_kind in ["bytes", "count"] {
+        let input = BUDGET
+            .replace(
+                "metric_kind = \"wall-time\"",
+                &format!("metric_kind = \"{metric_kind}\""),
+            )
+            .replace("timing_boundary = \"sim_execution\"\n", "");
+        parse_budget_manifest(&input, root.path()).expect("valid non-timing threshold");
+    }
+}
+
+#[test]
+fn threshold_scope_must_be_corpus_or_a_declared_workload() {
+    let root = budget_repo();
+    parse_budget_manifest(
+        &BUDGET.replace("applies_to = \"fixture\"", "applies_to = \"corpus\""),
+        root.path(),
+    )
+    .expect("valid corpus-level threshold");
+
+    for invalid in ["", "missing-workload"] {
+        assert_malformed(parse_budget_manifest(
+            &BUDGET.replace(
+                "applies_to = \"fixture\"",
+                &format!("applies_to = \"{invalid}\""),
+            ),
+            root.path(),
+        ));
+    }
+    assert_malformed(parse_budget_manifest(
+        &BUDGET.replace("applies_to = \"fixture\"\n", ""),
+        root.path(),
+    ));
 }
 
 #[test]

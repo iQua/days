@@ -111,8 +111,8 @@ Information diagnostics use the same format and never affect the exit status.
 | `DAYS-AUDIT-0023` | `reproduce-command-failed` | error | A declared reproduce test command exited non-zero. |
 | `DAYS-AUDIT-0024` | `reproduce-no-host-command` | error | No declared reproduce test command matches the host platform. |
 | `DAYS-AUDIT-0025` | `audit-internal-error` | error | An audit check attempted to emit an unknown diagnostic code. |
-| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze commit is missing or unverifiable, contains different budget content, or does not strictly precede its measurement commit. Equality means the measurement was committed together with the budget and is rejected. |
-| `DAYS-AUDIT-0027` | `measurement-evidence-invalid` | error | Measurement evidence omits its required budget, budget hash, or run commit, or a declared budget has no citing measurement. |
+| `DAYS-AUDIT-0026` | `budget-freeze-invalid` | error | A budget freeze is missing or unverifiable, has different content, lacks a linear first-parent path to the run, or cites an artifact not introduced after the freeze. |
+| `DAYS-AUDIT-0027` | `measurement-evidence-invalid` | error | Measurement evidence omits its required binding, a declared budget has no citing measurement, or a required consumer does not reuse the exact frozen budget identity. |
 | `DAYS-AUDIT-0028` | `archive-check-skipped` | info | Archive verification was skipped because the `days-gpu` repository is unavailable. |
 
 The machine-readable registry golden is
@@ -128,7 +128,7 @@ version in this table:
 | Phase metadata | 1 |
 | Evidence manifest | 1 |
 | Dependency baseline | 1 |
-| Budget manifest | 3 |
+| Budget manifest | 4 |
 
 Version 0 and every version not listed for that document kind are rejected
 separately from malformed TOML. Schema records deny unknown fields, so a
@@ -218,18 +218,28 @@ An incomplete backend must not be selectable or appear in
 
 | Field | Type | Presence | Rule |
 | --- | --- | --- | --- |
+| `id` | string | required | Stable identifier matching the budget manifest's inner `id`. |
+| `owner_phase` | phase ID | required | Owning phase matching the budget manifest's inner `phase`. |
+| `required_consumers` | array of phase IDs | required | Phases that must reuse this exact frozen identity when their metadata exists. |
 | `path` | string path | required | Budget manifest path. |
 | `content_hash` | SHA-256 string | required | Must match the current file bytes. |
 | `frozen_at_commit` | string | required | Full 40-lowercase-hex Git commit SHA containing the frozen budget bytes. |
 
 The audit verifies that the working-tree budget hash matches `content_hash`,
 that the budget path at `frozen_at_commit` exists and hashes to the same value,
-and that `frozen_at_commit` is a strict ancestor of every measurement
-`run_commit` that cites the budget. Equality is rejected because it means the
-measurement was committed together with the budget instead of after the
-freeze. An uncommitted budget, an unknown or unreachable commit, a path absent
-at that commit, an indeterminate ancestry result, or different budget bytes at
-that commit fails closed.
+and that the inner budget identity agrees with `id` and `owner_phase`. Duplicate
+budget IDs within a phase are rejected. If metadata for a named
+`required_consumers` phase exists, that phase must cite the identical
+`id`/`owner_phase`/`path`/`content_hash`/`frozen_at_commit` tuple.
+
+For every measurement citation, `frozen_at_commit` must be a strict ancestor
+of `run_commit`, the range must contain no merge commit, and following first
+parents from `run_commit` must reach the freeze. Equality is rejected because
+it means the measurement was committed together with the budget. Every
+measurement artifact path must have an adding commit within
+`(frozen_at_commit, run_commit]`; an identical blob at the freeze is rejected.
+An uncommitted budget, unknown or unreachable commit, missing path, ambiguous
+history, or different budget bytes fails closed.
 
 ## Evidence manifest schema
 
@@ -265,8 +275,9 @@ Each `artifacts` table uses these fields:
 | `schema` | string | archive only, required | Non-empty payload schema version. |
 
 A golden artifact's hash must match its checked-in file. A measurement
-artifact must be readable from `run_commit` with `git cat-file`, and its hash
-must match that committed blob. Golden and measurement artifacts must not carry
+artifact must be readable from `run_commit` with `git cat-file`, its hash must
+match that committed blob, and its path must have been introduced within the
+audited post-freeze range. Golden and measurement artifacts must not carry
 archive-only provenance. An archive artifact must carry every archive-only
 field. URL fields are not part of the version 1 archive contract.
 
@@ -294,14 +305,20 @@ be cited by at least one measurement manifest. Every evidence kind, including
 
 The budget binding is temporal as well as content-addressed. The audit compares
 the current budget bytes with `content_hash`, compares the budget blob at the
-phase metadata's `frozen_at_commit` with that same hash, and verifies that
-`frozen_at_commit` is a strict ancestor of the measurement's `run_commit`.
-Equal commits are rejected as a measurement committed together with its
-budget. The audit also reads every measurement artifact from `run_commit` and
-checks the committed blob against the artifact hash. These checks mechanically
-enforce content equality and commit ordering; they do not prove that a
-measurement was executed. Any actual rerun rests on reviewed commit sequencing,
-not on a machine check performed by this audit.
+phase metadata's `frozen_at_commit` with that same hash, and requires a strict,
+merge-free, first-parent history to the measurement's `run_commit`. Equal
+commits are rejected as a measurement committed together with its budget.
+Every measurement path must be added in that range and must not contain the
+same bytes at the freeze.
+
+This guarantee is tamper-evident against published history, not tamper-proof
+against an author before publication. A coherent local rewrite can construct a
+history indistinguishable from an honest one using repository content alone.
+Closing that gap requires an external anchor, such as a published immutable
+ref, a signed freeze tag held outside the mutable repository, or a third party
+retaining the earlier history. The audit also cannot prove that a measurement
+was executed; a reproducible command and reviewed commit sequence establish
+provenance without claiming physical execution attestation.
 
 ## Budget manifest schema
 
@@ -311,7 +328,7 @@ selection.
 
 | Field | Type | Presence | Rule |
 | --- | --- | --- | --- |
-| `schema_version` | integer | required | Must equal 3. |
+| `schema_version` | integer | required | Must equal 4. Version 3 and all unknown versions are rejected. |
 | `id` | string | required | Stable budget identifier. |
 | `phase` | string | required | Owning phase identifier. |
 | `frozen_at` | string | required | ISO-8601 calendar date in `YYYY-MM-DD` form. |
@@ -335,14 +352,20 @@ positive finite sample wall-time floor; and a positive finite effective
 simulation duration. Non-empty rules identify the duration source, require
 each sample to record its simulated end time and effective thread count, and
 define run and pairing order. The method also pins the resampling algorithm,
-PRNG and seed, ST and MT names, and the P23 rule that selects the best exact
-Nexosim CPU mode. Schema validation checks the declared floor's shape and
+PRNG and seed, ST and MT configurations, and the rule that selects the best
+exact Nexosim configuration. Its non-empty `resolved_defaults` array names each
+implicit input, exact resolved value, and production source. Duplicate default
+names are rejected. Schema validation checks the declared floor's shape and
 value. The later measurement runner checks observed samples against it.
 
 The `admission` table requires `evaluated_at = "P23"` and non-empty `statistic`
-and `confidence_rule` strings. Its non-empty `thresholds` array contains tables
-with string fields `name`, `metric`, `comparison`, and `unit`, plus a numeric
-`value`. `comparison` is one of `<`, `<=`, `>`, `>=`, or `==`. P01 records
+and `confidence_rule` strings. Its non-empty `thresholds` array contains
+`name`, `metric`, `metric_kind`, `applies_to`, `timing_boundary`,
+`comparison`, `value`, and `unit`. `metric_kind` is `wall-time`,
+`throughput`, `bytes`, or `count`. Wall-time and throughput metrics require a
+`timing_boundary` of `sim_execution` or `end_to_end`; byte and count metrics
+must omit it. `applies_to` is `corpus` or a workload identity present in the
+corpus. `comparison` is one of `<`, `<=`, `>`, `>=`, or `==`. P01 records
 absolute Nexosim references and evaluates no admission threshold.
 
 Each `corpus` table requires a repository-relative `path`, its canonical
@@ -560,13 +583,13 @@ admission or default selection, the budget manifest must be versioned and
 frozen before measurement. Phase metadata records both the budget content hash
 and the commit containing those exact bytes. Every measurement record embeds
 the budget path, its exact hash, and the measured code's `run_commit`. The
-audit verifies that the freeze commit contains the recorded bytes and is an
-strict ancestor of the run commit, and that measurement artifacts are present
-with their declared content at that run commit. Equality fails because the
-measurement would have been committed together with the budget. These are
-commit content and ordering checks; whether a measurement was actually rerun
-depends on reviewed commit sequencing rather than machine verification by the
-audit.
+audit verifies that the freeze commit contains the recorded bytes, reaches the
+run commit through a strict merge-free first-parent range, and that every
+measurement artifact is introduced in that range with its declared content.
+Equality fails because the measurement would have been committed together with
+the budget. The result is tamper-evident against published history. Preventing
+a coherent pre-publication rewrite requires an external published or signed
+anchor; repository content alone cannot supply one.
 
 Public API or configuration changes require migration notes in phase metadata
 and the design note. Incomplete implementation remains feature-gated and may

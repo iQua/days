@@ -102,29 +102,58 @@ remain unchanged.
 ### Budget schema repair and stage boundary
 
 T0's budget schema could not represent the machine-checkable inputs required by
-the plan. T1 upgrades only the budget schema to version 3. The schema separates
+the plan. T1 upgrades only the budget schema to version 4. The schema separates
 the common measurement method from the P23 admission rule and adds structured
-platform, corpus-role, workload, and mode fields. It validates corpus paths and
-hashes against repository bytes. It also rejects incomplete methods, empty
+platform, corpus-role, workload, and mode fields. Version 4 also binds each
+threshold to a metric class, workload or corpus scope, and, for timing metrics,
+either the `sim_execution` or `end_to_end` boundary. It records the production
+source and resolved value of load-bearing defaults. The schema validates corpus
+paths and hashes against repository bytes and rejects incomplete methods, empty
 corpora or thresholds, malformed hashes, and an empty waiver authority. Phase,
 evidence, dependency-baseline, and trace schemas remain at version 1.
 
 `docs/days-executor/budgets/retirement-budget.toml` freezes the developer's
 Apple M5 Max, macOS build `26A5388g`, Rust 1.96.0 toolchain, three warmups,
-fifteen repetitions, the paired-bootstrap confidence rule, the no-regression
+fifteen repetitions, the unpaired-bootstrap confidence rule, the no-regression
 geometric-mean threshold, the 20 percent per-workload limit, and maintainer
 waiver authority. The method applies to P01 reference collection and P23
 candidate runs. P01 records absolute Nexosim measurements and evaluates no
-threshold. P23 selects the faster median Nexosim mode per workload, with ST as
-the exact-tie winner, before applying the frozen admission statistic. The
-budget contains no measured value.
+threshold. The method freezes the per-workload selected-mode rule before
+measurement. The A2 result artifact, not the premeasurement budget, records the
+selected mode and event-rate outcome after samples exist. This avoids putting a
+measured outcome inside the blob that must be frozen first. Plan section
+12.1.3 currently reads as if the selected outcome belongs in that
+premeasurement blob and needs an owner amendment to state this rule/outcome
+split. P01 does not edit the plan repository.
 
-The owner froze the final budget and corpus at commit
-`3c13ad4c8e32b7f8affad7e991c1a46586125fe7` (F3). Commit
-`6b4b8a6ea1e795b7fda50cb4910d9d00dc6493ca` (A), a strict descendant of F3,
-contains the baseline records. The phase metadata binds the F3 budget bytes,
-and `nexosim-baseline-measurement.toml` binds the seven commit-A artifacts.
-This ordering satisfies T0's strict-ancestry check.
+The F3/A evidence remains in the repository as an honest historical record,
+but its measurement manifest is no longer live task evidence. It is superseded
+because review required budget schema and method changes and because its
+recorded producer, `/private/tmp/t1_f3_runner`, was not reproducible from the
+repository. A future F4 freeze will be followed by an A2 measurement at new
+`baselines-v2` paths and a B2 binding. New paths let the audit prove each
+artifact was introduced after the freeze. No commit SHA is guessed before
+those commits exist.
+
+The checked-in `cargo xtask nexosim-baseline collect` runner is the only
+producer for A2. It builds timed Days with the exact frozen Cargo flags, asks
+`rustc --print cfg` for the feature set, and rejects `migration_ledger`. It
+records the binary SHA-256 and toolchain in a build record. It executes the
+frozen warmups, repetitions, manifest order, duration guard, thread-count
+guard, and wall-time floor. A separate untimed `perf_stats` build obtains the
+Nexosim event count, so event counting does not contaminate either timed
+boundary. The v2 sample and summary schemas carry the event count, both
+events-per-second figures, and the selected-mode outcome.
+
+The budget reference also has a stable `id`, an owning phase, and required
+consumer phases. A present P23 phase must cite the same frozen tuple rather
+than substitute a relaxed budget. Measurement history must be a strict,
+merge-free first-parent sequence, and every measurement artifact must be added
+after the freeze. These checks defeat empty-child and sibling-merge histories.
+They are tamper-evident against published history, not tamper-proof before
+publication. A published immutable ref, externally held signed tag, or third
+party retaining the earlier history is needed to detect a coherent local
+rewrite.
 
 ### Corpus and comparison boundaries
 
@@ -150,6 +179,13 @@ form; `DistPacketSource` takes its existing no-sample fast path. Torus and
 Fat-Tree endpoint selection consumes the fixed seed once during construction.
 No RED decision appears in the exact corpus.
 
+Their complete canonical ledgers are frozen under
+`docs/days-executor/evidence/P01/ledgers-v1/`: 141 rows for explicit, 1,621 for
+torus, and 1,361 for fat-tree. Each file was reproduced byte-for-byte by two
+separate processes before acceptance. The migration-ledger integration test
+compares fresh output with these complete goldens, not merely one current run
+with another.
+
 `configs/migration/tcp_simple_st.toml` is a mechanical copy of
 `configs/tcp_simple.toml`. The copy adds only `threading = "single"` and
 `num_threads = 1`. The original config omits both fields, so `SimInit::new()`
@@ -171,21 +207,31 @@ suite. The fixed order is:
 
 All eight configs use fixed seed 1000, FIFO/TailDrop, and open-loop packet
 distributions. Their strongest frozen boundary is `terminal-observation`; a
-performance-length run does not claim full-key ledger equality. The files
-remain byte-identical to commit `cfdcfcb`.
+performance-length run does not claim full-key ledger equality. Each ST config
+sets `threading = "single"` and omits `concurrency_level` and `hot_workers`.
+Each MT config sets `threading = "multiple"`,
+`concurrency_level = "accelerated"`, and `hot_workers = 2`. The labels compare
+two differently tuned configurations, not threading alone. The best-mode rule
+states that distinction explicitly. The files remain byte-identical to commit
+`cfdcfcb`.
 
-The benchmark configs omit top-level `duration`. The language default at
-`src/topos/topo.rs:416` supplies an effective simulation duration of 1500.0
-seconds. `default_simulation_duration_is_pinned_to_1500_seconds` guards that
-source default. Each later measurement record captures the logged simulated
-end time, and the runner rejects a value other than 1500.0 seconds.
+The benchmark configs omit top-level `duration`.
+`simulation_duration` is called at `src/topos/topo.rs:416`; its constant and
+resolver at lines 1554-1557 supply an effective duration of 1500.0 seconds.
+`default_simulation_duration_is_pinned_to_1500_seconds` executes that resolution
+path with the key absent. Each later measurement record captures the logged
+simulated end time, and the runner rejects a value other than 1500.0 seconds.
 
 The MT configs also omit `num_threads`. Nexosim therefore takes
 `num_cpus::get()` at `src/topos/topo.rs:447`; the named platform declares an
 expected value of 18. Each sample records the effective thread count already
 reported by Days, and the runner rejects an MT sample whose count differs from
 18. The method records implicit inputs and enforces them instead of editing
-hashed benchmark artifacts.
+hashed benchmark artifacts. The other inherited inputs are mailbox capacity
+16, quantization disabled, UI duration 1.0 second with 0.01-second scheduled
+updates, periodic reports disabled with interval `f64::MAX`, no-link mode,
+FIFO batch size 1, shortest-path routing, and flow priority 0. Each value and
+production `file:line` is structured under `method.resolved_defaults`.
 
 The instrumentation added in this amendment captures `timer.elapsed()`
 immediately after `sim.step_until` returns. This `sim_execution` boundary
@@ -200,9 +246,11 @@ enforced the frozen 5 ms sample floor. The smallest recorded primary sample was
 commands, roles, modes, and boundaries are in
 `docs/days-executor/evidence/P01/retirement-corpus.toml`.
 
-### Measured Nexosim reference
+### Superseded F3/A Nexosim reference
 
-P01 ran three unrecorded warmup rounds and fifteen recorded rounds in manifest
+The following F3/A record is retained unchanged for traceability and is not the
+authoritative result for the forthcoming F4 budget. P01 ran three unrecorded
+warmup rounds and fifteen recorded rounds in manifest
 order. Timed runs used `cargo build --locked --release --bin days` without
 `migration_ledger`. Correctness runs used the diagnostic feature and recorded
 no wall-time result. Every performance sample reached 1500.0 simulated seconds
@@ -227,11 +275,12 @@ at k8/f64. The modes are close at k16/f512, where ST has the lower median. MT
 becomes 2.2 times faster at k32/f4096. The crossover therefore lies between
 k16/f512 and k32/f4096.
 
-Applying the frozen P23 rule to these reference medians selects ST for k4/f8,
+Applying the then-frozen rule to these reference medians selects ST for k4/f8,
 k8/f64, and k16/f512, and MT for k32/f4096. The result confirms why the rule
 selects a mode per workload: assuming MT wins would choose the slower reference
 for three of four workloads. P01 records this implication but evaluates no
-admission threshold.
+admission threshold. The comparison is between the ST and accelerated-MT
+configurations described above, not a pure threading contrast.
 
 The checked-in samples, summary, and five terminal digests total less than
 24 KB. The generated transition ledgers range from 4.5 KB to 78.6 KB, and the

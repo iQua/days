@@ -7,6 +7,8 @@
 
 # These are files related to logged outputs
 **/*.csv
+!docs/days-executor/evidence/P01/ledgers-v1/
+!docs/days-executor/evidence/P01/ledgers-v1/*.csv
 !docs/days-executor/evidence/P01/explicit-ledger-sample.csv
 !docs/days-executor/evidence/P01/explicit-terminal-digest.csv
 !docs/days-executor/evidence/P01/explicit-sources-default.csv
