@@ -1,7 +1,10 @@
 //! Immutable, backend-neutral simulation image records.
 
+use std::collections::VecDeque;
+
 use crate::{
-    Event, EventKind, LinkId, NodeId, NodeKind, SchedulerKind, TimeError, link_arrival_time_ns,
+    Event, EventKind, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind, TimeError,
+    link_arrival_time_ns,
 };
 
 /// The plan's default constant propagation delay for a directed link.
@@ -20,19 +23,34 @@ pub struct NodeDescriptor {
 }
 
 /// Host-owned semantic state.
-///
-/// T5 establishes the role-specific arena. T6 adds the state required by host FIFO execution.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostState;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostState {
+    pub egress_link: LinkId,
+    pub queue: VecDeque<PayloadId>,
+    pub in_service: Option<PayloadId>,
+    pub tx_ready_pending: bool,
+    pub next_origin_seq: u64,
+    pub sourced_packets: u64,
+    pub departed_packets: u64,
+}
 
-/// Switch-owned FIFO/TailDrop configuration.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Switch-owned FIFO/TailDrop state.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwitchState {
     pub scheduler: SchedulerKind,
     /// Maximum queued packets. A value of zero denotes an unbounded queue.
     pub queue_capacity_packets: u64,
+    pub queue: VecDeque<PayloadId>,
+    pub arrived_packets: u64,
+    pub dropped_packets: u64,
+}
+
+/// Immutable packet data referenced by a persistent event payload.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketDescriptor {
+    pub id: PayloadId,
+    pub size_bytes: u64,
 }
 
 /// Immutable configuration of one constant-rate, directed, non-preemptive link.
@@ -71,6 +89,7 @@ pub struct SimulationImage {
     pub nodes: Vec<NodeDescriptor>,
     pub host_states: Vec<HostState>,
     pub switch_states: Vec<SwitchState>,
+    pub packets: Vec<PacketDescriptor>,
     pub links: Vec<LinkDescriptor>,
     pub channels: Vec<RemoteChannel>,
     pub initial_events: Vec<Event>,

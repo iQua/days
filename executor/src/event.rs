@@ -49,6 +49,18 @@ pub enum EventKind {
     RemoteArrival = 3,
 }
 
+/// Returns the canonical equal-time phase for a closed v1 event kind.
+///
+/// Arrivals are visible before a transmission completes, and completion is visible before the
+/// next service selection. Time remains the primary ordering component.
+pub const fn event_phase(kind: EventKind) -> u16 {
+    match kind {
+        EventKind::PacketArrival | EventKind::RemoteArrival => 0,
+        EventKind::TxComplete => 1,
+        EventKind::TxReady => 2,
+    }
+}
+
 /// Fixed-width persistent event record.
 ///
 /// The record contains no callback, trait object, pointer, reference-counted owner, or

@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use days_executor::{
     EventKind, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, RemoteChannel,
     SchedulerKind, SimulationImage, SwitchState, TransitionHandler, resolve_transition,
@@ -21,11 +23,23 @@ fn one_image_contains_host_and_switch_state_arenas() {
                 state_slot: 0,
             },
         ],
-        host_states: vec![HostState],
+        host_states: vec![HostState {
+            egress_link: link,
+            queue: VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+            next_origin_seq: 0,
+            sourced_packets: 0,
+            departed_packets: 0,
+        }],
         switch_states: vec![SwitchState {
             scheduler: SchedulerKind::Fifo,
             queue_capacity_packets: 64,
+            queue: VecDeque::new(),
+            arrived_packets: 0,
+            dropped_packets: 0,
         }],
+        packets: Vec::new(),
         links: vec![LinkDescriptor {
             id: link,
             source: host,

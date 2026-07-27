@@ -1,17 +1,22 @@
-//! Platform-neutral data contracts for the Days executor.
+//! Exact execution contracts and the scalar oracle for the Days executor.
 //!
-//! This crate intentionally contains no execution backend. Its fixed-width records and exact
-//! integer-time helpers form the common input contract for later CPU and GPU executors.
+//! Fixed-width event records and exact integer-time helpers form the common input contract for
+//! later CPU and GPU executors. The scalar backend defines their executable reference behavior.
 
 pub mod event;
 pub mod image;
 pub mod model;
+pub mod scalar;
 pub mod time;
 
-pub use event::{Event, EventKey, EventKind, LinkId, NodeId, PayloadId};
+pub use event::{Event, EventKey, EventKind, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
-    HostState, LinkDescriptor, NodeDescriptor, RemoteChannel, SimulationImage, SwitchState,
-    default_propagation_ns,
+    HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, RemoteChannel, SimulationImage,
+    SwitchState, default_propagation_ns,
 };
 pub use model::{NodeKind, SchedulerKind, TransitionHandler, resolve_transition};
+pub use scalar::{
+    ArrivalDisposition, ExecutionError, PacketArrivalObservation, PacketDeparture, RunResult,
+    run_scalar,
+};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
