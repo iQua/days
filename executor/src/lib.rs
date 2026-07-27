@@ -12,13 +12,15 @@ pub mod validate;
 
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
-    FlowDescriptor, HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, RemoteChannel,
-    SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
+    ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
+    GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
+    HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, RemoteChannel,
+    ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
 };
 pub use model::{NodeKind, SchedulerKind, TransitionHandler, resolve_transition};
 pub use scalar::{
-    ArrivalDisposition, ExecutionError, PacketArrivalObservation, PacketDeparture, RunResult,
-    run_scalar,
+    ArrivalDisposition, ExecutionError, ObservationMode, PacketArrivalObservation, PacketDeparture,
+    RunResult, RunSummary, run_scalar, run_scalar_with_observations,
 };
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
 pub use validate::{Backend, ValidationError, validate};

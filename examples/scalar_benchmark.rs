@@ -1,7 +1,7 @@
 use std::{env, error::Error, time::Instant};
 
 use days::scenario::compile_config;
-use days_executor::{ArrivalDisposition, RunResult, SimulationImage, run_scalar};
+use days_executor::{RunResult, SimulationImage, run_scalar};
 
 fn processed_event_count(image: &SimulationImage, result: &RunResult) -> u64 {
     let initial_origin_seq = image
@@ -44,10 +44,6 @@ fn processed_event_count_from_parts(
     initial_events + generated_events - pending_events
 }
 
-fn packet_size(image: &SimulationImage, payload: days_executor::PayloadId) -> u64 {
-    image.packets[payload.0 as usize].size_bytes
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args().nth(1).ok_or("usage: scalar_benchmark CONFIG")?;
     let image = compile_config(&path)?;
@@ -56,45 +52,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let result = run_scalar(&image, None)?;
     let elapsed = timer.elapsed();
 
-    let sourced_packets = result
-        .host_states
-        .iter()
-        .map(|state| state.sourced_packets)
-        .sum::<u64>();
-    let sourced_bytes = image
-        .initial_events
-        .iter()
-        .filter(|event| event.key.time_ns <= image.stop_time_ns)
-        .map(|event| packet_size(&image, event.payload))
-        .sum::<u64>();
-    let received_packets = result
-        .arrivals
-        .iter()
-        .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
-        .count() as u64;
-    let received_bytes = result
-        .arrivals
-        .iter()
-        .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
-        .map(|arrival| packet_size(&image, arrival.payload))
-        .sum::<u64>();
-    let dropped_packets = result
-        .arrivals
-        .iter()
-        .filter(|arrival| arrival.disposition == ArrivalDisposition::Dropped)
-        .count() as u64;
-    let dropped_bytes = result
-        .arrivals
-        .iter()
-        .filter(|arrival| arrival.disposition == ArrivalDisposition::Dropped)
-        .map(|arrival| packet_size(&image, arrival.payload))
-        .sum::<u64>();
+    let summary = result.summary;
     println!(
         "config={path} stop_time_ns={} next_pending_ns={:?} pending_events={} \
          certified_lookahead_ns={:?} events={} \
-         sourced_packets={sourced_packets} sourced_bytes={sourced_bytes} \
-         received_packets={received_packets} received_bytes={received_bytes} \
-         dropped_packets={dropped_packets} dropped_bytes={dropped_bytes} wall_ns={}",
+         sourced_packets={} sourced_bytes={} \
+         received_packets={} received_bytes={} \
+         dropped_packets={} dropped_bytes={} wall_ns={}",
         image.stop_time_ns,
         result.pending_events.first().map(|event| event.key.time_ns),
         result.pending_events.len(),
@@ -104,6 +68,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|channel| channel.min_delay_ns)
             .min(),
         processed_event_count(&image, &result),
+        summary.sourced_packets,
+        summary.sourced_bytes,
+        summary.received_packets,
+        summary.received_bytes,
+        summary.dropped_packets,
+        summary.dropped_bytes,
         elapsed.as_nanos()
     );
     Ok(())

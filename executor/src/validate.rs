@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    EventKind, FlowDescriptor, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PayloadId,
-    SchedulerKind, SimulationImage, event_phase, resolve_transition,
+    EventKind, FlowDescriptor, FlowGeneratorKind, GeneratorStatus, GeneratorTermination,
+    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketKind, PayloadId, SchedulerKind,
+    SimulationImage, event_phase, resolve_transition,
 };
 
 /// Execution target whose representational limits are checked before running.
@@ -79,14 +80,17 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_state_ownership(image)?;
     validate_links(image)?;
     validate_flows(image)?;
+    validate_generators(image)?;
     let derived_delays = validate_packets_and_derive_delays(image)?;
     validate_owned_service_state(image, backend)?;
     validate_channels(image, backend, &derived_delays)?;
     validate_events(image)?;
     validate_global_time_capacity(image)?;
     validate_service_event_consistency(image)?;
-    let packet_counts_by_flow = validate_counters(image)?;
-    validate_origin_sequences(image, &packet_counts_by_flow)?;
+    let future_work = validate_counters(image)?;
+    validate_origin_sequences(image, &future_work)?;
+    validate_payload_sequences(image, &future_work)?;
+    validate_preloaded_arrival_capacity(image)?;
     Ok(())
 }
 
@@ -170,24 +174,18 @@ fn validate_flow_ids(image: &SimulationImage) -> Result<(), ValidationError> {
 
 fn validate_packet_ids(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut seen = BTreeSet::new();
-    let count = image.packets.len() as u64;
-    for (index, packet) in image.packets.iter().enumerate() {
+    for (index, packet) in image.initial_packets.iter().enumerate() {
         if !seen.insert(packet.id) {
             return Err(ValidationError::new(format!(
                 "duplicate packet ID {:?} at descriptor {index}",
                 packet.id
             )));
         }
-        if packet.id.0 >= count {
+        if index > 0 && image.initial_packets[index - 1].id >= packet.id {
             return Err(ValidationError::new(format!(
-                "packet ID {:?} at descriptor {index} is outside dense range 0..{count}",
-                packet.id
-            )));
-        }
-        if packet.id.0 != index as u64 {
-            return Err(ValidationError::new(format!(
-                "packet ID {:?} at descriptor {index} does not match dense table index {index}",
-                packet.id
+                "packet ID {:?} at descriptor {index} does not advance previous packet ID {:?}",
+                packet.id,
+                image.initial_packets[index - 1].id
             )));
         }
     }
@@ -338,6 +336,343 @@ fn validate_flows(image: &SimulationImage) -> Result<(), ValidationError> {
                 flow.id, expected_source, flow.target
             )));
         }
+        if !flow.reverse_route.is_empty() {
+            validate_reverse_route(image, flow)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_reverse_route(
+    image: &SimulationImage,
+    flow: &FlowDescriptor,
+) -> Result<(), ValidationError> {
+    let mut expected_source = flow.target;
+    let mut visited_nodes = BTreeSet::from([flow.target]);
+    for (step, link_id) in flow.reverse_route.iter().enumerate() {
+        let link = link(image, *link_id).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} reverse route step {step} references unknown link {link_id:?}",
+                flow.id
+            ))
+        })?;
+        if link.source != expected_source {
+            return Err(ValidationError::new(format!(
+                "flow {:?} reverse route step {step} link {:?} starts at {:?}, expected {:?}",
+                flow.id, link.id, link.source, expected_source
+            )));
+        }
+        if step > 0 {
+            let interior =
+                node(image, link.source).expect("link validation established reverse source");
+            if interior.kind != NodeKind::Switch {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} reverse route step {step} uses interior {:?} node {:?}; only Switch nodes may forward",
+                    flow.id, interior.kind, interior.id
+                )));
+            }
+        }
+        if !visited_nodes.insert(link.target) {
+            return Err(ValidationError::new(format!(
+                "flow {:?} reverse route revisits node {:?} at step {step}",
+                flow.id, link.target
+            )));
+        }
+        if step + 1 < flow.reverse_route.len() {
+            let interior =
+                node(image, link.target).expect("link validation established reverse target");
+            if interior.kind != NodeKind::Switch {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} reverse route reaches interior {:?} node {:?} at step {step}; only Switch nodes may forward",
+                    flow.id, interior.kind, interior.id
+                )));
+            }
+        }
+        expected_source = link.target;
+    }
+    if expected_source != flow.source {
+        return Err(ValidationError::new(format!(
+            "flow {:?} reverse route ends at node {:?}, expected {:?}",
+            flow.id, expected_source, flow.source
+        )));
+    }
+    Ok(())
+}
+
+fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
+    let mut arrival_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
+    for event in image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacketArrival)
+    {
+        *arrival_counts
+            .entry((event.target, event.payload, event.key.time_ns))
+            .or_default() += 1;
+    }
+    let mut owners = BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64)>::new();
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        let mut previous = None;
+        for (index, generator) in state.generators.iter().enumerate() {
+            if previous.is_some_and(|flow| flow >= generator.flow) {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} generator {index} flow {:?} does not advance previous flow {:?}",
+                    owner.id,
+                    generator.flow,
+                    previous.expect("checked Some")
+                )));
+            }
+            previous = Some(generator.flow);
+            let flow = flow(image, generator.flow).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "host node {:?} generator {index} references unknown flow {:?}",
+                    owner.id, generator.flow
+                ))
+            })?;
+            if flow.source != owner.id {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} owns generator for flow {:?}, but the flow source is {:?}",
+                    owner.id, flow.id, flow.source
+                )));
+            }
+            if let Some((first, ..)) = owners.insert(
+                flow.id,
+                (
+                    owner.id,
+                    generator.next_emission.status,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ),
+            ) {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} generator is owned by both node {first:?} and node {:?}",
+                    flow.id, owner.id
+                )));
+            }
+
+            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            if constant.interval_ns == 0 {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} constant generator interval must be positive",
+                    flow.id
+                )));
+            }
+            if constant.packet_size_bytes == 0 {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} constant generator packet size must be positive",
+                    flow.id
+                )));
+            }
+            if let GeneratorTermination::DurationNs(duration_ns) = constant.termination {
+                constant
+                    .first_departure_ns
+                    .checked_add(duration_ns)
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} generator duration end time exceeds u64",
+                            flow.id
+                        ))
+                    })?;
+            }
+
+            let remaining = remaining_generator_packets(generator)?;
+            match generator.next_emission.status {
+                GeneratorStatus::Scheduled if remaining == 0 => {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} has a scheduled emission after its constant generator finished",
+                        flow.id
+                    )));
+                }
+                GeneratorStatus::Finished if remaining != 0 => {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} generator is Finished with {remaining} packets remaining",
+                        flow.id
+                    )));
+                }
+                GeneratorStatus::Blocked if remaining == 0 => {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} generator is Blocked after its constant generator finished",
+                        flow.id
+                    )));
+                }
+                GeneratorStatus::Stopped if remaining == 0 => {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} generator is Stopped after its constant generator finished",
+                        flow.id
+                    )));
+                }
+                GeneratorStatus::Scheduled
+                | GeneratorStatus::Blocked
+                | GeneratorStatus::Finished
+                | GeneratorStatus::Stopped => {}
+            }
+
+            if generator.next_emission.status == GeneratorStatus::Scheduled {
+                let packet = packet(image, generator.next_emission.payload).ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} scheduled emission references unknown packet {:?}",
+                        flow.id, generator.next_emission.payload
+                    ))
+                })?;
+                if packet.flow != flow.id {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} scheduled emission packet {:?} belongs to flow {:?}",
+                        flow.id, packet.id, packet.flow
+                    )));
+                }
+                if packet.kind != PacketKind::Data {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} scheduled packet {:?} is {:?}, expected Data",
+                        flow.id, packet.id, packet.kind
+                    )));
+                }
+                if packet.size_bytes != constant.packet_size_bytes {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} scheduled packet {:?} has size {}, expected {}",
+                        flow.id, packet.id, packet.size_bytes, constant.packet_size_bytes
+                    )));
+                }
+                let expected_departure = constant
+                    .interval_ns
+                    .checked_mul(generator.packets_emitted)
+                    .and_then(|offset| constant.first_departure_ns.checked_add(offset))
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} generator next departure time exceeds u64",
+                            flow.id
+                        ))
+                    })?;
+                if generator.next_emission.departure_time_ns != expected_departure {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} scheduled departure time {} does not match recurrence value {expected_departure}",
+                        flow.id, generator.next_emission.departure_time_ns
+                    )));
+                }
+                let matching_events = arrival_counts
+                    .get(&(
+                        owner.id,
+                        packet.id,
+                        generator.next_emission.departure_time_ns,
+                    ))
+                    .copied()
+                    .unwrap_or(0);
+                if matching_events != 1 {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} scheduled emission has {matching_events} matching PacketArrival events; expected 1",
+                        flow.id
+                    )));
+                }
+                validate_scheduled_payload_sequence(image, owner, state, packet.id, flow.id)?;
+            } else if generator.next_emission.status == GeneratorStatus::Stopped {
+                let expected_departure = constant
+                    .interval_ns
+                    .checked_mul(generator.packets_emitted)
+                    .and_then(|offset| constant.first_departure_ns.checked_add(offset))
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} generator next departure time exceeds u64",
+                            flow.id
+                        ))
+                    })?;
+                if generator.next_emission.departure_time_ns != expected_departure {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} stopped departure time {} does not match recurrence value {expected_departure}",
+                        flow.id, generator.next_emission.departure_time_ns
+                    )));
+                }
+                if expected_departure <= image.stop_time_ns {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} generator is Stopped at {expected_departure}, which is not beyond stop time {}",
+                        flow.id, image.stop_time_ns
+                    )));
+                }
+            }
+        }
+    }
+    for event in image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacketArrival)
+    {
+        let Some(packet) = packet(image, event.payload) else {
+            continue;
+        };
+        if let Some((owner, status, payload, time_ns)) = owners.get(&packet.flow) {
+            let expected = *status == GeneratorStatus::Scheduled
+                && *owner == event.target
+                && *payload == event.payload
+                && *time_ns == event.key.time_ns;
+            if !expected {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} generator has an unexpected PacketArrival for payload {:?} at node {:?} time {}",
+                    packet.flow, event.payload, event.target, event.key.time_ns
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_preloaded_arrival_capacity(image: &SimulationImage) -> Result<(), ValidationError> {
+    let generator_flows = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .map(|generator| generator.flow)
+        .collect::<BTreeSet<_>>();
+    let mut counts = BTreeMap::<crate::FlowId, usize>::new();
+    for event in image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacketArrival)
+    {
+        let packet = packet(image, event.payload).expect("event validation established packet");
+        if generator_flows.contains(&packet.flow) {
+            continue;
+        }
+        let count = counts.entry(packet.flow).or_default();
+        *count += 1;
+        if *count > 1 {
+            return Err(ValidationError::new(format!(
+                "flow {:?} without a generator has {count} PacketArrival inputs; at most one preloaded input is supported",
+                packet.flow
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scheduled_payload_sequence(
+    image: &SimulationImage,
+    owner: &NodeDescriptor,
+    state: &crate::HostState,
+    payload: PayloadId,
+    flow: crate::FlowId,
+) -> Result<(), ValidationError> {
+    let node_count = u64::try_from(image.nodes.len()).unwrap_or(u64::MAX);
+    let offset = payload.0.checked_sub(owner.id.0).ok_or_else(|| {
+        ValidationError::new(format!(
+            "flow {flow:?} scheduled payload {payload:?} is not allocated by source node {:?}",
+            owner.id
+        ))
+    })?;
+    if node_count == 0 || offset % node_count != 0 {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} scheduled payload {payload:?} is not allocated by source node {:?}",
+            owner.id
+        )));
+    }
+    let sequence = offset / node_count;
+    if sequence >= state.next_payload_seq {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} scheduled payload {payload:?} sequence {sequence} is not below node {:?} next payload sequence {}",
+            owner.id, state.next_payload_seq
+        )));
     }
     Ok(())
 }
@@ -346,7 +681,7 @@ fn validate_packets_and_derive_delays(
     image: &SimulationImage,
 ) -> Result<BTreeMap<LinkId, u64>, ValidationError> {
     let mut derived = BTreeMap::<LinkId, u64>::new();
-    for packet in &image.packets {
+    for packet in &image.initial_packets {
         if packet.size_bytes == 0 {
             return Err(ValidationError::new(format!(
                 "packet {:?} has zero size, which cannot certify positive serialization",
@@ -360,7 +695,7 @@ fn validate_packets_and_derive_delays(
             ))
         })?;
         let mut cumulative_delay = 0_u64;
-        for link_id in &flow.route {
+        for link_id in packet_route(flow, packet.kind) {
             let link = link(image, *link_id).expect("validated flow route names an existing link");
             let delay = link.delay_ns(packet.size_bytes).map_err(|error| {
                 ValidationError::new(format!(
@@ -378,6 +713,29 @@ fn validate_packets_and_derive_delays(
                 .entry(link.id)
                 .and_modify(|minimum| *minimum = (*minimum).min(delay))
                 .or_insert(delay);
+        }
+    }
+    for state in &image.host_states {
+        for generator in &state.generators {
+            if remaining_generator_packets(generator)? == 0 {
+                continue;
+            }
+            let flow = flow(image, generator.flow).expect("generator validation established flow");
+            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            for link_id in &flow.route {
+                let link =
+                    link(image, *link_id).expect("validated flow route names an existing link");
+                let delay = link.delay_ns(constant.packet_size_bytes).map_err(|error| {
+                    ValidationError::new(format!(
+                        "link {:?} delay overflows for flow {:?} generator: {error}",
+                        link.id, flow.id
+                    ))
+                })?;
+                derived
+                    .entry(link.id)
+                    .and_modify(|minimum| *minimum = (*minimum).min(delay))
+                    .or_insert(delay);
+            }
         }
     }
     Ok(derived)
@@ -582,7 +940,7 @@ fn validate_payload_egress(
             ))
         })?;
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
-        let actual_egress = flow_egress_at(image, flow, owner);
+        let actual_egress = flow_egress_at(image, flow, packet.kind, owner);
         if actual_egress != Some(expected_egress) {
             return Err(ValidationError::new(format!(
                 "node {owner:?} {location} contains packet {payload:?} for egress {actual_egress:?}, expected {expected_egress:?}"
@@ -728,7 +1086,7 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
 
         match event.kind {
             EventKind::PacketArrival => {
-                if event.target != flow.source {
+                if packet.kind != PacketKind::Data || event.target != flow.source {
                     return Err(ValidationError::new(format!(
                         "PacketArrival event {index} for payload {:?} targets node {:?}, but flow {:?} is sourced by node {:?}",
                         event.payload, event.target, flow.id, flow.source
@@ -743,11 +1101,10 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                 validate_remaining_route_time(
                     image,
                     flow,
-                    packet.size_bytes,
+                    packet,
                     event.key.time_ns,
                     event.target,
                     index,
-                    event.payload,
                 )?;
             }
             EventKind::TxReady | EventKind::TxComplete => {
@@ -757,7 +1114,7 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                         event.kind, origin.id, event.target
                     )));
                 }
-                if !flow_route_contains_source(image, flow, event.target) {
+                if !flow_route_contains_source(image, flow, packet.kind, event.target) {
                     return Err(ValidationError::new(format!(
                         "{:?} event {index} targets node {:?}, which does not own service for payload {:?}",
                         event.kind, event.target, event.payload
@@ -767,16 +1124,15 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                     validate_remaining_route_time(
                         image,
                         flow,
-                        packet.size_bytes,
+                        packet,
                         event.key.time_ns,
                         event.target,
                         index,
-                        event.payload,
                     )?;
                 }
             }
             EventKind::RemoteArrival => {
-                if !flow.route.iter().any(|link_id| {
+                if !packet_route(flow, packet.kind).iter().any(|link_id| {
                     declared_route_channels.contains(&(
                         origin.id,
                         event.target,
@@ -792,11 +1148,10 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                 validate_remaining_route_time(
                     image,
                     flow,
-                    packet.size_bytes,
+                    packet,
                     event.key.time_ns,
                     event.target,
                     index,
-                    event.payload,
                 )?;
             }
         }
@@ -807,25 +1162,28 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
 fn validate_remaining_route_time(
     image: &SimulationImage,
     flow: &FlowDescriptor,
-    packet_size_bytes: u64,
+    packet: &crate::PacketDescriptor,
     start_time_ns: u64,
     start_node: NodeId,
     event_index: usize,
-    payload: PayloadId,
 ) -> Result<(), ValidationError> {
-    if start_node == flow.target {
+    let terminal = match packet.kind {
+        PacketKind::Data => flow.target,
+        PacketKind::Feedback => flow.source,
+    };
+    if start_node == terminal {
         return Ok(());
     }
     let mut remaining_delay = 0_u64;
     let mut started = false;
-    for link_id in &flow.route {
+    for link_id in packet_route(flow, packet.kind) {
         let link = link(image, *link_id).expect("flow validation established the route link");
         if link.source == start_node {
             started = true;
         }
         if started {
             let delay = link
-                .delay_ns(packet_size_bytes)
+                .delay_ns(packet.size_bytes)
                 .expect("packet/link delay validation already succeeded");
             remaining_delay = remaining_delay
                 .checked_add(delay)
@@ -834,15 +1192,16 @@ fn validate_remaining_route_time(
     }
     if !started {
         return Err(ValidationError::new(format!(
-            "initial event {event_index} starts payload {payload:?} at node {start_node:?}, which is not on flow {:?}",
-            flow.id
+            "initial event {event_index} starts payload {:?} at node {start_node:?}, which is not on flow {:?}",
+            packet.id, flow.id
         )));
     }
     start_time_ns
         .checked_add(remaining_delay)
         .ok_or_else(|| {
             ValidationError::new(format!(
-                "initial event {event_index} time {start_time_ns} plus remaining route delay {remaining_delay} overflows for payload {payload:?} at node {start_node:?}"
+                "initial event {event_index} time {start_time_ns} plus remaining route delay {remaining_delay} overflows for payload {:?} at node {start_node:?}",
+                packet.id
             ))
         })?;
     Ok(())
@@ -850,9 +1209,19 @@ fn validate_remaining_route_time(
 
 fn validate_global_time_capacity(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut service_bound = 0_u64;
-    for packet in &image.packets {
+    let scheduled_payloads = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
+        .map(|generator| generator.next_emission.payload)
+        .collect::<BTreeSet<_>>();
+    for packet in &image.initial_packets {
+        if scheduled_payloads.contains(&packet.id) {
+            continue;
+        }
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
-        for link_id in &flow.route {
+        for link_id in packet_route(flow, packet.kind) {
             let link = link(image, *link_id).expect("flow validation established the route link");
             let delay = link
                 .delay_ns(packet.size_bytes)
@@ -865,19 +1234,76 @@ fn validate_global_time_capacity(image: &SimulationImage) -> Result<(), Validati
             })?;
         }
     }
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let flow = flow(image, generator.flow).expect("generator validation established the flow");
+        let FlowGeneratorKind::Constant(constant) = generator.kind;
+        let remaining = executable_generator_packets(generator)?;
+        for link_id in &flow.route {
+            let link = link(image, *link_id).expect("flow validation established the route link");
+            let delay = link
+                .delay_ns(constant.packet_size_bytes)
+                .expect("generator/link delay validation already succeeded");
+            let flow_delay = delay.checked_mul(remaining).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "conservative service-time bound overflows for flow {:?} generator on link {:?}",
+                    flow.id, link.id
+                ))
+            })?;
+            service_bound = service_bound.checked_add(flow_delay).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "conservative service-time bound overflows for flow {:?} generator on link {:?}",
+                    flow.id, link.id
+                ))
+            })?;
+        }
+    }
     let maximum_initial_time = image
         .initial_events
         .iter()
         .map(|event| event.key.time_ns)
         .max()
         .unwrap_or(0);
-    maximum_initial_time
-        .checked_add(service_bound)
-        .ok_or_else(|| {
+    let maximum_generator_time = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
+        .map(|generator| {
+            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            let remaining = executable_generator_packets(generator)?;
+            let intervals = remaining.saturating_sub(1);
+            constant
+                .interval_ns
+                .checked_mul(intervals)
+                .and_then(|offset| {
+                    generator
+                        .next_emission
+                        .departure_time_ns
+                        .checked_add(offset)
+                })
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} latest generated departure time exceeds u64",
+                        generator.flow
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let maximum_work_time = maximum_initial_time.max(maximum_generator_time);
+    maximum_work_time.checked_add(service_bound).ok_or_else(|| {
+        if maximum_generator_time <= maximum_initial_time {
             ValidationError::new(format!(
                 "maximum initial event time {maximum_initial_time} plus conservative service bound {service_bound} overflows"
             ))
-        })?;
+        } else {
+            ValidationError::new(format!(
+                "maximum generator departure time {maximum_generator_time} plus conservative service bound {service_bound} overflows"
+            ))
+        }
+    })?;
     Ok(())
 }
 
@@ -1029,26 +1455,83 @@ fn record_mutable_payload(
     Ok(())
 }
 
-fn validate_counters(image: &SimulationImage) -> Result<Vec<u64>, ValidationError> {
-    let mut packet_counts_by_flow = vec![0_u64; image.flows.len()];
-    for packet in &image.packets {
-        let count = &mut packet_counts_by_flow[packet.flow.0 as usize];
+struct FutureWork {
+    data_by_flow: Vec<u64>,
+    feedback_by_flow: Vec<u64>,
+}
+
+fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
+    let mut data_by_flow = vec![0_u64; image.flows.len()];
+    let mut feedback_by_flow = vec![0_u64; image.flows.len()];
+    let scheduled_payloads = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
+        .map(|generator| generator.next_emission.payload)
+        .collect::<BTreeSet<_>>();
+    for packet in &image.initial_packets {
+        if scheduled_payloads.contains(&packet.id) {
+            continue;
+        }
+        let counts = match packet.kind {
+            PacketKind::Data => &mut data_by_flow,
+            PacketKind::Feedback => &mut feedback_by_flow,
+        };
+        let count = &mut counts[packet.flow.0 as usize];
         *count = count
             .checked_add(1)
             .ok_or_else(|| ValidationError::new("packet count exceeds the u64 counter domain"))?;
     }
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        add_packet_count(
+            &mut data_by_flow[generator.flow.0 as usize],
+            executable_generator_packets(generator)?,
+        )?;
+    }
+    Ok(FutureWork {
+        data_by_flow,
+        feedback_by_flow,
+    })
+}
 
+fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
+    let work = future_work(image)?;
     let mut sourced_by_node = vec![0_u64; image.nodes.len()];
+    let mut departed_by_node = vec![0_u64; image.nodes.len()];
     let mut received_by_node = vec![0_u64; image.nodes.len()];
     let mut traversing_by_node = vec![0_u64; image.nodes.len()];
-    for (flow, packet_count) in image.flows.iter().zip(&packet_counts_by_flow) {
-        add_packet_count(&mut sourced_by_node[flow.source.0 as usize], *packet_count)?;
-        add_packet_count(&mut received_by_node[flow.target.0 as usize], *packet_count)?;
-        for link_id in &flow.route {
+    for (flow, (data_count, feedback_count)) in image
+        .flows
+        .iter()
+        .zip(work.data_by_flow.iter().zip(work.feedback_by_flow.iter()))
+    {
+        add_packet_count(&mut sourced_by_node[flow.source.0 as usize], *data_count)?;
+        add_packet_count(&mut received_by_node[flow.target.0 as usize], *data_count)?;
+        add_packet_count(
+            &mut received_by_node[flow.source.0 as usize],
+            *feedback_count,
+        )?;
+        for link_id in packet_route(flow, PacketKind::Data) {
             let route_link = link(image, *link_id).expect("flow validation established the link");
             add_packet_count(
+                &mut departed_by_node[route_link.source.0 as usize],
+                *data_count,
+            )?;
+            add_packet_count(
                 &mut traversing_by_node[route_link.source.0 as usize],
-                *packet_count,
+                *data_count,
+            )?;
+        }
+        for link_id in packet_route(flow, PacketKind::Feedback) {
+            let route_link = link(image, *link_id).expect("flow validation established the link");
+            add_packet_count(
+                &mut departed_by_node[route_link.source.0 as usize],
+                *feedback_count,
+            )?;
+            add_packet_count(
+                &mut traversing_by_node[route_link.source.0 as usize],
+                *feedback_count,
             )?;
         }
     }
@@ -1064,7 +1547,7 @@ fn validate_counters(image: &SimulationImage) -> Result<Vec<u64>, ValidationErro
                     owner.id,
                     "departed_packets",
                     state.departed_packets,
-                    sourced,
+                    departed_by_node[owner.id.0 as usize],
                 )?;
                 check_counter(
                     owner.id,
@@ -1097,7 +1580,67 @@ fn validate_counters(image: &SimulationImage) -> Result<Vec<u64>, ValidationErro
             }
         }
     }
-    Ok(packet_counts_by_flow)
+    Ok(work)
+}
+
+fn remaining_generator_packets(
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let FlowGeneratorKind::Constant(constant) = generator.kind;
+    let total = match constant.termination {
+        GeneratorTermination::Bytes(bytes) => {
+            if bytes == 0 {
+                0
+            } else {
+                1 + (bytes - 1) / constant.packet_size_bytes
+            }
+        }
+        GeneratorTermination::DurationNs(duration_ns) => {
+            if duration_ns == 0 {
+                0
+            } else {
+                1 + (duration_ns - 1) / constant.interval_ns
+            }
+        }
+    };
+    total
+        .checked_mul(constant.packet_size_bytes)
+        .ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} generator byte total exceeds u64",
+                generator.flow
+            ))
+        })?;
+    let expected_bytes = generator
+        .packets_emitted
+        .checked_mul(constant.packet_size_bytes)
+        .ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} generator byte bookkeeping exceeds u64",
+                generator.flow
+            ))
+        })?;
+    if generator.bytes_emitted != expected_bytes {
+        return Err(ValidationError::new(format!(
+            "flow {:?} generator records {} emitted bytes, expected {expected_bytes}",
+            generator.flow, generator.bytes_emitted
+        )));
+    }
+    total.checked_sub(generator.packets_emitted).ok_or_else(|| {
+        ValidationError::new(format!(
+            "flow {:?} generator emitted {} packets, exceeding constant total {total}",
+            generator.flow, generator.packets_emitted
+        ))
+    })
+}
+
+fn executable_generator_packets(
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    match generator.next_emission.status {
+        GeneratorStatus::Scheduled => remaining_generator_packets(generator),
+        GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
+    }
 }
 
 fn add_packet_count(total: &mut u64, count: u64) -> Result<(), ValidationError> {
@@ -1123,7 +1666,7 @@ fn check_counter(
 
 fn validate_origin_sequences(
     image: &SimulationImage,
-    packet_counts_by_flow: &[u64],
+    work: &FutureWork,
 ) -> Result<(), ValidationError> {
     let mut maximum = BTreeMap::<NodeId, u64>::new();
     for event in &image.initial_events {
@@ -1133,10 +1676,32 @@ fn validate_origin_sequences(
             .or_insert(event.key.origin_seq);
     }
     let mut transmissions_by_node = vec![0_u128; image.nodes.len()];
-    for (flow, packet_count) in image.flows.iter().zip(packet_counts_by_flow) {
-        for link_id in &flow.route {
+    let mut emissions_by_node = vec![0_u128; image.nodes.len()];
+    for (flow, (data_count, feedback_count)) in image
+        .flows
+        .iter()
+        .zip(work.data_by_flow.iter().zip(work.feedback_by_flow.iter()))
+    {
+        for link_id in packet_route(flow, PacketKind::Data) {
             let route_link = link(image, *link_id).expect("flow validation established the link");
-            transmissions_by_node[route_link.source.0 as usize] += u128::from(*packet_count);
+            transmissions_by_node[route_link.source.0 as usize] += u128::from(*data_count);
+        }
+        for link_id in packet_route(flow, PacketKind::Feedback) {
+            let route_link = link(image, *link_id).expect("flow validation established the link");
+            transmissions_by_node[route_link.source.0 as usize] += u128::from(*feedback_count);
+        }
+    }
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        for generator in &state.generators {
+            let remaining = executable_generator_packets(generator)?;
+            let scheduled = u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+            emissions_by_node[owner.id.0 as usize] +=
+                u128::from(remaining.saturating_sub(scheduled));
         }
     }
     for node in &image.nodes {
@@ -1152,8 +1717,23 @@ fn validate_origin_sequences(
                 )));
             }
         }
-        let generated =
+        let transmission_events =
             possible_generated_events(node.id, transmissions_by_node[node.id.0 as usize])?;
+        let emission_events =
+            u64::try_from(emissions_by_node[node.id.0 as usize]).map_err(|_| {
+                ValidationError::new(format!(
+                    "node {:?} generated-event count exceeds u64",
+                    node.id
+                ))
+            })?;
+        let generated = transmission_events
+            .checked_add(emission_events)
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "node {:?} generated-event count exceeds u64",
+                    node.id
+                ))
+            })?;
         if next.checked_add(generated).is_none() {
             return Err(ValidationError::new(format!(
                 "node {:?} origin sequence space overflows while reserving {generated} generated events",
@@ -1164,13 +1744,124 @@ fn validate_origin_sequences(
     Ok(())
 }
 
-fn possible_emission_links(image: &SimulationImage) -> BTreeSet<LinkId> {
-    image
-        .packets
+fn validate_payload_sequences(
+    image: &SimulationImage,
+    _work: &FutureWork,
+) -> Result<(), ValidationError> {
+    let node_count = u64::try_from(image.nodes.len()).unwrap_or(u64::MAX);
+    let mut payload_sequences_by_owner = vec![Vec::<(u64, PayloadId)>::new(); image.nodes.len()];
+    if node_count != 0 {
+        for packet in &image.initial_packets {
+            let owner = packet.id.0 % node_count;
+            let sequence = packet.id.0 / node_count;
+            if let Some(payloads) = payload_sequences_by_owner.get_mut(owner as usize) {
+                payloads.push((sequence, packet.id));
+            }
+        }
+    }
+    for owner in image
+        .nodes
         .iter()
-        .filter_map(|packet| flow(image, packet.flow))
-        .flat_map(|flow| flow.route.iter().copied())
-        .collect()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        let mut allocations = 0_u64;
+        let mut consumed_sequences = 0_u64;
+        for generator in &state.generators {
+            let remaining = executable_generator_packets(generator)?;
+            let already_scheduled =
+                u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+            consumed_sequences = consumed_sequences
+                .checked_add(generator.packets_emitted)
+                .and_then(|total| total.checked_add(already_scheduled))
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "node {:?} consumed payload sequence count exceeds u64",
+                        owner.id
+                    ))
+                })?;
+            let required = remaining.checked_sub(already_scheduled).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} has a scheduled emission after its constant generator finished",
+                    generator.flow
+                ))
+            })?;
+            allocations = allocations.checked_add(required).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "node {:?} generated-packet count exceeds u64",
+                    owner.id
+                ))
+            })?;
+        }
+        if state.next_payload_seq < consumed_sequences {
+            return Err(ValidationError::new(format!(
+                "node {:?} next payload sequence {} is below generator allocation lower bound {consumed_sequences}",
+                owner.id, state.next_payload_seq
+            )));
+        }
+        if allocations == 0 {
+            continue;
+        }
+        let end_sequence = state
+            .next_payload_seq
+            .checked_add(allocations)
+            .ok_or_else(|| {
+                payload_reservation_error(owner.id, state.next_payload_seq, allocations)
+            })?;
+        let last_sequence = end_sequence - 1;
+        if allocate_payload_id(owner.id, node_count, last_sequence).is_none() {
+            return Err(payload_reservation_error(
+                owner.id,
+                state.next_payload_seq,
+                allocations,
+            ));
+        }
+        for (sequence, payload) in &payload_sequences_by_owner[owner.id.0 as usize] {
+            if (state.next_payload_seq..end_sequence).contains(sequence) {
+                return Err(ValidationError::new(format!(
+                    "node {:?} future payload sequence {sequence} collides with initial packet {:?}",
+                    owner.id, payload
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn payload_reservation_error(
+    node: NodeId,
+    next_sequence: u64,
+    allocations: u64,
+) -> ValidationError {
+    ValidationError::new(format!(
+        "node {node:?} payload identity sequence {next_sequence} overflows while reserving {allocations} generated packets"
+    ))
+}
+
+fn allocate_payload_id(source: NodeId, node_count: u64, sequence: u64) -> Option<PayloadId> {
+    PayloadId::from_node_sequence(source, node_count, sequence)
+}
+
+fn possible_emission_links(image: &SimulationImage) -> BTreeSet<LinkId> {
+    let mut links = image
+        .initial_packets
+        .iter()
+        .flat_map(|packet| {
+            flow(image, packet.flow)
+                .into_iter()
+                .flat_map(|flow| packet_route(flow, packet.kind).iter().copied())
+        })
+        .collect::<BTreeSet<_>>();
+    links.extend(
+        image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .filter(|generator| remaining_generator_packets(generator).is_ok_and(|count| count > 0))
+            .filter_map(|generator| flow(image, generator.flow))
+            .flat_map(|flow| flow.route.iter().copied()),
+    );
+    links
 }
 
 fn possible_generated_events(source: NodeId, transmissions: u128) -> Result<u64, ValidationError> {
@@ -1185,17 +1876,19 @@ fn possible_generated_events(source: NodeId, transmissions: u128) -> Result<u64,
 fn flow_route_contains_source(
     image: &SimulationImage,
     flow: &FlowDescriptor,
+    packet_kind: PacketKind,
     source: NodeId,
 ) -> bool {
-    flow_egress_at(image, flow, source).is_some()
+    flow_egress_at(image, flow, packet_kind, source).is_some()
 }
 
 fn flow_egress_at(
     image: &SimulationImage,
     flow: &FlowDescriptor,
+    packet_kind: PacketKind,
     source: NodeId,
 ) -> Option<LinkId> {
-    flow.route
+    packet_route(flow, packet_kind)
         .iter()
         .copied()
         .find(|link_id| link(image, *link_id).is_some_and(|link| link.source == source))
@@ -1204,7 +1897,14 @@ fn flow_egress_at(
 fn event_egress(image: &SimulationImage, event: &crate::Event) -> Option<LinkId> {
     let packet = packet(image, event.payload)?;
     let flow = flow(image, packet.flow)?;
-    flow_egress_at(image, flow, event.target)
+    flow_egress_at(image, flow, packet.kind, event.target)
+}
+
+fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
+    match packet_kind {
+        PacketKind::Data => &flow.route,
+        PacketKind::Feedback => &flow.reverse_route,
+    }
 }
 
 fn node(image: &SimulationImage, id: NodeId) -> Option<&NodeDescriptor> {
@@ -1230,7 +1930,8 @@ fn flow(image: &SimulationImage, id: crate::FlowId) -> Option<&FlowDescriptor> {
 
 fn packet(image: &SimulationImage, id: PayloadId) -> Option<&crate::PacketDescriptor> {
     image
-        .packets
-        .get(usize::try_from(id.0).ok()?)
-        .filter(|packet| packet.id == id)
+        .initial_packets
+        .binary_search_by_key(&id, |packet| packet.id)
+        .ok()
+        .map(|index| &image.initial_packets[index])
 }

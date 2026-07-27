@@ -5,9 +5,10 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Event, EventKey, EventKind, FlowId, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
-    PayloadId, SimulationImage, SwitchState, TimeError, TransitionHandler, event_phase,
-    resolve_transition,
+    Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
+    GeneratorStatus, GeneratorTermination, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
+    PacketDescriptor, PacketKind, PayloadId, SimulationImage, SwitchState, TimeError,
+    TransitionHandler, event_phase, resolve_transition,
 };
 
 /// Outcome of one remote packet arrival at a switch queue or sink host.
@@ -16,6 +17,7 @@ pub enum ArrivalDisposition {
     Admitted,
     Dropped,
     Delivered,
+    Feedback,
 }
 
 /// One completed non-preemptive transmission.
@@ -34,11 +36,41 @@ pub struct PacketArrivalObservation {
     pub disposition: ArrivalDisposition,
 }
 
+/// Whether the scalar oracle retains complete per-packet observations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObservationMode {
+    #[default]
+    Summary,
+    Full,
+}
+
+/// Constant-space counters accumulated regardless of observation mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunSummary {
+    pub sourced_packets: u128,
+    pub sourced_bytes: u128,
+    pub departed_packets: u128,
+    pub departed_bytes: u128,
+    pub admitted_packets: u128,
+    pub admitted_bytes: u128,
+    pub received_packets: u128,
+    pub received_bytes: u128,
+    pub dropped_packets: u128,
+    pub dropped_bytes: u128,
+    pub feedback_packets: u128,
+    pub feedback_bytes: u128,
+}
+
 /// Complete normalized scalar state after reaching a configured endpoint or execution horizon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunResult {
     pub host_states: Vec<HostState>,
     pub switch_states: Vec<SwitchState>,
+    pub summary: RunSummary,
+    /// Nonterminal packet data referenced by queues, service slots, or pending events.
+    pub resident_packets: Vec<PacketDescriptor>,
+    /// Complete packet descriptors referenced by full-mode observations.
+    pub observed_packets: Vec<PacketDescriptor>,
     pub departures: Vec<PacketDeparture>,
     pub arrivals: Vec<PacketArrivalObservation>,
     /// Unprocessed events in canonical `EventKey` order.
@@ -70,7 +102,19 @@ pub enum ExecutionError {
         actual_source: NodeId,
     },
     UnknownPacket(PayloadId),
+    DuplicatePayload(PayloadId),
     UnknownFlow(FlowId),
+    UnknownGenerator {
+        node: NodeId,
+        flow: FlowId,
+    },
+    UnexpectedGeneratorEmission {
+        node: NodeId,
+        flow: FlowId,
+        payload: PayloadId,
+    },
+    PayloadSequenceOverflow(NodeId),
+    GeneratorTimeOverflow(FlowId),
     FlowRouteMiss {
         flow: FlowId,
         node: NodeId,
@@ -129,7 +173,33 @@ impl fmt::Display for ExecutionError {
                 "link {link:?} source is {actual_source:?}, expected {expected_source:?}"
             ),
             Self::UnknownPacket(payload) => write!(formatter, "unknown packet {payload:?}"),
+            Self::DuplicatePayload(payload) => {
+                write!(formatter, "duplicate generated packet identity {payload:?}")
+            }
             Self::UnknownFlow(flow) => write!(formatter, "unknown flow {flow:?}"),
+            Self::UnknownGenerator { node, flow } => {
+                write!(
+                    formatter,
+                    "host node {node:?} does not own generator for flow {flow:?}"
+                )
+            }
+            Self::UnexpectedGeneratorEmission {
+                node,
+                flow,
+                payload,
+            } => write!(
+                formatter,
+                "host node {node:?} generator for flow {flow:?} did not schedule payload {payload:?}"
+            ),
+            Self::PayloadSequenceOverflow(node) => {
+                write!(
+                    formatter,
+                    "payload identity sequence exhausted at node {node:?}"
+                )
+            }
+            Self::GeneratorTimeOverflow(flow) => {
+                write!(formatter, "generator time overflow for flow {flow:?}")
+            }
             Self::FlowRouteMiss { flow, node } => {
                 write!(
                     formatter,
@@ -199,7 +269,16 @@ pub fn run_scalar(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
 ) -> Result<RunResult, ExecutionError> {
-    ScalarExecutor::new(image)?.run(exclusive_horizon_ns)
+    run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Summary)
+}
+
+/// Runs the scalar executor with explicit full-record retention for oracle comparisons.
+pub fn run_scalar_with_observations(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    observation_mode: ObservationMode,
+) -> Result<RunResult, ExecutionError> {
+    ScalarExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
 }
 
 struct ScalarExecutor<'image> {
@@ -207,12 +286,27 @@ struct ScalarExecutor<'image> {
     events: BTreeMap<EventKey, Event>,
     host_states: Vec<HostState>,
     switch_states: Vec<SwitchState>,
+    packets: BTreeMap<PayloadId, ResidentPacket>,
+    observation_mode: ObservationMode,
+    summary: RunSummary,
+    observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
     departures: Vec<PacketDeparture>,
     arrivals: Vec<PacketArrivalObservation>,
 }
 
+#[derive(Clone, Copy)]
+struct ResidentPacket {
+    descriptor: PacketDescriptor,
+    source_time_ns: Option<u64>,
+    transmitters: u64,
+    terminal: bool,
+}
+
 impl<'image> ScalarExecutor<'image> {
-    fn new(image: &'image SimulationImage) -> Result<Self, ExecutionError> {
+    fn new(
+        image: &'image SimulationImage,
+        observation_mode: ObservationMode,
+    ) -> Result<Self, ExecutionError> {
         let mut events = BTreeMap::new();
         for event in image.initial_events.iter().copied() {
             if events.insert(event.key, event).is_some() {
@@ -220,11 +314,53 @@ impl<'image> ScalarExecutor<'image> {
             }
         }
 
+        let mut packets = BTreeMap::new();
+        for descriptor in image.initial_packets.iter().copied() {
+            if packets
+                .insert(
+                    descriptor.id,
+                    ResidentPacket {
+                        descriptor,
+                        source_time_ns: None,
+                        transmitters: 0,
+                        terminal: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ExecutionError::DuplicatePayload(descriptor.id));
+            }
+        }
+        for payload in image
+            .host_states
+            .iter()
+            .filter_map(|state| state.in_service)
+            .chain(
+                image
+                    .switch_states
+                    .iter()
+                    .flat_map(|state| &state.queues)
+                    .filter_map(|queue| queue.in_service),
+            )
+        {
+            let packet = packets
+                .get_mut(&payload)
+                .ok_or(ExecutionError::UnknownPacket(payload))?;
+            packet.transmitters = packet
+                .transmitters
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+        }
+
         Ok(Self {
             image,
             events,
             host_states: image.host_states.clone(),
             switch_states: image.switch_states.clone(),
+            packets,
+            observation_mode,
+            summary: RunSummary::default(),
+            observed_packets: BTreeMap::new(),
             departures: Vec::new(),
             arrivals: Vec::new(),
         })
@@ -242,9 +378,18 @@ impl<'image> ScalarExecutor<'image> {
             self.dispatch(event)?;
         }
 
+        let resident_packets = self
+            .packets
+            .into_values()
+            .map(|packet| packet.descriptor)
+            .collect();
+        let observed_packets = self.observed_packets.into_values().collect();
         Ok(RunResult {
             host_states: self.host_states,
             switch_states: self.switch_states,
+            summary: self.summary,
+            resident_packets,
+            observed_packets,
             departures: self.departures,
             arrivals: self.arrivals,
             pending_events: self.events.into_values().collect(),
@@ -277,24 +422,143 @@ impl<'image> ScalarExecutor<'image> {
         node: NodeDescriptor,
         event: Event,
     ) -> Result<(), ExecutionError> {
-        self.packet_size(event.payload)?;
-
-        let schedule_ready = {
+        let packet = self.packet(event.payload)?;
+        let owns_generator = self
+            .host_states
+            .get(node.state_slot as usize)
+            .is_some_and(|state| {
+                state
+                    .generators
+                    .iter()
+                    .any(|generator| generator.flow == packet.flow)
+            });
+        if !owns_generator {
+            return self.host_preloaded_packet_arrival(node, event);
+        }
+        self.set_source_time(event.payload, event.key.time_ns)?;
+        let (next_packet, next_departure_ns, schedule_ready) = {
+            let stop_time_ns = self.image.stop_time_ns;
+            let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
             let state = self.host_state_mut(node)?;
+            let generator_index = state
+                .generators
+                .iter()
+                .position(|generator| generator.flow == packet.flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow: packet.flow,
+                })?;
+            let (constant, candidate_departure_ns, next_departure_ns, next_status) = {
+                let generator = &mut state.generators[generator_index];
+                if generator.next_emission.status != GeneratorStatus::Scheduled
+                    || generator.next_emission.departure_time_ns != event.key.time_ns
+                    || generator.next_emission.payload != event.payload
+                {
+                    return Err(ExecutionError::UnexpectedGeneratorEmission {
+                        node: node.id,
+                        flow: packet.flow,
+                        payload: event.payload,
+                    });
+                }
+
+                generator.packets_emitted = generator
+                    .packets_emitted
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                generator.bytes_emitted = generator
+                    .bytes_emitted
+                    .checked_add(packet.size_bytes)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+
+                let FlowGeneratorKind::Constant(constant) = generator.kind;
+                let next_departure_ns = match constant.termination {
+                    GeneratorTermination::Bytes(bytes) if generator.bytes_emitted < bytes => Some(
+                        event
+                            .key
+                            .time_ns
+                            .checked_add(constant.interval_ns)
+                            .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?,
+                    ),
+                    GeneratorTermination::Bytes(_) => None,
+                    GeneratorTermination::DurationNs(duration_ns) => {
+                        let end_time_ns = constant
+                            .first_departure_ns
+                            .checked_add(duration_ns)
+                            .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                        let candidate = event
+                            .key
+                            .time_ns
+                            .checked_add(constant.interval_ns)
+                            .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                        (candidate < end_time_ns).then_some(candidate)
+                    }
+                };
+                let next_status = match next_departure_ns {
+                    Some(next) if next <= stop_time_ns => GeneratorStatus::Scheduled,
+                    Some(_) => GeneratorStatus::Stopped,
+                    None => GeneratorStatus::Finished,
+                };
+                (
+                    constant,
+                    next_departure_ns,
+                    next_departure_ns.filter(|next| *next <= stop_time_ns),
+                    next_status,
+                )
+            };
+            let next_packet = if let Some(next_departure_ns) = next_departure_ns {
+                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                state.next_payload_seq = state
+                    .next_payload_seq
+                    .checked_add(1)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                state.generators[generator_index].next_emission = crate::ScheduledEmission {
+                    status: GeneratorStatus::Scheduled,
+                    departure_time_ns: next_departure_ns,
+                    payload,
+                };
+                Some(PacketDescriptor {
+                    id: payload,
+                    flow: packet.flow,
+                    size_bytes: constant.packet_size_bytes,
+                    kind: PacketKind::Data,
+                })
+            } else {
+                state.generators[generator_index].next_emission.status = next_status;
+                if let Some(candidate) = candidate_departure_ns {
+                    state.generators[generator_index]
+                        .next_emission
+                        .departure_time_ns = candidate;
+                }
+                None
+            };
+
             state.sourced_packets = state
                 .sourced_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            state.queue.push_back(event.payload);
-
-            if state.in_service.is_none() && !state.tx_ready_pending {
+            let schedule_ready = if state.in_service.is_none() && !state.tx_ready_pending {
                 state.tx_ready_pending = true;
                 true
             } else {
                 false
-            }
+            };
+            (next_packet, next_departure_ns, schedule_ready)
         };
+        self.enqueue_source_packet(node, event.payload)?;
 
+        self.record_sourced(node.id, packet)?;
+        if let Some(next_packet) = next_packet {
+            self.insert_packet(next_packet, Some(next_departure_ns.expect("produced time")))?;
+            self.emit_from_host(
+                node,
+                event,
+                node.id,
+                EventKind::PacketArrival,
+                next_packet.id,
+                next_departure_ns.expect("a produced packet has a departure"),
+            )?;
+        }
         if schedule_ready {
             self.emit_from_host(
                 node,
@@ -306,6 +570,41 @@ impl<'image> ScalarExecutor<'image> {
             )?;
         }
 
+        Ok(())
+    }
+
+    fn host_preloaded_packet_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+    ) -> Result<(), ExecutionError> {
+        let packet = self.packet(event.payload)?;
+        self.set_source_time(event.payload, event.key.time_ns)?;
+        let schedule_ready = {
+            let state = self.host_state_mut(node)?;
+            state.sourced_packets = state
+                .sourced_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            if state.in_service.is_none() && !state.tx_ready_pending {
+                state.tx_ready_pending = true;
+                true
+            } else {
+                false
+            }
+        };
+        self.enqueue_source_packet(node, event.payload)?;
+        self.record_sourced(node.id, packet)?;
+        if schedule_ready {
+            self.emit_from_host(
+                node,
+                event,
+                node.id,
+                EventKind::TxReady,
+                event.payload,
+                event.key.time_ns,
+            )?;
+        }
         Ok(())
     }
 
@@ -333,6 +632,7 @@ impl<'image> ScalarExecutor<'image> {
             });
         }
 
+        self.start_transmission(node.id, payload)?;
         let arrival_time_ns =
             link.arrival_time_ns(event.key.time_ns, self.packet_size(payload)?)?;
         let departure_time_ns = arrival_time_ns
@@ -387,10 +687,9 @@ impl<'image> ScalarExecutor<'image> {
             }
         };
 
-        self.departures.push(PacketDeparture {
-            payload: event.payload,
-            time_ns: event.key.time_ns,
-        });
+        let packet = self.packet(event.payload)?;
+        self.record_departure(node.id, packet, event.key.time_ns)?;
+        self.finish_transmission(node.id, event.payload)?;
 
         if schedule_ready {
             self.emit_from_host(
@@ -411,7 +710,7 @@ impl<'image> ScalarExecutor<'image> {
         node: NodeDescriptor,
         event: Event,
     ) -> Result<(), ExecutionError> {
-        self.packet_size(event.payload)?;
+        let packet = self.packet(event.payload)?;
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
 
         let (disposition, schedule_ready) = {
@@ -448,11 +747,10 @@ impl<'image> ScalarExecutor<'image> {
             }
         };
 
-        self.arrivals.push(PacketArrivalObservation {
-            payload: event.payload,
-            time_ns: event.key.time_ns,
-            disposition,
-        });
+        self.record_arrival(node.id, packet, event.key.time_ns, disposition)?;
+        if disposition == ArrivalDisposition::Dropped {
+            self.mark_terminal(event.payload)?;
+        }
 
         if schedule_ready {
             self.emit_from_switch(
@@ -472,24 +770,49 @@ impl<'image> ScalarExecutor<'image> {
         node: NodeDescriptor,
         event: Event,
     ) -> Result<(), ExecutionError> {
-        let flow = self.packet_flow(event.payload)?;
-        if flow.target != node.id {
-            return Err(ExecutionError::FlowRouteMiss {
-                flow: flow.id,
-                node: node.id,
-            });
+        let packet = self.packet(event.payload)?;
+        let (flow_id, flow_source, flow_target) = {
+            let flow = self.flow(packet.flow)?;
+            (flow.id, flow.source, flow.target)
+        };
+        let expected_target = match packet.kind {
+            PacketKind::Data => flow_target,
+            PacketKind::Feedback => flow_source,
+        };
+        let (disposition, feedback_action) = {
+            let state = self.host_state_mut(node)?;
+            let feedback_generator = (packet.kind == PacketKind::Feedback)
+                .then(|| {
+                    state
+                        .generators
+                        .iter_mut()
+                        .find(|generator| generator.flow == packet.flow)
+                })
+                .flatten();
+            if let Some(generator) = feedback_generator {
+                (
+                    ArrivalDisposition::Feedback,
+                    apply_generator_feedback(generator, node.id)?,
+                )
+            } else {
+                if expected_target != node.id {
+                    return Err(ExecutionError::FlowRouteMiss {
+                        flow: flow_id,
+                        node: node.id,
+                    });
+                }
+                state.received_packets = state
+                    .received_packets
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                (ArrivalDisposition::Delivered, GeneratorFeedbackAction::None)
+            }
+        };
+        self.record_arrival(node.id, packet, event.key.time_ns, disposition)?;
+        self.mark_terminal(event.payload)?;
+        if let GeneratorFeedbackAction::Emit { flow, size_bytes } = feedback_action {
+            self.emit_feedback_driven_packet(node, event, flow, size_bytes)?;
         }
-
-        let state = self.host_state_mut(node)?;
-        state.received_packets = state
-            .received_packets
-            .checked_add(1)
-            .ok_or(ExecutionError::CounterOverflow(node.id))?;
-        self.arrivals.push(PacketArrivalObservation {
-            payload: event.payload,
-            time_ns: event.key.time_ns,
-            disposition: ArrivalDisposition::Delivered,
-        });
         Ok(())
     }
 
@@ -539,6 +862,7 @@ impl<'image> ScalarExecutor<'image> {
                 actual_source: link.source,
             });
         }
+        self.start_transmission(node.id, payload)?;
         let arrival_time_ns =
             link.arrival_time_ns(event.key.time_ns, self.packet_size(payload)?)?;
         let departure_time_ns = arrival_time_ns
@@ -609,10 +933,9 @@ impl<'image> ScalarExecutor<'image> {
             schedule_payload
         };
 
-        self.departures.push(PacketDeparture {
-            payload: event.payload,
-            time_ns: event.key.time_ns,
-        });
+        let packet = self.packet(event.payload)?;
+        self.record_departure(node.id, packet, event.key.time_ns)?;
+        self.finish_transmission(node.id, event.payload)?;
 
         if let Some(payload) = next_payload {
             self.emit_from_switch(
@@ -706,11 +1029,6 @@ impl<'image> ScalarExecutor<'image> {
         Ok(())
     }
 
-    fn packet_flow(&self, payload: PayloadId) -> Result<&crate::FlowDescriptor, ExecutionError> {
-        let packet = self.packet(payload)?;
-        self.flow(packet.flow)
-    }
-
     fn node(&self, id: NodeId) -> Result<NodeDescriptor, ExecutionError> {
         indexed_lookup(&self.image.nodes, id.0, |node| node.id == id)
             .copied()
@@ -750,8 +1068,10 @@ impl<'image> ScalarExecutor<'image> {
         Ok(self.packet(id)?.size_bytes)
     }
 
-    fn packet(&self, id: PayloadId) -> Result<&crate::PacketDescriptor, ExecutionError> {
-        indexed_lookup(&self.image.packets, id.0, |packet| packet.id == id)
+    fn packet(&self, id: PayloadId) -> Result<PacketDescriptor, ExecutionError> {
+        self.packets
+            .get(&id)
+            .map(|packet| packet.descriptor)
             .ok_or(ExecutionError::UnknownPacket(id))
     }
 
@@ -768,7 +1088,11 @@ impl<'image> ScalarExecutor<'image> {
         let packet = self.packet(payload)?;
         let flow = self.flow(packet.flow)?;
 
-        for link_id in &flow.route {
+        let route = match packet.kind {
+            PacketKind::Data => &flow.route,
+            PacketKind::Feedback => &flow.reverse_route,
+        };
+        for link_id in route {
             let link = self.link(*link_id)?;
             if link.source == node {
                 return Ok(Some(link.id));
@@ -782,6 +1106,259 @@ impl<'image> ScalarExecutor<'image> {
             node,
         })
     }
+
+    fn insert_packet(
+        &mut self,
+        packet: PacketDescriptor,
+        source_time_ns: Option<u64>,
+    ) -> Result<(), ExecutionError> {
+        if self.packets.contains_key(&packet.id) {
+            return Err(ExecutionError::DuplicatePayload(packet.id));
+        }
+        self.packets.insert(
+            packet.id,
+            ResidentPacket {
+                descriptor: packet,
+                source_time_ns,
+                transmitters: 0,
+                terminal: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn set_source_time(&mut self, payload: PayloadId, time_ns: u64) -> Result<(), ExecutionError> {
+        let packet = self
+            .packets
+            .get_mut(&payload)
+            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        packet.source_time_ns = Some(time_ns);
+        Ok(())
+    }
+
+    fn enqueue_source_packet(
+        &mut self,
+        node: NodeDescriptor,
+        payload: PayloadId,
+    ) -> Result<(), ExecutionError> {
+        let packet = self.packet(payload)?;
+        let source_time_ns = self
+            .packets
+            .get(&payload)
+            .and_then(|resident| resident.source_time_ns)
+            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        let slot =
+            usize::try_from(node.state_slot).map_err(|_| ExecutionError::InvalidStateSlot {
+                node: node.id,
+                kind: node.kind,
+                state_slot: node.state_slot,
+            })?;
+        let position = self
+            .host_states
+            .get(slot)
+            .ok_or(ExecutionError::InvalidStateSlot {
+                node: node.id,
+                kind: node.kind,
+                state_slot: node.state_slot,
+            })?
+            .queue
+            .iter()
+            .rposition(|queued| {
+                self.packets.get(queued).is_some_and(|resident| {
+                    (
+                        u8::from(resident.source_time_ns.is_some()),
+                        resident.source_time_ns.unwrap_or(0),
+                        resident.descriptor.flow,
+                        resident.descriptor.id,
+                    ) <= (1, source_time_ns, packet.flow, packet.id)
+                })
+            })
+            .map_or(0, |position| position + 1);
+        let state = self.host_state_mut(node)?;
+        if position < state.queue.len() {
+            state.queue.insert(position, payload);
+        } else {
+            state.queue.push_back(payload);
+        }
+        Ok(())
+    }
+
+    fn emit_feedback_driven_packet(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        size_bytes: u64,
+    ) -> Result<(), ExecutionError> {
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let (payload, schedule_ready) = {
+            let state = self.host_state_mut(node)?;
+            let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+            state.next_payload_seq = state
+                .next_payload_seq
+                .checked_add(1)
+                .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+            state.sourced_packets = state
+                .sourced_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let schedule_ready = state.in_service.is_none() && !state.tx_ready_pending;
+            if schedule_ready {
+                state.tx_ready_pending = true;
+            }
+            (payload, schedule_ready)
+        };
+        let packet = PacketDescriptor {
+            id: payload,
+            flow,
+            size_bytes,
+            kind: PacketKind::Data,
+        };
+        self.insert_packet(packet, Some(parent.key.time_ns))?;
+        self.enqueue_source_packet(node, payload)?;
+        self.record_sourced(node.id, packet)?;
+        if schedule_ready {
+            self.emit_from_host(
+                node,
+                parent,
+                node.id,
+                EventKind::TxReady,
+                payload,
+                parent.key.time_ns,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_sourced(
+        &mut self,
+        node: NodeId,
+        packet: PacketDescriptor,
+    ) -> Result<(), ExecutionError> {
+        self.observe_packet(packet);
+        add_summary(&mut self.summary.sourced_packets, 1, node)?;
+        add_summary(&mut self.summary.sourced_bytes, packet.size_bytes, node)
+    }
+
+    fn record_departure(
+        &mut self,
+        node: NodeId,
+        packet: PacketDescriptor,
+        time_ns: u64,
+    ) -> Result<(), ExecutionError> {
+        self.observe_packet(packet);
+        add_summary(&mut self.summary.departed_packets, 1, node)?;
+        add_summary(&mut self.summary.departed_bytes, packet.size_bytes, node)?;
+        if self.observation_mode == ObservationMode::Full {
+            self.departures.push(PacketDeparture {
+                payload: packet.id,
+                time_ns,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_arrival(
+        &mut self,
+        node: NodeId,
+        packet: PacketDescriptor,
+        time_ns: u64,
+        disposition: ArrivalDisposition,
+    ) -> Result<(), ExecutionError> {
+        self.observe_packet(packet);
+        let (packets, bytes) = match disposition {
+            ArrivalDisposition::Admitted => (
+                &mut self.summary.admitted_packets,
+                &mut self.summary.admitted_bytes,
+            ),
+            ArrivalDisposition::Dropped => (
+                &mut self.summary.dropped_packets,
+                &mut self.summary.dropped_bytes,
+            ),
+            ArrivalDisposition::Delivered => (
+                &mut self.summary.received_packets,
+                &mut self.summary.received_bytes,
+            ),
+            ArrivalDisposition::Feedback => (
+                &mut self.summary.feedback_packets,
+                &mut self.summary.feedback_bytes,
+            ),
+        };
+        add_summary(packets, 1, node)?;
+        add_summary(bytes, packet.size_bytes, node)?;
+        if self.observation_mode == ObservationMode::Full {
+            self.arrivals.push(PacketArrivalObservation {
+                payload: packet.id,
+                time_ns,
+                disposition,
+            });
+        }
+        Ok(())
+    }
+
+    fn observe_packet(&mut self, packet: PacketDescriptor) {
+        if self.observation_mode == ObservationMode::Full {
+            self.observed_packets.entry(packet.id).or_insert(packet);
+        }
+    }
+
+    fn start_transmission(
+        &mut self,
+        node: NodeId,
+        payload: PayloadId,
+    ) -> Result<(), ExecutionError> {
+        let packet = self
+            .packets
+            .get_mut(&payload)
+            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        packet.transmitters = packet
+            .transmitters
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        Ok(())
+    }
+
+    fn finish_transmission(
+        &mut self,
+        node: NodeId,
+        payload: PayloadId,
+    ) -> Result<(), ExecutionError> {
+        let remove =
+            {
+                let packet = self
+                    .packets
+                    .get_mut(&payload)
+                    .ok_or(ExecutionError::UnknownPacket(payload))?;
+                packet.transmitters = packet.transmitters.checked_sub(1).ok_or(
+                    ExecutionError::UnexpectedTxComplete {
+                        node,
+                        expected: None,
+                        actual: payload,
+                    },
+                )?;
+                packet.terminal && packet.transmitters == 0
+            };
+        if remove {
+            self.packets.remove(&payload);
+        }
+        Ok(())
+    }
+
+    fn mark_terminal(&mut self, payload: PayloadId) -> Result<(), ExecutionError> {
+        let remove = {
+            let packet = self
+                .packets
+                .get_mut(&payload)
+                .ok_or(ExecutionError::UnknownPacket(payload))?;
+            packet.terminal = true;
+            packet.transmitters == 0
+        };
+        if remove {
+            self.packets.remove(&payload);
+        }
+        Ok(())
+    }
 }
 
 fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> Option<&T> {
@@ -793,4 +1370,34 @@ fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> O
     // Validated images always return above. The fallback preserves `run_scalar` behavior and
     // checked `Unknown*` errors for legacy hand-built callers that intentionally skip validation.
     indexed.or_else(|| table.iter().find(|descriptor| matches_id(descriptor)))
+}
+
+fn allocate_payload_id(source: NodeId, node_count: u64, sequence: u64) -> Option<PayloadId> {
+    PayloadId::from_node_sequence(source, node_count, sequence)
+}
+
+fn add_summary(total: &mut u128, value: u64, node: NodeId) -> Result<(), ExecutionError> {
+    *total = total
+        .checked_add(u128::from(value))
+        .ok_or(ExecutionError::CounterOverflow(node))?;
+    Ok(())
+}
+
+/// Routes an ordinary arriving packet into the closed source-generator transition.
+///
+/// The constant generator records feedback bookkeeping but never emits because of feedback. A
+/// future closed-loop variant extends this closed transition and uses the caller's host-owned
+/// emission path without adding an event kind.
+fn apply_generator_feedback(
+    generator: &mut crate::FlowGeneratorState,
+    node: NodeId,
+) -> Result<GeneratorFeedbackAction, ExecutionError> {
+    generator.feedback.arrivals = generator
+        .feedback
+        .arrivals
+        .checked_add(1)
+        .ok_or(ExecutionError::CounterOverflow(node))?;
+    match generator.kind {
+        FlowGeneratorKind::Constant(_) => Ok(GeneratorFeedbackAction::None),
+    }
 }

@@ -41,6 +41,8 @@ fn valid_image() -> SimulationImage {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 1,
                 sourced_packets: 0,
                 departed_packets: 0,
@@ -51,6 +53,8 @@ fn valid_image() -> SimulationImage {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 0,
                 sourced_packets: 0,
                 departed_packets: 0,
@@ -76,11 +80,13 @@ fn valid_image() -> SimulationImage {
             source: SOURCE,
             target: SINK,
             route: vec![SOURCE_LINK, SWITCH_LINK],
+            reverse_route: vec![],
         }],
-        packets: vec![PacketDescriptor {
+        initial_packets: vec![PacketDescriptor {
             id: PACKET,
             flow: FLOW,
             size_bytes: 2,
+            kind: days_executor::PacketKind::Data,
         }],
         links: vec![
             LinkDescriptor {
@@ -218,6 +224,7 @@ fn descriptor_ids_must_match_their_dense_table_indices() {
         source: SOURCE,
         target: SINK,
         route: vec![SOURCE_LINK, SWITCH_LINK],
+        reverse_route: vec![],
     });
     flows.flows.swap(0, 1);
     assert_eq!(
@@ -226,15 +233,16 @@ fn descriptor_ids_must_match_their_dense_table_indices() {
     );
 
     let mut packets = valid_image();
-    packets.packets.push(PacketDescriptor {
+    packets.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        kind: days_executor::PacketKind::Data,
     });
-    packets.packets.swap(0, 1);
+    packets.initial_packets.swap(0, 1);
     assert_eq!(
         rejection(&packets, Backend::Scalar),
-        "packet ID PayloadId(1) at descriptor 0 does not match dense table index 0"
+        "packet ID PayloadId(0) at descriptor 1 does not advance previous packet ID PayloadId(1)"
     );
 }
 
@@ -393,10 +401,11 @@ fn channels_must_match_emissions_and_certified_bounds() {
 #[test]
 fn channel_bounds_use_the_minimum_delay_across_packets_on_the_link() {
     let mut image = valid_image();
-    image.packets.push(PacketDescriptor {
+    image.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 100,
+        kind: days_executor::PacketKind::Data,
     });
 
     validate(&image, Backend::Scalar)
@@ -412,7 +421,7 @@ fn channel_bounds_use_the_minimum_delay_across_packets_on_the_link() {
 #[test]
 fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
     let mut image = valid_image();
-    image.packets[0].size_bytes = 100;
+    image.initial_packets[0].size_bytes = 100;
     image.channels[0].min_delay_ns = 100;
     image.channels[1].min_delay_ns = 267;
 
@@ -437,11 +446,13 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
         source: SINK,
         target: SOURCE,
         route: vec![SINK_EGRESS, return_link],
+        reverse_route: vec![],
     });
-    image.packets.push(PacketDescriptor {
+    image.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FlowId(1),
         size_bytes: 1,
+        kind: days_executor::PacketKind::Data,
     });
     image.channels.extend([
         RemoteChannel {
@@ -513,14 +524,14 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
     );
 
     let mut zero_packet = valid_image();
-    zero_packet.packets[0].size_bytes = 0;
+    zero_packet.initial_packets[0].size_bytes = 0;
     assert_eq!(
         rejection(&zero_packet, Backend::Scalar),
         "packet PayloadId(0) has zero size, which cannot certify positive serialization"
     );
 
     let mut serialization = valid_image();
-    serialization.packets[0].size_bytes = u64::MAX;
+    serialization.initial_packets[0].size_bytes = u64::MAX;
     serialization.links[0].rate_bps = 1;
     assert_eq!(
         rejection(&serialization, Backend::Scalar),
@@ -528,7 +539,7 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
     );
 
     let mut cumulative = valid_image();
-    cumulative.packets[0].size_bytes = u64::MAX / 2 + 1;
+    cumulative.initial_packets[0].size_bytes = u64::MAX / 2 + 1;
     cumulative.links[1].rate_bps = 8_000_000_000;
     assert_eq!(
         rejection(&cumulative, Backend::Scalar),
@@ -544,10 +555,11 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
 
     let mut queued_overflow = valid_image();
     queued_overflow.initial_events[0].key.time_ns = u64::MAX - 10;
-    queued_overflow.packets.push(PacketDescriptor {
+    queued_overflow.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        kind: days_executor::PacketKind::Data,
     });
     queued_overflow.initial_events.push(Event {
         key: EventKey {
@@ -595,10 +607,11 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
 #[test]
 fn initial_event_keys_must_be_strictly_ascending() {
     let mut image = valid_image();
-    image.packets.push(PacketDescriptor {
+    image.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        kind: days_executor::PacketKind::Data,
     });
     image.initial_events[0].key.time_ns = 1;
     image.initial_events.push(Event {
@@ -641,10 +654,11 @@ fn remote_arrivals_require_a_channel_on_the_payload_route() {
 #[test]
 fn completion_diagnostics_preserve_initial_event_payload_order() {
     let mut image = valid_image();
-    image.packets.push(PacketDescriptor {
+    image.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        kind: days_executor::PacketKind::Data,
     });
     image.initial_events[0].kind = EventKind::TxComplete;
     image.initial_events[0].key.phase = event_phase(EventKind::TxComplete);
@@ -671,10 +685,11 @@ fn completion_diagnostics_preserve_initial_event_payload_order() {
 #[test]
 fn aggregate_packet_counts_retain_counter_and_sequence_diagnostics() {
     let mut counter = valid_image();
-    counter.packets.push(PacketDescriptor {
+    counter.initial_packets.push(PacketDescriptor {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        kind: days_executor::PacketKind::Data,
     });
     counter.host_states[0].sourced_packets = u64::MAX - 1;
     assert_eq!(

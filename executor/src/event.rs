@@ -29,6 +29,24 @@ pub struct FlowId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PayloadId(pub u64);
 
+impl PayloadId {
+    /// Allocates a globally unique packet identity from one node's monotone local sequence.
+    ///
+    /// The final local sequence value is reserved so the owning state can always represent the
+    /// next (possibly exhausted) cursor without a second flag.
+    pub fn from_node_sequence(
+        source: NodeId,
+        node_count: u64,
+        local_sequence: u64,
+    ) -> Option<Self> {
+        local_sequence
+            .checked_add(1)
+            .and_then(|_| local_sequence.checked_mul(node_count))
+            .and_then(|base| base.checked_add(source.0))
+            .map(Self)
+    }
+}
+
 /// Total canonical ordering key for persistent events.
 ///
 /// Ordering is lexicographic in declaration order. Producers make keys unique by allocating
@@ -46,7 +64,7 @@ pub struct EventKey {
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EventKind {
-    /// A precomputed input makes a packet available at a node.
+    /// A source generator transition makes a packet available at its host.
     PacketArrival = 0,
     /// An egress link may select at most one queued packet for service.
     TxReady = 1,

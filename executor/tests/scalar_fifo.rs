@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 
 use days_executor::{
     ArrivalDisposition, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
-    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind, SimulationImage,
-    SwitchQueueState, SwitchState, event_phase, run_scalar,
+    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
+    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel,
+    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    run_scalar_with_observations,
 };
 
 const HOST: NodeId = NodeId(10);
@@ -51,6 +52,8 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             queue: VecDeque::new(),
             in_service: None,
             tx_ready_pending: false,
+            generators: vec![],
+            next_payload_seq: 0,
             next_origin_seq: 4,
             sourced_packets: 0,
             departed_packets: 0,
@@ -75,27 +78,32 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             source: HOST,
             target: SWITCH,
             route: vec![LINK],
+            reverse_route: vec![],
         }],
-        packets: vec![
+        initial_packets: vec![
             PacketDescriptor {
                 id: P0,
                 flow: FLOW,
                 size_bytes: 3,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P1,
                 flow: FLOW,
                 size_bytes: 6,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P2,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P3,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
         ],
         links: vec![LinkDescriptor {
@@ -159,7 +167,8 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
       ready2=10, complete2=11, remote2=12,
       ready3=13, complete3=14, remote3=15.
     */
-    let result = run_scalar(&image, Some(37)).expect("the hand-built image must execute");
+    let result = run_scalar_with_observations(&image, Some(37), ObservationMode::Full)
+        .expect("the hand-built image must execute");
 
     assert_eq!(
         result.host_states,
@@ -168,6 +177,8 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             queue: VecDeque::new(),
             in_service: None,
             tx_ready_pending: false,
+            generators: vec![],
+            next_payload_seq: 0,
             next_origin_seq: 16,
             sourced_packets: 4,
             departed_packets: 4,

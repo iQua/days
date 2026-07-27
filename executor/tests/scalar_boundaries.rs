@@ -49,6 +49,8 @@ fn image(stop_time_ns: u64) -> SimulationImage {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 2,
                 sourced_packets: 0,
                 departed_packets: 0,
@@ -59,6 +61,8 @@ fn image(stop_time_ns: u64) -> SimulationImage {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 0,
                 sourced_packets: 0,
                 departed_packets: 0,
@@ -71,17 +75,20 @@ fn image(stop_time_ns: u64) -> SimulationImage {
             source: SOURCE,
             target: SINK,
             route: vec![LINK],
+            reverse_route: vec![],
         }],
-        packets: vec![
+        initial_packets: vec![
             PacketDescriptor {
                 id: AT_BOUNDARY,
                 flow: FLOW,
                 size_bytes: 1,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: AFTER_BOUNDARY,
                 flow: FLOW,
                 size_bytes: 1,
+                kind: days_executor::PacketKind::Data,
             },
         ],
         links: vec![LinkDescriptor {

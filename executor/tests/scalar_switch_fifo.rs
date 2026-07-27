@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 
 use days_executor::{
     ArrivalDisposition, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
-    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind, SimulationImage,
-    SwitchQueueState, SwitchState, event_phase, run_scalar,
+    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
+    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel,
+    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    run_scalar_with_observations,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -60,6 +61,8 @@ fn image() -> SimulationImage {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 5,
                 sourced_packets: 0,
                 departed_packets: 0,
@@ -70,6 +73,8 @@ fn image() -> SimulationImage {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 0,
                 sourced_packets: 0,
                 departed_packets: 0,
@@ -95,32 +100,38 @@ fn image() -> SimulationImage {
             source: SOURCE,
             target: SINK,
             route: vec![SOURCE_LINK, SWITCH_LINK],
+            reverse_route: vec![],
         }],
-        packets: vec![
+        initial_packets: vec![
             PacketDescriptor {
                 id: P0,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P1,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P2,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P3,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
             PacketDescriptor {
                 id: P4,
                 flow: FLOW,
                 size_bytes: 2,
+                kind: days_executor::PacketKind::Data,
             },
         ],
         links: vec![
@@ -187,7 +198,8 @@ fn switch_fifo_selects_one_packet_per_tx_ready_and_reaches_the_sink() {
     correct independently rounded intervals from cumulative serialization,
     which would depart P2 at 19 ns.
     */
-    let result = run_scalar(&image(), Some(27)).expect("the complete path must execute");
+    let result = run_scalar_with_observations(&image(), Some(27), ObservationMode::Full)
+        .expect("the complete path must execute");
 
     assert_eq!(
         result.departures,
@@ -289,6 +301,8 @@ fn switch_fifo_selects_one_packet_per_tx_ready_and_reaches_the_sink() {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 20,
                 sourced_packets: 5,
                 departed_packets: 5,
@@ -299,6 +313,8 @@ fn switch_fifo_selects_one_packet_per_tx_ready_and_reaches_the_sink() {
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: vec![],
+                next_payload_seq: 0,
                 next_origin_seq: 0,
                 sourced_packets: 0,
                 departed_packets: 0,

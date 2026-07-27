@@ -30,6 +30,8 @@ fn one_image_contains_host_and_switch_state_arenas() {
             queue: VecDeque::new(),
             in_service: None,
             tx_ready_pending: false,
+            generators: vec![],
+            next_payload_seq: 0,
             next_origin_seq: 0,
             sourced_packets: 0,
             departed_packets: 0,
@@ -50,7 +52,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
             departed_packets: 0,
         }],
         flows: Vec::new(),
-        packets: Vec::new(),
+        initial_packets: Vec::new(),
         links: vec![LinkDescriptor {
             id: link,
             source: host,

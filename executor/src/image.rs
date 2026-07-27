@@ -29,7 +29,11 @@ pub struct HostState {
     pub queue: VecDeque<PayloadId>,
     pub in_service: Option<PayloadId>,
     pub tx_ready_pending: bool,
+    /// Source-owned flow generators in canonical `FlowId` order.
+    pub generators: Vec<FlowGeneratorState>,
     pub next_origin_seq: u64,
+    /// Per-node packet identity cursor. Every generated packet consumes one sequence value.
+    pub next_payload_seq: u64,
     pub sourced_packets: u64,
     pub departed_packets: u64,
     pub received_packets: u64,
@@ -67,16 +71,109 @@ pub struct FlowDescriptor {
     pub id: FlowId,
     pub source: NodeId,
     pub target: NodeId,
+    /// Canonical data-packet route from source to target.
     pub route: Vec<LinkId>,
+    /// Canonical feedback-packet route from target back to source.
+    pub reverse_route: Vec<LinkId>,
 }
 
-/// Immutable packet data referenced by a persistent event payload.
+/// Whether a generator owns a scheduled emission or is waiting without local work.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorStatus {
+    Scheduled = 0,
+    Blocked = 1,
+    Finished = 2,
+    /// Emission remains under the traffic termination but lies beyond the scenario stop.
+    Stopped = 3,
+}
+
+/// The next packet already produced by a generator for a future emission transition.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledEmission {
+    pub status: GeneratorStatus,
+    /// Meaningful only when `status == GeneratorStatus::Scheduled`.
+    pub departure_time_ns: u64,
+    /// Meaningful only when `status == GeneratorStatus::Scheduled`.
+    pub payload: PayloadId,
+}
+
+/// Feedback-owned transport state reserved by every generator kind.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratorFeedbackState {
+    pub arrivals: u64,
+    pub outstanding_bytes: u64,
+    pub unacknowledged_bytes: u64,
+}
+
+/// Closed termination modes supported by the constant generator.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorTermination {
+    Bytes(u64),
+    DurationNs(u64),
+}
+
+/// Fixed-width parameters for the v1 constant generator.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConstantGenerator {
+    pub first_departure_ns: u64,
+    pub interval_ns: u64,
+    pub packet_size_bytes: u64,
+    pub termination: GeneratorTermination,
+}
+
+/// Closed generator transition set. New traffic families require an explicit image variant.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowGeneratorKind {
+    Constant(ConstantGenerator),
+}
+
+/// Fixed-width result of routing an ordinary feedback packet into a source generator.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorFeedbackAction {
+    None,
+    Emit { flow: FlowId, size_bytes: u64 },
+}
+
+/// Mutable generator state owned exclusively by the source host LP.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowGeneratorState {
+    pub flow: FlowId,
+    pub packets_emitted: u64,
+    pub bytes_emitted: u64,
+    pub next_emission: ScheduledEmission,
+    /// Per-flow deterministic stream state derived from the image seed and semantic flow key.
+    pub rng_state: u64,
+    pub feedback: GeneratorFeedbackState,
+    pub kind: FlowGeneratorKind,
+}
+
+/// Immutable per-packet data referenced by a persistent event payload.
+///
+/// Lowered images retain only the first scheduled packet for each active flow. Later records are
+/// produced by the source generator and live only while the packet is scheduled or in flight.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketDescriptor {
     pub id: PayloadId,
     pub flow: FlowId,
     pub size_bytes: u64,
+    pub kind: PacketKind,
+}
+
+/// Closed packet direction used to route ordinary data and feedback packets.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketKind {
+    Data = 0,
+    Feedback = 1,
 }
 
 /// Immutable configuration of one constant-rate, directed, non-preemptive link.
@@ -139,7 +236,8 @@ pub struct SimulationImage {
     pub host_states: Vec<HostState>,
     pub switch_states: Vec<SwitchState>,
     pub flows: Vec<FlowDescriptor>,
-    pub packets: Vec<PacketDescriptor>,
+    /// Packet records needed by initial events or preloaded mutable state, never a whole-run table.
+    pub initial_packets: Vec<PacketDescriptor>,
     pub links: Vec<LinkDescriptor>,
     pub channels: Vec<RemoteChannel>,
     pub initial_events: Vec<Event>,

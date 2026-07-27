@@ -3,9 +3,11 @@ use std::fs;
 use std::path::Path;
 
 use days_executor::{
-    Backend, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId,
-    NodeDescriptor, NodeKind, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, event_phase, validate,
+    Backend, ConstantGenerator, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
+    FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
+    HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor,
+    PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
+    SwitchQueueState, SwitchState, event_phase, validate,
 };
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
@@ -156,20 +158,6 @@ struct FlowInput {
     source: u64,
     target: u64,
     traffic: TrafficKey,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PacketKey {
-    flow: FlowKey,
-    packet_ordinal: u64,
-}
-
-#[derive(Clone, Debug)]
-struct PacketInput {
-    key: PacketKey,
-    source: NodeKey,
-    time_ns: u64,
-    size_bytes: u64,
 }
 
 /// Lowers one Days configuration file into one heterogeneous semantic image.
@@ -727,11 +715,11 @@ fn lower(
                 source: ids.node(NodeKey::Host(flow.source)),
                 target: ids.node(NodeKey::Host(flow.target)),
                 route: canonical_route(flow.source, flow.target, &adjacency, &ids)?,
+                reverse_route: canonical_route(flow.target, flow.source, &adjacency, &ids)?,
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-    let inputs = precompute_inputs(&flows)?;
-    let payload_ids = dense_ids(inputs.iter().map(|input| input.key.clone()))?;
+    validate_input_bounds(&flows)?;
 
     let host_slots = dense_ids(host_topology_ids.iter().copied().map(NodeKey::Host))?;
     let switch_slots = dense_ids(switch_topology_ids.iter().copied().map(NodeKey::Switch))?;
@@ -751,36 +739,105 @@ fn lower(
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
+    let node_count = u64::try_from(nodes.len())
+        .map_err(|_| CompileError::Invalid("node count exceeds u64".to_owned()))?;
+
+    let mut generators_by_source = BTreeMap::<NodeKey, Vec<FlowGeneratorState>>::new();
+    let mut payload_sequences = BTreeMap::<NodeKey, u64>::new();
+    let mut initial_packets = Vec::with_capacity(flows.len());
+    let mut initial_event_inputs = Vec::<(NodeKey, u64, FlowId, PayloadId)>::new();
+    for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+        let source = NodeKey::Host(flow.source);
+        let emission_count = packet_count(&flow.traffic);
+        let next_emission = if emission_count == 0 {
+            ScheduledEmission {
+                status: GeneratorStatus::Finished,
+                departure_time_ns: 0,
+                payload: PayloadId(0),
+            }
+        } else {
+            let sequence = payload_sequences.entry(source).or_default();
+            let payload = allocate_payload_id(
+                ids.node(source),
+                node_count,
+                *sequence,
+                "initial payload sequence",
+            )?;
+            *sequence = sequence.checked_add(1).ok_or_else(|| {
+                CompileError::Invalid(format!("initial payload sequence overflow at {source:?}"))
+            })?;
+            initial_packets.push(PacketDescriptor {
+                id: payload,
+                flow: descriptor.id,
+                size_bytes: flow.traffic.packet_size_bytes,
+                kind: PacketKind::Data,
+            });
+            initial_event_inputs.push((
+                source,
+                flow.traffic.initial_delay_ns,
+                descriptor.id,
+                payload,
+            ));
+            ScheduledEmission {
+                status: GeneratorStatus::Scheduled,
+                departure_time_ns: flow.traffic.initial_delay_ns,
+                payload,
+            }
+        };
+        generators_by_source
+            .entry(source)
+            .or_default()
+            .push(FlowGeneratorState {
+                flow: descriptor.id,
+                packets_emitted: 0,
+                bytes_emitted: 0,
+                next_emission,
+                rng_state: generator_seed(model.seed, &flow.key),
+                feedback: GeneratorFeedbackState {
+                    arrivals: 0,
+                    outstanding_bytes: 0,
+                    unacknowledged_bytes: 0,
+                },
+                kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                    first_departure_ns: flow.traffic.initial_delay_ns,
+                    interval_ns: flow.traffic.interval_ns,
+                    packet_size_bytes: flow.traffic.packet_size_bytes,
+                    termination: match flow.traffic.termination {
+                        Termination::Bytes(bytes) => GeneratorTermination::Bytes(bytes),
+                        Termination::DurationNs(duration_ns) => {
+                            GeneratorTermination::DurationNs(duration_ns)
+                        }
+                    },
+                }),
+            });
+    }
+    initial_packets.sort_by_key(|packet| packet.id);
 
     let mut origin_sequences = BTreeMap::<NodeKey, u64>::new();
-    let mut event_inputs = inputs.iter().collect::<Vec<_>>();
-    event_inputs.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then_with(|| left.time_ns.cmp(&right.time_ns))
-            .then_with(|| left.key.cmp(&right.key))
+    initial_event_inputs.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
     });
-    let mut initial_events = Vec::with_capacity(event_inputs.len());
-    for input in event_inputs {
-        let sequence = origin_sequences.entry(input.source).or_default();
+    let mut initial_events = Vec::with_capacity(initial_event_inputs.len());
+    for (source, time_ns, _, payload) in initial_event_inputs {
+        let sequence = origin_sequences.entry(source).or_default();
         let origin_seq = *sequence;
         *sequence = sequence.checked_add(1).ok_or_else(|| {
-            CompileError::Invalid(format!(
-                "initial origin sequence overflow at {:?}",
-                input.source
-            ))
+            CompileError::Invalid(format!("initial origin sequence overflow at {source:?}"))
         })?;
-        let origin_node = ids.node(input.source);
+        let origin_node = ids.node(source);
         initial_events.push(Event {
             key: EventKey {
-                time_ns: input.time_ns,
+                time_ns,
                 phase: event_phase(EventKind::PacketArrival),
                 origin_node,
                 origin_seq,
             },
             target: origin_node,
             kind: EventKind::PacketArrival,
-            payload: PayloadId(payload_ids[&input.key]),
+            payload,
         });
     }
     initial_events.sort_by_key(|event| event.key);
@@ -798,7 +855,9 @@ fn lower(
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
+                generators: generators_by_source.remove(&node_key).unwrap_or_default(),
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
+                next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,
                 departed_packets: 0,
                 received_packets: 0,
@@ -826,14 +885,6 @@ fn lower(
             departed_packets: 0,
         })
         .collect();
-    let packets = inputs
-        .iter()
-        .map(|input| PacketDescriptor {
-            id: PayloadId(payload_ids[&input.key]),
-            flow: FlowId(flow_ids[&input.key.flow]),
-            size_bytes: input.size_bytes,
-        })
-        .collect::<Vec<_>>();
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
@@ -845,15 +896,15 @@ fn lower(
         })
         .collect::<Vec<_>>();
     let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
-    for packet in &packets {
-        let flow = flow_descriptors
-            .get(packet.flow.0 as usize)
-            .ok_or_else(|| {
-                CompileError::Invalid(format!(
-                    "packet {:?} references missing flow {:?}",
-                    packet.id, packet.flow
-                ))
-            })?;
+    let initial_payload_by_flow = initial_packets
+        .iter()
+        .map(|packet| (packet.flow, packet.id))
+        .collect::<BTreeMap<_, _>>();
+    for (flow, input) in flow_descriptors.iter().zip(&flows) {
+        if packet_count(&input.traffic) == 0 {
+            continue;
+        }
+        let payload = initial_payload_by_flow[&flow.id];
         for link_id in &flow.route {
             let link = links.get(link_id.0 as usize).ok_or_else(|| {
                 CompileError::Invalid(format!(
@@ -861,16 +912,17 @@ fn lower(
                     flow.id
                 ))
             })?;
-            link.delay_ns(packet.size_bytes).map_err(|error| {
-                CompileError::Invalid(format!(
-                    "link {link_id:?} delay overflows for packet {:?}: {error}",
-                    packet.id
-                ))
-            })?;
+            link.delay_ns(input.traffic.packet_size_bytes)
+                .map_err(|error| {
+                    CompileError::Invalid(format!(
+                        "link {link_id:?} delay overflows for packet {:?}: {error}",
+                        payload
+                    ))
+                })?;
             min_packet_size_by_link
                 .entry(*link_id)
-                .and_modify(|size| *size = (*size).min(packet.size_bytes))
-                .or_insert(packet.size_bytes);
+                .and_modify(|size| *size = (*size).min(input.traffic.packet_size_bytes))
+                .or_insert(input.traffic.packet_size_bytes);
         }
     }
     let channels = min_packet_size_by_link
@@ -891,7 +943,7 @@ fn lower(
         host_states,
         switch_states,
         flows: flow_descriptors,
-        packets,
+        initial_packets,
         links,
         channels,
         initial_events,
@@ -983,9 +1035,8 @@ fn canonical_flows(
     Ok(flows)
 }
 
-fn precompute_inputs(flows: &[FlowInput]) -> Result<Vec<PacketInput>, CompileError> {
-    let mut inputs = Vec::new();
-    let input_count = flows.iter().try_fold(0_usize, |total, flow| {
+fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
+    let _input_count = flows.iter().try_fold(0_usize, |total, flow| {
         let count = packet_count(&flow.traffic);
         let count = usize::try_from(count).map_err(|_| {
             CompileError::Invalid("packet input count exceeds the platform index domain".to_owned())
@@ -994,63 +1045,39 @@ fn precompute_inputs(flows: &[FlowInput]) -> Result<Vec<PacketInput>, CompileErr
             .checked_add(count)
             .ok_or_else(|| CompileError::Invalid("total packet input count overflow".to_owned()))
     })?;
-    inputs.try_reserve_exact(input_count).map_err(|error| {
-        CompileError::Invalid(format!("packet input expansion is too large: {error}"))
-    })?;
 
     for flow in flows {
-        let mut packet_ordinal = 0_u64;
-        let mut time_ns = flow.traffic.initial_delay_ns;
-        let mut sent_bytes = 0_u64;
-        let end_time_ns = match flow.traffic.termination {
+        let count = packet_count(&flow.traffic);
+        match flow.traffic.termination {
             Termination::DurationNs(duration_ns) => {
-                Some(time_ns.checked_add(duration_ns).ok_or_else(|| {
-                    CompileError::Invalid("flow duration end time exceeds u64".to_owned())
-                })?)
-            }
-            Termination::Bytes(_) => None,
-        };
-
-        loop {
-            let finished = match flow.traffic.termination {
-                Termination::Bytes(size) => sent_bytes >= size,
-                Termination::DurationNs(_) => time_ns >= end_time_ns.expect("duration has an end"),
-            };
-            if finished {
-                break;
-            }
-
-            inputs.push(PacketInput {
-                key: PacketKey {
-                    flow: flow.key.clone(),
-                    packet_ordinal,
-                },
-                source: NodeKey::Host(flow.source),
-                time_ns,
-                size_bytes: flow.traffic.packet_size_bytes,
-            });
-            packet_ordinal = packet_ordinal
-                .checked_add(1)
-                .ok_or_else(|| CompileError::Invalid("packet ordinal exceeds u64".to_owned()))?;
-            sent_bytes = sent_bytes
-                .checked_add(flow.traffic.packet_size_bytes)
-                .ok_or_else(|| CompileError::Invalid("flow byte count exceeds u64".to_owned()))?;
-
-            let has_next = match flow.traffic.termination {
-                Termination::Bytes(size) => sent_bytes < size,
-                Termination::DurationNs(_) => true,
-            };
-            if has_next {
-                time_ns = time_ns
-                    .checked_add(flow.traffic.interval_ns)
+                flow.traffic
+                    .initial_delay_ns
+                    .checked_add(duration_ns)
                     .ok_or_else(|| {
-                        CompileError::Invalid("packet input time exceeds u64".to_owned())
+                        CompileError::Invalid("flow duration end time exceeds u64".to_owned())
                     })?;
             }
+            Termination::Bytes(_) => {}
         }
+        flow.traffic
+            .packet_size_bytes
+            .checked_mul(count)
+            .ok_or_else(|| CompileError::Invalid("flow byte count exceeds u64".to_owned()))?;
+        let interval_steps = match flow.traffic.termination {
+            Termination::Bytes(_) => count.saturating_sub(1),
+            Termination::DurationNs(_) => count,
+        };
+        let interval_extent = flow
+            .traffic
+            .interval_ns
+            .checked_mul(interval_steps)
+            .ok_or_else(|| CompileError::Invalid("packet input time exceeds u64".to_owned()))?;
+        flow.traffic
+            .initial_delay_ns
+            .checked_add(interval_extent)
+            .ok_or_else(|| CompileError::Invalid("packet input time exceeds u64".to_owned()))?;
     }
-    inputs.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(inputs)
+    Ok(())
 }
 
 fn packet_count(traffic: &TrafficKey) -> u64 {
@@ -1062,4 +1089,72 @@ fn packet_count(traffic: &TrafficKey) -> u64 {
         return 0;
     }
     1 + (extent - 1) / step
+}
+
+fn allocate_payload_id(
+    source: NodeId,
+    node_count: u64,
+    local_sequence: u64,
+    label: &str,
+) -> Result<PayloadId, CompileError> {
+    PayloadId::from_node_sequence(source, node_count, local_sequence).ok_or_else(|| {
+        CompileError::Invalid(format!(
+            "{label} overflow at node {source:?} sequence {local_sequence}"
+        ))
+    })
+}
+
+fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
+    let mut state = mix_seed(image_seed ^ 0x6a09_e667_f3bc_c909);
+    match key {
+        FlowKey::Explicit {
+            semantic,
+            duplicate_ordinal,
+        } => {
+            state = mix_seed(state ^ 0x4558_504c_4943_4954);
+            state = mix_seed(state ^ semantic.source);
+            state = mix_seed(state ^ semantic.target);
+            state = mix_traffic_seed(state, &semantic.traffic);
+            state = mix_seed(state ^ duplicate_ordinal);
+        }
+        FlowKey::SetMember {
+            semantic,
+            duplicate_ordinal,
+            member_ordinal,
+            source,
+            target,
+        } => {
+            state = mix_seed(state ^ 0x5345_545f_4d45_4d42);
+            state = mix_seed(state ^ semantic.flow_count);
+            state = mix_traffic_seed(state, &semantic.traffic);
+            state = mix_seed(state ^ duplicate_ordinal);
+            state = mix_seed(state ^ member_ordinal);
+            state = mix_seed(state ^ source);
+            state = mix_seed(state ^ target);
+        }
+    }
+    state
+}
+
+fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey) -> u64 {
+    state = mix_seed(state ^ traffic.initial_delay_ns);
+    state = mix_seed(state ^ traffic.interval_ns);
+    state = mix_seed(state ^ traffic.packet_size_bytes);
+    match traffic.termination {
+        Termination::Bytes(bytes) => {
+            state = mix_seed(state ^ 0x4259_5445_5300_0000);
+            mix_seed(state ^ bytes)
+        }
+        Termination::DurationNs(duration_ns) => {
+            state = mix_seed(state ^ 0x4455_5241_5449_4f4e);
+            mix_seed(state ^ duration_ns)
+        }
+    }
+}
+
+fn mix_seed(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }

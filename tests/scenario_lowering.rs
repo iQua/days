@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    ArrivalDisposition, Backend, EventKind, FlowId, LinkId, NodeId, NodeKind,
-    PacketArrivalObservation, PacketDeparture, PayloadId, SimulationImage, run_scalar, validate,
+    ArrivalDisposition, Backend, EventKind, FlowId, LinkId, NodeId, NodeKind, ObservationMode,
+    PacketArrivalObservation, PacketDeparture, PayloadId, SimulationImage, run_scalar,
+    run_scalar_with_observations, validate,
 };
 use tempfile::TempDir;
 
@@ -19,7 +20,7 @@ fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
 
 fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
     let mut delays = BTreeMap::<LinkId, u64>::new();
-    for packet in &image.packets {
+    for packet in &image.initial_packets {
         let flow = image
             .flows
             .iter()
@@ -78,13 +79,122 @@ pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
     let result = run_scalar(&image, None).expect("lowered image should run");
 
     assert_eq!(
-        result
-            .arrivals
-            .iter()
-            .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
-            .count(),
-        0,
+        result.summary.received_packets, 0,
         "a packet starting after the configured duration must not be delivered"
+    );
+    assert_eq!(result.pending_events.len(), 1);
+}
+
+#[test]
+fn zero_byte_and_zero_duration_flows_have_finished_generators_without_inputs() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "zero-termination.toml",
+        r#"
+seed = 1
+duration = 1.0
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 8_000_000_000
+capacity = 1
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+size = 0
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+duration = 0.0
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+"#,
+    );
+
+    let image = compile_config(path).expect("zero termination should lower");
+    assert_eq!(image.flows.len(), 2);
+    assert!(image.initial_packets.is_empty());
+    assert!(image.initial_events.is_empty());
+    assert!(image.channels.is_empty());
+    assert!(
+        image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .all(|generator| generator.next_emission.status
+                == days_executor::GeneratorStatus::Finished)
+    );
+    validate(&image, Backend::Scalar).expect("zero-termination image should validate");
+    let result = run_scalar(&image, None).expect("zero-termination image should run");
+    assert_eq!(result.summary.sourced_packets, 0);
+    assert!(result.pending_events.is_empty());
+}
+
+#[test]
+fn generator_rng_seed_depends_on_the_semantic_flow_key_not_dense_flow_id() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let common = r#"
+seed = 91
+duration = 1.0
+edges = [[0, 1], [1, 2]]
+hosts = [0, 1, 2]
+
+[switch]
+port_rate = 8_000_000_000
+capacity = 8
+discipline = "FIFO"
+drop = "TailDrop"
+"#;
+    let traffic = r#"
+[flow.traffic]
+size = 2
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+"#;
+    let base = write_config(
+        &directory,
+        "rng-base.toml",
+        &format!(
+            "{common}\n[[flow]]\nflow_type = \"PacketDistribution\"\ngraph = [[1, 2]]\n{traffic}"
+        ),
+    );
+    let extended = write_config(
+        &directory,
+        "rng-extended.toml",
+        &format!(
+            "{common}\n[[flow]]\nflow_type = \"PacketDistribution\"\ngraph = [[0, 2]]\n{traffic}\n[[flow]]\nflow_type = \"PacketDistribution\"\ngraph = [[1, 2]]\n{traffic}"
+        ),
+    );
+
+    let base = compile_config(base).expect("base config should lower");
+    let extended = compile_config(extended).expect("extended config should lower");
+    let rng_for = |image: &SimulationImage, source: NodeId, target: NodeId| {
+        let flow = image
+            .flows
+            .iter()
+            .find(|flow| flow.source == source && flow.target == target)
+            .expect("semantic flow must exist");
+        image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .find(|generator| generator.flow == flow.id)
+            .expect("flow generator must exist")
+            .rng_state
+    };
+    assert_eq!(
+        rng_for(&base, NodeId(1), NodeId(2)),
+        rng_for(&extended, NodeId(1), NodeId(2))
     );
 }
 
@@ -330,8 +440,16 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
             .all(|event| event.kind == EventKind::PacketArrival),
         "TxReady must be generated only at the actual service decision point"
     );
-    assert_eq!(first.packets.len(), 11);
-    assert_eq!(first.initial_events.len(), 11);
+    assert_eq!(first.initial_packets.len(), first.flows.len());
+    assert_eq!(
+        first
+            .host_states
+            .iter()
+            .map(|state| state.generators.len())
+            .sum::<usize>(),
+        first.flows.len()
+    );
+    assert_eq!(first.initial_events.len(), first.flows.len());
 
     validate(&first, Backend::Scalar).expect("lowered image should validate for scalar");
     validate(&first, Backend::Cpu { workers: 2 })
@@ -533,8 +651,16 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
         certified_delays(&first)
     );
     assert_eq!(first.flows.len(), 8);
-    assert_eq!(first.packets.len(), 12_000);
-    assert_eq!(first.initial_events.len(), 12_000);
+    assert_eq!(first.initial_packets.len(), first.flows.len());
+    assert_eq!(
+        first
+            .host_states
+            .iter()
+            .map(|state| state.generators.len())
+            .sum::<usize>(),
+        first.flows.len()
+    );
+    assert_eq!(first.initial_events.len(), first.flows.len());
     assert_eq!(first.stop_time_ns, 1_500_000_000_000);
     assert_eq!(
         first
@@ -559,6 +685,14 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
         .expect("zero propagation with positive serialization is parallel-safe");
     validate(&first, Backend::Scalar).expect("baseline image should validate for scalar execution");
     let result = run_scalar(&first, None).expect("baseline image should run to completion");
+    assert_eq!(result.summary.sourced_packets, 12_000);
+    assert_eq!(result.summary.sourced_bytes, 12_000_000);
+    assert_eq!(result.summary.received_packets, 11_992);
+    assert_eq!(result.summary.received_bytes, 11_992_000);
+    assert_eq!(result.summary.dropped_packets, 0);
+    assert_eq!(result.summary.dropped_bytes, 0);
+    assert!(result.arrivals.is_empty());
+    assert!(result.departures.is_empty());
     assert!(
         result
             .pending_events
@@ -617,7 +751,8 @@ pkt_size_dist = { type = "Uniform", low = 2, high = 2 }
     validate(&image, Backend::Cpu { workers: 2 })
         .expect("serialization plus propagation gives positive lookahead");
 
-    let result = run_scalar(&image, Some(16)).expect("lowered image should reach the sink");
+    let result = run_scalar_with_observations(&image, Some(16), ObservationMode::Full)
+        .expect("lowered image should reach the sink");
     assert_eq!(
         result.departures,
         vec![
@@ -785,6 +920,9 @@ pkt_size_dist = { type = "DiscreteUniform", low = 9223372036854775807, high = 92
 
     let image = compile_config(path).expect("exact i64 packet size should lower");
 
-    assert_eq!(image.packets.len(), 1);
-    assert_eq!(image.packets[0].size_bytes, 9_223_372_036_854_775_807);
+    assert_eq!(image.initial_packets.len(), 1);
+    assert_eq!(
+        image.initial_packets[0].size_bytes,
+        9_223_372_036_854_775_807
+    );
 }
