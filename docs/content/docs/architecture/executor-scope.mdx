@@ -1,0 +1,75 @@
+---
+title: Days Executor v1 Scope
+description: Supported models, non-goals, follow-on work, and required validation errors for the new executor.
+---
+
+The Days executor is an exact-time, conservative executor planned alongside the
+existing Nexosim runtime. This page records the model boundary for its first
+complete version. It is a project scope, not a claim that models outside the
+boundary are impossible to support.
+
+The new executor is not implemented yet, so it cannot currently be selected.
+Nexosim remains the working runtime and `time_quantum_ns` remains a supported
+legacy Nexosim option. Nothing described here changes current behavior.
+
+## Supported v1 model
+
+The first complete vertical slice supports:
+
+- static topologies with one logical process (LP) per physical network node;
+- integer nanosecond logical time without timestamp quantization;
+- FIFO scheduling with TailDrop;
+- constant-rate, non-preemptive links;
+- a constant propagation delay for each directed link;
+- open-loop UDP traffic generated from deterministic, precomputed inputs;
+- one CPU process and one GPU device; and
+- a known, positive lookahead on every channel that crosses LP boundaries.
+
+This deliberately closed model gives the scalar, multicore CPU, Metal, and CUDA
+backends one common execution contract.
+
+## Project non-goals
+
+The following capabilities are outside this project. They may be reasonable
+future work; their absence is a scope decision, not a statement that they
+cannot be implemented.
+
+- **Timestamp quantization:** the new executor has one exact-time model.
+- **Legacy scheduler run batching:** each service-start event selects at most
+  one packet.
+- **Speculation beyond the safe horizon:** v1 remains conservative.
+- **Per-run proof checking or proof certificates:** Lean is an offline
+  development and CI tool, not part of normal execution.
+- **Hybrid CPU/GPU placement:** one selected backend runs the model.
+- **Zero-lookahead cross-LP parallel execution:** v1 parallel backends require a
+  positive delay bound.
+- **PFC and DCQCN:** neither protocol is part of this project's supported model.
+- **Automatic backend selection:** callers select a backend explicitly.
+- **Nexosim removal or a default-runtime cutover:** either decision requires a
+  later proposal based on completed coverage and performance evidence.
+- **General callback-to-GPU compilation:** the image uses a closed set of model
+  and event kinds.
+- **Runtime LP migration:** LP ownership is fixed for a run.
+- **Multi-GPU execution:** v1 uses at most one GPU device.
+
+## Follow-on model work
+
+Strict Priority (SP) and Weighted Fair Queueing (WFQ) follow FIFO. Deficit Round
+Robin (DRR), Weighted Round Robin (WRR), TCP, CUBIC, RED-family active queue
+management, PFC, and DCQCN are not required for the first result. A later
+project may qualify these models against the same exact execution contract.
+
+## Required rejection paths
+
+These errors are requirements for later phases, not behavior implemented by
+this page.
+
+| Invalid selection or model | Phase | Required diagnostic |
+|---|---|---|
+| The Days executor is selected with a nonzero `time_quantum_ns`. | P03, when backend selection is introduced | State that `time_quantum_ns` is unsupported by the Days executor and tell the user to remove or set it to zero, or select Nexosim. The setting must never be ignored and must never alter Days-executor timestamps. |
+| A parallel backend is selected for an image with zero or unknown lookahead on a cross-LP channel. | P04 load-time validation | Identify the channel and state that the selected parallel backend requires a known positive `min_delay_ns`. The diagnostic may suggest the scalar backend, which may execute zero-lookahead models. |
+| The selected backend does not support an image's scheduler or event kind. | P04 load-time validation | Name the backend and the unsupported scheduler or event kind. Validation must reject the image before execution. |
+| A model requests preemptive or cancellable service, or changes a link rate during an in-progress service. | P04 load-time validation | State which unsupported service behavior was requested and that v1 requires constant-rate, non-preemptive, non-cancellable transmission. |
+
+P03 owns the explicit backend-selection boundary. P04 owns validation of the
+lowered simulation image and its backend-specific model constraints.
