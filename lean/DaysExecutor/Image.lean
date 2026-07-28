@@ -261,18 +261,37 @@ def DescriptorOracleWellFormed (image : SimulationImage State) : Prop :=
       (image.packetDescriptor payload).sizeBytes = image.payloadBytes payload
 
 /--
-Prepared initial descriptor stores contain unique oracle values and cover every initial event at
-its target LP, matching ownership derivation at `executor/src/cpu.rs:3034-3199`.
+A descriptor store is in the strict payload-key order exposed by Rust's
+`BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367`. Consequently its list
+projection is independent of descriptor insertion order.
+-/
+def DescriptorStoreSorted (store : List PacketDescriptor) : Prop :=
+  store.Pairwise fun left right => left.id < right.id
+
+/--
+Prepared initial descriptor stores are strictly payload-sorted, contain unique oracle values, and
+cover every initial event at its target LP, matching ownership derivation at
+`executor/src/cpu.rs:3034-3199`.
 -/
 def InitialPacketStoresWellFormed (image : SimulationImage State) : Prop :=
   (∀ node ∈ image.nodes,
-    ((image.initialPacketStore node.id).map PacketDescriptor.id).Nodup ∧
-      ∀ descriptor ∈ image.initialPacketStore node.id,
-        descriptor = image.packetDescriptor descriptor.id) ∧
+    DescriptorStoreSorted (image.initialPacketStore node.id) ∧
+      ((image.initialPacketStore node.id).map PacketDescriptor.id).Nodup ∧
+        ∀ descriptor ∈ image.initialPacketStore node.id,
+          descriptor = image.packetDescriptor descriptor.id) ∧
     ∀ event ∈ image.initialEvents,
       ∃ node ∈ image.nodes,
         event.target = node.id ∧
           image.packetDescriptor event.payload ∈ image.initialPacketStore node.id
+
+/-- Validated prepared arenas expose a strictly payload-sorted descriptor store at every LP. -/
+theorem initialPacketStore_sorted_of_wellFormed
+    (image : SimulationImage State)
+    (hwellFormed : InitialPacketStoresWellFormed image)
+    (node : NodeDescriptor)
+    (hnode : node ∈ image.nodes) :
+    DescriptorStoreSorted (image.initialPacketStore node.id) :=
+  (hwellFormed.1 node hnode).1
 
 /--
 Every origin's prepared cursor lies above all of its initial event sequences, matching validation

@@ -554,6 +554,72 @@ def queueCounterexampleImage : SimulationImage TinyQueueStateFamily :=
     initialNextOriginSeq := fun _ => 1
     payloadBytes := fun _ => 1 }
 
+/--
+Executable descriptor-store order regression. The deliberately reversed `[d5, d1]` store is the
+shape admitted by the halted round countermodel and must be incoherent. Starting from sorted
+stores, distinct descriptor installs commute, distinct removals commute, and an install commutes
+with a removal of another payload, matching Rust's payload-keyed `BTreeMap` at
+`executor/src/scalar.rs:367`.
+-/
+def descriptorStoreOrderIndependenceCheck : Bool :=
+  let d1 := queueCounterexampleDescriptor 1
+  let d3 := queueCounterexampleDescriptor 3
+  let d5 := queueCounterexampleDescriptor 5
+  decide (
+    installDescriptor d3 (installDescriptor d1 []) =
+        installDescriptor d1 (installDescriptor d3 []) ∧
+      removeDescriptor 5 (removeDescriptor 1 [d1, d3, d5]) =
+        removeDescriptor 1 (removeDescriptor 5 [d1, d3, d5]) ∧
+      removeDescriptor 5 (installDescriptor d3 [d1, d5]) =
+        installDescriptor d3 (removeDescriptor 5 [d1, d5]))
+
+/-- Canonical descriptor stores are independent of distinct install/removal operation order. -/
+def DescriptorStoreOrderIndependenceWitness : Prop :=
+  descriptorStoreOrderIndependenceCheck = true
+
+theorem reversedDescriptorStoreCountermodel_incoherent :
+    ¬ DescriptorStoreCoherent queueCounterexampleImage
+      [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1] := by
+  simp [DescriptorStoreCoherent, DescriptorStoreSorted,
+    queueCounterexampleImage, queueCounterexampleDescriptor]
+
+/--
+Embedding the reversed descriptor store at the switch LP violates the machine invariant required
+at every post-exchange round boundary.
+-/
+theorem reversedDescriptorStoreCountermodel_not_wellFormed
+    (machine : MachineState TinyQueueStateFamily)
+    (hstore :
+      machine.packetStore
+          { id := 1, kind := .switch, stateSlot := 0 } =
+        [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1]) :
+    ¬ MachineWellFormed queueCounterexampleImage machine := by
+  intro hwellFormed
+  let node : NodeDescriptor :=
+    { id := 1, kind := .switch, stateSlot := 0 }
+  have hnode : node ∈ queueCounterexampleImage.nodes := by
+    simp [node, queueCounterexampleImage]
+  have hcoherent := hwellFormed.2.2.2.2.1 node hnode
+  have hstore' :
+      machine.packetStore node =
+        [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1] := by
+    simpa [node] using hstore
+  rw [hstore'] at hcoherent
+  exact reversedDescriptorStoreCountermodel_incoherent hcoherent
+
+/-- The reversed-store round countermodel cannot be a valid post-exchange start. -/
+theorem reversedDescriptorStoreCountermodel_not_postExchangeStart
+    (round : RoundState TinyQueueStateFamily)
+    (hstore :
+      round.machine.packetStore
+          { id := 1, kind := .switch, stateSlot := 0 } =
+        [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1]) :
+    ¬ PostExchangeStart queueCounterexampleImage round := by
+  intro hstart
+  exact
+    reversedDescriptorStoreCountermodel_not_wellFormed
+      round.machine hstore hstart.2
+
 /-- Role-correct initial state selected through the concrete image's state arenas. -/
 def queueCounterexampleLocalState
     (node : NodeDescriptor) : RoleState TinyQueueStateFamily node.kind :=

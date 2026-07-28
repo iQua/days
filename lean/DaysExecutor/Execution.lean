@@ -81,19 +81,116 @@ def installDescriptor (descriptor : PacketDescriptor) : List PacketDescriptor �
       else
         head :: installDescriptor descriptor tail
 
-/-- A local descriptor store contains unique payload IDs and exactly the oracle values. -/
+/--
+A local descriptor store is in canonical `BTreeMap` payload order, contains unique payload IDs,
+and contains exactly the oracle values.
+-/
 def DescriptorStoreCoherent
     (image : SimulationImage State)
     (store : List PacketDescriptor) : Prop :=
-  (store.map PacketDescriptor.id).Nodup ∧
-    ∀ descriptor ∈ store,
-      descriptor = image.packetDescriptor descriptor.id
+  DescriptorStoreSorted store ∧
+    (store.map PacketDescriptor.id).Nodup ∧
+      ∀ descriptor ∈ store,
+        descriptor = image.packetDescriptor descriptor.id
 
 /--
 Remove one payload descriptor from a local resident store.
 -/
 def removeDescriptor (payload : PayloadId) (store : List PacketDescriptor) : List PacketDescriptor :=
   store.filter fun descriptor => descriptor.id ≠ payload
+
+/--
+Every descriptor returned by canonical insertion is either the installed descriptor or an
+existing store member.
+-/
+private theorem mem_installDescriptor_cases
+    (candidate descriptor : PacketDescriptor)
+    (store : List PacketDescriptor)
+    (hmem : candidate ∈ installDescriptor descriptor store) :
+    candidate = descriptor ∨ candidate ∈ store := by
+  induction store with
+  | nil =>
+      simpa [installDescriptor] using hmem
+  | cons head tail ih =>
+      simp only [installDescriptor] at hmem
+      split at hmem
+      next =>
+        exact Or.inr hmem
+      next =>
+        split at hmem
+        next =>
+          rcases List.mem_cons.mp hmem with rfl | hmem
+          · exact Or.inl rfl
+          · exact Or.inr hmem
+        next =>
+          rcases List.mem_cons.mp hmem with rfl | hmem
+          · exact Or.inr (List.mem_cons_self)
+          · rcases ih hmem with rfl | hold
+            · exact Or.inl rfl
+            · exact Or.inr (List.mem_cons_of_mem _ hold)
+
+/--
+Canonical payload insertion preserves strict descriptor-store ordering. This is the list-model
+counterpart of insertion into Rust's `BTreeMap<PayloadId, ResidentPacket>` at
+`executor/src/scalar.rs:367`.
+-/
+theorem installDescriptor_preserves_sorted
+    (descriptor : PacketDescriptor)
+    (store : List PacketDescriptor)
+    (hsorted : DescriptorStoreSorted store) :
+    DescriptorStoreSorted (installDescriptor descriptor store) := by
+  induction store with
+  | nil =>
+      simp [DescriptorStoreSorted, installDescriptor]
+  | cons head tail ih =>
+      have hhead := (List.pairwise_cons.mp hsorted).1
+      have htail := (List.pairwise_cons.mp hsorted).2
+      simp only [installDescriptor]
+      split
+      next =>
+        exact hsorted
+      next hne =>
+        split
+        next hle =>
+          apply List.pairwise_cons.mpr
+          constructor
+          · intro current hmem
+            rcases List.mem_cons.mp hmem with hcurrent | hmem
+            · subst current
+              change descriptor.id < head.id
+              change descriptor.id ≤ head.id at hle
+              change descriptor.id ≠ head.id at hne
+              exact Std.lt_of_le_of_ne hle hne
+            · have hheadCurrent := hhead current hmem
+              change descriptor.id ≤ head.id at hle
+              change descriptor.id ≠ head.id at hne
+              change head.id < current.id at hheadCurrent
+              change descriptor.id < current.id
+              exact Nat.lt_trans (Std.lt_of_le_of_ne hle hne) hheadCurrent
+          · exact hsorted
+        next hnle =>
+          apply List.pairwise_cons.mpr
+          constructor
+          · intro current hmem
+            rcases mem_installDescriptor_cases current descriptor tail hmem with
+              hcurrent | hcurrent
+            · subst current
+              change head.id < descriptor.id
+              change ¬ descriptor.id ≤ head.id at hnle
+              exact Nat.lt_of_not_le hnle
+            · exact hhead current hcurrent
+          · exact ih htail
+
+/--
+Payload removal preserves strict descriptor-store ordering because it is a filter of the canonical
+store projection.
+-/
+theorem removeDescriptor_preserves_sorted
+    (payload : PayloadId)
+    (store : List PacketDescriptor)
+    (hsorted : DescriptorStoreSorted store) :
+    DescriptorStoreSorted (removeDescriptor payload store) := by
+  exact hsorted.filter _
 
 /-- Executable payload-reference check underlying `PacketRemovalsRespectReferences`. -/
 def packetRemovalsRespectReferencesCheck
