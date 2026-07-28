@@ -265,7 +265,12 @@ def LocalRoundStep
           (image.nodes.flatMap fun owner => before.outboxes owner.id).map
             RemoteEnvelope.event) ∧
       AllocatesChildrenInOrder node result.children before.machine after.machine ∧
-      AppliesTransitionResult image node result before.machine after.machine ∧
+      AppliesTransitionResult image node result
+        ((before.machine.pending.erase event) ++
+          (image.nodes.flatMap fun owner => before.outboxes owner.id).map
+            RemoteEnvelope.event ++
+          result.children)
+        before.machine after.machine ∧
       DescriptorStoreCoherent image (after.machine.packetStore node) ∧
       ChildDescriptorsAvailable image
         (after.machine.packetStore node) result.children ∧
@@ -376,7 +381,9 @@ def installRemoteEnvelopesFor
 /--
 Complete exactly-once canonical exchange: all and only buffered remote events are ordered by
 `(target, EventKey)`, their descriptors are installed before their future events, and every outbox
-is emptied, mirroring `executor/src/cpu.rs:4453-4506`.
+is emptied, mirroring `executor/src/cpu.rs:4453-4506`. `LocalRoundStep` treats every buffered
+envelope as a live payload reference, so this install can materialize target-local availability but
+cannot resurrect a descriptor removed while the envelope was buffered.
 -/
 def CompleteCanonicalExchange
     (image : SimulationImage State)

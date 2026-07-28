@@ -709,12 +709,66 @@ def tinyQueueTransition (eager : Bool) : TransitionRelation TinyQueueStateFamily
       result = tinyQueueTransitionResult eager node event state
 
 /--
+Executable per-LP commutation sketch for the accepted FIFO instance. Two decisionless arrivals on
+distinct LPs have no child or descriptor effects, so each local application touches only its own
+store component. Updating those two components in either order gives pointwise-equal stores for
+every declared LP. This is the concrete disjoint-store case required by the strengthened
+`IndependentStepsCommute` obligation; immutable child installs in service-start cases are
+canonical and idempotent, while live-reference removal conflicts are rejected separately.
+The ownership split mirrors `CpuLp.transitions` at `executor/src/cpu.rs:563-569`, local drain at
+lines 586-690, and the later canonical install at lines 4485-4500.
+-/
+def fifoPerLPStoreCommutationCheck : Bool :=
+  let firstNode : NodeDescriptor :=
+    { id := 1, kind := .switch, stateSlot := 0 }
+  let secondNode : NodeDescriptor :=
+    { id := 2, kind := .host, stateSlot := 1 }
+  let firstEvent := queueCounterexampleArrival
+  let secondEvent : Event :=
+    { queueCounterexampleArrival with
+      key :=
+        { timeNs := 6, phase := eventPhase .remoteArrival
+          originNode := 2, originSeq := 0 }
+      target := secondNode.id
+      payload := 12 }
+  let firstState := queueCounterexampleLocalState firstNode
+  let secondState := queueCounterexampleLocalState secondNode
+  let firstResult :=
+    tinyQueueTransitionResult false firstNode firstEvent firstState
+  let secondResult :=
+    tinyQueueTransitionResult false secondNode secondEvent secondState
+  let stores := initialPacketStore queueCounterexampleImage
+  let replaceStore :=
+    fun (owner : NodeDescriptor) (value : List PacketDescriptor)
+        (current : NodeDescriptor → List PacketDescriptor) =>
+      fun candidate =>
+        if candidate.id = owner.id then value else current candidate
+  let firstStore := applyPacketEffects firstResult (stores firstNode)
+  let secondStore := applyPacketEffects secondResult (stores secondNode)
+  let afterFirstThenSecond :=
+    replaceStore secondNode secondStore
+      (replaceStore firstNode firstStore stores)
+  let afterSecondThenFirst :=
+    replaceStore firstNode firstStore
+      (replaceStore secondNode secondStore stores)
+  decide (
+    firstNode.id ≠ secondNode.id ∧
+      firstResult.children = [] ∧
+      secondResult.children = [] ∧
+      firstResult.packetInstalls = [] ∧
+      firstResult.packetRemovals = [] ∧
+      secondResult.packetInstalls = [] ∧
+      secondResult.packetRemovals = [] ∧
+      queueCounterexampleImage.nodes.map afterFirstThenSecond =
+        queueCounterexampleImage.nodes.map afterSecondThenFirst)
+
+/--
 Executable strengthened-FIFO satisfiability sketch. Canonical selection is identical under
 replacement private state, appends and records packet 12, emits exactly one required child of each
 kind, keeps the emitted descriptor at its remote target after source-side removal, preserves exact
-list equality and observation-key fidelity across a decisionless arrival, and removes exactly
-packet 12 on completion. The committed-service list is duplicate-free initially and after every
-step.
+list equality and observation-key fidelity across a decisionless arrival, removes exactly packet
+12 on completion, and includes the distinct-LP store-commutation check above. The committed-service
+list is duplicate-free initially and after every step.
 -/
 def fifoStrengthenedServiceContractCheck : Bool :=
   let node : NodeDescriptor :=
@@ -745,7 +799,8 @@ def fifoStrengthenedServiceContractCheck : Bool :=
       let sourceStoreAfterRemoval :=
         removeDescriptor 12 [queueCounterexampleDescriptor 12]
       decide (
-        SameServiceSelectionResult readyResult alternateReadyResult ∧
+        fifoPerLPStoreCommutationCheck = true ∧
+          SameServiceSelectionResult readyResult alternateReadyResult ∧
           ObservationRecordsUseEventKey queueCounterexampleReady readyResult ∧
           sourceStoreAfterRemoval = [] ∧
           queueCounterexampleDescriptor 12 ∈ remoteStore ∧
@@ -780,6 +835,44 @@ def fifoStrengthenedServiceContractCheck : Bool :=
               afterArrival.nextState afterCompletion.nextState ∧
           afterCompletion.nextState.committedService = [])
   | _ => false
+
+/--
+Executable regression for the packet-lifetime removal race. Without a lifetime condition,
+install-then-remove and remove-then-exchange diverge. The modeled removal is rejected both while
+the remote child remains in the scalar pending queue and while its coherent descriptor-carrying
+envelope remains in a round outbox.
+-/
+def packetLifetimeRemovalRaceRejectedCheck : Bool :=
+  let payload : PayloadId := 12
+  let descriptor := queueCounterexampleDescriptor payload
+  let node : NodeDescriptor :=
+    { id := 2, kind := .host, stateSlot := 1 }
+  let event : Event :=
+    { key :=
+        { timeNs := 20, phase := eventPhase .remoteArrival
+          originNode := 1, originSeq := 2 }
+      target := node.id
+      kind := .remoteArrival
+      payload }
+  let envelope : RemoteEnvelope :=
+    { event, packet := descriptor }
+  let state := queueCounterexampleLocalState node
+  let removal :=
+    { tinyQueueTransitionResult false node event state with
+      packetRemovals := [payload] }
+  let installThenRemove :=
+    removeDescriptor payload (installDescriptor descriptor [descriptor])
+  let removeThenExchange :=
+    installDescriptor descriptor (removeDescriptor payload [descriptor])
+  decide (installThenRemove ≠ removeThenExchange) &&
+    decide (envelope.packet =
+      queueCounterexampleImage.packetDescriptor envelope.event.payload) &&
+    !packetRemovalsRespectReferencesCheck removal [event] &&
+    !packetRemovalsRespectReferencesCheck removal [envelope.event]
+
+/-- The removal-race shape is rejected by both pending-event and buffered-envelope references. -/
+def PacketLifetimeRemovalRaceRejectedShape : Prop :=
+  packetLifetimeRemovalRaceRejectedCheck = true
 
 /--
 Executable regression for the former cross-LP observation-key countermodel. Two independent LPs

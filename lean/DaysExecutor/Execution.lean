@@ -95,6 +95,27 @@ Remove one payload descriptor from a local resident store.
 def removeDescriptor (payload : PayloadId) (store : List PacketDescriptor) : List PacketDescriptor :=
   store.filter fun descriptor => descriptor.id ≠ payload
 
+/-- Executable payload-reference check underlying `PacketRemovalsRespectReferences`. -/
+def packetRemovalsRespectReferencesCheck
+    (result : TransitionResult State kind)
+    (referencedEvents : List Event) : Bool :=
+  result.packetRemovals.all fun payload =>
+    referencedEvents.all fun event =>
+      decide (event.payload ≠ payload)
+
+/--
+A transition may release a descriptor only when no surviving event owns that payload. Pending
+events and CPU outbox envelopes are lifetime references: scalar transport increments
+`transmitters` at `executor/src/scalar.rs:1645-1658` and removal after completion occurs only when
+that count reaches zero at lines 1661-1683. The CPU path likewise preserves pinned event payloads
+across dispatch at `executor/src/cpu.rs:627-635` and carries remote descriptors in envelopes at
+lines 664-667.
+-/
+def PacketRemovalsRespectReferences
+    (result : TransitionResult State kind)
+    (referencedEvents : List Event) : Prop :=
+  packetRemovalsRespectReferencesCheck result referencedEvents = true
+
 /-- Canonical global payload-ID projection used by `RunResult.resident_packets`. -/
 def canonicalizeDescriptors (descriptors : List PacketDescriptor) : List PacketDescriptor :=
   descriptors.foldl
@@ -240,6 +261,7 @@ def AppliesTransitionResult
     (image : SimulationImage State)
     (node : NodeDescriptor)
     (result : TransitionResult State node.kind)
+    (referencedEvents : List Event)
     (before after : MachineState State) : Prop :=
   after.localState node = result.nextState ∧
     after.packetStore node =
@@ -248,18 +270,22 @@ def AppliesTransitionResult
       other.id ≠ node.id →
       after.localState other = before.localState other ∧
         after.packetStore other = before.packetStore other) ∧
-    applyRecordedOutput result before after
+    applyRecordedOutput result before after ∧
+    PacketRemovalsRespectReferences result referencedEvents
 
 /--
 Scalar transition application in the model's per-LP descriptor projection. Rust scalar execution
 has one shared packet map, so every emitted child can use its descriptor immediately; the
 projection records that availability at the child's target while preserving exact local state and
-output effects. This is the scalar counterpart of the target copies installed by
-`CompleteCanonicalExchange`, not a weakening of final resident-packet comparison.
+output effects. A removal must also respect every event reference that survives the step. This is
+the scalar counterpart of the target copies installed by `CompleteCanonicalExchange`: the
+exchange's later physical install is idempotent availability realization, not descriptor
+resurrection.
 -/
 def AppliesScalarTransitionResult
     (image : SimulationImage State)
     (node : NodeDescriptor)
+    (event : Event)
     (result : TransitionResult State node.kind)
     (before after : MachineState State) : Prop :=
   after.localState node = result.nextState ∧
@@ -271,7 +297,9 @@ def AppliesScalarTransitionResult
         after.packetStore other =
           installChildDescriptorsFor image other.id result.children
             (before.packetStore other)) ∧
-    applyRecordedOutput result before after
+    applyRecordedOutput result before after ∧
+    PacketRemovalsRespectReferences result
+      ((before.pending.erase event) ++ result.children)
 
 /--
 One arbitrary available-event step used to define an explicit candidate reordering; unlike the
@@ -290,7 +318,7 @@ def AvailableEventStep
       transition node event (before.localState node) result ∧
       FreshEventKeys result.children (before.pending.erase event) ∧
       AllocatesChildrenInOrder node result.children before after ∧
-      AppliesScalarTransitionResult image node result before after ∧
+      AppliesScalarTransitionResult image node event result before after ∧
       DescriptorStoreCoherent image (after.packetStore node) ∧
       ChildDescriptorsAvailable image (after.packetStore node) result.children ∧
       after.pending = insertEvents result.children (before.pending.erase event) ∧
@@ -506,14 +534,31 @@ def projectRunResult
     pendingEvents := machine.pending }
 
 /--
+Exact descriptor holdings at every declared LP. The globally canonical resident-packet projection
+used by `RunResult` deliberately forgets this ownership information.
+-/
+def PerLPDescriptorStoresEqual
+    (image : SimulationImage State)
+    (left right : MachineState State) : Prop :=
+  ∀ node ∈ image.nodes,
+    left.packetStore node = right.packetStore node
+
+/--
 Complete normalized-result equality used by all cross-executor claims. Descriptor installation,
-summary counters, full observations, pending events, and both role arenas must all agree; only
-proof ghosts are excluded.
+summary counters, full observations, pending events, both role arenas, and exact per-LP descriptor
+holdings must all agree; only proof ghosts are excluded.
+
+Per-LP equality is stronger than assembled Rust `RunResult` equality because result assembly
+globally deduplicates descriptors at `executor/src/cpu.rs:3372-3433`. This intentionally strengthens
+the concrete `IndependentStepsCommute` instance obligation: swapped prefixes must retain identical
+LP holdings so equality remains valid under every dependent suffix. Because the statements reuse
+this relation, F2 and F3 also receive the stronger internal congruence guarantee.
 -/
 def SameMachineResult
     (image : SimulationImage State)
     (left right : MachineState State) : Prop :=
   (∀ node ∈ image.nodes, left.localState node = right.localState node) ∧
+    PerLPDescriptorStoresEqual image left right ∧
     projectRunResult image left = projectRunResult image right
 
 /--
