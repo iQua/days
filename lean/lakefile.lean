@@ -6,6 +6,9 @@ package leanGuard where
 lean_lib LeanGuard where
 
 @[default_target]
+lean_lib DaysExecutor where
+
+@[default_target]
 lean_exe dcqcn_check where
   root := `LeanGuard.Main
 
