@@ -2773,6 +2773,297 @@ impl<'image> WorkerShard<'image> {
     }
 }
 
+#[cfg(test)]
+use crate::{Backend, validate};
+#[cfg(test)]
+use crate::{
+    EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId, PacketKind,
+    RemoteChannel, SchedulerKind, SwitchQueueState, SwitchState, event_phase,
+};
+
+#[cfg(test)]
+fn target_interleaved_outbox_image() -> SimulationImage {
+    let source_link = LinkDescriptor {
+        id: LinkId(0),
+        source: NodeId(0),
+        target: NodeId(1),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let lower_port_link = LinkDescriptor {
+        id: LinkId(1),
+        source: NodeId(1),
+        target: NodeId(3),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let higher_port_link = LinkDescriptor {
+        id: LinkId(2),
+        source: NodeId(2),
+        target: NodeId(4),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let lower_sink_egress = LinkDescriptor {
+        id: LinkId(3),
+        source: NodeId(3),
+        target: NodeId(0),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let higher_sink_egress = LinkDescriptor {
+        id: LinkId(4),
+        source: NodeId(4),
+        target: NodeId(0),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let packets = (0..3)
+        .map(|sequence| {
+            let flow = FlowId(sequence);
+            PacketDescriptor {
+                id: PayloadId::from_node_sequence(NodeId(0), 5, sequence).unwrap(),
+                flow,
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    SimulationImage {
+        stop_time_ns: 3,
+        nodes: vec![
+            NodeDescriptor {
+                id: NodeId(0),
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(1),
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(2),
+                kind: NodeKind::Switch,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(3),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(4),
+                kind: NodeKind::Host,
+                state_slot: 2,
+            },
+        ],
+        host_states: vec![
+            HostState {
+                egress_link: source_link.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 3,
+                next_payload_seq: 3,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: lower_sink_egress.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: higher_sink_egress.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ],
+        switch_states: vec![
+            SwitchState {
+                physical_switch: 0,
+                queues: vec![SwitchQueueState {
+                    egress_link: Some(lower_port_link.id),
+                    scheduler: SchedulerKind::Fifo,
+                    queue_capacity_packets: 1,
+                    queue: VecDeque::new(),
+                    in_service: None,
+                    tx_ready_pending: false,
+                }],
+                next_origin_seq: 0,
+                arrived_packets: 0,
+                dropped_packets: 0,
+                departed_packets: 0,
+            },
+            SwitchState {
+                physical_switch: 0,
+                queues: vec![SwitchQueueState {
+                    egress_link: Some(higher_port_link.id),
+                    scheduler: SchedulerKind::Fifo,
+                    queue_capacity_packets: 1,
+                    queue: VecDeque::new(),
+                    in_service: None,
+                    tx_ready_pending: false,
+                }],
+                next_origin_seq: 0,
+                arrived_packets: 0,
+                dropped_packets: 0,
+                departed_packets: 0,
+            },
+        ],
+        flows: vec![
+            FlowDescriptor {
+                id: FlowId(0),
+                source: NodeId(0),
+                target: NodeId(4),
+                route: vec![source_link.id, higher_port_link.id],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: FlowId(1),
+                source: NodeId(0),
+                target: NodeId(3),
+                route: vec![source_link.id, lower_port_link.id],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: FlowId(2),
+                source: NodeId(0),
+                target: NodeId(4),
+                route: vec![source_link.id, higher_port_link.id],
+                reverse_route: vec![],
+            },
+        ],
+        initial_packets: packets.clone(),
+        links: vec![
+            source_link,
+            lower_port_link,
+            higher_port_link,
+            lower_sink_egress,
+            higher_sink_egress,
+        ],
+        channels: vec![
+            RemoteChannel::for_packet_link_to(source_link, NodeId(2), 1).unwrap(),
+            RemoteChannel::for_packet_link_to(source_link, NodeId(1), 1).unwrap(),
+            RemoteChannel::for_packet_link(lower_port_link, 1).unwrap(),
+            RemoteChannel::for_packet_link(higher_port_link, 1).unwrap(),
+        ],
+        initial_events: packets
+            .iter()
+            .enumerate()
+            .map(|(origin_seq, packet)| Event {
+                key: EventKey {
+                    time_ns: 0,
+                    phase: event_phase(EventKind::PacketArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: origin_seq as u64,
+                },
+                target: NodeId(0),
+                kind: EventKind::PacketArrival,
+                payload: packet.id,
+            })
+            .collect(),
+        seed: 1,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn one_lp_outbox_is_event_key_ordered_not_target_major() {
+    let image = target_interleaved_outbox_image();
+    validate(&image, Backend::Scalar).unwrap();
+    validate(&image, Backend::Cpu { workers: 1 }).unwrap();
+    let mut source = build_lps(&image, ObservationMode::Summary)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let (work, outbox) = source.drain(4, None, None, 0, 0).unwrap();
+
+    assert_eq!(
+        work,
+        LpRoundWork {
+            node: NodeId(0),
+            events_processed: 9,
+            same_time_continuations: 2,
+        }
+    );
+    assert_eq!(
+        outbox
+            .iter()
+            .map(|envelope| {
+                (
+                    envelope.event.target,
+                    envelope.event.payload,
+                    envelope.event.key,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                NodeId(2),
+                PayloadId(0),
+                EventKey {
+                    time_ns: 1,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: 5,
+                },
+            ),
+            (
+                NodeId(1),
+                PayloadId(5),
+                EventKey {
+                    time_ns: 2,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: 8,
+                },
+            ),
+            (
+                NodeId(2),
+                PayloadId(10),
+                EventKey {
+                    time_ns: 3,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: 11,
+                },
+            ),
+        ]
+    );
+    assert!(
+        outbox
+            .windows(2)
+            .all(|pair| pair[0].event.key < pair[1].event.key)
+    );
+    assert!(
+        (outbox[0].event.target, outbox[0].event.key)
+            > (outbox[1].event.target, outbox[1].event.key)
+    );
+    // A P11 sorted-run optimization may expose sorted sub-runs per (source, target);
+    // a whole-LP outbox is key-monotone, not target-major.
+}
+
 impl<'image> WorkerShard<'image> {
     fn merge_remote(
         &mut self,

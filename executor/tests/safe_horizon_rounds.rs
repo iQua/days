@@ -1027,14 +1027,29 @@ fn add_idle_switches(image: &mut SimulationImage, count: usize) {
     for _ in 0..count {
         let id = NodeId(image.nodes.len() as u64);
         let state_slot = image.switch_states.len() as u32;
+        let egress_link = LinkDescriptor {
+            id: LinkId(image.links.len() as u64),
+            source: id,
+            target: SOURCE,
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        };
         image.nodes.push(NodeDescriptor {
             id,
             kind: NodeKind::Switch,
             state_slot,
         });
+        image.links.push(egress_link);
         image.switch_states.push(SwitchState {
             physical_switch: u64::from(state_slot),
-            queues: vec![],
+            queues: vec![SwitchQueueState {
+                egress_link: Some(egress_link.id),
+                scheduler: SchedulerKind::Fifo,
+                queue_capacity_packets: 1,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+            }],
             next_origin_seq: 0,
             arrived_packets: 0,
             dropped_packets: 0,
@@ -1046,9 +1061,14 @@ fn add_idle_switches(image: &mut SimulationImage, count: usize) {
 #[test]
 fn idle_lp_count_does_not_change_round_loop_operations() {
     let mut small = image(100, 0, 10);
+    add_sink_owned_egress(&mut small);
     let mut large = small.clone();
     add_idle_switches(&mut small, 100);
     add_idle_switches(&mut large, 10_000);
+    for image in [&small, &large] {
+        validate(image, Backend::Scalar).unwrap();
+        validate(image, Backend::Cpu { workers: 4 }).unwrap();
+    }
 
     let scalar_small =
         run_scalar_rounds_with_observations(&small, None, ObservationMode::Full).unwrap();
@@ -1405,7 +1425,9 @@ fn pre_split_heterogeneous_image(seed: u64) -> SimulationImage {
                 link.source = NodeId(3);
                 link.target = NodeId(0);
             }
-            other => panic!("unexpected heterogeneous-image link {other:?}"),
+            LinkId(_) => {
+                link.source.0 -= 1;
+            }
         }
     }
     for flow in &mut image.flows {
@@ -1446,29 +1468,83 @@ fn pre_split_heterogeneous_image(seed: u64) -> SimulationImage {
     image
 }
 
-type SemanticPacket = (u64, u8, u64);
-type NormalizedQueue = (
-    LinkId,
-    u64,
-    Vec<SemanticPacket>,
-    Option<SemanticPacket>,
-    bool,
-);
-type NormalizedPendingEvent = (SemanticPacket, u64, u16, u64);
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticPacket {
+    source_sequence: u64,
+    flow: FlowId,
+    kind: u8,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NormalizedHostState {
+    egress_link: LinkId,
+    queue: Vec<SemanticPacket>,
+    in_service: Option<SemanticPacket>,
+    tx_ready_pending: bool,
+    generators: Vec<FlowGeneratorState>,
+    next_origin_seq: u64,
+    next_payload_seq: u64,
+    sourced_packets: u64,
+    departed_packets: u64,
+    received_packets: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NormalizedQueue {
+    physical_switch: u64,
+    egress_link: Option<LinkId>,
+    scheduler: u8,
+    queue_capacity_packets: u64,
+    queue: Vec<SemanticPacket>,
+    in_service: Option<SemanticPacket>,
+    tx_ready_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticDeparture {
+    packet: SemanticPacket,
+    time_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticArrival {
+    packet: SemanticPacket,
+    time_ns: u64,
+    disposition: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NormalizedPendingEvent {
+    packet: SemanticPacket,
+    time_ns: u64,
+    phase: u16,
+    kind: u16,
+    physical_target: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NormalizedTerminalResult {
+    summary: days_executor::RunSummary,
+    host_states: Vec<NormalizedHostState>,
+    switch_counters: BTreeMap<u64, (u64, u64, u64, u64)>,
+    queues: Vec<NormalizedQueue>,
+    resident_packets: Vec<SemanticPacket>,
+    observed_packets: Vec<SemanticPacket>,
+    pending_events: BTreeMap<u64, Vec<NormalizedPendingEvent>>,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct NormalizedPhysicalResult {
-    summary: days_executor::RunSummary,
-    switch_counters: (u64, u64, u64),
-    queues: Vec<NormalizedQueue>,
-    departures: Vec<(SemanticPacket, u64)>,
-    arrivals: Vec<(SemanticPacket, u64, u8)>,
-    pending: Vec<NormalizedPendingEvent>,
+    terminal: NormalizedTerminalResult,
+    departures: Vec<SemanticDeparture>,
+    arrivals: Vec<SemanticArrival>,
 }
 
 fn normalized_physical_result(
     result: &days_executor::RunResult,
     post_split: bool,
+    node_count: u64,
 ) -> NormalizedPhysicalResult {
     let packets = result
         .observed_packets
@@ -1478,7 +1554,12 @@ fn normalized_physical_result(
         .collect::<BTreeMap<_, _>>();
     let semantic_packet = |payload: PayloadId| {
         let packet = packets[&payload];
-        (packet.flow.0, packet.kind as u8, packet.size_bytes)
+        SemanticPacket {
+            source_sequence: payload.0 / node_count,
+            flow: packet.flow,
+            kind: packet.kind as u8,
+            size_bytes: packet.size_bytes,
+        }
     };
     let physical_target = |target: NodeId| {
         if post_split {
@@ -1492,31 +1573,48 @@ fn normalized_physical_result(
         }
     };
 
+    let host_states = result
+        .host_states
+        .iter()
+        .map(|state| NormalizedHostState {
+            egress_link: state.egress_link,
+            queue: state.queue.iter().copied().map(semantic_packet).collect(),
+            in_service: state.in_service.map(semantic_packet),
+            tx_ready_pending: state.tx_ready_pending,
+            generators: state.generators.clone(),
+            next_origin_seq: state.next_origin_seq,
+            next_payload_seq: state.next_payload_seq,
+            sourced_packets: state.sourced_packets,
+            departed_packets: state.departed_packets,
+            received_packets: state.received_packets,
+        })
+        .collect();
     let mut queues = result
         .switch_states
         .iter()
-        .flat_map(|state| &state.queues)
-        .filter_map(|queue| {
-            queue.egress_link.map(|link| {
-                (
-                    link,
-                    queue.queue_capacity_packets,
-                    queue.queue.iter().copied().map(semantic_packet).collect(),
-                    queue.in_service.map(semantic_packet),
-                    queue.tx_ready_pending,
-                )
+        .flat_map(|state| {
+            state.queues.iter().map(|queue| NormalizedQueue {
+                physical_switch: state.physical_switch,
+                egress_link: queue.egress_link,
+                scheduler: queue.scheduler as u8,
+                queue_capacity_packets: queue.queue_capacity_packets,
+                queue: queue.queue.iter().copied().map(semantic_packet).collect(),
+                in_service: queue.in_service.map(semantic_packet),
+                tx_ready_pending: queue.tx_ready_pending,
             })
         })
         .collect::<Vec<_>>();
-    queues.sort_unstable_by_key(|queue| queue.0);
+    queues.sort_unstable();
 
-    let mut departures = result
+    let departures = result
         .departures
         .iter()
-        .map(|departure| (semantic_packet(departure.payload), departure.time_ns))
+        .map(|departure| SemanticDeparture {
+            packet: semantic_packet(departure.payload),
+            time_ns: departure.time_ns,
+        })
         .collect::<Vec<_>>();
-    departures.sort_unstable();
-    let mut arrivals = result
+    let arrivals = result
         .arrivals
         .iter()
         .map(|arrival| {
@@ -1526,45 +1624,614 @@ fn normalized_physical_result(
                 days_executor::ArrivalDisposition::Delivered => 2,
                 days_executor::ArrivalDisposition::Feedback => 3,
             };
-            (
-                semantic_packet(arrival.payload),
-                arrival.time_ns,
+            SemanticArrival {
+                packet: semantic_packet(arrival.payload),
+                time_ns: arrival.time_ns,
                 disposition,
-            )
+            }
         })
         .collect::<Vec<_>>();
-    arrivals.sort_unstable();
-    let mut pending = result
-        .pending_events
+    let mut pending_events = BTreeMap::<u64, Vec<NormalizedPendingEvent>>::new();
+    for event in &result.pending_events {
+        pending_events
+            .entry(event.key.time_ns)
+            .or_default()
+            .push(NormalizedPendingEvent {
+                packet: semantic_packet(event.payload),
+                time_ns: event.key.time_ns,
+                phase: event.key.phase,
+                kind: event.kind as u16,
+                physical_target: physical_target(event.target),
+            });
+    }
+    for events in pending_events.values_mut() {
+        events.sort_unstable();
+    }
+    let mut resident_packets = result
+        .resident_packets
         .iter()
-        .map(|event| {
-            (
-                semantic_packet(event.payload),
-                event.key.time_ns,
-                event.kind as u16,
-                physical_target(event.target),
-            )
-        })
+        .map(|packet| semantic_packet(packet.id))
         .collect::<Vec<_>>();
-    pending.sort_unstable();
+    resident_packets.sort_unstable();
+    let mut observed_packets = result
+        .observed_packets
+        .iter()
+        .map(|packet| semantic_packet(packet.id))
+        .collect::<Vec<_>>();
+    observed_packets.sort_unstable();
+    let switch_counters =
+        result
+            .switch_states
+            .iter()
+            .fold(BTreeMap::new(), |mut counters, state| {
+                let entry = counters
+                    .entry(state.physical_switch)
+                    .or_insert((0_u64, 0_u64, 0_u64, 0_u64));
+                entry.0 += state.next_origin_seq;
+                entry.1 += state.arrived_packets;
+                entry.2 += state.dropped_packets;
+                entry.3 += state.departed_packets;
+                counters
+            });
 
     NormalizedPhysicalResult {
-        summary: result.summary,
-        switch_counters: result.switch_states.iter().fold(
-            (0_u64, 0_u64, 0_u64),
-            |(arrived, dropped, departed), state| {
-                (
-                    arrived + state.arrived_packets,
-                    dropped + state.dropped_packets,
-                    departed + state.departed_packets,
-                )
-            },
-        ),
-        queues,
+        terminal: NormalizedTerminalResult {
+            summary: result.summary,
+            host_states,
+            switch_counters,
+            queues,
+            resident_packets,
+            observed_packets,
+            pending_events,
+        },
         departures,
         arrivals,
-        pending,
     }
+}
+
+fn timestamp_multisets<T>(records: &[T], time_ns: impl Fn(&T) -> u64) -> BTreeMap<u64, Vec<T>>
+where
+    T: Clone + Ord,
+{
+    let mut by_time = BTreeMap::<u64, Vec<T>>::new();
+    for record in records {
+        by_time
+            .entry(time_ns(record))
+            .or_default()
+            .push(record.clone());
+    }
+    for records in by_time.values_mut() {
+        records.sort_unstable();
+    }
+    by_time
+}
+
+fn assert_permutation_aware_physical_equality(
+    before: &NormalizedPhysicalResult,
+    after: &NormalizedPhysicalResult,
+) {
+    assert_eq!(after.terminal, before.terminal);
+
+    assert_eq!(
+        after
+            .departures
+            .iter()
+            .map(|record| record.time_ns)
+            .collect::<Vec<_>>(),
+        before
+            .departures
+            .iter()
+            .map(|record| record.time_ns)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        timestamp_multisets(&after.departures, |record| record.time_ns),
+        timestamp_multisets(&before.departures, |record| record.time_ns)
+    );
+    assert_eq!(
+        after
+            .arrivals
+            .iter()
+            .map(|record| record.time_ns)
+            .collect::<Vec<_>>(),
+        before
+            .arrivals
+            .iter()
+            .map(|record| record.time_ns)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        timestamp_multisets(&after.arrivals, |record| record.time_ns),
+        timestamp_multisets(&before.arrivals, |record| record.time_ns)
+    );
+
+    let departures_by_flow = |records: &[SemanticDeparture]| {
+        let mut by_flow = BTreeMap::<FlowId, Vec<SemanticDeparture>>::new();
+        for record in records {
+            by_flow.entry(record.packet.flow).or_default().push(*record);
+        }
+        by_flow
+    };
+    let arrivals_by_flow = |records: &[SemanticArrival]| {
+        let mut by_flow = BTreeMap::<FlowId, Vec<SemanticArrival>>::new();
+        for record in records {
+            by_flow.entry(record.packet.flow).or_default().push(*record);
+        }
+        by_flow
+    };
+    assert_eq!(
+        departures_by_flow(&after.departures),
+        departures_by_flow(&before.departures)
+    );
+    assert_eq!(
+        arrivals_by_flow(&after.arrivals),
+        arrivals_by_flow(&before.arrivals)
+    );
+
+    let departures_by_packet = |records: &[SemanticDeparture]| {
+        let mut by_packet = BTreeMap::<SemanticPacket, Vec<u64>>::new();
+        for record in records {
+            by_packet
+                .entry(record.packet)
+                .or_default()
+                .push(record.time_ns);
+        }
+        by_packet
+    };
+    let arrivals_by_packet = |records: &[SemanticArrival]| {
+        let mut by_packet = BTreeMap::<SemanticPacket, Vec<(u64, u8)>>::new();
+        for record in records {
+            by_packet
+                .entry(record.packet)
+                .or_default()
+                .push((record.time_ns, record.disposition));
+        }
+        by_packet
+    };
+    assert_eq!(
+        departures_by_packet(&after.departures),
+        departures_by_packet(&before.departures)
+    );
+    assert_eq!(
+        arrivals_by_packet(&after.arrivals),
+        arrivals_by_packet(&before.arrivals)
+    );
+
+    let dropped_packets = |records: &[SemanticArrival]| {
+        let mut packets = records
+            .iter()
+            .filter(|record| record.disposition == 1)
+            .map(|record| record.packet)
+            .collect::<Vec<_>>();
+        packets.sort_unstable();
+        packets
+    };
+    assert_eq!(
+        dropped_packets(&after.arrivals),
+        dropped_packets(&before.arrivals)
+    );
+}
+
+fn equal_time_star_image() -> SimulationImage {
+    let flow_zero_packet = PayloadId(0);
+    let flow_one_packet = PayloadId(5);
+    let flow_zero_egress = LinkDescriptor {
+        id: LinkId(0),
+        source: NodeId(2),
+        target: NodeId(3),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 1,
+    };
+    let flow_one_egress = LinkDescriptor {
+        id: LinkId(1),
+        source: NodeId(1),
+        target: NodeId(4),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 1,
+    };
+    let source_link = LinkDescriptor {
+        id: LinkId(2),
+        source: NodeId(0),
+        target: NodeId(1),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let sink_zero_egress = LinkDescriptor {
+        id: LinkId(3),
+        source: NodeId(3),
+        target: NodeId(0),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let sink_one_egress = LinkDescriptor {
+        id: LinkId(4),
+        source: NodeId(4),
+        target: NodeId(0),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+
+    SimulationImage {
+        stop_time_ns: 4,
+        nodes: vec![
+            NodeDescriptor {
+                id: NodeId(0),
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(1),
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(2),
+                kind: NodeKind::Switch,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(3),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(4),
+                kind: NodeKind::Host,
+                state_slot: 2,
+            },
+        ],
+        host_states: vec![
+            HostState {
+                egress_link: source_link.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 2,
+                sourced_packets: 2,
+                departed_packets: 2,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: sink_zero_egress.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: sink_one_egress.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ],
+        switch_states: vec![
+            SwitchState {
+                physical_switch: 0,
+                queues: vec![SwitchQueueState {
+                    egress_link: Some(flow_one_egress.id),
+                    scheduler: SchedulerKind::Fifo,
+                    queue_capacity_packets: 1,
+                    queue: VecDeque::new(),
+                    in_service: Some(flow_one_packet),
+                    tx_ready_pending: false,
+                }],
+                next_origin_seq: 2,
+                arrived_packets: 1,
+                dropped_packets: 0,
+                departed_packets: 0,
+            },
+            SwitchState {
+                physical_switch: 0,
+                queues: vec![SwitchQueueState {
+                    egress_link: Some(flow_zero_egress.id),
+                    scheduler: SchedulerKind::Fifo,
+                    queue_capacity_packets: 1,
+                    queue: VecDeque::new(),
+                    in_service: Some(flow_zero_packet),
+                    tx_ready_pending: false,
+                }],
+                next_origin_seq: 2,
+                arrived_packets: 1,
+                dropped_packets: 0,
+                departed_packets: 0,
+            },
+        ],
+        flows: vec![
+            FlowDescriptor {
+                id: FlowId(0),
+                source: NodeId(0),
+                target: NodeId(3),
+                route: vec![source_link.id, flow_zero_egress.id],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: FlowId(1),
+                source: NodeId(0),
+                target: NodeId(4),
+                route: vec![source_link.id, flow_one_egress.id],
+                reverse_route: vec![],
+            },
+        ],
+        initial_packets: vec![
+            PacketDescriptor {
+                id: flow_zero_packet,
+                flow: FlowId(0),
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            },
+            PacketDescriptor {
+                id: flow_one_packet,
+                flow: FlowId(1),
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            },
+        ],
+        links: vec![
+            flow_zero_egress,
+            flow_one_egress,
+            source_link,
+            sink_zero_egress,
+            sink_one_egress,
+        ],
+        channels: vec![
+            RemoteChannel::for_packet_link_to(source_link, NodeId(1), 1).unwrap(),
+            RemoteChannel::for_packet_link_to(source_link, NodeId(2), 1).unwrap(),
+            RemoteChannel::for_packet_link(flow_zero_egress, 1).unwrap(),
+            RemoteChannel::for_packet_link(flow_one_egress, 1).unwrap(),
+        ],
+        initial_events: vec![
+            Event {
+                key: EventKey {
+                    time_ns: 3,
+                    phase: event_phase(EventKind::TxComplete),
+                    origin_node: NodeId(1),
+                    origin_seq: 0,
+                },
+                target: NodeId(1),
+                kind: EventKind::TxComplete,
+                payload: flow_one_packet,
+            },
+            Event {
+                key: EventKey {
+                    time_ns: 3,
+                    phase: event_phase(EventKind::TxComplete),
+                    origin_node: NodeId(2),
+                    origin_seq: 0,
+                },
+                target: NodeId(2),
+                kind: EventKind::TxComplete,
+                payload: flow_zero_packet,
+            },
+            Event {
+                key: EventKey {
+                    time_ns: 4,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: NodeId(1),
+                    origin_seq: 1,
+                },
+                target: NodeId(4),
+                kind: EventKind::RemoteArrival,
+                payload: flow_one_packet,
+            },
+            Event {
+                key: EventKey {
+                    time_ns: 4,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: NodeId(2),
+                    origin_seq: 1,
+                },
+                target: NodeId(3),
+                kind: EventKind::RemoteArrival,
+                payload: flow_zero_packet,
+            },
+        ],
+        seed: 1,
+    }
+}
+
+fn pre_split_equal_time_star_image() -> SimulationImage {
+    let mut image = equal_time_star_image();
+    let post_node_count = image.nodes.len() as u64;
+    let pre_node_count = post_node_count - 1;
+    let flow_zero_port = image.switch_states.remove(1);
+    image.switch_states[0].arrived_packets += flow_zero_port.arrived_packets;
+    image.switch_states[0].dropped_packets += flow_zero_port.dropped_packets;
+    image.switch_states[0].departed_packets += flow_zero_port.departed_packets;
+    image.switch_states[0].queues.extend(flow_zero_port.queues);
+    image.switch_states[0].next_origin_seq = 4;
+    image.nodes.remove(2);
+    for node in &mut image.nodes {
+        if node.id.0 > 2 {
+            node.id.0 -= 1;
+        }
+    }
+    for link in &mut image.links {
+        if link.source == NodeId(2) {
+            link.source = NodeId(1);
+        } else if link.source.0 > 2 {
+            link.source.0 -= 1;
+        }
+        if link.target.0 > 2 {
+            link.target.0 -= 1;
+        }
+    }
+    for flow in &mut image.flows {
+        flow.target.0 -= 1;
+    }
+    let remap_payload =
+        |payload: PayloadId| PayloadId((payload.0 / post_node_count) * pre_node_count);
+    for packet in &mut image.initial_packets {
+        packet.id = remap_payload(packet.id);
+    }
+    for state in &mut image.switch_states {
+        for queue in &mut state.queues {
+            queue.queue = queue.queue.iter().copied().map(remap_payload).collect();
+            queue.in_service = queue.in_service.map(remap_payload);
+        }
+    }
+    for event in &mut image.initial_events {
+        let flow = image.initial_packets[usize::from(event.payload != PayloadId(0))].flow;
+        event.payload = remap_payload(event.payload);
+        event.key.origin_node = NodeId(1);
+        event.key.origin_seq = match (flow, event.kind) {
+            (FlowId(0), EventKind::TxComplete) => 0,
+            (FlowId(0), EventKind::RemoteArrival) => 1,
+            (FlowId(1), EventKind::TxComplete) => 2,
+            (FlowId(1), EventKind::RemoteArrival) => 3,
+            _ => unreachable!("the star fixture has two in-flight data packets"),
+        };
+        if event.target == NodeId(2) {
+            event.target = NodeId(1);
+        } else if event.target.0 > 2 {
+            event.target.0 -= 1;
+        }
+    }
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image.channels = [LinkId(0), LinkId(1), LinkId(2)]
+        .map(|link_id| {
+            let link = image.links[link_id.0 as usize];
+            RemoteChannel::for_packet_link(link, 1).unwrap()
+        })
+        .to_vec();
+    image
+}
+
+#[test]
+fn port_split_documents_equal_time_cross_origin_permutation() {
+    let before_image = pre_split_equal_time_star_image();
+    let after_image = equal_time_star_image();
+    validate(&after_image, Backend::Scalar).unwrap();
+    validate(&after_image, Backend::Cpu { workers: 4 }).unwrap();
+
+    let before = run_scalar_with_observations(&before_image, None, ObservationMode::Full).unwrap();
+    let after = run_scalar_with_observations(&after_image, None, ObservationMode::Full).unwrap();
+    let round_after =
+        run_scalar_rounds_with_observations(&after_image, None, ObservationMode::Full).unwrap();
+    assert_eq!(round_after.result, after);
+    for config in [
+        CpuConfig {
+            workers: 1,
+            granularity: ChunkGranularity::Static,
+            ..CpuConfig::default()
+        },
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Static,
+            ..CpuConfig::default()
+        },
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Fixed(1),
+            straggler_threshold_events: Some(0),
+            dedicated_straggler_workers: 1,
+            ..CpuConfig::default()
+        },
+    ] {
+        let cpu =
+            run_cpu_with_observations(&after_image, None, config, ObservationMode::Full).unwrap();
+        assert_eq!(cpu.result, after);
+    }
+
+    let before = normalized_physical_result(
+        &before,
+        false,
+        u64::try_from(before_image.nodes.len()).unwrap(),
+    );
+    let after = normalized_physical_result(
+        &after,
+        true,
+        u64::try_from(after_image.nodes.len()).unwrap(),
+    );
+    let flow_zero = SemanticPacket {
+        source_sequence: 0,
+        flow: FlowId(0),
+        kind: PacketKind::Data as u8,
+        size_bytes: 1,
+    };
+    let flow_one = SemanticPacket {
+        source_sequence: 1,
+        flow: FlowId(1),
+        kind: PacketKind::Data as u8,
+        size_bytes: 1,
+    };
+    assert_eq!(
+        before.departures,
+        vec![
+            SemanticDeparture {
+                packet: flow_zero,
+                time_ns: 3,
+            },
+            SemanticDeparture {
+                packet: flow_one,
+                time_ns: 3,
+            },
+        ]
+    );
+    assert_eq!(
+        after.departures,
+        vec![
+            SemanticDeparture {
+                packet: flow_one,
+                time_ns: 3,
+            },
+            SemanticDeparture {
+                packet: flow_zero,
+                time_ns: 3,
+            },
+        ]
+    );
+    assert_eq!(
+        before.arrivals,
+        vec![
+            SemanticArrival {
+                packet: flow_zero,
+                time_ns: 4,
+                disposition: 2,
+            },
+            SemanticArrival {
+                packet: flow_one,
+                time_ns: 4,
+                disposition: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        after.arrivals,
+        vec![
+            SemanticArrival {
+                packet: flow_one,
+                time_ns: 4,
+                disposition: 2,
+            },
+            SemanticArrival {
+                packet: flow_zero,
+                time_ns: 4,
+                disposition: 2,
+            },
+        ]
+    );
+    assert_ne!(after.departures, before.departures);
+    assert_ne!(after.arrivals, before.arrivals);
+    assert_permutation_aware_physical_equality(&before, &after);
 }
 
 #[test]
@@ -1672,37 +2339,6 @@ fn port_lps_take_independent_same_time_tx_ready_continuations() {
 }
 
 #[test]
-fn one_port_outbox_need_not_be_sorted_by_target_then_event_key() {
-    let image = heterogeneous_image(1);
-    let mut route_targets = image
-        .channels
-        .iter()
-        .filter(|channel| channel.link == LinkId(0))
-        .map(|channel| channel.target)
-        .collect::<Vec<_>>();
-    route_targets.sort_unstable();
-    route_targets.dedup();
-    assert_eq!(route_targets, vec![NodeId(1), NodeId(2)]);
-
-    // One source-port LP may serialize a packet for the higher target before a packet for the
-    // lower target. Its EventKeys advance, but the exchange's target-first composite key falls.
-    let first_key = EventKey {
-        time_ns: 100,
-        phase: event_phase(EventKind::RemoteArrival),
-        origin_node: NodeId(0),
-        origin_seq: 10,
-    };
-    let second_key = EventKey {
-        time_ns: 200,
-        phase: event_phase(EventKind::RemoteArrival),
-        origin_node: NodeId(0),
-        origin_seq: 12,
-    };
-    assert!(first_key < second_key);
-    assert!((NodeId(2), first_key) > (NodeId(1), second_key));
-}
-
-#[test]
 fn port_decomposition_preserves_pre_split_physical_outcomes() {
     for seed in 0..128 {
         let post_split = heterogeneous_image(seed);
@@ -1712,11 +2348,17 @@ fn port_decomposition_preserves_pre_split_physical_outcomes() {
                 run_scalar_with_observations(&pre_split, horizon, ObservationMode::Full).unwrap();
             let after =
                 run_scalar_with_observations(&post_split, horizon, ObservationMode::Full).unwrap();
-            assert_eq!(
-                normalized_physical_result(&after, true),
-                normalized_physical_result(&before, false),
-                "seed {seed}, horizon {horizon:?}"
+            let before = normalized_physical_result(
+                &before,
+                false,
+                u64::try_from(pre_split.nodes.len()).unwrap(),
             );
+            let after = normalized_physical_result(
+                &after,
+                true,
+                u64::try_from(post_split.nodes.len()).unwrap(),
+            );
+            assert_permutation_aware_physical_equality(&before, &after);
         }
     }
 }
@@ -1801,8 +2443,10 @@ fn cpu_worker_count_granularity_and_straggler_classification_preserve_complete_s
 }
 
 fn incast_image(sender_count: usize) -> SimulationImage {
-    let sink = NodeId(sender_count as u64);
-    let sink_egress = LinkId(sender_count as u64);
+    let hot_port = NodeId(sender_count as u64);
+    let sink = NodeId(sender_count as u64 + 1);
+    let port_egress = LinkId(sender_count as u64);
+    let sink_egress = LinkId(sender_count as u64 + 1);
     let mut nodes = Vec::new();
     let mut host_states = Vec::new();
     let mut flows = Vec::new();
@@ -1816,12 +2460,12 @@ fn incast_image(sender_count: usize) -> SimulationImage {
         let link = LinkDescriptor {
             id: LinkId(sender.0),
             source: sender,
-            target: sink,
+            target: hot_port,
             rate_bps: 8_000_000_000,
             propagation_ns: 9,
         };
         let flow = FlowId(sender.0);
-        let payload = PayloadId::from_node_sequence(sender, (sender_count + 1) as u64, 0).unwrap();
+        let payload = PayloadId::from_node_sequence(sender, (sender_count + 2) as u64, 0).unwrap();
         nodes.push(NodeDescriptor {
             id: sender,
             kind: NodeKind::Host,
@@ -1843,7 +2487,7 @@ fn incast_image(sender_count: usize) -> SimulationImage {
             id: flow,
             source: sender,
             target: sink,
-            route: vec![link.id],
+            route: vec![link.id, port_egress],
             reverse_route: vec![],
         });
         initial_packets.push(PacketDescriptor {
@@ -1872,11 +2516,25 @@ fn incast_image(sender_count: usize) -> SimulationImage {
                 origin_node: sender,
                 origin_seq: 1,
             },
-            target: sink,
+            target: hot_port,
             kind: EventKind::RemoteArrival,
             payload,
         });
     }
+    nodes.push(NodeDescriptor {
+        id: hot_port,
+        kind: NodeKind::Switch,
+        state_slot: 0,
+    });
+    let port_link = LinkDescriptor {
+        id: port_egress,
+        source: hot_port,
+        target: sink,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 9,
+    };
+    links.push(port_link);
+    channels.push(RemoteChannel::for_packet_link(port_link, 1).unwrap());
     nodes.push(NodeDescriptor {
         id: sink,
         kind: NodeKind::Host,
@@ -1907,7 +2565,21 @@ fn incast_image(sender_count: usize) -> SimulationImage {
         stop_time_ns: 19,
         nodes,
         host_states,
-        switch_states: vec![],
+        switch_states: vec![SwitchState {
+            physical_switch: 0,
+            queues: vec![SwitchQueueState {
+                egress_link: Some(port_egress),
+                scheduler: SchedulerKind::Fifo,
+                queue_capacity_packets: 0,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+            }],
+            next_origin_seq: 0,
+            arrived_packets: 0,
+            dropped_packets: 0,
+            departed_packets: 0,
+        }],
         flows,
         initial_packets,
         links,
@@ -1920,6 +2592,13 @@ fn incast_image(sender_count: usize) -> SimulationImage {
 #[test]
 fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
     let image = incast_image(16);
+    let hot_port = NodeId(16);
+    let descriptor = image.nodes[hot_port.0 as usize];
+    assert_eq!(descriptor.kind, NodeKind::Switch);
+    let port_state = &image.switch_states[descriptor.state_slot as usize];
+    assert_eq!(port_state.physical_switch, 0);
+    assert_eq!(port_state.queues.len(), 1);
+    assert_eq!(port_state.queues[0].egress_link, Some(LinkId(16)));
     validate(&image, Backend::Scalar).unwrap();
     validate(&image, Backend::Cpu { workers: 4 }).unwrap();
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
@@ -1941,7 +2620,7 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
     assert_eq!(
         actual.rounds[0].partition.stragglers,
         vec![days_executor::LpWorkEstimate {
-            node: NodeId(16),
+            node: hot_port,
             estimated_events: 16,
         }]
     );
@@ -1950,19 +2629,19 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
         actual.rounds[0].partition.reserved_straggler_workers,
         vec![0]
     );
-    let sink = actual.rounds[0]
+    let port = actual.rounds[0]
         .lp_timings
         .iter()
-        .find(|timing| timing.node == NodeId(16))
+        .find(|timing| timing.node == hot_port)
         .unwrap();
-    assert_eq!(sink.class, WorkClass::Straggler);
-    assert_eq!(sink.worker, 0);
-    assert_eq!(sink.dispatch_order, 0);
+    assert_eq!(port.class, WorkClass::Straggler);
+    assert_eq!(port.worker, 0);
+    assert_eq!(port.dispatch_order, 0);
     assert!(
         actual.rounds[0]
             .partition
             .reserved_straggler_workers
-            .contains(&sink.worker)
+            .contains(&port.worker)
     );
     assert!(
         actual.rounds[0]
@@ -1985,16 +2664,63 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
             .lp_timings
             .iter()
             .filter(|timing| timing.class == WorkClass::Bulk)
-            .all(|timing| timing.worker != sink.worker
-                && timing.started_after_ns >= sink.started_after_ns)
+            .all(|timing| timing.worker != port.worker
+                && timing.started_after_ns >= port.started_after_ns)
     );
+}
+
+fn port_fault_image() -> SimulationImage {
+    let mut image = incast_image(2);
+    image
+        .initial_events
+        .retain(|event| event.kind == EventKind::RemoteArrival);
+    for state in &mut image.host_states[..2] {
+        state.in_service = None;
+        state.departed_packets = 1;
+    }
+    image
+}
+
+fn assert_clean_port_execution(
+    image: &SimulationImage,
+    expected: &days_executor::RunResult,
+    granularity: ChunkGranularity,
+    hot_port: NodeId,
+) {
+    let clean = run_cpu_with_observations(
+        image,
+        None,
+        CpuConfig {
+            workers: 2,
+            granularity,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("a clean rerun after injected failures must succeed");
+    assert_eq!(
+        clean.result, *expected,
+        "clean rerun granularity={granularity:?}"
+    );
+    let port_timing = clean.rounds[0]
+        .lp_timings
+        .iter()
+        .find(|timing| timing.node == hot_port)
+        .expect("the active port LP must have a timing record");
+    assert_eq!(port_timing.worker, 0, "granularity={granularity:?}");
 }
 
 #[test]
 fn cpu_worker_faults_and_capacity_errors_abort_without_a_partial_result() {
-    let image = image(100, 0, 10);
+    let image = port_fault_image();
+    let hot_port = NodeId(2);
+    assert_eq!(image.nodes[hot_port.0 as usize].kind, NodeKind::Switch);
+    assert_eq!(image.switch_states[0].queues.len(), 1);
+    validate(&image, Backend::Scalar).unwrap();
+    validate(&image, Backend::Cpu { workers: 2 }).unwrap();
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
     for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
+        assert_clean_port_execution(&image, &expected, granularity, hot_port);
         let error = run_cpu_with_observations(
             &image,
             None,
@@ -2036,34 +2762,21 @@ fn cpu_worker_faults_and_capacity_errors_abort_without_a_partial_result() {
         assert_eq!(
             capacity_error,
             ExecutionError::OutboxCapacityExceeded {
-                node: SOURCE,
+                node: hot_port,
                 capacity: 0,
             },
             "granularity={granularity:?}"
-        );
-
-        let clean = run_cpu_with_observations(
-            &image,
-            None,
-            CpuConfig {
-                workers: 2,
-                granularity,
-                ..CpuConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .expect("a clean rerun after injected failures must succeed");
-        assert_eq!(
-            clean.result, expected,
-            "clean rerun granularity={granularity:?}"
         );
     }
 }
 
 #[test]
 fn cpu_panic_root_cause_beats_a_forced_earlier_disconnect() {
-    let image = image(100, 0, 10);
+    let image = port_fault_image();
+    let hot_port = NodeId(2);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
     for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
+        assert_clean_port_execution(&image, &expected, granularity, hot_port);
         let error = run_cpu_with_observations(
             &image,
             None,
@@ -2093,12 +2806,13 @@ fn cpu_panic_root_cause_beats_a_forced_earlier_disconnect() {
 
 #[test]
 fn cpu_arithmetic_overflow_aborts_with_the_scalar_error() {
-    let mut image = image(100, 0, 10);
-    image.host_states[0].next_origin_seq = u64::MAX;
+    let mut image = port_fault_image();
+    let hot_port = NodeId(2);
+    image.switch_states[0].next_origin_seq = u64::MAX;
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect_err("the scalar oracle must reject exhausted origin sequences");
 
-    assert_eq!(scalar, ExecutionError::OriginSequenceOverflow(SOURCE));
+    assert_eq!(scalar, ExecutionError::OriginSequenceOverflow(hot_port));
     for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
         let cpu = run_cpu_with_observations(
             &image,

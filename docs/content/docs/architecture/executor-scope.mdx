@@ -49,6 +49,19 @@ directions use `switch.port_rate` and `link.propagation_ns`. With the key on,
 legacy physical links also apply `link.propagation_ns`, matching exact lowering;
 the key-off physical path remains unchanged.
 
+Equal-time observation-vector order is version-specific. Days orders records by
+`(time, phase, origin_node, origin_seq)`, so splitting one switch LP into egress-port
+LPs re-keys `origin_node` and may permute records emitted by different ports. In the
+star regression, the pre-split arrival order at 4 ns is flow 0 then flow 1, while
+the port-LP order is flow 1 then flow 0. This is the same kind of version boundary
+as legacy's LIFO tie order differing from Days' canonical order.
+
+Cross-version comparisons therefore require exact per-timestamp record multisets,
+per-packet fields and times, dispositions, dropped-packet identities, per-flow
+sequences, summaries, and normalized terminal state. Within one version, the full
+observation vectors remain deterministic and byte-identical across backends,
+worker counts, granularities, and work classifications.
+
 ## Project non-goals
 
 The following capabilities are outside this project. They may be reasonable
