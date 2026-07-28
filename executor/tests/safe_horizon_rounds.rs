@@ -499,6 +499,78 @@ fn same_time_tx_ready_continuations_skip_round_queue_churn_without_changing_stat
 }
 
 #[test]
+fn cross_transport_round_semantics_match_for_remote_and_finish_merges() {
+    let image = image(100, 0, 10);
+    for exclusive_horizon_ns in [None, Some(10)] {
+        let expected = run_scalar_rounds_with_observations(
+            &image,
+            exclusive_horizon_ns,
+            ObservationMode::Full,
+        )
+        .unwrap();
+        let semantics = |round: &days_executor::RoundMetrics| {
+            (
+                round.frontier_ns,
+                round.exclusive_horizon_ns,
+                round.horizon_advance_ns,
+                round.events_processed,
+                round.active_lp_count,
+                round.lp_work.clone(),
+                round.parallel_efficiency,
+                round.messages_exchanged,
+                round.frontier_updates,
+                round.frontier_heap_pops,
+            )
+        };
+        let expected_semantics = expected.rounds.iter().map(&semantics).collect::<Vec<_>>();
+        assert_eq!(
+            expected
+                .rounds
+                .iter()
+                .map(|round| round.frontier_updates)
+                .collect::<Vec<_>>(),
+            if exclusive_horizon_ns.is_some() {
+                vec![2]
+            } else {
+                vec![2, 1]
+            }
+        );
+
+        for workers in [1, 2, 4] {
+            for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
+                let actual = run_cpu_with_observations(
+                    &image,
+                    exclusive_horizon_ns,
+                    CpuConfig {
+                        workers,
+                        granularity,
+                        ..CpuConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .unwrap();
+                let actual_semantics = actual
+                    .rounds
+                    .iter()
+                    .map(|round| semantics(&round.semantic))
+                    .collect::<Vec<_>>();
+
+                assert_eq!(
+                    actual.result, expected.result,
+                    "workers={workers}, granularity={granularity:?}, \
+                     exclusive_horizon_ns={exclusive_horizon_ns:?}"
+                );
+                assert_eq!(
+                    actual_semantics, expected_semantics,
+                    "workers={workers}, granularity={granularity:?}, \
+                     exclusive_horizon_ns={exclusive_horizon_ns:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
     let mut image = incast_image(8);
     image.initial_events.clear();
@@ -1272,6 +1344,109 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
 }
 
 #[test]
+fn multi_queue_same_time_event_declines_tx_ready_continuation() {
+    let mut image = heterogeneous_image(1);
+    image.flows.truncate(4);
+    image.initial_packets.truncate(4);
+    image.initial_events.clear();
+
+    let queue_a_in_service = image.initial_packets[0].id;
+    let queue_b_in_service = image.initial_packets[1].id;
+    let queue_a_waiting = image.initial_packets[2].id;
+    let queue_b_waiting = image.initial_packets[3].id;
+    image.switch_states[0].queues[0].queue = VecDeque::from([queue_a_waiting]);
+    image.switch_states[0].queues[0].in_service = Some(queue_a_in_service);
+    image.switch_states[0].queues[0].tx_ready_pending = false;
+    image.switch_states[0].queues[0].queue_capacity_packets = 1;
+    image.switch_states[0].queues[1].queue = VecDeque::from([queue_b_waiting]);
+    image.switch_states[0].queues[1].in_service = Some(queue_b_in_service);
+    image.switch_states[0].queues[1].tx_ready_pending = false;
+    image.switch_states[0].queues[1].queue_capacity_packets = 1;
+    image.switch_states[0].next_origin_seq = 2;
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: 10,
+                phase: event_phase(EventKind::TxComplete),
+                origin_node: NodeId(1),
+                origin_seq: 0,
+            },
+            target: NodeId(1),
+            kind: EventKind::TxComplete,
+            payload: queue_a_in_service,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 10,
+                phase: event_phase(EventKind::TxComplete),
+                origin_node: NodeId(1),
+                origin_seq: 1,
+            },
+            target: NodeId(1),
+            kind: EventKind::TxComplete,
+            payload: queue_b_in_service,
+        },
+    ];
+
+    validate(&image, Backend::Scalar).unwrap();
+    validate(&image, Backend::Cpu { workers: 4 }).unwrap();
+    let expected = run_scalar_with_observations(&image, Some(11), ObservationMode::Full).unwrap();
+    let scalar =
+        run_scalar_rounds_with_observations(&image, Some(11), ObservationMode::Full).unwrap();
+    let cpu = [ChunkGranularity::Static, ChunkGranularity::Fixed(1)].map(|granularity| {
+        run_cpu_with_observations(
+            &image,
+            Some(11),
+            CpuConfig {
+                workers: 4,
+                granularity,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap()
+    });
+
+    assert_eq!(scalar.result, expected);
+    assert!(cpu.iter().all(|run| run.result == expected));
+    assert_eq!(
+        scalar
+            .rounds
+            .iter()
+            .flat_map(|round| &round.lp_work)
+            .map(|work| work.same_time_continuations)
+            .sum::<u64>(),
+        0
+    );
+    assert!(cpu.iter().all(|run| {
+        run.rounds
+            .iter()
+            .flat_map(|round| &round.semantic.lp_work)
+            .map(|work| work.same_time_continuations)
+            .sum::<u64>()
+            == 0
+    }));
+
+    let origin_sequence = |payload, kind| {
+        expected
+            .pending_events
+            .iter()
+            .find(|event| event.payload == payload && event.kind == kind)
+            .map(|event| event.key.origin_seq)
+            .expect("each waiting packet must have one pending transmission event")
+    };
+    assert_eq!(
+        (
+            origin_sequence(queue_a_waiting, EventKind::TxComplete),
+            origin_sequence(queue_a_waiting, EventKind::RemoteArrival),
+            origin_sequence(queue_b_waiting, EventKind::TxComplete),
+            origin_sequence(queue_b_waiting, EventKind::RemoteArrival),
+        ),
+        (4, 5, 6, 7)
+    );
+}
+
+#[test]
 fn randomized_small_heterogeneous_images_match_complete_global_state() {
     for seed in 0..128 {
         let image = heterogeneous_image(seed);
@@ -1543,89 +1718,102 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
 #[test]
 fn cpu_worker_faults_and_capacity_errors_abort_without_a_partial_result() {
     let image = image(100, 0, 10);
-    let error = run_cpu_with_observations(
-        &image,
-        None,
-        CpuConfig {
-            workers: 2,
-            granularity: ChunkGranularity::Fixed(1),
-            fault_injection: Some(CpuFaultInjection {
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
+        let error = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity,
+                fault_injection: Some(CpuFaultInjection {
+                    worker: 0,
+                    round: 0,
+                    after_events: 1,
+                    kind: CpuFaultKind::Failure,
+                }),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("an injected worker fault must abort the run");
+        assert_eq!(
+            error,
+            ExecutionError::WorkerFailed {
                 worker: 0,
                 round: 0,
-                after_events: 1,
-                kind: CpuFaultKind::Failure,
-            }),
-            ..CpuConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect_err("an injected worker fault must abort the run");
-    assert_eq!(
-        error,
-        ExecutionError::WorkerFailed {
-            worker: 0,
-            round: 0,
-        }
-    );
+            },
+            "granularity={granularity:?}"
+        );
 
-    let capacity_error = run_cpu_with_observations(
-        &image,
-        None,
-        CpuConfig {
-            workers: 2,
-            granularity: ChunkGranularity::Fixed(1),
-            max_outbox_events_per_lp: Some(0),
-            ..CpuConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect_err("an exhausted LP outbox must abort the run");
-    assert_eq!(
-        capacity_error,
-        ExecutionError::OutboxCapacityExceeded {
-            node: SOURCE,
-            capacity: 0,
-        }
-    );
+        let capacity_error = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity,
+                max_outbox_events_per_lp: Some(0),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("an exhausted LP outbox must abort the run");
+        assert_eq!(
+            capacity_error,
+            ExecutionError::OutboxCapacityExceeded {
+                node: SOURCE,
+                capacity: 0,
+            },
+            "granularity={granularity:?}"
+        );
 
-    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-    let clean = run_cpu_with_observations(
-        &image,
-        None,
-        CpuConfig {
-            workers: 2,
-            granularity: ChunkGranularity::Fixed(1),
-            ..CpuConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("a clean rerun after injected failures must succeed");
-    assert_eq!(clean.result, expected);
+        let clean = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("a clean rerun after injected failures must succeed");
+        assert_eq!(
+            clean.result, expected,
+            "clean rerun granularity={granularity:?}"
+        );
+    }
 }
 
 #[test]
 fn cpu_panic_root_cause_beats_a_forced_earlier_disconnect() {
     let image = image(100, 0, 10);
-    let error = run_cpu_with_observations(
-        &image,
-        None,
-        CpuConfig {
-            workers: 2,
-            granularity: ChunkGranularity::Fixed(1),
-            fault_injection: Some(CpuFaultInjection {
-                worker: 0,
-                round: 0,
-                after_events: 1,
-                kind: CpuFaultKind::Panic,
-            }),
-            ..CpuConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect_err("an injected worker panic must abort the run");
+    for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
+        let error = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity,
+                fault_injection: Some(CpuFaultInjection {
+                    worker: 0,
+                    round: 0,
+                    after_events: 1,
+                    kind: CpuFaultKind::Panic,
+                }),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("an injected worker panic must abort the run");
 
-    // The injected-panic wrapper queues a disconnect report first to force the reviewed race.
-    assert_eq!(error, ExecutionError::WorkerPanicked { worker: 0 });
+        // The injected-panic wrapper queues a disconnect report first to force the reviewed race.
+        assert_eq!(
+            error,
+            ExecutionError::WorkerPanicked { worker: 0 },
+            "granularity={granularity:?}"
+        );
+    }
 }
 
 #[test]
@@ -1634,18 +1822,20 @@ fn cpu_arithmetic_overflow_aborts_with_the_scalar_error() {
     image.host_states[0].next_origin_seq = u64::MAX;
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect_err("the scalar oracle must reject exhausted origin sequences");
-    let cpu = run_cpu_with_observations(
-        &image,
-        None,
-        CpuConfig {
-            workers: 2,
-            granularity: ChunkGranularity::Fixed(1),
-            ..CpuConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect_err("the CPU executor must reject exhausted origin sequences");
 
     assert_eq!(scalar, ExecutionError::OriginSequenceOverflow(SOURCE));
-    assert_eq!(cpu, scalar);
+    for granularity in [ChunkGranularity::Fixed(1), ChunkGranularity::Static] {
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("the CPU executor must reject exhausted origin sequences");
+        assert_eq!(cpu, scalar, "granularity={granularity:?}");
+    }
 }

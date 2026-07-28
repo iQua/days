@@ -731,6 +731,9 @@ enum OwnedWorkerReply<'image> {
         executed: Vec<ExecutedLp>,
         work_estimates: Vec<LpWorkEstimate>,
         remote_by_owner: Vec<Vec<RemoteEnvelope>>,
+        inbound_frontier_updates: u64,
+        inbound_heap_pops: u64,
+        inbound_physical_lp_probes: u64,
         frontier_updates: u64,
         heap_pops: u64,
         physical_lp_probes: u64,
@@ -740,6 +743,9 @@ enum OwnedWorkerReply<'image> {
     Finished {
         worker: usize,
         lps: Vec<CpuLp<'image>>,
+        inbound_frontier_updates: u64,
+        inbound_heap_pops: u64,
+        inbound_physical_lp_probes: u64,
     },
     Failed {
         error: ExecutionError,
@@ -969,7 +975,7 @@ fn owned_worker_loop<'image>(
                 workers,
             } => {
                 let started = Instant::now();
-                let (mut frontier_updates, mut heap_pops, mut physical_lp_probes) =
+                let (inbound_frontier_updates, inbound_heap_pops, inbound_physical_lp_probes) =
                     match shard.merge_remote(inbox, remote_floor_ns, workers) {
                         Ok(metrics) => metrics,
                         Err(error) => {
@@ -977,6 +983,9 @@ fn owned_worker_loop<'image>(
                             return;
                         }
                     };
+                let mut frontier_updates = 0_u64;
+                let mut heap_pops = 0_u64;
+                let mut physical_lp_probes = 0_u64;
                 let (active, extract_pops, extract_probes) =
                     match shard.extract(exclusive_horizon_ns) {
                         Ok(active) => active,
@@ -1066,6 +1075,9 @@ fn owned_worker_loop<'image>(
                         executed,
                         work_estimates,
                         remote_by_owner,
+                        inbound_frontier_updates,
+                        inbound_heap_pops,
+                        inbound_physical_lp_probes,
                         frontier_updates,
                         heap_pops,
                         physical_lp_probes,
@@ -1083,10 +1095,14 @@ fn owned_worker_loop<'image>(
                 workers,
             } => {
                 let worker = shard.worker;
-                if let Err(error) = shard.merge_remote(inbox, remote_floor_ns, workers) {
-                    let _ = replies.send(OwnedWorkerReply::Failed { error });
-                    return;
-                }
+                let (inbound_frontier_updates, inbound_heap_pops, inbound_physical_lp_probes) =
+                    match shard.merge_remote(inbox, remote_floor_ns, workers) {
+                        Ok(metrics) => metrics,
+                        Err(error) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed { error });
+                            return;
+                        }
+                    };
                 let lps = match shard.into_lps() {
                     Ok(lps) => lps,
                     Err(error) => {
@@ -1094,7 +1110,13 @@ fn owned_worker_loop<'image>(
                         return;
                     }
                 };
-                let _ = replies.send(OwnedWorkerReply::Finished { worker, lps });
+                let _ = replies.send(OwnedWorkerReply::Finished {
+                    worker,
+                    lps,
+                    inbound_frontier_updates,
+                    inbound_heap_pops,
+                    inbound_physical_lp_probes,
+                });
                 return;
             }
         }
@@ -1403,7 +1425,7 @@ fn run_owned_static_coordinator<'image>(
 
     let mut inboxes = (0..config.workers).map(|_| Vec::new()).collect::<Vec<_>>();
     let mut previous_horizon = None;
-    let mut rounds = Vec::new();
+    let mut rounds = Vec::<CpuRoundMetrics>::new();
     let mut round_number = 0_u64;
     while let Some(frontier_ns) = minima.iter().copied().flatten().min() {
         if u128::from(frontier_ns) >= run_end {
@@ -1443,6 +1465,9 @@ fn run_owned_static_coordinator<'image>(
         let mut work_by_worker = (0..config.workers).map(|_| Vec::new()).collect::<Vec<_>>();
         let mut executed_lps = Vec::new();
         let mut remote_runs = Vec::new();
+        let mut inbound_frontier_updates = 0_u64;
+        let mut inbound_frontier_heap_pops = 0_u64;
+        let mut inbound_physical_lp_probes = 0_u64;
         let mut frontier_updates = 0_u64;
         let mut frontier_heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
@@ -1455,6 +1480,9 @@ fn run_owned_static_coordinator<'image>(
                     executed,
                     work_estimates,
                     remote_by_owner,
+                    inbound_frontier_updates: inbound_updates,
+                    inbound_heap_pops,
+                    inbound_physical_lp_probes: inbound_probes,
                     frontier_updates: updates,
                     heap_pops,
                     physical_lp_probes: probes,
@@ -1466,6 +1494,12 @@ fn run_owned_static_coordinator<'image>(
                     worker_busy_ns[worker] = busy_ns;
                     work_by_worker[worker] = work_estimates;
                     executed_lps.extend(executed);
+                    inbound_frontier_updates =
+                        inbound_frontier_updates.saturating_add(inbound_updates);
+                    inbound_frontier_heap_pops =
+                        inbound_frontier_heap_pops.saturating_add(inbound_heap_pops);
+                    inbound_physical_lp_probes =
+                        inbound_physical_lp_probes.saturating_add(inbound_probes);
                     frontier_updates = frontier_updates.saturating_add(updates);
                     frontier_heap_pops = frontier_heap_pops.saturating_add(heap_pops);
                     physical_lp_probes = physical_lp_probes.saturating_add(probes);
@@ -1482,6 +1516,22 @@ fn run_owned_static_coordinator<'image>(
             }
         }
         let worker_wait_ns = elapsed_ns(wait_started);
+        // Resident workers merge the preceding barrier's inbox on this wake. Keep the physical
+        // timing here, but attribute its deterministic frontier work to the producing round.
+        if let Some(previous) = rounds.last_mut() {
+            previous.semantic.frontier_updates = previous
+                .semantic
+                .frontier_updates
+                .saturating_add(inbound_frontier_updates);
+            previous.semantic.frontier_heap_pops = previous
+                .semantic
+                .frontier_heap_pops
+                .saturating_add(inbound_frontier_heap_pops);
+            previous.semantic.physical_lp_probes = previous
+                .semantic
+                .physical_lp_probes
+                .saturating_add(inbound_physical_lp_probes);
+        }
 
         let exchange_started = Instant::now();
         let mut inbox_minima: Vec<Option<u64>> = vec![None; config.workers];
@@ -1615,18 +1665,44 @@ fn run_owned_static_coordinator<'image>(
     }
     let mut lps = Vec::with_capacity(image.nodes.len());
     let mut finished = vec![false; config.workers];
+    let mut inbound_frontier_updates = 0_u64;
+    let mut inbound_frontier_heap_pops = 0_u64;
+    let mut inbound_physical_lp_probes = 0_u64;
     for _ in 0..config.workers {
         match receive_owned_reply(replies, 0)? {
             OwnedWorkerReply::Finished {
                 worker,
                 lps: worker_lps,
+                inbound_frontier_updates: inbound_updates,
+                inbound_heap_pops,
+                inbound_physical_lp_probes: inbound_probes,
             } if !finished[worker] => {
                 finished[worker] = true;
                 lps.extend(worker_lps);
+                inbound_frontier_updates = inbound_frontier_updates.saturating_add(inbound_updates);
+                inbound_frontier_heap_pops =
+                    inbound_frontier_heap_pops.saturating_add(inbound_heap_pops);
+                inbound_physical_lp_probes =
+                    inbound_physical_lp_probes.saturating_add(inbound_probes);
             }
             OwnedWorkerReply::Failed { error } => return Err(error),
             _ => return Err(ExecutionError::WorkerChannelDisconnected),
         }
+    }
+    // Messages at or beyond run_end are merged only for final-state assembly.
+    if let Some(last) = rounds.last_mut() {
+        last.semantic.frontier_updates = last
+            .semantic
+            .frontier_updates
+            .saturating_add(inbound_frontier_updates);
+        last.semantic.frontier_heap_pops = last
+            .semantic
+            .frontier_heap_pops
+            .saturating_add(inbound_frontier_heap_pops);
+        last.semantic.physical_lp_probes = last
+            .semantic
+            .physical_lp_probes
+            .saturating_add(inbound_physical_lp_probes);
     }
     Ok(CpuRun {
         result: assemble_result(image, lps)?,
