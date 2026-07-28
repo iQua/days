@@ -39,8 +39,10 @@ Before any legacy-versus-Days observation comparison, assert that every flow
 traverses the same ordered physical links and that both engines model the same
 endpoint stages. Only residuals measured after those structural preconditions
 hold may be assessed as legacy `f64` behavior outside the exact common domain.
-Rate-limited endpoint attachment semantics remain a separate pending migration
-decision; route unification does not change them.
+The endpoint-attachment model is settled: the exact model retains attachment
+links, while legacy will gain an opt-in attachment stage. Only that legacy
+implementation remains pending; route unification does not change endpoint
+semantics.
 
 ## Project non-goals
 

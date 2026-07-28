@@ -4,7 +4,7 @@
 //! computing feasible paths for all the flows, and installing Flow Information
 //! Base tables to all the switches to route these flows accordingly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::sync::Arc;
 #[cfg(feature = "l2_pfc")]
@@ -57,6 +57,131 @@ type OutputStateMap = HashMap<usize, HashMap<usize, Arc<QueueState>>>;
 type OutputStates = Arc<RwLock<OutputStateMap>>;
 
 use crate::flows::app_source::AppDataSource;
+
+fn physical_flow_paths(graph: &UnGraph<usize, ()>, flows: &[Flow]) -> Vec<Vec<NodeIndex>> {
+    let shortest_paths = compute_shortest_path_route_table(
+        graph,
+        flows.iter().filter_map(|flow| {
+            matches!(flow.routing, Routing::ShortestPath(_)).then_some((
+                flow.id,
+                NodeIndex::new(flow.source_host),
+                NodeIndex::new(flow.sink_host),
+            ))
+        }),
+    )
+    .unwrap_or_else(|error| match error {
+        RouteTableError::Unreachable(_) => panic!("No path can be found."),
+        RouteTableError::DuplicateKey(_) => {
+            panic!("Duplicate flow ID in shortest-path route table.")
+        }
+    });
+
+    flows
+        .iter()
+        .map(|flow| match &flow.routing {
+            Routing::ShortestPath(_) => shortest_paths[&flow.id].clone(),
+            Routing::PathFromConfig(_) | Routing::ECMP(_) => {
+                let path = flow.compute_path(graph);
+                path[1..path.len() - 1].to_vec()
+            }
+        })
+        .collect()
+}
+
+fn install_forwarding_path(
+    switches: &mut HashMap<usize, PacketSwitch>,
+    flow_id: usize,
+    path: &[NodeIndex],
+    mut forward_installed: impl FnMut(usize, usize),
+) {
+    for window in path.windows(2) {
+        let node_id = window[0].index();
+        let next_id = window[1].index();
+
+        // FIBs do not include PacketSource.
+        if node_id != path[0].index() {
+            switches
+                .get_mut(&node_id)
+                .expect("legacy route must install only at topology switches")
+                .set_fib(flow_id, next_id);
+            forward_installed(node_id, next_id);
+        }
+
+        // Reverse FIBs do not include PacketSink.
+        if next_id != path[path.len() - 1].index() {
+            switches
+                .get_mut(&next_id)
+                .expect("legacy reverse route must install only at topology switches")
+                .set_r_fib(flow_id, node_id);
+        }
+    }
+}
+
+/// Readable copies of the per-switch forwarding tables installed by legacy Days.
+#[derive(Debug, Eq, PartialEq)]
+pub struct InstalledForwardingState {
+    /// Switch ID -> flow ID -> forward next-hop ID.
+    pub fibs: BTreeMap<usize, BTreeMap<usize, usize>>,
+    /// Switch ID -> flow ID -> reverse next-hop ID.
+    pub reverse_fibs: BTreeMap<usize, BTreeMap<usize, usize>>,
+}
+
+/// Installs routes with the legacy FIB writer and returns the resulting forwarding tables.
+///
+/// Endpoint IDs are diagnostic sentinels. Consumers comparing physical routes should walk from
+/// the source attachment switch to the sink attachment switch (and back through `reverse_fibs`).
+pub fn installed_forwarding_state(
+    graph: &UnGraph<usize, ()>,
+    flows: &[Flow],
+) -> InstalledForwardingState {
+    let mut switches = graph
+        .node_indices()
+        .map(|node| {
+            (
+                node.index(),
+                PacketSwitch::with_id(node.index(), HashMap::new(), HashMap::new()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let paths = physical_flow_paths(graph, flows);
+
+    for (flow, physical_path) in flows.iter().zip(paths) {
+        let mut path = Vec::with_capacity(physical_path.len() + 2);
+        path.push(NodeIndex::new(usize::MAX));
+        path.extend(physical_path);
+        path.push(NodeIndex::new(usize::MAX - 1));
+        install_forwarding_path(&mut switches, flow.id, &path, |_, _| {});
+    }
+
+    InstalledForwardingState {
+        fibs: switches
+            .iter()
+            .map(|(&node_id, switch)| {
+                (
+                    node_id,
+                    switch
+                        .fib
+                        .iter()
+                        .map(|(&flow_id, &next_id)| (flow_id, next_id))
+                        .collect(),
+                )
+            })
+            .collect(),
+        reverse_fibs: switches
+            .iter()
+            .map(|(&node_id, switch)| {
+                (
+                    node_id,
+                    switch
+                        .r_fib
+                        .iter()
+                        .map(|(&flow_id, &next_id)| (flow_id, next_id))
+                        .collect(),
+                )
+            })
+            .collect(),
+    }
+}
 
 fn switches_in_registration_order(
     switches: HashMap<usize, PacketSwitch>,
@@ -1347,55 +1472,22 @@ impl Topology {
         );
         let pg = multi.add(progress_bar);
         let mut flow_count = 0;
-        let shortest_paths = compute_shortest_path_route_table(
-            &self.graph,
-            self.flows.iter().filter_map(|flow| {
-                matches!(flow.routing, Routing::ShortestPath(_)).then_some((
-                    flow.id,
-                    NodeIndex::new(flow.source_host),
-                    NodeIndex::new(flow.sink_host),
-                ))
-            }),
-        )
-        .unwrap_or_else(|error| match error {
-            RouteTableError::Unreachable(_) => panic!("No path can be found."),
-            RouteTableError::DuplicateKey(_) => {
-                panic!("Duplicate flow ID in shortest-path route table.")
-            }
-        });
+        let paths = physical_flow_paths(&self.graph, &self.flows);
 
-        for flow in self.flows.iter() {
-            let path = match &flow.routing {
-                Routing::ShortestPath(_) => {
-                    let mut path = vec![NodeIndex::new(flow.source_id)];
-                    path.extend_from_slice(&shortest_paths[&flow.id]);
-                    path.push(NodeIndex::new(flow.sink_id));
-                    path
+        for (flow, physical_path) in self.flows.iter().zip(paths) {
+            let mut path = Vec::with_capacity(physical_path.len() + 2);
+            path.push(NodeIndex::new(flow.source_id));
+            path.extend(physical_path);
+            path.push(NodeIndex::new(flow.sink_id));
+            install_forwarding_path(&mut self.switches, flow.id, &path, |node_id, next_id| {
+                #[cfg(feature = "l2_pfc")]
+                if let Some(fib_view) = self.fib_views.get(&node_id) {
+                    let mut guard = fib_view.write().expect("FIB view lock poisoned");
+                    guard.insert(flow.id, next_id);
                 }
-                Routing::PathFromConfig(_) | Routing::ECMP(_) => flow.compute_path(&self.graph),
-            };
-
-            for window in path.windows(2) {
-                let node_id = window.first().unwrap().index();
-                let next_id = window.get(1).unwrap().index();
-
-                // FIBs do not include PacketSource
-                if node_id != path.first().unwrap().index() {
-                    let switch = self.switches.get_mut(&node_id).unwrap();
-                    switch.set_fib(flow.id, next_id);
-                    #[cfg(feature = "l2_pfc")]
-                    if let Some(fib_view) = self.fib_views.get(&node_id) {
-                        let mut guard = fib_view.write().expect("FIB view lock poisoned");
-                        guard.insert(flow.id, next_id);
-                    }
-                }
-
-                // reverse FIBs do not include PacketSink
-                if next_id != path.last().unwrap().index() {
-                    let switch = self.switches.get_mut(&next_id).unwrap();
-                    switch.set_r_fib(flow.id, node_id);
-                }
-            }
+                #[cfg(not(feature = "l2_pfc"))]
+                let _ = (node_id, next_id);
+            });
 
             // increment the progress bar
             flow_count += 1;

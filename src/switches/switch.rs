@@ -34,6 +34,14 @@ pub struct PacketSwitch {
 
 impl PacketSwitch {
     pub fn new(fib: HashMap<usize, usize>, r_fib: HashMap<usize, usize>) -> PacketSwitch {
+        Self::with_id(next_switch_id(), fib, r_fib)
+    }
+
+    pub(crate) fn with_id(
+        switch_id: usize,
+        fib: HashMap<usize, usize>,
+        r_fib: HashMap<usize, usize>,
+    ) -> PacketSwitch {
         // the senders from the demultiplexer to ports inside the switch
         let mut outputs = HashMap::new();
 
@@ -44,7 +52,7 @@ impl PacketSwitch {
         }
 
         PacketSwitch {
-            switch_id: next_switch_id(),
+            switch_id,
             fib,
             r_fib,
             packets_received: 0,

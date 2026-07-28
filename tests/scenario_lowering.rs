@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use days::flows::flow::Flow;
-use days::flows::route::compute_shortest_path_route_table;
 use days::scenario::compile_config;
 use days::topos::build::build_graph;
+use days::topos::topo::installed_forwarding_state;
 use days_executor::{
     ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId, NodeId,
     NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PayloadId,
@@ -52,17 +53,7 @@ fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
 fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     let (graph, hosts) = build_graph(config_path).expect("legacy topology should build");
     let legacy_flows = Flow::flows_from_config(config_path, &hosts);
-    let legacy_route_table = compute_shortest_path_route_table(
-        &graph,
-        legacy_flows.iter().enumerate().map(|(index, flow)| {
-            (
-                index,
-                NodeIndex::new(flow.source_host),
-                NodeIndex::new(flow.sink_host),
-            )
-        }),
-    )
-    .expect("legacy routes should have unique flow keys and reachable endpoints");
+    let forwarding = installed_forwarding_state(&graph, &legacy_flows);
     let nodes = image
         .nodes
         .iter()
@@ -87,17 +78,56 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
             .collect::<Vec<_>>()
     };
 
+    let walk_installed_route = |flow_id: usize,
+                                source: usize,
+                                target: usize,
+                                tables: &BTreeMap<usize, BTreeMap<usize, usize>>,
+                                direction: &str| {
+        let mut current = source;
+        let mut visited = BTreeSet::new();
+        let mut route = Vec::new();
+        while current != target {
+            assert!(
+                visited.insert(current),
+                "legacy {direction} FIB contains a cycle for flow {flow_id} at switch {current}"
+            );
+            let next = tables
+                .get(&current)
+                .and_then(|fib| fib.get(&flow_id))
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!("legacy {direction} FIB is missing flow {flow_id} at switch {current}")
+                });
+            assert!(
+                graph.contains_edge(NodeIndex::new(current), NodeIndex::new(next)),
+                "legacy {direction} FIB sends flow {flow_id} across non-link {current} -> {next}"
+            );
+            route.push((current, next));
+            assert!(
+                route.len() < graph.node_count(),
+                "legacy {direction} FIB does not reach switch {target} for flow {flow_id}"
+            );
+            current = next;
+        }
+        route
+    };
+
     let mut legacy_routes = BTreeMap::new();
-    for (index, flow) in legacy_flows.into_iter().enumerate() {
-        let forward = legacy_route_table[&index]
-            .windows(2)
-            .map(|pair| (pair[0].index(), pair[1].index()))
-            .collect::<Vec<_>>();
-        let reverse = forward
-            .iter()
-            .rev()
-            .map(|&(left, right)| (right, left))
-            .collect::<Vec<_>>();
+    for flow in legacy_flows {
+        let forward = walk_installed_route(
+            flow.id,
+            flow.source_host,
+            flow.sink_host,
+            &forwarding.fibs,
+            "forward",
+        );
+        let reverse = walk_installed_route(
+            flow.id,
+            flow.sink_host,
+            flow.source_host,
+            &forwarding.reverse_fibs,
+            "reverse",
+        );
         *legacy_routes
             .entry((flow.source_host, flow.sink_host, forward, reverse))
             .or_insert(0_usize) += 1;
@@ -129,6 +159,16 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
         image_routes, legacy_routes,
         "lowered flows must use the same endpoints and ordered physical links as legacy Days for {config_path}"
     );
+}
+
+fn compile_for_legacy_comparison(path: &Path) -> SimulationImage {
+    let image = compile_config(path).expect("legacy comparison fixture should lower");
+    assert_legacy_physical_routes(
+        path.to_str()
+            .expect("legacy comparison fixture path should be valid UTF-8"),
+        &image,
+    );
+    image
 }
 
 #[test]
@@ -721,13 +761,9 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/benchmarks/baseline/fattree_k4_f8_st.toml");
 
-    let first = compile_config(&path).expect("the smallest P01 fixture should lower");
+    let first = compile_for_legacy_comparison(&path);
     let second = compile_config(&path).expect("a second in-process lowering should also succeed");
 
-    assert_legacy_physical_routes(
-        path.to_str().expect("fixture path should be valid UTF-8"),
-        &first,
-    );
     for fixture in [
         "fattree_k8_f64_st.toml",
         "fattree_k16_f512_st.toml",
