@@ -15,7 +15,8 @@ use crate::scalar::{
     PacketArrivalObservation, PacketDeparture, RunResult, RunSummary, TransitionState,
 };
 use crate::{
-    Event, EventKey, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PayloadId, SimulationImage,
+    Event, EventKey, FlowGeneratorKind, NodeDescriptor, NodeId, NodeKind, PacketDescriptor,
+    PayloadId, SimulationImage,
 };
 
 const TIME_AFTER_U64_MAX: u128 = 1_u128 << 64;
@@ -30,6 +31,16 @@ pub enum ChunkGranularity {
     #[default]
     Static,
     Fixed(usize),
+}
+
+/// Deterministic pool-lifetime ownership used by the static CPU path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StaticPartitionPolicy {
+    /// Stable baseline assignment by semantic LP slot.
+    Modulo,
+    /// Image-only LPT assignment weighted by offered load along flow routes.
+    #[default]
+    RouteLoad,
 }
 
 /// Test-only worker-failure kind exposed so integration tests can verify all-or-nothing failure.
@@ -55,6 +66,7 @@ pub struct CpuFaultInjection {
 pub struct CpuConfig {
     pub workers: usize,
     pub granularity: ChunkGranularity,
+    pub static_partition: StaticPartitionPolicy,
     /// Empty channel polls before a per-round wait parks the thread. Zero parks immediately.
     ///
     /// This bounded spin is pool-lifecycle synchronization: it runs once at round/chunk
@@ -75,6 +87,7 @@ impl Default for CpuConfig {
         Self {
             workers: 1,
             granularity: ChunkGranularity::Static,
+            static_partition: StaticPartitionPolicy::RouteLoad,
             spin_before_park: 4_096,
             straggler_threshold_events: None,
             dedicated_straggler_workers: 1,
@@ -329,7 +342,8 @@ fn run_owned_static_cpu_with_observations(
     observation_mode: ObservationMode,
 ) -> Result<CpuRun, ExecutionError> {
     let lps = build_lps(image, observation_mode)?;
-    let shards = partition_initial_ownership(lps, config.workers)?;
+    let (shards, placement) =
+        partition_static_ownership(lps, image, config.workers, config.static_partition)?;
     let minimum_lookahead_ns = image
         .channels
         .iter()
@@ -363,6 +377,7 @@ fn run_owned_static_cpu_with_observations(
                 .take()
                 .expect("each static worker owns one ingress receiver");
             let worker_routes = routes.clone();
+            let worker_placement = &placement;
             scope.spawn(move |_| {
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     owned_worker_loop(
@@ -370,6 +385,7 @@ fn run_owned_static_cpu_with_observations(
                         command_rx,
                         worker_ingress,
                         &worker_routes,
+                        worker_placement,
                         &worker_reply,
                         config,
                     )
@@ -676,6 +692,21 @@ struct WorkerShard<'image> {
     worker: usize,
     lps: Vec<Option<CpuLp<'image>>>,
     frontier: OwnerFrontierIndex,
+}
+
+struct StaticPlacement {
+    workers: usize,
+    owner_workers: Vec<usize>,
+    owner_slots: Vec<usize>,
+}
+
+impl StaticPlacement {
+    fn locate(&self, lp_slot: usize) -> Option<(usize, usize)> {
+        Some((
+            *self.owner_workers.get(lp_slot)?,
+            *self.owner_slots.get(lp_slot)?,
+        ))
+    }
 }
 
 enum WorkerCommand<'image> {
@@ -991,6 +1022,7 @@ fn owned_worker_loop<'image>(
     commands: Receiver<OwnedWorkerCommand>,
     ingress: StaticOwnerIngress,
     routes: &[StaticOwnerRoute],
+    placement: &StaticPlacement,
     replies: &Sender<OwnedWorkerReply<'image>>,
     config: CpuConfig,
 ) {
@@ -1020,7 +1052,7 @@ fn owned_worker_loop<'image>(
             &ingress,
             &mut pending_batches,
             completed_round,
-            config.workers,
+            placement,
             config.spin_before_park,
         ) {
             Ok(next) => next,
@@ -1040,7 +1072,7 @@ fn owned_worker_loop<'image>(
                     config.max_outbox_events_per_lp,
                     config.fault_injection,
                     round,
-                    config.workers,
+                    placement,
                 );
                 let OwnedRoundDrain {
                     executed,
@@ -1169,7 +1201,7 @@ fn receive_owned_command_and_merge(
     ingress: &StaticOwnerIngress,
     pending_batches: &mut VecDeque<StaticOwnerBatch>,
     completed_round: Option<(u64, u128)>,
-    workers: usize,
+    placement: &StaticPlacement,
     spin_before_park: u32,
 ) -> Result<(OwnedWorkerCommand, InboundMergeMetrics), ExecutionError> {
     let Some((completed_round, remote_floor_ns)) = completed_round else {
@@ -1189,7 +1221,7 @@ fn receive_owned_command_and_merge(
             .pop_front()
             .expect("pending batch count was captured");
         if batch.round == completed_round {
-            merge_static_owner_batch(shard, batch, remote_floor_ns, workers, true, &mut metrics)?;
+            merge_static_owner_batch(shard, batch, remote_floor_ns, placement, true, &mut metrics)?;
         } else {
             pending_batches.push_back(batch);
         }
@@ -1202,7 +1234,7 @@ fn receive_owned_command_and_merge(
                     shard,
                     batch,
                     remote_floor_ns,
-                    workers,
+                    placement,
                     command.is_none(),
                     &mut metrics,
                 )?;
@@ -1261,7 +1293,7 @@ fn receive_owned_command_and_merge(
                     shard,
                     batch,
                     remote_floor_ns,
-                    workers,
+                    placement,
                     command.is_none(),
                     &mut metrics,
                 )?;
@@ -1292,13 +1324,13 @@ fn merge_static_owner_batch(
     shard: &mut WorkerShard<'_>,
     batch: StaticOwnerBatch,
     remote_floor_ns: u128,
-    workers: usize,
+    placement: &StaticPlacement,
     early: bool,
     metrics: &mut InboundMergeMetrics,
 ) -> Result<(), ExecutionError> {
     let started = Instant::now();
     let (frontier_updates, heap_pops, physical_lp_probes) =
-        shard.merge_remote(batch.envelopes, remote_floor_ns, workers)?;
+        shard.merge_static_remote(batch.envelopes, remote_floor_ns, placement)?;
     metrics.frontier_updates = metrics.frontier_updates.saturating_add(frontier_updates);
     metrics.heap_pops = metrics.heap_pops.saturating_add(heap_pops);
     metrics.physical_lp_probes = metrics
@@ -2488,6 +2520,127 @@ fn partition_initial_ownership<'image>(
         .collect()
 }
 
+fn partition_static_ownership<'image>(
+    lps: Vec<CpuLp<'image>>,
+    image: &SimulationImage,
+    workers: usize,
+    policy: StaticPartitionPolicy,
+) -> Result<(Vec<WorkerShard<'image>>, StaticPlacement), ExecutionError> {
+    let lp_count = lps.len();
+    let mut owned = (0..workers)
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<CpuLp<'image>>>>();
+    match policy {
+        StaticPartitionPolicy::Modulo => {
+            for lp in lps {
+                owned[lp.lp_slot % workers].push(lp);
+            }
+        }
+        StaticPartitionPolicy::RouteLoad => {
+            let offered_load = route_offered_load(image);
+            let mut ranked = lps
+                .into_iter()
+                .map(|lp| (offered_load.get(lp.lp_slot).copied().unwrap_or(0), lp))
+                .collect::<Vec<_>>();
+            ranked.sort_by(|(left_load, left_lp), (right_load, right_lp)| {
+                right_load
+                    .cmp(left_load)
+                    .then_with(|| left_lp.node.id.cmp(&right_lp.node.id))
+            });
+            let mut worker_load = vec![0_u128; workers];
+            for (load, lp) in ranked {
+                let worker = (0..workers)
+                    .min_by_key(|worker| (worker_load[*worker], owned[*worker].len(), *worker))
+                    .expect("CPU configuration requires at least one worker");
+                worker_load[worker] = worker_load[worker].saturating_add(load);
+                owned[worker].push(lp);
+            }
+        }
+    }
+
+    let mut owner_workers = vec![usize::MAX; lp_count];
+    let mut owner_slots = vec![usize::MAX; lp_count];
+    for (worker, worker_lps) in owned.iter().enumerate() {
+        for (owner_slot, lp) in worker_lps.iter().enumerate() {
+            let Some(owner_worker) = owner_workers.get_mut(lp.lp_slot) else {
+                return Err(ExecutionError::UnknownNode(lp.node.id));
+            };
+            let Some(local_slot) = owner_slots.get_mut(lp.lp_slot) else {
+                return Err(ExecutionError::UnknownNode(lp.node.id));
+            };
+            *owner_worker = worker;
+            *local_slot = owner_slot;
+        }
+    }
+    if owner_workers.contains(&usize::MAX) || owner_slots.contains(&usize::MAX) {
+        return Err(ExecutionError::UnknownNode(NodeId(0)));
+    }
+    let shards = owned
+        .into_iter()
+        .enumerate()
+        .map(|(worker, lps)| WorkerShard::new(worker, lps))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        shards,
+        StaticPlacement {
+            workers,
+            owner_workers,
+            owner_slots,
+        },
+    ))
+}
+
+/// Image-only packet-rate estimate. Topology structure never enters this calculation: a flow
+/// contributes its generator rate to every LP that owns an egress link on its declared route.
+fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
+    const RATE_SCALE: u128 = 1_u128 << 64;
+
+    let mut flow_rates = vec![0_u128; image.flows.len()];
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let FlowGeneratorKind::Constant(constant) = generator.kind;
+        let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
+            continue;
+        };
+        let Some(rate) = flow_rates.get_mut(flow_slot) else {
+            continue;
+        };
+        if image
+            .flows
+            .get(flow_slot)
+            .is_none_or(|flow| flow.id != generator.flow)
+            || constant.interval_ns == 0
+        {
+            continue;
+        }
+        *rate = rate.saturating_add(RATE_SCALE.div_ceil(u128::from(constant.interval_ns)));
+    }
+
+    let mut offered_load = vec![0_u128; image.nodes.len()];
+    for flow in &image.flows {
+        let Ok(flow_slot) = usize::try_from(flow.id.0) else {
+            continue;
+        };
+        let rate = flow_rates.get(flow_slot).copied().unwrap_or(0);
+        for link_id in &flow.route {
+            let Ok(link_slot) = usize::try_from(link_id.0) else {
+                continue;
+            };
+            let Some(link) = image
+                .links
+                .get(link_slot)
+                .filter(|link| link.id == *link_id)
+            else {
+                continue;
+            };
+            let Some(lp_slot) = node_slot(image, link.source) else {
+                continue;
+            };
+            offered_load[lp_slot] = offered_load[lp_slot].saturating_add(rate);
+        }
+    }
+    offered_load
+}
+
 fn finish_workers<'image>(
     image: &SimulationImage,
     commands: &[Sender<WorkerCommand<'image>>],
@@ -3051,8 +3204,10 @@ impl<'image> WorkerShard<'image> {
 use crate::{Backend, validate};
 #[cfg(test)]
 use crate::{
-    EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId, PacketKind,
-    RemoteChannel, SchedulerKind, SwitchQueueState, SwitchState, event_phase,
+    ConstantGenerator, EventKind, FlowDescriptor, FlowGeneratorState, FlowId,
+    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
+    LinkId, PacketKind, RemoteChannel, ScheduledEmission, SchedulerKind, SwitchQueueState,
+    SwitchState, event_phase,
 };
 
 #[cfg(test)]
@@ -3338,6 +3493,46 @@ fn one_lp_outbox_is_event_key_ordered_not_target_major() {
     // a whole-LP outbox is key-monotone, not target-major.
 }
 
+#[test]
+fn route_load_estimator_uses_only_declared_routes_and_generator_rates() {
+    let mut image = target_interleaved_outbox_image();
+    let intervals = [1_u64, 4, 1];
+    image.host_states[0].generators = intervals
+        .into_iter()
+        .enumerate()
+        .map(|(flow, interval_ns)| FlowGeneratorState {
+            flow: FlowId(flow as u64),
+            packets_emitted: 0,
+            bytes_emitted: 0,
+            next_emission: ScheduledEmission {
+                status: GeneratorStatus::Finished,
+                departure_time_ns: 0,
+                payload: PayloadId(0),
+            },
+            rng_state: 0,
+            feedback: GeneratorFeedbackState {
+                arrivals: 0,
+                outstanding_bytes: 0,
+                unacknowledged_bytes: 0,
+            },
+            kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                first_departure_ns: 0,
+                interval_ns,
+                packet_size_bytes: 1,
+                termination: GeneratorTermination::DurationNs(1),
+            }),
+        })
+        .collect();
+
+    let loads = route_offered_load(&image);
+    let scale = 1_u128 << 64;
+    assert_eq!(loads[NodeId(0).0 as usize], 2 * scale + scale / 4);
+    assert_eq!(loads[NodeId(1).0 as usize], scale / 4);
+    assert_eq!(loads[NodeId(2).0 as usize], 2 * scale);
+    assert_eq!(loads[NodeId(3).0 as usize], 0);
+    assert_eq!(loads[NodeId(4).0 as usize], 0);
+}
+
 impl<'image> WorkerShard<'image> {
     fn drain_owned_round(
         &mut self,
@@ -3345,11 +3540,13 @@ impl<'image> WorkerShard<'image> {
         outbox_capacity: Option<usize>,
         fault: Option<CpuFaultInjection>,
         round: u64,
-        workers: usize,
+        placement: &StaticPlacement,
     ) -> Result<OwnedRoundDrain, ExecutionError> {
         let round_started = Instant::now();
         let mut executed = Vec::new();
-        let mut remote_by_owner = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut remote_by_owner = (0..placement.workers)
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
         let mut frontier_updates = 0_u64;
         let mut heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
@@ -3378,7 +3575,10 @@ impl<'image> WorkerShard<'image> {
             for envelope in outbox {
                 let target_slot = usize::try_from(envelope.event.target.0)
                     .map_err(|_| ExecutionError::UnknownNode(envelope.event.target))?;
-                remote_by_owner[target_slot % workers].push(envelope);
+                let (owner_worker, _) = placement
+                    .locate(target_slot)
+                    .ok_or(ExecutionError::UnknownNode(envelope.event.target))?;
+                remote_by_owner[owner_worker].push(envelope);
             }
             let node = lp.node.id;
             let next = lp.next_key();
@@ -3431,11 +3631,22 @@ impl<'image> WorkerShard<'image> {
         })
     }
 
-    fn merge_remote(
+    fn merge_static_remote(
+        &mut self,
+        inbox: Vec<RemoteEnvelope>,
+        remote_floor_ns: u128,
+        placement: &StaticPlacement,
+    ) -> Result<(u64, u64, u64), ExecutionError> {
+        self.merge_remote_with(inbox, remote_floor_ns, |global_slot| {
+            placement.locate(global_slot)
+        })
+    }
+
+    fn merge_remote_with(
         &mut self,
         mut inbox: Vec<RemoteEnvelope>,
         remote_floor_ns: u128,
-        workers: usize,
+        locate: impl Fn(usize) -> Option<(usize, usize)>,
     ) -> Result<(u64, u64, u64), ExecutionError> {
         let mut frontier_updates = 0_u64;
         let heap_pops = 0_u64;
@@ -3446,10 +3657,12 @@ impl<'image> WorkerShard<'image> {
             let target = inbox[offset].event.target;
             let global_slot =
                 usize::try_from(target.0).map_err(|_| ExecutionError::UnknownNode(target))?;
-            if global_slot % workers != self.worker {
+            let Some((owner_worker, owner_slot)) = locate(global_slot) else {
+                return Err(ExecutionError::UnknownNode(target));
+            };
+            if owner_worker != self.worker {
                 return Err(ExecutionError::UnknownNode(target));
             }
-            let owner_slot = global_slot / workers;
             physical_lp_probes = physical_lp_probes.saturating_add(1);
             let lp = self
                 .lps

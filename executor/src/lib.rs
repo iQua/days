@@ -14,8 +14,8 @@ pub mod validate;
 
 pub use cpu::{
     ChunkGranularity, CpuConfig, CpuFaultInjection, CpuFaultKind, CpuRoundMetrics, CpuRun,
-    LpExecutionTiming, LpWorkEstimate, WorkClass, WorkPartition, WorkerRoundTiming, run_cpu,
-    run_cpu_with_observations,
+    LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass, WorkPartition,
+    WorkerRoundTiming, run_cpu, run_cpu_with_observations,
 };
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{

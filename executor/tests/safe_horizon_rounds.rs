@@ -6,7 +6,7 @@ use days_executor::{
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
     PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, WorkClass, event_phase,
+    SimulationImage, StaticPartitionPolicy, SwitchQueueState, SwitchState, WorkClass, event_phase,
     run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
     validate,
 };
@@ -2396,6 +2396,30 @@ fn cpu_worker_count_granularity_and_straggler_classification_preserve_complete_s
         let image = heterogeneous_image(seed);
         let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
             .unwrap_or_else(|error| panic!("seed {seed} scalar execution failed: {error}"));
+
+        for static_partition in [
+            StaticPartitionPolicy::Modulo,
+            StaticPartitionPolicy::RouteLoad,
+        ] {
+            let actual = run_cpu_with_observations(
+                &image,
+                None,
+                CpuConfig {
+                    workers: 4,
+                    granularity: ChunkGranularity::Static,
+                    static_partition,
+                    ..CpuConfig::default()
+                },
+                ObservationMode::Full,
+            )
+            .unwrap_or_else(|error| {
+                panic!("seed {seed}, static partition {static_partition:?} failed: {error}")
+            });
+            assert_eq!(
+                actual.result, expected,
+                "seed {seed}, static partition {static_partition:?}"
+            );
+        }
 
         for workers in 1..=4 {
             for granularity in [

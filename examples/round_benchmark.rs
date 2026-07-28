@@ -2,7 +2,8 @@ use std::{env, error::Error, time::Instant};
 
 use days::scenario::compile_config;
 use days_executor::{
-    ChunkGranularity, CpuConfig, CpuRoundMetrics, RoundMetrics, run_cpu, run_scalar_rounds,
+    ChunkGranularity, CpuConfig, CpuRoundMetrics, RoundMetrics, StaticPartitionPolicy, run_cpu,
+    run_scalar_rounds,
 };
 
 #[derive(Clone, Copy)]
@@ -27,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "scalar",
                     1,
                     "scalar",
+                    "none",
                     None,
                     None,
                     wall_ns,
@@ -42,12 +44,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ChunkGranularity::Static => "static".to_owned(),
                     ChunkGranularity::Fixed(size) => size.to_string(),
                 };
+                let static_partition = match config.static_partition {
+                    StaticPartitionPolicy::Modulo => "modulo",
+                    StaticPartitionPolicy::RouteLoad => "route-load",
+                };
                 print_result(
                     &path,
                     repetition,
                     "cpu",
                     config.workers,
                     &chunk,
+                    static_partition,
                     config.straggler_threshold_events,
                     Some(config.spin_before_park),
                     wall_ns,
@@ -66,10 +73,11 @@ fn parse_args() -> Result<(String, Mode, usize), Box<dyn Error>> {
     let path = args.next().ok_or(
         "usage: round_benchmark CONFIG [--workers N] [--chunk static|N] \
          [--straggler-threshold none|N] [--dedicated N] [--spin-before-park N] \
-         [--repetitions N]",
+         [--static-partition modulo|route-load] [--repetitions N]",
     )?;
     let mut workers = None;
     let mut granularity = ChunkGranularity::Static;
+    let mut static_partition = CpuConfig::default().static_partition;
     let mut straggler_threshold_events = None;
     let mut dedicated_straggler_workers = 1;
     let mut spin_before_park = CpuConfig::default().spin_before_park;
@@ -88,6 +96,12 @@ fn parse_args() -> Result<(String, Mode, usize), Box<dyn Error>> {
             "--straggler-threshold" => straggler_threshold_events = Some(value.parse()?),
             "--dedicated" => dedicated_straggler_workers = value.parse()?,
             "--spin-before-park" => spin_before_park = value.parse()?,
+            "--static-partition" if value == "modulo" => {
+                static_partition = StaticPartitionPolicy::Modulo;
+            }
+            "--static-partition" if value == "route-load" => {
+                static_partition = StaticPartitionPolicy::RouteLoad;
+            }
             "--repetitions" => repetitions = value.parse()?,
             _ => return Err(format!("unknown option {flag}").into()),
         }
@@ -96,6 +110,7 @@ fn parse_args() -> Result<(String, Mode, usize), Box<dyn Error>> {
         Mode::Cpu(CpuConfig {
             workers,
             granularity,
+            static_partition,
             straggler_threshold_events,
             dedicated_straggler_workers,
             spin_before_park,
@@ -112,6 +127,7 @@ fn print_result<'round>(
     mode: &str,
     workers: usize,
     chunk: &str,
+    static_partition: &str,
     straggler_threshold: Option<u64>,
     spin_before_park: Option<u32>,
     wall_ns: u128,
@@ -298,7 +314,8 @@ fn print_result<'round>(
 
     println!(
         "config={path} repetition={repetition} mode={mode} workers={workers} chunk={chunk} \
-         straggler_threshold={} rounds={round_count} events={total_events} \
+         static_partition={static_partition} straggler_threshold={} \
+         rounds={round_count} events={total_events} \
          mean_events_per_round={:.3} max_events_per_round={maximum_events} \
          mean_active_lps={:.3} max_active_lps={maximum_active_lps} \
          max_lp_events={maximum_lp_events} \
