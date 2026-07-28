@@ -20,6 +20,7 @@ use crate::{
 
 const TIME_AFTER_U64_MAX: u128 = 1_u128 << 64;
 const REMOTE_ORDER_BYTES: usize = 34;
+const WALL_CLOCK_SAMPLE_ROUNDS: u64 = 64;
 
 /// LP count per dispatch request.
 ///
@@ -167,6 +168,7 @@ pub struct CpuRoundMetrics {
     pub owner_merge_ns: u64,
     /// Subset of owner merge time overlapped with the straggler tail before publication.
     pub early_owner_merge_ns: u64,
+    /// Per-LP wall clocks: every round in full observation mode, every 64th static summary round.
     pub lp_timings: Vec<LpExecutionTiming>,
     pub worker_timings: Vec<WorkerRoundTiming>,
     pub lp_time_parallel_efficiency: f64,
@@ -403,6 +405,7 @@ fn run_owned_static_cpu_with_observations(
                         worker_placement,
                         &worker_reply,
                         config,
+                        observation_mode,
                     )
                 }));
                 if outcome.is_err() {
@@ -704,6 +707,7 @@ struct ExecutedLp {
     estimated_events: u64,
     messages_exchanged: u64,
     timing: LpExecutionTiming,
+    timing_sampled: bool,
 }
 
 struct ReturnedLp<'image> {
@@ -1180,6 +1184,7 @@ fn worker_loop<'image>(
                         estimated_events: active.estimated_events,
                         messages_exchanged,
                         timing,
+                        timing_sampled: true,
                     });
                 }
                 replies.send(WorkerReply::ChunkComplete {
@@ -1475,6 +1480,7 @@ fn classified_worker_loop<'image>(
                             started_after_ns,
                             busy_ns: elapsed_ns(lp_started),
                         },
+                        timing_sampled: true,
                     });
                 }
                 for owner in 0..config.workers {
@@ -1616,6 +1622,7 @@ fn receive_classified_or_abort<T>(
     Err(ExecutionError::WorkerChannelDisconnected)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn owned_worker_loop<'image>(
     mut shard: WorkerShard<'image>,
     commands: Receiver<OwnedWorkerCommand>,
@@ -1624,6 +1631,7 @@ fn owned_worker_loop<'image>(
     placement: &StaticPlacement,
     replies: &Sender<OwnedWorkerReply<'image>>,
     config: CpuConfig,
+    observation_mode: ObservationMode,
 ) {
     let mut setup_heap_pops = 0;
     let mut setup_physical_lp_probes = 0;
@@ -1666,6 +1674,8 @@ fn owned_worker_loop<'image>(
                 expected_inbound_batches: _,
             } => {
                 let started = Instant::now();
+                let measure_lp_wall = observation_mode == ObservationMode::Full
+                    || round.is_multiple_of(WALL_CLOCK_SAMPLE_ROUNDS);
                 let drain = shard.drain_owned_round(
                     exclusive_horizon_ns,
                     config.max_outbox_events_per_lp,
@@ -1673,6 +1683,7 @@ fn owned_worker_loop<'image>(
                     round,
                     placement,
                     config.straggler_threshold_events,
+                    measure_lp_wall,
                 );
                 let OwnedRoundDrain {
                     executed,
@@ -2087,7 +2098,9 @@ fn run_coordinator<'image>(
                 .checked_add(executed.messages_exchanged)
                 .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
             lp_work.push(executed.work);
-            lp_timings.push(executed.timing);
+            if executed.timing_sampled {
+                lp_timings.push(executed.timing);
+            }
         }
 
         let mut owner_batch_messages = 0_u64;
@@ -2442,7 +2455,9 @@ fn run_owned_static_coordinator<'image>(
                 .checked_add(executed.messages_exchanged)
                 .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
             lp_work.push(executed.work);
-            lp_timings.push(executed.timing);
+            if executed.timing_sampled {
+                lp_timings.push(executed.timing);
+            }
         }
         radix_sort_by_node(&mut lp_work, |work| work.node);
         radix_sort_by_node(&mut lp_timings, |timing| timing.node);
@@ -4250,6 +4265,7 @@ fn indexed_frontier_updates_remove_and_reinsert_without_stale_entries() {
 }
 
 impl<'image> WorkerShard<'image> {
+    #[allow(clippy::too_many_arguments)]
     fn drain_owned_round(
         &mut self,
         exclusive_horizon_ns: u128,
@@ -4258,8 +4274,9 @@ impl<'image> WorkerShard<'image> {
         round: u64,
         placement: &StaticPlacement,
         straggler_threshold_events: Option<u64>,
+        measure_lp_wall: bool,
     ) -> Result<OwnedRoundDrain, ExecutionError> {
-        let round_started = Instant::now();
+        let round_started = measure_lp_wall.then(Instant::now);
         let mut executed = Vec::new();
         let mut remote_by_owner = (0..placement.workers)
             .map(|_| Vec::new())
@@ -4274,8 +4291,13 @@ impl<'image> WorkerShard<'image> {
             &mut heap_pops,
             &mut physical_lp_probes,
         ) {
-            let lp_started = Instant::now();
-            let started_after_ns = duration_ns(lp_started.saturating_duration_since(round_started));
+            let lp_started = measure_lp_wall.then(Instant::now);
+            let started_after_ns = match (lp_started, round_started) {
+                (Some(lp_started), Some(round_started)) => {
+                    duration_ns(lp_started.saturating_duration_since(round_started))
+                }
+                _ => 0,
+            };
             physical_lp_probes = physical_lp_probes.saturating_add(1);
             let lp = self.lps[entry.owner_slot]
                 .as_mut()
@@ -4316,7 +4338,7 @@ impl<'image> WorkerShard<'image> {
                 },
                 dispatch_order,
                 started_after_ns,
-                busy_ns: elapsed_ns(lp_started),
+                busy_ns: lp_started.map_or(0, elapsed_ns),
             };
             dispatch_order = dispatch_order
                 .checked_add(1)
@@ -4326,6 +4348,7 @@ impl<'image> WorkerShard<'image> {
                 estimated_events,
                 messages_exchanged,
                 timing,
+                timing_sampled: measure_lp_wall,
             });
             self.frontier
                 .update(entry.owner_slot, node, next, &mut physical_lp_probes)?;

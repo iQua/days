@@ -660,6 +660,36 @@ fn static_cpu_pool_publishes_one_horizon_and_delivers_owner_batches_directly() {
 }
 
 #[test]
+fn summary_mode_samples_static_lp_wall_clock_buckets() {
+    let image = direct_packets(1, 100);
+    let config = CpuConfig {
+        workers: 4,
+        granularity: ChunkGranularity::Static,
+        ..CpuConfig::default()
+    };
+    let summary =
+        run_cpu_with_observations(&image, None, config, ObservationMode::Summary).unwrap();
+    let full = run_cpu_with_observations(&image, None, config, ObservationMode::Full).unwrap();
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Summary).unwrap();
+
+    assert_eq!(summary.result, expected);
+    assert_eq!(summary.result.summary, full.result.summary);
+    assert!(summary.rounds.len() > 64);
+    assert!(
+        summary
+            .rounds
+            .iter()
+            .enumerate()
+            .all(|(round, metrics)| { metrics.lp_timings.is_empty() == (round % 64 != 0) })
+    );
+    assert!(
+        full.rounds
+            .iter()
+            .all(|round| { round.lp_timings.len() == round.semantic.active_lp_count })
+    );
+}
+
+#[test]
 fn bounded_spin_configuration_preserves_static_and_dynamic_results() {
     let image = direct_packets(100, 8);
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();

@@ -268,12 +268,29 @@ fn print_result<'round>(
             .flat_map(|round| &round.worker_timings)
             .map(|worker| u128::from(worker.idle_ns))
             .sum::<u128>();
-        let lp_busy_ns = cpu_rounds
+        let timed_rounds = cpu_rounds
+            .iter()
+            .filter(|round| !round.lp_timings.is_empty())
+            .collect::<Vec<_>>();
+        let timed_active_lps = timed_rounds
+            .iter()
+            .map(|round| round.lp_timings.len() as u128)
+            .sum::<u128>();
+        let timed_physical_lp_probes = timed_rounds
+            .iter()
+            .map(|round| u128::from(round.semantic.physical_lp_probes))
+            .sum::<u128>();
+        let timed_worker_busy_ns = timed_rounds
+            .iter()
+            .flat_map(|round| &round.worker_timings)
+            .map(|worker| u128::from(worker.busy_ns))
+            .sum::<u128>();
+        let lp_busy_ns = timed_rounds
             .iter()
             .flat_map(|round| &round.lp_timings)
             .map(|lp| u128::from(lp.busy_ns))
             .sum::<u128>();
-        let worker_machinery_ns = worker_busy_ns.saturating_sub(lp_busy_ns);
+        let worker_machinery_ns = timed_worker_busy_ns.saturating_sub(lp_busy_ns);
         let coordinator_partition_ns = cpu_rounds
             .iter()
             .map(|round| u128::from(round.coordinator_partition_ns))
@@ -308,8 +325,10 @@ fn print_result<'round>(
              legacy_protocol_messages_estimate={legacy_protocol_messages_estimate} \
              pool_messages_actual={pool_messages} \
              mean_pool_messages_per_round={:.3} \
-             lp_busy_ns={lp_busy_ns} worker_machinery_ns={worker_machinery_ns} \
-             lp_busy_ns_per_active_lp={:.3} machinery_ns_per_physical_probe={:.3} \
+             timed_rounds={} lp_busy_ns={lp_busy_ns} \
+             worker_machinery_ns={worker_machinery_ns} \
+             lp_busy_ns_per_timed_active_lp={:.3} \
+             machinery_ns_per_timed_physical_probe={:.3} \
              wall_ns_per_physical_probe={:.3} \
              worker_busy_ns={worker_busy_ns} worker_idle_ns={worker_idle_ns} \
              coordinator_partition_ns={coordinator_partition_ns} \
@@ -318,8 +337,9 @@ fn print_result<'round>(
              mean_coordinator_exchange_ns={:.3}",
             spin_before_park.expect("CPU rows provide a spin bound"),
             pool_messages as f64 / round_divisor as f64,
-            lp_busy_ns as f64 / total_active_lps.max(1) as f64,
-            worker_machinery_ns as f64 / physical_lp_probes.max(1) as f64,
+            timed_rounds.len(),
+            lp_busy_ns as f64 / timed_active_lps.max(1) as f64,
+            worker_machinery_ns as f64 / timed_physical_lp_probes.max(1) as f64,
             wall_ns as f64 / physical_lp_probes.max(1) as f64,
             coordinator_partition_ns as f64 / round_divisor as f64,
             worker_wait_ns as f64 / round_divisor as f64,
