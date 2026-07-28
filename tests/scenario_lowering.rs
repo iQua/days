@@ -6,15 +6,48 @@ use std::path::PathBuf;
 use days::flows::flow::Flow;
 use days::scenario::compile_config;
 use days::topos::build::build_graph;
-use days::topos::topo::installed_forwarding_state;
+use days::topos::topo::{
+    InstalledHostStage, installed_forwarding_state, installed_host_attachment_state,
+};
 use days_executor::{
     ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId, NodeId,
-    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PayloadId,
+    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PayloadId, SchedulerKind,
     SimulationImage, run_cpu, run_scalar, run_scalar_rounds, run_scalar_with_observations,
     validate,
 };
 use petgraph::graph::NodeIndex;
 use tempfile::TempDir;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum QueueSemantics {
+    FifoTailDrop,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FlowStage {
+    HostInjection {
+        host: usize,
+        rate_bps: u64,
+        propagation_ns: u64,
+        capacity_packets: u64,
+        queue: QueueSemantics,
+    },
+    Physical {
+        source: usize,
+        target: usize,
+        rate_bps: u64,
+        propagation_ns: u64,
+        capacity_packets: u64,
+        queue: QueueSemantics,
+    },
+    HostDelivery {
+        host: usize,
+        rate_bps: u64,
+        propagation_ns: u64,
+        capacity_packets: u64,
+        queue: QueueSemantics,
+    },
+}
 
 fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
     let path = directory.path().join(name);
@@ -113,7 +146,7 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     };
 
     let mut legacy_routes = BTreeMap::new();
-    for flow in legacy_flows {
+    for flow in &legacy_flows {
         let forward = walk_installed_route(
             flow.id,
             flow.source_host,
@@ -158,6 +191,196 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     assert_eq!(
         image_routes, legacy_routes,
         "lowered flows must use the same endpoints and ordered physical links as legacy Days for {config_path}"
+    );
+
+    let Some(attachments) = installed_host_attachment_state(config_path, &hosts, &legacy_flows)
+    else {
+        return;
+    };
+    assert_eq!(
+        attachments.hosts.len(),
+        hosts.iter().copied().collect::<BTreeSet<_>>().len(),
+        "legacy must install exactly one shared full-duplex attachment per host"
+    );
+    if legacy_flows.len() > attachments.hosts.len() {
+        assert!(
+            attachments
+                .hosts
+                .values()
+                .any(|attachment| attachment.forward_injection_flows.len() > 1),
+            "multi-flow fixtures must exercise a shared host injection FIFO"
+        );
+    }
+    let checked_stage = |stage: InstalledHostStage| {
+        assert!(
+            stage.rate_bps.is_finite()
+                && stage.rate_bps > 0.0
+                && stage.rate_bps.fract() == 0.0
+                && stage.rate_bps <= u64::MAX as f64,
+            "exact comparison requires an integral positive legacy stage rate"
+        );
+        (
+            stage.rate_bps as u64,
+            stage.propagation_ns,
+            stage.capacity_packets as u64,
+        )
+    };
+    let (physical_rate, physical_propagation, physical_capacity) =
+        checked_stage(attachments.physical);
+    let legacy_stages = |physical: Vec<(usize, usize)>,
+                         source: usize,
+                         target: usize,
+                         injection: InstalledHostStage,
+                         delivery: InstalledHostStage| {
+        let (injection_rate, injection_propagation, injection_capacity) = checked_stage(injection);
+        let (delivery_rate, delivery_propagation, delivery_capacity) = checked_stage(delivery);
+        std::iter::once(FlowStage::HostInjection {
+            host: source,
+            rate_bps: injection_rate,
+            propagation_ns: injection_propagation,
+            capacity_packets: injection_capacity,
+            queue: QueueSemantics::FifoTailDrop,
+        })
+        .chain(
+            physical
+                .into_iter()
+                .map(|(source, target)| FlowStage::Physical {
+                    source,
+                    target,
+                    rate_bps: physical_rate,
+                    propagation_ns: physical_propagation,
+                    capacity_packets: physical_capacity,
+                    queue: QueueSemantics::FifoTailDrop,
+                }),
+        )
+        .chain(std::iter::once(FlowStage::HostDelivery {
+            host: target,
+            rate_bps: delivery_rate,
+            propagation_ns: delivery_propagation,
+            capacity_packets: delivery_capacity,
+            queue: QueueSemantics::FifoTailDrop,
+        }))
+        .collect::<Vec<_>>()
+    };
+    let mut legacy_complete_routes = BTreeMap::new();
+    for flow in &legacy_flows {
+        let forward_physical = walk_installed_route(
+            flow.id,
+            flow.source_host,
+            flow.sink_host,
+            &forwarding.fibs,
+            "forward",
+        );
+        let reverse_physical = walk_installed_route(
+            flow.id,
+            flow.sink_host,
+            flow.source_host,
+            &forwarding.reverse_fibs,
+            "reverse",
+        );
+        let source_attachment = &attachments.hosts[&flow.source_host];
+        let sink_attachment = &attachments.hosts[&flow.sink_host];
+        assert!(source_attachment.forward_injection_flows.contains(&flow.id));
+        assert!(source_attachment.reverse_delivery_flows.contains(&flow.id));
+        assert!(sink_attachment.reverse_injection_flows.contains(&flow.id));
+        assert!(sink_attachment.forward_delivery_flows.contains(&flow.id));
+        let forward = legacy_stages(
+            forward_physical,
+            flow.source_host,
+            flow.sink_host,
+            source_attachment.injection,
+            sink_attachment.delivery,
+        );
+        let reverse = legacy_stages(
+            reverse_physical,
+            flow.sink_host,
+            flow.source_host,
+            sink_attachment.injection,
+            source_attachment.delivery,
+        );
+        *legacy_complete_routes
+            .entry((flow.source_host, flow.sink_host, forward, reverse))
+            .or_insert(0_usize) += 1;
+    }
+
+    let image_stages = |route: &[LinkId]| {
+        route
+            .iter()
+            .map(|link_id| {
+                let link = links[link_id];
+                let source = nodes[&link.source];
+                let target = nodes[&link.target];
+                match (source.kind, target.kind) {
+                    (NodeKind::Host, NodeKind::Switch) => FlowStage::HostInjection {
+                        host: target.state_slot as usize,
+                        rate_bps: link.rate_bps,
+                        propagation_ns: link.propagation_ns,
+                        capacity_packets: 0,
+                        queue: QueueSemantics::FifoTailDrop,
+                    },
+                    (NodeKind::Switch, NodeKind::Switch) => {
+                        let queue = image.switch_states[source.state_slot as usize]
+                            .queues
+                            .iter()
+                            .find(|queue| queue.egress_link == Some(*link_id))
+                            .expect("physical link should own one switch egress queue");
+                        assert_eq!(
+                            queue.scheduler,
+                            SchedulerKind::Fifo,
+                            "exact physical stage should use FIFO"
+                        );
+                        FlowStage::Physical {
+                            source: source.state_slot as usize,
+                            target: target.state_slot as usize,
+                            rate_bps: link.rate_bps,
+                            propagation_ns: link.propagation_ns,
+                            capacity_packets: queue.queue_capacity_packets,
+                            queue: QueueSemantics::FifoTailDrop,
+                        }
+                    }
+                    (NodeKind::Switch, NodeKind::Host) => {
+                        let queue = image.switch_states[source.state_slot as usize]
+                            .queues
+                            .iter()
+                            .find(|queue| queue.egress_link == Some(*link_id))
+                            .expect("host delivery link should own one switch egress queue");
+                        assert_eq!(
+                            queue.scheduler,
+                            SchedulerKind::Fifo,
+                            "exact host delivery should use FIFO"
+                        );
+                        FlowStage::HostDelivery {
+                            host: source.state_slot as usize,
+                            rate_bps: link.rate_bps,
+                            propagation_ns: link.propagation_ns,
+                            capacity_packets: queue.queue_capacity_packets,
+                            queue: QueueSemantics::FifoTailDrop,
+                        }
+                    }
+                    kinds => panic!("unsupported lowered route stage {kinds:?}"),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut image_complete_routes = BTreeMap::new();
+    for flow in &image.flows {
+        let forward = image_stages(&flow.route);
+        let reverse = image_stages(&flow.reverse_route);
+        let source = match forward.first() {
+            Some(FlowStage::HostInjection { host, .. }) => *host,
+            first => panic!("lowered forward route should start at a host injection: {first:?}"),
+        };
+        let target = match forward.last() {
+            Some(FlowStage::HostDelivery { host, .. }) => *host,
+            last => panic!("lowered forward route should end at a host delivery: {last:?}"),
+        };
+        *image_complete_routes
+            .entry((source, target, forward, reverse))
+            .or_insert(0_usize) += 1;
+    }
+    assert_eq!(
+        image_complete_routes, legacy_complete_routes,
+        "key-on legacy flows must use the same ordered endpoint and physical stages as the exact image for {config_path}"
     );
 }
 
@@ -873,6 +1096,30 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
             .any(|state| state.received_packets > 0),
         "baseline execution should deliver traffic before its configured duration"
     );
+}
+
+#[test]
+fn key_on_legacy_endpoint_stage_sequences_match_the_exact_image() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+
+    for fixture in [
+        "fattree_k4_f8_st.toml",
+        "fattree_k8_f64_st.toml",
+        "fattree_k16_f512_st.toml",
+        "fattree_k32_f4096_st.toml",
+    ] {
+        let baseline = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("configs/benchmarks/baseline")
+            .join(fixture);
+        let contents = fs::read_to_string(&baseline).expect("baseline fixture should be readable");
+        let enabled = write_config(
+            &directory,
+            fixture,
+            &format!("model_host_attachment = true\n{contents}"),
+        );
+        let image = compile_config(&enabled).expect("enabled fixture should lower");
+        assert_legacy_physical_routes(&enabled, &image);
+    }
 }
 
 #[test]

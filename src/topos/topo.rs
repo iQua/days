@@ -4,7 +4,7 @@
 //! computing feasible paths for all the flows, and installing Flow Information
 //! Base tables to all the switches to route these flows accordingly.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::sync::Arc;
 #[cfg(feature = "l2_pfc")]
@@ -24,7 +24,8 @@ use crate::flows::packet::Packet;
 use crate::flows::route::{RouteTableError, Routing, compute_shortest_path_route_table};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
-use crate::flows::{FlowSize, TrafficCharacteristics};
+use crate::flows::wire::Wire;
+use crate::flows::{DistributionInfo, FlowSize, TrafficCharacteristics};
 #[cfg(feature = "l2_pfc")]
 use crate::l2::link::Link;
 #[cfg(feature = "l2_pfc")]
@@ -261,6 +262,7 @@ pub struct PfcLinkConfig {
 pub struct LinkConfig {
     mode: Option<LinkMode>,
     pfc: Option<PfcLinkConfig>,
+    propagation_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +302,131 @@ pub struct Config {
     pub app_source: Option<AppSourceConfig>,
     pub link: Option<LinkConfig>,
     pub time_quantum_ns: Option<u64>,
+    #[serde(default)]
+    pub model_host_attachment: bool,
+}
+
+/// Legacy endpoint-stage parameters derived from the same config fields as exact lowering.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostAttachmentSpec {
+    pub rate_bps: f64,
+    pub propagation_ns: u64,
+    /// Host-owned source injection is an unbounded FIFO.
+    pub injection_capacity_packets: usize,
+    /// Switch-owned delivery uses the configured packet capacity.
+    pub delivery_capacity_packets: usize,
+}
+
+/// One rate-limited FIFO stage installed by the legacy topology builder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InstalledHostStage {
+    pub rate_bps: f64,
+    pub propagation_ns: u64,
+    /// Packet capacity waiting behind the packet in service; zero means unbounded.
+    pub capacity_packets: usize,
+}
+
+/// The shared full-duplex attachment installed for one host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstalledHostAttachment {
+    pub injection: InstalledHostStage,
+    pub delivery: InstalledHostStage,
+    pub forward_injection_flows: BTreeSet<usize>,
+    pub reverse_injection_flows: BTreeSet<usize>,
+    pub forward_delivery_flows: BTreeSet<usize>,
+    pub reverse_delivery_flows: BTreeSet<usize>,
+}
+
+/// Readable copy of the attachment plan consumed by the legacy topology builder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstalledHostAttachmentState {
+    /// The common physical switch-to-switch egress stage.
+    pub physical: InstalledHostStage,
+    /// Host switch ID -> one shared injection stage and one shared delivery stage.
+    pub hosts: BTreeMap<usize, InstalledHostAttachment>,
+}
+
+impl Config {
+    fn host_attachment_spec(&self) -> Option<HostAttachmentSpec> {
+        self.model_host_attachment.then_some(HostAttachmentSpec {
+            rate_bps: self.switch.port_rate,
+            propagation_ns: self
+                .link
+                .as_ref()
+                .and_then(|link| link.propagation_ns)
+                .unwrap_or(0),
+            injection_capacity_packets: 0,
+            delivery_capacity_packets: self.switch.capacity,
+        })
+    }
+}
+
+fn build_host_attachment_state(
+    spec: HostAttachmentSpec,
+    hosts: &[usize],
+    flows: &[Flow],
+) -> InstalledHostAttachmentState {
+    let injection = InstalledHostStage {
+        rate_bps: spec.rate_bps,
+        propagation_ns: spec.propagation_ns,
+        capacity_packets: spec.injection_capacity_packets,
+    };
+    let delivery = InstalledHostStage {
+        rate_bps: spec.rate_bps,
+        propagation_ns: spec.propagation_ns,
+        capacity_packets: spec.delivery_capacity_packets,
+    };
+    let mut installed_hosts = hosts
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|host_id| {
+            (
+                host_id,
+                InstalledHostAttachment {
+                    injection,
+                    delivery,
+                    forward_injection_flows: BTreeSet::new(),
+                    reverse_injection_flows: BTreeSet::new(),
+                    forward_delivery_flows: BTreeSet::new(),
+                    reverse_delivery_flows: BTreeSet::new(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for flow in flows {
+        let source = installed_hosts
+            .get_mut(&flow.source_host)
+            .expect("flow source must be an attached host");
+        source.forward_injection_flows.insert(flow.id);
+        source.reverse_delivery_flows.insert(flow.id);
+
+        let sink = installed_hosts
+            .get_mut(&flow.sink_host)
+            .expect("flow sink must be an attached host");
+        sink.reverse_injection_flows.insert(flow.id);
+        sink.forward_delivery_flows.insert(flow.id);
+    }
+
+    InstalledHostAttachmentState {
+        physical: delivery,
+        hosts: installed_hosts,
+    }
+}
+
+/// Returns the opt-in attachment plan consumed by legacy topology construction.
+pub fn installed_host_attachment_state(
+    config_path: &str,
+    hosts: &[usize],
+    flows: &[Flow],
+) -> Option<InstalledHostAttachmentState> {
+    let content = fs::read_to_string(config_path).expect("The configuration is not valid");
+    let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
+    config
+        .host_attachment_spec()
+        .map(|spec| build_host_attachment_state(spec, hosts, flows))
 }
 
 #[derive(Deserialize)]
@@ -323,6 +450,17 @@ struct SinkStatistics {
     sink_addresses: HashMap<usize, Address<PacketSink>>,
     /// sink id -> sink statistics
     sink_statistics: HashMap<usize, EventSlot<PacketStatistics>>,
+}
+
+struct PendingHostAttachment {
+    injection: Port,
+    injection_mbox: Mailbox<Port>,
+    delivery: Port,
+    delivery_mbox: Mailbox<Port>,
+    demux: PacketSwitch,
+    demux_mbox: Mailbox<PacketSwitch>,
+    injection_wire: Option<(Wire, Mailbox<Wire>)>,
+    delivery_wire: Option<(Wire, Mailbox<Wire>)>,
 }
 
 impl SinkStatistics {
@@ -375,6 +513,8 @@ pub struct Topology {
     duration: f64,
     /// app source runtime config
     app_source_cfg: AppBufferConfig,
+    /// Opt-in host-to-switch and switch-to-host attachment stages.
+    host_attachment: Option<HostAttachmentSpec>,
 }
 
 struct PreparedTcpAppSources {
@@ -523,6 +663,7 @@ impl Topology {
 
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
+        let host_attachment = config.host_attachment_spec();
 
         let mailbox_config: MailboxConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of mailbox capacity");
@@ -660,6 +801,7 @@ impl Topology {
             config_path: config_path.to_string(),
             duration,
             app_source_cfg,
+            host_attachment,
         }
     }
 
@@ -705,7 +847,26 @@ impl Topology {
         match self.link_mode() {
             LinkMode::None => {
                 let downstream_mbox = self.switch_mailboxes.get(&downstream_id).unwrap();
-                scheduler_output.connect(PacketSwitch::packet_received, downstream_mbox);
+                let propagation_ns = self
+                    .host_attachment
+                    .map(|attachment| attachment.propagation_ns)
+                    .unwrap_or(0);
+                if propagation_ns == 0 {
+                    scheduler_output.connect(PacketSwitch::packet_received, downstream_mbox);
+                } else {
+                    let propagation_seconds = propagation_ns as f64 / 1_000_000_000.0;
+                    let delay = DistributionInfo::Uniform {
+                        low: propagation_seconds,
+                        high: propagation_seconds,
+                    };
+                    let mut wire = Wire::new(crate::next_link_id(), delay);
+                    let wire_mbox = Mailbox::with_capacity(self.mailbox_capacity);
+                    scheduler_output.connect(Wire::packet_received, &wire_mbox);
+                    wire.output
+                        .connect(PacketSwitch::packet_received, downstream_mbox);
+                    let sim_init = std::mem::replace(&mut self.sim_init, SimInit::new());
+                    self.sim_init = sim_init.add_model(wire, wire_mbox, "Wire");
+                }
             }
             LinkMode::Pfc => {
                 #[cfg(feature = "l2_pfc")]
@@ -1280,6 +1441,113 @@ impl Topology {
         self
     }
 
+    fn prepare_host_attachments(
+        &self,
+    ) -> (
+        Option<InstalledHostAttachmentState>,
+        BTreeMap<usize, PendingHostAttachment>,
+    ) {
+        let Some(spec) = self.host_attachment else {
+            return (None, BTreeMap::new());
+        };
+        assert!(
+            spec.rate_bps.is_finite() && spec.rate_bps > 0.0,
+            "model_host_attachment requires a finite positive switch.port_rate"
+        );
+
+        let installed = build_host_attachment_state(spec, &self.hosts, &self.flows);
+        let propagation_seconds = spec.propagation_ns as f64 / 1_000_000_000.0;
+        let pending = installed
+            .hosts
+            .iter()
+            .map(|(&host_id, plan)| {
+                let mut injection = Port::new(
+                    plan.injection.rate_bps,
+                    plan.injection.capacity_packets,
+                    CapacityUnit::Packets,
+                    DropStrategy::TailDrop,
+                    DEFAULT_ECN_THRESHOLD,
+                );
+                let injection_mbox = Mailbox::with_capacity(self.mailbox_capacity);
+                let mut delivery = Port::new(
+                    plan.delivery.rate_bps,
+                    plan.delivery.capacity_packets,
+                    CapacityUnit::Packets,
+                    DropStrategy::TailDrop,
+                    DEFAULT_ECN_THRESHOLD,
+                );
+                let delivery_mbox = Mailbox::with_capacity(self.mailbox_capacity);
+
+                // This switch is only the flow-aware demultiplexer after the shared delivery
+                // FIFO. Its diagnostic ID is outside the topology/endpoint identity range and
+                // never participates in route selection.
+                let demux_id = usize::MAX - host_id;
+                let demux = PacketSwitch::with_id(demux_id, HashMap::new(), HashMap::new());
+                let demux_mbox = Mailbox::with_capacity(self.mailbox_capacity);
+
+                let (injection_wire, delivery_wire) = if spec.propagation_ns == 0 {
+                    let edge_mbox = self
+                        .switch_mailboxes
+                        .get(&host_id)
+                        .expect("host attachment switch mailbox should exist");
+                    injection
+                        .output
+                        .connect(PacketSwitch::packet_received, edge_mbox);
+                    delivery
+                        .output
+                        .connect(PacketSwitch::packet_received, &demux_mbox);
+                    (None, None)
+                } else {
+                    let delay = DistributionInfo::Uniform {
+                        low: propagation_seconds,
+                        high: propagation_seconds,
+                    };
+                    let mut injection_wire = Wire::new(crate::next_link_id(), delay.clone());
+                    let injection_wire_mbox = Mailbox::with_capacity(self.mailbox_capacity);
+                    injection
+                        .output
+                        .connect(Wire::packet_received, &injection_wire_mbox);
+                    let edge_mbox = self
+                        .switch_mailboxes
+                        .get(&host_id)
+                        .expect("host attachment switch mailbox should exist");
+                    injection_wire
+                        .output
+                        .connect(PacketSwitch::packet_received, edge_mbox);
+
+                    let mut delivery_wire = Wire::new(crate::next_link_id(), delay);
+                    let delivery_wire_mbox = Mailbox::with_capacity(self.mailbox_capacity);
+                    delivery
+                        .output
+                        .connect(Wire::packet_received, &delivery_wire_mbox);
+                    delivery_wire
+                        .output
+                        .connect(PacketSwitch::packet_received, &demux_mbox);
+
+                    (
+                        Some((injection_wire, injection_wire_mbox)),
+                        Some((delivery_wire, delivery_wire_mbox)),
+                    )
+                };
+
+                (
+                    host_id,
+                    PendingHostAttachment {
+                        injection,
+                        injection_mbox,
+                        delivery,
+                        delivery_mbox,
+                        demux,
+                        demux_mbox,
+                        injection_wire,
+                        delivery_wire,
+                    },
+                )
+            })
+            .collect();
+        (Some(installed), pending)
+    }
+
     /// Attaches packet sources and sinks from the flows to hosts in the network
     /// graph.
     fn attach_flows(
@@ -1292,6 +1560,7 @@ impl Topology {
             "Attaching packet sources and sinks to their hosts in all {} flows.",
             self.flows.len()
         );
+        let (installed_attachments, mut host_attachments) = self.prepare_host_attachments();
 
         let mut successor_map: HashMap<usize, Vec<usize>> = HashMap::new();
         for flow in self.flows.iter() {
@@ -1337,6 +1606,14 @@ impl Topology {
             // packet sources and sinks must be attached to hosts
             assert!(self.hosts.contains(&flow.source_host));
             assert!(self.hosts.contains(&flow.sink_host));
+            if let Some(installed) = &installed_attachments {
+                let source = &installed.hosts[&flow.source_host];
+                let sink = &installed.hosts[&flow.sink_host];
+                assert!(source.forward_injection_flows.contains(&flow.id));
+                assert!(source.reverse_delivery_flows.contains(&flow.id));
+                assert!(sink.reverse_injection_flows.contains(&flow.id));
+                assert!(sink.forward_delivery_flows.contains(&flow.id));
+            }
 
             let handle = flow_id_to_source_handle
                 .as_ref()
@@ -1371,15 +1648,32 @@ impl Topology {
             // establishes a bi-directional connection between the packet source
             // and the host
             let source_mbox = &source_mboxes[&flow.id];
-            source
-                .output()
-                .connect(PacketSwitch::packet_received, host_mbox);
+            if let Some(attachment) = host_attachments.get_mut(&flow.source_host) {
+                source
+                    .output()
+                    .connect(Port::packet_received, &attachment.injection_mbox);
+            } else {
+                source
+                    .output()
+                    .connect(PacketSwitch::packet_received, host_mbox);
+            }
             source
                 .ui_output()
                 .connect(UserInterface::flow_finished, &ui_mbox);
 
             let mut output = Output::default();
-            output.connect(PacketSource::packet_received, source_mbox);
+            if let Some(attachment) = host_attachments.get_mut(&flow.source_host) {
+                output.connect(Port::packet_received, &attachment.delivery_mbox);
+                let mut endpoint_output = Output::default();
+                endpoint_output.connect(PacketSource::packet_received, source_mbox);
+                attachment.demux.set_r_fib(flow.id, source.id());
+                attachment
+                    .demux
+                    .outputs
+                    .insert(source.id(), endpoint_output);
+            } else {
+                output.connect(PacketSource::packet_received, source_mbox);
+            }
             source_host.outputs.insert(source.id(), output);
 
             // obtains the host switch and its mailbox for the packet sink
@@ -1399,11 +1693,24 @@ impl Topology {
             sink.statistics().connect_sink(sink_stats.writer());
             stats.sink_statistics.insert(sink.id(), sink_stats);
 
-            sink.output()
-                .connect(PacketSwitch::packet_received, host_mbox);
+            if let Some(attachment) = host_attachments.get_mut(&flow.sink_host) {
+                sink.output()
+                    .connect(Port::packet_received, &attachment.injection_mbox);
+            } else {
+                sink.output()
+                    .connect(PacketSwitch::packet_received, host_mbox);
+            }
 
             let mut output = Output::default();
-            output.connect(PacketSink::packet_received, &sink_mbox);
+            if let Some(attachment) = host_attachments.get_mut(&flow.sink_host) {
+                output.connect(Port::packet_received, &attachment.delivery_mbox);
+                let mut endpoint_output = Output::default();
+                endpoint_output.connect(PacketSink::packet_received, &sink_mbox);
+                attachment.demux.set_fib(flow.id, sink.id());
+                attachment.demux.outputs.insert(sink.id(), endpoint_output);
+            } else {
+                output.connect(PacketSink::packet_received, &sink_mbox);
+            }
             sink_host.outputs.insert(sink.id(), output);
 
             // establishes connections between the packet sink (or source for
@@ -1435,6 +1742,32 @@ impl Topology {
 
             // activates the packet sink
             self.sim_init = self.sim_init.add_model(sink, sink_mbox, "Sink");
+        }
+
+        for (_, attachment) in host_attachments {
+            self.sim_init = self
+                .sim_init
+                .add_model(
+                    attachment.injection,
+                    attachment.injection_mbox,
+                    "HostInjectionPort",
+                )
+                .add_model(
+                    attachment.delivery,
+                    attachment.delivery_mbox,
+                    "HostDeliveryPort",
+                );
+            if let Some((wire, mailbox)) = attachment.injection_wire {
+                self.sim_init = self.sim_init.add_model(wire, mailbox, "HostInjectionWire");
+            }
+            if let Some((wire, mailbox)) = attachment.delivery_wire {
+                self.sim_init = self.sim_init.add_model(wire, mailbox, "HostDeliveryWire");
+            }
+            self.sim_init = self.sim_init.add_model(
+                attachment.demux,
+                attachment.demux_mbox,
+                "HostAttachmentDemux",
+            );
         }
 
         // activates all packet sources in deterministic flow_id order
@@ -1673,6 +2006,24 @@ mod tests {
             assert_eq!(*id, switch.id());
         }
     }
+
+    #[test]
+    fn model_host_attachment_defaults_off_and_parses_true() {
+        let base = r#"
+[switch]
+port_rate = 8_000_000_000
+capacity = 4
+discipline = "FIFO"
+drop = "TailDrop"
+"#;
+        let historical: Config =
+            toml::from_str(base).expect("historical config should deserialize");
+        assert!(!historical.model_host_attachment);
+
+        let enabled: Config = toml::from_str(&format!("model_host_attachment = true\n{base}"))
+            .expect("host attachment config should deserialize");
+        assert!(enabled.model_host_attachment);
+    }
 }
 
 #[cfg(test)]
@@ -1755,6 +2106,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         // Produce flows for the collective (no scheduling, no routing).
@@ -1953,6 +2305,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         topo.process_collectives();
@@ -2058,6 +2411,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         topo.process_collectives();
@@ -2155,6 +2509,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         topo.process_collectives();
@@ -2221,6 +2576,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         topo.process_collectives();
@@ -2264,6 +2620,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         topo.process_collectives();
@@ -2318,6 +2675,7 @@ mod ring_allreduce_serialization_tests {
             config_path: String::new(),
             duration: 1.0,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
+            host_attachment: None,
         };
 
         topo.process_collectives();

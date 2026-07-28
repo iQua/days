@@ -40,9 +40,14 @@ traverses the same ordered physical links and that both engines model the same
 endpoint stages. Only residuals measured after those structural preconditions
 hold may be assessed as legacy `f64` behavior outside the exact common domain.
 The endpoint-attachment model is settled: the exact model retains attachment
-links, while legacy will gain an opt-in attachment stage. Only that legacy
-implementation remains pending; route unification does not change endpoint
-semantics.
+links, and legacy provides the same endpoint structure when the top-level
+`model_host_attachment = true` key is set. The key defaults to `false` so
+historical Nexosim behavior remains reproducible. In the opt-in model, every
+host shares one unbounded FIFO injection stage to its edge switch, while the
+reverse delivery stage is a FIFO/TailDrop queue with `switch.capacity`; both
+directions use `switch.port_rate` and `link.propagation_ns`. With the key on,
+legacy physical links also apply `link.propagation_ns`, matching exact lowering;
+the key-off physical path remains unchanged.
 
 ## Project non-goals
 
