@@ -1,7 +1,6 @@
 //! Persistent whole-LP CPU worker pool for exact safe-horizon rounds.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hint::spin_loop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
@@ -612,20 +611,25 @@ struct OwnerBatchMetadata {
 struct FrontierEntry {
     time_ns: u64,
     node: NodeId,
-    generation: u64,
     owner_slot: usize,
 }
 
+const NO_INDEX_SLOT: usize = usize::MAX;
+
 struct OwnerFrontierIndex {
-    heap: BinaryHeap<Reverse<FrontierEntry>>,
-    generations: Vec<u64>,
+    heap: Vec<FrontierEntry>,
+    next_time_ns: Vec<u64>,
+    active: Vec<bool>,
+    index_slot: Vec<usize>,
 }
 
 impl OwnerFrontierIndex {
     fn new(lp_count: usize) -> Self {
         Self {
-            heap: BinaryHeap::new(),
-            generations: vec![0; lp_count],
+            heap: Vec::with_capacity(lp_count),
+            next_time_ns: vec![0; lp_count],
+            active: vec![false; lp_count],
+            index_slot: vec![NO_INDEX_SLOT; lp_count],
         }
     }
 
@@ -637,35 +641,48 @@ impl OwnerFrontierIndex {
         physical_lp_probes: &mut u64,
     ) -> Result<(), ExecutionError> {
         *physical_lp_probes = physical_lp_probes.saturating_add(1);
-        let generation = self.generations[owner_slot]
-            .checked_add(1)
-            .ok_or(ExecutionError::CounterOverflow(node))?;
-        self.generations[owner_slot] = generation;
-        if let Some(key) = next {
-            self.heap.push(Reverse(FrontierEntry {
-                time_ns: key.time_ns,
-                node,
-                generation,
-                owner_slot,
-            }));
+        if owner_slot >= self.next_time_ns.len() {
+            return Err(ExecutionError::UnknownNode(node));
+        }
+        match (self.active[owner_slot], next) {
+            (true, Some(key)) => {
+                self.next_time_ns[owner_slot] = key.time_ns;
+                let index = self.index_slot[owner_slot];
+                self.heap[index] = FrontierEntry {
+                    time_ns: key.time_ns,
+                    node,
+                    owner_slot,
+                };
+                self.restore_heap_at(index);
+            }
+            (true, None) => {
+                self.remove_at(self.index_slot[owner_slot]);
+            }
+            (false, Some(key)) => {
+                self.next_time_ns[owner_slot] = key.time_ns;
+                self.active[owner_slot] = true;
+                let index = self.heap.len();
+                self.heap.push(FrontierEntry {
+                    time_ns: key.time_ns,
+                    node,
+                    owner_slot,
+                });
+                self.index_slot[owner_slot] = index;
+                self.sift_up(index);
+            }
+            (false, None) => {}
         }
         Ok(())
     }
 
     fn peek_min(
         &mut self,
-        heap_pops: &mut u64,
+        _heap_pops: &mut u64,
         physical_lp_probes: &mut u64,
     ) -> Option<FrontierEntry> {
-        loop {
-            let entry = self.heap.peek().map(|entry| entry.0)?;
-            *physical_lp_probes = physical_lp_probes.saturating_add(1);
-            if self.generations[entry.owner_slot] == entry.generation {
-                return Some(entry);
-            }
-            self.heap.pop();
-            *heap_pops = heap_pops.saturating_add(1);
-        }
+        let entry = *self.heap.first()?;
+        *physical_lp_probes = physical_lp_probes.saturating_add(1);
+        Some(entry)
     }
 
     fn pop_before(
@@ -678,13 +695,67 @@ impl OwnerFrontierIndex {
         if u128::from(entry.time_ns) >= exclusive_horizon_ns {
             return None;
         }
-        let popped = self
-            .heap
-            .pop()
-            .expect("peek_min established a heap entry")
-            .0;
+        let popped = self.remove_at(0);
         *heap_pops = heap_pops.saturating_add(1);
         Some(popped)
+    }
+
+    fn restore_heap_at(&mut self, index: usize) {
+        if index != 0 && self.heap[index] < self.heap[(index - 1) / 2] {
+            self.sift_up(index);
+        } else {
+            self.sift_down(index);
+        }
+    }
+
+    fn remove_at(&mut self, index: usize) -> FrontierEntry {
+        let removed = self.heap[index];
+        let last = self.heap.pop().expect("remove_at names a live heap slot");
+        self.active[removed.owner_slot] = false;
+        self.index_slot[removed.owner_slot] = NO_INDEX_SLOT;
+        if index < self.heap.len() {
+            self.heap[index] = last;
+            self.index_slot[last.owner_slot] = index;
+            self.restore_heap_at(index);
+        }
+        removed
+    }
+
+    fn sift_up(&mut self, mut index: usize) {
+        while index != 0 {
+            let parent = (index - 1) / 2;
+            if self.heap[index] >= self.heap[parent] {
+                break;
+            }
+            self.swap_heap(index, parent);
+            index = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut index: usize) {
+        loop {
+            let left = index.saturating_mul(2).saturating_add(1);
+            if left >= self.heap.len() {
+                return;
+            }
+            let right = left + 1;
+            let child = if right < self.heap.len() && self.heap[right] < self.heap[left] {
+                right
+            } else {
+                left
+            };
+            if self.heap[child] >= self.heap[index] {
+                return;
+            }
+            self.swap_heap(index, child);
+            index = child;
+        }
+    }
+
+    fn swap_heap(&mut self, left: usize, right: usize) {
+        self.heap.swap(left, right);
+        self.index_slot[self.heap[left].owner_slot] = left;
+        self.index_slot[self.heap[right].owner_slot] = right;
     }
 }
 
@@ -3531,6 +3602,41 @@ fn route_load_estimator_uses_only_declared_routes_and_generator_rates() {
     assert_eq!(loads[NodeId(2).0 as usize], 2 * scale);
     assert_eq!(loads[NodeId(3).0 as usize], 0);
     assert_eq!(loads[NodeId(4).0 as usize], 0);
+}
+
+#[test]
+fn indexed_frontier_updates_remove_and_reinsert_without_stale_entries() {
+    let key = |time_ns| EventKey {
+        time_ns,
+        phase: 0,
+        origin_node: NodeId(0),
+        origin_seq: time_ns,
+    };
+    let mut frontier = OwnerFrontierIndex::new(2);
+    let mut probes = 0;
+    frontier
+        .update(0, NodeId(4), Some(key(10)), &mut probes)
+        .unwrap();
+    frontier
+        .update(1, NodeId(2), Some(key(10)), &mut probes)
+        .unwrap();
+    assert_eq!(frontier.next_time_ns, vec![10, 10]);
+    assert_eq!(frontier.active, vec![true, true]);
+    assert_eq!(frontier.index_slot[1], 0, "NodeId breaks equal-time ties");
+
+    frontier
+        .update(1, NodeId(2), Some(key(20)), &mut probes)
+        .unwrap();
+    assert_eq!(frontier.index_slot[0], 0);
+    frontier.update(0, NodeId(4), None, &mut probes).unwrap();
+    assert_eq!(frontier.active, vec![false, true]);
+    assert_eq!(frontier.heap.len(), 1);
+
+    frontier
+        .update(0, NodeId(4), Some(key(20)), &mut probes)
+        .unwrap();
+    assert_eq!(frontier.heap.len(), 2);
+    assert_eq!(frontier.index_slot[1], 0, "NodeId breaks equal-time ties");
 }
 
 impl<'image> WorkerShard<'image> {
