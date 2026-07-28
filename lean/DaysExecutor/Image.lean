@@ -33,6 +33,19 @@ structure PacketDescriptor where
   deriving DecidableEq, Repr
 
 /--
+One resident descriptor together with its positive live-reference count. Rust stores the immutable
+descriptor beside `ResidentPacket.transmitters` at `executor/src/scalar.rs:375-381`, increments the
+count at transmission start (lines 1645-1658), checked-decrements it at completion (1661-1683), and
+drops terminal zero-count entries (1687-1698). The Lean count also abstracts the CPU pin/event
+ownership that preserves descriptors across dispatch and exchange at
+`executor/src/cpu.rs:563-569,627-667,4485-4500`.
+-/
+structure PacketStoreEntry where
+  descriptor : PacketDescriptor
+  references : Nat
+  deriving DecidableEq, Repr
+
+/--
 Kind-indexed mutable-state family formalizing Rust's separate host and switch arenas at
 `executor/src/image.rs:247-260`.
 -/
@@ -139,10 +152,12 @@ structure SimulationImage (State : StateFamily) where
   -/
   packetDescriptor : PayloadId → PacketDescriptor
   /--
-  Per-LP initial descriptor ownership derived by the CPU constructor from initial events and
-  mutable queue/service state; this is semantic prepared-image data, not an added Rust field.
+  Per-LP initial descriptor ownership and positive live-reference counts derived by the CPU
+  constructor from initial events and mutable queue/service state at
+  `executor/src/cpu.rs:3039-3197`, abstracting the checked count discipline at
+  `executor/src/scalar.rs:1645-1698`; this is semantic prepared-image data, not an added Rust field.
   -/
-  initialPacketStore : NodeId → List PacketDescriptor
+  initialPacketStore : NodeId → List PacketStoreEntry
   /-- Initial per-origin allocation cursor derived from role state during image preparation. -/
   initialNextOriginSeq : NodeId → Nat
   payloadBytes : PayloadId → Nat
@@ -261,30 +276,49 @@ def DescriptorOracleWellFormed (image : SimulationImage State) : Prop :=
       (image.packetDescriptor payload).sizeBytes = image.payloadBytes payload
 
 /--
-A descriptor store is in the strict payload-key order exposed by Rust's
+A counted descriptor store is in the strict payload-key order exposed by Rust's
 `BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367`. Consequently its list
 projection is independent of descriptor insertion order.
 -/
-def DescriptorStoreSorted (store : List PacketDescriptor) : Prop :=
-  store.Pairwise fun left right => left.id < right.id
+def DescriptorStoreSorted (store : List PacketStoreEntry) : Prop :=
+  store.Pairwise fun left right => left.descriptor.id < right.descriptor.id
 
 /--
-Prepared initial descriptor stores are strictly payload-sorted, contain unique oracle values, and
-cover every initial event at its target LP, matching ownership derivation at
-`executor/src/cpu.rs:3034-3199`.
+Look up one payload's live-reference count in the payload-sorted resident projection. This combines
+Rust transmitter counts at `executor/src/scalar.rs:375-381` with CPU event/pin ownership at
+`executor/src/cpu.rs:563-569,627-667`.
+-/
+def descriptorReferenceCount (payload : PayloadId) : List PacketStoreEntry → Nat
+  | [] => 0
+  | entry :: tail =>
+      if entry.descriptor.id = payload then
+        entry.references
+      else
+        descriptorReferenceCount payload tail
+
+/--
+Prepared initial descriptor stores are strictly payload-sorted, contain positive counts and unique
+oracle values, and give every initial event a live target-LP reference. This combines transmitter
+counts at `executor/src/scalar.rs:375-381,1645-1683` with CPU ownership derivation and pinned-event
+preservation at `executor/src/cpu.rs:3039-3197,627-635`.
 -/
 def InitialPacketStoresWellFormed (image : SimulationImage State) : Prop :=
   (∀ node ∈ image.nodes,
     DescriptorStoreSorted (image.initialPacketStore node.id) ∧
-      ((image.initialPacketStore node.id).map PacketDescriptor.id).Nodup ∧
-        ∀ descriptor ∈ image.initialPacketStore node.id,
-          descriptor = image.packetDescriptor descriptor.id) ∧
-    ∀ event ∈ image.initialEvents,
-      ∃ node ∈ image.nodes,
-        event.target = node.id ∧
-          image.packetDescriptor event.payload ∈ image.initialPacketStore node.id
+      ((image.initialPacketStore node.id).map
+        fun entry => entry.descriptor.id).Nodup ∧
+        ∀ entry ∈ image.initialPacketStore node.id,
+          0 < entry.references ∧
+            entry.descriptor = image.packetDescriptor entry.descriptor.id) ∧
+    ∀ node ∈ image.nodes, ∀ payload,
+      ((image.initialEvents.filter fun event => event.target = node.id).map Event.payload).count
+          payload ≤
+        descriptorReferenceCount payload (image.initialPacketStore node.id)
 
-/-- Validated prepared arenas expose a strictly payload-sorted descriptor store at every LP. -/
+/--
+Validated prepared arenas expose a strictly payload-sorted counted store at every LP, corresponding
+to `BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367-381`.
+-/
 theorem initialPacketStore_sorted_of_wellFormed
     (image : SimulationImage State)
     (hwellFormed : InitialPacketStoresWellFormed image)

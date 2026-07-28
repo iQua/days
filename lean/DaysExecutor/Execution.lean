@@ -12,7 +12,7 @@ project every Rust `RunResult` component, including descriptor data that crosses
 -/
 structure MachineState (State : StateFamily) where
   localState : (node : NodeDescriptor) → RoleState State node.kind
-  packetStore : NodeDescriptor → List PacketDescriptor
+  packetStore : NodeDescriptor → List PacketStoreEntry
   pending : List Event
   summary : RunSummary
   observedPackets : List PacketDescriptor
@@ -56,8 +56,8 @@ def FreshEventKeys (children existing : List Event) : Prop :=
   ∀ child ∈ children, ∀ pending ∈ existing, child.key ≠ pending.key
 
 /--
-Canonical descriptor ordering by payload ID, matching the `BTreeMap`-normalized result assembly at
-`executor/src/scalar.rs:577-590` and `executor/src/cpu.rs:3383-3426`.
+Payload ordering used only to normalize descriptor-valued public result fields after Rust forgets
+resident counts at `executor/src/scalar.rs:577-590`.
 -/
 def descriptorLE (left right : PacketDescriptor) : Prop :=
   left.id ≤ right.id
@@ -68,8 +68,9 @@ instance (left right : PacketDescriptor) : Decidable (descriptorLE left right) :
   infer_instance
 
 /--
-Install one immutable descriptor in payload order. A descriptor already installed for its payload
-is retained; `DescriptorStoreCoherent` rules out a conflicting value.
+Insert one immutable descriptor into a descriptor-only public result projection. Resident reference
+acquisition is modeled separately below. Rust assembles descriptor-valued result maps at
+`executor/src/scalar.rs:577-590` and `executor/src/cpu.rs:3383-3426`.
 -/
 def installDescriptor (descriptor : PacketDescriptor) : List PacketDescriptor → List PacketDescriptor
   | [] => [descriptor]
@@ -82,26 +83,340 @@ def installDescriptor (descriptor : PacketDescriptor) : List PacketDescriptor �
         head :: installDescriptor descriptor tail
 
 /--
-A local descriptor store is in canonical `BTreeMap` payload order, contains unique payload IDs,
-and contains exactly the oracle values.
+A local counted store is in canonical `BTreeMap` payload order, contains only positive entries,
+and contains exactly the oracle descriptors. This mirrors `ResidentPacket` storage at
+`executor/src/scalar.rs:367-381`; zero-count terminal entries are dropped at lines 1679-1698.
 -/
 def DescriptorStoreCoherent
     (image : SimulationImage State)
-    (store : List PacketDescriptor) : Prop :=
+    (store : List PacketStoreEntry) : Prop :=
   DescriptorStoreSorted store ∧
-    (store.map PacketDescriptor.id).Nodup ∧
-      ∀ descriptor ∈ store,
-        descriptor = image.packetDescriptor descriptor.id
+    (store.map fun entry => entry.descriptor.id).Nodup ∧
+      ∀ entry ∈ store,
+        0 < entry.references ∧
+          entry.descriptor = image.packetDescriptor entry.descriptor.id
+
+/-- Add a batch of live references (`executor/src/scalar.rs:1645-1658`). -/
+def incrementReferenceCountBy (amount references : Nat) : Nat :=
+  references + amount
+
+/-- Consume a batch of held references (`executor/src/scalar.rs:1661-1683`). -/
+def consumeReferenceCountBy (amount references : Nat) : Nat :=
+  references - amount
+
+/-- One checked-success-path reference increment (`executor/src/scalar.rs:1645-1658`). -/
+def incrementReferenceCount (references : Nat) : Nat :=
+  incrementReferenceCountBy 1 references
+
+/-- One checked-success-path reference consumption (`executor/src/scalar.rs:1661-1683`). -/
+def consumeReferenceCount (references : Nat) : Nat :=
+  consumeReferenceCountBy 1 references
 
 /--
-Remove one payload descriptor from a local resident store.
+Two acquisitions commute on one reference counter, matching repeated transmitter increments at
+`executor/src/scalar.rs:1645-1658`.
 -/
-def removeDescriptor (payload : PayloadId) (store : List PacketDescriptor) : List PacketDescriptor :=
-  store.filter fun descriptor => descriptor.id ≠ payload
+theorem incrementReferenceCountBy_commutes (left right references : Nat) :
+    incrementReferenceCountBy left (incrementReferenceCountBy right references) =
+      incrementReferenceCountBy right (incrementReferenceCountBy left references) := by
+  simp [incrementReferenceCountBy, Nat.add_comm, Nat.add_left_comm]
 
 /--
-Every descriptor returned by canonical insertion is either the installed descriptor or an
-existing store member.
+Two consumptions commute in the totalized counter algebra. Semantic steps separately require held
+references, so only Rust's checked-success path at `executor/src/scalar.rs:1661-1683` is reachable.
+-/
+theorem consumeReferenceCountBy_commutes (left right references : Nat) :
+    consumeReferenceCountBy left (consumeReferenceCountBy right references) =
+      consumeReferenceCountBy right (consumeReferenceCountBy left references) := by
+  simp [consumeReferenceCountBy, Nat.sub_sub, Nat.add_comm]
+
+/--
+Acquisition and consumption commute whenever the consumed reference is held. Positivity is exactly
+the condition that excludes Rust's checked-sub underflow at `executor/src/scalar.rs:1672-1678`.
+-/
+theorem increment_consumeReferenceCountBy_commutes
+    (increment consume references : Nat)
+    (hheld : consume ≤ references) :
+    incrementReferenceCountBy increment (consumeReferenceCountBy consume references) =
+      consumeReferenceCountBy consume (incrementReferenceCountBy increment references) := by
+  simp [incrementReferenceCountBy, consumeReferenceCountBy]
+  omega
+
+/--
+Acquire one descriptor reference, inserting a positive entry or incrementing its existing count.
+This abstracts transmitter acquisition at `executor/src/scalar.rs:1645-1658` together with CPU
+event/envelope ownership at `executor/src/cpu.rs:627-667,4485-4500`.
+-/
+def incrementDescriptorReference
+    (descriptor : PacketDescriptor) : List PacketStoreEntry → List PacketStoreEntry
+  | [] => [{ descriptor, references := 1 }]
+  | head :: tail =>
+      if descriptor.id = head.descriptor.id then
+        { head with references := incrementReferenceCount head.references } :: tail
+      else if descriptorLE descriptor head.descriptor then
+        { descriptor, references := 1 } :: head :: tail
+      else
+        head :: incrementDescriptorReference descriptor tail
+
+/--
+Consume one held reference and automatically drop the entry at zero. Missing references are a
+total no-op here so the update remains executable; `PacketReferencesHeld` makes that case
+impossible in semantic steps, matching Rust's checked decrement and zero drop at
+`executor/src/scalar.rs:1661-1683`.
+-/
+def consumeDescriptorReference
+    (payload : PayloadId) : List PacketStoreEntry → List PacketStoreEntry
+  | [] => []
+  | head :: tail =>
+      if head.descriptor.id = payload then
+        if head.references = 1 then
+          tail
+        else
+          { head with references := consumeReferenceCount head.references } :: tail
+      else
+        head :: consumeDescriptorReference payload tail
+
+/--
+Canonical acquisitions commute as exact counted-store updates. Equal payloads must carry the same
+immutable descriptor, as Rust's payload-keyed resident map requires at
+`executor/src/scalar.rs:367-381,1645-1658`.
+-/
+theorem incrementDescriptorReference_commutes
+    (left right : PacketDescriptor)
+    (hcanonical : left.id = right.id → left = right)
+    (store : List PacketStoreEntry) :
+    incrementDescriptorReference left (incrementDescriptorReference right store) =
+      incrementDescriptorReference right (incrementDescriptorReference left store) := by
+  rcases Nat.lt_trichotomy left.id right.id with hlt | heq | hgt
+  · have hne : left.id ≠ right.id := Nat.ne_of_lt hlt
+    have hne' : right.id ≠ left.id := Nat.ne_of_gt hlt
+    have hle : left.id ≤ right.id := Nat.le_of_lt hlt
+    have hnle : ¬ right.id ≤ left.id := Nat.not_le_of_gt hlt
+    induction store with
+    | nil =>
+        simp [incrementDescriptorReference, descriptorLE, hne, hne', hle, hnle]
+    | cons head tail ih =>
+        rcases Nat.lt_trichotomy left.id head.descriptor.id with hlh | hlh | hlh
+        <;> rcases Nat.lt_trichotomy right.id head.descriptor.id with hrh | hrh | hrh
+        <;> simp_all! +arith [incrementDescriptorReference, incrementReferenceCount,
+          incrementReferenceCountBy, descriptorLE, Nat.ne_of_lt, Nat.ne_of_gt,
+          Nat.le_of_lt, Nat.not_le_of_gt]
+        <;> omega
+  · have heq' := hcanonical heq
+    subst right
+    rfl
+  · have hne : left.id ≠ right.id := Nat.ne_of_gt hgt
+    have hne' : right.id ≠ left.id := Nat.ne_of_lt hgt
+    have hle : right.id ≤ left.id := Nat.le_of_lt hgt
+    have hnle : ¬ left.id ≤ right.id := Nat.not_le_of_gt hgt
+    induction store with
+    | nil =>
+        simp [incrementDescriptorReference, descriptorLE, hne, hne', hle, hnle]
+    | cons head tail ih =>
+        rcases Nat.lt_trichotomy left.id head.descriptor.id with hlh | hlh | hlh
+        <;> rcases Nat.lt_trichotomy right.id head.descriptor.id with hrh | hrh | hrh
+        <;> simp_all! +arith [incrementDescriptorReference, incrementReferenceCount,
+          incrementReferenceCountBy, descriptorLE, Nat.ne_of_lt, Nat.ne_of_gt,
+          Nat.le_of_lt, Nat.not_le_of_gt]
+        <;> omega
+
+/--
+Canonical consumptions commute as exact counted-store updates, including zero-count erasure. The
+totalized missing-reference case is unreachable in semantic steps by
+`ReferenceConsumptionsValid`, matching `executor/src/scalar.rs:1661-1683`.
+-/
+theorem consumeDescriptorReference_commutes
+    (left right : PayloadId)
+    (store : List PacketStoreEntry) :
+    consumeDescriptorReference left (consumeDescriptorReference right store) =
+      consumeDescriptorReference right (consumeDescriptorReference left store) := by
+  induction store with
+  | nil =>
+      simp [consumeDescriptorReference]
+  | cons head tail ih =>
+      by_cases hl : head.descriptor.id = left
+      <;> by_cases hr : head.descriptor.id = right
+      <;> by_cases hone : head.references = 1
+      <;> simp_all [consumeDescriptorReference, consumeReferenceCount,
+        consumeReferenceCountBy]
+
+/--
+Inserting before a strictly larger suffix preserves the canonical resident-map position used by
+Rust's payload-keyed store at `executor/src/scalar.rs:367-381`.
+-/
+private theorem incrementDescriptorReference_before
+    (descriptor : PacketDescriptor)
+    (store : List PacketStoreEntry)
+    (hbefore : ∀ entry ∈ store, descriptor.id < entry.descriptor.id) :
+    incrementDescriptorReference descriptor store =
+      { descriptor, references := 1 } :: store := by
+  cases store with
+  | nil =>
+      rfl
+  | cons head tail =>
+      have hlt := hbefore head List.mem_cons_self
+      simp [incrementDescriptorReference, descriptorLE, Nat.ne_of_lt hlt,
+        Nat.le_of_lt hlt]
+
+/--
+A payload below every store key has no resident references, as in Rust's payload-keyed lookup at
+`executor/src/scalar.rs:367-381`.
+-/
+private theorem descriptorReferenceCount_eq_zero_of_before
+    (payload : PayloadId)
+    (store : List PacketStoreEntry)
+    (hbefore : ∀ entry ∈ store, payload < entry.descriptor.id) :
+    descriptorReferenceCount payload store = 0 := by
+  induction store with
+  | nil =>
+      rfl
+  | cons head tail ih =>
+      have hlt := hbefore head List.mem_cons_self
+      simp only [descriptorReferenceCount]
+      rw [if_neg (Nat.ne_of_gt hlt)]
+      apply ih
+      intro entry hentry
+      exact hbefore entry (List.mem_cons_of_mem _ hentry)
+
+/--
+Acquisition commutes with consumption of a distinct payload as an exact sorted-store update. The
+proof covers erasing the entry that previously determined the insertion point, matching Rust's
+payload-keyed increment/decrement/drop operations at `executor/src/scalar.rs:1645-1683`.
+-/
+theorem increment_consumeDescriptorReference_commutes_of_ne
+    (descriptor : PacketDescriptor)
+    (payload : PayloadId)
+    (hne : descriptor.id ≠ payload)
+    (store : List PacketStoreEntry)
+    (hsorted : DescriptorStoreSorted store) :
+    incrementDescriptorReference descriptor
+        (consumeDescriptorReference payload store) =
+      consumeDescriptorReference payload
+        (incrementDescriptorReference descriptor store) := by
+  induction store with
+  | nil =>
+      simp [incrementDescriptorReference, consumeDescriptorReference, hne]
+  | cons head tail ih =>
+      have hhead := (List.pairwise_cons.mp hsorted).1
+      have htail := (List.pairwise_cons.mp hsorted).2
+      have hinduction := ih htail
+      by_cases hp : head.descriptor.id = payload
+      · rcases Nat.lt_trichotomy descriptor.id head.descriptor.id with hd | hd | hd
+        · have hbefore : ∀ entry ∈ tail,
+              descriptor.id < entry.descriptor.id := by
+            intro entry hentry
+            exact Nat.lt_trans hd (hhead entry hentry)
+          by_cases hone : head.references = 1
+          · simp only [consumeDescriptorReference, hp, hone, ↓reduceIte]
+            rw [incrementDescriptorReference_before descriptor tail hbefore]
+            simp_all! +arith [incrementDescriptorReference, consumeDescriptorReference,
+              incrementReferenceCount, incrementReferenceCountBy,
+              consumeReferenceCount, consumeReferenceCountBy, descriptorLE,
+              Nat.ne_of_lt, Nat.ne_of_gt, Nat.le_of_lt, Nat.not_le_of_gt]
+          · simp_all! +arith [incrementDescriptorReference, consumeDescriptorReference,
+              incrementReferenceCount, incrementReferenceCountBy,
+              consumeReferenceCount, consumeReferenceCountBy, descriptorLE,
+              Nat.ne_of_lt, Nat.ne_of_gt, Nat.le_of_lt, Nat.not_le_of_gt]
+        · exact False.elim (hne (hd.trans hp))
+        · by_cases hone : head.references = 1
+          <;> simp_all! +arith [incrementDescriptorReference, consumeDescriptorReference,
+            incrementReferenceCount, incrementReferenceCountBy,
+            consumeReferenceCount, consumeReferenceCountBy, descriptorLE,
+            Nat.ne_of_lt, Nat.ne_of_gt, Nat.le_of_lt, Nat.not_le_of_gt]
+      · rcases Nat.lt_trichotomy descriptor.id head.descriptor.id with hd | hd | hd
+        <;> simp_all! +arith [incrementDescriptorReference, consumeDescriptorReference,
+          incrementReferenceCount, incrementReferenceCountBy,
+          consumeReferenceCount, consumeReferenceCountBy, descriptorLE,
+          Nat.ne_of_lt, Nat.ne_of_gt, Nat.le_of_lt, Nat.not_le_of_gt]
+
+/--
+At the resident entry, acquisition commutes with one held consumption even across zero-drop and
+reinsertion, matching Rust's increment/decrement/drop sites at
+`executor/src/scalar.rs:1645-1683`.
+-/
+private theorem increment_consumeDescriptorReference_commutes_at_head
+    (descriptor : PacketDescriptor)
+    (references : Nat)
+    (tail : List PacketStoreEntry)
+    (hpositive : 0 < references)
+    (htail : ∀ entry ∈ tail, descriptor.id < entry.descriptor.id) :
+    incrementDescriptorReference descriptor
+        (consumeDescriptorReference descriptor.id
+          ({ descriptor, references } :: tail)) =
+      consumeDescriptorReference descriptor.id
+        (incrementDescriptorReference descriptor
+          ({ descriptor, references } :: tail)) := by
+  rcases references with _ | references
+  · omega
+  · rcases references with _ | references
+    · simp only [consumeDescriptorReference, ↓reduceIte]
+      rw [incrementDescriptorReference_before descriptor tail htail]
+      simp [consumeDescriptorReference, incrementDescriptorReference,
+        incrementReferenceCount, incrementReferenceCountBy,
+        consumeReferenceCount, consumeReferenceCountBy]
+    · simp [consumeDescriptorReference, incrementDescriptorReference,
+        incrementReferenceCount, incrementReferenceCountBy,
+        consumeReferenceCount, consumeReferenceCountBy]
+
+/--
+Acquiring and consuming the same held descriptor commute as exact counted-store updates. Strict
+ordering and descriptor immutability cover the zero-drop/reinsert case, while the held premise
+excludes Rust's checked-sub underflow at `executor/src/scalar.rs:1645-1683`.
+-/
+theorem increment_consumeDescriptorReference_commutes
+    (descriptor : PacketDescriptor)
+    (store : List PacketStoreEntry)
+    (hsorted : DescriptorStoreSorted store)
+    (hheld : 0 < descriptorReferenceCount descriptor.id store)
+    (hcanonical : ∀ entry ∈ store,
+      entry.descriptor.id = descriptor.id → entry.descriptor = descriptor) :
+    incrementDescriptorReference descriptor
+        (consumeDescriptorReference descriptor.id store) =
+      consumeDescriptorReference descriptor.id
+        (incrementDescriptorReference descriptor store) := by
+  induction store with
+  | nil =>
+      simp [descriptorReferenceCount] at hheld
+  | cons head tail ih =>
+      have hhead := (List.pairwise_cons.mp hsorted).1
+      have htail := (List.pairwise_cons.mp hsorted).2
+      by_cases heq : head.descriptor.id = descriptor.id
+      · have hdescriptor := hcanonical head List.mem_cons_self heq
+        rcases head with ⟨headDescriptor, references⟩
+        simp only at hdescriptor heq hheld hhead ⊢
+        subst headDescriptor
+        apply increment_consumeDescriptorReference_commutes_at_head
+        · simpa [descriptorReferenceCount] using hheld
+        · exact hhead
+      · have hheldTail : 0 < descriptorReferenceCount descriptor.id tail := by
+          simpa [descriptorReferenceCount, heq] using hheld
+        have hcanonicalTail : ∀ entry ∈ tail,
+            entry.descriptor.id = descriptor.id → entry.descriptor = descriptor := by
+          intro entry hentry
+          exact hcanonical entry (List.mem_cons_of_mem _ hentry)
+        have hinduction := ih htail hheldTail hcanonicalTail
+        by_cases hle : descriptorLE descriptor head.descriptor
+        · have hlt : descriptor.id < head.descriptor.id := by
+            change descriptor.id ≤ head.descriptor.id at hle
+            exact Std.lt_of_le_of_ne hle (Ne.symm heq)
+          have hbefore : ∀ entry ∈ tail,
+              descriptor.id < entry.descriptor.id := by
+            intro entry hentry
+            exact Nat.lt_trans hlt (hhead entry hentry)
+          have hzero := descriptorReferenceCount_eq_zero_of_before
+            descriptor.id tail hbefore
+          rw [hzero] at hheldTail
+          omega
+        · have hheadlt : head.descriptor.id < descriptor.id := by
+            change ¬ descriptor.id ≤ head.descriptor.id at hle
+            exact Nat.lt_of_not_ge hle
+          have heq' : descriptor.id ≠ head.descriptor.id := Ne.symm heq
+          simp [incrementDescriptorReference, consumeDescriptorReference, heq,
+            heq', hle, hinduction]
+
+/--
+Every descriptor returned by descriptor-only canonical insertion is either the inserted descriptor
+or an existing public-result member (`executor/src/scalar.rs:577-590`).
 -/
 private theorem mem_installDescriptor_cases
     (candidate descriptor : PacketDescriptor)
@@ -130,25 +445,60 @@ private theorem mem_installDescriptor_cases
             · exact Or.inr (List.mem_cons_of_mem _ hold)
 
 /--
-Canonical payload insertion preserves strict descriptor-store ordering. This is the list-model
-counterpart of insertion into Rust's `BTreeMap<PayloadId, ResidentPacket>` at
-`executor/src/scalar.rs:367`.
+Every counted acquisition returns either its new entry or an existing entry with updated count,
+matching `executor/src/scalar.rs:1645-1658`.
 -/
-theorem installDescriptor_preserves_sorted
+private theorem mem_incrementDescriptorReference_cases
+    (candidate : PacketStoreEntry)
     (descriptor : PacketDescriptor)
-    (store : List PacketDescriptor)
-    (hsorted : DescriptorStoreSorted store) :
-    DescriptorStoreSorted (installDescriptor descriptor store) := by
+    (store : List PacketStoreEntry)
+    (hmem : candidate ∈ incrementDescriptorReference descriptor store) :
+    candidate.descriptor = descriptor ∨
+      ∃ existing ∈ store, candidate.descriptor = existing.descriptor := by
   induction store with
   | nil =>
-      simp [DescriptorStoreSorted, installDescriptor]
+      simp [incrementDescriptorReference] at hmem
+      subst candidate
+      exact Or.inl rfl
+  | cons head tail ih =>
+      simp only [incrementDescriptorReference] at hmem
+      split at hmem
+      next =>
+        rcases List.mem_cons.mp hmem with rfl | hmem
+        · exact Or.inr ⟨head, List.mem_cons_self, rfl⟩
+        · exact Or.inr ⟨_, List.mem_cons_of_mem _ hmem, rfl⟩
+      next =>
+        split at hmem
+        next =>
+          rcases List.mem_cons.mp hmem with rfl | hmem
+          · exact Or.inl rfl
+          · exact Or.inr ⟨_, hmem, rfl⟩
+        next =>
+          rcases List.mem_cons.mp hmem with rfl | hmem
+          · exact Or.inr ⟨_, List.mem_cons_self, rfl⟩
+          · rcases ih hmem with hnew | ⟨existing, hold, heq⟩
+            · exact Or.inl hnew
+            · exact Or.inr ⟨existing, List.mem_cons_of_mem _ hold, heq⟩
+
+/--
+Reference acquisition preserves strict payload ordering, matching Rust's counted
+`BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367-381,1645-1658`.
+-/
+theorem incrementDescriptorReference_preserves_sorted
+    (descriptor : PacketDescriptor)
+    (store : List PacketStoreEntry)
+    (hsorted : DescriptorStoreSorted store) :
+    DescriptorStoreSorted (incrementDescriptorReference descriptor store) := by
+  induction store with
+  | nil =>
+      simp [DescriptorStoreSorted, incrementDescriptorReference]
   | cons head tail ih =>
       have hhead := (List.pairwise_cons.mp hsorted).1
       have htail := (List.pairwise_cons.mp hsorted).2
-      simp only [installDescriptor]
+      simp only [incrementDescriptorReference]
       split
       next =>
-        exact hsorted
+        simpa [DescriptorStoreSorted] using hsorted
       next hne =>
         split
         next hle =>
@@ -157,61 +507,142 @@ theorem installDescriptor_preserves_sorted
           · intro current hmem
             rcases List.mem_cons.mp hmem with hcurrent | hmem
             · subst current
-              change descriptor.id < head.id
-              change descriptor.id ≤ head.id at hle
-              change descriptor.id ≠ head.id at hne
+              change descriptor.id < head.descriptor.id
+              change descriptor.id ≤ head.descriptor.id at hle
+              change descriptor.id ≠ head.descriptor.id at hne
               exact Std.lt_of_le_of_ne hle hne
             · have hheadCurrent := hhead current hmem
-              change descriptor.id ≤ head.id at hle
-              change descriptor.id ≠ head.id at hne
-              change head.id < current.id at hheadCurrent
-              change descriptor.id < current.id
+              change descriptor.id ≤ head.descriptor.id at hle
+              change descriptor.id ≠ head.descriptor.id at hne
+              change head.descriptor.id < current.descriptor.id at hheadCurrent
+              change descriptor.id < current.descriptor.id
               exact Nat.lt_trans (Std.lt_of_le_of_ne hle hne) hheadCurrent
           · exact hsorted
         next hnle =>
           apply List.pairwise_cons.mpr
           constructor
           · intro current hmem
-            rcases mem_installDescriptor_cases current descriptor tail hmem with
-              hcurrent | hcurrent
-            · subst current
-              change head.id < descriptor.id
-              change ¬ descriptor.id ≤ head.id at hnle
+            rcases mem_incrementDescriptorReference_cases current descriptor tail hmem with
+              hcurrent | ⟨existing, hexisting, hcurrent⟩
+            · rw [hcurrent]
+              change head.descriptor.id < descriptor.id
+              change ¬ descriptor.id ≤ head.descriptor.id at hnle
               exact Nat.lt_of_not_le hnle
-            · exact hhead current hcurrent
+            · change head.descriptor.id < current.descriptor.id
+              rw [hcurrent]
+              exact hhead existing hexisting
           · exact ih htail
 
 /--
-Payload removal preserves strict descriptor-store ordering because it is a filter of the canonical
-store projection.
+Reference consumption preserves strict payload ordering, including Rust's automatic zero-count
+erase after checked decrement at `executor/src/scalar.rs:1661-1683`.
 -/
-theorem removeDescriptor_preserves_sorted
+theorem consumeDescriptorReference_preserves_sorted
     (payload : PayloadId)
-    (store : List PacketDescriptor)
+    (store : List PacketStoreEntry)
     (hsorted : DescriptorStoreSorted store) :
-    DescriptorStoreSorted (removeDescriptor payload store) := by
-  exact hsorted.filter _
-
-/-- Executable payload-reference check underlying `PacketRemovalsRespectReferences`. -/
-def packetRemovalsRespectReferencesCheck
-    (result : TransitionResult State kind)
-    (referencedEvents : List Event) : Bool :=
-  result.packetRemovals.all fun payload =>
-    referencedEvents.all fun event =>
-      decide (event.payload ≠ payload)
+    DescriptorStoreSorted (consumeDescriptorReference payload store) := by
+  induction store with
+  | nil =>
+      simpa [consumeDescriptorReference] using hsorted
+  | cons head tail ih =>
+      have hhead := (List.pairwise_cons.mp hsorted).1
+      have htail := (List.pairwise_cons.mp hsorted).2
+      simp only [consumeDescriptorReference]
+      split
+      next =>
+        split
+        next =>
+          exact htail
+        next =>
+          simpa [DescriptorStoreSorted] using hsorted
+      next =>
+        apply List.pairwise_cons.mpr
+        constructor
+        · intro current hmem
+          have hdescriptor :
+              ∃ existing ∈ tail, current.descriptor = existing.descriptor := by
+            clear hhead htail hsorted ih
+            induction tail with
+            | nil =>
+                simp [consumeDescriptorReference] at hmem
+            | cons next rest nested =>
+                simp only [consumeDescriptorReference] at hmem
+                split at hmem
+                next =>
+                  split at hmem
+                  next =>
+                    exact ⟨current, List.mem_cons_of_mem _ hmem, rfl⟩
+                  next =>
+                    rcases List.mem_cons.mp hmem with rfl | hmem
+                    · exact ⟨next, List.mem_cons_self, rfl⟩
+                    · exact ⟨_, List.mem_cons_of_mem _ hmem, rfl⟩
+                next =>
+                  rcases List.mem_cons.mp hmem with rfl | hmem
+                  · exact ⟨_, List.mem_cons_self, rfl⟩
+                  · rcases nested hmem with ⟨existing, hexisting, heq⟩
+                    exact ⟨existing, List.mem_cons_of_mem _ hexisting, heq⟩
+          rcases hdescriptor with ⟨existing, hexisting, heq⟩
+          change head.descriptor.id < current.descriptor.id
+          rw [heq]
+          exact hhead existing hexisting
+        · exact ih htail
 
 /--
-A transition may release a descriptor only when no surviving event owns that payload. Pending
-events and CPU outbox envelopes are lifetime references: scalar transport increments
-`transmitters` at `executor/src/scalar.rs:1645-1658` and removal after completion occurs only when
-that count reaches zero at lines 1661-1683. The CPU path likewise preserves pinned event payloads
-across dispatch at `executor/src/cpu.rs:627-635` and carries remote descriptors in envelopes at
-lines 664-667.
+A multiset of payload references is held when its multiplicity never exceeds the resident count.
+This replaces the order-sensitive pending scan. Rust rejects transmitter underflow at
+`executor/src/scalar.rs:1661-1678`; CPU pins and outboxes preserve other live ownership at
+`executor/src/cpu.rs:563-569,627-667`.
 -/
-def PacketRemovalsRespectReferences
+def PacketReferencesHeld
+    (payloads : List PayloadId)
+    (store : List PacketStoreEntry) : Prop :=
+  ∀ payload ∈ payloads,
+    payloads.count payload ≤ descriptorReferenceCount payload store
+
+/--
+Multiplicity-aware held-reference validity is executable for finite counted stores
+(`executor/src/scalar.rs:1672-1683`).
+-/
+instance (payloads : List PayloadId) (store : List PacketStoreEntry) :
+    Decidable (PacketReferencesHeld payloads store) := by
+  unfold PacketReferencesHeld
+  infer_instance
+
+/--
+Every held reference has a positive resident count, so a pending event, local child, or buffered
+envelope cannot be stranded after Rust's zero-count drop
+(`executor/src/scalar.rs:1679-1698`, `executor/src/cpu.rs:627-667`).
+-/
+theorem descriptorReferenceCount_positive_of_held
+    (payloads : List PayloadId)
+    (store : List PacketStoreEntry)
+    (payload : PayloadId)
+    (hheld : PacketReferencesHeld payloads store)
+    (hmem : payload ∈ payloads) :
+    0 < descriptorReferenceCount payload store := by
+  have hcountNe : payloads.count payload ≠ 0 := by
+    intro hzero
+    exact (List.count_eq_zero.mp hzero) hmem
+  have hcount : 0 < payloads.count payload := Nat.zero_lt_of_ne_zero hcountNe
+  exact Nat.lt_of_lt_of_le hcount (hheld payload hmem)
+
+/--
+One transition cannot consume more references than its processing LP holds, matching Rust's
+`checked_sub` error at `executor/src/scalar.rs:1672-1678`.
+-/
+def ReferenceConsumptionsValid
     (result : TransitionResult State kind)
-    (referencedEvents : List Event) : Prop :=
-  packetRemovalsRespectReferencesCheck result referencedEvents = true
+    (store : List PacketStoreEntry) : Prop :=
+  PacketReferencesHeld result.packetReferenceConsumptions store
+
+/-- Checked transition consumption validity is executable (`executor/src/scalar.rs:1672-1678`). -/
+instance
+    (result : TransitionResult State kind)
+    (store : List PacketStoreEntry) :
+    Decidable (ReferenceConsumptionsValid result store) := by
+  unfold ReferenceConsumptionsValid
+  infer_instance
 
 /-- Canonical global payload-ID projection used by `RunResult.resident_packets`. -/
 def canonicalizeDescriptors (descriptors : List PacketDescriptor) : List PacketDescriptor :=
@@ -219,46 +650,90 @@ def canonicalizeDescriptors (descriptors : List PacketDescriptor) : List PacketD
     (fun current descriptor => installDescriptor descriptor current)
     []
 
-/-- Apply one transition's resident-packet effects in their deterministic result-list order. -/
+/--
+Coherence for descriptor-only observation/result lists. These carry no lifetime count in Rust's
+`observed_packets` map at `executor/src/scalar.rs:370,577-590`.
+-/
+def DescriptorListCoherent
+    (image : SimulationImage State)
+    (descriptors : List PacketDescriptor) : Prop :=
+  descriptors.Pairwise (fun left right => left.id < right.id) ∧
+    (descriptors.map PacketDescriptor.id).Nodup ∧
+      ∀ descriptor ∈ descriptors,
+        descriptor = image.packetDescriptor descriptor.id
+
+/--
+Apply checked consumptions followed by explicit acquisitions. Zero-count removal is derived rather
+than discretionary, matching `executor/src/scalar.rs:1645-1683`.
+-/
 def applyPacketEffects
     (result : TransitionResult State kind)
-    (store : List PacketDescriptor) : List PacketDescriptor :=
-  result.packetInstalls.foldl
-    (fun current descriptor => installDescriptor descriptor current)
-    (result.packetRemovals.foldl
-      (fun current payload => removeDescriptor payload current)
+    (store : List PacketStoreEntry) : List PacketStoreEntry :=
+  result.packetReferenceIncrements.foldl
+    (fun current descriptor => incrementDescriptorReference descriptor current)
+    (result.packetReferenceConsumptions.foldl
+      (fun current payload => consumeDescriptorReference payload current)
       store)
 
 /--
-Every emitted child's actual descriptor remains available at the emitting LP after transition
-packet effects, matching `packet_descriptor(child.payload)` at
-`executor/src/cpu.rs:627-667`.
+Every emitted child has a positive counted reference at its current holding LP. Locally queued
+children and buffered remote envelopes both require descriptor availability at
+`executor/src/cpu.rs:627-667`; exchange later transfers remote references.
 -/
 def ChildDescriptorsAvailable
     (image : SimulationImage State)
-    (store : List PacketDescriptor)
+    (store : List PacketStoreEntry)
     (children : List Event) : Prop :=
   ∀ child ∈ children,
-    image.packetDescriptor child.payload ∈ store
+    ∃ entry ∈ store,
+      entry.descriptor = image.packetDescriptor child.payload ∧
+        0 < entry.references
 
 /--
-Install the immutable descriptors of children addressed to one LP. In the scalar executor all
-handlers share one packet map (`executor/src/scalar.rs:362-372,545-565`), so its per-LP projection
-materializes this availability when a child enters the future-event list. The exchanged executor
-does the corresponding target installation from descriptor-carrying envelopes at
-`executor/src/cpu.rs:664-667,4485-4500`.
+Every scalar child has a positive counted reference at its target LP. This is the per-LP projection
+of the shared scalar map and immediate future insertion at `executor/src/scalar.rs:344-372`; CPU
+execution reaches the same holdings after `executor/src/cpu.rs:4485-4500`.
+-/
+def ChildReferencesAvailableAtTargets
+    (image : SimulationImage State)
+    (machine : MachineState State)
+    (children : List Event) : Prop :=
+  ∀ child ∈ children,
+    ∃ target ∈ image.nodes,
+      target.id = child.target ∧
+        ∃ entry ∈ machine.packetStore target,
+          entry.descriptor = image.packetDescriptor child.payload ∧
+            0 < entry.references
+
+/--
+Acquire references for children addressed to one LP. The scalar projection materializes them when
+children enter the shared future list (`executor/src/scalar.rs:344-372`); the CPU projection does
+so either locally or from exchanged envelopes at `executor/src/cpu.rs:649-667,4485-4500`.
 -/
 def installChildDescriptorsFor
     (image : SimulationImage State)
     (target : NodeId)
     (children : List Event)
-    (store : List PacketDescriptor) : List PacketDescriptor :=
+    (store : List PacketStoreEntry) : List PacketStoreEntry :=
   children.foldl
     (fun current child =>
       if child.target = target then
-        installDescriptor (image.packetDescriptor child.payload) current
+        incrementDescriptorReference (image.packetDescriptor child.payload) current
       else
         current)
+    store
+
+/--
+Hold every emitted child reference at its source LP until local insertion or remote exchange. This
+is the counted abstraction of the CPU child/outbox loop at `executor/src/cpu.rs:649-667`.
+-/
+def holdEmittedChildReferences
+    (image : SimulationImage State)
+    (children : List Event)
+    (store : List PacketStoreEntry) : List PacketStoreEntry :=
+  children.foldl
+    (fun current child =>
+      incrementDescriptorReference (image.packetDescriptor child.payload) current)
     store
 
 /-- Insert a keyed departure in canonical event-key order. -/
@@ -350,44 +825,43 @@ def NoEligibleEvent (eligible : Event → Prop) (pending : List Event) : Prop :=
   ∀ event ∈ pending, ¬ eligible event
 
 /--
-LP-local transition application: only the processing LP's mutable role state and descriptor store
-change; all normalized result effects are applied explicitly. This mirrors exclusive CPU state-slot
-ownership before remote exchange at `executor/src/cpu.rs:586-690`.
+LP-local transition application: the processing LP consumes only held references, applies explicit
+acquisitions, and holds every emitted child until local insertion or remote exchange. Other LPs are
+unchanged. This mirrors exclusive CPU state-slot ownership and outbox creation at
+`executor/src/cpu.rs:586-690`.
 -/
 def AppliesTransitionResult
     (image : SimulationImage State)
     (node : NodeDescriptor)
     (result : TransitionResult State node.kind)
-    (referencedEvents : List Event)
     (before after : MachineState State) : Prop :=
   after.localState node = result.nextState ∧
     after.packetStore node =
-      applyPacketEffects result (before.packetStore node) ∧
+      holdEmittedChildReferences image result.children
+        (applyPacketEffects result (before.packetStore node)) ∧
     (∀ other ∈ image.nodes,
       other.id ≠ node.id →
       after.localState other = before.localState other ∧
         after.packetStore other = before.packetStore other) ∧
     applyRecordedOutput result before after ∧
-    PacketRemovalsRespectReferences result referencedEvents
+    ReferenceConsumptionsValid result (before.packetStore node)
 
 /--
-Scalar transition application in the model's per-LP descriptor projection. Rust scalar execution
-has one shared packet map, so every emitted child can use its descriptor immediately; the
-projection records that availability at the child's target while preserving exact local state and
-output effects. A removal must also respect every event reference that survives the step. This is
-the scalar counterpart of the target copies installed by `CompleteCanonicalExchange`: the
-exchange's later physical install is idempotent availability realization, not descriptor
-resurrection.
+Scalar transition application in the counted per-LP projection. A processed event consumes only a
+held reference, while each child reference is acquired immediately at its target. The CPU path
+temporarily holds remote children at the source and transfers them at exchange; the count
+commutation lemmas above make these timing choices converge. Rust sites:
+`executor/src/scalar.rs:344-372,1645-1683` and `executor/src/cpu.rs:649-667,4485-4500`.
 -/
 def AppliesScalarTransitionResult
     (image : SimulationImage State)
     (node : NodeDescriptor)
-    (event : Event)
     (result : TransitionResult State node.kind)
     (before after : MachineState State) : Prop :=
   after.localState node = result.nextState ∧
     after.packetStore node =
-      applyPacketEffects result (before.packetStore node) ∧
+      installChildDescriptorsFor image node.id result.children
+        (applyPacketEffects result (before.packetStore node)) ∧
     (∀ other ∈ image.nodes,
       other.id ≠ node.id →
       after.localState other = before.localState other ∧
@@ -395,8 +869,7 @@ def AppliesScalarTransitionResult
           installChildDescriptorsFor image other.id result.children
             (before.packetStore other)) ∧
     applyRecordedOutput result before after ∧
-    PacketRemovalsRespectReferences result
-      ((before.pending.erase event) ++ result.children)
+    ReferenceConsumptionsValid result (before.packetStore node)
 
 /--
 One arbitrary available-event step used to define an explicit candidate reordering; unlike the
@@ -415,9 +888,9 @@ def AvailableEventStep
       transition node event (before.localState node) result ∧
       FreshEventKeys result.children (before.pending.erase event) ∧
       AllocatesChildrenInOrder node result.children before after ∧
-      AppliesScalarTransitionResult image node event result before after ∧
+      AppliesScalarTransitionResult image node result before after ∧
       DescriptorStoreCoherent image (after.packetStore node) ∧
-      ChildDescriptorsAvailable image (after.packetStore node) result.children ∧
+      ChildReferencesAvailableAtTargets image after result.children ∧
       after.pending = insertEvents result.children (before.pending.erase event) ∧
       after.emissions =
         before.emissions ++ (result.children.map fun child => (event, child))
@@ -499,19 +972,20 @@ def CanonicalSerialThroughStop
     NoEligibleEvent (withinInclusiveStop image.stopTimeNs) after.pending
 
 /--
-Canonical initial descriptor store derived for each event-owning LP. Rust's CPU constructor derives
-the same ownership partition from initial events and mutable state at
-`executor/src/cpu.rs:3034-3199`; the total oracle also covers dynamically generated packets.
+Canonical initial counted store derived for each event-owning LP. Rust's CPU constructor derives
+the ownership partition and in-service holdings at `executor/src/cpu.rs:3039-3197`; the Lean count
+also represents event/pin ownership.
 -/
 def initialPacketStore
     (image : SimulationImage State)
-    (node : NodeDescriptor) : List PacketDescriptor :=
+    (node : NodeDescriptor) : List PacketStoreEntry :=
   image.initialPacketStore node.id
 
 /--
 Structural machine invariant used at round boundaries: pending events are declared and supported,
-their lifetime keys remain allocated below the corresponding cursor, and their immutable packet
-descriptors are installed at the target LP.
+their lifetime keys remain allocated below the corresponding cursor, and every target LP holds the
+pending payload multiset in positive counted entries. This is the count form of CPU pin/future
+ownership at `executor/src/cpu.rs:563-569,627-635,3389-3397`.
 -/
 def MachineWellFormed
     (image : SimulationImage State)
@@ -526,10 +1000,12 @@ def MachineWellFormed
         ∃ node ∈ image.nodes,
           event.target = node.id ∧
             roleSupports node.kind event.kind ∧
-            image.packetDescriptor event.payload ∈ machine.packetStore node) ∧
+            PacketReferencesHeld
+              ((machine.pending.filter fun pending => pending.target = node.id).map Event.payload)
+              (machine.packetStore node)) ∧
     (∀ node ∈ image.nodes,
       DescriptorStoreCoherent image (machine.packetStore node)) ∧
-    DescriptorStoreCoherent image machine.observedPackets
+    DescriptorListCoherent image machine.observedPackets
 
 /--
 Initial machine relation resolving Rust's role arena plus `state_slot` representation at
@@ -615,24 +1091,26 @@ structure RunResultView where
   pendingEvents : List Event
 
 /--
-Deterministic non-arena portion of the full result projection. Resident packet data is globally
-normalized from every LP descriptor store as in `executor/src/cpu.rs:3372-3433`; the accompanying
-`SameMachineResult` relation projects the host/switch arenas through validated node descriptors.
+Deterministic non-arena portion of the full result projection. Resident packet data forgets counts
+and is globally normalized from every LP entry as in `executor/src/cpu.rs:3372-3433`; exact counts
+remain visible to `SameMachineResult` through per-LP store equality.
 -/
 def projectRunResult
     (image : SimulationImage State)
     (machine : MachineState State) : RunResultView :=
   { summary := machine.summary
     residentPackets :=
-      canonicalizeDescriptors (image.nodes.flatMap machine.packetStore)
+      canonicalizeDescriptors
+        ((image.nodes.flatMap machine.packetStore).map PacketStoreEntry.descriptor)
     observedPackets := canonicalizeDescriptors machine.observedPackets
     departures := machine.departures.map RecordedDeparture.departure
     arrivals := machine.arrivals.map RecordedArrival.arrival
     pendingEvents := machine.pending }
 
 /--
-Exact descriptor holdings at every declared LP. The globally canonical resident-packet projection
-used by `RunResult` deliberately forgets this ownership information.
+Exact `(descriptor, positive reference count)` holdings at every declared LP. Rust's public
+`RunResult` forgets these counts during assembly at `executor/src/cpu.rs:3372-3433`, but the
+semantic equality retains them to support dependent suffixes.
 -/
 def PerLPDescriptorStoresEqual
     (image : SimulationImage State)
@@ -641,9 +1119,10 @@ def PerLPDescriptorStoresEqual
     left.packetStore node = right.packetStore node
 
 /--
-Complete normalized-result equality used by all cross-executor claims. Descriptor installation,
-summary counters, full observations, pending events, both role arenas, and exact per-LP descriptor
-holdings must all agree; only proof ghosts are excluded.
+Complete normalized-result equality used by all cross-executor claims. Reference counts, descriptor
+identity, summary counters, full observations, pending events, and both role arenas must all agree;
+only proof ghosts are excluded. The count component models the checked lifetime updates at
+`executor/src/scalar.rs:1645-1698`.
 
 Per-LP equality is stronger than assembled Rust `RunResult` equality because result assembly
 globally deduplicates descriptors at `executor/src/cpu.rs:3372-3433`. This intentionally strengthens

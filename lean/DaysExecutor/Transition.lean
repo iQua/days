@@ -97,15 +97,17 @@ structure ServiceDecision where
   deriving DecidableEq, Repr
 
 /--
-Abstract result of one role-correct run-to-completion handler, including child, descriptor,
-summary, and observation effects accumulated by `TransitionState.dispatch` and finish assembly at
-`executor/src/scalar.rs:575-663`.
+Abstract result of one role-correct run-to-completion handler, including explicit descriptor
+increments beyond the separately derived child ownership, checked reference consumptions, summary,
+and observation effects accumulated by `TransitionState.dispatch` and finish assembly at
+`executor/src/scalar.rs:575-663`. The count effects model transmitter increments/decrements at
+lines 1645-1683 together with CPU event pins at `executor/src/cpu.rs:627-667`.
 -/
 structure TransitionResult (State : StateFamily) (kind : NodeKind) where
   nextState : RoleState State kind
   children : List Event
-  packetInstalls : List PacketDescriptor
-  packetRemovals : List PayloadId
+  packetReferenceIncrements : List PacketDescriptor
+  packetReferenceConsumptions : List PayloadId
   summaryDelta : RunSummary
   observedPackets : List PacketDescriptor
   departures : List RecordedDeparture
@@ -266,16 +268,16 @@ def CertifiedBoundSoundness
           event.key.timeNs + channel.minDelayNs ≤ child.key.timeNs
 
 /--
-Every descriptor installed or retained for full observations is the immutable oracle value for its
-payload. This matches Rust's conflicting-descriptor rejection at
-`executor/src/scalar.rs:545-565`.
+Every descriptor whose reference count is incremented or retained for full observations is the
+immutable oracle value for its payload. This matches Rust's conflicting-descriptor rejection at
+`executor/src/scalar.rs:545-565` and counted transmitter acquisition at lines 1645-1658.
 -/
 def TransitionDescriptorEffectsCoherent
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
   ∀ node event state result,
     transition node event state result →
-    (∀ descriptor ∈ result.packetInstalls,
+    (∀ descriptor ∈ result.packetReferenceIncrements,
       descriptor = image.packetDescriptor descriptor.id) ∧
     (∀ descriptor ∈ result.observedPackets,
       descriptor = image.packetDescriptor descriptor.id)
@@ -431,15 +433,16 @@ def CommittedServiceNonPreemptive
 /--
 Two transition results agree on every externally visible effect of service selection. Replacement
 private bookkeeping may differ, but the public next state, emitted children, packet-store effects,
-summary and observation effects, and decision trace do not.
+summary and observation effects, and decision trace do not. Packet-store effects include exact
+reference acquisitions and consumptions from `executor/src/scalar.rs:1645-1683`.
 -/
 def SameServiceSelectionResult
     (left right : TransitionResult State kind) : Prop :=
   left.nextState.serviceQueue = right.nextState.serviceQueue ∧
     left.nextState.committedService = right.nextState.committedService ∧
     left.children = right.children ∧
-    left.packetInstalls = right.packetInstalls ∧
-    left.packetRemovals = right.packetRemovals ∧
+    left.packetReferenceIncrements = right.packetReferenceIncrements ∧
+    left.packetReferenceConsumptions = right.packetReferenceConsumptions ∧
     left.summaryDelta = right.summaryDelta ∧
     left.observedPackets = right.observedPackets ∧
     left.departures = right.departures ∧

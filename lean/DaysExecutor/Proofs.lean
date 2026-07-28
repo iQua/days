@@ -166,7 +166,7 @@ theorem constantGlobalBoundsValid
     potentiallyReachable_seed_time_le
       hadvance hparentReachable
   obtain ⟨frontier, hfrontier, hfrontierLe⟩ :=
-    minimumLPFrontier_le_of_pending image start.machine hstart.2 hseed
+    minimumLPFrontier_le_of_pending image start.machine hstart.2.1 hseed
   obtain ⟨lookahead, hlookahead, hlookaheadLe⟩ :=
     minimumChannelDelay_le_of_mem image hchannel
   have hboundLe : globalHorizon image start.machine ≤ child.key.timeNs := by
@@ -229,10 +229,11 @@ private theorem mem_insertEvents
 
 private theorem remoteEnvelopesFromStore_event_mem
     (image : SimulationImage State)
-    (store : List PacketDescriptor)
+    (source : NodeId)
+    (store : List PacketStoreEntry)
     {events : List Event}
     {envelopes : List RemoteEnvelope}
-    (hfrom : RemoteEnvelopesFromStore image store events envelopes)
+    (hfrom : RemoteEnvelopesFromStore image source store events envelopes)
     {envelope : RemoteEnvelope}
     (hmem : envelope ∈ envelopes) :
     envelope.event ∈ events := by
@@ -245,7 +246,7 @@ private theorem remoteEnvelopesFromStore_event_mem
           simp [RemoteEnvelopesFromStore] at hfrom
       | cons head tail =>
           simp only [RemoteEnvelopesFromStore] at hfrom
-          rcases hfrom with ⟨hevent, _, _, _, htail⟩
+          rcases hfrom with ⟨_, hevent, _, _, _, htail⟩
           simp only [List.mem_cons] at hmem ⊢
           rcases hmem with rfl | hmem
           · exact Or.inl hevent
@@ -289,7 +290,7 @@ private theorem roundReachabilityInvariant_step
     RoundReachabilityInvariant image transition startPending after := by
   rcases hstep with
     ⟨hnode, hleast, result, htransition, _, _, _, _, _, hpending,
-      _, emittedRemote, hremoteEnvelopes, houtbox, hotherOutboxes⟩
+      _, _, emittedRemote, hremoteEnvelopes, houtbox, hotherOutboxes⟩
   have heventReachable :=
     hinvariant.1 event hleast.1
   have heventTarget : event.target = node.id := hleast.2.1.1
@@ -309,7 +310,7 @@ private theorem roundReachabilityInvariant_step
       · exact hinvariant.2 owner howner envelope (by simpa [hid] using hold)
       · have hremoteEvent :=
           remoteEnvelopesFromStore_event_mem image
-            (after.machine.packetStore node) hremoteEnvelopes hnew
+            node.id (after.machine.packetStore node) hremoteEnvelopes hnew
         have hchild : envelope.event ∈ result.children := by
           exact (List.mem_filter.mp hremoteEvent).1
         have htargetNe : envelope.event.target ≠ node.id := by

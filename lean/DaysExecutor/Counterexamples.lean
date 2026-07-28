@@ -489,6 +489,15 @@ def queueCounterexampleDescriptor (payload : PayloadId) : PacketDescriptor :=
     kind := .data }
 
 /--
+Positive counted fixture entry, corresponding to the descriptor/count pair stored by
+`ResidentPacket` at `executor/src/scalar.rs:375-381`.
+-/
+def queueCounterexampleEntry
+    (payload : PayloadId)
+    (references : Nat := 1) : PacketStoreEntry :=
+  { descriptor := queueCounterexampleDescriptor payload, references }
+
+/--
 Concrete heterogeneous image whose canonical initial queue is exactly the two counterexample
 events. The source host supplies the remote event's origin; the switch owns the finite-capacity
 queue under test, and the terminal host completes the switch's declared route. The incoming
@@ -548,40 +557,179 @@ def queueCounterexampleImage : SimulationImage TinyQueueStateFamily :=
     packetDescriptor := queueCounterexampleDescriptor
     initialPacketStore := fun node =>
       if node = 1 then
-        [queueCounterexampleDescriptor 12, queueCounterexampleDescriptor 21]
+        [queueCounterexampleEntry 12, queueCounterexampleEntry 21]
       else
         []
     initialNextOriginSeq := fun _ => 1
     payloadBytes := fun _ => 1 }
 
 /--
-Executable descriptor-store order regression. The deliberately reversed `[d5, d1]` store is the
-shape admitted by the halted round countermodel and must be incoherent. Starting from sorted
-stores, distinct descriptor installs commute, distinct removals commute, and an install commutes
-with a removal of another payload, matching Rust's payload-keyed `BTreeMap` at
-`executor/src/scalar.rs:367`.
+Executable counted-store order regression. The deliberately reversed `[e5, e1]` store is
+incoherent. Starting from sorted positive entries, distinct acquisitions commute, distinct
+consumptions commute, and acquisition commutes with a held consumption of either a different or
+the same payload. This models Rust's payload-keyed resident map and checked count updates at
+`executor/src/scalar.rs:367-381,1645-1683`.
 -/
 def descriptorStoreOrderIndependenceCheck : Bool :=
   let d1 := queueCounterexampleDescriptor 1
   let d3 := queueCounterexampleDescriptor 3
-  let d5 := queueCounterexampleDescriptor 5
+  let e1 := queueCounterexampleEntry 1
+  let e3 := queueCounterexampleEntry 3
+  let e5 := queueCounterexampleEntry 5
   decide (
-    installDescriptor d3 (installDescriptor d1 []) =
-        installDescriptor d1 (installDescriptor d3 []) ∧
-      removeDescriptor 5 (removeDescriptor 1 [d1, d3, d5]) =
-        removeDescriptor 1 (removeDescriptor 5 [d1, d3, d5]) ∧
-      removeDescriptor 5 (installDescriptor d3 [d1, d5]) =
-        installDescriptor d3 (removeDescriptor 5 [d1, d5]))
+    incrementDescriptorReference d3 (incrementDescriptorReference d1 []) =
+        incrementDescriptorReference d1 (incrementDescriptorReference d3 []) ∧
+      consumeDescriptorReference 5 (consumeDescriptorReference 1 [e1, e3, e5]) =
+        consumeDescriptorReference 1 (consumeDescriptorReference 5 [e1, e3, e5]) ∧
+      consumeDescriptorReference 5 (incrementDescriptorReference d3 [e1, e5]) =
+        incrementDescriptorReference d3 (consumeDescriptorReference 5 [e1, e5]) ∧
+      incrementDescriptorReference d1 (consumeDescriptorReference 1 [e1]) =
+        consumeDescriptorReference 1 (incrementDescriptorReference d1 [e1]))
 
-/-- Canonical descriptor stores are independent of distinct install/removal operation order. -/
+/--
+Canonical counted stores are independent of valid acquisition/consumption order
+(`executor/src/scalar.rs:1645-1683`).
+-/
 def DescriptorStoreOrderIndependenceWitness : Prop :=
   descriptorStoreOrderIndependenceCheck = true
 
+/--
+The exact b/p/a/c events from the round-9 obstruction. Rust count updates occur at
+`executor/src/scalar.rs:1645-1683`; CPU emissions and exchange ownership are at
+`executor/src/cpu.rs:649-667,4485-4500`.
+-/
+def referenceCountBEvent : Event :=
+  { key := { timeNs := 1, phase := 0, originNode := 0, originSeq := 0 }
+    target := 0
+    kind := .packetArrival
+    payload := 12 }
+
+def referenceCountPEvent : Event :=
+  { key := { timeNs := 2, phase := 2, originNode := 1, originSeq := 0 }
+    target := 1
+    kind := .txReady
+    payload := 12 }
+
+def referenceCountAEvent : Event :=
+  { key := { timeNs := 3, phase := 0, originNode := 1, originSeq := 2 }
+    target := 2
+    kind := .remoteArrival
+    payload := 12 }
+
+def referenceCountCEvent : Event :=
+  { key := { timeNs := 4, phase := 1, originNode := 1, originSeq := 1 }
+    target := 1
+    kind := .txComplete
+    payload := 12 }
+
+def referenceCountPChildren : List Event :=
+  [referenceCountCEvent, referenceCountAEvent]
+
+def referenceCountRoundOneBounds : BoundFamily :=
+  fun node => if node = 0 then 1 else 3
+
+def referenceCountRoundOneLPOrder : List NodeId :=
+  [1, 0, 2]
+
+def referenceCountRoundTwoBounds : BoundFamily :=
+  fun _ => 5
+
+def referenceCountRoundTwoLPOrder : List NodeId :=
+  [2, 1, 0]
+
+private def applyReferenceCountBpacEvent
+    (event : Event)
+    (stores : NodeId → List PacketStoreEntry) :
+    NodeId → List PacketStoreEntry :=
+  if event = referenceCountPEvent then
+    fun node =>
+      installChildDescriptorsFor queueCounterexampleImage node referenceCountPChildren
+        (if node = event.target then
+          consumeDescriptorReference event.payload (stores node)
+        else
+          stores node)
+  else
+    fun node =>
+      if node = event.target then
+        consumeDescriptorReference event.payload (stores node)
+      else
+        stores node
+
+/--
+Executable equality regression for the former countermodel. Before `p`, B and S hold the `b`/`p`
+references. CPU emission first leaves two references at S (`c` plus the outbound `a`); exchange
+transfers `a` to A, yielding the same B/S/A counts as scalar immediate target installation.
+Canonical `[b,p,a,c]` and round order `[p,a,c,b]` then consume exactly the same references and
+finish with identical empty per-LP stores. Round one retains bounds B↦1/S↦3/A↦3 and LP order S/B/A;
+round two retains bound 5 and order A/S/B.
+The modeled Rust sites are `executor/src/scalar.rs:1645-1683` and
+`executor/src/cpu.rs:649-667,4485-4500`.
+-/
+def referenceCountBpacCommutativityCheck : Bool :=
+  let initialStores : NodeId → List PacketStoreEntry :=
+    fun node =>
+      if node = 0 ∨ node = 1 then [queueCounterexampleEntry 12] else []
+  let runFrom :
+      (NodeId → List PacketStoreEntry) →
+        List Event → (NodeId → List PacketStoreEntry) :=
+    fun stores (order : List Event) =>
+      order.foldl
+        (fun stores event => applyReferenceCountBpacEvent event stores)
+        stores
+  let scalarAfterP :=
+    applyReferenceCountBpacEvent referenceCountPEvent initialStores
+  let roundAfterPEmission : NodeId → List PacketStoreEntry :=
+    fun node =>
+      if node = referenceCountPEvent.target then
+        holdEmittedChildReferences queueCounterexampleImage referenceCountPChildren
+          (consumeDescriptorReference referenceCountPEvent.payload (initialStores node))
+      else
+        initialStores node
+  let remoteEnvelope : RemoteEnvelope :=
+    { source := referenceCountPEvent.target
+      event := referenceCountAEvent
+      packet := queueCounterexampleDescriptor referenceCountAEvent.payload }
+  let roundAfterExchange : NodeId → List PacketStoreEntry :=
+    fun node =>
+      installRemoteEnvelopesFor node [remoteEnvelope]
+        (consumeRemoteEnvelopesFor node [remoteEnvelope] (roundAfterPEmission node))
+  let canonical := runFrom initialStores
+    [referenceCountBEvent, referenceCountPEvent, referenceCountAEvent, referenceCountCEvent]
+  let round := runFrom roundAfterExchange
+    [referenceCountAEvent, referenceCountCEvent, referenceCountBEvent]
+  decide (
+    referenceCountPChildren = [referenceCountCEvent, referenceCountAEvent] ∧
+      referenceCountRoundOneLPOrder = [1, 0, 2] ∧
+      referenceCountRoundTwoLPOrder = [2, 1, 0] ∧
+      ¬ belowBound referenceCountRoundOneBounds referenceCountBEvent ∧
+      belowBound referenceCountRoundOneBounds referenceCountPEvent ∧
+      ¬ belowBound referenceCountRoundOneBounds referenceCountAEvent ∧
+      ¬ belowBound referenceCountRoundOneBounds referenceCountCEvent ∧
+      belowBound referenceCountRoundTwoBounds referenceCountBEvent ∧
+      belowBound referenceCountRoundTwoBounds referenceCountPEvent ∧
+      belowBound referenceCountRoundTwoBounds referenceCountAEvent ∧
+      belowBound referenceCountRoundTwoBounds referenceCountCEvent ∧
+      descriptorReferenceCount 12 (roundAfterPEmission 0) = 1 ∧
+      descriptorReferenceCount 12 (roundAfterPEmission 1) = 2 ∧
+      descriptorReferenceCount 12 (roundAfterPEmission 2) = 0 ∧
+      descriptorReferenceCount 12 (roundAfterExchange 0) = 1 ∧
+      descriptorReferenceCount 12 (roundAfterExchange 1) = 1 ∧
+      descriptorReferenceCount 12 (roundAfterExchange 2) = 1 ∧
+      ([0, 1, 2] : List NodeId).map scalarAfterP =
+        ([0, 1, 2] : List NodeId).map roundAfterExchange ∧
+      ([0, 1, 2] : List NodeId).map canonical =
+        ([0, 1, 2] : List NodeId).map round ∧
+      (([0, 1, 2] : List NodeId).all fun node => (canonical node).isEmpty) = true)
+
+theorem referenceCountBpacCommutativity :
+    referenceCountBpacCommutativityCheck = true := by
+  native_decide
+
 theorem reversedDescriptorStoreCountermodel_incoherent :
     ¬ DescriptorStoreCoherent queueCounterexampleImage
-      [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1] := by
+      [queueCounterexampleEntry 5, queueCounterexampleEntry 1] := by
   simp [DescriptorStoreCoherent, DescriptorStoreSorted,
-    queueCounterexampleImage, queueCounterexampleDescriptor]
+    queueCounterexampleImage, queueCounterexampleEntry, queueCounterexampleDescriptor]
 
 /--
 Embedding the reversed descriptor store at the switch LP violates the machine invariant required
@@ -592,7 +740,7 @@ theorem reversedDescriptorStoreCountermodel_not_wellFormed
     (hstore :
       machine.packetStore
           { id := 1, kind := .switch, stateSlot := 0 } =
-        [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1]) :
+        [queueCounterexampleEntry 5, queueCounterexampleEntry 1]) :
     ¬ MachineWellFormed queueCounterexampleImage machine := by
   intro hwellFormed
   let node : NodeDescriptor :=
@@ -602,7 +750,7 @@ theorem reversedDescriptorStoreCountermodel_not_wellFormed
   have hcoherent := hwellFormed.2.2.2.2.1 node hnode
   have hstore' :
       machine.packetStore node =
-        [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1] := by
+        [queueCounterexampleEntry 5, queueCounterexampleEntry 1] := by
     simpa [node] using hstore
   rw [hstore'] at hcoherent
   exact reversedDescriptorStoreCountermodel_incoherent hcoherent
@@ -613,12 +761,12 @@ theorem reversedDescriptorStoreCountermodel_not_postExchangeStart
     (hstore :
       round.machine.packetStore
           { id := 1, kind := .switch, stateSlot := 0 } =
-        [queueCounterexampleDescriptor 5, queueCounterexampleDescriptor 1]) :
+        [queueCounterexampleEntry 5, queueCounterexampleEntry 1]) :
     ¬ PostExchangeStart queueCounterexampleImage round := by
   intro hstart
   exact
     reversedDescriptorStoreCountermodel_not_wellFormed
-      round.machine hstore hstart.2
+      round.machine hstore hstart.2.1
 
 /-- Role-correct initial state selected through the concrete image's state arenas. -/
 def queueCounterexampleLocalState
@@ -752,8 +900,8 @@ def tinyQueueTransitionResult
     | .packetArrival => state
   { nextState
     children := tinyQueueServiceChildren node event selected
-    packetInstalls := []
-    packetRemovals := []
+    packetReferenceIncrements := []
+    packetReferenceConsumptions := [event.payload]
     summaryDelta := RunSummary.zero
     observedPackets := []
     departures := []
@@ -776,13 +924,11 @@ def tinyQueueTransition (eager : Bool) : TransitionRelation TinyQueueStateFamily
 
 /--
 Executable per-LP commutation sketch for the accepted FIFO instance. Two decisionless arrivals on
-distinct LPs have no child or descriptor effects, so each local application touches only its own
-store component. Updating those two components in either order gives pointwise-equal stores for
-every declared LP. This is the concrete disjoint-store case required by the strengthened
-`IndependentStepsCommute` obligation; immutable child installs in service-start cases are
-canonical and idempotent, while live-reference removal conflicts are rejected separately.
+distinct LPs consume their own held event references, so each local application touches only its
+own counted store. Updating the components in either order gives pointwise-equal stores. This is
+the concrete disjoint-count case required by `IndependentStepsCommute`.
 The ownership split mirrors `CpuLp.transitions` at `executor/src/cpu.rs:563-569`, local drain at
-lines 586-690, and the later canonical install at lines 4485-4500.
+lines 586-690, and checked scalar consumption at `executor/src/scalar.rs:1661-1683`.
 -/
 def fifoPerLPStoreCommutationCheck : Bool :=
   let firstNode : NodeDescriptor :=
@@ -803,10 +949,16 @@ def fifoPerLPStoreCommutationCheck : Bool :=
     tinyQueueTransitionResult false firstNode firstEvent firstState
   let secondResult :=
     tinyQueueTransitionResult false secondNode secondEvent secondState
-  let stores := initialPacketStore queueCounterexampleImage
+  let initialStores := initialPacketStore queueCounterexampleImage
+  let stores : NodeDescriptor → List PacketStoreEntry :=
+    fun owner =>
+      if owner.id = secondNode.id then
+        [queueCounterexampleEntry secondEvent.payload]
+      else
+        initialStores owner
   let replaceStore :=
-    fun (owner : NodeDescriptor) (value : List PacketDescriptor)
-        (current : NodeDescriptor → List PacketDescriptor) =>
+    fun (owner : NodeDescriptor) (value : List PacketStoreEntry)
+        (current : NodeDescriptor → List PacketStoreEntry) =>
       fun candidate =>
         if candidate.id = owner.id then value else current candidate
   let firstStore := applyPacketEffects firstResult (stores firstNode)
@@ -821,20 +973,19 @@ def fifoPerLPStoreCommutationCheck : Bool :=
     firstNode.id ≠ secondNode.id ∧
       firstResult.children = [] ∧
       secondResult.children = [] ∧
-      firstResult.packetInstalls = [] ∧
-      firstResult.packetRemovals = [] ∧
-      secondResult.packetInstalls = [] ∧
-      secondResult.packetRemovals = [] ∧
+      firstResult.packetReferenceIncrements = [] ∧
+      firstResult.packetReferenceConsumptions = [firstEvent.payload] ∧
+      secondResult.packetReferenceIncrements = [] ∧
+      secondResult.packetReferenceConsumptions = [secondEvent.payload] ∧
       queueCounterexampleImage.nodes.map afterFirstThenSecond =
         queueCounterexampleImage.nodes.map afterSecondThenFirst)
 
 /--
-Executable strengthened-FIFO satisfiability sketch. Canonical selection is identical under
-replacement private state, appends and records packet 12, emits exactly one required child of each
-kind, keeps the emitted descriptor at its remote target after source-side removal, preserves exact
-list equality and observation-key fidelity across a decisionless arrival, removes exactly packet
-12 on completion, and includes the distinct-LP store-commutation check above. The committed-service
-list is duplicate-free initially and after every step.
+Executable strengthened-FIFO satisfiability sketch. Canonical selection is identical under private
+replacement, consumes the ready-event reference, creates two child references, transfers the remote
+one, and consumes the completion reference to zero. Exact source/target counts therefore match the
+transmitter decrement and CPU exchange sites at
+`executor/src/scalar.rs:1645-1683` and `executor/src/cpu.rs:649-667,4485-4500`.
 -/
 def fifoStrengthenedServiceContractCheck : Bool :=
   let node : NodeDescriptor :=
@@ -862,14 +1013,21 @@ def fifoStrengthenedServiceContractCheck : Bool :=
       let remoteStore :=
         installChildDescriptorsFor
           queueCounterexampleImage 2 readyResult.children []
-      let sourceStoreAfterRemoval :=
-        removeDescriptor 12 [queueCounterexampleDescriptor 12]
+      let sourceStoreAfterEmission :=
+        holdEmittedChildReferences queueCounterexampleImage readyResult.children
+          (applyPacketEffects readyResult [queueCounterexampleEntry 12])
+      let sourceStoreAfterExchange :=
+        consumeDescriptorReference remote.payload sourceStoreAfterEmission
+      let sourceStoreAfterCompletion :=
+        applyPacketEffects afterCompletion sourceStoreAfterExchange
       decide (
         fifoPerLPStoreCommutationCheck = true ∧
           SameServiceSelectionResult readyResult alternateReadyResult ∧
           ObservationRecordsUseEventKey queueCounterexampleReady readyResult ∧
-          sourceStoreAfterRemoval = [] ∧
-          queueCounterexampleDescriptor 12 ∈ remoteStore ∧
+          descriptorReferenceCount 12 sourceStoreAfterEmission = 2 ∧
+          descriptorReferenceCount 12 sourceStoreAfterExchange = 1 ∧
+          descriptorReferenceCount 12 remoteStore = 1 ∧
+          sourceStoreAfterCompletion = [] ∧
           initial.committedService.Nodup ∧
           SelectionIntroduced initial readyResult.nextState 12 ∧
           CommittedServiceTransitionValid
@@ -903,10 +1061,11 @@ def fifoStrengthenedServiceContractCheck : Bool :=
   | _ => false
 
 /--
-Executable regression for the packet-lifetime removal race. Without a lifetime condition,
-install-then-remove and remove-then-exchange diverge. The modeled removal is rejected both while
-the remote child remains in the scalar pending queue and while its coherent descriptor-carrying
-envelope remains in a round outbox.
+Executable count-form regression for the former packet-lifetime removal race. A held consumption
+commutes with a reference acquisition, both pending-event and envelope references have positive
+counts, and consuming twice from a single reference is rejected. This mirrors checked decrement at
+`executor/src/scalar.rs:1661-1683` and CPU envelope ownership at
+`executor/src/cpu.rs:627-667,4485-4500`.
 -/
 def packetLifetimeRemovalRaceRejectedCheck : Bool :=
   let payload : PayloadId := 12
@@ -921,22 +1080,32 @@ def packetLifetimeRemovalRaceRejectedCheck : Bool :=
       kind := .remoteArrival
       payload }
   let envelope : RemoteEnvelope :=
-    { event, packet := descriptor }
+    { source := 1, event, packet := descriptor }
   let state := queueCounterexampleLocalState node
-  let removal :=
+  let consumption :=
     { tinyQueueTransitionResult false node event state with
-      packetRemovals := [payload] }
-  let installThenRemove :=
-    removeDescriptor payload (installDescriptor descriptor [descriptor])
-  let removeThenExchange :=
-    installDescriptor descriptor (removeDescriptor payload [descriptor])
-  decide (installThenRemove ≠ removeThenExchange) &&
+      packetReferenceConsumptions := [payload] }
+  let underConsumption :=
+    { consumption with packetReferenceConsumptions := [payload, payload] }
+  let held := [queueCounterexampleEntry payload]
+  let consumeThenIncrement :=
+    incrementDescriptorReference descriptor
+      (consumeDescriptorReference payload held)
+  let incrementThenConsume :=
+    consumeDescriptorReference payload
+      (incrementDescriptorReference descriptor held)
+  decide (consumeThenIncrement = incrementThenConsume) &&
     decide (envelope.packet =
       queueCounterexampleImage.packetDescriptor envelope.event.payload) &&
-    !packetRemovalsRespectReferencesCheck removal [event] &&
-    !packetRemovalsRespectReferencesCheck removal [envelope.event]
+    decide (PacketReferencesHeld [event.payload] held) &&
+    decide (PacketReferencesHeld [envelope.event.payload] held) &&
+    decide (ReferenceConsumptionsValid consumption held) &&
+    decide (¬ ReferenceConsumptionsValid underConsumption held)
 
-/-- The removal-race shape is rejected by both pending-event and buffered-envelope references. -/
+/--
+The former removal race commutes, while Rust's checked under-consumption remains impossible
+(`executor/src/scalar.rs:1672-1683`).
+-/
 def PacketLifetimeRemovalRaceRejectedShape : Prop :=
   packetLifetimeRemovalRaceRejectedCheck = true
 
@@ -1068,8 +1237,10 @@ def privatePayloadSmugglingCheck : Bool :=
       smuggledResult.nextState.committedService =
         alternateResult.nextState.committedService ∧
       smuggledResult.decisions = alternateResult.decisions ∧
-      smuggledResult.packetInstalls = alternateResult.packetInstalls ∧
-      smuggledResult.packetRemovals = alternateResult.packetRemovals ∧
+      smuggledResult.packetReferenceIncrements =
+        alternateResult.packetReferenceIncrements ∧
+      smuggledResult.packetReferenceConsumptions =
+        alternateResult.packetReferenceConsumptions ∧
       smuggledResult.summaryDelta = alternateResult.summaryDelta ∧
       smuggledResult.observedPackets = alternateResult.observedPackets ∧
       smuggledResult.departures = alternateResult.departures ∧

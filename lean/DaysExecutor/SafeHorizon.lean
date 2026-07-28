@@ -167,10 +167,12 @@ def BoundFamilyWithinStop
   ∀ node ∈ image.nodes, bounds node.id ≤ stopExclusive image.stopTimeNs
 
 /--
-CPU exchange payload mirroring `executor/src/cpu.rs:694-698`. Descriptor equality with the
-immutable oracle prevents event-only exchange from hiding missing or corrupt packet data.
+CPU exchange payload mirroring `executor/src/cpu.rs:694-698`, with the source LP retained as a
+proof-relevant owner for transferring its counted outbox reference. Descriptor equality with the
+oracle prevents event-only exchange from hiding missing or corrupt packet data.
 -/
 structure RemoteEnvelope where
+  source : NodeId
   event : Event
   packet : PacketDescriptor
   deriving DecidableEq, Repr
@@ -182,20 +184,24 @@ def RemoteEnvelope.Coherent
   envelope.packet = image.packetDescriptor envelope.event.payload
 
 /--
-Descriptor-carrying envelopes built in child-emission order from descriptors actually present in
-the emitting LP's post-transition store.
+Descriptor-carrying envelopes built in child-emission order from positive counted entries at the
+source LP. Rust builds them after dispatch at `executor/src/cpu.rs:627-667`; the source field is a
+Lean ownership ghost used to model the later target install at lines 4485-4500.
 -/
 def RemoteEnvelopesFromStore
     (image : SimulationImage State)
-    (store : List PacketDescriptor) :
+    (source : NodeId)
+    (store : List PacketStoreEntry) :
     List Event → List RemoteEnvelope → Prop
   | [], [] => True
   | event :: events, envelope :: envelopes =>
-      envelope.event = event ∧
-        envelope.packet ∈ store ∧
+      envelope.source = source ∧
+        envelope.event = event ∧
+        (∃ entry ∈ store,
+          entry.descriptor = envelope.packet ∧ 0 < entry.references) ∧
         envelope.packet.id = event.payload ∧
         RemoteEnvelope.Coherent image envelope ∧
-        RemoteEnvelopesFromStore image store events envelopes
+        RemoteEnvelopesFromStore image source store events envelopes
   | _, _ => False
 
 /--
@@ -205,6 +211,21 @@ at `executor/src/cpu.rs:586-698`.
 structure RoundState (State : StateFamily) where
   machine : MachineState State
   outboxes : NodeId → List RemoteEnvelope
+
+/--
+Every pending event and buffered envelope is backed by a distinct positive reference at its current
+LP. This is the round-local lifetime invariant combining CPU future ownership and outboxes at
+`executor/src/cpu.rs:563-569,627-667` with checked zero removal at
+`executor/src/scalar.rs:1661-1698`.
+-/
+def RoundReferencesHeld
+    (image : SimulationImage State)
+    (state : RoundState State) : Prop :=
+  ∀ node ∈ image.nodes,
+    PacketReferencesHeld
+      (((state.machine.pending.filter fun event => event.target = node.id).map Event.payload) ++
+        (state.outboxes node.id).map fun envelope => envelope.event.payload)
+      (state.machine.packetStore node)
 
 /--
 Local children produced by one LP, corresponding to immediate local insertion at
@@ -237,7 +258,9 @@ and the future-event list is canonical, mirroring the barrier boundary between
 def PostExchangeStart
     (image : SimulationImage State)
     (state : RoundState State) : Prop :=
-  AllOutboxesEmpty image state ∧ MachineWellFormed image state.machine
+  AllOutboxesEmpty image state ∧
+    MachineWellFormed image state.machine ∧
+      RoundReferencesHeld image state
 
 /--
 One sequential local LP step below its half-open bound. Local children enter the future list
@@ -265,12 +288,7 @@ def LocalRoundStep
           (image.nodes.flatMap fun owner => before.outboxes owner.id).map
             RemoteEnvelope.event) ∧
       AllocatesChildrenInOrder node result.children before.machine after.machine ∧
-      AppliesTransitionResult image node result
-        ((before.machine.pending.erase event) ++
-          (image.nodes.flatMap fun owner => before.outboxes owner.id).map
-            RemoteEnvelope.event ++
-          result.children)
-        before.machine after.machine ∧
+      AppliesTransitionResult image node result before.machine after.machine ∧
       DescriptorStoreCoherent image (after.machine.packetStore node) ∧
       ChildDescriptorsAvailable image
         (after.machine.packetStore node) result.children ∧
@@ -281,8 +299,10 @@ def LocalRoundStep
       after.machine.emissions =
         before.machine.emissions ++
           (result.children.map fun child => (event, child)) ∧
+      RoundReferencesHeld image after ∧
       ∃ emittedRemote,
         RemoteEnvelopesFromStore image
+          node.id
           (after.machine.packetStore node)
           (remoteChildren node.id result.children)
           emittedRemote ∧
@@ -365,25 +385,44 @@ def flattenedOutboxes
     (state : RoundState State) : List RemoteEnvelope :=
   image.nodes.flatMap fun node => state.outboxes node.id
 
-/-- Install all canonically ordered envelopes for one target LP. -/
+/--
+Acquire all canonically ordered incoming envelope references for one target LP, corresponding to
+target installation at `executor/src/cpu.rs:4485-4500`.
+-/
 def installRemoteEnvelopesFor
     (target : NodeId)
     (ordered : List RemoteEnvelope)
-    (store : List PacketDescriptor) : List PacketDescriptor :=
+    (store : List PacketStoreEntry) : List PacketStoreEntry :=
   ordered.foldl
     (fun current envelope =>
       if envelope.event.target = target then
-        installDescriptor envelope.packet current
+        incrementDescriptorReference envelope.packet current
       else
         current)
     store
 
 /--
-Complete exactly-once canonical exchange: all and only buffered remote events are ordered by
-`(target, EventKey)`, their descriptors are installed before their future events, and every outbox
-is emptied, mirroring `executor/src/cpu.rs:4453-4506`. `LocalRoundStep` treats every buffered
-envelope as a live payload reference, so this install can materialize target-local availability but
-cannot resurrect a descriptor removed while the envelope was buffered.
+Consume all canonically ordered outgoing envelope references for one source LP before their target
+acquisitions. Under-consumption is excluded by `CompleteCanonicalExchange`, paralleling checked
+decrement at `executor/src/scalar.rs:1661-1683`.
+-/
+def consumeRemoteEnvelopesFor
+    (source : NodeId)
+    (ordered : List RemoteEnvelope)
+    (store : List PacketStoreEntry) : List PacketStoreEntry :=
+  ordered.foldl
+    (fun current envelope =>
+      if envelope.source = source then
+        consumeDescriptorReference envelope.event.payload current
+      else
+        current)
+    store
+
+/--
+Complete exactly-once canonical exchange: all buffered remote reference counts move from source
+outboxes to targets before future-event insertion, and every outbox is emptied. This models envelope
+creation and target installation at `executor/src/cpu.rs:649-667,4453-4506`; multiplicity-aware
+heldness excludes under-consumption and descriptor resurrection.
 -/
 def CompleteCanonicalExchange
     (image : SimulationImage State)
@@ -393,10 +432,16 @@ def CompleteCanonicalExchange
     ordered.Pairwise exchangeLT ∧
     (∀ envelope ∈ ordered, RemoteEnvelope.Coherent image envelope) ∧
     (∀ node ∈ image.nodes,
+      PacketReferencesHeld
+        ((ordered.filter fun envelope => envelope.source = node.id).map
+          fun envelope => envelope.event.payload)
+        (drained.machine.packetStore node)) ∧
+    (∀ node ∈ image.nodes,
       next.machine.localState node = drained.machine.localState node ∧
         next.machine.packetStore node =
           installRemoteEnvelopesFor node.id ordered
-            (drained.machine.packetStore node)) ∧
+            (consumeRemoteEnvelopesFor node.id ordered
+              (drained.machine.packetStore node))) ∧
     next.machine.pending =
       insertEvents (ordered.map RemoteEnvelope.event) drained.machine.pending ∧
     next.machine.summary = drained.machine.summary ∧
@@ -406,7 +451,8 @@ def CompleteCanonicalExchange
     next.machine.nextOriginSeq = drained.machine.nextOriginSeq ∧
     next.machine.allocatedKeys = drained.machine.allocatedKeys ∧
     next.machine.emissions = drained.machine.emissions ∧
-    AllOutboxesEmpty image next
+    RoundReferencesHeld image next ∧
+      AllOutboxesEmpty image next
 
 /--
 One valid safe-horizon round over a drained consistent cut: post-exchange start, valid progressive
