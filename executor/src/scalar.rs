@@ -144,6 +144,19 @@ pub enum ExecutionError {
         key: EventKey,
         exclusive_horizon_ns: u128,
     },
+    InvalidCpuConfig(&'static str),
+    WorkerFailed {
+        worker: usize,
+        round: u64,
+    },
+    WorkerPanicked {
+        worker: usize,
+    },
+    WorkerChannelDisconnected,
+    OutboxCapacityExceeded {
+        node: NodeId,
+        capacity: usize,
+    },
     NonMonotoneChild {
         parent: EventKey,
         child: EventKey,
@@ -264,6 +277,22 @@ impl fmt::Display for ExecutionError {
                 "LP still has event {key:?} below exclusive safe horizon \
                  {exclusive_horizon_ns} after its drain"
             ),
+            Self::InvalidCpuConfig(message) => {
+                write!(formatter, "invalid CPU executor configuration: {message}")
+            }
+            Self::WorkerFailed { worker, round } => {
+                write!(formatter, "CPU worker {worker} failed during round {round}")
+            }
+            Self::WorkerPanicked { worker } => {
+                write!(formatter, "CPU worker {worker} panicked")
+            }
+            Self::WorkerChannelDisconnected => {
+                write!(formatter, "CPU worker channel disconnected")
+            }
+            Self::OutboxCapacityExceeded { node, capacity } => write!(
+                formatter,
+                "LP {node:?} exceeded its configured outbox capacity of {capacity} events"
+            ),
             Self::NonMonotoneChild { parent, child } => {
                 write!(
                     formatter,
@@ -334,6 +363,7 @@ pub(crate) struct TransitionState<'image> {
     image: &'image SimulationImage,
     host_states: Vec<HostState>,
     switch_states: Vec<SwitchState>,
+    local_node: Option<NodeDescriptor>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
     observation_mode: ObservationMode,
     summary: RunSummary,
@@ -348,6 +378,21 @@ struct ResidentPacket {
     source_time_ns: Option<u64>,
     transmitters: u64,
     terminal: bool,
+}
+
+pub(crate) enum LocalNodeState {
+    Host(HostState),
+    Switch(SwitchState),
+}
+
+pub(crate) struct LocalTransitionResult {
+    pub node: NodeDescriptor,
+    pub state: LocalNodeState,
+    pub summary: RunSummary,
+    pub resident_packets: Vec<PacketDescriptor>,
+    pub observed_packets: Vec<PacketDescriptor>,
+    pub departures: Vec<(EventKey, PacketDeparture)>,
+    pub arrivals: Vec<(EventKey, PacketArrivalObservation)>,
 }
 
 #[derive(Clone, Copy)]
@@ -405,6 +450,7 @@ impl<'image> TransitionState<'image> {
             image,
             host_states: image.host_states.clone(),
             switch_states: image.switch_states.clone(),
+            local_node: None,
             packets,
             observation_mode,
             summary: RunSummary::default(),
@@ -414,7 +460,120 @@ impl<'image> TransitionState<'image> {
         })
     }
 
+    pub(crate) fn new_local(
+        image: &'image SimulationImage,
+        node: NodeDescriptor,
+        packets: impl IntoIterator<Item = PacketDescriptor>,
+        observation_mode: ObservationMode,
+    ) -> Result<Self, ExecutionError> {
+        let (host_states, switch_states) = match node.kind {
+            NodeKind::Host => {
+                let state = image
+                    .host_states
+                    .get(node.state_slot as usize)
+                    .cloned()
+                    .ok_or(ExecutionError::InvalidStateSlot {
+                        node: node.id,
+                        kind: node.kind,
+                        state_slot: node.state_slot,
+                    })?;
+                (vec![state], Vec::new())
+            }
+            NodeKind::Switch => {
+                let state = image
+                    .switch_states
+                    .get(node.state_slot as usize)
+                    .cloned()
+                    .ok_or(ExecutionError::InvalidStateSlot {
+                        node: node.id,
+                        kind: node.kind,
+                        state_slot: node.state_slot,
+                    })?;
+                (Vec::new(), vec![state])
+            }
+        };
+
+        let mut resident = BTreeMap::new();
+        for descriptor in packets {
+            if resident
+                .insert(
+                    descriptor.id,
+                    ResidentPacket {
+                        descriptor,
+                        source_time_ns: None,
+                        transmitters: 0,
+                        terminal: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ExecutionError::DuplicatePayload(descriptor.id));
+            }
+        }
+        let in_service = match node.kind {
+            NodeKind::Host => host_states[0].in_service.into_iter().collect::<Vec<_>>(),
+            NodeKind::Switch => switch_states[0]
+                .queues
+                .iter()
+                .filter_map(|queue| queue.in_service)
+                .collect(),
+        };
+        for payload in in_service {
+            let packet = resident
+                .get_mut(&payload)
+                .ok_or(ExecutionError::UnknownPacket(payload))?;
+            packet.transmitters = packet
+                .transmitters
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        }
+
+        Ok(Self {
+            image,
+            host_states,
+            switch_states,
+            local_node: Some(node),
+            packets: resident,
+            observation_mode,
+            summary: RunSummary::default(),
+            observed_packets: BTreeMap::new(),
+            departures: Vec::new(),
+            arrivals: Vec::new(),
+        })
+    }
+
+    pub(crate) fn install_packet(
+        &mut self,
+        descriptor: PacketDescriptor,
+    ) -> Result<(), ExecutionError> {
+        if let Some(existing) = self.packets.get(&descriptor.id) {
+            return if existing.descriptor == descriptor {
+                Ok(())
+            } else {
+                Err(ExecutionError::DuplicatePayload(descriptor.id))
+            };
+        }
+        self.packets.insert(
+            descriptor.id,
+            ResidentPacket {
+                descriptor,
+                source_time_ns: None,
+                transmitters: 0,
+                terminal: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn packet_descriptor(
+        &self,
+        payload: PayloadId,
+    ) -> Result<PacketDescriptor, ExecutionError> {
+        self.packet(payload)
+    }
+
     pub(crate) fn finish(mut self, pending_events: Vec<Event>) -> RunResult {
+        debug_assert!(self.local_node.is_none());
         let resident_packets = self
             .packets
             .into_values()
@@ -440,6 +599,39 @@ impl<'image> TransitionState<'image> {
                 .map(|(_, arrival)| arrival)
                 .collect(),
             pending_events,
+        }
+    }
+
+    pub(crate) fn finish_local(mut self) -> LocalTransitionResult {
+        let node = self
+            .local_node
+            .expect("finish_local requires node-local transition state");
+        self.departures.sort_unstable_by_key(|(key, _)| *key);
+        self.arrivals.sort_unstable_by_key(|(key, _)| *key);
+        let state = match node.kind {
+            NodeKind::Host => LocalNodeState::Host(
+                self.host_states
+                    .pop()
+                    .expect("local host transition state owns one host"),
+            ),
+            NodeKind::Switch => LocalNodeState::Switch(
+                self.switch_states
+                    .pop()
+                    .expect("local switch transition state owns one switch"),
+            ),
+        };
+        LocalTransitionResult {
+            node,
+            state,
+            summary: self.summary,
+            resident_packets: self
+                .packets
+                .into_values()
+                .map(|packet| packet.descriptor)
+                .collect(),
+            observed_packets: self.observed_packets.into_values().collect(),
+            departures: self.departures,
+            arrivals: self.arrivals,
         }
     }
 
@@ -478,14 +670,10 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
         let owns_generator = self
-            .host_states
-            .get(node.state_slot as usize)
-            .is_some_and(|state| {
-                state
-                    .generators
-                    .iter()
-                    .any(|generator| generator.flow == packet.flow)
-            });
+            .host_state(node)?
+            .generators
+            .iter()
+            .any(|generator| generator.flow == packet.flow);
         if !owns_generator {
             return self.host_preloaded_packet_arrival(node, event, children);
         }
@@ -1131,8 +1319,9 @@ impl<'image> TransitionState<'image> {
     }
 
     fn host_state_mut(&mut self, node: NodeDescriptor) -> Result<&mut HostState, ExecutionError> {
+        let state_slot = self.local_state_slot(node)?;
         self.host_states
-            .get_mut(node.state_slot as usize)
+            .get_mut(state_slot)
             .ok_or(ExecutionError::InvalidStateSlot {
                 node: node.id,
                 kind: node.kind,
@@ -1144,13 +1333,33 @@ impl<'image> TransitionState<'image> {
         &mut self,
         node: NodeDescriptor,
     ) -> Result<&mut SwitchState, ExecutionError> {
-        self.switch_states.get_mut(node.state_slot as usize).ok_or(
-            ExecutionError::InvalidStateSlot {
+        let state_slot = self.local_state_slot(node)?;
+        self.switch_states
+            .get_mut(state_slot)
+            .ok_or(ExecutionError::InvalidStateSlot {
                 node: node.id,
                 kind: node.kind,
                 state_slot: node.state_slot,
-            },
-        )
+            })
+    }
+
+    fn host_state(&self, node: NodeDescriptor) -> Result<&HostState, ExecutionError> {
+        let state_slot = self.local_state_slot(node)?;
+        self.host_states
+            .get(state_slot)
+            .ok_or(ExecutionError::InvalidStateSlot {
+                node: node.id,
+                kind: node.kind,
+                state_slot: node.state_slot,
+            })
+    }
+
+    fn local_state_slot(&self, node: NodeDescriptor) -> Result<usize, ExecutionError> {
+        match self.local_node {
+            Some(local) if local == node => Ok(0),
+            Some(_) => Err(ExecutionError::UnknownNode(node.id)),
+            None => Ok(node.state_slot as usize),
+        }
     }
 
     fn link(&self, id: LinkId) -> Result<crate::LinkDescriptor, ExecutionError> {
@@ -1242,12 +1451,7 @@ impl<'image> TransitionState<'image> {
             .get(&payload)
             .and_then(|resident| resident.source_time_ns)
             .ok_or(ExecutionError::UnknownPacket(payload))?;
-        let slot =
-            usize::try_from(node.state_slot).map_err(|_| ExecutionError::InvalidStateSlot {
-                node: node.id,
-                kind: node.kind,
-                state_slot: node.state_slot,
-            })?;
+        let slot = self.local_state_slot(node)?;
         let position = self
             .host_states
             .get(slot)
@@ -1442,7 +1646,7 @@ impl<'image> TransitionState<'image> {
                         actual: payload,
                     },
                 )?;
-                packet.terminal && packet.transmitters == 0
+                packet.transmitters == 0 && (packet.terminal || self.local_node.is_some())
             };
         if remove {
             self.packets.remove(&payload);

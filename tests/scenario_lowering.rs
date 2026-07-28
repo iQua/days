@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    ArrivalDisposition, Backend, EventKind, FlowId, LinkId, NodeId, NodeKind, ObservationMode,
-    PacketArrivalObservation, PacketDeparture, PayloadId, SimulationImage, run_scalar,
-    run_scalar_rounds, run_scalar_with_observations, validate,
+    ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId, NodeId,
+    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PayloadId,
+    SimulationImage, run_cpu, run_scalar, run_scalar_rounds, run_scalar_with_observations,
+    validate,
 };
 use tempfile::TempDir;
 
@@ -687,9 +688,25 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     let result = run_scalar(&first, None).expect("baseline image should run to completion");
     let round_run =
         run_scalar_rounds(&first, None).expect("baseline image should run by safe-horizon rounds");
+    let cpu_run = run_cpu(
+        &first,
+        None,
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Fixed(1),
+            straggler_threshold_events: Some(16),
+            dedicated_straggler_workers: 1,
+            ..CpuConfig::default()
+        },
+    )
+    .expect("baseline image should run on persistent CPU workers");
     assert_eq!(
         round_run.result, result,
         "round execution must match the complete global-priority-queue state"
+    );
+    assert_eq!(
+        cpu_run.result, result,
+        "CPU execution must match the complete global-priority-queue state"
     );
     assert_eq!(result.summary.sourced_packets, 12_000);
     assert_eq!(result.summary.sourced_bytes, 12_000_000);

@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    Backend, ConstantGenerator, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
+    Backend, ChunkGranularity, ConstantGenerator, CpuConfig, CpuFaultInjection, CpuFaultKind,
+    Event, EventKey, EventKind, ExecutionError, FlowDescriptor, FlowGeneratorKind,
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
     PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, event_phase,
-    run_scalar_rounds_with_observations, run_scalar_with_observations, validate,
+    SimulationImage, SwitchQueueState, SwitchState, WorkClass, event_phase,
+    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
+    validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -275,6 +277,18 @@ fn in_flight_completion_and_remote_arrival_remain_valid_and_equivalent() {
         assert_equivalent(&image, None);
 
         let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 4,
+                granularity: ChunkGranularity::Fixed(1),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap();
+        assert_eq!(cpu.result, result);
         assert_eq!(result.summary.departed_packets, 1);
         assert_eq!(result.summary.received_packets, 1);
         assert!(result.resident_packets.is_empty());
@@ -290,10 +304,55 @@ fn ready_control_token_can_coexist_with_an_in_flight_payload() {
     assert_equivalent(&image, None);
 
     let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+    assert_eq!(cpu.result, result);
     assert_eq!(result.summary.departed_packets, 1);
     assert_eq!(result.summary.received_packets, 2);
     assert!(result.resident_packets.is_empty());
     assert!(result.pending_events.is_empty());
+}
+
+#[test]
+fn cpu_preserves_accepted_orphan_packet_snapshots() {
+    let mut lost_remote = in_flight_image(4);
+    lost_remote
+        .initial_events
+        .retain(|event| event.kind == EventKind::TxComplete);
+    validate(&lost_remote, Backend::Scalar).unwrap();
+    validate(&lost_remote, Backend::Cpu { workers: 2 }).unwrap();
+
+    let mut orphan_ready = ready_token_and_remote_arrival_image();
+    orphan_ready
+        .initial_events
+        .retain(|event| event.kind == EventKind::TxReady);
+    validate(&orphan_ready, Backend::Scalar).unwrap();
+    validate(&orphan_ready, Backend::Cpu { workers: 2 }).unwrap();
+
+    for image in [lost_remote, orphan_ready] {
+        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        let actual = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity: ChunkGranularity::Fixed(1),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap();
+        assert_eq!(actual.result, expected);
+    }
 }
 
 #[test]
@@ -309,6 +368,27 @@ fn scalar_rounds_match_the_global_queue_and_record_sparse_round_work() {
     assert_eq!(run.rounds[1].lp_work[0].node, SINK);
     assert_eq!(run.rounds[0].parallel_efficiency, 1.0);
     assert_eq!(run.rounds[1].parallel_efficiency, 1.0);
+}
+
+#[test]
+fn cpu_handles_no_active_lps_and_more_workers_than_nodes() {
+    let mut image = image(100, 0, 10);
+    image.initial_events.clear();
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let actual = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 8,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+
+    assert!(actual.rounds.is_empty());
+    assert_eq!(actual.result, expected);
 }
 
 #[test]
@@ -716,6 +796,18 @@ fn canonical_exchange_reorders_outboxes_before_finite_queue_admission() {
         at_switch[1].disposition,
         days_executor::ArrivalDisposition::Dropped
     );
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+    assert_eq!(cpu.result, run.result);
 }
 
 fn add_idle_switches(image: &mut SimulationImage, count: usize) {
@@ -744,8 +836,10 @@ fn idle_lp_count_does_not_change_round_loop_operations() {
     add_idle_switches(&mut small, 100);
     add_idle_switches(&mut large, 10_000);
 
-    let small = run_scalar_rounds_with_observations(&small, None, ObservationMode::Full).unwrap();
-    let large = run_scalar_rounds_with_observations(&large, None, ObservationMode::Full).unwrap();
+    let scalar_small =
+        run_scalar_rounds_with_observations(&small, None, ObservationMode::Full).unwrap();
+    let scalar_large =
+        run_scalar_rounds_with_observations(&large, None, ObservationMode::Full).unwrap();
     let operations = |run: &days_executor::ScalarRoundRun| {
         run.rounds
             .iter()
@@ -764,7 +858,35 @@ fn idle_lp_count_does_not_change_round_loop_operations() {
             .collect::<Vec<_>>()
     };
 
-    assert_eq!(operations(&small), operations(&large));
+    assert_eq!(operations(&scalar_small), operations(&scalar_large));
+
+    let config = CpuConfig {
+        workers: 4,
+        granularity: ChunkGranularity::Fixed(1),
+        ..CpuConfig::default()
+    };
+    let cpu_small = run_cpu_with_observations(&small, None, config, ObservationMode::Full).unwrap();
+    let cpu_large = run_cpu_with_observations(&large, None, config, ObservationMode::Full).unwrap();
+    let cpu_operations = |run: &days_executor::CpuRun| {
+        run.rounds
+            .iter()
+            .map(|round| {
+                (
+                    round.semantic.frontier_ns,
+                    round.semantic.exclusive_horizon_ns,
+                    round.semantic.events_processed,
+                    round.semantic.active_lp_count,
+                    round.semantic.lp_work.clone(),
+                    round.semantic.messages_exchanged,
+                    round.semantic.frontier_updates,
+                    round.semantic.frontier_heap_pops,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cpu_operations(&cpu_small), cpu_operations(&cpu_large));
+    assert_eq!(cpu_small.result, scalar_small.result);
+    assert_eq!(cpu_large.result, scalar_large.result);
 }
 
 #[derive(Clone, Copy)]
@@ -999,4 +1121,319 @@ fn randomized_small_heterogeneous_images_match_complete_global_state() {
         let cut = 1 + (seed * 17) % image.stop_time_ns;
         assert_equivalent(&image, Some(cut));
     }
+}
+
+#[test]
+fn cpu_worker_count_granularity_and_straggler_classification_preserve_complete_state() {
+    for seed in 0..128 {
+        let image = heterogeneous_image(seed);
+        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("seed {seed} scalar execution failed: {error}"));
+
+        for workers in 1..=4 {
+            for granularity in [
+                ChunkGranularity::Static,
+                ChunkGranularity::Fixed(1),
+                ChunkGranularity::Fixed(3),
+            ] {
+                for straggler_threshold_events in [None, Some(0), Some(3)] {
+                    let config = CpuConfig {
+                        workers,
+                        granularity,
+                        straggler_threshold_events,
+                        ..CpuConfig::default()
+                    };
+                    let actual =
+                        run_cpu_with_observations(&image, None, config, ObservationMode::Full)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "seed {seed}, workers {workers}, granularity {granularity:?}, \
+                             threshold {straggler_threshold_events:?} failed: {error}"
+                                )
+                            });
+                    assert_eq!(
+                        actual.result, expected,
+                        "seed {seed}, workers {workers}, granularity {granularity:?}, \
+                         threshold {straggler_threshold_events:?}"
+                    );
+                }
+            }
+        }
+
+        let cut = 1 + (seed * 17) % image.stop_time_ns;
+        let partial_expected =
+            run_scalar_with_observations(&image, Some(cut), ObservationMode::Full).unwrap();
+        let partial_actual = run_cpu_with_observations(
+            &image,
+            Some(cut),
+            CpuConfig {
+                workers: 4,
+                granularity: ChunkGranularity::Fixed(1),
+                straggler_threshold_events: Some(3),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap();
+        assert_eq!(
+            partial_actual.result, partial_expected,
+            "partial-horizon seed {seed}"
+        );
+    }
+}
+
+fn incast_image(sender_count: usize) -> SimulationImage {
+    let sink = NodeId(sender_count as u64);
+    let sink_egress = LinkId(sender_count as u64);
+    let mut nodes = Vec::new();
+    let mut host_states = Vec::new();
+    let mut flows = Vec::new();
+    let mut initial_packets = Vec::new();
+    let mut links = Vec::new();
+    let mut channels = Vec::new();
+    let mut initial_events = Vec::new();
+
+    for sender in 0..sender_count {
+        let sender = NodeId(sender as u64);
+        let link = LinkDescriptor {
+            id: LinkId(sender.0),
+            source: sender,
+            target: sink,
+            rate_bps: 8_000_000_000,
+            propagation_ns: 9,
+        };
+        let flow = FlowId(sender.0);
+        let payload = PayloadId::from_node_sequence(sender, (sender_count + 1) as u64, 0).unwrap();
+        nodes.push(NodeDescriptor {
+            id: sender,
+            kind: NodeKind::Host,
+            state_slot: sender.0 as u32,
+        });
+        host_states.push(HostState {
+            egress_link: link.id,
+            queue: VecDeque::new(),
+            in_service: Some(payload),
+            tx_ready_pending: false,
+            generators: vec![],
+            next_origin_seq: 2,
+            next_payload_seq: 0,
+            sourced_packets: 1,
+            departed_packets: 0,
+            received_packets: 0,
+        });
+        flows.push(FlowDescriptor {
+            id: flow,
+            source: sender,
+            target: sink,
+            route: vec![link.id],
+            reverse_route: vec![],
+        });
+        initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow,
+            size_bytes: 1,
+            kind: PacketKind::Data,
+        });
+        links.push(link);
+        channels.push(RemoteChannel::for_packet_link(link, 1).unwrap());
+        initial_events.push(Event {
+            key: EventKey {
+                time_ns: 10,
+                phase: event_phase(EventKind::TxComplete),
+                origin_node: sender,
+                origin_seq: 0,
+            },
+            target: sender,
+            kind: EventKind::TxComplete,
+            payload,
+        });
+        initial_events.push(Event {
+            key: EventKey {
+                time_ns: 19,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: sender,
+                origin_seq: 1,
+            },
+            target: sink,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+    nodes.push(NodeDescriptor {
+        id: sink,
+        kind: NodeKind::Host,
+        state_slot: sender_count as u32,
+    });
+    host_states.push(HostState {
+        egress_link: sink_egress,
+        queue: VecDeque::new(),
+        in_service: None,
+        tx_ready_pending: false,
+        generators: vec![],
+        next_origin_seq: 0,
+        next_payload_seq: 0,
+        sourced_packets: 0,
+        departed_packets: 0,
+        received_packets: 0,
+    });
+    links.push(LinkDescriptor {
+        id: sink_egress,
+        source: sink,
+        target: NodeId(0),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    });
+    initial_events.sort_unstable_by_key(|event| event.key);
+
+    SimulationImage {
+        stop_time_ns: 19,
+        nodes,
+        host_states,
+        switch_states: vec![],
+        flows,
+        initial_packets,
+        links,
+        channels,
+        initial_events,
+        seed: 1,
+    }
+}
+
+#[test]
+fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
+    let image = incast_image(16);
+    validate(&image, Backend::Scalar).unwrap();
+    validate(&image, Backend::Cpu { workers: 4 }).unwrap();
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let actual = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Fixed(1),
+            straggler_threshold_events: Some(4),
+            dedicated_straggler_workers: 1,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(actual.result, expected);
+    assert_eq!(
+        actual.rounds[0].partition.stragglers,
+        vec![days_executor::LpWorkEstimate {
+            node: NodeId(16),
+            estimated_events: 16,
+        }]
+    );
+    let sink = actual.rounds[0]
+        .lp_timings
+        .iter()
+        .find(|timing| timing.node == NodeId(16))
+        .unwrap();
+    assert_eq!(sink.class, WorkClass::Straggler);
+    assert_eq!(sink.worker, 0);
+    assert_eq!(sink.dispatch_order, 0);
+    assert!(
+        actual.rounds[0]
+            .lp_timings
+            .iter()
+            .filter(|timing| timing.class == WorkClass::Bulk)
+            .all(|timing| timing.worker != sink.worker
+                && timing.started_after_ns >= sink.started_after_ns)
+    );
+}
+
+#[test]
+fn cpu_worker_faults_and_capacity_errors_abort_without_a_partial_result() {
+    let image = image(100, 0, 10);
+    for (kind, expected) in [
+        (
+            CpuFaultKind::Failure,
+            ExecutionError::WorkerFailed {
+                worker: 0,
+                round: 0,
+            },
+        ),
+        (
+            CpuFaultKind::Panic,
+            ExecutionError::WorkerPanicked { worker: 0 },
+        ),
+    ] {
+        let error = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                granularity: ChunkGranularity::Fixed(1),
+                fault_injection: Some(CpuFaultInjection {
+                    worker: 0,
+                    round: 0,
+                    after_events: 1,
+                    kind,
+                }),
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("an injected worker fault must abort the run");
+        assert_eq!(error, expected);
+    }
+
+    let capacity_error = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            granularity: ChunkGranularity::Fixed(1),
+            max_outbox_events_per_lp: Some(0),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("an exhausted LP outbox must abort the run");
+    assert_eq!(
+        capacity_error,
+        ExecutionError::OutboxCapacityExceeded {
+            node: SOURCE,
+            capacity: 0,
+        }
+    );
+
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let clean = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("a clean rerun after injected failures must succeed");
+    assert_eq!(clean.result, expected);
+}
+
+#[test]
+fn cpu_arithmetic_overflow_aborts_with_the_scalar_error() {
+    let mut image = image(100, 0, 10);
+    image.host_states[0].next_origin_seq = u64::MAX;
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect_err("the scalar oracle must reject exhausted origin sequences");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("the CPU executor must reject exhausted origin sequences");
+
+    assert_eq!(scalar, ExecutionError::OriginSequenceOverflow(SOURCE));
+    assert_eq!(cpu, scalar);
 }

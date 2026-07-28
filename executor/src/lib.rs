@@ -3,6 +3,7 @@
 //! Fixed-width event records and exact integer-time helpers form the common input contract for
 //! later CPU and GPU executors. The scalar backend defines their executable reference behavior.
 
+pub mod cpu;
 pub mod event;
 pub mod image;
 pub mod model;
@@ -11,6 +12,11 @@ pub mod scalar;
 pub mod time;
 pub mod validate;
 
+pub use cpu::{
+    ChunkGranularity, CpuConfig, CpuFaultInjection, CpuFaultKind, CpuRoundMetrics, CpuRun,
+    LpExecutionTiming, LpWorkEstimate, WorkClass, WorkPartition, WorkerRoundTiming, run_cpu,
+    run_cpu_with_observations,
+};
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
     ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,

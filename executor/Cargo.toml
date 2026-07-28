@@ -8,3 +8,4 @@ license = "AGPL-3.0-only"
 name = "days_executor"
 
 [dependencies]
+crossbeam = "0.8.4"
