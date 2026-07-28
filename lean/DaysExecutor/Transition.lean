@@ -317,13 +317,67 @@ def ServiceDecisionTraceComplete
         ∃ decision ∈ result.decisions, decision.packet = packet
 
 /--
-Two transition results agree on every service-selection observable. Private bookkeeping may differ,
-but the ordered queue, committed ledger, and recorded decision do not.
+One recorded service decision commits and emits the same packet. Successful host and switch
+`TxReady` handlers schedule both a local `TxComplete` and a `RemoteArrival`, and every child of
+either kind carries the selected payload at
+`executor/src/scalar.rs:899-921,1145-1166`.
+-/
+def ServiceDecisionChildrenMatch
+    (result : TransitionResult State kind) : Prop :=
+  ∀ decision ∈ result.decisions,
+    (∃ child ∈ result.children,
+      child.kind = .txComplete ∧ child.payload = decision.packet) ∧
+    (∃ child ∈ result.children,
+      child.kind = .remoteArrival ∧ child.payload = decision.packet) ∧
+    ∀ child ∈ result.children,
+      child.kind = .txComplete ∨ child.kind = .remoteArrival →
+        child.payload = decision.packet
+
+/-- Every successful service decision has payload-consistent completion and arrival children. -/
+def ServiceDecisionEmissionsMatch
+    (transition : TransitionRelation State) : Prop :=
+  ∀ node event state result,
+    transition node event state result →
+    ServiceDecisionChildrenMatch result
+
+/--
+Committed service is non-preemptive. Every existing commitment survives a non-completion
+transition; a successful `TxComplete` must match its payload and removes exactly that commitment.
+This mirrors the checked host and switch completion paths at
+`executor/src/scalar.rs:932-940,1193-1200`.
+-/
+def CommittedServiceTransitionValid
+    (event : Event)
+    (before after : RoleState State kind) : Prop :=
+  if event.kind = .txComplete then
+    event.payload ∈ before.committedService ∧
+      after.committedService = before.committedService.erase event.payload
+  else
+    ∀ packet ∈ before.committedService, packet ∈ after.committedService
+
+/-- Every successful handler preserves already committed service until its matching completion. -/
+def CommittedServiceNonPreemptive
+    (transition : TransitionRelation State) : Prop :=
+  ∀ node event state result,
+    transition node event state result →
+    CommittedServiceTransitionValid event state result.nextState
+
+/--
+Two transition results agree on every externally visible effect of service selection. Replacement
+private bookkeeping may differ, but the public next state, emitted children, packet-store effects,
+summary and observation effects, and decision trace do not.
 -/
 def SameServiceSelectionResult
     (left right : TransitionResult State kind) : Prop :=
   left.nextState.serviceQueue = right.nextState.serviceQueue ∧
     left.nextState.committedService = right.nextState.committedService ∧
+    left.children = right.children ∧
+    left.packetInstalls = right.packetInstalls ∧
+    left.packetRemovals = right.packetRemovals ∧
+    left.summaryDelta = right.summaryDelta ∧
+    left.observedPackets = right.observedPackets ∧
+    left.departures = right.departures ∧
+    left.arrivals = right.arrivals ∧
     left.decisions = right.decisions
 
 /-- Service-selection result agreement is executable for finite result data. -/
@@ -339,7 +393,8 @@ visible at that instant. The alternate transition must exist for every replaceme
 so a relation cannot make this premise vacuous with a private/ledger consistency guard.
 
 An accepted FIFO instance is satisfiable: arrivals mutate `serviceQueue`, and `TxReady` removes its
-head and commits it without consulting private counters or other bookkeeping.
+head and commits it without consulting private counters or other bookkeeping. The same packet is
+placed in both emitted children, and the commitment remains until its matching `TxComplete`.
 -/
 def TxReadySelectionPrivateIrrelevant
     (transition : TransitionRelation State) : Prop :=
@@ -360,7 +415,9 @@ def CompleteActualServiceStartDiscipline
     (transition : TransitionRelation State) : Prop :=
   ActualServiceStartDiscipline transition ∧
     ServiceDecisionTraceComplete transition ∧
-    TxReadySelectionPrivateIrrelevant transition
+    TxReadySelectionPrivateIrrelevant transition ∧
+    ServiceDecisionEmissionsMatch transition ∧
+    CommittedServiceNonPreemptive transition
 
 /--
 Every initial event has a supported handler for its target role, mirroring validation before

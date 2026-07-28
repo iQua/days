@@ -593,6 +593,35 @@ def tinyQueueDecisions
   | none => []
 
 /--
+The FIFO fixture's successful service start emits completion first and remote arrival second, with
+both children carrying the selected packet as in
+`executor/src/scalar.rs:899-921,1145-1166`. The concrete switch sends remotely to terminal host 2;
+the unused host cases remain local so the total contract sketch stays role-correct.
+-/
+def tinyQueueServiceChildren
+    (node : NodeDescriptor)
+    (event : Event) : Option PayloadId → List Event
+  | none => []
+  | some packet =>
+      let remoteTarget := if node.id = 1 then 2 else node.id
+      [ { key :=
+            { timeNs := event.key.timeNs + 1
+              phase := eventPhase .txComplete
+              originNode := node.id
+              originSeq := 1 }
+          target := node.id
+          kind := .txComplete
+          payload := packet },
+        { key :=
+            { timeNs := event.key.timeNs + 1
+              phase := eventPhase .remoteArrival
+              originNode := node.id
+              originSeq := 2 }
+          target := remoteTarget
+          kind := .remoteArrival
+          payload := packet } ]
+
+/--
 Forbidden arrival-time reservation: remove the current public FIFO head and hide it in private
 state without committing the service ledger or recording a decision.
 -/
@@ -651,9 +680,12 @@ def tinyQueueTransitionResult
     match event.kind with
     | .remoteArrival => tinyQueueArrivalState eager state event.payload
     | .txReady => tinyQueueReadyState selected state
-    | .packetArrival | .txComplete => state
+    | .txComplete =>
+        { state with
+          committedService := state.committedService.erase event.payload }
+    | .packetArrival => state
   { nextState
-    children := []
+    children := tinyQueueServiceChildren node event selected
     packetInstalls := []
     packetRemovals := []
     summaryDelta := RunSummary.zero
@@ -670,9 +702,50 @@ to the service ledger: the general private-irrelevance premise must reject smugg
 -/
 def tinyQueueTransition (eager : Bool) : TransitionRelation TinyQueueStateFamily :=
   fun node event state result =>
-    event.target = node.id ∧
+    node ∈ queueCounterexampleImage.nodes ∧
+      event.target = node.id ∧
       roleSupports node.kind event.kind ∧
+      (event.kind = .txComplete → event.payload ∈ state.committedService) ∧
       result = tinyQueueTransitionResult eager node event state
+
+/--
+Executable strengthened-FIFO satisfiability sketch. Canonical selection is identical under
+replacement private state, commits and records packet 12, emits both required children with payload
+12, preserves the commitment across a remote arrival, and removes it only on `TxComplete 12`.
+-/
+def fifoStrengthenedServiceContractCheck : Bool :=
+  let node : NodeDescriptor :=
+    { id := 1, kind := .switch, stateSlot := 0 }
+  let initial : RoleState TinyQueueStateFamily .switch :=
+    { privateState := queueCounterexamplePrivateState
+      serviceQueue := [12]
+      committedService := [] }
+  let alternate : RoleState TinyQueueStateFamily .switch :=
+    { initial with
+      privateState :=
+        { initial.privateState with
+          hiddenReservation := some 21
+          accepted := [30] } }
+  let readyResult :=
+    tinyQueueTransitionResult false node queueCounterexampleReady initial
+  let alternateReadyResult :=
+    tinyQueueTransitionResult false node queueCounterexampleReady alternate
+  match readyResult.children with
+  | [completion, remote] =>
+      let afterArrival :=
+        tinyQueueTransitionResult false node remote readyResult.nextState
+      let afterCompletion :=
+        tinyQueueTransitionResult false node completion afterArrival.nextState
+      decide (
+        SameServiceSelectionResult readyResult alternateReadyResult ∧
+          readyResult.nextState.committedService = [12] ∧
+          readyResult.decisions.map ServiceDecision.packet = [12] ∧
+          readyResult.children.map Event.kind =
+            [.txComplete, .remoteArrival] ∧
+          readyResult.children.map Event.payload = [12, 12] ∧
+          afterArrival.nextState.committedService = [12] ∧
+          afterCompletion.nextState.committedService = [])
+  | _ => false
 
 /--
 Executable private-smuggling check behind the eager model's failure of the general premise. The
@@ -700,6 +773,163 @@ def eagerSelectionPrivateSmugglingCheck : Bool :=
         (tinyQueueTransitionResult true node queueCounterexampleReady smuggled)
         (tinyQueueTransitionResult true node queueCounterexampleReady alternate))
 
+/--
+Forbidden private-payload smuggler. Public FIFO selection still commits and records packet 12, but
+the `TxComplete` and `RemoteArrival` payload is taken from private state. Under replacement private
+state every old comparison field agrees; only the emitted children diverge.
+-/
+def tinyQueuePrivatePayloadResult
+    (node : NodeDescriptor)
+    (event : Event)
+    (state : RoleState TinyQueueStateFamily node.kind) :
+    TransitionResult TinyQueueStateFamily node.kind :=
+  let selected :=
+    if event.kind = .txReady then tinyQueueSelectedPacket false state else none
+  let emitted :=
+    match selected, state.privateState.hiddenReservation with
+    | some _, some hidden => some hidden
+    | _, _ => selected
+  { tinyQueueTransitionResult false node event state with
+    children := tinyQueueServiceChildren node event emitted }
+
+/-- Successful transition relation for the private-payload smuggler shape. -/
+def tinyQueuePrivatePayloadTransition : TransitionRelation TinyQueueStateFamily :=
+  fun node event state result =>
+    node ∈ queueCounterexampleImage.nodes ∧
+      event.target = node.id ∧
+      roleSupports node.kind event.kind ∧
+      (event.kind = .txComplete → event.payload ∈ state.committedService) ∧
+      result = tinyQueuePrivatePayloadResult node event state
+
+/--
+Executable payload-smuggling regression. Queue, commitment, decisions, and every non-child effect
+agree after private replacement, but the private payload produces `[21, 21]` children instead of
+the committed packet's `[12, 12]`. The widened `SameServiceSelectionResult` and the explicit
+decision/child payload axiom therefore both reject the shape.
+-/
+def privatePayloadSmugglingCheck : Bool :=
+  let node : NodeDescriptor :=
+    { id := 1, kind := .switch, stateSlot := 0 }
+  let smuggled : RoleState TinyQueueStateFamily .switch :=
+    { privateState :=
+        { capacity := 1
+          hiddenReservation := some 21
+          accepted := []
+          dropped := [] }
+      serviceQueue := [12]
+      committedService := [] }
+  let alternate : RoleState TinyQueueStateFamily .switch :=
+    { smuggled with
+      privateState := { smuggled.privateState with hiddenReservation := none } }
+  let smuggledResult :=
+    tinyQueuePrivatePayloadResult node queueCounterexampleReady smuggled
+  let alternateResult :=
+    tinyQueuePrivatePayloadResult node queueCounterexampleReady alternate
+  decide (
+    smuggledResult.nextState.serviceQueue =
+        alternateResult.nextState.serviceQueue ∧
+      smuggledResult.nextState.committedService =
+        alternateResult.nextState.committedService ∧
+      smuggledResult.decisions = alternateResult.decisions ∧
+      smuggledResult.packetInstalls = alternateResult.packetInstalls ∧
+      smuggledResult.packetRemovals = alternateResult.packetRemovals ∧
+      smuggledResult.summaryDelta = alternateResult.summaryDelta ∧
+      smuggledResult.observedPackets = alternateResult.observedPackets ∧
+      smuggledResult.departures = alternateResult.departures ∧
+      smuggledResult.arrivals = alternateResult.arrivals ∧
+      smuggledResult.nextState.committedService = [12] ∧
+      smuggledResult.decisions.map ServiceDecision.packet = [12] ∧
+      smuggledResult.children.map Event.payload = [21, 21] ∧
+      alternateResult.children.map Event.payload = [12, 12] ∧
+      ¬ SameServiceSelectionResult smuggledResult alternateResult)
+
+/--
+Countermodel-shaped statement for the former emitted-child channel. It obeys the actual-start,
+addition-trace, and non-preemption clauses, but violates both new protections: its children do not
+carry the decided packet, and private replacement changes a public transition effect.
+-/
+def PrivatePayloadSmugglerCountermodel : Prop :=
+  privatePayloadSmugglingCheck = true ∧
+    ActualServiceStartDiscipline tinyQueuePrivatePayloadTransition ∧
+    ServiceDecisionTraceComplete tinyQueuePrivatePayloadTransition ∧
+    CommittedServiceNonPreemptive tinyQueuePrivatePayloadTransition ∧
+    ¬ ServiceDecisionEmissionsMatch tinyQueuePrivatePayloadTransition ∧
+    ¬ TxReadySelectionPrivateIrrelevant tinyQueuePrivatePayloadTransition ∧
+    ¬ CompleteActualServiceStartDiscipline tinyQueuePrivatePayloadTransition
+
+/--
+Forbidden erasure-preemptor. A `RemoteArrival` applies its ordinary queue effect and then silently
+clears all committed service; the next `TxReady` can consequently choose a different packet.
+-/
+def tinyQueueErasurePreemptingResult
+    (node : NodeDescriptor)
+    (event : Event)
+    (state : RoleState TinyQueueStateFamily node.kind) :
+    TransitionResult TinyQueueStateFamily node.kind :=
+  let ordinary := tinyQueueTransitionResult false node event state
+  if event.kind = .remoteArrival then
+    { ordinary with
+      nextState := { ordinary.nextState with committedService := [] } }
+  else
+    ordinary
+
+/-- Successful transition relation for the committed-service erasure shape. -/
+def tinyQueueErasurePreemptingTransition : TransitionRelation TinyQueueStateFamily :=
+  fun node event state result =>
+    node ∈ queueCounterexampleImage.nodes ∧
+      event.target = node.id ∧
+      roleSupports node.kind event.kind ∧
+      (event.kind = .txComplete → event.payload ∈ state.committedService) ∧
+      result = tinyQueueErasurePreemptingResult node event state
+
+/--
+Executable erasure-preemption regression. Arrival removes commitment 12 without introducing any
+selection or decision; the later readiness event then commits packet 21. The old addition-only
+trace sees nothing at the erasure, while the persistence clause fails immediately because 12 was
+present before the non-completion transition and absent afterward.
+-/
+def committedServiceErasureCheck : Bool :=
+  let node : NodeDescriptor :=
+    { id := 1, kind := .switch, stateSlot := 0 }
+  let arrival : Event :=
+    { queueCounterexampleArrival with payload := 30 }
+  let ready : Event :=
+    { queueCounterexampleReady with payload := 21 }
+  let transmitting : RoleState TinyQueueStateFamily .switch :=
+    { privateState := queueCounterexamplePrivateState
+      serviceQueue := [21]
+      committedService := [12] }
+  let erased :=
+    tinyQueueErasurePreemptingResult node arrival transmitting
+  let restarted :=
+    tinyQueueErasurePreemptingResult node ready erased.nextState
+  decide (
+    12 ∈ transmitting.committedService ∧
+      12 ∉ erased.nextState.committedService ∧
+      erased.nextState.committedService = [] ∧
+      erased.decisions = [] ∧
+      ¬ (12 ∉ transmitting.committedService ∧
+        12 ∈ erased.nextState.committedService) ∧
+      ¬ (21 ∉ transmitting.committedService ∧
+        21 ∈ erased.nextState.committedService) ∧
+      restarted.nextState.committedService = [21] ∧
+      restarted.decisions.map ServiceDecision.packet = [21] ∧
+      restarted.children.map Event.payload = [21, 21])
+
+/--
+Countermodel-shaped statement for addition-only completeness. The erasure policy retains actual
+start, complete decision tracing, child payload binding, and private irrelevance, but violates the
+new non-preemption axiom and therefore no longer satisfies the complete F4 contract.
+-/
+def CommittedServiceErasurePreemptorCountermodel : Prop :=
+  committedServiceErasureCheck = true ∧
+    ActualServiceStartDiscipline tinyQueueErasurePreemptingTransition ∧
+    ServiceDecisionTraceComplete tinyQueueErasurePreemptingTransition ∧
+    TxReadySelectionPrivateIrrelevant tinyQueueErasurePreemptingTransition ∧
+    ServiceDecisionEmissionsMatch tinyQueueErasurePreemptingTransition ∧
+    ¬ CommittedServiceNonPreemptive tinyQueueErasurePreemptingTransition ∧
+    ¬ CompleteActualServiceStartDiscipline tinyQueueErasurePreemptingTransition
+
 /-- Concrete initial machine for both modeled executions. -/
 def queueCounterexampleMachine : MachineState TinyQueueStateFamily :=
   { localState := queueCounterexampleLocalState
@@ -722,7 +952,9 @@ private-state-irrelevance premise. With public queue `[21]` and an empty ledger,
 
 The accepted FIFO instance remains satisfiable: the arrival at 5 sees public queue `[12]` at
 capacity one and drops packet 21; `TxReady` at 10 removes public head 12, commits `[12]`, and emits
-exactly that decision. Its selection is unchanged by arbitrary private bookkeeping.
+completion and remote-arrival children that both carry packet 12. Its selection and every public
+effect are unchanged by arbitrary private bookkeeping, and `[12]` persists until a matching
+`TxComplete 12` removes exactly that commitment.
 
 This is a `Prop`-valued T11 statement over concrete executable data. T12 proves the proposition
 alongside F4.
@@ -740,6 +972,8 @@ def ReachableEagerSelectionCountermodel : Prop :=
     CompleteActualServiceStartDiscipline (tinyQueueTransition false) ∧
     ActualServiceStartDiscipline (tinyQueueTransition true) ∧
     ServiceDecisionTraceComplete (tinyQueueTransition true) ∧
+    ServiceDecisionEmissionsMatch (tinyQueueTransition true) ∧
+    CommittedServiceNonPreemptive (tinyQueueTransition true) ∧
     ¬ TxReadySelectionPrivateIrrelevant (tinyQueueTransition true) ∧
     ¬ CompleteActualServiceStartDiscipline (tinyQueueTransition true) ∧
     ∃ canonicalFinish eagerFinish,

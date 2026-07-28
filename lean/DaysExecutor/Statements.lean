@@ -108,9 +108,10 @@ def F3RunComposition
 
 /--
 F4 theorem statement from plan §8: F2/F3 are scoped to state-dependent choices made only at the
-actual `TxReady` service start, and the concrete eager-selection witness shows why a sound horizon
-alone is insufficient. The Rust decision handlers are
-`executor/src/scalar.rs:863-921,1091-1166`.
+actual `TxReady` service start, whose committed packet is emitted in both children and cannot be
+replaced before matching completion. The concrete eager-selection, private-payload, and erasure
+witnesses isolate why each clause is required. The Rust decision and completion handlers are
+`executor/src/scalar.rs:863-940,1091-1200`.
 
 The executable witness data is already constructed in T11; its Lean proof is deferred to T12.
 -/
@@ -120,7 +121,9 @@ def F4DecisionPointScope
   (CompleteActualServiceStartDiscipline transition →
       F2RoundSerializability image transition ∧
       F3RunComposition image transition) ∧
-    ReachableEagerSelectionCountermodel
+    ReachableEagerSelectionCountermodel ∧
+    PrivatePayloadSmugglerCountermodel ∧
+    CommittedServiceErasurePreemptorCountermodel
 
 /--
 Per-packet causal order required by F5, corresponding to a packet's parent/child transition chain
