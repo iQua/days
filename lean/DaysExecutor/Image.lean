@@ -39,12 +39,15 @@ Kind-indexed mutable-state family formalizing Rust's separate host and switch ar
 abbrev StateFamily := NodeKind → Type
 
 /--
-Role state with the committed non-preemptive service slots exposed as a first-class semantic
-field. `privateState` contains the remaining role-specific data; `committedService` represents the
-host/switch `in_service` slots at `executor/src/image.rs:25-69`.
+Role state with the queue and committed non-preemptive service slots exposed as first-class
+semantic fields. `serviceQueue` is the ordered packet view consulted at service start, while
+`committedService` represents the host/switch `in_service` slots. Both are semantic projections of
+the role-specific state at `executor/src/image.rs:25-69`; `privateState` contains only data that
+cannot influence service selection except by an explicit `serviceQueue` mutation.
 -/
 structure RoleState (State : StateFamily) (kind : NodeKind) where
   privateState : State kind
+  serviceQueue : List PayloadId
   committedService : List PayloadId
 
 /--

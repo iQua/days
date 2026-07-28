@@ -27,16 +27,6 @@ def RelayCounterexample.channels (fixture : RelayCounterexample) : List RemoteCh
 def RelayCounterexample.links (fixture : RelayCounterexample) : List LinkDescriptor :=
   [fixture.mToILink, fixture.iToJLink]
 
-/--
-Arrival time obtained by traversing both certified channel delays. This is deliberately computed,
-not fixture data: Rust computes each next-hop arrival from the current event time at
-`executor/src/scalar.rs:1091-1166` using `executor/src/time.rs:54-66`.
--/
-def RelayCounterexample.relayedArrivalTime (fixture : RelayCounterexample) : Nat :=
-  linkArrivalTimeNs fixture.iToJLink
-    (linkArrivalTimeNs fixture.mToILink fixture.rootTime fixture.payloadBytes)
-    fixture.payloadBytes
-
 /-- Root service event that launches the first remote hop. -/
 def RelayCounterexample.rootReady (fixture : RelayCounterexample) : Event :=
   { key :=
@@ -48,17 +38,28 @@ def RelayCounterexample.rootReady (fixture : RelayCounterexample) : Event :=
     kind := .txReady
     payload := 0 }
 
-/-- First-hop remote arrival at the relay LP. -/
-def RelayCounterexample.atRelay (fixture : RelayCounterexample) : Event :=
+/--
+Earliest remote child certified by one declared channel. Using the channel bound here is exact for
+this finite witness because `RelayChannelMatchesLink` equates it with the physical link delay
+derived at `executor/src/validate.rs:698-755` and checked against the channel declaration at lines
+1053-1068.
+-/
+def RemoteChannel.boundArrival
+    (channel : RemoteChannel)
+    (service : Event)
+    (originSeq : Nat) : Event :=
   { key :=
-      { timeNs :=
-          linkArrivalTimeNs fixture.mToILink fixture.rootTime fixture.payloadBytes
-        phase := eventPhase .remoteArrival
-        originNode := fixture.m
-        originSeq := 1 }
-    target := fixture.i
-    kind := .remoteArrival
-    payload := 0 }
+      { timeNs := service.key.timeNs + channel.minDelayNs
+        phase := eventPhase channel.eventKind
+        originNode := channel.source
+        originSeq }
+    target := channel.target
+    kind := channel.eventKind
+    payload := service.payload }
+
+/-- First-hop remote arrival, constructed directly from the first declared channel. -/
+def RelayCounterexample.atRelay (fixture : RelayCounterexample) : Event :=
+  fixture.mToI.boundArrival fixture.rootReady 1
 
 /-- Same-time service decision scheduled by the relay arrival. -/
 def RelayCounterexample.relayReady (fixture : RelayCounterexample) : Event :=
@@ -71,34 +72,31 @@ def RelayCounterexample.relayReady (fixture : RelayCounterexample) : Event :=
     kind := .txReady
     payload := 0 }
 
-/-- Second-hop remote arrival at the destination LP. -/
+/-- Second-hop remote arrival, constructed directly from the second declared channel. -/
 def RelayCounterexample.atDestination (fixture : RelayCounterexample) : Event :=
-  { key :=
-      { timeNs := fixture.relayedArrivalTime
-        phase := eventPhase .remoteArrival
-        originNode := fixture.i
-        originSeq := 1 }
-    target := fixture.j
-    kind := .remoteArrival
-    payload := 0 }
+  fixture.iToJ.boundArrival fixture.relayReady 1
 
-/-- One service-to-remote-arrival causal hop along a certified channel. -/
-def RelayChannelHop
+/--
+Final arrival time obtained by traversing both declared channel bounds. The two remote event
+constructors, rather than unrelated fixture timestamps, determine this value.
+-/
+def RelayCounterexample.relayedArrivalTime (fixture : RelayCounterexample) : Nat :=
+  fixture.atDestination.key.timeNs
+
+/--
+Static certificate making a channel-bound arrival exact for this witness: the declared lower bound
+equals the concrete serialization-plus-propagation delay used at
+`executor/src/scalar.rs:893-920,1139-1165`.
+-/
+def RelayChannelMatchesLink
     (channel : RemoteChannel)
     (link : LinkDescriptor)
-    (payloadBytes : Nat)
-    (service arrival : Event) : Prop :=
+    (payloadBytes : Nat) : Prop :=
   channel.link = link.id ∧
     channel.source = link.source ∧
     channel.target = link.physicalTarget ∧
-    channel.minDelayNs ≤ linkDelayNs link payloadBytes ∧
-    service.target = channel.source ∧
-    service.kind = .txReady ∧
-    arrival.target = channel.target ∧
-    arrival.kind = .remoteArrival ∧
-    arrival.payload = service.payload ∧
-    arrival.key.timeNs =
-      linkArrivalTimeNs link service.key.timeNs payloadBytes
+    channel.eventKind = .remoteArrival ∧
+    channel.minDelayNs = linkDelayNs link payloadBytes
 
 /-- Local causal edge by which a remote arrival schedules the relay's same-time service decision. -/
 def RelayArrivalSchedulesReady
@@ -111,11 +109,13 @@ def RelayArrivalSchedulesReady
     arrival.key < ready.key
 
 /--
-Arithmetic and causal shape of an `m → i → j` relay. The endpoint equalities and recurrence make
-the final arrival a consequence of the two channel edges rather than an unrelated timestamp.
+Minimum executable channel-bound shape of an `m → i → j` relay. This fixture does not claim a full
+`AcceptedModel` trace: instead, each remote event is constructed from its parent and declared
+channel, and the exact link certificates prevent an unrelated timestamp from satisfying the check.
 -/
 def TwoHopRelayPath (fixture : RelayCounterexample) : Prop :=
   fixture.frontier fixture.m = some fixture.rootTime ∧
+    fixture.frontier fixture.j = some fixture.jPendingTime ∧
     fixture.mToI ∈ fixture.channels ∧
     fixture.iToJ ∈ fixture.channels ∧
     fixture.mToILink ∈ fixture.links ∧
@@ -126,24 +126,23 @@ def TwoHopRelayPath (fixture : RelayCounterexample) : Prop :=
     fixture.iToJ.target = fixture.j ∧
     fixture.mToI.eventKind = .remoteArrival ∧
     fixture.iToJ.eventKind = .remoteArrival ∧
-    linkDelayNs fixture.mToILink fixture.payloadBytes = 1 ∧
-    linkDelayNs fixture.iToJLink fixture.payloadBytes = 1 ∧
-    RelayChannelHop fixture.mToI fixture.mToILink fixture.payloadBytes
-      fixture.rootReady fixture.atRelay ∧
+    fixture.mToI.minDelayNs = 1 ∧
+    fixture.iToJ.minDelayNs = 1 ∧
+    RelayChannelMatchesLink fixture.mToI fixture.mToILink fixture.payloadBytes ∧
     RelayArrivalSchedulesReady fixture.atRelay fixture.relayReady ∧
-    RelayChannelHop fixture.iToJ fixture.iToJLink fixture.payloadBytes
-      fixture.relayReady fixture.atDestination ∧
+    RelayChannelMatchesLink fixture.iToJ fixture.iToJLink fixture.payloadBytes ∧
     fixture.atDestination.key.timeNs = fixture.relayedArrivalTime ∧
     fixture.relayedArrivalTime =
       (fixture.rootTime + 1) + 1
 
 /-- The finite relay fixture's causal path predicate is executable. -/
 instance (fixture : RelayCounterexample) : Decidable (TwoHopRelayPath fixture) := by
-  unfold TwoHopRelayPath RelayChannelHop RelayArrivalSchedulesReady
+  unfold TwoHopRelayPath RelayChannelMatchesLink RelayArrivalSchedulesReady
     RelayCounterexample.channels RelayCounterexample.relayedArrivalTime
     RelayCounterexample.links
-    RelayCounterexample.rootReady RelayCounterexample.atRelay
-    RelayCounterexample.relayReady RelayCounterexample.atDestination
+    RelayCounterexample.atDestination RelayCounterexample.relayReady
+    RelayCounterexample.atRelay RelayCounterexample.rootReady
+    RemoteChannel.boundArrival
   infer_instance
 
 /--
@@ -292,6 +291,18 @@ structure TinyQueueState where
   deriving DecidableEq, Repr
 
 /--
+Private bookkeeping for the accepted-model fixture. The authoritative waiting queue and committed
+service slot live in `RoleState`; `hiddenReservation` exists only to exercise the forbidden eager
+private-state smuggling policy.
+-/
+structure TinyQueuePrivateState where
+  capacity : Nat
+  hiddenReservation : Option PayloadId
+  accepted : List PayloadId
+  dropped : List PayloadId
+  deriving DecidableEq, Repr
+
+/--
 Tiny queue events needed to execute the eager-selection and unsound-reordering shapes from
 `executor/src/scalar.rs:975-1016,1091-1128`.
 -/
@@ -333,16 +344,22 @@ before `executor/src/scalar.rs:999-1015`.
 -/
 def queueCounterexampleInitial : TinyQueueState :=
   { capacity := 1
-    waiting := [10]
+    waiting := [12]
     inService := none
     accepted := []
     dropped := [] }
 
-/-- Unused source-host state in the concrete heterogeneous countermodel. -/
-def queueCounterexampleSourceState : TinyQueueState :=
+/-- Unused source-host bookkeeping in the concrete heterogeneous countermodel. -/
+def queueCounterexampleSourceState : TinyQueuePrivateState :=
   { capacity := 0
-    waiting := []
-    inService := none
+    hiddenReservation := none
+    accepted := []
+    dropped := [] }
+
+/-- Initial switch bookkeeping; its authoritative FIFO is exposed separately in `RoleState`. -/
+def queueCounterexamplePrivateState : TinyQueuePrivateState :=
+  { capacity := 1
+    hiddenReservation := none
     accepted := []
     dropped := [] }
 
@@ -351,14 +368,14 @@ Canonical Rust order: the earlier arrival observes a full queue before the later
 decision at `executor/src/event.rs:78-88`.
 -/
 def queueCounterexampleCanonicalOrder : List TinyQueueEvent :=
-  [.remoteArrival 20, .txReady]
+  [.remoteArrival 21, .txReady]
 
 /--
 Unsound order: an eager or otherwise reordered service choice frees the slot before the arrival,
 contrary to `executor/src/scalar.rs:975-1016,1091-1128`.
 -/
 def queueCounterexampleUnsoundOrder : List TinyQueueEvent :=
-  [.txReady, .remoteArrival 20]
+  [.txReady, .remoteArrival 21]
 
 /--
 Concrete event metadata placing the queue arrival before the actual service-start decision, as
@@ -370,7 +387,7 @@ def queueCounterexampleArrival : Event :=
         originNode := 0, originSeq := 0 }
     target := 1
     kind := .remoteArrival
-    payload := 20 }
+    payload := 21 }
 
 /--
 Concrete later `TxReady` decision point from the eager-selection counterexample, matching
@@ -382,7 +399,7 @@ def queueCounterexampleReady : Event :=
         originNode := 1, originSeq := 0 }
     target := 1
     kind := .txReady
-    payload := 10 }
+    payload := 12 }
 
 /--
 Post-exchange start queue for the eager-selection fixture: the remote arrival is already merged
@@ -462,7 +479,7 @@ def EagerSelectionCounterexampleShape : Prop :=
 
 /-- Constant role-indexed state family for the concrete modeled queue counterexample. -/
 abbrev TinyQueueStateFamily : StateFamily :=
-  fun _ => TinyQueueState
+  fun _ => TinyQueuePrivateState
 
 /-- Immutable descriptor data for the two concrete packet IDs. -/
 def queueCounterexampleDescriptor (payload : PayloadId) : PacketDescriptor :=
@@ -474,28 +491,64 @@ def queueCounterexampleDescriptor (payload : PayloadId) : PacketDescriptor :=
 /--
 Concrete heterogeneous image whose canonical initial queue is exactly the two counterexample
 events. The source host supplies the remote event's origin; the switch owns the finite-capacity
-queue under test.
+queue under test, and the terminal host completes the switch's declared route. The incoming
+channel satisfies initial `RemoteArrival` route validation at `executor/src/validate.rs:1203-1215`;
+the outgoing switch link satisfies initial `TxReady` ownership validation at lines 1179-1200.
+Packet IDs 12 and 21 belong to source LP 0 under the three-node allocation rule at lines
+1956-1971, and the unused third link lets terminal host 2 name a source-owned egress as required at
+lines 791-807.
 -/
 def queueCounterexampleImage : SimulationImage TinyQueueStateFamily :=
   { stopTimeNs := 10
     nodes :=
       [ { id := 0, kind := .host, stateSlot := 0 },
-        { id := 1, kind := .switch, stateSlot := 0 } ]
+        { id := 1, kind := .switch, stateSlot := 0 },
+        { id := 2, kind := .host, stateSlot := 1 } ]
     stateArena := fun kind =>
       match kind with
       | .host =>
           [ { privateState := queueCounterexampleSourceState
+              serviceQueue := []
+              committedService := [] },
+            { privateState := queueCounterexampleSourceState
+              serviceQueue := []
               committedService := [] } ]
       | .switch =>
-          [ { privateState := queueCounterexampleInitial
+          [ { privateState := queueCounterexamplePrivateState
+              serviceQueue := [12]
               committedService := [] } ]
-    links := []
-    channels := []
+    links :=
+      [ { id := 0
+          source := 0
+          physicalTarget := 1
+          rateBps := 8_000_000_000
+          propagationNs := 4 },
+        { id := 1
+          source := 1
+          physicalTarget := 2
+          rateBps := 8_000_000_000
+          propagationNs := 0 },
+        { id := 2
+          source := 2
+          physicalTarget := 0
+          rateBps := 8_000_000_000
+          propagationNs := 0 } ]
+    channels :=
+      [ { source := 0
+          target := 1
+          link := 0
+          eventKind := .remoteArrival
+          minDelayNs := 5 },
+        { source := 1
+          target := 2
+          link := 1
+          eventKind := .remoteArrival
+          minDelayNs := 1 } ]
     initialEvents := queueCounterexampleStartPending
     packetDescriptor := queueCounterexampleDescriptor
     initialPacketStore := fun node =>
       if node = 1 then
-        [queueCounterexampleDescriptor 10, queueCounterexampleDescriptor 20]
+        [queueCounterexampleDescriptor 12, queueCounterexampleDescriptor 21]
       else
         []
     initialNextOriginSeq := fun _ => 1
@@ -507,37 +560,83 @@ def queueCounterexampleLocalState
   match node.kind with
   | .host =>
       { privateState := queueCounterexampleSourceState
+        serviceQueue := []
         committedService := [] }
   | .switch =>
-      { privateState := queueCounterexampleInitial
+      { privateState := queueCounterexamplePrivateState
+        serviceQueue := [12]
         committedService := [] }
+
+/--
+Packet selected at `TxReady`. The canonical FIFO reads only the observable queue and ledger; the
+forbidden eager policy first consults its hidden private reservation.
+-/
+def tinyQueueSelectedPacket
+    (eager : Bool)
+    (state : RoleState TinyQueueStateFamily kind) : Option PayloadId :=
+  match state.committedService with
+  | _ :: _ => none
+  | [] =>
+      match eager, state.privateState.hiddenReservation with
+      | true, some packet => some packet
+      | _, _ => state.serviceQueue.head?
 
 /-- The one service decision introduced by a successful tiny `TxReady`, if any. -/
 def tinyQueueDecisions
     (node : NodeDescriptor)
-    (event : Event)
-    (before after : TinyQueueState) : List ServiceDecision :=
-  match before.inService, after.inService with
-  | none, some packet =>
+    (event : Event) : Option PayloadId → List ServiceDecision
+  | some packet =>
       [ { node := node.id
           decisionKey := event.key
           packet
           committedNonPreemptively := true } ]
-  | _, _ => []
+  | none => []
 
-/-- Canonical or eager next-state policy for the concrete accepted transition relation. -/
-def tinyQueueNextState
+/--
+Forbidden arrival-time reservation: remove the current public FIFO head and hide it in private
+state without committing the service ledger or recording a decision.
+-/
+def tinyQueueReservePrivately
+    (state : RoleState TinyQueueStateFamily kind) :
+    TinyQueuePrivateState × List PayloadId :=
+  match state.committedService, state.privateState.hiddenReservation, state.serviceQueue with
+  | [], none, packet :: rest =>
+      ({ state.privateState with hiddenReservation := some packet }, rest)
+  | _, _, _ => (state.privateState, state.serviceQueue)
+
+/-- Arrival effect after any forbidden eager reservation has been applied. -/
+def tinyQueueArrivalState
     (eager : Bool)
-    (state : TinyQueueState)
-    (event : Event) : TinyQueueState :=
-  match event.kind with
-  | .remoteArrival =>
-      if eager then
-        tinyQueueStep (tinyQueueStep state .txReady) (.remoteArrival event.payload)
-      else
-        tinyQueueStep state (.remoteArrival event.payload)
-  | .txReady => tinyQueueStep state .txReady
-  | .packetArrival | .txComplete => state
+    (state : RoleState TinyQueueStateFamily kind)
+    (packet : PayloadId) : RoleState TinyQueueStateFamily kind :=
+  let reserved :=
+    if eager then tinyQueueReservePrivately state
+    else (state.privateState, state.serviceQueue)
+  let privateState := reserved.1
+  let serviceQueue := reserved.2
+  if privateState.capacity ≠ 0 ∧ privateState.capacity ≤ serviceQueue.length then
+    { privateState :=
+        { privateState with dropped := privateState.dropped ++ [packet] }
+      serviceQueue
+      committedService := state.committedService }
+  else
+    { privateState :=
+        { privateState with accepted := privateState.accepted ++ [packet] }
+      serviceQueue := serviceQueue ++ [packet]
+      committedService := state.committedService }
+
+/-- Service-start effect for the packet selected by the canonical or eager policy. -/
+def tinyQueueReadyState
+    (selected : Option PayloadId)
+    (state : RoleState TinyQueueStateFamily kind) :
+    RoleState TinyQueueStateFamily kind :=
+  match selected with
+  | none => state
+  | some packet =>
+      { privateState :=
+          { state.privateState with hiddenReservation := none }
+        serviceQueue := state.serviceQueue.erase packet
+        committedService := [packet] }
 
 /-- Complete transition result for the concrete canonical/eager policies. -/
 def tinyQueueTransitionResult
@@ -546,11 +645,14 @@ def tinyQueueTransitionResult
     (event : Event)
     (state : RoleState TinyQueueStateFamily node.kind) :
     TransitionResult TinyQueueStateFamily node.kind :=
-  let nextPrivate := tinyQueueNextState eager state.privateState event
-  let next : RoleState TinyQueueStateFamily node.kind :=
-    { privateState := nextPrivate
-      committedService := nextPrivate.inService.toList }
-  { nextState := next
+  let selected :=
+    if event.kind = .txReady then tinyQueueSelectedPacket eager state else none
+  let nextState :=
+    match event.kind with
+    | .remoteArrival => tinyQueueArrivalState eager state event.payload
+    | .txReady => tinyQueueReadyState selected state
+    | .packetArrival | .txComplete => state
+  { nextState
     children := []
     packetInstalls := []
     packetRemovals := []
@@ -558,23 +660,45 @@ def tinyQueueTransitionResult
     observedPackets := []
     departures := []
     arrivals := []
-    decisions :=
-      if event.kind = .txReady then
-        tinyQueueDecisions node event state.privateState nextPrivate
-      else
-        [] }
+    decisions := tinyQueueDecisions node event selected }
 
 /--
 Concrete successful transition relation. Both policies are deterministic and enabled for every
 role-supported reachable configuration; they differ only in whether arrival eagerly performs the
-future service selection.
+future service selection. There is deliberately no fixture-local equality relating private state
+to the service ledger: the general private-irrelevance premise must reject smuggling.
 -/
 def tinyQueueTransition (eager : Bool) : TransitionRelation TinyQueueStateFamily :=
   fun node event state result =>
-    state.committedService = state.privateState.inService.toList ∧
-      event.target = node.id ∧
+    event.target = node.id ∧
       roleSupports node.kind event.kind ∧
       result = tinyQueueTransitionResult eager node event state
+
+/--
+Executable private-smuggling check behind the eager model's failure of the general premise. The
+observable queue and ledger are identical, but replacing only the hidden reservation changes the
+`TxReady` service result.
+-/
+def eagerSelectionPrivateSmugglingCheck : Bool :=
+  let node : NodeDescriptor :=
+    { id := 1, kind := .switch, stateSlot := 0 }
+  let smuggled : RoleState TinyQueueStateFamily .switch :=
+    { privateState :=
+        { capacity := 1
+          hiddenReservation := some 12
+          accepted := [21]
+          dropped := [] }
+      serviceQueue := [21]
+      committedService := [] }
+  let alternate : RoleState TinyQueueStateFamily .switch :=
+    { smuggled with
+      privateState := { smuggled.privateState with hiddenReservation := none } }
+  decide (
+    smuggled.serviceQueue = alternate.serviceQueue ∧
+      smuggled.committedService = alternate.committedService ∧
+      ¬ SameServiceSelectionResult
+        (tinyQueueTransitionResult true node queueCounterexampleReady smuggled)
+        (tinyQueueTransitionResult true node queueCounterexampleReady alternate))
 
 /-- Concrete initial machine for both modeled executions. -/
 def queueCounterexampleMachine : MachineState TinyQueueStateFamily :=
@@ -592,13 +716,20 @@ def queueCounterexampleMachine : MachineState TinyQueueStateFamily :=
 /--
 Reachable semantic countermodel for F4. The same accepted image and canonical event order execute
 under deterministic canonical and eager policies. The horizon is valid, yet results differ; the
-eager policy satisfies the old one-way metadata check but cannot satisfy decision completeness.
+eager policy records its eventual `TxReady` decision completely but fails the general
+private-state-irrelevance premise. With public queue `[21]` and an empty ledger, hidden reservation
+`some 12` selects packet 12 while alternate private state with no reservation selects packet 21.
+
+The accepted FIFO instance remains satisfiable: the arrival at 5 sees public queue `[12]` at
+capacity one and drops packet 21; `TxReady` at 10 removes public head 12, commits `[12]`, and emits
+exactly that decision. Its selection is unchanged by arbitrary private bookkeeping.
 
 This is a `Prop`-valued T11 statement over concrete executable data. T12 proves the proposition
 alongside F4.
 -/
 def ReachableEagerSelectionCountermodel : Prop :=
   EagerSelectionCounterexampleShape ∧
+    eagerSelectionPrivateSmugglingCheck = true ∧
     AcceptedModel queueCounterexampleImage (tinyQueueTransition false) ∧
     AcceptedModel queueCounterexampleImage (tinyQueueTransition true) ∧
     InitialMachine queueCounterexampleImage queueCounterexampleMachine ∧
@@ -608,6 +739,8 @@ def ReachableEagerSelectionCountermodel : Prop :=
       queueCounterexampleMachine ∧
     CompleteActualServiceStartDiscipline (tinyQueueTransition false) ∧
     ActualServiceStartDiscipline (tinyQueueTransition true) ∧
+    ServiceDecisionTraceComplete (tinyQueueTransition true) ∧
+    ¬ TxReadySelectionPrivateIrrelevant (tinyQueueTransition true) ∧
     ¬ CompleteActualServiceStartDiscipline (tinyQueueTransition true) ∧
     ∃ canonicalFinish eagerFinish,
       ExecutionInOrder

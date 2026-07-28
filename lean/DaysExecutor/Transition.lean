@@ -304,9 +304,9 @@ def SelectionIntroduced
 
 /--
 Every newly committed service packet has exactly the decision record carrying it, and every
-decision record denotes such a newly committed packet. This closes the optional-metadata loophole:
-an arrival that eagerly reserves service either omits a required record or violates the
-`TxReady`-only rule.
+decision record denotes such a newly committed packet. This closes optional metadata for the
+observable ledger; `TxReadySelectionPrivateIrrelevant` separately excludes an earlier reservation
+hidden only in private state.
 -/
 def ServiceDecisionTraceComplete
     (transition : TransitionRelation State) : Prop :=
@@ -316,11 +316,51 @@ def ServiceDecisionTraceComplete
       SelectionIntroduced state result.nextState packet ↔
         ∃ decision ∈ result.decisions, decision.packet = packet
 
+/--
+Two transition results agree on every service-selection observable. Private bookkeeping may differ,
+but the ordered queue, committed ledger, and recorded decision do not.
+-/
+def SameServiceSelectionResult
+    (left right : TransitionResult State kind) : Prop :=
+  left.nextState.serviceQueue = right.nextState.serviceQueue ∧
+    left.nextState.committedService = right.nextState.committedService ∧
+    left.decisions = right.decisions
+
+/-- Service-selection result agreement is executable for finite result data. -/
+instance
+    (left right : TransitionResult State kind) :
+    Decidable (SameServiceSelectionResult left right) := by
+  unfold SameServiceSelectionResult
+  infer_instance
+
+/--
+A `TxReady` service choice is a function only of the ordered queue and committed-service ledger
+visible at that instant. The alternate transition must exist for every replacement private state,
+so a relation cannot make this premise vacuous with a private/ledger consistency guard.
+
+An accepted FIFO instance is satisfiable: arrivals mutate `serviceQueue`, and `TxReady` removes its
+head and commits it without consulting private counters or other bookkeeping.
+-/
+def TxReadySelectionPrivateIrrelevant
+    (transition : TransitionRelation State) : Prop :=
+  ∀ node event state result,
+    transition node event state result →
+    event.kind = .txReady →
+    ∀ privateState,
+      ∃ alternateResult,
+        transition node event
+          { privateState
+            serviceQueue := state.serviceQueue
+            committedService := state.committedService }
+          alternateResult ∧
+        SameServiceSelectionResult result alternateResult
+
 /-- Complete service-start contract used by F2–F4. -/
 def CompleteActualServiceStartDiscipline
     (transition : TransitionRelation State) : Prop :=
   ActualServiceStartDiscipline transition ∧
-    ServiceDecisionTraceComplete transition
+    ServiceDecisionTraceComplete transition ∧
+    TxReadySelectionPrivateIrrelevant transition
 
 /--
 Every initial event has a supported handler for its target role, mirroring validation before
