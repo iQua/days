@@ -296,11 +296,22 @@ def ActualServiceStartDiscipline
         decision.decisionKey = event.key ∧
         decision.committedNonPreemptively = true
 
-/-- A transition newly commits one packet in the role state's intrinsic service ledger. -/
+/--
+A transition newly commits exactly one packet by appending it to the role state's intrinsic
+service ledger. Duplicate exclusion is enforced by the committed-service invariant below.
+-/
 def SelectionIntroduced
     (before after : RoleState State kind)
     (packet : PayloadId) : Prop :=
-  packet ∉ before.committedService ∧ packet ∈ after.committedService
+  after.committedService = before.committedService ++ [packet]
+
+/-- Exact selection introduction is executable for finite committed-service lists. -/
+instance
+    (before after : RoleState State kind)
+    (packet : PayloadId) :
+    Decidable (SelectionIntroduced before after packet) := by
+  unfold SelectionIntroduced
+  infer_instance
 
 /--
 Every newly committed service packet has exactly the decision record carrying it, and every
@@ -317,23 +328,29 @@ def ServiceDecisionTraceComplete
         ∃ decision ∈ result.decisions, decision.packet = packet
 
 /--
-One recorded service decision commits and emits the same packet. Successful host and switch
-`TxReady` handlers schedule both a local `TxComplete` and a `RemoteArrival`, and every child of
-either kind carries the selected payload at
-`executor/src/scalar.rs:899-921,1145-1166`.
+The ordered completion-child and remote-arrival-child payload projections each equal the ordered
+decision payload projection. Thus every decision has exactly one child of each service kind, and
+every service-shaped child has a decision, matching the successful host and switch `TxReady`
+emission paths at `executor/src/scalar.rs:899-921,1145-1166`.
 -/
 def ServiceDecisionChildrenMatch
     (result : TransitionResult State kind) : Prop :=
-  ∀ decision ∈ result.decisions,
-    (∃ child ∈ result.children,
-      child.kind = .txComplete ∧ child.payload = decision.packet) ∧
-    (∃ child ∈ result.children,
-      child.kind = .remoteArrival ∧ child.payload = decision.packet) ∧
-    ∀ child ∈ result.children,
-      child.kind = .txComplete ∨ child.kind = .remoteArrival →
-        child.payload = decision.packet
+  (result.children.filter fun child => child.kind = .txComplete).map Event.payload =
+      result.decisions.map ServiceDecision.packet ∧
+    (result.children.filter fun child => child.kind = .remoteArrival).map Event.payload =
+      result.decisions.map ServiceDecision.packet
 
-/-- Every successful service decision has payload-consistent completion and arrival children. -/
+/-- Exact bidirectional decision/child coverage is executable for finite transition results. -/
+instance
+    (result : TransitionResult State kind) :
+    Decidable (ServiceDecisionChildrenMatch result) := by
+  unfold ServiceDecisionChildrenMatch
+  infer_instance
+
+/--
+Every transition has exact bidirectional and cardinality-preserving coverage between recorded
+service decisions and payload-consistent completion and arrival children.
+-/
 def ServiceDecisionEmissionsMatch
     (transition : TransitionRelation State) : Prop :=
   ∀ node event state result,
@@ -341,26 +358,43 @@ def ServiceDecisionEmissionsMatch
     ServiceDecisionChildrenMatch result
 
 /--
-Committed service is non-preemptive. Every existing commitment survives a non-completion
-transition; a successful `TxComplete` must match its payload and removes exactly that commitment.
-This mirrors the checked host and switch completion paths at
-`executor/src/scalar.rs:932-940,1193-1200`.
+Committed service has exact, duplicate-free deltas. A successful `TxComplete` must match its
+payload and produces exactly `old.erase payload`. Every other transition appends exactly its
+recorded decision payloads, which is literal list equality when there is no decision and one exact
+append under `ActualServiceStartDiscipline`. Every transition preserves the `Nodup` invariant.
+This mirrors selection and checked completion at
+`executor/src/scalar.rs:876-880,932-940,1123-1127,1193-1200`.
 -/
 def CommittedServiceTransitionValid
     (event : Event)
+    (decisions : List ServiceDecision)
     (before after : RoleState State kind) : Prop :=
-  if event.kind = .txComplete then
-    event.payload ∈ before.committedService ∧
-      after.committedService = before.committedService.erase event.payload
-  else
-    ∀ packet ∈ before.committedService, packet ∈ after.committedService
+  (before.committedService.Nodup → after.committedService.Nodup) ∧
+    if event.kind = .txComplete then
+      event.payload ∈ before.committedService ∧
+        after.committedService = before.committedService.erase event.payload
+    else
+      after.committedService =
+        before.committedService ++ decisions.map ServiceDecision.packet
 
-/-- Every successful handler preserves already committed service until its matching completion. -/
+/-- Exact committed-service delta validity is executable for finite transition data. -/
+instance
+    (event : Event)
+    (decisions : List ServiceDecision)
+    (before after : RoleState State kind) :
+    Decidable (CommittedServiceTransitionValid event decisions before after) := by
+  unfold CommittedServiceTransitionValid
+  infer_instance
+
+/--
+Every successful handler preserves the exact committed-service list and its duplicate-free
+invariant until a matching completion, apart from an exactly traced service append.
+-/
 def CommittedServiceNonPreemptive
     (transition : TransitionRelation State) : Prop :=
   ∀ node event state result,
     transition node event state result →
-    CommittedServiceTransitionValid event state result.nextState
+    CommittedServiceTransitionValid event result.decisions state result.nextState
 
 /--
 Two transition results agree on every externally visible effect of service selection. Replacement

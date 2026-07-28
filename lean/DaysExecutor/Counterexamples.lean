@@ -710,8 +710,9 @@ def tinyQueueTransition (eager : Bool) : TransitionRelation TinyQueueStateFamily
 
 /--
 Executable strengthened-FIFO satisfiability sketch. Canonical selection is identical under
-replacement private state, commits and records packet 12, emits both required children with payload
-12, preserves the commitment across a remote arrival, and removes it only on `TxComplete 12`.
+replacement private state, appends and records packet 12, emits exactly one required child of each
+kind, preserves exact list equality across a decisionless arrival, and removes exactly packet 12
+on completion. The committed-service list is duplicate-free initially and after every step.
 -/
 def fifoStrengthenedServiceContractCheck : Bool :=
   let node : NodeDescriptor :=
@@ -738,12 +739,33 @@ def fifoStrengthenedServiceContractCheck : Bool :=
         tinyQueueTransitionResult false node completion afterArrival.nextState
       decide (
         SameServiceSelectionResult readyResult alternateReadyResult ∧
+          initial.committedService.Nodup ∧
+          SelectionIntroduced initial readyResult.nextState 12 ∧
+          CommittedServiceTransitionValid
+            queueCounterexampleReady readyResult.decisions initial readyResult.nextState ∧
           readyResult.nextState.committedService = [12] ∧
+          readyResult.nextState.committedService.Nodup ∧
           readyResult.decisions.map ServiceDecision.packet = [12] ∧
+          ServiceDecisionChildrenMatch readyResult ∧
           readyResult.children.map Event.kind =
             [.txComplete, .remoteArrival] ∧
           readyResult.children.map Event.payload = [12, 12] ∧
+          afterArrival.nextState.committedService =
+            readyResult.nextState.committedService ∧
+          afterArrival.nextState.committedService.Nodup ∧
+          afterArrival.decisions = [] ∧
+          ServiceDecisionChildrenMatch afterArrival ∧
+          CommittedServiceTransitionValid
+            remote afterArrival.decisions readyResult.nextState afterArrival.nextState ∧
           afterArrival.nextState.committedService = [12] ∧
+          afterCompletion.nextState.committedService =
+            afterArrival.nextState.committedService.erase completion.payload ∧
+          afterCompletion.nextState.committedService.Nodup ∧
+          afterCompletion.decisions = [] ∧
+          ServiceDecisionChildrenMatch afterCompletion ∧
+          CommittedServiceTransitionValid
+            completion afterCompletion.decisions
+              afterArrival.nextState afterCompletion.nextState ∧
           afterCompletion.nextState.committedService = [])
   | _ => false
 
@@ -845,8 +867,8 @@ def privatePayloadSmugglingCheck : Bool :=
 
 /--
 Countermodel-shaped statement for the former emitted-child channel. It obeys the actual-start,
-addition-trace, and non-preemption clauses, but violates both new protections: its children do not
-carry the decided packet, and private replacement changes a public transition effect.
+exact decision-trace, and non-preemption clauses, but violates both new protections: its children
+do not carry the decided packet, and private replacement changes a public transition effect.
 -/
 def PrivatePayloadSmugglerCountermodel : Prop :=
   privatePayloadSmugglingCheck = true ∧
@@ -884,9 +906,8 @@ def tinyQueueErasurePreemptingTransition : TransitionRelation TinyQueueStateFami
 
 /--
 Executable erasure-preemption regression. Arrival removes commitment 12 without introducing any
-selection or decision; the later readiness event then commits packet 21. The old addition-only
-trace sees nothing at the erasure, while the persistence clause fails immediately because 12 was
-present before the non-completion transition and absent afterward.
+selection or decision; the later readiness event then commits packet 21. The exact decisionless
+delta rejects the erasure immediately, before the later selection can replace packet 12.
 -/
 def committedServiceErasureCheck : Bool :=
   let node : NodeDescriptor :=
@@ -917,9 +938,50 @@ def committedServiceErasureCheck : Bool :=
       restarted.children.map Event.payload = [21, 21])
 
 /--
-Countermodel-shaped statement for addition-only completeness. The erasure policy retains actual
-start, complete decision tracing, child payload binding, and private irrelevance, but violates the
-new non-preemption axiom and therefore no longer satisfies the complete F4 contract.
+Executable multiplicity regression for the forbidden decisionless duplicator `[12] → [12, 12]`
+on a non-completion. The exact selection delta now observes the append, while exact
+decision-payload accounting and `Nodup` preservation both make the step fail non-preemption.
+-/
+def committedServiceDuplicatorCheck : Bool :=
+  let before : RoleState TinyQueueStateFamily .switch :=
+    { privateState := queueCounterexamplePrivateState
+      serviceQueue := [21]
+      committedService := [12] }
+  let after : RoleState TinyQueueStateFamily .switch :=
+    { before with committedService := [12, 12] }
+  decide (
+    before.committedService.Nodup ∧
+      ¬ after.committedService.Nodup ∧
+      SelectionIntroduced before after 12 ∧
+      ¬ CommittedServiceTransitionValid
+        queueCounterexampleArrival [] before after)
+
+/--
+Executable multiplicity regression for the forbidden decisionless partial eraser
+`[12, 12] → [12]` on a non-completion. Even from the deliberately malformed duplicate source, the
+unconditional exact list delta makes the step fail non-preemption.
+-/
+def committedServicePartialEraserCheck : Bool :=
+  let before : RoleState TinyQueueStateFamily .switch :=
+    { privateState := queueCounterexamplePrivateState
+      serviceQueue := [21]
+      committedService := [12, 12] }
+  let after : RoleState TinyQueueStateFamily .switch :=
+    { before with committedService := [12] }
+  decide (
+    ¬ SelectionIntroduced before after 12 ∧
+      ¬ CommittedServiceTransitionValid
+        queueCounterexampleArrival [] before after)
+
+/-- Both commitment-multiplicity attacks execute and fail the exact non-preemption statement. -/
+def CommittedServiceMultiplicityCounterexamples : Prop :=
+  committedServiceDuplicatorCheck = true ∧
+    committedServicePartialEraserCheck = true
+
+/--
+Countermodel-shaped statement for decision-trace completeness. The erasure policy retains actual
+start, exact decision tracing, child payload binding, and private irrelevance, but violates exact
+non-preemption and therefore no longer satisfies the complete F4 contract.
 -/
 def CommittedServiceErasurePreemptorCountermodel : Prop :=
   committedServiceErasureCheck = true ∧
@@ -952,9 +1014,9 @@ private-state-irrelevance premise. With public queue `[21]` and an empty ledger,
 
 The accepted FIFO instance remains satisfiable: the arrival at 5 sees public queue `[12]` at
 capacity one and drops packet 21; `TxReady` at 10 removes public head 12, commits `[12]`, and emits
-completion and remote-arrival children that both carry packet 12. Its selection and every public
-effect are unchanged by arbitrary private bookkeeping, and `[12]` persists until a matching
-`TxComplete 12` removes exactly that commitment.
+exactly one completion and one remote-arrival child carrying packet 12. Its selection and every
+public effect are unchanged by arbitrary private bookkeeping; the duplicate-free list `[12]`
+persists by exact equality until a matching `TxComplete 12` produces `[12].erase 12`.
 
 This is a `Prop`-valued T11 statement over concrete executable data. T12 proves the proposition
 alongside F4.

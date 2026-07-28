@@ -199,6 +199,14 @@ def ExactStateOwnership (image : SimulationImage State) : Prop :=
             other = node
 
 /--
+Every prepared initial role state has a duplicate-free committed-service projection. Rust stores
+each host or switch-queue service slot as an `Option` at `executor/src/image.rs:25-69`, while
+`executor/src/validate.rs:1379-1511` rejects duplicate mutable payload ownership.
+-/
+def InitialCommittedServicesNodup (image : SimulationImage State) : Prop :=
+  ∀ kind, ∀ state ∈ image.stateArena kind, state.committedService.Nodup
+
+/--
 Unique initial persistent event keys, matching validation at
 `executor/src/validate.rs:1097-1115`.
 -/
@@ -325,12 +333,14 @@ def ChannelsReferenceDirectedLinks (image : SimulationImage State) : Prop :=
       channel.eventKind = .remoteArrival
 
 /--
-Static accepted-image assumptions checked independently of transition bodies, mirroring the
-load-time checks around `executor/src/validate.rs:196-245,1010-1080`.
+Static accepted-image assumptions checked independently of transition bodies: the load-time checks
+around `executor/src/validate.rs:196-245,1010-1080,1379-1511`, including the duplicate-free semantic
+projection of Rust's initial `in_service` slots at `executor/src/image.rs:25-69`.
 -/
 def StaticImageWellFormed (image : SimulationImage State) : Prop :=
   UniqueNodeIds image ∧
     ExactStateOwnership image ∧
+    InitialCommittedServicesNodup image ∧
     UniqueEventKeys image.initialEvents ∧
     InitialEventsOrdered image ∧
     UniqueLinkIds image ∧
