@@ -143,6 +143,7 @@ fn print_result<'round>(
         .unwrap_or(0);
     let mean_efficiency = mean(rounds.clone().map(|round| round.parallel_efficiency));
     let minimum_efficiency = rounds
+        .clone()
         .map(|round| round.parallel_efficiency)
         .reduce(f64::min)
         .unwrap_or(1.0);
@@ -165,6 +166,18 @@ fn print_result<'round>(
         .iter()
         .map(|round| round.partition.bulk_chunks.len() as u128)
         .sum::<u128>();
+    let remote_events = cpu_rounds
+        .iter()
+        .map(|round| u128::from(round.semantic.messages_exchanged))
+        .sum::<u128>();
+    let owner_batches = cpu_rounds
+        .iter()
+        .map(|round| u128::from(round.owner_batch_messages))
+        .sum::<u128>();
+    let physical_lp_probes = rounds
+        .clone()
+        .map(|round| u128::from(round.physical_lp_probes))
+        .sum::<u128>();
     let worker_busy_ns = cpu_rounds
         .iter()
         .flat_map(|round| &round.worker_timings)
@@ -176,6 +189,19 @@ fn print_result<'round>(
         .map(|worker| u128::from(worker.idle_ns))
         .sum::<u128>();
     let round_divisor = u128::try_from(round_count.max(1)).expect("round count must fit u128");
+    let chunks = straggler_lps.saturating_add(bulk_chunks);
+    let control_messages = if cpu_rounds.is_empty() {
+        0
+    } else {
+        4_u128
+            .saturating_mul(workers as u128)
+            .saturating_mul(round_count as u128)
+            .saturating_add(3_u128.saturating_mul(chunks))
+    };
+    let pool_messages_before = control_messages
+        .saturating_add(total_active_lps)
+        .saturating_add(remote_events);
+    let pool_messages_after = control_messages.saturating_add(owner_batches);
 
     println!(
         "config={path} repetition={repetition} mode={mode} workers={workers} chunk={chunk} \
@@ -189,6 +215,9 @@ fn print_result<'round>(
          mean_worker_efficiency={mean_worker_efficiency:.6} \
          mean_worker_utilization={mean_worker_utilization:.6} \
          straggler_lps={straggler_lps} bulk_chunks={bulk_chunks} \
+         remote_events={remote_events} owner_batches={owner_batches} \
+         pool_messages_before={pool_messages_before} pool_messages_after={pool_messages_after} \
+         physical_lp_probes={physical_lp_probes} \
          worker_busy_ns={worker_busy_ns} worker_idle_ns={worker_idle_ns} \
          sourced_packets={} received_packets={} dropped_packets={} wall_ns={wall_ns}",
         straggler_threshold.map_or_else(|| "none".to_owned(), |value| value.to_string()),

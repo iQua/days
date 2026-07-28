@@ -39,6 +39,8 @@ pub struct RoundMetrics {
     pub frontier_updates: u64,
     /// Valid and stale heap entries removed during this round.
     pub frontier_heap_pops: u64,
+    /// Physical LP-table slots visited by frontier, dispatch, and merge machinery.
+    pub physical_lp_probes: u64,
 }
 
 impl RoundMetrics {
@@ -105,7 +107,9 @@ impl OwnerFrontierIndex {
         lp_slot: usize,
         node: NodeId,
         next: Option<EventKey>,
+        physical_lp_probes: &mut u64,
     ) -> Result<(), ExecutionError> {
+        *physical_lp_probes = physical_lp_probes.saturating_add(1);
         let generation = self.generations[lp_slot]
             .checked_add(1)
             .ok_or(ExecutionError::CounterOverflow(node))?;
@@ -121,9 +125,14 @@ impl OwnerFrontierIndex {
         Ok(())
     }
 
-    fn peek_min(&mut self, heap_pops: &mut u64) -> Option<FrontierEntry> {
+    fn peek_min(
+        &mut self,
+        heap_pops: &mut u64,
+        physical_lp_probes: &mut u64,
+    ) -> Option<FrontierEntry> {
         loop {
             let entry = self.heap.peek().map(|entry| entry.0)?;
+            *physical_lp_probes = physical_lp_probes.saturating_add(1);
             if self.generations[entry.lp_slot] == entry.generation {
                 return Some(entry);
             }
@@ -136,8 +145,9 @@ impl OwnerFrontierIndex {
         &mut self,
         exclusive_horizon_ns: u128,
         heap_pops: &mut u64,
+        physical_lp_probes: &mut u64,
     ) -> Option<FrontierEntry> {
-        let entry = self.peek_min(heap_pops)?;
+        let entry = self.peek_min(heap_pops, physical_lp_probes)?;
         if u128::from(entry.time_ns) >= exclusive_horizon_ns {
             return None;
         }
@@ -194,12 +204,14 @@ impl<'image> RoundExecutor<'image> {
         }
 
         let mut frontier = OwnerFrontierIndex::new(image.nodes.len());
+        let mut setup_physical_lp_probes = 0;
         for lp_slot in touched {
             let node = image.nodes[lp_slot].id;
             frontier.update(
                 lp_slot,
                 node,
                 futures[lp_slot].first_key_value().map(|(key, _)| *key),
+                &mut setup_physical_lp_probes,
             )?;
         }
 
@@ -229,7 +241,11 @@ impl<'image> RoundExecutor<'image> {
 
         loop {
             let mut frontier_heap_pops = 0;
-            let Some(frontier_entry) = self.frontier.peek_min(&mut frontier_heap_pops) else {
+            let mut physical_lp_probes = 0_u64;
+            let Some(frontier_entry) = self
+                .frontier
+                .peek_min(&mut frontier_heap_pops, &mut physical_lp_probes)
+            else {
                 break;
             };
             let frontier_ns = frontier_entry.time_ns;
@@ -247,7 +263,10 @@ impl<'image> RoundExecutor<'image> {
                 horizon.saturating_sub(previous_horizon.unwrap_or(u128::from(frontier_ns)));
 
             let mut active = Vec::new();
-            while let Some(entry) = self.frontier.pop_before(horizon, &mut frontier_heap_pops) {
+            while let Some(entry) =
+                self.frontier
+                    .pop_before(horizon, &mut frontier_heap_pops, &mut physical_lp_probes)
+            {
                 active.push(entry);
             }
 
@@ -257,17 +276,21 @@ impl<'image> RoundExecutor<'image> {
             let mut events_processed = 0_u64;
             let mut frontier_updates = 0_u64;
             for entry in active {
+                physical_lp_probes = physical_lp_probes.saturating_add(1);
                 let (work, outbox) = self.drain_lp(entry.lp_slot, horizon, &mut children)?;
                 events_processed = events_processed.saturating_add(work.events_processed);
                 lp_work.push(work);
                 if !outbox.is_empty() {
                     outboxes.push(outbox);
                 }
-                self.update_frontier(entry.lp_slot)?;
+                self.update_frontier(entry.lp_slot, &mut physical_lp_probes)?;
                 frontier_updates = frontier_updates.saturating_add(1);
             }
 
-            if let Some(entry) = self.frontier.peek_min(&mut frontier_heap_pops) {
+            if let Some(entry) = self
+                .frontier
+                .peek_min(&mut frontier_heap_pops, &mut physical_lp_probes)
+            {
                 if u128::from(entry.time_ns) < horizon {
                     let key = self.futures[entry.lp_slot]
                         .first_key_value()
@@ -288,6 +311,7 @@ impl<'image> RoundExecutor<'image> {
                 let target = remote_events[offset].target;
                 let lp_slot =
                     node_slot(self.image, target).ok_or(ExecutionError::UnknownNode(target))?;
+                physical_lp_probes = physical_lp_probes.saturating_add(1);
                 let mut end = offset + 1;
                 while end < remote_events.len() && remote_events[end].target == target {
                     end += 1;
@@ -303,7 +327,7 @@ impl<'image> RoundExecutor<'image> {
                         return Err(ExecutionError::DuplicateEventKey(event.key));
                     }
                 }
-                self.update_frontier(lp_slot)?;
+                self.update_frontier(lp_slot, &mut physical_lp_probes)?;
                 frontier_updates = frontier_updates.saturating_add(1);
                 offset = end;
             }
@@ -330,6 +354,7 @@ impl<'image> RoundExecutor<'image> {
                 messages_exchanged,
                 frontier_updates,
                 frontier_heap_pops,
+                physical_lp_probes,
             });
             previous_horizon = Some(horizon);
         }
@@ -394,12 +419,18 @@ impl<'image> RoundExecutor<'image> {
         ))
     }
 
-    fn update_frontier(&mut self, lp_slot: usize) -> Result<(), ExecutionError> {
+    fn update_frontier(
+        &mut self,
+        lp_slot: usize,
+        physical_lp_probes: &mut u64,
+    ) -> Result<(), ExecutionError> {
+        *physical_lp_probes = physical_lp_probes.saturating_add(1);
         let node = self.image.nodes[lp_slot].id;
         self.frontier.update(
             lp_slot,
             node,
             self.futures[lp_slot].first_key_value().map(|(key, _)| *key),
+            physical_lp_probes,
         )
     }
 }
@@ -499,6 +530,7 @@ mod tests {
     #[test]
     fn lazy_frontier_discards_superseded_entries_without_visiting_idle_lps() {
         let mut frontier = OwnerFrontierIndex::new(100_000);
+        let mut physical_lp_probes = 0;
         frontier
             .update(
                 7,
@@ -509,6 +541,7 @@ mod tests {
                     origin_node: NodeId(7),
                     origin_seq: 0,
                 }),
+                &mut physical_lp_probes,
             )
             .unwrap();
         frontier
@@ -521,11 +554,18 @@ mod tests {
                     origin_node: NodeId(7),
                     origin_seq: 1,
                 }),
+                &mut physical_lp_probes,
             )
             .unwrap();
         let mut heap_pops = 0;
 
-        assert_eq!(frontier.peek_min(&mut heap_pops).unwrap().time_ns, 20);
+        assert_eq!(
+            frontier
+                .peek_min(&mut heap_pops, &mut physical_lp_probes)
+                .unwrap()
+                .time_ns,
+            20
+        );
         assert_eq!(heap_pops, 1);
         assert_eq!(frontier.heap.len(), 1);
     }
@@ -533,6 +573,7 @@ mod tests {
     #[test]
     fn event_exactly_at_horizon_is_not_active() {
         let mut frontier = OwnerFrontierIndex::new(1);
+        let mut physical_lp_probes = 0;
         frontier
             .update(
                 0,
@@ -543,12 +584,22 @@ mod tests {
                     origin_node: NodeId(0),
                     origin_seq: 0,
                 }),
+                &mut physical_lp_probes,
             )
             .unwrap();
         let mut heap_pops = 0;
 
-        assert_eq!(frontier.pop_before(10, &mut heap_pops), None);
-        assert_eq!(frontier.peek_min(&mut heap_pops).unwrap().time_ns, 10);
+        assert_eq!(
+            frontier.pop_before(10, &mut heap_pops, &mut physical_lp_probes),
+            None
+        );
+        assert_eq!(
+            frontier
+                .peek_min(&mut heap_pops, &mut physical_lp_probes)
+                .unwrap()
+                .time_ns,
+            10
+        );
         assert_eq!(heap_pops, 0);
     }
 

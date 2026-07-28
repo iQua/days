@@ -460,6 +460,55 @@ fn wide_and_narrow_lookahead_pin_events_per_round_separately_from_efficiency() {
     assert_eq!(narrow.rounds[0].parallel_efficiency, 1.0);
 }
 
+#[test]
+fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
+    let mut image = incast_image(8);
+    image.initial_events.clear();
+    for sender in 0..8 {
+        let sender = NodeId(sender);
+        let state = &mut image.host_states[sender.0 as usize];
+        state.in_service = None;
+        state.next_origin_seq = 1;
+        state.sourced_packets = 0;
+        let payload = image.initial_packets[sender.0 as usize].id;
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::PacketArrival),
+                origin_node: sender,
+                origin_seq: 0,
+            },
+            target: sender,
+            kind: EventKind::PacketArrival,
+            payload,
+        });
+    }
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let actual = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 1,
+            granularity: ChunkGranularity::Fixed(1),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(actual.result, expected);
+    assert_eq!(actual.rounds[0].semantic.active_lp_count, 8);
+    assert_eq!(actual.rounds[0].semantic.messages_exchanged, 8);
+    assert_eq!(actual.rounds[0].partition.bulk_chunks.len(), 8);
+    assert_eq!(actual.rounds[0].owner_batch_messages, 1);
+    assert!(
+        actual
+            .rounds
+            .iter()
+            .all(|round| round.owner_batch_messages <= 1)
+    );
+}
+
 fn blocked_feedback_image() -> SimulationImage {
     let forward = LinkDescriptor {
         id: LinkId(0),
@@ -885,6 +934,28 @@ fn idle_lp_count_does_not_change_round_loop_operations() {
             .collect::<Vec<_>>()
     };
     assert_eq!(cpu_operations(&cpu_small), cpu_operations(&cpu_large));
+    let physical_probes = |run: &days_executor::ScalarRoundRun| {
+        run.rounds
+            .iter()
+            .map(|round| round.physical_lp_probes)
+            .collect::<Vec<_>>()
+    };
+    let cpu_physical_probes = |run: &days_executor::CpuRun| {
+        run.rounds
+            .iter()
+            .map(|round| round.semantic.physical_lp_probes)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (
+            physical_probes(&scalar_small),
+            cpu_physical_probes(&cpu_small)
+        ),
+        (
+            physical_probes(&scalar_large),
+            cpu_physical_probes(&cpu_large)
+        )
+    );
     assert_eq!(cpu_small.result, scalar_small.result);
     assert_eq!(cpu_large.result, scalar_large.result);
 }
@@ -1148,9 +1219,15 @@ fn cpu_worker_count_granularity_and_straggler_classification_preserve_complete_s
                             .unwrap_or_else(|error| {
                                 panic!(
                                     "seed {seed}, workers {workers}, granularity {granularity:?}, \
-                             threshold {straggler_threshold_events:?} failed: {error}"
+                                    threshold {straggler_threshold_events:?} failed: {error}"
                                 )
                             });
+                    let maximum_owner_batches =
+                        u64::try_from(workers * workers).expect("worker bound must fit u64");
+                    assert!(actual.rounds.iter().all(|round| {
+                        round.owner_batch_messages <= maximum_owner_batches
+                            && round.owner_batch_messages <= round.semantic.messages_exchanged
+                    }));
                     assert_eq!(
                         actual.result, expected,
                         "seed {seed}, workers {workers}, granularity {granularity:?}, \
@@ -1327,6 +1404,11 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
             estimated_events: 16,
         }]
     );
+    assert!(!actual.rounds[0].partition.bulk_chunks.is_empty());
+    assert_eq!(
+        actual.rounds[0].partition.reserved_straggler_workers,
+        vec![0]
+    );
     let sink = actual.rounds[0]
         .lp_timings
         .iter()
@@ -1335,6 +1417,28 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
     assert_eq!(sink.class, WorkClass::Straggler);
     assert_eq!(sink.worker, 0);
     assert_eq!(sink.dispatch_order, 0);
+    assert!(
+        actual.rounds[0]
+            .partition
+            .reserved_straggler_workers
+            .contains(&sink.worker)
+    );
+    assert!(
+        actual.rounds[0]
+            .lp_timings
+            .iter()
+            .any(|timing| timing.class == WorkClass::Bulk)
+    );
+    assert!(
+        actual.rounds[0]
+            .lp_timings
+            .iter()
+            .filter(|timing| timing.class == WorkClass::Bulk)
+            .all(|timing| !actual.rounds[0]
+                .partition
+                .reserved_straggler_workers
+                .contains(&timing.worker))
+    );
     assert!(
         actual.rounds[0]
             .lp_timings
@@ -1348,38 +1452,30 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
 #[test]
 fn cpu_worker_faults_and_capacity_errors_abort_without_a_partial_result() {
     let image = image(100, 0, 10);
-    for (kind, expected) in [
-        (
-            CpuFaultKind::Failure,
-            ExecutionError::WorkerFailed {
+    let error = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            granularity: ChunkGranularity::Fixed(1),
+            fault_injection: Some(CpuFaultInjection {
                 worker: 0,
                 round: 0,
-            },
-        ),
-        (
-            CpuFaultKind::Panic,
-            ExecutionError::WorkerPanicked { worker: 0 },
-        ),
-    ] {
-        let error = run_cpu_with_observations(
-            &image,
-            None,
-            CpuConfig {
-                workers: 2,
-                granularity: ChunkGranularity::Fixed(1),
-                fault_injection: Some(CpuFaultInjection {
-                    worker: 0,
-                    round: 0,
-                    after_events: 1,
-                    kind,
-                }),
-                ..CpuConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .expect_err("an injected worker fault must abort the run");
-        assert_eq!(error, expected);
-    }
+                after_events: 1,
+                kind: CpuFaultKind::Failure,
+            }),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("an injected worker fault must abort the run");
+    assert_eq!(
+        error,
+        ExecutionError::WorkerFailed {
+            worker: 0,
+            round: 0,
+        }
+    );
 
     let capacity_error = run_cpu_with_observations(
         &image,
@@ -1414,6 +1510,31 @@ fn cpu_worker_faults_and_capacity_errors_abort_without_a_partial_result() {
     )
     .expect("a clean rerun after injected failures must succeed");
     assert_eq!(clean.result, expected);
+}
+
+#[test]
+fn cpu_panic_root_cause_beats_a_forced_earlier_disconnect() {
+    let image = image(100, 0, 10);
+    let error = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            granularity: ChunkGranularity::Fixed(1),
+            fault_injection: Some(CpuFaultInjection {
+                worker: 0,
+                round: 0,
+                after_events: 1,
+                kind: CpuFaultKind::Panic,
+            }),
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("an injected worker panic must abort the run");
+
+    // The injected-panic wrapper queues a disconnect report first to force the reviewed race.
+    assert_eq!(error, ExecutionError::WorkerPanicked { worker: 0 });
 }
 
 #[test]
