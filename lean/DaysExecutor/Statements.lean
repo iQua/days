@@ -38,10 +38,40 @@ def F1RemoteLowerBound
           ¬ belowBound bounds envelope.event))
 
 /--
+Post-exchange boundary reached by zero or more actual safe-horizon rounds from an initial machine.
+This is plan §4.2's execution-boundary scope. The T12 halt countermodel showed that
+`PostExchangeStart` alone also admits arbitrary well-formed but unreachable machines on which
+round serializability is false.
+-/
+def ReachablePostExchangeStart
+    (image : SimulationImage State)
+    (transition : TransitionRelation State)
+    (start : RoundState State) : Prop :=
+  ∃ initial : RoundState State, ∃ prefixBounds : List BoundFamily,
+    InitialMachine image initial.machine ∧
+      PostExchangeStart image initial ∧
+      SafeHorizonRounds image transition initial prefixBounds start
+
+/--
+Reachability glue for iterating F2 inside F3: completing one valid round from an actual
+post-exchange boundary produces the next actual post-exchange boundary.
+
+This is intentionally a `Prop`-valued definition for T11; T12 supplies the proof.
+-/
+def ReachablePostExchangeStartAfterRound
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) : Prop :=
+  ∀ bounds cut start drainedEvents finish,
+    ReachablePostExchangeStart image transition start →
+    SafeHorizonRound image transition bounds cut start drainedEvents finish →
+    ReachablePostExchangeStart image transition finish
+
+/--
 General cut-form serializability obligation behind F2: per-LP sequential half-open drains plus one
 complete exchange equal least-key serial execution restricted to the same drained consistent cut,
-mirroring `executor/src/scalar.rs:335-359` against
-`executor/src/safe_horizon.rs:241-365`.
+mirroring `executor/src/scalar.rs:335-359` against `executor/src/safe_horizon.rs:241-365`.
+Following plan §4.2, its start is a post-exchange boundary of an actual execution rather than an
+arbitrary well-formed state admitted by the T12 halt countermodel.
 -/
 def RoundSerializabilityOverCut
     (image : SimulationImage State)
@@ -49,6 +79,7 @@ def RoundSerializabilityOverCut
   AcceptedModel image transition →
     CompleteActualServiceStartDiscipline transition →
     ∀ bounds cut start drainedEvents finish,
+      ReachablePostExchangeStart image transition start →
       SafeHorizonRound image transition bounds cut start drainedEvents finish →
       ∃ serialOrder serialFinish,
         CanonicalSerialRestricted image transition cut
