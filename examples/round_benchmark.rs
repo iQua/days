@@ -210,6 +210,22 @@ fn print_result<'round>(
             .iter()
             .map(|round| u128::from(round.owner_delivery_messages))
             .sum::<u128>();
+        let owner_batches_merged = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.owner_batches_merged))
+            .sum::<u128>();
+        let early_owner_batches_merged = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.early_owner_batches_merged))
+            .sum::<u128>();
+        let owner_merge_ns = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.owner_merge_ns))
+            .sum::<u128>();
+        let early_owner_merge_ns = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.early_owner_merge_ns))
+            .sum::<u128>();
         let pool_messages = cpu_rounds
             .iter()
             .map(|round| u128::from(round.pool_messages()))
@@ -255,11 +271,15 @@ fn print_result<'round>(
              straggler_lps={straggler_lps} bulk_chunks={bulk_chunks} \
              owner_batches={owner_batches} worker_wakes={worker_wakes} \
              worker_completions={worker_completions} chunk_requests={chunk_requests} \
-             owner_deliveries={owner_deliveries} \
+             owner_deliveries={owner_deliveries} owner_batches_merged={owner_batches_merged} \
+             early_owner_batches_merged={early_owner_batches_merged} \
+             owner_merge_ns={owner_merge_ns} early_owner_merge_ns={early_owner_merge_ns} \
              legacy_protocol_messages_estimate={legacy_protocol_messages_estimate} \
              pool_messages_actual={pool_messages} \
              mean_pool_messages_per_round={:.3} \
              lp_busy_ns={lp_busy_ns} worker_machinery_ns={worker_machinery_ns} \
+             lp_busy_ns_per_active_lp={:.3} machinery_ns_per_physical_probe={:.3} \
+             wall_ns_per_physical_probe={:.3} \
              worker_busy_ns={worker_busy_ns} worker_idle_ns={worker_idle_ns} \
              coordinator_partition_ns={coordinator_partition_ns} \
              worker_wait_ns={worker_wait_ns} coordinator_exchange_ns={coordinator_exchange_ns} \
@@ -267,6 +287,9 @@ fn print_result<'round>(
              mean_coordinator_exchange_ns={:.3}",
             spin_before_park.expect("CPU rows provide a spin bound"),
             pool_messages as f64 / round_divisor as f64,
+            lp_busy_ns as f64 / total_active_lps.max(1) as f64,
+            worker_machinery_ns as f64 / physical_lp_probes.max(1) as f64,
+            wall_ns as f64 / physical_lp_probes.max(1) as f64,
             coordinator_partition_ns as f64 / round_divisor as f64,
             worker_wait_ns as f64 / round_divisor as f64,
             coordinator_exchange_ns as f64 / round_divisor as f64,

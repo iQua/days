@@ -620,7 +620,7 @@ fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
 }
 
 #[test]
-fn static_cpu_pool_uses_one_assignment_and_one_completion_per_worker_per_round() {
+fn static_cpu_pool_publishes_one_horizon_and_delivers_owner_batches_directly() {
     let image = direct_packets(100, 8);
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
     let workers = 4;
@@ -642,7 +642,20 @@ fn static_cpu_pool_uses_one_assignment_and_one_completion_per_worker_per_round()
         assert_eq!(round.worker_wake_messages, workers as u64);
         assert_eq!(round.worker_completion_messages, workers as u64);
         assert_eq!(round.chunk_request_messages, 0);
-        assert_eq!(round.pool_messages(), 2 * workers as u64);
+        assert_eq!(
+            round.owner_delivery_messages, round.owner_batch_messages,
+            "static owner batches must bypass the coordinator"
+        );
+        assert_eq!(
+            round.owner_batches_merged, round.owner_delivery_messages,
+            "the next publication must seal every direct owner batch"
+        );
+        assert!(round.early_owner_batches_merged <= round.owner_batches_merged);
+        assert!(round.early_owner_merge_ns <= round.owner_merge_ns);
+        assert_eq!(
+            round.pool_messages(),
+            2 * workers as u64 + round.owner_delivery_messages
+        );
     }
 }
 

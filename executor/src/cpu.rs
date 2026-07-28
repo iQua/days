@@ -6,7 +6,7 @@ use std::hint::spin_loop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{Receiver, RecvError, Sender, TryRecvError, bounded, unbounded};
+use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, bounded, unbounded};
 
 use crate::event::is_same_time_tx_ready_continuation;
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
@@ -141,6 +141,14 @@ pub struct CpuRoundMetrics {
     pub chunk_request_messages: u64,
     /// Owner-delivery channel crossings not fused into aggregate worker messages.
     pub owner_delivery_messages: u64,
+    /// Direct owner batches merged after the owner finished draining this round.
+    pub owner_batches_merged: u64,
+    /// Subset merged before the next horizon publication reached the owner.
+    pub early_owner_batches_merged: u64,
+    /// Worker time spent merging direct owner batches produced by this round.
+    pub owner_merge_ns: u64,
+    /// Subset of owner merge time overlapped with the straggler tail before publication.
+    pub early_owner_merge_ns: u64,
     pub lp_timings: Vec<LpExecutionTiming>,
     pub worker_timings: Vec<WorkerRoundTiming>,
     pub lp_time_parallel_efficiency: f64,
@@ -338,15 +346,33 @@ fn run_owned_static_cpu_with_observations(
 
     crossbeam::scope(|scope| {
         let (reply_tx, reply_rx) = bounded(config.workers.saturating_mul(2).max(1));
+        let mut routes = Vec::with_capacity(config.workers);
+        let mut ingresses = Vec::with_capacity(config.workers);
+        for _ in 0..config.workers {
+            let (remote_tx, remote_rx) = unbounded();
+            routes.push(StaticOwnerRoute { remote: remote_tx });
+            ingresses.push(Some(StaticOwnerIngress { remote: remote_rx }));
+        }
         let mut commands = Vec::with_capacity(config.workers);
         for shard in shards {
             let worker = shard.worker;
             let (command_tx, command_rx) = bounded(1);
             commands.push(command_tx);
             let worker_reply = reply_tx.clone();
+            let worker_ingress = ingresses[worker]
+                .take()
+                .expect("each static worker owns one ingress receiver");
+            let worker_routes = routes.clone();
             scope.spawn(move |_| {
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    owned_worker_loop(shard, command_rx, &worker_reply, config.spin_before_park)
+                    owned_worker_loop(
+                        shard,
+                        command_rx,
+                        worker_ingress,
+                        &worker_routes,
+                        &worker_reply,
+                        config,
+                    )
                 }));
                 if outcome.is_err() {
                     if config.fault_injection.is_some_and(|fault| {
@@ -546,6 +572,26 @@ struct OwnerIngress {
     remote: Receiver<Vec<RemoteEnvelope>>,
 }
 
+#[derive(Clone)]
+struct StaticOwnerRoute {
+    remote: Sender<StaticOwnerBatch>,
+}
+
+struct StaticOwnerIngress {
+    remote: Receiver<StaticOwnerBatch>,
+}
+
+struct StaticOwnerBatch {
+    round: u64,
+    envelopes: Vec<RemoteEnvelope>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct OwnerBatchMetadata {
+    batches: u64,
+    minimum_ns: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FrontierEntry {
     time_ns: u64,
@@ -702,21 +748,14 @@ enum WorkerReply<'image> {
     },
 }
 
+#[derive(Clone, Copy)]
 enum OwnedWorkerCommand {
     RunRound {
-        round: u64,
-        round_start: Instant,
         exclusive_horizon_ns: u128,
-        remote_floor_ns: u128,
-        inbox: Vec<RemoteEnvelope>,
-        outbox_capacity: Option<usize>,
-        fault: Option<CpuFaultInjection>,
-        workers: usize,
+        expected_inbound_batches: u64,
     },
     Finish {
-        remote_floor_ns: u128,
-        inbox: Vec<RemoteEnvelope>,
-        workers: usize,
+        expected_inbound_batches: u64,
     },
 }
 
@@ -729,11 +768,14 @@ enum OwnedWorkerReply<'image> {
         worker: usize,
         round: u64,
         executed: Vec<ExecutedLp>,
-        work_estimates: Vec<LpWorkEstimate>,
-        remote_by_owner: Vec<Vec<RemoteEnvelope>>,
+        outbox_metadata: Vec<OwnerBatchMetadata>,
         inbound_frontier_updates: u64,
         inbound_heap_pops: u64,
         inbound_physical_lp_probes: u64,
+        inbound_busy_ns: u64,
+        inbound_batches: u64,
+        inbound_early_batches: u64,
+        inbound_early_busy_ns: u64,
         frontier_updates: u64,
         heap_pops: u64,
         physical_lp_probes: u64,
@@ -746,6 +788,10 @@ enum OwnedWorkerReply<'image> {
         inbound_frontier_updates: u64,
         inbound_heap_pops: u64,
         inbound_physical_lp_probes: u64,
+        inbound_busy_ns: u64,
+        inbound_batches: u64,
+        inbound_early_batches: u64,
+        inbound_early_busy_ns: u64,
     },
     Failed {
         error: ExecutionError,
@@ -943,8 +989,10 @@ fn worker_loop<'image>(
 fn owned_worker_loop<'image>(
     mut shard: WorkerShard<'image>,
     commands: Receiver<OwnedWorkerCommand>,
+    ingress: StaticOwnerIngress,
+    routes: &[StaticOwnerRoute],
     replies: &Sender<OwnedWorkerReply<'image>>,
-    spin_before_park: u32,
+    config: CpuConfig,
 ) {
     let mut setup_heap_pops = 0;
     let mut setup_physical_lp_probes = 0;
@@ -962,122 +1010,89 @@ fn owned_worker_loop<'image>(
         return;
     }
 
-    while let Ok(command) = receive_spin_then_park(&commands, spin_before_park) {
+    let mut round = 0_u64;
+    let mut completed_round = None;
+    let mut pending_batches = VecDeque::new();
+    loop {
+        let (command, inbound) = match receive_owned_command_and_merge(
+            &mut shard,
+            &commands,
+            &ingress,
+            &mut pending_batches,
+            completed_round,
+            config.workers,
+            config.spin_before_park,
+        ) {
+            Ok(next) => next,
+            Err(error) => {
+                let _ = replies.send(OwnedWorkerReply::Failed { error });
+                return;
+            }
+        };
         match command {
             OwnedWorkerCommand::RunRound {
-                round,
-                round_start,
                 exclusive_horizon_ns,
-                remote_floor_ns,
-                inbox,
-                outbox_capacity,
-                fault,
-                workers,
+                expected_inbound_batches: _,
             } => {
                 let started = Instant::now();
-                let (inbound_frontier_updates, inbound_heap_pops, inbound_physical_lp_probes) =
-                    match shard.merge_remote(inbox, remote_floor_ns, workers) {
-                        Ok(metrics) => metrics,
-                        Err(error) => {
-                            let _ = replies.send(OwnedWorkerReply::Failed { error });
-                            return;
-                        }
-                    };
-                let mut frontier_updates = 0_u64;
-                let mut heap_pops = 0_u64;
-                let mut physical_lp_probes = 0_u64;
-                let (active, extract_pops, extract_probes) =
-                    match shard.extract(exclusive_horizon_ns) {
-                        Ok(active) => active,
-                        Err(error) => {
-                            let _ = replies.send(OwnedWorkerReply::Failed { error });
-                            return;
-                        }
-                    };
-                heap_pops = heap_pops.saturating_add(extract_pops);
-                physical_lp_probes = physical_lp_probes.saturating_add(extract_probes);
-
-                let mut executed = Vec::with_capacity(active.len());
-                let mut returned = Vec::with_capacity(active.len());
-                let mut work_estimates = Vec::with_capacity(active.len());
-                let mut remote_by_owner = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
-                for (dispatch_order, mut active) in active.into_iter().enumerate() {
-                    let lp_started = Instant::now();
-                    let started_after_ns =
-                        duration_ns(lp_started.saturating_duration_since(round_start));
-                    work_estimates.push(work_estimate(&active));
-                    let (work, outbox) = match active.lp.drain(
-                        exclusive_horizon_ns,
-                        outbox_capacity,
-                        fault,
-                        shard.worker,
-                        round,
-                    ) {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let _ = replies.send(OwnedWorkerReply::Failed { error });
-                            return;
-                        }
-                    };
-                    let messages_exchanged = match u64::try_from(outbox.len()) {
-                        Ok(count) => count,
-                        Err(_) => {
-                            let _ = replies.send(OwnedWorkerReply::Failed {
-                                error: ExecutionError::CounterOverflow(active.lp.node.id),
-                            });
-                            return;
-                        }
-                    };
-                    let timing = LpExecutionTiming {
-                        node: active.lp.node.id,
-                        worker: shard.worker,
-                        class: WorkClass::Bulk,
-                        dispatch_order: u64::try_from(dispatch_order).unwrap_or(u64::MAX),
-                        started_after_ns,
-                        busy_ns: elapsed_ns(lp_started),
-                    };
-                    returned.push(ReturnedLp {
-                        owner_worker: shard.worker,
-                        owner_slot: active.owner_slot,
-                        lp: active.lp,
-                    });
-                    for envelope in outbox {
-                        let Ok(target_slot) = usize::try_from(envelope.event.target.0) else {
-                            let _ = replies.send(OwnedWorkerReply::Failed {
-                                error: ExecutionError::UnknownNode(envelope.event.target),
-                            });
-                            return;
-                        };
-                        remote_by_owner[target_slot % workers].push(envelope);
+                let drain = shard.drain_owned_round(
+                    exclusive_horizon_ns,
+                    config.max_outbox_events_per_lp,
+                    config.fault_injection,
+                    round,
+                    config.workers,
+                );
+                let OwnedRoundDrain {
+                    executed,
+                    remote_by_owner,
+                    frontier_updates,
+                    heap_pops,
+                    physical_lp_probes,
+                    minimum_ns,
+                } = match drain {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = replies.send(OwnedWorkerReply::Failed { error });
+                        return;
                     }
-                    executed.push(ExecutedLp {
-                        work,
-                        messages_exchanged,
-                        timing,
-                    });
-                }
-
-                let (updates, restore_pops, restore_probes, minimum_ns) =
-                    match shard.restore_owned(returned, exclusive_horizon_ns) {
-                        Ok(metrics) => metrics,
-                        Err(error) => {
-                            let _ = replies.send(OwnedWorkerReply::Failed { error });
-                            return;
-                        }
+                };
+                let mut outbox_metadata = vec![OwnerBatchMetadata::default(); config.workers];
+                for (owner, envelopes) in remote_by_owner.into_iter().enumerate() {
+                    if envelopes.is_empty() {
+                        continue;
+                    }
+                    let minimum_ns = envelopes
+                        .iter()
+                        .map(|envelope| envelope.event.key.time_ns)
+                        .min();
+                    outbox_metadata[owner] = OwnerBatchMetadata {
+                        batches: 1,
+                        minimum_ns,
                     };
-                frontier_updates = frontier_updates.saturating_add(updates);
-                heap_pops = heap_pops.saturating_add(restore_pops);
-                physical_lp_probes = physical_lp_probes.saturating_add(restore_probes);
+                    if routes[owner]
+                        .remote
+                        .send(StaticOwnerBatch { round, envelopes })
+                        .is_err()
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                }
                 if replies
                     .send(OwnedWorkerReply::RoundComplete {
                         worker: shard.worker,
                         round,
                         executed,
-                        work_estimates,
-                        remote_by_owner,
-                        inbound_frontier_updates,
-                        inbound_heap_pops,
-                        inbound_physical_lp_probes,
+                        outbox_metadata,
+                        inbound_frontier_updates: inbound.frontier_updates,
+                        inbound_heap_pops: inbound.heap_pops,
+                        inbound_physical_lp_probes: inbound.physical_lp_probes,
+                        inbound_busy_ns: inbound.busy_ns,
+                        inbound_batches: inbound.batches,
+                        inbound_early_batches: inbound.early_batches,
+                        inbound_early_busy_ns: inbound.early_busy_ns,
                         frontier_updates,
                         heap_pops,
                         physical_lp_probes,
@@ -1088,21 +1103,21 @@ fn owned_worker_loop<'image>(
                 {
                     return;
                 }
+                completed_round = Some((round, exclusive_horizon_ns));
+                round = match round.checked_add(1) {
+                    Some(round) => round,
+                    None => {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::CounterOverflow(NodeId(0)),
+                        });
+                        return;
+                    }
+                };
             }
             OwnedWorkerCommand::Finish {
-                remote_floor_ns,
-                inbox,
-                workers,
+                expected_inbound_batches: _,
             } => {
                 let worker = shard.worker;
-                let (inbound_frontier_updates, inbound_heap_pops, inbound_physical_lp_probes) =
-                    match shard.merge_remote(inbox, remote_floor_ns, workers) {
-                        Ok(metrics) => metrics,
-                        Err(error) => {
-                            let _ = replies.send(OwnedWorkerReply::Failed { error });
-                            return;
-                        }
-                    };
                 let lps = match shard.into_lps() {
                     Ok(lps) => lps,
                     Err(error) => {
@@ -1113,14 +1128,196 @@ fn owned_worker_loop<'image>(
                 let _ = replies.send(OwnedWorkerReply::Finished {
                     worker,
                     lps,
-                    inbound_frontier_updates,
-                    inbound_heap_pops,
-                    inbound_physical_lp_probes,
+                    inbound_frontier_updates: inbound.frontier_updates,
+                    inbound_heap_pops: inbound.heap_pops,
+                    inbound_physical_lp_probes: inbound.physical_lp_probes,
+                    inbound_busy_ns: inbound.busy_ns,
+                    inbound_batches: inbound.batches,
+                    inbound_early_batches: inbound.early_batches,
+                    inbound_early_busy_ns: inbound.early_busy_ns,
                 });
                 return;
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InboundMergeMetrics {
+    frontier_updates: u64,
+    heap_pops: u64,
+    physical_lp_probes: u64,
+    busy_ns: u64,
+    batches: u64,
+    early_batches: u64,
+    early_busy_ns: u64,
+}
+
+struct OwnedRoundDrain {
+    executed: Vec<ExecutedLp>,
+    remote_by_owner: Vec<Vec<RemoteEnvelope>>,
+    frontier_updates: u64,
+    heap_pops: u64,
+    physical_lp_probes: u64,
+    minimum_ns: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_owned_command_and_merge(
+    shard: &mut WorkerShard<'_>,
+    commands: &Receiver<OwnedWorkerCommand>,
+    ingress: &StaticOwnerIngress,
+    pending_batches: &mut VecDeque<StaticOwnerBatch>,
+    completed_round: Option<(u64, u128)>,
+    workers: usize,
+    spin_before_park: u32,
+) -> Result<(OwnedWorkerCommand, InboundMergeMetrics), ExecutionError> {
+    let Some((completed_round, remote_floor_ns)) = completed_round else {
+        let command = receive_spin_then_park(commands, spin_before_park)
+            .map_err(|_| ExecutionError::WorkerChannelDisconnected)?;
+        if expected_inbound_batches(command) != 0 {
+            return Err(ExecutionError::WorkerChannelDisconnected);
+        }
+        return Ok((command, InboundMergeMetrics::default()));
+    };
+
+    let mut command = None;
+    let mut metrics = InboundMergeMetrics::default();
+    let pending_count = pending_batches.len();
+    for _ in 0..pending_count {
+        let batch = pending_batches
+            .pop_front()
+            .expect("pending batch count was captured");
+        if batch.round == completed_round {
+            merge_static_owner_batch(shard, batch, remote_floor_ns, workers, true, &mut metrics)?;
+        } else {
+            pending_batches.push_back(batch);
+        }
+    }
+
+    for _ in 0..spin_before_park {
+        while let Ok(batch) = ingress.remote.try_recv() {
+            if batch.round == completed_round {
+                merge_static_owner_batch(
+                    shard,
+                    batch,
+                    remote_floor_ns,
+                    workers,
+                    command.is_none(),
+                    &mut metrics,
+                )?;
+            } else if batch.round == completed_round.saturating_add(1) {
+                pending_batches.push_back(batch);
+            } else {
+                return Err(ExecutionError::WorkerChannelDisconnected);
+            }
+        }
+        if command.is_none() {
+            match commands.try_recv() {
+                Ok(next) => command = Some(next),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err(ExecutionError::WorkerChannelDisconnected);
+                }
+            }
+        }
+        if command.is_some_and(|next| metrics.batches == expected_inbound_batches(next)) {
+            return Ok((command.expect("command presence was established"), metrics));
+        }
+        if command.is_some_and(|next| metrics.batches > expected_inbound_batches(next)) {
+            return Err(ExecutionError::WorkerChannelDisconnected);
+        }
+        spin_loop();
+    }
+
+    loop {
+        if let Some(next) = command {
+            let expected = expected_inbound_batches(next);
+            if metrics.batches == expected {
+                return Ok((next, metrics));
+            }
+            if metrics.batches > expected {
+                return Err(ExecutionError::WorkerChannelDisconnected);
+            }
+        }
+
+        let mut select = Select::new();
+        let command_index = select.recv(commands);
+        let ingress_index = select.recv(&ingress.remote);
+        let selected = select.select();
+        if selected.index() == command_index {
+            let next = selected
+                .recv(commands)
+                .map_err(|_| ExecutionError::WorkerChannelDisconnected)?;
+            if command.replace(next).is_some() {
+                return Err(ExecutionError::WorkerChannelDisconnected);
+            }
+        } else if selected.index() == ingress_index {
+            let batch = selected
+                .recv(&ingress.remote)
+                .map_err(|_| ExecutionError::WorkerChannelDisconnected)?;
+            if batch.round == completed_round {
+                merge_static_owner_batch(
+                    shard,
+                    batch,
+                    remote_floor_ns,
+                    workers,
+                    command.is_none(),
+                    &mut metrics,
+                )?;
+            } else if batch.round == completed_round.saturating_add(1) {
+                pending_batches.push_back(batch);
+            } else {
+                return Err(ExecutionError::WorkerChannelDisconnected);
+            }
+        } else {
+            unreachable!("the static wait selects only command and owner-inbox channels");
+        }
+    }
+}
+
+fn expected_inbound_batches(command: OwnedWorkerCommand) -> u64 {
+    match command {
+        OwnedWorkerCommand::RunRound {
+            expected_inbound_batches,
+            ..
+        }
+        | OwnedWorkerCommand::Finish {
+            expected_inbound_batches,
+        } => expected_inbound_batches,
+    }
+}
+
+fn merge_static_owner_batch(
+    shard: &mut WorkerShard<'_>,
+    batch: StaticOwnerBatch,
+    remote_floor_ns: u128,
+    workers: usize,
+    early: bool,
+    metrics: &mut InboundMergeMetrics,
+) -> Result<(), ExecutionError> {
+    let started = Instant::now();
+    let (frontier_updates, heap_pops, physical_lp_probes) =
+        shard.merge_remote(batch.envelopes, remote_floor_ns, workers)?;
+    metrics.frontier_updates = metrics.frontier_updates.saturating_add(frontier_updates);
+    metrics.heap_pops = metrics.heap_pops.saturating_add(heap_pops);
+    metrics.physical_lp_probes = metrics
+        .physical_lp_probes
+        .saturating_add(physical_lp_probes);
+    let busy_ns = elapsed_ns(started);
+    metrics.busy_ns = metrics.busy_ns.saturating_add(busy_ns);
+    metrics.batches = metrics
+        .batches
+        .checked_add(1)
+        .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+    if early {
+        metrics.early_batches = metrics
+            .early_batches
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+        metrics.early_busy_ns = metrics.early_busy_ns.saturating_add(busy_ns);
+    }
+    Ok(())
 }
 
 struct WorkChunk<'image> {
@@ -1382,6 +1579,10 @@ fn run_coordinator<'image>(
             .unwrap_or(u64::MAX),
             chunk_request_messages: 0,
             owner_delivery_messages: owner_batch_messages,
+            owner_batches_merged: 0,
+            early_owner_batches_merged: 0,
+            owner_merge_ns: 0,
+            early_owner_merge_ns: 0,
             lp_timings,
             worker_timings,
             lp_time_parallel_efficiency,
@@ -1423,7 +1624,7 @@ fn run_owned_static_coordinator<'image>(
         }
     }
 
-    let mut inboxes = (0..config.workers).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut expected_inbound_batches = vec![0_u64; config.workers];
     let mut previous_horizon = None;
     let mut rounds = Vec::<CpuRoundMetrics>::new();
     let mut round_number = 0_u64;
@@ -1438,21 +1639,13 @@ fn run_owned_static_coordinator<'image>(
         let exclusive_horizon_ns = run_end.min(lookahead_end);
         let horizon_advance_ns = exclusive_horizon_ns
             .saturating_sub(previous_horizon.unwrap_or(u128::from(frontier_ns)));
-        let remote_floor_ns = previous_horizon.unwrap_or(u128::from(frontier_ns));
-
         let partition_started = Instant::now();
         for (worker, command) in commands.iter().enumerate() {
             send_command(
                 command,
                 OwnedWorkerCommand::RunRound {
-                    round: round_number,
-                    round_start,
                     exclusive_horizon_ns,
-                    remote_floor_ns,
-                    inbox: std::mem::take(&mut inboxes[worker]),
-                    outbox_capacity: config.max_outbox_events_per_lp,
-                    fault: config.fault_injection,
-                    workers: config.workers,
+                    expected_inbound_batches: expected_inbound_batches[worker],
                 },
             )?;
         }
@@ -1462,12 +1655,17 @@ fn run_owned_static_coordinator<'image>(
         let mut completed = vec![false; config.workers];
         let mut next_local_minima = vec![None; config.workers];
         let mut worker_busy_ns = vec![0_u64; config.workers];
-        let mut work_by_worker = (0..config.workers).map(|_| Vec::new()).collect::<Vec<_>>();
         let mut executed_lps = Vec::new();
-        let mut remote_runs = Vec::new();
+        let mut outbox_metadata_by_worker = (0..config.workers)
+            .map(|_| None)
+            .collect::<Vec<Option<Vec<OwnerBatchMetadata>>>>();
         let mut inbound_frontier_updates = 0_u64;
         let mut inbound_frontier_heap_pops = 0_u64;
         let mut inbound_physical_lp_probes = 0_u64;
+        let mut inbound_busy_by_worker = vec![0_u64; config.workers];
+        let mut inbound_batches = 0_u64;
+        let mut inbound_early_batches = 0_u64;
+        let mut inbound_early_busy_ns = 0_u64;
         let mut frontier_updates = 0_u64;
         let mut frontier_heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
@@ -1478,11 +1676,14 @@ fn run_owned_static_coordinator<'image>(
                     worker,
                     round,
                     executed,
-                    work_estimates,
-                    remote_by_owner,
+                    outbox_metadata,
                     inbound_frontier_updates: inbound_updates,
                     inbound_heap_pops,
                     inbound_physical_lp_probes: inbound_probes,
+                    inbound_busy_ns,
+                    inbound_batches: worker_inbound_batches,
+                    inbound_early_batches: worker_early_batches,
+                    inbound_early_busy_ns: worker_early_busy_ns,
                     frontier_updates: updates,
                     heap_pops,
                     physical_lp_probes: probes,
@@ -1492,24 +1693,23 @@ fn run_owned_static_coordinator<'image>(
                     completed[worker] = true;
                     next_local_minima[worker] = minimum_ns;
                     worker_busy_ns[worker] = busy_ns;
-                    work_by_worker[worker] = work_estimates;
                     executed_lps.extend(executed);
+                    outbox_metadata_by_worker[worker] = Some(outbox_metadata);
                     inbound_frontier_updates =
                         inbound_frontier_updates.saturating_add(inbound_updates);
                     inbound_frontier_heap_pops =
                         inbound_frontier_heap_pops.saturating_add(inbound_heap_pops);
                     inbound_physical_lp_probes =
                         inbound_physical_lp_probes.saturating_add(inbound_probes);
+                    inbound_busy_by_worker[worker] = inbound_busy_ns;
+                    inbound_batches = inbound_batches.saturating_add(worker_inbound_batches);
+                    inbound_early_batches =
+                        inbound_early_batches.saturating_add(worker_early_batches);
+                    inbound_early_busy_ns =
+                        inbound_early_busy_ns.saturating_add(worker_early_busy_ns);
                     frontier_updates = frontier_updates.saturating_add(updates);
                     frontier_heap_pops = frontier_heap_pops.saturating_add(heap_pops);
                     physical_lp_probes = physical_lp_probes.saturating_add(probes);
-                    for (owner, batch) in remote_by_owner.into_iter().enumerate() {
-                        if batch.is_empty() {
-                            continue;
-                        }
-                        owner_batch_messages = owner_batch_messages.saturating_add(1);
-                        remote_runs.push((owner, batch));
-                    }
                 }
                 OwnedWorkerReply::Failed { error } => return Err(error),
                 _ => return Err(ExecutionError::WorkerChannelDisconnected),
@@ -1531,18 +1731,44 @@ fn run_owned_static_coordinator<'image>(
                 .semantic
                 .physical_lp_probes
                 .saturating_add(inbound_physical_lp_probes);
+            previous.owner_batches_merged = previous
+                .owner_batches_merged
+                .saturating_add(inbound_batches);
+            previous.early_owner_batches_merged = previous
+                .early_owner_batches_merged
+                .saturating_add(inbound_early_batches);
+            previous.owner_merge_ns = previous.owner_merge_ns.saturating_add(
+                inbound_busy_by_worker
+                    .iter()
+                    .copied()
+                    .fold(0_u64, u64::saturating_add),
+            );
+            previous.early_owner_merge_ns = previous
+                .early_owner_merge_ns
+                .saturating_add(inbound_early_busy_ns);
+            for (worker, busy_ns) in inbound_busy_by_worker.into_iter().enumerate() {
+                add_worker_merge_timing(previous, worker, busy_ns);
+            }
         }
 
         let exchange_started = Instant::now();
+        let mut next_expected_inbound_batches = vec![0_u64; config.workers];
         let mut inbox_minima: Vec<Option<u64>> = vec![None; config.workers];
-        for (owner, batch) in remote_runs {
-            for envelope in &batch {
-                inbox_minima[owner] = match inbox_minima[owner] {
-                    Some(current) => Some(current.min(envelope.event.key.time_ns)),
-                    None => Some(envelope.event.key.time_ns),
-                };
+        for metadata in outbox_metadata_by_worker.into_iter().flatten() {
+            for (owner, metadata) in metadata.into_iter().enumerate() {
+                next_expected_inbound_batches[owner] = next_expected_inbound_batches[owner]
+                    .checked_add(metadata.batches)
+                    .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+                owner_batch_messages = owner_batch_messages
+                    .checked_add(metadata.batches)
+                    .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+                if let Some(remote) = metadata.minimum_ns {
+                    inbox_minima[owner] = match inbox_minima[owner] {
+                        Some(current) => Some(current.min(remote)),
+                        None => Some(remote),
+                    };
+                }
             }
-            inboxes[owner].extend(batch);
         }
         for worker in 0..config.workers {
             minima[worker] = match (next_local_minima[worker], inbox_minima[worker]) {
@@ -1552,6 +1778,7 @@ fn run_owned_static_coordinator<'image>(
                 (None, None) => None,
             };
         }
+        expected_inbound_batches = next_expected_inbound_batches;
         let coordinator_exchange_ns = elapsed_ns(exchange_started);
 
         let mut lp_work = Vec::with_capacity(executed_lps.len());
@@ -1608,14 +1835,6 @@ fn run_owned_static_coordinator<'image>(
         } else {
             total_worker_busy as f64 / available_worker_time as f64
         };
-        let partition = WorkPartition {
-            stragglers: Vec::new(),
-            bulk_chunks: work_by_worker
-                .into_iter()
-                .filter(|chunk| !chunk.is_empty())
-                .collect(),
-            reserved_straggler_workers: Vec::new(),
-        };
         rounds.push(CpuRoundMetrics {
             semantic: RoundMetrics {
                 frontier_ns,
@@ -1630,12 +1849,16 @@ fn run_owned_static_coordinator<'image>(
                 frontier_heap_pops,
                 physical_lp_probes,
             },
-            partition,
+            partition: WorkPartition::default(),
             owner_batch_messages,
             worker_wake_messages: config.workers as u64,
             worker_completion_messages: config.workers as u64,
             chunk_request_messages: 0,
-            owner_delivery_messages: 0,
+            owner_delivery_messages: owner_batch_messages,
+            owner_batches_merged: 0,
+            early_owner_batches_merged: 0,
+            owner_merge_ns: 0,
+            early_owner_merge_ns: 0,
             lp_timings,
             worker_timings,
             lp_time_parallel_efficiency,
@@ -1652,14 +1875,11 @@ fn run_owned_static_coordinator<'image>(
             .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
     }
 
-    let remote_floor_ns = previous_horizon.unwrap_or(0);
     for (worker, command) in commands.iter().enumerate() {
         send_command(
             command,
             OwnedWorkerCommand::Finish {
-                remote_floor_ns,
-                inbox: std::mem::take(&mut inboxes[worker]),
-                workers: config.workers,
+                expected_inbound_batches: expected_inbound_batches[worker],
             },
         )?;
     }
@@ -1668,6 +1888,10 @@ fn run_owned_static_coordinator<'image>(
     let mut inbound_frontier_updates = 0_u64;
     let mut inbound_frontier_heap_pops = 0_u64;
     let mut inbound_physical_lp_probes = 0_u64;
+    let mut inbound_busy_by_worker = vec![0_u64; config.workers];
+    let mut inbound_batches = 0_u64;
+    let mut inbound_early_batches = 0_u64;
+    let mut inbound_early_busy_ns = 0_u64;
     for _ in 0..config.workers {
         match receive_owned_reply(replies, 0)? {
             OwnedWorkerReply::Finished {
@@ -1676,6 +1900,10 @@ fn run_owned_static_coordinator<'image>(
                 inbound_frontier_updates: inbound_updates,
                 inbound_heap_pops,
                 inbound_physical_lp_probes: inbound_probes,
+                inbound_busy_ns,
+                inbound_batches: worker_inbound_batches,
+                inbound_early_batches: worker_early_batches,
+                inbound_early_busy_ns: worker_early_busy_ns,
             } if !finished[worker] => {
                 finished[worker] = true;
                 lps.extend(worker_lps);
@@ -1684,6 +1912,10 @@ fn run_owned_static_coordinator<'image>(
                     inbound_frontier_heap_pops.saturating_add(inbound_heap_pops);
                 inbound_physical_lp_probes =
                     inbound_physical_lp_probes.saturating_add(inbound_probes);
+                inbound_busy_by_worker[worker] = inbound_busy_ns;
+                inbound_batches = inbound_batches.saturating_add(worker_inbound_batches);
+                inbound_early_batches = inbound_early_batches.saturating_add(worker_early_batches);
+                inbound_early_busy_ns = inbound_early_busy_ns.saturating_add(worker_early_busy_ns);
             }
             OwnedWorkerReply::Failed { error } => return Err(error),
             _ => return Err(ExecutionError::WorkerChannelDisconnected),
@@ -1703,11 +1935,53 @@ fn run_owned_static_coordinator<'image>(
             .semantic
             .physical_lp_probes
             .saturating_add(inbound_physical_lp_probes);
+        last.owner_batches_merged = last.owner_batches_merged.saturating_add(inbound_batches);
+        last.early_owner_batches_merged = last
+            .early_owner_batches_merged
+            .saturating_add(inbound_early_batches);
+        last.owner_merge_ns = last.owner_merge_ns.saturating_add(
+            inbound_busy_by_worker
+                .iter()
+                .copied()
+                .fold(0_u64, u64::saturating_add),
+        );
+        last.early_owner_merge_ns = last
+            .early_owner_merge_ns
+            .saturating_add(inbound_early_busy_ns);
+        for (worker, busy_ns) in inbound_busy_by_worker.into_iter().enumerate() {
+            add_worker_merge_timing(last, worker, busy_ns);
+        }
     }
     Ok(CpuRun {
         result: assemble_result(image, lps)?,
         rounds,
     })
+}
+
+fn add_worker_merge_timing(round: &mut CpuRoundMetrics, worker: usize, busy_ns: u64) {
+    if busy_ns == 0 {
+        return;
+    }
+    let Some(timing) = round.worker_timings.get_mut(worker) else {
+        return;
+    };
+    timing.busy_ns = timing.busy_ns.saturating_add(busy_ns);
+    timing.idle_ns = round.round_wall_time_ns.saturating_sub(timing.busy_ns);
+    round.worker_parallel_efficiency = efficiency(
+        round.worker_timings.iter().map(|timing| timing.busy_ns),
+        round.worker_timings.len(),
+    );
+    let total_busy = round
+        .worker_timings
+        .iter()
+        .fold(0_u128, |total, timing| total + u128::from(timing.busy_ns));
+    let available =
+        u128::from(round.round_wall_time_ns).saturating_mul(round.worker_timings.len() as u128);
+    round.worker_utilization = if available == 0 {
+        1.0
+    } else {
+        total_busy as f64 / available as f64
+    };
 }
 
 fn partition_round<'image>(
@@ -3065,6 +3339,98 @@ fn one_lp_outbox_is_event_key_ordered_not_target_major() {
 }
 
 impl<'image> WorkerShard<'image> {
+    fn drain_owned_round(
+        &mut self,
+        exclusive_horizon_ns: u128,
+        outbox_capacity: Option<usize>,
+        fault: Option<CpuFaultInjection>,
+        round: u64,
+        workers: usize,
+    ) -> Result<OwnedRoundDrain, ExecutionError> {
+        let round_started = Instant::now();
+        let mut executed = Vec::new();
+        let mut remote_by_owner = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut frontier_updates = 0_u64;
+        let mut heap_pops = 0_u64;
+        let mut physical_lp_probes = 0_u64;
+        let mut dispatch_order = 0_u64;
+
+        while let Some(entry) = self.frontier.pop_before(
+            exclusive_horizon_ns,
+            &mut heap_pops,
+            &mut physical_lp_probes,
+        ) {
+            let lp_started = Instant::now();
+            let started_after_ns = duration_ns(lp_started.saturating_duration_since(round_started));
+            physical_lp_probes = physical_lp_probes.saturating_add(1);
+            let lp = self.lps[entry.owner_slot]
+                .as_mut()
+                .expect("a live frontier entry owns a resident static LP");
+            let (work, outbox) = lp.drain(
+                exclusive_horizon_ns,
+                outbox_capacity,
+                fault,
+                self.worker,
+                round,
+            )?;
+            let messages_exchanged = u64::try_from(outbox.len())
+                .map_err(|_| ExecutionError::CounterOverflow(lp.node.id))?;
+            for envelope in outbox {
+                let target_slot = usize::try_from(envelope.event.target.0)
+                    .map_err(|_| ExecutionError::UnknownNode(envelope.event.target))?;
+                remote_by_owner[target_slot % workers].push(envelope);
+            }
+            let node = lp.node.id;
+            let next = lp.next_key();
+            let timing = LpExecutionTiming {
+                node,
+                worker: self.worker,
+                class: WorkClass::Bulk,
+                dispatch_order,
+                started_after_ns,
+                busy_ns: elapsed_ns(lp_started),
+            };
+            dispatch_order = dispatch_order
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node))?;
+            executed.push(ExecutedLp {
+                work,
+                messages_exchanged,
+                timing,
+            });
+            self.frontier
+                .update(entry.owner_slot, node, next, &mut physical_lp_probes)?;
+            frontier_updates = frontier_updates.saturating_add(1);
+        }
+
+        let minimum_ns = self
+            .frontier
+            .peek_min(&mut heap_pops, &mut physical_lp_probes)
+            .map(|entry| entry.time_ns);
+        if minimum_ns.is_some_and(|time_ns| u128::from(time_ns) < exclusive_horizon_ns) {
+            let entry = self
+                .frontier
+                .peek_min(&mut heap_pops, &mut physical_lp_probes)
+                .expect("minimum was established");
+            let key = self.lps[entry.owner_slot]
+                .as_ref()
+                .and_then(CpuLp::next_key)
+                .expect("a live owner frontier entry has a pending event");
+            return Err(ExecutionError::EventBelowHorizonAfterDrain {
+                key,
+                exclusive_horizon_ns,
+            });
+        }
+        Ok(OwnedRoundDrain {
+            executed,
+            remote_by_owner,
+            frontier_updates,
+            heap_pops,
+            physical_lp_probes,
+            minimum_ns,
+        })
+    }
+
     fn merge_remote(
         &mut self,
         mut inbox: Vec<RemoteEnvelope>,
@@ -3117,48 +3483,6 @@ impl<'image> WorkerShard<'image> {
             offset = end;
         }
         Ok((frontier_updates, heap_pops, physical_lp_probes))
-    }
-
-    fn restore_owned(
-        &mut self,
-        states: Vec<ReturnedLp<'image>>,
-        exclusive_horizon_ns: u128,
-    ) -> Result<(u64, u64, u64, Option<u64>), ExecutionError> {
-        let mut frontier_updates = 0_u64;
-        let mut heap_pops = 0_u64;
-        let mut physical_lp_probes = 0_u64;
-        for state in states {
-            let node = state.lp.node.id;
-            let next = state.lp.next_key();
-            physical_lp_probes = physical_lp_probes.saturating_add(1);
-            if state.owner_worker != self.worker
-                || self.lps[state.owner_slot].replace(state.lp).is_some()
-            {
-                return Err(ExecutionError::UnknownNode(node));
-            }
-            self.frontier
-                .update(state.owner_slot, node, next, &mut physical_lp_probes)?;
-            frontier_updates = frontier_updates.saturating_add(1);
-        }
-        let minimum_ns = self
-            .frontier
-            .peek_min(&mut heap_pops, &mut physical_lp_probes)
-            .map(|entry| entry.time_ns);
-        if minimum_ns.is_some_and(|time_ns| u128::from(time_ns) < exclusive_horizon_ns) {
-            let entry = self
-                .frontier
-                .peek_min(&mut heap_pops, &mut physical_lp_probes)
-                .expect("minimum was established");
-            let key = self.lps[entry.owner_slot]
-                .as_ref()
-                .and_then(CpuLp::next_key)
-                .expect("a live owner frontier entry has a pending event");
-            return Err(ExecutionError::EventBelowHorizonAfterDrain {
-                key,
-                exclusive_horizon_ns,
-            });
-        }
-        Ok((frontier_updates, heap_pops, physical_lp_probes, minimum_ns))
     }
 
     fn into_lps(self) -> Result<Vec<CpuLp<'image>>, ExecutionError> {
