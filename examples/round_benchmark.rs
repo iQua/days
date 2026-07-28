@@ -222,6 +222,18 @@ fn print_result<'round>(
             .iter()
             .map(|round| u128::from(round.chunk_request_messages))
             .sum::<u128>();
+        let classification_presence_messages = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.classification_presence_messages))
+            .sum::<u128>();
+        let classification_work_messages = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.classification_work_messages))
+            .sum::<u128>();
+        let classification_return_messages = cpu_rounds
+            .iter()
+            .map(|round| u128::from(round.classification_return_messages))
+            .sum::<u128>();
         let owner_deliveries = cpu_rounds
             .iter()
             .map(|round| u128::from(round.owner_delivery_messages))
@@ -287,6 +299,9 @@ fn print_result<'round>(
              straggler_lps={straggler_lps} bulk_chunks={bulk_chunks} \
              owner_batches={owner_batches} worker_wakes={worker_wakes} \
              worker_completions={worker_completions} chunk_requests={chunk_requests} \
+             classification_presence_messages={classification_presence_messages} \
+             classification_work_messages={classification_work_messages} \
+             classification_return_messages={classification_return_messages} \
              owner_deliveries={owner_deliveries} owner_batches_merged={owner_batches_merged} \
              early_owner_batches_merged={early_owner_batches_merged} \
              owner_merge_ns={owner_merge_ns} early_owner_merge_ns={early_owner_merge_ns} \

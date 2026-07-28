@@ -151,6 +151,12 @@ pub struct CpuRoundMetrics {
     pub worker_completion_messages: u64,
     /// Additional dynamic-granularity chunk requests.
     pub chunk_request_messages: u64,
+    /// Classified-round peer broadcasts that establish whether dedicated workers are needed.
+    pub classification_presence_messages: u64,
+    /// Classified-round peer batches that route active LP state to execution workers.
+    pub classification_work_messages: u64,
+    /// Classified-round peer batches that restore LP state and deliver remote events to owners.
+    pub classification_return_messages: u64,
     /// Owner-delivery channel crossings not fused into aggregate worker messages.
     pub owner_delivery_messages: u64,
     /// Direct owner batches merged after the owner finished draining this round.
@@ -181,6 +187,9 @@ impl CpuRoundMetrics {
         self.worker_wake_messages
             .saturating_add(self.worker_completion_messages)
             .saturating_add(self.chunk_request_messages)
+            .saturating_add(self.classification_presence_messages)
+            .saturating_add(self.classification_work_messages)
+            .saturating_add(self.classification_return_messages)
             .saturating_add(self.owner_delivery_messages)
     }
 }
@@ -214,8 +223,16 @@ pub fn run_cpu_with_observations(
     observation_mode: ObservationMode,
 ) -> Result<CpuRun, ExecutionError> {
     validate_config(config)?;
-    if config.granularity == ChunkGranularity::Static && config.straggler_threshold_events.is_none()
+    if config.granularity == ChunkGranularity::Static && config.straggler_threshold_events.is_some()
     {
+        return run_classified_static_cpu_with_observations(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+        );
+    }
+    if config.granularity == ChunkGranularity::Static {
         return run_owned_static_cpu_with_observations(
             image,
             exclusive_horizon_ns,
@@ -328,7 +345,7 @@ fn validate_config(config: CpuConfig) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-/// Static, unclassified rounds keep deterministic modulo LP ownership for the pool lifetime.
+/// Static, unclassified rounds keep deterministic LP ownership for the pool lifetime.
 ///
 /// Each command carries the horizon and the owner's fused remote inbox; each aggregate completion
 /// carries its local minimum, instrumentation, and source-worker × target-owner outbox batches.
@@ -341,8 +358,7 @@ fn run_owned_static_cpu_with_observations(
     observation_mode: ObservationMode,
 ) -> Result<CpuRun, ExecutionError> {
     let lps = build_lps(image, observation_mode)?;
-    let (shards, placement) =
-        partition_static_ownership(lps, image, config.workers, config.static_partition)?;
+    let (shards, placement) = partition_static_ownership(lps, image, config)?;
     let minimum_lookahead_ns = image
         .channels
         .iter()
@@ -384,6 +400,123 @@ fn run_owned_static_cpu_with_observations(
                         command_rx,
                         worker_ingress,
                         &worker_routes,
+                        worker_placement,
+                        &worker_reply,
+                        config,
+                    )
+                }));
+                if outcome.is_err() {
+                    if config.fault_injection.is_some_and(|fault| {
+                        fault.worker == worker && fault.kind == CpuFaultKind::Panic
+                    }) {
+                        let _ = worker_reply.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                    }
+                    let _ = worker_reply.send(OwnedWorkerReply::Failed {
+                        error: ExecutionError::WorkerPanicked { worker },
+                    });
+                }
+            });
+        }
+        drop(reply_tx);
+
+        let result = run_owned_static_coordinator(
+            image,
+            config,
+            run_end,
+            minimum_lookahead_ns,
+            &commands,
+            &reply_rx,
+        );
+        drop(commands);
+        match result {
+            Ok(run) => Ok(run),
+            Err(error) => Err(drain_owned_worker_errors(&reply_rx, error)),
+        }
+    })
+    .map_err(|_| ExecutionError::WorkerChannelDisconnected)?
+}
+
+/// Classified static rounds retain the fused coordinator protocol while moving only active LP
+/// state directly between workers. A peer presence exchange establishes whether the round needs
+/// dedicated workers; peer work and return batches then route stragglers without coordinator data
+/// relays. These peer exchanges are round barriers, never per-event atomics or shared counters.
+fn run_classified_static_cpu_with_observations(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: CpuConfig,
+    observation_mode: ObservationMode,
+) -> Result<CpuRun, ExecutionError> {
+    let lps = build_lps(image, observation_mode)?;
+    let ownership_config = CpuConfig {
+        straggler_threshold_events: None,
+        ..config
+    };
+    let (shards, placement) = partition_static_ownership(lps, image, ownership_config)?;
+    let minimum_lookahead_ns = image
+        .channels
+        .iter()
+        .map(|channel| channel.min_delay_ns)
+        .min();
+    if minimum_lookahead_ns == Some(0) {
+        return Err(ExecutionError::NonPositiveLookahead);
+    }
+    let configured_stop = u128::from(image.stop_time_ns) + 1;
+    let run_end = exclusive_horizon_ns
+        .map(u128::from)
+        .unwrap_or(TIME_AFTER_U64_MAX)
+        .min(configured_stop);
+
+    crossbeam::scope(|scope| {
+        let (reply_tx, reply_rx) = bounded(config.workers.saturating_mul(2).max(1));
+        let mut presence_routes = Vec::with_capacity(config.workers);
+        let mut presence_ingresses = Vec::with_capacity(config.workers);
+        let mut work_routes = Vec::with_capacity(config.workers);
+        let mut work_ingresses = Vec::with_capacity(config.workers);
+        let mut return_routes = Vec::with_capacity(config.workers);
+        let mut return_ingresses = Vec::with_capacity(config.workers);
+        for _ in 0..config.workers {
+            let (presence_tx, presence_rx) = unbounded();
+            presence_routes.push(presence_tx);
+            presence_ingresses.push(Some(presence_rx));
+            let (work_tx, work_rx) = unbounded();
+            work_routes.push(work_tx);
+            work_ingresses.push(Some(work_rx));
+            let (return_tx, return_rx) = unbounded();
+            return_routes.push(return_tx);
+            return_ingresses.push(Some(return_rx));
+        }
+        let mut commands = Vec::with_capacity(config.workers);
+        for shard in shards {
+            let worker = shard.worker;
+            let (command_tx, command_rx) = bounded(1);
+            commands.push(command_tx);
+            let worker_reply = reply_tx.clone();
+            let worker_presence_routes = presence_routes.clone();
+            let worker_work_routes = work_routes.clone();
+            let worker_return_routes = return_routes.clone();
+            let presence_ingress = presence_ingresses[worker]
+                .take()
+                .expect("each classified worker owns one presence receiver");
+            let work_ingress = work_ingresses[worker]
+                .take()
+                .expect("each classified worker owns one work receiver");
+            let return_ingress = return_ingresses[worker]
+                .take()
+                .expect("each classified worker owns one return receiver");
+            let worker_placement = &placement;
+            scope.spawn(move |_| {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    classified_worker_loop(
+                        shard,
+                        command_rx,
+                        presence_ingress,
+                        work_ingress,
+                        return_ingress,
+                        &worker_presence_routes,
+                        &worker_work_routes,
+                        &worker_return_routes,
                         worker_placement,
                         &worker_reply,
                         config,
@@ -568,6 +701,7 @@ struct ActiveLp<'image> {
 
 struct ExecutedLp {
     work: LpRoundWork,
+    estimated_events: u64,
     messages_exchanged: u64,
     timing: LpExecutionTiming,
 }
@@ -598,6 +732,26 @@ struct StaticOwnerIngress {
 
 struct StaticOwnerBatch {
     round: u64,
+    envelopes: Vec<RemoteEnvelope>,
+}
+
+#[derive(Clone, Copy)]
+struct ClassifiedPresence {
+    round: u64,
+    source: usize,
+    has_straggler: bool,
+}
+
+struct ClassifiedWorkBatch<'image> {
+    round: u64,
+    source: usize,
+    items: Vec<ActiveLp<'image>>,
+}
+
+struct ClassifiedReturnBatch<'image> {
+    round: u64,
+    source: usize,
+    states: Vec<ReturnedLp<'image>>,
     envelopes: Vec<RemoteEnvelope>,
 }
 
@@ -1023,6 +1177,7 @@ fn worker_loop<'image>(
                     }
                     executed.push(ExecutedLp {
                         work,
+                        estimated_events: active.estimated_events,
                         messages_exchanged,
                         timing,
                     });
@@ -1088,6 +1243,379 @@ fn worker_loop<'image>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn classified_worker_loop<'image>(
+    mut shard: WorkerShard<'image>,
+    commands: Receiver<OwnedWorkerCommand>,
+    presence_ingress: Receiver<ClassifiedPresence>,
+    work_ingress: Receiver<ClassifiedWorkBatch<'image>>,
+    return_ingress: Receiver<ClassifiedReturnBatch<'image>>,
+    presence_routes: &[Sender<ClassifiedPresence>],
+    work_routes: &[Sender<ClassifiedWorkBatch<'image>>],
+    return_routes: &[Sender<ClassifiedReturnBatch<'image>>],
+    placement: &StaticPlacement,
+    replies: &Sender<OwnedWorkerReply<'image>>,
+    config: CpuConfig,
+) {
+    let mut setup_heap_pops = 0;
+    let mut setup_physical_lp_probes = 0;
+    let minimum_ns = shard
+        .frontier
+        .peek_min(&mut setup_heap_pops, &mut setup_physical_lp_probes)
+        .map(|entry| entry.time_ns);
+    if replies
+        .send(OwnedWorkerReply::Ready {
+            worker: shard.worker,
+            minimum_ns,
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    let threshold = config
+        .straggler_threshold_events
+        .expect("classified worker requires a threshold");
+    let mut round = 0_u64;
+    while let Ok(command) = receive_spin_then_park(&commands, config.spin_before_park) {
+        match command {
+            OwnedWorkerCommand::RunRound {
+                exclusive_horizon_ns,
+                expected_inbound_batches: _,
+            } => {
+                let started = Instant::now();
+                let (active, extract_heap_pops, extract_physical_lp_probes) =
+                    match shard.extract(exclusive_horizon_ns) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed { error });
+                            return;
+                        }
+                    };
+                let has_straggler = active.iter().any(|item| item.estimated_events > threshold);
+                for route in presence_routes {
+                    if route
+                        .send(ClassifiedPresence {
+                            round,
+                            source: shard.worker,
+                            has_straggler,
+                        })
+                        .is_err()
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                }
+                let mut presence_seen = vec![false; config.workers];
+                let mut round_has_straggler = false;
+                for _ in 0..config.workers {
+                    let presence = match receive_classified_or_abort(&presence_ingress, &commands) {
+                        Ok(presence) => presence,
+                        Err(error) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed { error });
+                            return;
+                        }
+                    };
+                    if presence.round != round
+                        || presence.source >= config.workers
+                        || presence_seen[presence.source]
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                    presence_seen[presence.source] = true;
+                    round_has_straggler |= presence.has_straggler;
+                }
+
+                let dedicated_count = if round_has_straggler {
+                    config
+                        .dedicated_straggler_workers
+                        .min(config.workers.saturating_sub(1).max(1))
+                } else {
+                    0
+                };
+                let bulk_worker_count = config.workers.saturating_sub(dedicated_count);
+                let mut work_by_worker = (0..config.workers)
+                    .map(|_| Vec::new())
+                    .collect::<Vec<Vec<ActiveLp<'image>>>>();
+                for item in active {
+                    let is_straggler = item.estimated_events > threshold;
+                    let worker = if config.workers == 1 {
+                        0
+                    } else if is_straggler {
+                        usize::try_from(item.lp.node.id.0)
+                            .unwrap_or(0)
+                            .wrapping_rem(dedicated_count)
+                    } else if dedicated_count == 0 || item.owner_worker >= dedicated_count {
+                        item.owner_worker
+                    } else {
+                        dedicated_count
+                            + usize::try_from(item.lp.node.id.0)
+                                .unwrap_or(0)
+                                .wrapping_rem(bulk_worker_count)
+                    };
+                    work_by_worker[worker].push(item);
+                }
+                for (target, items) in work_by_worker.into_iter().enumerate() {
+                    if work_routes[target]
+                        .send(ClassifiedWorkBatch {
+                            round,
+                            source: shard.worker,
+                            items,
+                        })
+                        .is_err()
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                }
+
+                let mut assigned = Vec::new();
+                let mut work_seen = vec![false; config.workers];
+                for _ in 0..config.workers {
+                    let mut batch = match receive_classified_or_abort(&work_ingress, &commands) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed { error });
+                            return;
+                        }
+                    };
+                    if batch.round != round
+                        || batch.source >= config.workers
+                        || work_seen[batch.source]
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                    work_seen[batch.source] = true;
+                    assigned.append(&mut batch.items);
+                }
+                radix_order_lpt(&mut assigned);
+
+                let mut executed = Vec::with_capacity(assigned.len());
+                let mut returned_by_owner = (0..config.workers)
+                    .map(|_| Vec::new())
+                    .collect::<Vec<Vec<ReturnedLp<'image>>>>();
+                let mut remote_by_owner = (0..config.workers)
+                    .map(|_| Vec::new())
+                    .collect::<Vec<Vec<RemoteEnvelope>>>();
+                let mut outbox_metadata = vec![OwnerBatchMetadata::default(); config.workers];
+                for (dispatch_order, mut active) in assigned.into_iter().enumerate() {
+                    let lp_started = Instant::now();
+                    let started_after_ns =
+                        duration_ns(lp_started.saturating_duration_since(started));
+                    let (work, outbox) = match active.lp.drain(
+                        exclusive_horizon_ns,
+                        config.max_outbox_events_per_lp,
+                        config.fault_injection,
+                        shard.worker,
+                        round,
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed { error });
+                            return;
+                        }
+                    };
+                    let messages_exchanged = match u64::try_from(outbox.len()) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed {
+                                error: ExecutionError::CounterOverflow(active.lp.node.id),
+                            });
+                            return;
+                        }
+                    };
+                    for envelope in outbox {
+                        let target_slot = match usize::try_from(envelope.event.target.0) {
+                            Ok(slot) => slot,
+                            Err(_) => {
+                                let _ = replies.send(OwnedWorkerReply::Failed {
+                                    error: ExecutionError::UnknownNode(envelope.event.target),
+                                });
+                                return;
+                            }
+                        };
+                        let Some((owner, _)) = placement.locate(target_slot) else {
+                            let _ = replies.send(OwnedWorkerReply::Failed {
+                                error: ExecutionError::UnknownNode(envelope.event.target),
+                            });
+                            return;
+                        };
+                        remote_by_owner[owner].push(envelope);
+                    }
+                    let node = active.lp.node.id;
+                    let class = if active.estimated_events > threshold {
+                        WorkClass::Straggler
+                    } else {
+                        WorkClass::Bulk
+                    };
+                    returned_by_owner[active.owner_worker].push(ReturnedLp {
+                        owner_worker: active.owner_worker,
+                        owner_slot: active.owner_slot,
+                        lp: active.lp,
+                    });
+                    executed.push(ExecutedLp {
+                        work,
+                        estimated_events: active.estimated_events,
+                        messages_exchanged,
+                        timing: LpExecutionTiming {
+                            node,
+                            worker: shard.worker,
+                            class,
+                            dispatch_order: dispatch_order as u64,
+                            started_after_ns,
+                            busy_ns: elapsed_ns(lp_started),
+                        },
+                    });
+                }
+                for owner in 0..config.workers {
+                    if !remote_by_owner[owner].is_empty() {
+                        outbox_metadata[owner] = OwnerBatchMetadata {
+                            batches: 1,
+                            minimum_ns: remote_by_owner[owner]
+                                .iter()
+                                .map(|envelope| envelope.event.key.time_ns)
+                                .min(),
+                        };
+                    }
+                    if return_routes[owner]
+                        .send(ClassifiedReturnBatch {
+                            round,
+                            source: shard.worker,
+                            states: std::mem::take(&mut returned_by_owner[owner]),
+                            envelopes: std::mem::take(&mut remote_by_owner[owner]),
+                        })
+                        .is_err()
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                }
+
+                let mut returned = Vec::new();
+                let mut inbox = Vec::new();
+                let mut return_seen = vec![false; config.workers];
+                for _ in 0..config.workers {
+                    let mut batch = match receive_classified_or_abort(&return_ingress, &commands) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            let _ = replies.send(OwnedWorkerReply::Failed { error });
+                            return;
+                        }
+                    };
+                    if batch.round != round
+                        || batch.source >= config.workers
+                        || return_seen[batch.source]
+                    {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::WorkerChannelDisconnected,
+                        });
+                        return;
+                    }
+                    return_seen[batch.source] = true;
+                    returned.append(&mut batch.states);
+                    inbox.append(&mut batch.envelopes);
+                }
+                let (frontier_updates, heap_pops, physical_lp_probes, minimum_ns) = match shard
+                    .restore_classified_round(returned, inbox, exclusive_horizon_ns, placement)
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = replies.send(OwnedWorkerReply::Failed { error });
+                        return;
+                    }
+                };
+                if replies
+                    .send(OwnedWorkerReply::RoundComplete {
+                        worker: shard.worker,
+                        round,
+                        executed,
+                        outbox_metadata,
+                        inbound_frontier_updates: 0,
+                        inbound_heap_pops: 0,
+                        inbound_physical_lp_probes: 0,
+                        inbound_busy_ns: 0,
+                        inbound_batches: 0,
+                        inbound_early_batches: 0,
+                        inbound_early_busy_ns: 0,
+                        frontier_updates,
+                        heap_pops: heap_pops.saturating_add(extract_heap_pops),
+                        physical_lp_probes: physical_lp_probes
+                            .saturating_add(extract_physical_lp_probes),
+                        minimum_ns,
+                        busy_ns: elapsed_ns(started),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                round = match round.checked_add(1) {
+                    Some(round) => round,
+                    None => {
+                        let _ = replies.send(OwnedWorkerReply::Failed {
+                            error: ExecutionError::CounterOverflow(NodeId(0)),
+                        });
+                        return;
+                    }
+                };
+            }
+            OwnedWorkerCommand::Finish {
+                expected_inbound_batches: _,
+            } => {
+                let worker = shard.worker;
+                let lps = match shard.into_lps() {
+                    Ok(lps) => lps,
+                    Err(error) => {
+                        let _ = replies.send(OwnedWorkerReply::Failed { error });
+                        return;
+                    }
+                };
+                let _ = replies.send(OwnedWorkerReply::Finished {
+                    worker,
+                    lps,
+                    inbound_frontier_updates: 0,
+                    inbound_heap_pops: 0,
+                    inbound_physical_lp_probes: 0,
+                    inbound_busy_ns: 0,
+                    inbound_batches: 0,
+                    inbound_early_batches: 0,
+                    inbound_early_busy_ns: 0,
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn receive_classified_or_abort<T>(
+    receiver: &Receiver<T>,
+    commands: &Receiver<OwnedWorkerCommand>,
+) -> Result<T, ExecutionError> {
+    let mut select = Select::new();
+    let batch_index = select.recv(receiver);
+    let command_index = select.recv(commands);
+    let selected = select.select();
+    if selected.index() == batch_index {
+        return selected
+            .recv(receiver)
+            .map_err(|_| ExecutionError::WorkerChannelDisconnected);
+    }
+    debug_assert_eq!(selected.index(), command_index);
+    let _ = selected.recv(commands);
+    Err(ExecutionError::WorkerChannelDisconnected)
+}
+
 fn owned_worker_loop<'image>(
     mut shard: WorkerShard<'image>,
     commands: Receiver<OwnedWorkerCommand>,
@@ -1144,6 +1672,7 @@ fn owned_worker_loop<'image>(
                     config.fault_injection,
                     round,
                     placement,
+                    config.straggler_threshold_events,
                 );
                 let OwnedRoundDrain {
                     executed,
@@ -1681,6 +2210,9 @@ fn run_coordinator<'image>(
             )
             .unwrap_or(u64::MAX),
             chunk_request_messages: 0,
+            classification_presence_messages: 0,
+            classification_work_messages: 0,
+            classification_return_messages: 0,
             owner_delivery_messages: owner_batch_messages,
             owner_batches_merged: 0,
             early_owner_batches_merged: 0,
@@ -1855,35 +2387,49 @@ fn run_owned_static_coordinator<'image>(
         }
 
         let exchange_started = Instant::now();
+        let classified = config.straggler_threshold_events.is_some();
         let mut next_expected_inbound_batches = vec![0_u64; config.workers];
         let mut inbox_minima: Vec<Option<u64>> = vec![None; config.workers];
         for metadata in outbox_metadata_by_worker.into_iter().flatten() {
             for (owner, metadata) in metadata.into_iter().enumerate() {
-                next_expected_inbound_batches[owner] = next_expected_inbound_batches[owner]
-                    .checked_add(metadata.batches)
-                    .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+                if !classified {
+                    next_expected_inbound_batches[owner] = next_expected_inbound_batches[owner]
+                        .checked_add(metadata.batches)
+                        .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+                }
                 owner_batch_messages = owner_batch_messages
                     .checked_add(metadata.batches)
                     .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
-                if let Some(remote) = metadata.minimum_ns {
-                    inbox_minima[owner] = match inbox_minima[owner] {
-                        Some(current) => Some(current.min(remote)),
-                        None => Some(remote),
-                    };
+                if !classified {
+                    if let Some(remote) = metadata.minimum_ns {
+                        inbox_minima[owner] = match inbox_minima[owner] {
+                            Some(current) => Some(current.min(remote)),
+                            None => Some(remote),
+                        };
+                    }
                 }
             }
         }
         for worker in 0..config.workers {
-            minima[worker] = match (next_local_minima[worker], inbox_minima[worker]) {
-                (Some(local), Some(remote)) => Some(local.min(remote)),
-                (Some(local), None) => Some(local),
-                (None, Some(remote)) => Some(remote),
-                (None, None) => None,
+            minima[worker] = if classified {
+                next_local_minima[worker]
+            } else {
+                match (next_local_minima[worker], inbox_minima[worker]) {
+                    (Some(local), Some(remote)) => Some(local.min(remote)),
+                    (Some(local), None) => Some(local),
+                    (None, Some(remote)) => Some(remote),
+                    (None, None) => None,
+                }
             };
         }
         expected_inbound_batches = next_expected_inbound_batches;
         let coordinator_exchange_ns = elapsed_ns(exchange_started);
 
+        let partition = static_work_partition(
+            &executed_lps,
+            config.straggler_threshold_events.is_some(),
+            config.workers,
+        );
         let mut lp_work = Vec::with_capacity(executed_lps.len());
         let mut lp_timings = Vec::with_capacity(executed_lps.len());
         let mut events_processed = 0_u64;
@@ -1952,13 +2498,28 @@ fn run_owned_static_coordinator<'image>(
                 frontier_heap_pops,
                 physical_lp_probes,
             },
-            partition: WorkPartition::default(),
+            partition,
             owner_batch_messages,
             worker_wake_messages: config.workers as u64,
             worker_completion_messages: config.workers as u64,
             chunk_request_messages: 0,
+            classification_presence_messages: if classified {
+                u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            classification_work_messages: if classified {
+                u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            classification_return_messages: if classified {
+                u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
             owner_delivery_messages: owner_batch_messages,
-            owner_batches_merged: 0,
+            owner_batches_merged: if classified { owner_batch_messages } else { 0 },
             early_owner_batches_merged: 0,
             owner_merge_ns: 0,
             early_owner_merge_ns: 0,
@@ -2085,6 +2646,54 @@ fn add_worker_merge_timing(round: &mut CpuRoundMetrics, worker: usize, busy_ns: 
     } else {
         total_busy as f64 / available as f64
     };
+}
+
+fn static_work_partition(
+    executed: &[ExecutedLp],
+    classification_enabled: bool,
+    workers: usize,
+) -> WorkPartition {
+    if !classification_enabled {
+        return WorkPartition::default();
+    }
+    let mut stragglers = executed
+        .iter()
+        .filter(|item| item.timing.class == WorkClass::Straggler)
+        .map(|item| LpWorkEstimate {
+            node: item.work.node,
+            estimated_events: item.estimated_events,
+        })
+        .collect::<Vec<_>>();
+    stragglers.sort_by(|left, right| {
+        right
+            .estimated_events
+            .cmp(&left.estimated_events)
+            .then_with(|| left.node.cmp(&right.node))
+    });
+    let mut bulk_chunks = (0..workers)
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<LpWorkEstimate>>>();
+    let mut reserved_straggler_workers = Vec::new();
+    for item in executed {
+        match item.timing.class {
+            WorkClass::Straggler => reserved_straggler_workers.push(item.timing.worker),
+            WorkClass::Bulk => bulk_chunks[item.timing.worker].push(LpWorkEstimate {
+                node: item.work.node,
+                estimated_events: item.estimated_events,
+            }),
+        }
+    }
+    reserved_straggler_workers.sort_unstable();
+    reserved_straggler_workers.dedup();
+    for chunk in &mut bulk_chunks {
+        chunk.sort_by_key(|item| item.node);
+    }
+    bulk_chunks.retain(|chunk| !chunk.is_empty());
+    WorkPartition {
+        stragglers,
+        bulk_chunks,
+        reserved_straggler_workers,
+    }
 }
 
 fn partition_round<'image>(
@@ -2594,14 +3203,15 @@ fn partition_initial_ownership<'image>(
 fn partition_static_ownership<'image>(
     lps: Vec<CpuLp<'image>>,
     image: &SimulationImage,
-    workers: usize,
-    policy: StaticPartitionPolicy,
+    config: CpuConfig,
 ) -> Result<(Vec<WorkerShard<'image>>, StaticPlacement), ExecutionError> {
+    let workers = config.workers;
     let lp_count = lps.len();
     let mut owned = (0..workers)
         .map(|_| Vec::new())
         .collect::<Vec<Vec<CpuLp<'image>>>>();
-    match policy {
+
+    match config.static_partition {
         StaticPartitionPolicy::Modulo => {
             for lp in lps {
                 owned[lp.lp_slot % workers].push(lp);
@@ -3647,6 +4257,7 @@ impl<'image> WorkerShard<'image> {
         fault: Option<CpuFaultInjection>,
         round: u64,
         placement: &StaticPlacement,
+        straggler_threshold_events: Option<u64>,
     ) -> Result<OwnedRoundDrain, ExecutionError> {
         let round_started = Instant::now();
         let mut executed = Vec::new();
@@ -3669,6 +4280,11 @@ impl<'image> WorkerShard<'image> {
             let lp = self.lps[entry.owner_slot]
                 .as_mut()
                 .expect("a live frontier entry owns a resident static LP");
+            let estimated_events = if straggler_threshold_events.is_some() {
+                lp.estimated_work(exclusive_horizon_ns)?
+            } else {
+                0
+            };
             let (work, outbox) = lp.drain(
                 exclusive_horizon_ns,
                 outbox_capacity,
@@ -3691,7 +4307,13 @@ impl<'image> WorkerShard<'image> {
             let timing = LpExecutionTiming {
                 node,
                 worker: self.worker,
-                class: WorkClass::Bulk,
+                class: if straggler_threshold_events
+                    .is_some_and(|threshold| estimated_events > threshold)
+                {
+                    WorkClass::Straggler
+                } else {
+                    WorkClass::Bulk
+                },
                 dispatch_order,
                 started_after_ns,
                 busy_ns: elapsed_ns(lp_started),
@@ -3701,6 +4323,7 @@ impl<'image> WorkerShard<'image> {
                 .ok_or(ExecutionError::CounterOverflow(node))?;
             executed.push(ExecutedLp {
                 work,
+                estimated_events,
                 messages_exchanged,
                 timing,
             });
@@ -3746,6 +4369,60 @@ impl<'image> WorkerShard<'image> {
         self.merge_remote_with(inbox, remote_floor_ns, |global_slot| {
             placement.locate(global_slot)
         })
+    }
+
+    fn restore_classified_round(
+        &mut self,
+        states: Vec<ReturnedLp<'image>>,
+        inbox: Vec<RemoteEnvelope>,
+        exclusive_horizon_ns: u128,
+        placement: &StaticPlacement,
+    ) -> Result<(u64, u64, u64, Option<u64>), ExecutionError> {
+        let mut frontier_updates = 0_u64;
+        let mut heap_pops = 0_u64;
+        let mut physical_lp_probes = 0_u64;
+        for state in states {
+            if state.owner_worker != self.worker {
+                return Err(ExecutionError::UnknownNode(state.lp.node.id));
+            }
+            let node = state.lp.node.id;
+            let next = state.lp.next_key();
+            physical_lp_probes = physical_lp_probes.saturating_add(1);
+            if self.lps[state.owner_slot].replace(state.lp).is_some() {
+                return Err(ExecutionError::WorkerFailed {
+                    worker: self.worker,
+                    round: 0,
+                });
+            }
+            self.frontier
+                .update(state.owner_slot, node, next, &mut physical_lp_probes)?;
+            frontier_updates = frontier_updates.saturating_add(1);
+        }
+        let (remote_updates, remote_heap_pops, remote_probes) =
+            self.merge_static_remote(inbox, exclusive_horizon_ns, placement)?;
+        frontier_updates = frontier_updates.saturating_add(remote_updates);
+        heap_pops = heap_pops.saturating_add(remote_heap_pops);
+        physical_lp_probes = physical_lp_probes.saturating_add(remote_probes);
+
+        let minimum_ns = if let Some(entry) = self
+            .frontier
+            .peek_min(&mut heap_pops, &mut physical_lp_probes)
+        {
+            if u128::from(entry.time_ns) < exclusive_horizon_ns {
+                let key = self.lps[entry.owner_slot]
+                    .as_ref()
+                    .and_then(CpuLp::next_key)
+                    .expect("a live classified frontier entry has a pending event");
+                return Err(ExecutionError::EventBelowHorizonAfterDrain {
+                    key,
+                    exclusive_horizon_ns,
+                });
+            }
+            Some(entry.time_ns)
+        } else {
+            None
+        };
+        Ok((frontier_updates, heap_pops, physical_lp_probes, minimum_ns))
     }
 
     fn merge_remote_with(

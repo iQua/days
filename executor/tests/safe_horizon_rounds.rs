@@ -2706,6 +2706,87 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
     );
 }
 
+#[test]
+fn static_classification_uses_the_fused_two_message_worker_protocol() {
+    let image = incast_image(16);
+    let hot_port = NodeId(16);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let workers = 4;
+    let actual = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers,
+            granularity: ChunkGranularity::Static,
+            straggler_threshold_events: Some(4),
+            dedicated_straggler_workers: 1,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(actual.result, expected);
+    let first = &actual.rounds[0];
+    assert_eq!(
+        first.partition.stragglers,
+        vec![days_executor::LpWorkEstimate {
+            node: hot_port,
+            estimated_events: 16,
+        }]
+    );
+    assert_eq!(first.partition.reserved_straggler_workers, vec![0]);
+    assert!(first.lp_timings.iter().any(|timing| timing.node == hot_port
+        && timing.worker == 0
+        && timing.class == WorkClass::Straggler));
+    assert!(
+        first
+            .lp_timings
+            .iter()
+            .filter(|timing| timing.class == WorkClass::Bulk)
+            .all(|timing| timing.worker != 0)
+    );
+    for round in &actual.rounds {
+        assert_eq!(round.worker_wake_messages, workers as u64);
+        assert_eq!(round.worker_completion_messages, workers as u64);
+        assert_eq!(round.chunk_request_messages, 0);
+        let peer_messages = (workers * workers) as u64;
+        assert_eq!(round.classification_presence_messages, peer_messages);
+        assert_eq!(round.classification_work_messages, peer_messages);
+        assert_eq!(round.classification_return_messages, peer_messages);
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode classification ablation"]
+fn benchmark_fused_static_classification_on_incast() {
+    let image = incast_image(16);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    for threshold in [None, Some(4)] {
+        let config = CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Static,
+            straggler_threshold_events: threshold,
+            dedicated_straggler_workers: 1,
+            ..CpuConfig::default()
+        };
+        run_cpu_with_observations(&image, None, config, ObservationMode::Full).unwrap();
+        let mut samples = Vec::with_capacity(31);
+        for _ in 0..31 {
+            let started = std::time::Instant::now();
+            let actual =
+                run_cpu_with_observations(&image, None, config, ObservationMode::Full).unwrap();
+            assert_eq!(actual.result, expected);
+            samples.push(started.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        println!(
+            "incast_fan_in=16 workers=4 straggler_threshold={threshold:?} median_ns={}",
+            samples[samples.len() / 2]
+        );
+    }
+}
+
 fn port_fault_image() -> SimulationImage {
     let mut image = incast_image(2);
     image
