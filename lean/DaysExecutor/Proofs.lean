@@ -428,4 +428,13 @@ theorem f1RemoteLowerBound_proved
           start afterDrain drainedEvents hstart hdrain
           envelope henvelope)
 
+theorem f2GlobalTimePrefixCorollary_proved :
+    F2GlobalTimePrefixCorollary := by
+  intro emissions startPending drainedEvents bounds horizon cut
+      hconstant hdrained event
+  subst bounds
+  rw [hdrained.2.2 event]
+  unfold TimePrefix
+  rw [belowConstantTimeBound_iff]
+
 end DaysExecutor
