@@ -113,6 +113,26 @@ structure TransitionResult (State : StateFamily) (kind : NodeKind) where
   decisions : List ServiceDecision
 
 /--
+Every full observation emitted by one handler carries the key of the event being processed. Rust
+passes `event.key` at the departure and arrival recording sites
+`executor/src/scalar.rs:955,1018,1083,1217`, and the record helpers retain that exact key at
+`executor/src/scalar.rs:1577-1635`.
+-/
+def ObservationRecordsUseEventKey
+    (event : Event)
+    (result : TransitionResult State kind) : Prop :=
+  (∀ record ∈ result.departures, record.eventKey = event.key) ∧
+    (∀ record ∈ result.arrivals, record.eventKey = event.key)
+
+/-- Observation provenance is executable for a concrete transition result. -/
+instance
+    (event : Event)
+    (result : TransitionResult State kind) :
+    Decidable (ObservationRecordsUseEventKey event result) := by
+  unfold ObservationRecordsUseEventKey
+  infer_instance
+
+/--
 Per-LP abstract transition relation. The `node` argument deliberately permits different LPs and
 roles to use different code while retaining Rust's `(NodeKind, EventKind)` dispatch shape at
 `executor/src/scalar.rs:638-663`.
@@ -261,6 +281,17 @@ def TransitionDescriptorEffectsCoherent
       descriptor = image.packetDescriptor descriptor.id)
 
 /--
+Every transition result binds all keyed observations to its processed event. Together with
+lifetime-global event-key uniqueness, observations produced by distinct events cannot alias a
+normalization key.
+-/
+def TransitionObservationsUseEventKey
+    (transition : TransitionRelation State) : Prop :=
+  ∀ node event state result,
+    transition node event state result →
+    ObservationRecordsUseEventKey event result
+
+/--
 All global transition-safety assumptions used by the safe-horizon statements, collected without
 introducing a runtime certificate; reachable enabledness is stated separately after execution
 reachability is defined. These mirror validation plus dispatch at
@@ -278,7 +309,8 @@ def TransitionAxioms
     TransitionChildrenHaveUniqueKeys transition ∧
     RemoteEmissionCoverage image transition ∧
     CertifiedBoundSoundness image transition ∧
-    TransitionDescriptorEffectsCoherent image transition
+    TransitionDescriptorEffectsCoherent image transition ∧
+    TransitionObservationsUseEventKey transition
 
 /--
 State-dependent choices occur only at the actual `TxReady`, choose at most one packet, and commit

@@ -711,8 +711,10 @@ def tinyQueueTransition (eager : Bool) : TransitionRelation TinyQueueStateFamily
 /--
 Executable strengthened-FIFO satisfiability sketch. Canonical selection is identical under
 replacement private state, appends and records packet 12, emits exactly one required child of each
-kind, preserves exact list equality across a decisionless arrival, and removes exactly packet 12
-on completion. The committed-service list is duplicate-free initially and after every step.
+kind, keeps the emitted descriptor at its remote target after source-side removal, preserves exact
+list equality and observation-key fidelity across a decisionless arrival, and removes exactly
+packet 12 on completion. The committed-service list is duplicate-free initially and after every
+step.
 -/
 def fifoStrengthenedServiceContractCheck : Bool :=
   let node : NodeDescriptor :=
@@ -737,8 +739,16 @@ def fifoStrengthenedServiceContractCheck : Bool :=
         tinyQueueTransitionResult false node remote readyResult.nextState
       let afterCompletion :=
         tinyQueueTransitionResult false node completion afterArrival.nextState
+      let remoteStore :=
+        installChildDescriptorsFor
+          queueCounterexampleImage 2 readyResult.children []
+      let sourceStoreAfterRemoval :=
+        removeDescriptor 12 [queueCounterexampleDescriptor 12]
       decide (
         SameServiceSelectionResult readyResult alternateReadyResult ∧
+          ObservationRecordsUseEventKey queueCounterexampleReady readyResult ∧
+          sourceStoreAfterRemoval = [] ∧
+          queueCounterexampleDescriptor 12 ∈ remoteStore ∧
           initial.committedService.Nodup ∧
           SelectionIntroduced initial readyResult.nextState 12 ∧
           CommittedServiceTransitionValid
@@ -754,6 +764,7 @@ def fifoStrengthenedServiceContractCheck : Bool :=
             readyResult.nextState.committedService ∧
           afterArrival.nextState.committedService.Nodup ∧
           afterArrival.decisions = [] ∧
+          ObservationRecordsUseEventKey remote afterArrival ∧
           ServiceDecisionChildrenMatch afterArrival ∧
           CommittedServiceTransitionValid
             remote afterArrival.decisions readyResult.nextState afterArrival.nextState ∧
@@ -762,12 +773,57 @@ def fifoStrengthenedServiceContractCheck : Bool :=
             afterArrival.nextState.committedService.erase completion.payload ∧
           afterCompletion.nextState.committedService.Nodup ∧
           afterCompletion.decisions = [] ∧
+          ObservationRecordsUseEventKey completion afterCompletion ∧
           ServiceDecisionChildrenMatch afterCompletion ∧
           CommittedServiceTransitionValid
             completion afterCompletion.decisions
               afterArrival.nextState afterCompletion.nextState ∧
           afterCompletion.nextState.committedService = [])
   | _ => false
+
+/--
+Executable regression for the former cross-LP observation-key countermodel. Two independent LPs
+process distinct completion events but are given departure records with the first event's key.
+The first transition is coherent, while the aliased second transition violates the
+processed-event key binding.
+-/
+def aliasedObservationKeyRejectedCheck : Bool :=
+  let firstNode : NodeDescriptor :=
+    { id := 0, kind := .host, stateSlot := 0 }
+  let secondNode : NodeDescriptor :=
+    { id := 2, kind := .host, stateSlot := 1 }
+  let initial : RoleState TinyQueueStateFamily .host :=
+    { privateState := queueCounterexampleSourceState
+      serviceQueue := []
+      committedService := [12, 21] }
+  let firstEvent : Event :=
+    { key :=
+        { timeNs := 5, phase := eventPhase .txComplete
+          originNode := 0, originSeq := 0 }
+      target := 0
+      kind := .txComplete
+      payload := 12 }
+  let secondEvent : Event :=
+    { key :=
+        { timeNs := 6, phase := eventPhase .txComplete
+          originNode := 2, originSeq := 0 }
+      target := 2
+      kind := .txComplete
+      payload := 21 }
+  let firstResult :=
+    { tinyQueueTransitionResult false firstNode firstEvent initial with
+      departures :=
+        [ { eventKey := firstEvent.key
+            departure := { payload := 12, timeNs := firstEvent.key.timeNs } } ] }
+  let aliasedSecondResult :=
+    { tinyQueueTransitionResult false secondNode secondEvent initial with
+      departures :=
+        [ { eventKey := firstEvent.key
+            departure := { payload := 21, timeNs := secondEvent.key.timeNs } } ] }
+  decide (
+    firstEvent.key ≠ secondEvent.key ∧
+      ObservationRecordsUseEventKey firstEvent firstResult ∧
+      ¬ ObservationRecordsUseEventKey secondEvent aliasedSecondResult)
 
 /--
 Executable private-smuggling check behind the eager model's failure of the general premise. The

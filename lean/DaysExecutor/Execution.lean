@@ -123,6 +123,26 @@ def ChildDescriptorsAvailable
   ∀ child ∈ children,
     image.packetDescriptor child.payload ∈ store
 
+/--
+Install the immutable descriptors of children addressed to one LP. In the scalar executor all
+handlers share one packet map (`executor/src/scalar.rs:362-372,545-565`), so its per-LP projection
+materializes this availability when a child enters the future-event list. The exchanged executor
+does the corresponding target installation from descriptor-carrying envelopes at
+`executor/src/cpu.rs:664-667,4485-4500`.
+-/
+def installChildDescriptorsFor
+    (image : SimulationImage State)
+    (target : NodeId)
+    (children : List Event)
+    (store : List PacketDescriptor) : List PacketDescriptor :=
+  children.foldl
+    (fun current child =>
+      if child.target = target then
+        installDescriptor (image.packetDescriptor child.payload) current
+      else
+        current)
+    store
+
 /-- Insert a keyed departure in canonical event-key order. -/
 def insertDeparture (record : RecordedDeparture) : List RecordedDeparture → List RecordedDeparture
   | [] => [record]
@@ -212,9 +232,9 @@ def NoEligibleEvent (eligible : Event → Prop) (pending : List Event) : Prop :=
   ∀ event ∈ pending, ¬ eligible event
 
 /--
-Only the target LP's mutable role state and descriptor store change; all normalized result effects
-are applied explicitly. This mirrors exclusive state-slot ownership plus the complete scalar
-finish surface at `executor/src/scalar.rs:575-602`.
+LP-local transition application: only the processing LP's mutable role state and descriptor store
+change; all normalized result effects are applied explicitly. This mirrors exclusive CPU state-slot
+ownership before remote exchange at `executor/src/cpu.rs:586-690`.
 -/
 def AppliesTransitionResult
     (image : SimulationImage State)
@@ -231,9 +251,33 @@ def AppliesTransitionResult
     applyRecordedOutput result before after
 
 /--
+Scalar transition application in the model's per-LP descriptor projection. Rust scalar execution
+has one shared packet map, so every emitted child can use its descriptor immediately; the
+projection records that availability at the child's target while preserving exact local state and
+output effects. This is the scalar counterpart of the target copies installed by
+`CompleteCanonicalExchange`, not a weakening of final resident-packet comparison.
+-/
+def AppliesScalarTransitionResult
+    (image : SimulationImage State)
+    (node : NodeDescriptor)
+    (result : TransitionResult State node.kind)
+    (before after : MachineState State) : Prop :=
+  after.localState node = result.nextState ∧
+    after.packetStore node =
+      applyPacketEffects result (before.packetStore node) ∧
+    (∀ other ∈ image.nodes,
+      other.id ≠ node.id →
+      after.localState other = before.localState other ∧
+        after.packetStore other =
+          installChildDescriptorsFor image other.id result.children
+            (before.packetStore other)) ∧
+    applyRecordedOutput result before after
+
+/--
 One arbitrary available-event step used to define an explicit candidate reordering; unlike the
-canonical scalar loop, it does not itself impose least-key choice
-(`executor/src/scalar.rs:344-356`).
+canonical scalar loop, it does not itself impose least-key choice. Child descriptors become
+available in their target LP projections when their events enter the scalar future list
+(`executor/src/scalar.rs:344-356,362-372`).
 -/
 def AvailableEventStep
     (image : SimulationImage State)
@@ -246,7 +290,7 @@ def AvailableEventStep
       transition node event (before.localState node) result ∧
       FreshEventKeys result.children (before.pending.erase event) ∧
       AllocatesChildrenInOrder node result.children before after ∧
-      AppliesTransitionResult image node result before after ∧
+      AppliesScalarTransitionResult image node result before after ∧
       DescriptorStoreCoherent image (after.packetStore node) ∧
       ChildDescriptorsAvailable image (after.packetStore node) result.children ∧
       after.pending = insertEvents result.children (before.pending.erase event) ∧
