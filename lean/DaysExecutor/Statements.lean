@@ -3,25 +3,39 @@ import DaysExecutor.Counterexamples
 namespace DaysExecutor
 
 /--
-F1 theorem statement from plan §8: actual unseen remote events produced by a sequential round drain
-are at or beyond their destination LP's valid bound, generalizing the runtime outbox assertion at
-`executor/src/safe_horizon.rs:322-327`.
+V1 policy obligation missing from the generic bound-family lemma: the actual
+`min(stopExclusive, G + L)` family computed at `executor/src/safe_horizon.rs:231-264` is valid at
+every well-formed post-exchange start.
+-/
+def ConstantGlobalBoundPolicySound
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) : Prop :=
+  AcceptedModel image transition →
+    ∀ start,
+      PostExchangeStart image start →
+      ConstantGlobalBoundsValid image transition start.machine
+
+/--
+F1 theorem statement from plan §8. Its first conjunct proves Rust's concrete `G + L` policy rather
+than assuming its conclusion; the second retains the general bound-family consequence and the
+runtime outbox assertion at `executor/src/safe_horizon.rs:322-327`.
 
 This is intentionally a `Prop`-valued definition for T11; T12 supplies the proof.
 -/
 def F1RemoteLowerBound
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
-  AcceptedModel image transition →
-    ∀ bounds start drainedEvents afterDrain,
-      PostExchangeStart image start →
-      BoundFamilyValid transition start.machine bounds →
-      SequentialRoundDrain image transition bounds start drainedEvents afterDrain →
-      (∀ target event,
-        UnseenRemoteAt transition start.machine.pending target event →
-        bounds target ≤ event.key.timeNs) ∧
-      (∀ event ∈ flattenedOutboxes image afterDrain,
-        ¬ belowBound bounds event)
+  ConstantGlobalBoundPolicySound image transition ∧
+    (AcceptedModel image transition →
+      ∀ bounds start drainedEvents afterDrain,
+        PostExchangeStart image start →
+        BoundFamilyValid transition start.machine bounds →
+        SequentialRoundDrain image transition bounds start drainedEvents afterDrain →
+        (∀ target event,
+          UnseenRemoteAt transition start.machine.pending target event →
+          bounds target ≤ event.key.timeNs) ∧
+        (∀ envelope ∈ flattenedOutboxes image afterDrain,
+          ¬ belowBound bounds envelope.event))
 
 /--
 General cut-form serializability obligation behind F2: per-LP sequential half-open drains plus one
@@ -33,7 +47,7 @@ def RoundSerializabilityOverCut
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
   AcceptedModel image transition →
-    ActualServiceStartDiscipline transition →
+    CompleteActualServiceStartDiscipline transition →
     ∀ bounds cut start drainedEvents finish,
       SafeHorizonRound image transition bounds cut start drainedEvents finish →
       ∃ serialOrder serialFinish,
@@ -71,8 +85,8 @@ def F2RoundSerializability
 
 /--
 F3 theorem statement from plan §8: repeated valid progressive rounds compose to the canonical
-least-key serial run through the image's inclusive stop, preserving complete normalized state,
-pending events, and observations from `executor/src/scalar.rs:322-360` and
+least-key serial run through the image's inclusive stop, preserving every normalized `RunResult`
+field from `executor/src/scalar.rs:64-78,322-360` and
 `executor/src/safe_horizon.rs:231-365`.
 
 This is intentionally a `Prop`-valued definition for T11; T12 supplies the proof.
@@ -81,7 +95,7 @@ def F3RunComposition
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
   AcceptedModel image transition →
-    ActualServiceStartDiscipline transition →
+    CompleteActualServiceStartDiscipline transition →
     ∀ start bounds finish,
       InitialMachine image start.machine →
       PostExchangeStart image start →
@@ -103,10 +117,10 @@ The executable witness data is already constructed in T11; its Lean proof is def
 def F4DecisionPointScope
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
-  (ActualServiceStartDiscipline transition →
+  (CompleteActualServiceStartDiscipline transition →
       F2RoundSerializability image transition ∧
       F3RunComposition image transition) ∧
-    EagerSelectionCounterexampleShape
+    ReachableEagerSelectionCountermodel
 
 /--
 Per-packet causal order required by F5, corresponding to a packet's parent/child transition chain
@@ -170,6 +184,18 @@ def IntraRoundIndependent
     ¬ RequiredIntraRoundBefore emissions right left
 
 /--
+The conservative one-conflict-class ruling still licenses same-kind clustering across distinct
+LPs when there is no packet-causal edge. Within one LP it deliberately retains canonical order.
+-/
+def CrossLPSameKindClusteringLicensed : Prop :=
+  ∀ emissions left right,
+    left.kind = right.kind →
+    left.target ≠ right.target →
+    ¬ PacketCausalBefore emissions left right →
+    ¬ PacketCausalBefore emissions right left →
+    IntraRoundIndependent emissions left right
+
+/--
 Explicit commutation premise required for abstract heterogeneous handlers: swapping any declared
 independent adjacent pair yields the same normalized result. Rust's deterministic dispatch alone at
 `executor/src/scalar.rs:638-663` does not imply this property.
@@ -190,8 +216,9 @@ def IndependentStepsCommute
 /--
 F5 theorem statement from plan §8: under an explicit dependency-completeness/commutation premise,
 any permutation preserving per-packet causality and per-node same queue-type order produces the
-same final state and canonical observations. It also retains the concrete unsound reversal shape
-forced by the finite-capacity handlers at
+same complete normalized result, and the statement itself constructs an execution for every
+permitted order. It also retains the concrete unsound reversal shape forced by the finite-capacity
+handlers at
 `executor/src/scalar.rs:975-1016,1091-1128`.
 
 The commutation premise records an implementation/specification tension: those two base orders are
@@ -205,18 +232,21 @@ def F5IntraRoundReordering
     (transition : TransitionRelation State) : Prop :=
   (AcceptedModel image transition →
     ∀ bounds cut start drainedEvents roundFinish
-        canonicalOrder canonicalFinish candidateOrder candidateFinish,
+        canonicalOrder canonicalFinish candidateOrder roundEmissions,
       SafeHorizonRound image transition bounds cut
         start drainedEvents roundFinish →
       CanonicalSerialRestricted image transition cut
         start.machine canonicalOrder canonicalFinish →
-      IndependentStepsCommute image transition canonicalFinish.emissions →
+      RoundEmissionDelta start.machine canonicalFinish roundEmissions →
+      IndependentStepsCommute image transition roundEmissions →
       (∀ event, event ∈ canonicalOrder ↔ event ∈ drainedEvents) →
-      PreservesRequiredIntraRoundOrder canonicalFinish.emissions
+      PreservesRequiredIntraRoundOrder roundEmissions
         drainedEvents candidateOrder →
-      ExecutionInOrder image transition
-        start.machine candidateOrder candidateFinish →
-      SameMachineResult image canonicalFinish candidateFinish) ∧
+      ∃ candidateFinish,
+        ExecutionInOrder image transition
+          start.machine candidateOrder candidateFinish ∧
+        SameMachineResult image canonicalFinish candidateFinish) ∧
+    CrossLPSameKindClusteringLicensed ∧
     UnsoundReorderingCounterexampleShape
 
 end DaysExecutor

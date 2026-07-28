@@ -4,16 +4,22 @@ namespace DaysExecutor
 
 /--
 Semantic machine configuration shared by serial and round execution, corresponding to the complete
-state and pending-event result assembled at `executor/src/scalar.rs:575-602`.
+state and pending-event result assembled at `executor/src/scalar.rs:575-602` and
+`executor/src/cpu.rs:3372-3433`.
 
-`emissions` is a proof-only ghost trace of parent/child edges: it is absent from Rust's runtime
-result and deliberately excluded from `SameMachineResult`, so the model adds no proof-carrying
-runtime machinery.
+`nextOriginSeq`, `allocatedKeys`, and `emissions` are proof-only ghosts. The remaining fields
+project every Rust `RunResult` component, including descriptor data that crosses LPs.
 -/
 structure MachineState (State : StateFamily) where
-  localState : (node : NodeDescriptor) → State node.kind
+  localState : (node : NodeDescriptor) → RoleState State node.kind
+  packetStore : NodeDescriptor → List PacketDescriptor
   pending : List Event
-  observations : List Observation
+  summary : RunSummary
+  observedPackets : List PacketDescriptor
+  departures : List RecordedDeparture
+  arrivals : List RecordedArrival
+  nextOriginSeq : NodeId → Nat
+  allocatedKeys : List EventKey
   emissions : List (Event × Event)
 
 /--
@@ -50,40 +56,134 @@ def FreshEventKeys (children existing : List Event) : Prop :=
   ∀ child ∈ children, ∀ pending ∈ existing, child.key ≠ pending.key
 
 /--
-Lexicographic observation order used to normalize per-LP output, mirroring the key sort at
-`executor/src/scalar.rs:583-584`.
+Canonical descriptor ordering by payload ID, matching the `BTreeMap`-normalized result assembly at
+`executor/src/scalar.rs:577-590` and `executor/src/cpu.rs:3383-3426`.
 -/
-def observationLE (a b : Observation) : Prop :=
-  a.eventKey < b.eventKey ∨
-    (a.eventKey = b.eventKey ∧
-      (a.ordinal < b.ordinal ∨
-        (a.ordinal = b.ordinal ∧
-          (a.tag < b.tag ∨ (a.tag = b.tag ∧ a.value ≤ b.value)))))
+def descriptorLE (left right : PacketDescriptor) : Prop :=
+  left.id ≤ right.id
 
-/-- Decidability for normalized scalar observation ordering at `executor/src/scalar.rs:583-584`. -/
-instance (a b : Observation) : Decidable (observationLE a b) := by
-  unfold observationLE
+/-- Decidability for payload-keyed descriptor normalization. -/
+instance (left right : PacketDescriptor) : Decidable (descriptorLE left right) := by
+  unfold descriptorLE
   infer_instance
 
 /--
-Canonical insertion of one observation into the normalized result order at
-`executor/src/scalar.rs:583-600`.
+Install one immutable descriptor in payload order. A descriptor already installed for its payload
+is retained; `DescriptorStoreCoherent` rules out a conflicting value.
 -/
-def insertObservation (observation : Observation) : List Observation → List Observation
-  | [] => [observation]
+def installDescriptor (descriptor : PacketDescriptor) : List PacketDescriptor → List PacketDescriptor
+  | [] => [descriptor]
   | head :: tail =>
-      if observationLE observation head then
-        observation :: head :: tail
+      if descriptor.id = head.id then
+        head :: tail
+      else if descriptorLE descriptor head then
+        descriptor :: head :: tail
       else
-        head :: insertObservation observation tail
+        head :: installDescriptor descriptor tail
+
+/-- A local descriptor store contains unique payload IDs and exactly the oracle values. -/
+def DescriptorStoreCoherent
+    (image : SimulationImage State)
+    (store : List PacketDescriptor) : Prop :=
+  (store.map PacketDescriptor.id).Nodup ∧
+    ∀ descriptor ∈ store,
+      descriptor = image.packetDescriptor descriptor.id
 
 /--
-Canonical insertion of handler observations, making LP scheduling order non-semantic as in
-`executor/src/scalar.rs:583-600`.
+Remove one payload descriptor from a local resident store.
 -/
-def insertObservations
-    (generated current : List Observation) : List Observation :=
-  generated.foldl (fun ordered item => insertObservation item ordered) current
+def removeDescriptor (payload : PayloadId) (store : List PacketDescriptor) : List PacketDescriptor :=
+  store.filter fun descriptor => descriptor.id ≠ payload
+
+/-- Canonical global payload-ID projection used by `RunResult.resident_packets`. -/
+def canonicalizeDescriptors (descriptors : List PacketDescriptor) : List PacketDescriptor :=
+  descriptors.foldl
+    (fun current descriptor => installDescriptor descriptor current)
+    []
+
+/-- Apply one transition's resident-packet effects in their deterministic result-list order. -/
+def applyPacketEffects
+    (result : TransitionResult State kind)
+    (store : List PacketDescriptor) : List PacketDescriptor :=
+  result.packetInstalls.foldl
+    (fun current descriptor => installDescriptor descriptor current)
+    (result.packetRemovals.foldl
+      (fun current payload => removeDescriptor payload current)
+      store)
+
+/--
+Every emitted child's actual descriptor remains available at the emitting LP after transition
+packet effects, matching `packet_descriptor(child.payload)` at
+`executor/src/cpu.rs:627-667`.
+-/
+def ChildDescriptorsAvailable
+    (image : SimulationImage State)
+    (store : List PacketDescriptor)
+    (children : List Event) : Prop :=
+  ∀ child ∈ children,
+    image.packetDescriptor child.payload ∈ store
+
+/-- Insert a keyed departure in canonical event-key order. -/
+def insertDeparture (record : RecordedDeparture) : List RecordedDeparture → List RecordedDeparture
+  | [] => [record]
+  | head :: tail =>
+      if record.eventKey ≤ head.eventKey then record :: head :: tail
+      else head :: insertDeparture record tail
+
+/-- Insert a keyed arrival in canonical event-key order. -/
+def insertArrival (record : RecordedArrival) : List RecordedArrival → List RecordedArrival
+  | [] => [record]
+  | head :: tail =>
+      if record.eventKey ≤ head.eventKey then record :: head :: tail
+      else head :: insertArrival record tail
+
+/-- Canonically merge transition output into the complete normalized result surface. -/
+def applyRecordedOutput
+    (result : TransitionResult State kind)
+    (before after : MachineState State) : Prop :=
+  after.summary = RunSummary.add before.summary result.summaryDelta ∧
+    after.observedPackets =
+      result.observedPackets.foldl
+        (fun current descriptor => installDescriptor descriptor current)
+        before.observedPackets ∧
+    after.departures =
+      result.departures.foldl
+        (fun current record => insertDeparture record current)
+        before.departures ∧
+    after.arrivals =
+      result.arrivals.foldl
+        (fun current record => insertArrival record current)
+        before.arrivals
+
+/--
+Consecutive lifetime origin-sequence allocation in child-emission order, matching cursor
+consumption at `executor/src/scalar.rs:1236-1297`.
+-/
+def ChildrenUseOriginSequence
+    (origin : NodeId) : Nat → List Event → Prop
+  | _, [] => True
+  | next, child :: tail =>
+      child.key.originNode = origin ∧
+        child.key.originSeq = next ∧
+        ChildrenUseOriginSequence origin (next + 1) tail
+
+/--
+Atomic lifetime key allocation for one transition. Consumed keys remain in `allocatedKeys`, and
+children consume consecutive sequence values in result-list order.
+-/
+def AllocatesChildrenInOrder
+    (node : NodeDescriptor)
+    (children : List Event)
+    (before after : MachineState State) : Prop :=
+  ChildrenUseOriginSequence node.id (before.nextOriginSeq node.id) children ∧
+    (children.map Event.key).Nodup ∧
+    (∀ child ∈ children, child.key ∉ before.allocatedKeys) ∧
+    after.allocatedKeys = before.allocatedKeys ++ children.map Event.key ∧
+    after.nextOriginSeq node.id =
+      before.nextOriginSeq node.id + children.length ∧
+    ∀ other,
+      other ≠ node.id →
+      after.nextOriginSeq other = before.nextOriginSeq other
 
 /--
 Strictly key-ordered pending queue expected by both Rust executors at
@@ -112,20 +212,23 @@ def NoEligibleEvent (eligible : Event → Prop) (pending : List Event) : Prop :=
   ∀ event ∈ pending, ¬ eligible event
 
 /--
-Only the target LP's state changes and emitted observations enter canonical order, mirroring
-exclusive state-slot ownership plus normalized finish at
-`executor/src/scalar.rs:575-601,638-663`.
+Only the target LP's mutable role state and descriptor store change; all normalized result effects
+are applied explicitly. This mirrors exclusive state-slot ownership plus the complete scalar
+finish surface at `executor/src/scalar.rs:575-602`.
 -/
-def AppliesStateAndObservations
+def AppliesTransitionResult
     (image : SimulationImage State)
     (node : NodeDescriptor)
     (result : TransitionResult State node.kind)
     (before after : MachineState State) : Prop :=
   after.localState node = result.nextState ∧
+    after.packetStore node =
+      applyPacketEffects result (before.packetStore node) ∧
     (∀ other ∈ image.nodes,
       other.id ≠ node.id →
-      after.localState other = before.localState other) ∧
-    after.observations = insertObservations result.observations before.observations
+      after.localState other = before.localState other ∧
+        after.packetStore other = before.packetStore other) ∧
+    applyRecordedOutput result before after
 
 /--
 One arbitrary available-event step used to define an explicit candidate reordering; unlike the
@@ -142,7 +245,10 @@ def AvailableEventStep
       event.target = node.id ∧
       transition node event (before.localState node) result ∧
       FreshEventKeys result.children (before.pending.erase event) ∧
-      AppliesStateAndObservations image node result before after ∧
+      AllocatesChildrenInOrder node result.children before after ∧
+      AppliesTransitionResult image node result before after ∧
+      DescriptorStoreCoherent image (after.packetStore node) ∧
+      ChildDescriptorsAvailable image (after.packetStore node) result.children ∧
       after.pending = insertEvents result.children (before.pending.erase event) ∧
       after.emissions =
         before.emissions ++ (result.children.map fun child => (event, child))
@@ -224,27 +330,147 @@ def CanonicalSerialThroughStop
     NoEligibleEvent (withinInclusiveStop image.stopTimeNs) after.pending
 
 /--
+Canonical initial descriptor store derived for each event-owning LP. Rust's CPU constructor derives
+the same ownership partition from initial events and mutable state at
+`executor/src/cpu.rs:3034-3199`; the total oracle also covers dynamically generated packets.
+-/
+def initialPacketStore
+    (image : SimulationImage State)
+    (node : NodeDescriptor) : List PacketDescriptor :=
+  image.initialPacketStore node.id
+
+/--
+Structural machine invariant used at round boundaries: pending events are declared and supported,
+their lifetime keys remain allocated below the corresponding cursor, and their immutable packet
+descriptors are installed at the target LP.
+-/
+def MachineWellFormed
+    (image : SimulationImage State)
+    (machine : MachineState State) : Prop :=
+  CanonicalPending machine.pending ∧
+    machine.allocatedKeys.Nodup ∧
+    (∀ key ∈ machine.allocatedKeys,
+      key.originSeq < machine.nextOriginSeq key.originNode ∧
+        ∃ origin ∈ image.nodes, key.originNode = origin.id) ∧
+    (∀ event ∈ machine.pending,
+      event.key ∈ machine.allocatedKeys ∧
+        ∃ node ∈ image.nodes,
+          event.target = node.id ∧
+            roleSupports node.kind event.kind ∧
+            image.packetDescriptor event.payload ∈ machine.packetStore node) ∧
+    (∀ node ∈ image.nodes,
+      DescriptorStoreCoherent image (machine.packetStore node)) ∧
+    DescriptorStoreCoherent image machine.observedPackets
+
+/--
 Initial machine relation resolving Rust's role arena plus `state_slot` representation at
-`executor/src/image.rs:247-260` into the semantic node-indexed view used by the proof.
+`executor/src/image.rs:247-260` into the semantic node-indexed view used by the proof, including
+the validated initial origin-sequence cursors from `executor/src/validate.rs:1876-1953`.
 -/
 def InitialMachine
     (image : SimulationImage State)
     (machine : MachineState State) : Prop :=
   machine.pending = canonicalizeEvents image.initialEvents ∧
-    machine.observations = [] ∧
+    machine.summary = RunSummary.zero ∧
+    machine.observedPackets = [] ∧
+    machine.departures = [] ∧
+    machine.arrivals = [] ∧
+    machine.nextOriginSeq = image.initialNextOriginSeq ∧
+    machine.allocatedKeys = image.initialEvents.map Event.key ∧
     machine.emissions = [] ∧
-    ∀ node ∈ image.nodes, stateAt? image node = some (machine.localState node)
+    (∀ node ∈ image.nodes,
+      stateAt? image node = some (machine.localState node) ∧
+        machine.packetStore node = initialPacketStore image node) ∧
+    MachineWellFormed image machine
 
 /--
-Complete normalized-result equality used by all cross-executor claims, matching Rust's comparison
-surface at `executor/src/scalar.rs:575-602`.
+Canonical scalar reachability invariant used for handler progress. It contains exactly successful
+prefixes from an initial accepted machine, rather than arbitrary role/state combinations that Rust
+handlers reject with `ExecutionError` at `executor/src/scalar.rs:80-165,863-972,1091-1233`.
+-/
+def CanonicallyReachableMachine
+    (image : SimulationImage State)
+    (transition : TransitionRelation State)
+    (machine : MachineState State) : Prop :=
+  ∃ initial executed,
+    InitialMachine image initial ∧
+      CanonicalSerialExecution image transition (fun _ => True)
+        initial executed machine
+
+/--
+Successful-handler progress only at a canonically reachable least-event configuration. This is the
+reachable-state invariant relied on by the theorem statements; it does not claim Rust's checked
+handlers succeed on inconsistent arbitrary states. Enabledness is required for the least pending
+event of each LP, which covers canonical scalar execution and ownership-preserving LP drains
+without admitting invalid same-LP reorderings.
+-/
+def TransitionEnabledOnReachable
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) : Prop :=
+  ∀ machine,
+    CanonicallyReachableMachine image transition machine →
+    ∀ node ∈ image.nodes,
+      ∀ event,
+        IsLeastEligible
+          (fun candidate => candidate.target = node.id)
+          event
+          machine.pending →
+        event.target = node.id →
+        roleSupports node.kind event.kind →
+        ∃ after, AvailableEventStep image transition event machine after
+
+/--
+Accepted heterogeneous image plus its successful abstract transition semantics. Static checks and
+transition safety hold globally; enabledness is required only for canonically reachable
+configurations, matching the validator-established preconditions consumed by the partial Rust
+handlers.
+-/
+def AcceptedModel
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) : Prop :=
+  StaticImageWellFormed image ∧
+    InitialEventsRoleCorrect image ∧
+    TransitionAxioms image transition ∧
+    TransitionEnabledOnReachable image transition
+
+/--
+Non-arena semantic projection of the `RunResult` fields at `executor/src/scalar.rs:64-78`.
+`SameMachineResult` separately compares every node's local arena state.
+-/
+structure RunResultView where
+  summary : RunSummary
+  residentPackets : List PacketDescriptor
+  observedPackets : List PacketDescriptor
+  departures : List PacketDeparture
+  arrivals : List PacketArrivalObservation
+  pendingEvents : List Event
+
+/--
+Deterministic non-arena portion of the full result projection. Resident packet data is globally
+normalized from every LP descriptor store as in `executor/src/cpu.rs:3372-3433`; the accompanying
+`SameMachineResult` relation projects the host/switch arenas through validated node descriptors.
+-/
+def projectRunResult
+    (image : SimulationImage State)
+    (machine : MachineState State) : RunResultView :=
+  { summary := machine.summary
+    residentPackets :=
+      canonicalizeDescriptors (image.nodes.flatMap machine.packetStore)
+    observedPackets := canonicalizeDescriptors machine.observedPackets
+    departures := machine.departures.map RecordedDeparture.departure
+    arrivals := machine.arrivals.map RecordedArrival.arrival
+    pendingEvents := machine.pending }
+
+/--
+Complete normalized-result equality used by all cross-executor claims. Descriptor installation,
+summary counters, full observations, pending events, and both role arenas must all agree; only
+proof ghosts are excluded.
 -/
 def SameMachineResult
     (image : SimulationImage State)
     (left right : MachineState State) : Prop :=
   (∀ node ∈ image.nodes, left.localState node = right.localState node) ∧
-    left.pending = right.pending ∧
-    left.observations = right.observations
+    projectRunResult image left = projectRunResult image right
 
 /--
 One direct parent/child emission edge produced by the abstract handler relation, corresponding to
@@ -305,8 +531,18 @@ loop at `executor/src/scalar.rs:351-356`.
 -/
 def RecordedEmissionEdge
     (emissions : List (Event × Event))
-    (parent child : Event) : Prop :=
+  (parent child : Event) : Prop :=
   (parent, child) ∈ emissions
+
+/--
+Exact ghost-emission suffix produced since a round start. Lifetime history remains on the machine,
+but consistent-cut causality consumes only this suffix so round-start pending events are causal
+roots.
+-/
+def RoundEmissionDelta
+    (start finish : MachineState State)
+    (delta : List (Event × Event)) : Prop :=
+  finish.emissions = start.emissions ++ delta
 
 /--
 Trace-specific causal closure of actual recorded child emissions, avoiding hypothetical handler
@@ -360,8 +596,8 @@ def CausallyClosed
     cut parent
 
 /--
-Consistent cut: a reachable per-LP key prefix closed under causal/emission order, specifying the
-semantic set drained by `executor/src/safe_horizon.rs:268-336`.
+Consistent cut: a reachable per-LP key prefix closed under the current round's causal/emission
+order, specifying the semantic set drained by `executor/src/safe_horizon.rs:268-336`.
 -/
 def IsConsistentCut
     (emissions : List (Event × Event))
@@ -383,8 +619,9 @@ def TimePrefix
   RecordedReachableEvent emissions startPending event ∧ event.key.timeNs < horizon
 
 /--
-The concrete drained list represents exactly the reachable events below their target LP's bound
-and forms a consistent cut, generalizing `executor/src/safe_horizon.rs:381-448`.
+The concrete drained list represents exactly the events reachable from the round-start roots below
+their target LP's bound and forms a cut closed under round-local emissions, generalizing
+`executor/src/safe_horizon.rs:381-448`.
 -/
 def DrainedConsistentCut
     (emissions : List (Event × Event))

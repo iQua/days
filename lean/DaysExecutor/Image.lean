@@ -10,11 +10,42 @@ inductive NodeKind where
   | switch
   deriving DecidableEq, Repr, Ord
 
+/-- Stable flow identifier used by immutable packet descriptors. -/
+abbrev FlowId := Nat
+
+/--
+Closed packet direction mirroring `executor/src/image.rs:175-181` (`PacketKind`).
+-/
+inductive PacketKind where
+  | data
+  | feedback
+  deriving DecidableEq, Repr, Ord
+
+/--
+Immutable packet data carried alongside remote events by the CPU backend, mirroring
+`executor/src/image.rs:162-173` (`PacketDescriptor`).
+-/
+structure PacketDescriptor where
+  id : PayloadId
+  flow : FlowId
+  sizeBytes : Nat
+  kind : PacketKind
+  deriving DecidableEq, Repr
+
 /--
 Kind-indexed mutable-state family formalizing Rust's separate host and switch arenas at
 `executor/src/image.rs:247-260`.
 -/
 abbrev StateFamily := NodeKind → Type
+
+/--
+Role state with the committed non-preemptive service slots exposed as a first-class semantic
+field. `privateState` contains the remaining role-specific data; `committedService` represents the
+host/switch `in_service` slots at `executor/src/image.rs:25-69`.
+-/
+structure RoleState (State : StateFamily) (kind : NodeKind) where
+  privateState : State kind
+  committedService : List PayloadId
 
 /--
 Semantic LP identity and role-specific state slot mirroring
@@ -30,7 +61,7 @@ structure NodeDescriptor where
 Kind-indexed state arenas mirroring `SimulationImage.host_states` and `switch_states` at
 `executor/src/image.rs:252-254`.
 -/
-abbrev StateArena (State : StateFamily) := (kind : NodeKind) → List (State kind)
+abbrev StateArena (State : StateFamily) := (kind : NodeKind) → List (RoleState State kind)
 
 /--
 One constant-rate directed link mirroring `executor/src/image.rs:183-195`
@@ -98,6 +129,19 @@ structure SimulationImage (State : StateFamily) where
   links : List LinkDescriptor
   channels : List RemoteChannel
   initialEvents : List Event
+  /--
+  Immutable semantic descriptor oracle. Rust materializes generated descriptors on demand and
+  transports them in `RemoteEnvelope`; the model uses this total oracle to state descriptor
+  identity without pretending `initial_packets` is a whole-run table.
+  -/
+  packetDescriptor : PayloadId → PacketDescriptor
+  /--
+  Per-LP initial descriptor ownership derived by the CPU constructor from initial events and
+  mutable queue/service state; this is semantic prepared-image data, not an added Rust field.
+  -/
+  initialPacketStore : NodeId → List PacketDescriptor
+  /-- Initial per-origin allocation cursor derived from role state during image preparation. -/
+  initialNextOriginSeq : NodeId → Nat
   payloadBytes : PayloadId → Nat
 
 /--
@@ -114,7 +158,9 @@ def listGet? (items : List α) (index : Nat) : Option α :=
 Role-selected state lookup corresponding to `state_slot` indexing at
 `executor/src/scalar.rs:1321-1362`.
 -/
-def stateAt? (image : SimulationImage State) (node : NodeDescriptor) : Option (State node.kind) :=
+def stateAt?
+    (image : SimulationImage State)
+    (node : NodeDescriptor) : Option (RoleState State node.kind) :=
   listGet? (image.stateArena node.kind) node.stateSlot
 
 /--
@@ -150,15 +196,15 @@ def ExactStateOwnership (image : SimulationImage State) : Prop :=
             other = node
 
 /--
-Unique persistent event keys, matching Rust's duplicate rejection at
-`executor/src/safe_horizon.rs:188-196`.
+Unique initial persistent event keys, matching validation at
+`executor/src/validate.rs:1097-1115`.
 -/
 def UniqueEventKeys (events : List Event) : Prop :=
   (events.map Event.key).Nodup
 
 /--
 Initial events are stored in strict canonical-key order before executor construction, mirroring
-the accepted ordered image consumed at `executor/src/scalar.rs:341-359`.
+validation at `executor/src/validate.rs:1097-1115`.
 -/
 def InitialEventsOrdered (image : SimulationImage State) : Prop :=
   image.initialEvents.Pairwise (fun left right => left.key < right.key)
@@ -178,8 +224,8 @@ def UniqueChannelRoutes (image : SimulationImage State) : Prop :=
   (image.channels.map fun channel => (channel.link, channel.target)).Nodup
 
 /--
-Every initial event targets a declared LP, matching validation before dispatch at
-`executor/src/scalar.rs:343-351`.
+Every initial event targets a declared LP, matching validation at
+`executor/src/validate.rs:1123-1140`.
 -/
 def InitialTargetsDeclared (image : SimulationImage State) : Prop :=
   ∀ event ∈ image.initialEvents, ∃ node ∈ image.nodes, node.id = event.target
@@ -192,6 +238,39 @@ def InitialKeysCanonical (image : SimulationImage State) : Prop :=
   ∀ event ∈ image.initialEvents,
     event.key.phase = eventPhase event.kind ∧
     ∃ origin ∈ image.nodes, origin.id = event.key.originNode
+
+/--
+The immutable descriptor oracle is keyed by payload and agrees with the byte-size function used by
+link timing. This represents the descriptors created at `executor/src/scalar.rs:760-767` and
+transported at `executor/src/cpu.rs:664-667`.
+-/
+def DescriptorOracleWellFormed (image : SimulationImage State) : Prop :=
+  ∀ payload,
+    (image.packetDescriptor payload).id = payload ∧
+      (image.packetDescriptor payload).sizeBytes = image.payloadBytes payload
+
+/--
+Prepared initial descriptor stores contain unique oracle values and cover every initial event at
+its target LP, matching ownership derivation at `executor/src/cpu.rs:3034-3199`.
+-/
+def InitialPacketStoresWellFormed (image : SimulationImage State) : Prop :=
+  (∀ node ∈ image.nodes,
+    ((image.initialPacketStore node.id).map PacketDescriptor.id).Nodup ∧
+      ∀ descriptor ∈ image.initialPacketStore node.id,
+        descriptor = image.packetDescriptor descriptor.id) ∧
+    ∀ event ∈ image.initialEvents,
+      ∃ node ∈ image.nodes,
+        event.target = node.id ∧
+          image.packetDescriptor event.payload ∈ image.initialPacketStore node.id
+
+/--
+Every origin's prepared cursor lies above all of its initial event sequences, matching validation
+at `executor/src/validate.rs:1876-1927`.
+-/
+def InitialOriginSequencesReserved (image : SimulationImage State) : Prop :=
+  ∀ node ∈ image.nodes, ∀ event ∈ image.initialEvents,
+    event.key.originNode = node.id →
+    event.key.originSeq < image.initialNextOriginSeq node.id
 
 /--
 Every directed link has a positive serialization rate, mirroring the checked error at
@@ -210,8 +289,11 @@ def DeclaredLinkEndpoints (image : SimulationImage State) : Prop :=
     (∃ target ∈ image.nodes, target.id = link.physicalTarget)
 
 /--
-Every parallel channel has positive certified lookahead, mirroring
-`executor/src/safe_horizon.rs:200-207` and `executor/src/validate.rs:1059-1062`.
+Every channel used by a safe-horizon backend has positive certified lookahead. Load-time validation
+rejects zero specifically for parallel backends at `executor/src/validate.rs:1059-1062`; the
+single-threaded safe-horizon constructor independently rejects it at
+`executor/src/safe_horizon.rs:200-207` (the CPU constructors do likewise at
+`executor/src/cpu.rs:247-255,366-374,462-470`).
 -/
 def PositiveChannelBounds (image : SimulationImage State) : Prop :=
   ∀ channel ∈ image.channels, 0 < channel.minDelayNs
@@ -252,6 +334,9 @@ def StaticImageWellFormed (image : SimulationImage State) : Prop :=
     UniqueChannelRoutes image ∧
     InitialTargetsDeclared image ∧
     InitialKeysCanonical image ∧
+    DescriptorOracleWellFormed image ∧
+    InitialPacketStoresWellFormed image ∧
+    InitialOriginSequencesReserved image ∧
     PositiveLinkRates image ∧
     DeclaredLinkEndpoints image ∧
     PositiveChannelBounds image ∧

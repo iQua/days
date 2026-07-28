@@ -222,6 +222,12 @@ intentionally distinct from a round horizon.
 def withinInclusiveStop (stopTimeNs : Nat) (event : Event) : Prop :=
   event.key.timeNs ≤ stopTimeNs
 
+/-- Decidability of the configured inclusive scalar endpoint. -/
+instance (stopTimeNs : Nat) (event : Event) :
+    Decidable (withinInclusiveStop stopTimeNs event) := by
+  unfold withinInclusiveStop
+  infer_instance
+
 /--
 Exclusive endpoint corresponding to Rust's successful `u128(stop_time_ns) + 1` conversion at
 `executor/src/safe_horizon.rs:231-236`.

@@ -167,12 +167,44 @@ def BoundFamilyWithinStop
   ∀ node ∈ image.nodes, bounds node.id ≤ stopExclusive image.stopTimeNs
 
 /--
-Round-local machine plus one outbox per source LP, mirroring per-LP buffering in
-`executor/src/safe_horizon.rs:276-288,381-447`.
+CPU exchange payload mirroring `executor/src/cpu.rs:694-698`. Descriptor equality with the
+immutable oracle prevents event-only exchange from hiding missing or corrupt packet data.
+-/
+structure RemoteEnvelope where
+  event : Event
+  packet : PacketDescriptor
+  deriving DecidableEq, Repr
+
+/-- An envelope carries exactly the descriptor belonging to its event payload. -/
+def RemoteEnvelope.Coherent
+    (image : SimulationImage State)
+    (envelope : RemoteEnvelope) : Prop :=
+  envelope.packet = image.packetDescriptor envelope.event.payload
+
+/--
+Descriptor-carrying envelopes built in child-emission order from descriptors actually present in
+the emitting LP's post-transition store.
+-/
+def RemoteEnvelopesFromStore
+    (image : SimulationImage State)
+    (store : List PacketDescriptor) :
+    List Event → List RemoteEnvelope → Prop
+  | [], [] => True
+  | event :: events, envelope :: envelopes =>
+      envelope.event = event ∧
+        envelope.packet ∈ store ∧
+        envelope.packet.id = event.payload ∧
+        RemoteEnvelope.Coherent image envelope ∧
+        RemoteEnvelopesFromStore image store events envelopes
+  | _, _ => False
+
+/--
+Round-local machine plus one descriptor-carrying outbox per source LP, mirroring per-LP buffering
+at `executor/src/cpu.rs:586-698`.
 -/
 structure RoundState (State : StateFamily) where
   machine : MachineState State
-  outboxes : NodeId → List Event
+  outboxes : NodeId → List RemoteEnvelope
 
 /--
 Local children produced by one LP, corresponding to immediate local insertion at
@@ -205,12 +237,13 @@ and the future-event list is canonical, mirroring the barrier boundary between
 def PostExchangeStart
     (image : SimulationImage State)
     (state : RoundState State) : Prop :=
-  AllOutboxesEmpty image state ∧ CanonicalPending state.machine.pending
+  AllOutboxesEmpty image state ∧ MachineWellFormed image state.machine
 
 /--
 One sequential local LP step below its half-open bound. Local children enter the future list
-immediately while remote children enter only that LP's outbox, mirroring
-`executor/src/safe_horizon.rs:381-447`.
+immediately while remote children enter only that LP's descriptor-carrying outbox, combining the
+drain shape at `executor/src/safe_horizon.rs:381-447` with CPU envelope creation at
+`executor/src/cpu.rs:627-667`.
 -/
 def LocalRoundStep
     (image : SimulationImage State)
@@ -229,8 +262,13 @@ def LocalRoundStep
       transition node event (before.machine.localState node) result ∧
       FreshEventKeys result.children
         (before.machine.pending ++
-          image.nodes.flatMap fun owner => before.outboxes owner.id) ∧
-      AppliesStateAndObservations image node result before.machine after.machine ∧
+          (image.nodes.flatMap fun owner => before.outboxes owner.id).map
+            RemoteEnvelope.event) ∧
+      AllocatesChildrenInOrder node result.children before.machine after.machine ∧
+      AppliesTransitionResult image node result before.machine after.machine ∧
+      DescriptorStoreCoherent image (after.machine.packetStore node) ∧
+      ChildDescriptorsAvailable image
+        (after.machine.packetStore node) result.children ∧
       after.machine.pending =
         insertEvents
           (localChildren node.id result.children)
@@ -238,11 +276,16 @@ def LocalRoundStep
       after.machine.emissions =
         before.machine.emissions ++
           (result.children.map fun child => (event, child)) ∧
-      after.outboxes node.id =
-        before.outboxes node.id ++ remoteChildren node.id result.children ∧
-      ∀ other ∈ image.nodes,
-        other.id ≠ node.id →
-        after.outboxes other.id = before.outboxes other.id
+      ∃ emittedRemote,
+        RemoteEnvelopesFromStore image
+          (after.machine.packetStore node)
+          (remoteChildren node.id result.children)
+          emittedRemote ∧
+        after.outboxes node.id =
+          before.outboxes node.id ++ emittedRemote ∧
+        ∀ other ∈ image.nodes,
+          other.id ≠ node.id →
+          after.outboxes other.id = before.outboxes other.id
 
 /--
 Sequential least-local-key drain for one LP until no event remains below that LP's bound, mirroring
@@ -302,25 +345,38 @@ def SequentialRoundDrain
 
 /--
 Strict canonical exchange order `(target_lp, EventKey)`, mirroring
-`executor/src/safe_horizon.rs:309-335,472-547`.
+`executor/src/cpu.rs:3545-3642,4453-4500`.
 -/
-def exchangeLT (left right : Event) : Prop :=
-  left.target < right.target ∨
-    (left.target = right.target ∧ left.key < right.key)
+def exchangeLT (left right : RemoteEnvelope) : Prop :=
+  left.event.target < right.event.target ∨
+    (left.event.target = right.event.target ∧ left.event.key < right.event.key)
 
 /--
 Flattened per-source outboxes awaiting the common barrier exchange at
-`executor/src/safe_horizon.rs:309-310`.
+`executor/src/cpu.rs:4453-4463`.
 -/
 def flattenedOutboxes
     (image : SimulationImage State)
-    (state : RoundState State) : List Event :=
+    (state : RoundState State) : List RemoteEnvelope :=
   image.nodes.flatMap fun node => state.outboxes node.id
+
+/-- Install all canonically ordered envelopes for one target LP. -/
+def installRemoteEnvelopesFor
+    (target : NodeId)
+    (ordered : List RemoteEnvelope)
+    (store : List PacketDescriptor) : List PacketDescriptor :=
+  ordered.foldl
+    (fun current envelope =>
+      if envelope.event.target = target then
+        installDescriptor envelope.packet current
+      else
+        current)
+    store
 
 /--
 Complete exactly-once canonical exchange: all and only buffered remote events are ordered by
-`(target, EventKey)`, merged into future events, and every outbox is emptied, mirroring
-`executor/src/safe_horizon.rs:309-336`.
+`(target, EventKey)`, their descriptors are installed before their future events, and every outbox
+is emptied, mirroring `executor/src/cpu.rs:4453-4506`.
 -/
 def CompleteCanonicalExchange
     (image : SimulationImage State)
@@ -328,10 +384,20 @@ def CompleteCanonicalExchange
   ∃ ordered,
     (flattenedOutboxes image drained).Perm ordered ∧
     ordered.Pairwise exchangeLT ∧
+    (∀ envelope ∈ ordered, RemoteEnvelope.Coherent image envelope) ∧
     (∀ node ∈ image.nodes,
-      next.machine.localState node = drained.machine.localState node) ∧
-    next.machine.pending = insertEvents ordered drained.machine.pending ∧
-    next.machine.observations = drained.machine.observations ∧
+      next.machine.localState node = drained.machine.localState node ∧
+        next.machine.packetStore node =
+          installRemoteEnvelopesFor node.id ordered
+            (drained.machine.packetStore node)) ∧
+    next.machine.pending =
+      insertEvents (ordered.map RemoteEnvelope.event) drained.machine.pending ∧
+    next.machine.summary = drained.machine.summary ∧
+    next.machine.observedPackets = drained.machine.observedPackets ∧
+    next.machine.departures = drained.machine.departures ∧
+    next.machine.arrivals = drained.machine.arrivals ∧
+    next.machine.nextOriginSeq = drained.machine.nextOriginSeq ∧
+    next.machine.allocatedKeys = drained.machine.allocatedKeys ∧
     next.machine.emissions = drained.machine.emissions ∧
     AllOutboxesEmpty image next
 
@@ -354,8 +420,10 @@ def SafeHorizonRound
     BoundFamilyWithinStop image bounds ∧
     ∃ afterDrain,
       SequentialRoundDrain image transition bounds start drainedEvents afterDrain ∧
-      DrainedConsistentCut afterDrain.machine.emissions
-        start.machine.pending drainedEvents bounds cut ∧
+      ∃ roundEmissions,
+        RoundEmissionDelta start.machine afterDrain.machine roundEmissions ∧
+        DrainedConsistentCut roundEmissions
+          start.machine.pending drainedEvents bounds cut ∧
       CompleteCanonicalExchange image afterDrain finish ∧
       PostExchangeStart image finish
 

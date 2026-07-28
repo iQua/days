@@ -3,19 +3,91 @@ import DaysExecutor.Image
 namespace DaysExecutor
 
 /--
-Normalized observable record corresponding to the key-sorted scalar observations at
-`executor/src/scalar.rs:575-601`.
+Constant-space result counters mirroring every field of `executor/src/scalar.rs:49-62`
+(`RunSummary`).
 -/
-structure Observation where
-  eventKey : EventKey
-  ordinal : Nat
-  tag : Nat
-  value : Nat
+structure RunSummary where
+  sourcedPackets : Nat
+  sourcedBytes : Nat
+  departedPackets : Nat
+  departedBytes : Nat
+  admittedPackets : Nat
+  admittedBytes : Nat
+  receivedPackets : Nat
+  receivedBytes : Nat
+  droppedPackets : Nat
+  droppedBytes : Nat
+  feedbackPackets : Nat
+  feedbackBytes : Nat
+  deriving DecidableEq, Repr
+
+/-- Zero accumulated output before the first transition. -/
+def RunSummary.zero : RunSummary where
+  sourcedPackets := 0
+  sourcedBytes := 0
+  departedPackets := 0
+  departedBytes := 0
+  admittedPackets := 0
+  admittedBytes := 0
+  receivedPackets := 0
+  receivedBytes := 0
+  droppedPackets := 0
+  droppedBytes := 0
+  feedbackPackets := 0
+  feedbackBytes := 0
+
+/-- Checked-success-path counter accumulation corresponding to CPU result assembly. -/
+def RunSummary.add (left right : RunSummary) : RunSummary where
+  sourcedPackets := left.sourcedPackets + right.sourcedPackets
+  sourcedBytes := left.sourcedBytes + right.sourcedBytes
+  departedPackets := left.departedPackets + right.departedPackets
+  departedBytes := left.departedBytes + right.departedBytes
+  admittedPackets := left.admittedPackets + right.admittedPackets
+  admittedBytes := left.admittedBytes + right.admittedBytes
+  receivedPackets := left.receivedPackets + right.receivedPackets
+  receivedBytes := left.receivedBytes + right.receivedBytes
+  droppedPackets := left.droppedPackets + right.droppedPackets
+  droppedBytes := left.droppedBytes + right.droppedBytes
+  feedbackPackets := left.feedbackPackets + right.feedbackPackets
+  feedbackBytes := left.feedbackBytes + right.feedbackBytes
+
+/-- Remote-arrival outcome mirroring `executor/src/scalar.rs:14-21`. -/
+inductive ArrivalDisposition where
+  | admitted
+  | dropped
+  | delivered
+  | feedback
   deriving DecidableEq, Repr, Ord
 
+/-- Completed transmission record mirroring `executor/src/scalar.rs:23-29`. -/
+structure PacketDeparture where
+  payload : PayloadId
+  timeNs : Nat
+  deriving DecidableEq, Repr
+
+/-- Processed remote-arrival record mirroring `executor/src/scalar.rs:31-37`. -/
+structure PacketArrivalObservation where
+  payload : PayloadId
+  timeNs : Nat
+  disposition : ArrivalDisposition
+  deriving DecidableEq, Repr
+
+/-- Internal canonical key retained while normalizing a departure result. -/
+structure RecordedDeparture where
+  eventKey : EventKey
+  departure : PacketDeparture
+  deriving DecidableEq, Repr
+
+/-- Internal canonical key retained while normalizing an arrival result. -/
+structure RecordedArrival where
+  eventKey : EventKey
+  arrival : PacketArrivalObservation
+  deriving DecidableEq, Repr
+
 /--
-One state-dependent, committed service selection corresponding to a `TxReady` handler at
-`executor/src/scalar.rs:863-921,1091-1166`.
+Proof metadata for one state-dependent, committed service selection corresponding to a `TxReady`
+handler at `executor/src/scalar.rs:863-921,1091-1166`. Completeness is stated separately, so an
+implementation cannot omit a selection from this trace.
 -/
 structure ServiceDecision where
   node : NodeId
@@ -25,13 +97,19 @@ structure ServiceDecision where
   deriving DecidableEq, Repr
 
 /--
-Abstract result of one role-correct run-to-completion handler, mirroring the child and observation
-effects of `TransitionState.dispatch` at `executor/src/scalar.rs:638-663`.
+Abstract result of one role-correct run-to-completion handler, including child, descriptor,
+summary, and observation effects accumulated by `TransitionState.dispatch` and finish assembly at
+`executor/src/scalar.rs:575-663`.
 -/
 structure TransitionResult (State : StateFamily) (kind : NodeKind) where
-  nextState : State kind
+  nextState : RoleState State kind
   children : List Event
-  observations : List Observation
+  packetInstalls : List PacketDescriptor
+  packetRemovals : List PayloadId
+  summaryDelta : RunSummary
+  observedPackets : List PacketDescriptor
+  departures : List RecordedDeparture
+  arrivals : List RecordedArrival
   decisions : List ServiceDecision
 
 /--
@@ -42,7 +120,7 @@ roles to use different code while retaining Rust's `(NodeKind, EventKind)` dispa
 abbrev TransitionRelation (State : StateFamily) :=
   (node : NodeDescriptor) →
   (event : Event) →
-  State node.kind →
+  RoleState State node.kind →
   TransitionResult State node.kind →
   Prop
 
@@ -65,18 +143,6 @@ def TransitionDeterministic
     transition node event state left →
     transition node event state right →
     left = right
-
-/--
-Progress/enabledness for every accepted role/event pair, matching the closed Rust dispatch table
-at `executor/src/model.rs:45-60`.
--/
-def TransitionEnabled
-    (image : SimulationImage State)
-    (transition : TransitionRelation State) : Prop :=
-  ∀ node ∈ image.nodes, ∀ event,
-    event.target = node.id →
-    roleSupports node.kind event.kind →
-    ∀ state, ∃ result, transition node event state result
 
 /--
 Role and target correctness of dispatched handlers, matching the checks before
@@ -180,15 +246,30 @@ def CertifiedBoundSoundness
           event.key.timeNs + channel.minDelayNs ≤ child.key.timeNs
 
 /--
-All transition assumptions used by the safe-horizon statements, collected without introducing a
-runtime certificate; these mirror validation plus dispatch at
+Every descriptor installed or retained for full observations is the immutable oracle value for its
+payload. This matches Rust's conflicting-descriptor rejection at
+`executor/src/scalar.rs:545-565`.
+-/
+def TransitionDescriptorEffectsCoherent
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) : Prop :=
+  ∀ node event state result,
+    transition node event state result →
+    (∀ descriptor ∈ result.packetInstalls,
+      descriptor = image.packetDescriptor descriptor.id) ∧
+    (∀ descriptor ∈ result.observedPackets,
+      descriptor = image.packetDescriptor descriptor.id)
+
+/--
+All global transition-safety assumptions used by the safe-horizon statements, collected without
+introducing a runtime certificate; reachable enabledness is stated separately after execution
+reachability is defined. These mirror validation plus dispatch at
 `executor/src/validate.rs:1010-1080` and `executor/src/scalar.rs:638-663,1300-1313`.
 -/
 def TransitionAxioms
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
   TransitionDeterministic transition ∧
-    TransitionEnabled image transition ∧
     TransitionRoleCorrect transition ∧
     GeneratedEventsRoleCorrect image transition ∧
     ChildrenAdvanceParent transition ∧
@@ -196,7 +277,8 @@ def TransitionAxioms
     ChildrenUseCanonicalPhase transition ∧
     TransitionChildrenHaveUniqueKeys transition ∧
     RemoteEmissionCoverage image transition ∧
-    CertifiedBoundSoundness image transition
+    CertifiedBoundSoundness image transition ∧
+    TransitionDescriptorEffectsCoherent image transition
 
 /--
 State-dependent choices occur only at the actual `TxReady`, choose at most one packet, and commit
@@ -214,6 +296,32 @@ def ActualServiceStartDiscipline
         decision.decisionKey = event.key ∧
         decision.committedNonPreemptively = true
 
+/-- A transition newly commits one packet in the role state's intrinsic service ledger. -/
+def SelectionIntroduced
+    (before after : RoleState State kind)
+    (packet : PayloadId) : Prop :=
+  packet ∉ before.committedService ∧ packet ∈ after.committedService
+
+/--
+Every newly committed service packet has exactly the decision record carrying it, and every
+decision record denotes such a newly committed packet. This closes the optional-metadata loophole:
+an arrival that eagerly reserves service either omits a required record or violates the
+`TxReady`-only rule.
+-/
+def ServiceDecisionTraceComplete
+    (transition : TransitionRelation State) : Prop :=
+  ∀ node event state result,
+    transition node event state result →
+    ∀ packet,
+      SelectionIntroduced state result.nextState packet ↔
+        ∃ decision ∈ result.decisions, decision.packet = packet
+
+/-- Complete service-start contract used by F2–F4. -/
+def CompleteActualServiceStartDiscipline
+    (transition : TransitionRelation State) : Prop :=
+  ActualServiceStartDiscipline transition ∧
+    ServiceDecisionTraceComplete transition
+
 /--
 Every initial event has a supported handler for its target role, mirroring validation before
 `executor/src/scalar.rs:638-650`.
@@ -223,17 +331,6 @@ def InitialEventsRoleCorrect
   ∀ event ∈ image.initialEvents,
     ∃ node ∈ image.nodes,
       event.target = node.id ∧ roleSupports node.kind event.kind
-
-/--
-Accepted heterogeneous image plus its abstract closed transition semantics, corresponding to the
-pre-execution validator boundary at `executor/src/validate.rs:196-245,1010-1080`.
--/
-def AcceptedModel
-    (image : SimulationImage State)
-    (transition : TransitionRelation State) : Prop :=
-  StaticImageWellFormed image ∧
-    InitialEventsRoleCorrect image ∧
-    TransitionAxioms image transition
 
 /--
 Conservative queue-conflict class for the accepted FIFO/TailDrop handlers.
