@@ -91,6 +91,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_origin_sequences(image, &future_work)?;
     validate_payload_sequences(image, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
+    validate_initial_payload_positions(image)?;
     Ok(())
 }
 
@@ -1468,6 +1469,129 @@ fn validate_unique_mutable_payloads(image: &SimulationImage) -> Result<(), Valid
         }
     }
     Ok(())
+}
+
+fn validate_initial_payload_positions(image: &SimulationImage) -> Result<(), ValidationError> {
+    let mut events_by_payload = BTreeMap::<PayloadId, Vec<(usize, crate::Event)>>::new();
+    for (index, event) in image.initial_events.iter().copied().enumerate() {
+        events_by_payload
+            .entry(event.payload)
+            .or_default()
+            .push((index, event));
+    }
+
+    for (payload, events) in events_by_payload {
+        let packet_arrival = events
+            .iter()
+            .find(|(_, event)| event.kind == EventKind::PacketArrival);
+        if let Some(packet_arrival) = packet_arrival {
+            if let Some(other) = events
+                .iter()
+                .find(|(_, event)| event.kind != EventKind::PacketArrival)
+            {
+                return incompatible_initial_positions(image, payload, *packet_arrival, *other);
+            }
+        }
+
+        let completions = events
+            .iter()
+            .filter(|(_, event)| event.kind == EventKind::TxComplete)
+            .collect::<Vec<_>>();
+        if completions.len() > 1 {
+            return incompatible_initial_positions(
+                image,
+                payload,
+                *completions[0],
+                *completions[1],
+            );
+        }
+
+        let remote_arrivals = events
+            .iter()
+            .filter(|(_, event)| event.kind == EventKind::RemoteArrival)
+            .collect::<Vec<_>>();
+        if remote_arrivals.len() > 1 {
+            return incompatible_initial_positions(
+                image,
+                payload,
+                *remote_arrivals[0],
+                *remote_arrivals[1],
+            );
+        }
+
+        if let (Some(completion), Some(remote_arrival)) =
+            (completions.first(), remote_arrivals.first())
+        {
+            let completion = **completion;
+            let remote_arrival = **remote_arrival;
+            if !same_transmission_siblings(image, completion.1, remote_arrival.1) {
+                return incompatible_initial_positions(image, payload, completion, remote_arrival);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_transmission_siblings(
+    image: &SimulationImage,
+    completion: crate::Event,
+    remote_arrival: crate::Event,
+) -> bool {
+    let Some(egress) = event_egress(image, &completion).and_then(|link_id| link(image, link_id))
+    else {
+        return false;
+    };
+    completion.target == remote_arrival.key.origin_node
+        && remote_arrival.target == egress.target
+        && completion.key.time_ns.checked_add(egress.propagation_ns)
+            == Some(remote_arrival.key.time_ns)
+        && completion.key.origin_seq.checked_add(1) == Some(remote_arrival.key.origin_seq)
+}
+
+fn incompatible_initial_positions(
+    image: &SimulationImage,
+    payload: PayloadId,
+    first: (usize, crate::Event),
+    second: (usize, crate::Event),
+) -> Result<(), ValidationError> {
+    Err(ValidationError::new(format!(
+        "payload {payload:?} has causally incompatible initial positions: {} and {}",
+        describe_initial_position(image, first.0, first.1),
+        describe_initial_position(image, second.0, second.1)
+    )))
+}
+
+fn describe_initial_position(image: &SimulationImage, index: usize, event: crate::Event) -> String {
+    match event.kind {
+        EventKind::PacketArrival => {
+            format!("PacketArrival event {index} at node {:?}", event.target)
+        }
+        EventKind::TxReady => format!("TxReady event {index} at node {:?}", event.target),
+        EventKind::TxComplete => {
+            format!("TxComplete event {index} at node {:?}", event.target)
+        }
+        EventKind::RemoteArrival => {
+            let link = remote_arrival_link(image, event)
+                .expect("event validation established the route channel");
+            format!(
+                "RemoteArrival event {index} on link {link:?} from {:?} to {:?}",
+                event.key.origin_node, event.target
+            )
+        }
+    }
+}
+
+fn remote_arrival_link(image: &SimulationImage, event: crate::Event) -> Option<LinkId> {
+    let packet = packet(image, event.payload)?;
+    let flow = flow(image, packet.flow)?;
+    packet_route(flow, packet.kind)
+        .iter()
+        .copied()
+        .find(|link_id| {
+            link(image, *link_id).is_some_and(|route_link| {
+                route_link.source == event.key.origin_node && route_link.target == event.target
+            })
+        })
 }
 
 fn record_mutable_payload(

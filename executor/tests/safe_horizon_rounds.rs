@@ -99,6 +99,127 @@ fn image(stop_time_ns: u64, event_time_ns: u64, channel_delay_ns: u64) -> Simula
     }
 }
 
+fn add_sink_owned_egress(image: &mut SimulationImage) {
+    let sink_egress = LinkDescriptor {
+        id: LinkId(1),
+        source: SINK,
+        target: SOURCE,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    image.host_states[1].egress_link = sink_egress.id;
+    image.links.push(sink_egress);
+}
+
+fn causally_incompatible_positions_image() -> SimulationImage {
+    let mut image = image(0, 0, 1);
+    add_sink_owned_egress(&mut image);
+    image.host_states[0].next_origin_seq = 2;
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SOURCE,
+                origin_seq: 0,
+            },
+            target: SINK,
+            kind: EventKind::RemoteArrival,
+            payload: PACKET,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::PacketArrival),
+                origin_node: SOURCE,
+                origin_seq: 1,
+            },
+            target: SOURCE,
+            kind: EventKind::PacketArrival,
+            payload: PACKET,
+        },
+    ];
+    image
+}
+
+fn in_flight_image(propagation_ns: u64) -> SimulationImage {
+    let transmission_complete_ns = 1;
+    let remote_arrival_ns = transmission_complete_ns + propagation_ns;
+    let mut image = image(remote_arrival_ns, 0, propagation_ns + 1);
+    add_sink_owned_egress(&mut image);
+    image.host_states[0].in_service = Some(PACKET);
+    image.host_states[0].next_origin_seq = 2;
+    image.host_states[0].sourced_packets = 1;
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: transmission_complete_ns,
+                phase: event_phase(EventKind::TxComplete),
+                origin_node: SOURCE,
+                origin_seq: 0,
+            },
+            target: SOURCE,
+            kind: EventKind::TxComplete,
+            payload: PACKET,
+        },
+        Event {
+            key: EventKey {
+                time_ns: remote_arrival_ns,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SOURCE,
+                origin_seq: 1,
+            },
+            target: SINK,
+            kind: EventKind::RemoteArrival,
+            payload: PACKET,
+        },
+    ];
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image
+}
+
+fn ready_token_and_remote_arrival_image() -> SimulationImage {
+    let queued = PayloadId::from_node_sequence(SOURCE, 2, 1).unwrap();
+    let mut image = image(5, 0, 4);
+    add_sink_owned_egress(&mut image);
+    image.initial_packets.push(PacketDescriptor {
+        id: queued,
+        flow: FLOW,
+        size_bytes: 1,
+        kind: PacketKind::Data,
+    });
+    image.host_states[0].queue = VecDeque::from([queued]);
+    image.host_states[0].tx_ready_pending = true;
+    image.host_states[0].next_origin_seq = 3;
+    image.host_states[0].sourced_packets = 2;
+    image.host_states[0].departed_packets = 1;
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: 1,
+                phase: event_phase(EventKind::TxReady),
+                origin_node: SOURCE,
+                origin_seq: 2,
+            },
+            target: SOURCE,
+            kind: EventKind::TxReady,
+            payload: PACKET,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 4,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SOURCE,
+                origin_seq: 1,
+            },
+            target: SINK,
+            kind: EventKind::RemoteArrival,
+            payload: PACKET,
+        },
+    ];
+    image
+}
+
 fn assert_equivalent(image: &SimulationImage, exclusive_horizon_ns: Option<u64>) {
     let global =
         run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full).unwrap();
@@ -115,6 +236,64 @@ fn assert_equivalent(image: &SimulationImage, exclusive_horizon_ns: Option<u64>)
         assert_eq!(round.active_lp_count, round.lp_work.len());
         assert!(round.lp_work.iter().all(|work| work.events_processed > 0));
     }
+}
+
+#[test]
+fn causally_incompatible_initial_payload_positions_are_rejected() {
+    let image = causally_incompatible_positions_image();
+    let expected = "payload PayloadId(0) has causally incompatible initial positions: PacketArrival event 1 at node NodeId(0) and RemoteArrival event 0 on link LinkId(0) from NodeId(0) to NodeId(1)";
+
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 1 }] {
+        let diagnostic = validate(&image, backend)
+            .expect_err("causally incompatible positions must reject")
+            .to_string();
+        println!("{backend} validation: Err({diagnostic})");
+        assert_eq!(diagnostic, expected);
+    }
+}
+
+#[test]
+fn in_flight_pair_must_be_siblings_from_one_transmission() {
+    let mut image = in_flight_image(0);
+    image.initial_events[0].key.origin_seq = 2;
+    image.host_states[0].next_origin_seq = 3;
+
+    assert_eq!(
+        validate(&image, Backend::Scalar)
+            .expect_err("independently emitted positions must reject")
+            .to_string(),
+        "payload PayloadId(0) has causally incompatible initial positions: TxComplete event 1 at node NodeId(0) and RemoteArrival event 0 on link LinkId(0) from NodeId(0) to NodeId(1)"
+    );
+}
+
+#[test]
+fn in_flight_completion_and_remote_arrival_remain_valid_and_equivalent() {
+    for propagation_ns in [0, 3] {
+        let image = in_flight_image(propagation_ns);
+        validate(&image, Backend::Scalar).unwrap();
+        validate(&image, Backend::Cpu { workers: 1 }).unwrap();
+        assert_equivalent(&image, None);
+
+        let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        assert_eq!(result.summary.departed_packets, 1);
+        assert_eq!(result.summary.received_packets, 1);
+        assert!(result.resident_packets.is_empty());
+        assert!(result.pending_events.is_empty());
+    }
+}
+
+#[test]
+fn ready_control_token_can_coexist_with_an_in_flight_payload() {
+    let image = ready_token_and_remote_arrival_image();
+    validate(&image, Backend::Scalar).unwrap();
+    validate(&image, Backend::Cpu { workers: 1 }).unwrap();
+    assert_equivalent(&image, None);
+
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    assert_eq!(result.summary.departed_packets, 1);
+    assert_eq!(result.summary.received_packets, 2);
+    assert!(result.resident_packets.is_empty());
+    assert!(result.pending_events.is_empty());
 }
 
 #[test]
@@ -299,7 +478,7 @@ fn blocked_feedback_image() -> SimulationImage {
         ],
         initial_events: vec![Event {
             key: EventKey {
-                time_ns: 0,
+                time_ns: 5,
                 phase: event_phase(EventKind::TxReady),
                 origin_node: NodeId(1),
                 origin_seq: 0,
@@ -315,9 +494,13 @@ fn blocked_feedback_image() -> SimulationImage {
 #[test]
 fn blocked_lp_is_absent_from_the_frontier_until_feedback_arrives() {
     let image = blocked_feedback_image();
+    validate(&image, Backend::Scalar).unwrap();
+    validate(&image, Backend::Cpu { workers: 1 }).unwrap();
     assert_equivalent(&image, None);
     let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full).unwrap();
 
+    assert_eq!(run.rounds[0].frontier_ns, 5);
+    assert_eq!(run.rounds[0].exclusive_horizon_ns, 6);
     assert_eq!(
         run.rounds[0]
             .lp_work
