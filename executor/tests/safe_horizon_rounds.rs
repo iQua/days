@@ -461,6 +461,44 @@ fn wide_and_narrow_lookahead_pin_events_per_round_separately_from_efficiency() {
 }
 
 #[test]
+fn same_time_tx_ready_continuations_skip_round_queue_churn_without_changing_state() {
+    let image = direct_packets(100, 8);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let scalar = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 4,
+            granularity: ChunkGranularity::Static,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(scalar.result, expected);
+    assert_eq!(cpu.result, expected);
+    assert_eq!(
+        scalar
+            .rounds
+            .iter()
+            .flat_map(|round| &round.lp_work)
+            .map(|work| work.same_time_continuations)
+            .sum::<u64>(),
+        7
+    );
+    assert_eq!(
+        cpu.rounds
+            .iter()
+            .flat_map(|round| &round.semantic.lp_work)
+            .map(|work| work.same_time_continuations)
+            .sum::<u64>(),
+        7
+    );
+}
+
+#[test]
 fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
     let mut image = incast_image(8);
     image.initial_events.clear();
@@ -507,6 +545,59 @@ fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
             .iter()
             .all(|round| round.owner_batch_messages <= 1)
     );
+}
+
+#[test]
+fn static_cpu_pool_uses_one_assignment_and_one_completion_per_worker_per_round() {
+    let image = direct_packets(100, 8);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let workers = 4;
+    let actual = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers,
+            granularity: ChunkGranularity::Static,
+            straggler_threshold_events: None,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(actual.result, expected);
+    for round in &actual.rounds {
+        assert_eq!(round.worker_wake_messages, workers as u64);
+        assert_eq!(round.worker_completion_messages, workers as u64);
+        assert_eq!(round.chunk_request_messages, 0);
+        assert_eq!(round.pool_messages(), 2 * workers as u64);
+    }
+}
+
+#[test]
+fn bounded_spin_configuration_preserves_static_and_dynamic_results() {
+    let image = direct_packets(100, 8);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    for spin_before_park in [0, 4_096] {
+        for granularity in [ChunkGranularity::Static, ChunkGranularity::Fixed(1)] {
+            let actual = run_cpu_with_observations(
+                &image,
+                None,
+                CpuConfig {
+                    workers: 4,
+                    granularity,
+                    spin_before_park,
+                    ..CpuConfig::default()
+                },
+                ObservationMode::Full,
+            )
+            .unwrap();
+            assert_eq!(
+                actual.result, expected,
+                "spin_before_park={spin_before_park}, granularity={granularity:?}"
+            );
+        }
+    }
 }
 
 fn blocked_feedback_image() -> SimulationImage {

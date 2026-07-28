@@ -98,3 +98,22 @@ pub struct Event {
     pub kind: EventKind,
     pub payload: PayloadId,
 }
+
+/// Returns whether a locally emitted child can execute directly after its completion parent.
+///
+/// The strict comparison with the current LP minimum preserves both canonical ordering and the
+/// existing duplicate-key diagnostic. Remote events cannot interpose because safe-horizon drains
+/// buffer them until the round barrier.
+pub(crate) fn is_same_time_tx_ready_continuation(
+    parent: Event,
+    child: Event,
+    local_node: NodeId,
+    next_key: Option<EventKey>,
+) -> bool {
+    parent.kind == EventKind::TxComplete
+        && child.target == local_node
+        && child.kind == EventKind::TxReady
+        && child.key.time_ns == parent.key.time_ns
+        && child.key.phase == event_phase(EventKind::TxReady)
+        && next_key.is_none_or(|next| child.key < next)
+}

@@ -7,6 +7,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
+use crate::event::is_same_time_tx_ready_continuation;
 use crate::scalar::{ExecutionError, ObservationMode, RunResult, TransitionState};
 use crate::{Event, EventKey, NodeId, SimulationImage};
 
@@ -18,6 +19,8 @@ const REMOTE_ORDER_BYTES: usize = 34;
 pub struct LpRoundWork {
     pub node: NodeId,
     pub events_processed: u64,
+    /// Local `TxComplete` → same-time `TxReady` pairs executed without an LP queue insert/pop.
+    pub same_time_continuations: u64,
 }
 
 /// Cheap, deterministic instrumentation retained for one safe-horizon round.
@@ -383,24 +386,48 @@ impl<'image> RoundExecutor<'image> {
     ) -> Result<(LpRoundWork, Vec<Event>), ExecutionError> {
         let node = self.image.nodes[lp_slot].id;
         let mut events_processed = 0_u64;
+        let mut same_time_continuations = 0_u64;
         let mut outbox = Vec::new();
-        while self.futures[lp_slot]
-            .first_key_value()
-            .is_some_and(|(key, _)| u128::from(key.time_ns) < exclusive_horizon_ns)
+        let mut continuation = None;
+        while continuation.is_some()
+            || self.futures[lp_slot]
+                .first_key_value()
+                .is_some_and(|(key, _)| u128::from(key.time_ns) < exclusive_horizon_ns)
         {
-            let (_, event) = self.futures[lp_slot]
-                .pop_first()
-                .expect("first_key_value established a pending event");
+            let event = if let Some(event) = continuation.take() {
+                event
+            } else {
+                self.futures[lp_slot]
+                    .pop_first()
+                    .expect("first_key_value established a pending event")
+                    .1
+            };
             let removed = self.pending_keys.remove(&event.key);
             debug_assert!(removed, "executing event must own a pending key");
 
             self.transitions.dispatch(event, children)?;
+            let direct_child = match children.as_slice() {
+                [child]
+                    if is_same_time_tx_ready_continuation(
+                        event,
+                        *child,
+                        node,
+                        self.futures[lp_slot].first_key_value().map(|(key, _)| *key),
+                    ) =>
+                {
+                    Some(*child)
+                }
+                _ => None,
+            };
             for child in children.drain(..) {
                 if !self.pending_keys.insert(child.key) {
                     return Err(ExecutionError::DuplicateEventKey(child.key));
                 }
                 if child.target == node {
-                    if self.futures[lp_slot].insert(child.key, child).is_some() {
+                    if direct_child == Some(child) {
+                        continuation = Some(child);
+                        same_time_continuations = same_time_continuations.saturating_add(1);
+                    } else if self.futures[lp_slot].insert(child.key, child).is_some() {
                         return Err(ExecutionError::DuplicateEventKey(child.key));
                     }
                 } else {
@@ -414,6 +441,7 @@ impl<'image> RoundExecutor<'image> {
             LpRoundWork {
                 node,
                 events_processed,
+                same_time_continuations,
             },
             outbox,
         ))
@@ -443,15 +471,20 @@ fn node_slot(image: &SimulationImage, node: NodeId) -> Option<usize> {
 
 /// Stable LSD radix ordering for `(target_lp, EventKey)`.
 ///
-/// All components are fixed-width integers, so 34 byte passes are a constant. This keeps exchange
-/// O(messages) without a comparison sort or an LP-count-sized bucket table.
+/// All components are fixed-width integers. Bytes that are identical across the run are skipped;
+/// the remaining passes are the same stable radix operation. This keeps exchange O(messages)
+/// without a comparison sort or an LP-count-sized bucket table.
 fn radix_sort_remote_events(events: &mut Vec<Event>) {
     if events.len() < 2 {
         return;
     }
 
+    let varying_bytes = remote_event_varying_bytes(events);
     let mut scratch = vec![events[0]; events.len()];
     for pass in 0..REMOTE_ORDER_BYTES {
+        if varying_bytes & (1_u64 << pass) == 0 {
+            continue;
+        }
         let mut counts = [0_usize; 256];
         for event in events.iter() {
             counts[usize::from(remote_order_byte(*event, pass))] += 1;
@@ -469,6 +502,37 @@ fn radix_sort_remote_events(events: &mut Vec<Event>) {
         }
         std::mem::swap(events, &mut scratch);
     }
+}
+
+fn remote_event_varying_bytes(events: &[Event]) -> u64 {
+    let first = events[0];
+    let mut target = 0_u64;
+    let mut time = 0_u64;
+    let mut phase = 0_u16;
+    let mut origin_node = 0_u64;
+    let mut origin_seq = 0_u64;
+    for event in &events[1..] {
+        target |= first.target.0 ^ event.target.0;
+        time |= first.key.time_ns ^ event.key.time_ns;
+        phase |= first.key.phase ^ event.key.phase;
+        origin_node |= first.key.origin_node.0 ^ event.key.origin_node.0;
+        origin_seq |= first.key.origin_seq ^ event.key.origin_seq;
+    }
+    varying_byte_mask(origin_seq, 0)
+        | varying_byte_mask(origin_node, 8)
+        | varying_byte_mask(u64::from(phase), 16)
+        | varying_byte_mask(time, 18)
+        | varying_byte_mask(target, 26)
+}
+
+fn varying_byte_mask(value: u64, first_pass: usize) -> u64 {
+    let mut mask = 0_u64;
+    for byte in 0..8 {
+        if value & (0xff_u64 << (byte * 8)) != 0 {
+            mask |= 1_u64 << (first_pass + byte);
+        }
+    }
+    mask
 }
 
 const fn remote_order_byte(event: Event, pass: usize) -> u8 {
