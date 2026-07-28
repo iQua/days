@@ -57,7 +57,7 @@ pub enum RoutingConfig {
     ECMP,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Routing {
     ShortestPath(ShortestPath),
     PathFromConfig(PathFromConfig),

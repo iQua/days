@@ -65,6 +65,25 @@ impl Model for ScriptedPacketSource {
     }
 }
 
+struct OneShotLoopback {
+    output: Output<Packet>,
+}
+
+impl OneShotLoopback {
+    async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
+        if packet.packet_id == 0 {
+            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            self.output
+                .send(Packet::new(1, 1, packet.flow_id, now))
+                .await;
+        }
+    }
+}
+
+impl Model for OneShotLoopback {
+    type Env = ();
+}
+
 fn packets_with_intervening_arrival() -> Vec<Packet> {
     vec![
         Packet::new(1, 0, 0, 0.01),
@@ -144,6 +163,56 @@ fn fifo_rounding_does_not_delay_future_service_starts() {
     assert_eq!(
         observed, expected,
         "the backlog must depart by 100 ns so the 101 ns arrival is admitted"
+    );
+}
+
+#[test]
+fn fifo_idle_port_starts_service_when_busy_until_is_one_ulp_ahead() {
+    let rate = f64::from_bits(800.0_f64.to_bits() - 1);
+    let first_size = 149_935;
+    let busy_until = first_size as f64 * 8.0 / rate;
+    let event_time = Duration::from_secs_f64(busy_until).as_nanos() as f64 / 1_000_000_000.0;
+    assert_eq!(busy_until - event_time, f64::EPSILON * 1024.0);
+
+    let mut source = ScriptedPacketSource::new(vec![Packet::new(first_size, 0, 0, 0.0)]);
+    let mut scheduler = Port::new(rate, 2, CapacityUnit::Packets, DropStrategy::TailDrop, 0.0);
+    let mut loopback = OneShotLoopback {
+        output: Output::default(),
+    };
+    let source_mbox = Mailbox::new();
+    let scheduler_mbox = Mailbox::new();
+    let loopback_mbox = Mailbox::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
+
+    source
+        .output
+        .connect(Port::packet_received, &scheduler_mbox);
+    scheduler
+        .output
+        .connect(OneShotLoopback::packet_received, &loopback_mbox);
+    scheduler.output.connect_sink(writer);
+    loopback
+        .output
+        .connect(Port::packet_received, &scheduler_mbox);
+
+    let t0 = MonotonicTime::EPOCH;
+    let mut sim = SimInit::with_num_threads(1)
+        .add_model(source, source_mbox, "Source")
+        .add_model(scheduler, scheduler_mbox, "FIFO")
+        .add_model(loopback, loopback_mbox, "Loopback")
+        .init(t0)
+        .unwrap();
+
+    sim.step_until(t0 + Duration::from_secs(1_501)).unwrap();
+
+    let mut observed = Vec::new();
+    while let Some(packet) = reader.try_read() {
+        observed.push(packet.packet_id);
+    }
+    assert_eq!(
+        observed,
+        vec![0, 1],
+        "an idle port must not strand a queued packet when busy_until is one ULP ahead"
     );
 }
 

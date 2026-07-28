@@ -85,7 +85,7 @@ pub struct FlowParams {
 }
 
 /// Represents a network flow with its configurations and characteristics.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Flow {
     /// Unique identifier for the flow.
     pub id: usize,

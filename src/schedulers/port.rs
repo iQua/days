@@ -150,6 +150,10 @@ impl Port {
         self.scheduler_id
     }
 
+    pub(crate) fn rate_bps(&self) -> f64 {
+        self.rate
+    }
+
     pub fn set_queue_state(&mut self, state: std::sync::Arc<QueueState>) {
         self.queue_state = Some(state);
     }
@@ -314,8 +318,8 @@ impl Port {
         let packet_time = packet.time;
         self.queue.push_back(packet);
 
-        if packet_time >= self.busy_until && self.in_flight == 0 {
-            self.run(packet_time, cx).await;
+        if self.in_flight == 0 {
+            self.run(packet_time.max(self.busy_until), cx).await;
         }
     }
 

@@ -7,7 +7,8 @@ use days::flows::flow::Flow;
 use days::scenario::compile_config;
 use days::topos::build::build_graph;
 use days::topos::topo::{
-    InstalledHostStage, installed_forwarding_state, installed_host_attachment_state,
+    InstalledHostStage, InstalledHostStageDirection, installed_forwarding_state,
+    installed_host_attachment_state,
 };
 use days_executor::{
     ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId, NodeId,
@@ -211,7 +212,12 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
             "multi-flow fixtures must exercise a shared host injection FIFO"
         );
     }
-    let checked_stage = |stage: InstalledHostStage| {
+    let checked_stage = |stage: InstalledHostStage,
+                         expected_direction: InstalledHostStageDirection| {
+        assert_eq!(
+            stage.direction, expected_direction,
+            "installed legacy stage must retain its instantiated direction"
+        );
         assert!(
             stage.rate_bps.is_finite()
                 && stage.rate_bps > 0.0
@@ -226,14 +232,16 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
         )
     };
     let (physical_rate, physical_propagation, physical_capacity) =
-        checked_stage(attachments.physical);
+        checked_stage(attachments.physical, InstalledHostStageDirection::Physical);
     let legacy_stages = |physical: Vec<(usize, usize)>,
                          source: usize,
                          target: usize,
                          injection: InstalledHostStage,
                          delivery: InstalledHostStage| {
-        let (injection_rate, injection_propagation, injection_capacity) = checked_stage(injection);
-        let (delivery_rate, delivery_propagation, delivery_capacity) = checked_stage(delivery);
+        let (injection_rate, injection_propagation, injection_capacity) =
+            checked_stage(injection, InstalledHostStageDirection::Injection);
+        let (delivery_rate, delivery_propagation, delivery_capacity) =
+            checked_stage(delivery, InstalledHostStageDirection::Delivery);
         std::iter::once(FlowStage::HostInjection {
             host: source,
             rate_bps: injection_rate,
