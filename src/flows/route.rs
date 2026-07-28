@@ -7,12 +7,13 @@
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::hash::{Hash, Hasher};
 
 use petgraph::algo;
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
 #[derive(Copy, Clone, Debug)]
@@ -285,28 +286,97 @@ impl ShortestPath {
         None
     }
 
-    pub fn compute_route_in(
+    fn try_compute_route_in_canonical_graph(
         graph: &UnGraph<usize, ()>,
         start: NodeIndex,
         end: NodeIndex,
-    ) -> Vec<NodeIndex> {
+    ) -> Option<Vec<NodeIndex>> {
         if let Some(path) = Self::compute_fat_tree_route_in(graph, start, end) {
-            return path;
+            return Some(path);
         }
 
-        let path = astar(
+        astar(
             graph,
             start,
             |n| n == end,
             |_| 1, // Uniform cost
             |_| 0, // Heuristic ignored for uniform cost
-        );
-
-        match path {
-            Some((_, path)) => path,
-            None => panic!("No path can be found."),
-        }
+        )
+        .map(|(_, path)| path)
     }
+
+    pub fn try_compute_route_in(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Option<Vec<NodeIndex>> {
+        let graph = canonical_routing_graph(graph);
+        Self::try_compute_route_in_canonical_graph(&graph, start, end)
+    }
+
+    pub fn compute_route_in(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+    ) -> Vec<NodeIndex> {
+        Self::try_compute_route_in(graph, start, end).expect("No path can be found.")
+    }
+}
+
+fn canonical_routing_graph(graph: &UnGraph<usize, ()>) -> UnGraph<usize, ()> {
+    let mut canonical = UnGraph::with_capacity(graph.node_count(), graph.edge_count());
+    for node in graph.node_indices() {
+        let canonical_node = canonical.add_node(graph[node]);
+        debug_assert_eq!(canonical_node, node);
+    }
+
+    let mut edges = graph
+        .edge_references()
+        .map(|edge| {
+            let left = edge.source().index();
+            let right = edge.target().index();
+            (left.min(right), left.max(right))
+        })
+        .collect::<Vec<_>>();
+    edges.sort_unstable();
+    for (left, right) in edges {
+        canonical.add_edge(NodeIndex::new(left), NodeIndex::new(right), ());
+    }
+    canonical
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteTableError<K> {
+    DuplicateKey(K),
+    Unreachable(K),
+}
+
+/// Selects one deterministic physical switch path per flow.
+///
+/// Legacy Days consumes this table when installing forwarding entries, and exact lowering consumes
+/// the same table when materializing `FlowDescriptor` routes. Keeping selection here prevents the
+/// two engines from acquiring independent equal-cost-path policies.
+pub fn compute_shortest_path_route_table<K>(
+    graph: &UnGraph<usize, ()>,
+    flows: impl IntoIterator<Item = (K, NodeIndex, NodeIndex)>,
+) -> Result<BTreeMap<K, Vec<NodeIndex>>, RouteTableError<K>>
+where
+    K: Ord,
+{
+    let graph = canonical_routing_graph(graph);
+    let mut routes = BTreeMap::new();
+    for (key, source, target) in flows {
+        if routes.contains_key(&key) {
+            return Err(RouteTableError::DuplicateKey(key));
+        }
+        let Some(route) =
+            ShortestPath::try_compute_route_in_canonical_graph(&graph, source, target)
+        else {
+            return Err(RouteTableError::Unreachable(key));
+        };
+        routes.insert(key, route);
+    }
+    Ok(routes)
 }
 
 impl RoutingProtocol for ShortestPath {
@@ -607,14 +677,8 @@ mod tests {
 
     #[test]
     fn test_shortest_path_custom_five_node_graph_falls_back_from_fat_tree_fast_path() {
-        let graph = UnGraph::<usize, ()>::from_edges([
-            (0_u32, 2_u32),
-            (0, 3),
-            (1, 2),
-            (1, 3),
-            (0, 4),
-            (3, 4),
-        ]);
+        let edges = [(0_u32, 2_u32), (0, 3), (1, 2), (1, 3), (0, 4), (3, 4)];
+        let graph = UnGraph::<usize, ()>::from_edges(edges);
 
         let path = ShortestPath::compute_route_in(&graph, NodeIndex::new(0), NodeIndex::new(1));
 
@@ -625,5 +689,22 @@ mod tests {
         for window in path.windows(2) {
             assert!(graph.contains_edge(window[0], window[1]));
         }
+
+        let reordered_graph = UnGraph::<usize, ()>::from_edges(edges.into_iter().rev());
+        let reordered_path =
+            ShortestPath::compute_route_in(&reordered_graph, NodeIndex::new(0), NodeIndex::new(1));
+        assert_eq!(
+            reordered_path, path,
+            "equivalent edge collections must select the same shortest path"
+        );
+
+        let duplicate = compute_shortest_path_route_table(
+            &graph,
+            [
+                (7, NodeIndex::new(0), NodeIndex::new(1)),
+                (7, NodeIndex::new(1), NodeIndex::new(0)),
+            ],
+        );
+        assert_eq!(duplicate, Err(RouteTableError::DuplicateKey(7)));
     }
 }

@@ -14,13 +14,14 @@ use std::time::Duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, error, info};
-use petgraph::graph::UnGraph;
+use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 
 use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::packet::Packet;
+use crate::flows::route::{RouteTableError, Routing, compute_shortest_path_route_table};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::flows::{FlowSize, TrafficCharacteristics};
@@ -1346,9 +1347,33 @@ impl Topology {
         );
         let pg = multi.add(progress_bar);
         let mut flow_count = 0;
+        let shortest_paths = compute_shortest_path_route_table(
+            &self.graph,
+            self.flows.iter().filter_map(|flow| {
+                matches!(flow.routing, Routing::ShortestPath(_)).then_some((
+                    flow.id,
+                    NodeIndex::new(flow.source_host),
+                    NodeIndex::new(flow.sink_host),
+                ))
+            }),
+        )
+        .unwrap_or_else(|error| match error {
+            RouteTableError::Unreachable(_) => panic!("No path can be found."),
+            RouteTableError::DuplicateKey(_) => {
+                panic!("Duplicate flow ID in shortest-path route table.")
+            }
+        });
 
         for flow in self.flows.iter() {
-            let path = flow.compute_path(&self.graph);
+            let path = match &flow.routing {
+                Routing::ShortestPath(_) => {
+                    let mut path = vec![NodeIndex::new(flow.source_id)];
+                    path.extend_from_slice(&shortest_paths[&flow.id]);
+                    path.push(NodeIndex::new(flow.sink_id));
+                    path
+                }
+                Routing::PathFromConfig(_) | Routing::ECMP(_) => flow.compute_path(&self.graph),
+            };
 
             for window in path.windows(2) {
                 let node_id = window.first().unwrap().index();

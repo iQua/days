@@ -28,6 +28,20 @@ The first complete vertical slice supports:
 This deliberately closed model gives the scalar, multicore CPU, Metal, and CUDA
 backends one common execution contract.
 
+## Migration comparison policy
+
+The P05 gate's recorded k16 and k32 terminal-observation rows compared
+differently routed networks: exact lowering used canonical BFS while legacy
+Nexosim used `ShortestPath::compute_route_in`. Those rows are historical
+workload and performance evidence, not equivalence results.
+
+Before any legacy-versus-Days observation comparison, assert that every flow
+traverses the same ordered physical links and that both engines model the same
+endpoint stages. Only residuals measured after those structural preconditions
+hold may be assessed as legacy `f64` behavior outside the exact common domain.
+Rate-limited endpoint attachment semantics remain a separate pending migration
+decision; route unification does not change them.
+
 ## Project non-goals
 
 The following capabilities are outside this project. They may be reasonable

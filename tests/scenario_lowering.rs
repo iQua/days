@@ -2,13 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
+use days::flows::flow::Flow;
+use days::flows::route::compute_shortest_path_route_table;
 use days::scenario::compile_config;
+use days::topos::build::build_graph;
 use days_executor::{
     ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId, NodeId,
     NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PayloadId,
     SimulationImage, run_cpu, run_scalar, run_scalar_rounds, run_scalar_with_observations,
     validate,
 };
+use petgraph::graph::NodeIndex;
 use tempfile::TempDir;
 
 fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
@@ -43,6 +47,88 @@ fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
         }
     }
     delays
+}
+
+fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
+    let (graph, hosts) = build_graph(config_path).expect("legacy topology should build");
+    let legacy_flows = Flow::flows_from_config(config_path, &hosts);
+    let legacy_route_table = compute_shortest_path_route_table(
+        &graph,
+        legacy_flows.iter().enumerate().map(|(index, flow)| {
+            (
+                index,
+                NodeIndex::new(flow.source_host),
+                NodeIndex::new(flow.sink_host),
+            )
+        }),
+    )
+    .expect("legacy routes should have unique flow keys and reachable endpoints");
+    let nodes = image
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let links = image
+        .links
+        .iter()
+        .map(|link| (link.id, link))
+        .collect::<BTreeMap<_, _>>();
+
+    let physical_links = |route: &[LinkId]| {
+        route
+            .iter()
+            .filter_map(|link_id| {
+                let link = links[link_id];
+                let source = nodes[&link.source];
+                let target = nodes[&link.target];
+                (source.kind == NodeKind::Switch && target.kind == NodeKind::Switch)
+                    .then_some((source.state_slot as usize, target.state_slot as usize))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut legacy_routes = BTreeMap::new();
+    for (index, flow) in legacy_flows.into_iter().enumerate() {
+        let forward = legacy_route_table[&index]
+            .windows(2)
+            .map(|pair| (pair[0].index(), pair[1].index()))
+            .collect::<Vec<_>>();
+        let reverse = forward
+            .iter()
+            .rev()
+            .map(|&(left, right)| (right, left))
+            .collect::<Vec<_>>();
+        *legacy_routes
+            .entry((flow.source_host, flow.sink_host, forward, reverse))
+            .or_insert(0_usize) += 1;
+    }
+
+    let mut image_routes = BTreeMap::new();
+    for flow in &image.flows {
+        let first = links[flow
+            .route
+            .first()
+            .expect("lowered flow should have a source attachment")];
+        let last = links[flow
+            .route
+            .last()
+            .expect("lowered flow should have a sink attachment")];
+        let source = nodes[&first.target].state_slot as usize;
+        let target = nodes[&last.source].state_slot as usize;
+        *image_routes
+            .entry((
+                source,
+                target,
+                physical_links(&flow.route),
+                physical_links(&flow.reverse_route),
+            ))
+            .or_insert(0_usize) += 1;
+    }
+
+    assert_eq!(
+        image_routes, legacy_routes,
+        "lowered flows must use the same endpoints and ordered physical links as legacy Days for {config_path}"
+    );
 }
 
 #[test]
@@ -638,6 +724,27 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     let first = compile_config(&path).expect("the smallest P01 fixture should lower");
     let second = compile_config(&path).expect("a second in-process lowering should also succeed");
 
+    assert_legacy_physical_routes(
+        path.to_str().expect("fixture path should be valid UTF-8"),
+        &first,
+    );
+    for fixture in [
+        "fattree_k8_f64_st.toml",
+        "fattree_k16_f512_st.toml",
+        "fattree_k32_f4096_st.toml",
+    ] {
+        let comparison_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("configs/benchmarks/baseline")
+            .join(fixture);
+        let comparison_image =
+            compile_config(&comparison_path).expect("comparison fixture should lower");
+        assert_legacy_physical_routes(
+            comparison_path
+                .to_str()
+                .expect("fixture path should be valid UTF-8"),
+            &comparison_image,
+        );
+    }
     assert_eq!(first, second);
     assert_eq!(first.host_states.len(), 8);
     assert_eq!(first.switch_states.len(), 20);

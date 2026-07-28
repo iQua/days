@@ -9,6 +9,7 @@ use days_executor::{
     PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
     SwitchQueueState, SwitchState, event_phase, validate,
 };
+use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
 use rand::prelude::IndexedRandom;
@@ -18,6 +19,7 @@ use thiserror::Error;
 
 use super::ids::{IdError, LinkKey, NodeKey, StableIds, dense_ids};
 use crate::flows::DistributionInfo;
+use crate::flows::route::{RouteTableError, compute_shortest_path_route_table};
 use crate::topos::build::{TopologyError, build_graph};
 
 /// Failure while lowering supported Days source configuration.
@@ -560,66 +562,32 @@ fn seconds_to_ns(seconds: f64, label: &str) -> Result<u64, CompileError> {
     Ok(nanoseconds as u64)
 }
 
-fn canonical_adjacency(edges: &BTreeSet<(u64, u64)>) -> BTreeMap<u64, BTreeSet<u64>> {
-    let mut adjacency = BTreeMap::<u64, BTreeSet<u64>>::new();
-    for &(left, right) in edges {
-        adjacency.entry(left).or_default().insert(right);
-        adjacency.entry(right).or_default().insert(left);
-    }
-    adjacency
-}
-
-fn canonical_route(
+fn image_route(
     source: u64,
     target: u64,
-    adjacency: &BTreeMap<u64, BTreeSet<u64>>,
+    switch_path: &[NodeIndex],
     ids: &StableIds,
-) -> Result<Vec<LinkId>, CompileError> {
-    let mut parents = BTreeMap::from([(source, source)]);
-    let mut frontier = VecDeque::from([source]);
-
-    while let Some(node) = frontier.pop_front() {
-        if node == target {
-            break;
-        }
-        for &neighbor in adjacency.get(&node).into_iter().flatten() {
-            if let std::collections::btree_map::Entry::Vacant(entry) = parents.entry(neighbor) {
-                entry.insert(node);
-                frontier.push_back(neighbor);
-            }
-        }
-    }
-
-    if !parents.contains_key(&target) {
-        return Err(CompileError::Unsupported(format!(
-            "unsupported unreachable flow {source} -> {target}; no static topology route exists"
-        )));
-    }
-
-    let mut switch_path = vec![target];
-    let mut current = target;
-    while current != source {
-        current = parents[&current];
-        switch_path.push(current);
-    }
-    switch_path.reverse();
-
+) -> Vec<LinkId> {
     let mut route = Vec::with_capacity(switch_path.len() + 1);
     route.push(ids.link(LinkKey {
         source: NodeKey::Host(source),
         target: NodeKey::Switch(source),
     }));
     for pair in switch_path.windows(2) {
+        let source = u64::try_from(pair[0].index())
+            .expect("topology node identities were checked before route selection");
+        let target = u64::try_from(pair[1].index())
+            .expect("topology node identities were checked before route selection");
         route.push(ids.link(LinkKey {
-            source: NodeKey::Switch(pair[0]),
-            target: NodeKey::Switch(pair[1]),
+            source: NodeKey::Switch(source),
+            target: NodeKey::Switch(target),
         }));
     }
     route.push(ids.link(LinkKey {
         source: NodeKey::Switch(target),
         target: NodeKey::Host(target),
     }));
-    Ok(route)
+    route
 }
 
 fn lower(
@@ -706,19 +674,43 @@ fn lower(
         model.seed,
     )?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
-    let adjacency = canonical_adjacency(&undirected_edges);
+    let route_table = compute_shortest_path_route_table(
+        graph,
+        flows.iter().enumerate().map(|(index, flow)| {
+            (
+                index,
+                NodeIndex::new(flow.source as usize),
+                NodeIndex::new(flow.target as usize),
+            )
+        }),
+    )
+    .map_err(|error| match error {
+        RouteTableError::Unreachable(index) => {
+            let flow = &flows[index];
+            CompileError::Unsupported(format!(
+                "unsupported unreachable flow {} -> {}; no static topology route exists",
+                flow.source, flow.target
+            ))
+        }
+        RouteTableError::DuplicateKey(_) => {
+            CompileError::Invalid("duplicate internal flow route key".to_string())
+        }
+    })?;
     let flow_descriptors = flows
         .iter()
-        .map(|flow| {
-            Ok(FlowDescriptor {
+        .enumerate()
+        .map(|(index, flow)| {
+            let switch_path = &route_table[&index];
+            let reverse_switch_path = switch_path.iter().rev().copied().collect::<Vec<_>>();
+            FlowDescriptor {
                 id: FlowId(flow_ids[&flow.key]),
                 source: ids.node(NodeKey::Host(flow.source)),
                 target: ids.node(NodeKey::Host(flow.target)),
-                route: canonical_route(flow.source, flow.target, &adjacency, &ids)?,
-                reverse_route: canonical_route(flow.target, flow.source, &adjacency, &ids)?,
-            })
+                route: image_route(flow.source, flow.target, switch_path, &ids),
+                reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
+            }
         })
-        .collect::<Result<Vec<_>, CompileError>>()?;
+        .collect::<Vec<_>>();
     validate_input_bounds(&flows)?;
 
     let host_slots = dense_ids(host_topology_ids.iter().copied().map(NodeKey::Host))?;
