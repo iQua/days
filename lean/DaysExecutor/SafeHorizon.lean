@@ -168,7 +168,7 @@ def BoundFamilyWithinStop
 
 /--
 CPU exchange payload mirroring `executor/src/cpu.rs:694-698`, with the source LP retained as a
-proof-relevant owner for transferring its counted outbox reference. Descriptor equality with the
+proof-relevant part of its exact outbox owner. Descriptor equality with the
 oracle prevents event-only exchange from hiding missing or corrupt packet data.
 -/
 structure RemoteEnvelope where
@@ -183,10 +183,15 @@ def RemoteEnvelope.Coherent
     (envelope : RemoteEnvelope) : Prop :=
   envelope.packet = image.packetDescriptor envelope.event.payload
 
+/-- Exact hold owned by one buffered remote envelope. -/
+def ownedEnvelopeReference
+    (envelope : RemoteEnvelope) : OwnedPacketReference :=
+  { descriptor := envelope.packet
+    owner := .envelope envelope.source envelope.event.key }
+
 /--
-Descriptor-carrying envelopes built in child-emission order from positive counted entries at the
-source LP. Rust builds them after dispatch at `executor/src/cpu.rs:627-667`; the source field is a
-Lean ownership ghost used to model the later target install at lines 4485-4500.
+Descriptor-carrying envelopes built in child-emission order from their exact source-owned holds.
+Rust builds and moves this `{event,packet}` pair at `executor/src/cpu.rs:649-698,4453-4500`.
 -/
 def RemoteEnvelopesFromStore
     (image : SimulationImage State)
@@ -197,8 +202,7 @@ def RemoteEnvelopesFromStore
   | event :: events, envelope :: envelopes =>
       envelope.source = source ∧
         envelope.event = event ∧
-        (∃ entry ∈ store,
-          entry.descriptor = envelope.packet ∧ 0 < entry.references) ∧
+        0 < ownedReferenceCount (ownedEnvelopeReference envelope) store ∧
         envelope.packet.id = event.payload ∧
         RemoteEnvelope.Coherent image envelope ∧
         RemoteEnvelopesFromStore image source store events envelopes
@@ -213,18 +217,16 @@ structure RoundState (State : StateFamily) where
   outboxes : NodeId → List RemoteEnvelope
 
 /--
-Every pending event and buffered envelope is backed by a distinct positive reference at its current
-LP. This is the round-local lifetime invariant combining CPU future ownership and outboxes at
-`executor/src/cpu.rs:563-569,627-667` with checked zero removal at
-`executor/src/scalar.rs:1661-1698`.
+Every pending event, queue residency, in-service slot, and buffered envelope is backed by its exact
+owner at the current LP.
 -/
 def RoundReferencesHeld
     (image : SimulationImage State)
     (state : RoundState State) : Prop :=
   ∀ node ∈ image.nodes,
-    PacketReferencesHeld
-      (((state.machine.pending.filter fun event => event.target = node.id).map Event.payload) ++
-        (state.outboxes node.id).map fun envelope => envelope.event.payload)
+    OwnedReferencesMatchStore
+      (machineOwnedReferencesFor image state.machine node ++
+        (state.outboxes node.id).map ownedEnvelopeReference)
       (state.machine.packetStore node)
 
 /--
@@ -288,9 +290,9 @@ def LocalRoundStep
           (image.nodes.flatMap fun owner => before.outboxes owner.id).map
             RemoteEnvelope.event) ∧
       AllocatesChildrenInOrder node result.children before.machine after.machine ∧
-      AppliesTransitionResult image node result before.machine after.machine ∧
+      AppliesTransitionResult image node event result before.machine after.machine ∧
       DescriptorStoreCoherent image (after.machine.packetStore node) ∧
-      ChildDescriptorsAvailable image
+      ChildDescriptorsAvailable image node.id
         (after.machine.packetStore node) result.children ∧
       after.machine.pending =
         insertEvents
@@ -386,8 +388,8 @@ def flattenedOutboxes
   image.nodes.flatMap fun node => state.outboxes node.id
 
 /--
-Acquire all canonically ordered incoming envelope references for one target LP, corresponding to
-target installation at `executor/src/cpu.rs:4485-4500`.
+Transfer target-side ownership to the exact pending event inserted with each envelope at
+`executor/src/cpu.rs:4485-4500`.
 -/
 def installRemoteEnvelopesFor
     (target : NodeId)
@@ -396,15 +398,17 @@ def installRemoteEnvelopesFor
   ordered.foldl
     (fun current envelope =>
       if envelope.event.target = target then
-        incrementDescriptorReference envelope.packet current
+        acquireOwnedReference
+          { descriptor := envelope.packet
+            owner := .pendingEvent envelope.event.key }
+          current
       else
         current)
     store
 
 /--
-Consume all canonically ordered outgoing envelope references for one source LP before their target
-acquisitions. Under-consumption is excluded by `CompleteCanonicalExchange`, paralleling checked
-decrement at `executor/src/scalar.rs:1661-1683`.
+Release all exact outgoing envelope owners for one source LP before their target pending-event
+owners are installed. Rust performs this as a move of the envelope value.
 -/
 def consumeRemoteEnvelopesFor
     (source : NodeId)
@@ -413,16 +417,30 @@ def consumeRemoteEnvelopesFor
   ordered.foldl
     (fun current envelope =>
       if envelope.source = source then
-        consumeDescriptorReference envelope.event.payload current
+        releaseOwnedReference (ownedEnvelopeReference envelope) current
       else
         current)
     store
 
 /--
-Complete exactly-once canonical exchange: all buffered remote reference counts move from source
-outboxes to targets before future-event insertion, and every outbox is emptied. This models envelope
-creation and target installation at `executor/src/cpu.rs:649-667,4453-4506`; multiplicity-aware
-heldness excludes under-consumption and descriptor resurrection.
+For one exchanged envelope, the source-owned hold is released and the exact target pending-event
+hold is acquired. This is the owned store operation performed by Rust's move-and-install sequence
+at `executor/src/cpu.rs:4453-4500`.
+-/
+theorem singleRemoteEnvelopeTransfersOwnership
+    (envelope : RemoteEnvelope)
+    (store : List PacketStoreEntry) :
+    installRemoteEnvelopesFor envelope.event.target [envelope]
+        (consumeRemoteEnvelopesFor envelope.source [envelope] store) =
+      acquireOwnedReference
+        { descriptor := envelope.packet
+          owner := .pendingEvent envelope.event.key }
+        (releaseOwnedReference (ownedEnvelopeReference envelope) store) := by
+  simp [installRemoteEnvelopesFor, consumeRemoteEnvelopesFor]
+
+/--
+Complete exactly-once canonical exchange: every envelope-owned hold moves to the matching target
+pending-event owner before future insertion, and every outbox is emptied.
 -/
 def CompleteCanonicalExchange
     (image : SimulationImage State)
@@ -434,7 +452,7 @@ def CompleteCanonicalExchange
     (∀ node ∈ image.nodes,
       PacketReferencesHeld
         ((ordered.filter fun envelope => envelope.source = node.id).map
-          fun envelope => envelope.event.payload)
+          ownedEnvelopeReference)
         (drained.machine.packetStore node)) ∧
     (∀ node ∈ image.nodes,
       next.machine.localState node = drained.machine.localState node ∧

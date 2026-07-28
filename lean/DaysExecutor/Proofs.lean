@@ -88,7 +88,7 @@ theorem minimumLPFrontier_le_of_pending
       frontier ≤ event.key.timeNs := by
   obtain ⟨minimum, hminimum, hminimumLe⟩ :=
     leastPendingTimeFor_le_of_mem hmem
-  obtain ⟨node, hnode, htarget, _, _⟩ :=
+  obtain ⟨node, hnode, htarget, _⟩ :=
     (hwellFormed.2.2.2.1 event hmem).2
   rw [htarget] at hminimum
   obtain ⟨frontier, hfrontier, hfrontierLe⟩ :=

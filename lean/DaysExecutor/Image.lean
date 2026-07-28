@@ -33,17 +33,43 @@ structure PacketDescriptor where
   deriving DecidableEq, Repr
 
 /--
-One resident descriptor together with its positive live-reference count. Rust stores the immutable
-descriptor beside `ResidentPacket.transmitters` at `executor/src/scalar.rs:375-381`, increments the
-count at transmission start (lines 1645-1658), checked-decrements it at completion (1661-1683), and
-drops terminal zero-count entries (1687-1698). The Lean count also abstracts the CPU pin/event
-ownership that preserves descriptors across dispatch and exchange at
-`executor/src/cpu.rs:563-569,627-667,4485-4500`.
+The structural holder of one descriptor reference. Rust's pending futures are keyed by
+`EventKey` (`executor/src/cpu.rs:563-569,619-625`), queue and in-service residency are explicit
+state slots (`executor/src/image.rs:25-54`) transferred by the host/switch paths at
+`executor/src/scalar.rs:869-956,999-1015,1105-1218`, and a remote child is owned by its exact
+envelope until exchange
+(`executor/src/cpu.rs:649-698,4453-4500`).
+
+Only the in-service case corresponds literally to `ResidentPacket.transmitters`; the other tags
+make Rust's container ownership proof-relevant without pretending those containers share one
+anonymous counter.
+-/
+inductive ReferenceOwner where
+  | pendingEvent (key : EventKey)
+  | queueEntry (node : NodeId) (payload : PayloadId)
+  | inService (node : NodeId) (payload : PayloadId)
+  | envelope (source : NodeId) (key : EventKey)
+  deriving DecidableEq, Repr, Ord
+
+/-- One immutable descriptor reference paired with its exact structural holder. -/
+structure OwnedPacketReference where
+  descriptor : PacketDescriptor
+  owner : ReferenceOwner
+  deriving DecidableEq, Repr
+
+/--
+One resident descriptor together with the multiset of its live owners. The derived owner-list
+length has the same aggregate meaning as the former reference count, while exact owner membership
+prevents a transition from consuming another event's hold.
 -/
 structure PacketStoreEntry where
   descriptor : PacketDescriptor
-  references : Nat
+  owners : List ReferenceOwner
   deriving DecidableEq, Repr
+
+/-- Aggregate compatibility projection of an owned resident entry. -/
+def PacketStoreEntry.references (entry : PacketStoreEntry) : Nat :=
+  entry.owners.length
 
 /--
 Kind-indexed mutable-state family formalizing Rust's separate host and switch arenas at
@@ -152,10 +178,9 @@ structure SimulationImage (State : StateFamily) where
   -/
   packetDescriptor : PayloadId → PacketDescriptor
   /--
-  Per-LP initial descriptor ownership and positive live-reference counts derived by the CPU
-  constructor from initial events and mutable queue/service state at
-  `executor/src/cpu.rs:3039-3197`, abstracting the checked count discipline at
-  `executor/src/scalar.rs:1645-1698`; this is semantic prepared-image data, not an added Rust field.
+  Per-LP initial descriptor owners derived from futures, queues, and in-service state by the CPU
+  constructor at `executor/src/cpu.rs:3053-3166`; this is semantic prepared-image data, not an
+  added Rust field.
   -/
   initialPacketStore : NodeId → List PacketStoreEntry
   /-- Initial per-origin allocation cursor derived from role state during image preparation. -/
@@ -276,7 +301,7 @@ def DescriptorOracleWellFormed (image : SimulationImage State) : Prop :=
       (image.packetDescriptor payload).sizeBytes = image.payloadBytes payload
 
 /--
-A counted descriptor store is in the strict payload-key order exposed by Rust's
+An owned descriptor store is in the strict payload-key order exposed by Rust's
 `BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367`. Consequently its list
 projection is independent of descriptor insertion order.
 -/
@@ -284,9 +309,7 @@ def DescriptorStoreSorted (store : List PacketStoreEntry) : Prop :=
   store.Pairwise fun left right => left.descriptor.id < right.descriptor.id
 
 /--
-Look up one payload's live-reference count in the payload-sorted resident projection. This combines
-Rust transmitter counts at `executor/src/scalar.rs:375-381` with CPU event/pin ownership at
-`executor/src/cpu.rs:563-569,627-667`.
+Derive one payload's aggregate live-reference count from its exact owner multiset.
 -/
 def descriptorReferenceCount (payload : PayloadId) : List PacketStoreEntry → Nat
   | [] => 0
@@ -296,11 +319,87 @@ def descriptorReferenceCount (payload : PayloadId) : List PacketStoreEntry → N
       else
         descriptorReferenceCount payload tail
 
+/-- Number of occurrences of one exact owner in the payload-indexed resident store. -/
+def ownedReferenceCount
+    (reference : OwnedPacketReference) : List PacketStoreEntry → Nat
+  | [] => 0
+  | entry :: tail =>
+      if entry.descriptor.id = reference.descriptor.id then
+        entry.owners.count reference.owner
+      else
+        ownedReferenceCount reference tail
+
+/-- The future-list hold owned by one exact pending event key. -/
+def ownedEventReference
+    (image : SimulationImage State)
+    (event : Event) : OwnedPacketReference :=
+  { descriptor := image.packetDescriptor event.payload
+    owner := .pendingEvent event.key }
+
+/-- The hold owned by one queue residency at an LP. -/
+def ownedQueueReference
+    (image : SimulationImage State)
+    (node : NodeId)
+    (payload : PayloadId) : OwnedPacketReference :=
+  { descriptor := image.packetDescriptor payload
+    owner := .queueEntry node payload }
+
+/-- The hold owned by one committed in-service slot at an LP. -/
+def ownedInServiceReference
+    (image : SimulationImage State)
+    (node : NodeId)
+    (payload : PayloadId) : OwnedPacketReference :=
+  { descriptor := image.packetDescriptor payload
+    owner := .inService node payload }
+
 /--
-Prepared initial descriptor stores are strictly payload-sorted, contain positive counts and unique
-oracle values, and give every initial event a live target-LP reference. This combines transmitter
-counts at `executor/src/scalar.rs:375-381,1645-1683` with CPU ownership derivation and pinned-event
-preservation at `executor/src/cpu.rs:3039-3197,627-635`.
+Owned queue and in-service holds derived from the public mutable-state projection. Rust validation
+rejects duplicate mutable payload residency at `executor/src/validate.rs:1475-1573`, so the
+`(node,payload)` tags identify the corresponding queue entry or service slot.
+-/
+def ownedRoleStateReferences
+    (image : SimulationImage State)
+    (node : NodeDescriptor)
+    (state : RoleState State node.kind) : List OwnedPacketReference :=
+  state.serviceQueue.map (ownedQueueReference image node.id) ++
+    state.committedService.map (ownedInServiceReference image node.id)
+
+/-- Initial pending and mutable-state owners assigned to one LP. -/
+def initialOwnedReferencesFor
+    (image : SimulationImage State)
+    (node : NodeDescriptor)
+    (state : RoleState State node.kind) : List OwnedPacketReference :=
+  ((image.initialEvents.filter fun event => event.target = node.id).map
+      (ownedEventReference image)) ++
+    ownedRoleStateReferences image node state
+
+/--
+Exact correspondence between live structural holders and an owned resident store. The first
+direction rules out missing holds; the second rules out ghost owners that have no pending event,
+queue residency, in-service slot, or envelope.
+-/
+def OwnedReferencesMatchStore
+    (references : List OwnedPacketReference)
+    (store : List PacketStoreEntry) : Prop :=
+  (∀ reference ∈ references,
+    references.count reference = ownedReferenceCount reference store) ∧
+    ∀ entry ∈ store, ∀ owner ∈ entry.owners,
+      references.count { descriptor := entry.descriptor, owner } =
+        entry.owners.count owner
+
+/-- Exact finite owner/store correspondence is executable. -/
+instance
+    (references : List OwnedPacketReference)
+    (store : List PacketStoreEntry) :
+    Decidable (OwnedReferencesMatchStore references store) := by
+  unfold OwnedReferencesMatchStore
+  infer_instance
+
+/--
+Prepared initial descriptor stores are strictly payload-sorted, contain nonempty duplicate-free
+owner multisets and unique oracle values, and contain every future, queue, and in-service owner
+derived during CPU preparation (`executor/src/cpu.rs:3053-3166`). Aggregate per-payload counts are
+therefore derived from the owner multiset rather than supplied independently.
 -/
 def InitialPacketStoresWellFormed (image : SimulationImage State) : Prop :=
   (∀ node ∈ image.nodes,
@@ -308,15 +407,17 @@ def InitialPacketStoresWellFormed (image : SimulationImage State) : Prop :=
       ((image.initialPacketStore node.id).map
         fun entry => entry.descriptor.id).Nodup ∧
         ∀ entry ∈ image.initialPacketStore node.id,
-          0 < entry.references ∧
+          entry.owners ≠ [] ∧
+            entry.owners.Nodup ∧
             entry.descriptor = image.packetDescriptor entry.descriptor.id) ∧
-    ∀ node ∈ image.nodes, ∀ payload,
-      ((image.initialEvents.filter fun event => event.target = node.id).map Event.payload).count
-          payload ≤
-        descriptorReferenceCount payload (image.initialPacketStore node.id)
+    ∀ node ∈ image.nodes, ∀ state,
+      stateAt? image node = some state →
+      OwnedReferencesMatchStore
+        (initialOwnedReferencesFor image node state)
+        (image.initialPacketStore node.id)
 
 /--
-Validated prepared arenas expose a strictly payload-sorted counted store at every LP, corresponding
+Validated prepared arenas expose a strictly payload-sorted owned store at every LP, corresponding
 to `BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367-381`.
 -/
 theorem initialPacketStore_sorted_of_wellFormed

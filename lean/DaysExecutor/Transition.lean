@@ -97,17 +97,17 @@ structure ServiceDecision where
   deriving DecidableEq, Repr
 
 /--
-Abstract result of one role-correct run-to-completion handler, including explicit descriptor
-increments beyond the separately derived child ownership, checked reference consumptions, summary,
-and observation effects accumulated by `TransitionState.dispatch` and finish assembly at
-`executor/src/scalar.rs:575-663`. The count effects model transmitter increments/decrements at
-lines 1645-1683 together with CPU event pins at `executor/src/cpu.rs:627-667`.
+Abstract result of one role-correct run-to-completion handler, including explicit owned-reference
+acquisitions and releases beyond separately derived child ownership, summary, and observation
+effects accumulated by `TransitionState.dispatch` and finish assembly at
+`executor/src/scalar.rs:575-663`. The owners expose the exact pending event, queue residency, or
+in-service slot changed by the handler; remote child envelopes are derived from `children`.
 -/
 structure TransitionResult (State : StateFamily) (kind : NodeKind) where
   nextState : RoleState State kind
   children : List Event
-  packetReferenceIncrements : List PacketDescriptor
-  packetReferenceConsumptions : List PayloadId
+  packetReferenceIncrements : List OwnedPacketReference
+  packetReferenceConsumptions : List OwnedPacketReference
   summaryDelta : RunSummary
   observedPackets : List PacketDescriptor
   departures : List RecordedDeparture
@@ -268,17 +268,21 @@ def CertifiedBoundSoundness
           event.key.timeNs + channel.minDelayNs ≤ child.key.timeNs
 
 /--
-Every descriptor whose reference count is incremented or retained for full observations is the
-immutable oracle value for its payload. This matches Rust's conflicting-descriptor rejection at
-`executor/src/scalar.rs:545-565` and counted transmitter acquisition at lines 1645-1658.
+Every descriptor whose owned reference is acquired or released, or retained for full observations,
+is the immutable oracle value for its payload. This matches Rust's conflicting-descriptor
+rejection at `executor/src/scalar.rs:545-565`.
 -/
 def TransitionDescriptorEffectsCoherent
     (image : SimulationImage State)
     (transition : TransitionRelation State) : Prop :=
   ∀ node event state result,
     transition node event state result →
-    (∀ descriptor ∈ result.packetReferenceIncrements,
-      descriptor = image.packetDescriptor descriptor.id) ∧
+    (∀ reference ∈ result.packetReferenceIncrements,
+      reference.descriptor =
+        image.packetDescriptor reference.descriptor.id) ∧
+    (∀ reference ∈ result.packetReferenceConsumptions,
+      reference.descriptor =
+        image.packetDescriptor reference.descriptor.id) ∧
     (∀ descriptor ∈ result.observedPackets,
       descriptor = image.packetDescriptor descriptor.id)
 
