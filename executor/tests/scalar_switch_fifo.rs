@@ -82,6 +82,7 @@ fn image() -> SimulationImage {
             },
         ],
         switch_states: vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: Some(SWITCH_LINK),
                 scheduler: SchedulerKind::Fifo,
@@ -325,6 +326,7 @@ fn switch_fifo_selects_one_packet_per_tx_ready_and_reaches_the_sink() {
     assert_eq!(
         result.switch_states,
         vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: Some(SWITCH_LINK),
                 scheduler: SchedulerKind::Fifo,

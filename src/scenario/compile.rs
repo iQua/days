@@ -17,7 +17,7 @@ use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::ids::{IdError, LinkKey, NodeKey, StableIds, dense_ids};
+use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::flows::DistributionInfo;
 use crate::flows::route::{RouteTableError, compute_shortest_path_route_table};
 use crate::topos::build::{TopologyError, build_graph};
@@ -570,8 +570,8 @@ fn image_route(
 ) -> Vec<LinkId> {
     let mut route = Vec::with_capacity(switch_path.len() + 1);
     route.push(ids.link(LinkKey {
-        source: NodeKey::Host(source),
-        target: NodeKey::Switch(source),
+        source: PhysicalNodeKey::Host(source),
+        target: PhysicalNodeKey::Switch(source),
     }));
     for pair in switch_path.windows(2) {
         let source = u64::try_from(pair[0].index())
@@ -579,13 +579,13 @@ fn image_route(
         let target = u64::try_from(pair[1].index())
             .expect("topology node identities were checked before route selection");
         route.push(ids.link(LinkKey {
-            source: NodeKey::Switch(source),
-            target: NodeKey::Switch(target),
+            source: PhysicalNodeKey::Switch(source),
+            target: PhysicalNodeKey::Switch(target),
         }));
     }
     route.push(ids.link(LinkKey {
-        source: NodeKey::Switch(target),
-        target: NodeKey::Host(target),
+        source: PhysicalNodeKey::Switch(target),
+        target: PhysicalNodeKey::Host(target),
     }));
     route
 }
@@ -620,13 +620,6 @@ fn lower(
         }
     }
 
-    let node_keys = host_topology_ids
-        .iter()
-        .copied()
-        .map(NodeKey::Host)
-        .chain(switch_topology_ids.iter().copied().map(NodeKey::Switch))
-        .collect::<Vec<_>>();
-
     let mut link_keys = BTreeSet::new();
     let mut undirected_edges = BTreeSet::new();
     for edge in graph.edge_references() {
@@ -647,25 +640,39 @@ fn lower(
             )));
         }
         link_keys.insert(LinkKey {
-            source: NodeKey::Switch(left),
-            target: NodeKey::Switch(right),
+            source: PhysicalNodeKey::Switch(left),
+            target: PhysicalNodeKey::Switch(right),
         });
         link_keys.insert(LinkKey {
-            source: NodeKey::Switch(right),
-            target: NodeKey::Switch(left),
+            source: PhysicalNodeKey::Switch(right),
+            target: PhysicalNodeKey::Switch(left),
         });
     }
     for host in &host_topology_ids {
         link_keys.insert(LinkKey {
-            source: NodeKey::Host(*host),
-            target: NodeKey::Switch(*host),
+            source: PhysicalNodeKey::Host(*host),
+            target: PhysicalNodeKey::Switch(*host),
         });
         link_keys.insert(LinkKey {
-            source: NodeKey::Switch(*host),
-            target: NodeKey::Host(*host),
+            source: PhysicalNodeKey::Switch(*host),
+            target: PhysicalNodeKey::Host(*host),
         });
     }
 
+    let switch_port_keys = link_keys
+        .iter()
+        .copied()
+        .filter_map(|egress| match egress.source {
+            PhysicalNodeKey::Switch(switch) => Some(LpKey::SwitchPort { switch, egress }),
+            PhysicalNodeKey::Host(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let node_keys = host_topology_ids
+        .iter()
+        .copied()
+        .map(LpKey::Host)
+        .chain(switch_port_keys.iter().copied())
+        .collect::<Vec<_>>();
     let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let flows = canonical_flows(
         model.explicit_flows,
@@ -704,8 +711,8 @@ fn lower(
             let reverse_switch_path = switch_path.iter().rev().copied().collect::<Vec<_>>();
             FlowDescriptor {
                 id: FlowId(flow_ids[&flow.key]),
-                source: ids.node(NodeKey::Host(flow.source)),
-                target: ids.node(NodeKey::Host(flow.target)),
+                source: ids.node(LpKey::Host(flow.source)),
+                target: ids.node(LpKey::Host(flow.target)),
                 route: image_route(flow.source, flow.target, switch_path, &ids),
                 reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
             }
@@ -713,14 +720,14 @@ fn lower(
         .collect::<Vec<_>>();
     validate_input_bounds(&flows)?;
 
-    let host_slots = dense_ids(host_topology_ids.iter().copied().map(NodeKey::Host))?;
-    let switch_slots = dense_ids(switch_topology_ids.iter().copied().map(NodeKey::Switch))?;
+    let host_slots = dense_ids(host_topology_ids.iter().copied().map(LpKey::Host))?;
+    let switch_slots = dense_ids(switch_port_keys.iter().copied())?;
     let nodes = ids
         .nodes()
         .map(|(key, id)| {
             let (kind, slot) = match key {
-                NodeKey::Host(_) => (NodeKind::Host, host_slots[&key]),
-                NodeKey::Switch(_) => (NodeKind::Switch, switch_slots[&key]),
+                LpKey::Host(_) => (NodeKind::Host, host_slots[&key]),
+                LpKey::SwitchPort { .. } => (NodeKind::Switch, switch_slots[&key]),
             };
             let state_slot = u32::try_from(slot)
                 .map_err(|_| CompileError::Invalid(format!("{kind:?} state slot exceeds u32")))?;
@@ -734,12 +741,12 @@ fn lower(
     let node_count = u64::try_from(nodes.len())
         .map_err(|_| CompileError::Invalid("node count exceeds u64".to_owned()))?;
 
-    let mut generators_by_source = BTreeMap::<NodeKey, Vec<FlowGeneratorState>>::new();
-    let mut payload_sequences = BTreeMap::<NodeKey, u64>::new();
+    let mut generators_by_source = BTreeMap::<LpKey, Vec<FlowGeneratorState>>::new();
+    let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
-    let mut initial_event_inputs = Vec::<(NodeKey, u64, FlowId, PayloadId)>::new();
+    let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId)>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
-        let source = NodeKey::Host(flow.source);
+        let source = LpKey::Host(flow.source);
         let emission_count = packet_count(&flow.traffic);
         let next_emission = if emission_count == 0 {
             ScheduledEmission {
@@ -805,7 +812,7 @@ fn lower(
     }
     initial_packets.sort_by_key(|packet| packet.id);
 
-    let mut origin_sequences = BTreeMap::<NodeKey, u64>::new();
+    let mut origin_sequences = BTreeMap::<LpKey, u64>::new();
     initial_event_inputs.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -837,10 +844,10 @@ fn lower(
     let host_states = host_topology_ids
         .iter()
         .map(|host| {
-            let node_key = NodeKey::Host(*host);
+            let node_key = LpKey::Host(*host);
             let egress_key = LinkKey {
-                source: node_key,
-                target: NodeKey::Switch(*host),
+                source: PhysicalNodeKey::Host(*host),
+                target: PhysicalNodeKey::Switch(*host),
             };
             Ok(HostState {
                 egress_link: ids.link(egress_key),
@@ -856,37 +863,40 @@ fn lower(
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-    let switch_states = switch_topology_ids
+    let switch_states = switch_port_keys
         .iter()
-        .map(|switch| SwitchState {
-            queues: ids
-                .links()
-                .filter(|(key, _)| key.source == NodeKey::Switch(*switch))
-                .map(|(_, link)| SwitchQueueState {
-                    egress_link: Some(link),
+        .map(|port| {
+            let LpKey::SwitchPort { switch, egress } = *port else {
+                unreachable!("switch-port key set contains only switch ports")
+            };
+            SwitchState {
+                physical_switch: switch,
+                queues: vec![SwitchQueueState {
+                    egress_link: Some(ids.link(egress)),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: model.queue_capacity_packets,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
-                })
-                .collect(),
-            next_origin_seq: 0,
-            arrived_packets: 0,
-            dropped_packets: 0,
-            departed_packets: 0,
+                }],
+                next_origin_seq: 0,
+                arrived_packets: 0,
+                dropped_packets: 0,
+                departed_packets: 0,
+            }
         })
         .collect();
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
             id,
-            source: ids.node(key.source),
-            target: ids.node(key.target),
+            source: ids.node(LpKey::for_link_source(key)),
+            target: ids.node(LpKey::for_link_target(key)),
             rate_bps: model.rate_bps,
             propagation_ns: model.propagation_ns,
         })
         .collect::<Vec<_>>();
+    let mut channel_keys = BTreeSet::<(LinkId, NodeId)>::new();
     let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
     let initial_payload_by_flow = initial_packets
         .iter()
@@ -897,7 +907,7 @@ fn lower(
             continue;
         }
         let payload = initial_payload_by_flow[&flow.id];
-        for link_id in &flow.route {
+        for (index, link_id) in flow.route.iter().enumerate() {
             let link = links.get(link_id.0 as usize).ok_or_else(|| {
                 CompileError::Invalid(format!(
                     "flow {:?} references missing link {link_id:?}",
@@ -911,21 +921,27 @@ fn lower(
                         payload
                     ))
                 })?;
+            let target = flow
+                .route
+                .get(index + 1)
+                .map_or(flow.target, |next| links[next.0 as usize].source);
+            channel_keys.insert((*link_id, target));
             min_packet_size_by_link
                 .entry(*link_id)
                 .and_modify(|size| *size = (*size).min(input.traffic.packet_size_bytes))
                 .or_insert(input.traffic.packet_size_bytes);
         }
     }
-    let channels = min_packet_size_by_link
+    let channels = channel_keys
         .into_iter()
-        .map(|(link_id, min_packet_size_bytes)| {
+        .map(|(link_id, target)| {
             let link = links[link_id.0 as usize];
-            RemoteChannel::for_packet_link(link, min_packet_size_bytes).map_err(|error| {
-                CompileError::Invalid(format!(
-                    "failed to derive channel for link {link_id:?}: {error}"
-                ))
-            })
+            RemoteChannel::for_packet_link_to(link, target, min_packet_size_by_link[&link_id])
+                .map_err(|error| {
+                    CompileError::Invalid(format!(
+                        "failed to derive channel for link {link_id:?} to node {target:?}: {error}"
+                    ))
+                })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
 

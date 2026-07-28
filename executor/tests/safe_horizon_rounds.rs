@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use days_executor::{
     Backend, ChunkGranularity, ConstantGenerator, CpuConfig, CpuFaultInjection, CpuFaultKind,
@@ -908,6 +908,7 @@ fn canonical_exchange_image() -> SimulationImage {
             },
         ],
         switch_states: vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: Some(LinkId(2)),
                 scheduler: SchedulerKind::Fifo,
@@ -1032,6 +1033,7 @@ fn add_idle_switches(image: &mut SimulationImage, count: usize) {
             state_slot,
         });
         image.switch_states.push(SwitchState {
+            physical_switch: u64::from(state_slot),
             queues: vec![],
             next_origin_seq: 0,
             arrived_packets: 0,
@@ -1143,7 +1145,7 @@ impl StableRng {
 fn heterogeneous_image(seed: u64) -> SimulationImage {
     let mut rng = StableRng(seed);
     let idle_switches = rng.range(5) as usize;
-    let node_count = 4 + idle_switches;
+    let node_count = 5 + idle_switches;
     let source_link = LinkDescriptor {
         id: LinkId(0),
         source: NodeId(0),
@@ -1154,28 +1156,28 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
     let switch_link = LinkDescriptor {
         id: LinkId(1),
         source: NodeId(1),
-        target: NodeId(2),
+        target: NodeId(3),
         rate_bps: [1_000_000_000, 2_000_000_000, 8_000_000_000][rng.range(3) as usize],
         propagation_ns: rng.range(7),
     };
     let alternate_switch_link = LinkDescriptor {
         id: LinkId(2),
-        source: NodeId(1),
-        target: NodeId(3),
+        source: NodeId(2),
+        target: NodeId(4),
         rate_bps: [1_000_000_000, 4_000_000_000, 8_000_000_000][rng.range(3) as usize],
         propagation_ns: rng.range(7),
     };
     let return_link = LinkDescriptor {
         id: LinkId(3),
-        source: NodeId(2),
-        target: NodeId(0),
+        source: NodeId(3),
+        target: NodeId(1),
         rate_bps: 8_000_000_000,
         propagation_ns: 0,
     };
     let alternate_return_link = LinkDescriptor {
         id: LinkId(4),
-        source: NodeId(3),
-        target: NodeId(0),
+        source: NodeId(4),
+        target: NodeId(2),
         rate_bps: 8_000_000_000,
         propagation_ns: 0,
     };
@@ -1187,7 +1189,7 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
         flows.push(FlowDescriptor {
             id: FlowId(flow),
             source: NodeId(0),
-            target: if alternate_sink { NodeId(3) } else { NodeId(2) },
+            target: if alternate_sink { NodeId(4) } else { NodeId(3) },
             route: vec![LinkId(0), LinkId(if alternate_sink { 2 } else { 1 })],
             reverse_route: vec![],
         });
@@ -1221,7 +1223,7 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
             payload,
         });
         minimum_source_size = minimum_source_size.min(size_bytes);
-        if flows[flow.0 as usize].target == NodeId(2) {
+        if flows[flow.0 as usize].target == NodeId(3) {
             minimum_switch_size = minimum_switch_size.min(size_bytes);
         } else {
             minimum_alternate_switch_size = minimum_alternate_switch_size.min(size_bytes);
@@ -1250,11 +1252,16 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
             },
             NodeDescriptor {
                 id: NodeId(2),
-                kind: NodeKind::Host,
+                kind: NodeKind::Switch,
                 state_slot: 1,
             },
             NodeDescriptor {
                 id: NodeId(3),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(4),
                 kind: NodeKind::Host,
                 state_slot: 2,
             },
@@ -1297,30 +1304,38 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
                 received_packets: 0,
             },
         ],
-        switch_states: vec![SwitchState {
-            queues: vec![
-                SwitchQueueState {
+        switch_states: vec![
+            SwitchState {
+                physical_switch: 0,
+                queues: vec![SwitchQueueState {
                     egress_link: Some(LinkId(1)),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 1 + rng.range(5),
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
-                },
-                SwitchQueueState {
+                }],
+                next_origin_seq: 0,
+                arrived_packets: 0,
+                dropped_packets: 0,
+                departed_packets: 0,
+            },
+            SwitchState {
+                physical_switch: 0,
+                queues: vec![SwitchQueueState {
                     egress_link: Some(LinkId(2)),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 1 + rng.range(5),
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
-                },
-            ],
-            next_origin_seq: 0,
-            arrived_packets: 0,
-            dropped_packets: 0,
-            departed_packets: 0,
-        }],
+                }],
+                next_origin_seq: 0,
+                arrived_packets: 0,
+                dropped_packets: 0,
+                departed_packets: 0,
+            },
+        ],
         flows,
         initial_packets,
         links: vec![
@@ -1331,7 +1346,8 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
             alternate_return_link,
         ],
         channels: vec![
-            RemoteChannel::for_packet_link(source_link, minimum_source_size).unwrap(),
+            RemoteChannel::for_packet_link_to(source_link, NodeId(1), minimum_source_size).unwrap(),
+            RemoteChannel::for_packet_link_to(source_link, NodeId(2), minimum_source_size).unwrap(),
             RemoteChannel::for_packet_link(switch_link, minimum_switch_size).unwrap(),
             RemoteChannel::for_packet_link(alternate_switch_link, minimum_alternate_switch_size)
                 .unwrap(),
@@ -1343,8 +1359,216 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
     image
 }
 
+fn pre_split_heterogeneous_image(seed: u64) -> SimulationImage {
+    let mut image = heterogeneous_image(seed);
+    let post_node_count = image.nodes.len() as u64;
+    let pre_node_count = post_node_count - 1;
+
+    let second_port = image.switch_states.remove(1);
+    image.switch_states[0].queues.extend(second_port.queues);
+    image.nodes = image
+        .nodes
+        .into_iter()
+        .filter_map(|mut node| {
+            if node.id == NodeId(2) {
+                return None;
+            }
+            if node.id.0 > 2 {
+                node.id.0 -= 1;
+            }
+            if node.kind == NodeKind::Switch && node.state_slot > 1 {
+                node.state_slot -= 1;
+            }
+            Some(node)
+        })
+        .collect();
+
+    for link in &mut image.links {
+        match link.id {
+            LinkId(0) => {
+                link.source = NodeId(0);
+                link.target = NodeId(1);
+            }
+            LinkId(1) => {
+                link.source = NodeId(1);
+                link.target = NodeId(2);
+            }
+            LinkId(2) => {
+                link.source = NodeId(1);
+                link.target = NodeId(3);
+            }
+            LinkId(3) => {
+                link.source = NodeId(2);
+                link.target = NodeId(0);
+            }
+            LinkId(4) => {
+                link.source = NodeId(3);
+                link.target = NodeId(0);
+            }
+            other => panic!("unexpected heterogeneous-image link {other:?}"),
+        }
+    }
+    for flow in &mut image.flows {
+        if flow.target.0 > 2 {
+            flow.target.0 -= 1;
+        }
+    }
+
+    let remap_payload = |payload: PayloadId| {
+        let sequence = payload.0 / post_node_count;
+        PayloadId(sequence * pre_node_count)
+    };
+    for packet in &mut image.initial_packets {
+        packet.id = remap_payload(packet.id);
+    }
+    for event in &mut image.initial_events {
+        event.payload = remap_payload(event.payload);
+    }
+
+    let minimum_by_link =
+        image
+            .channels
+            .iter()
+            .fold(BTreeMap::<LinkId, u64>::new(), |mut minimums, channel| {
+                minimums
+                    .entry(channel.link)
+                    .and_modify(|minimum| *minimum = (*minimum).min(channel.min_delay_ns))
+                    .or_insert(channel.min_delay_ns);
+                minimums
+            });
+    image.channels = [LinkId(0), LinkId(1), LinkId(2)]
+        .into_iter()
+        .map(|link_id| {
+            let link = image.links[link_id.0 as usize];
+            RemoteChannel::for_packet_link(link, minimum_by_link[&link_id]).unwrap()
+        })
+        .collect();
+    image
+}
+
+type SemanticPacket = (u64, u8, u64);
+type NormalizedQueue = (
+    LinkId,
+    u64,
+    Vec<SemanticPacket>,
+    Option<SemanticPacket>,
+    bool,
+);
+type NormalizedPendingEvent = (SemanticPacket, u64, u16, u64);
+
+#[derive(Debug, Eq, PartialEq)]
+struct NormalizedPhysicalResult {
+    summary: days_executor::RunSummary,
+    switch_counters: (u64, u64, u64),
+    queues: Vec<NormalizedQueue>,
+    departures: Vec<(SemanticPacket, u64)>,
+    arrivals: Vec<(SemanticPacket, u64, u8)>,
+    pending: Vec<NormalizedPendingEvent>,
+}
+
+fn normalized_physical_result(
+    result: &days_executor::RunResult,
+    post_split: bool,
+) -> NormalizedPhysicalResult {
+    let packets = result
+        .observed_packets
+        .iter()
+        .chain(&result.resident_packets)
+        .map(|packet| (packet.id, *packet))
+        .collect::<BTreeMap<_, _>>();
+    let semantic_packet = |payload: PayloadId| {
+        let packet = packets[&payload];
+        (packet.flow.0, packet.kind as u8, packet.size_bytes)
+    };
+    let physical_target = |target: NodeId| {
+        if post_split {
+            match target {
+                NodeId(0) => 0,
+                NodeId(1) | NodeId(2) => 1,
+                NodeId(id) => id - 1,
+            }
+        } else {
+            target.0
+        }
+    };
+
+    let mut queues = result
+        .switch_states
+        .iter()
+        .flat_map(|state| &state.queues)
+        .filter_map(|queue| {
+            queue.egress_link.map(|link| {
+                (
+                    link,
+                    queue.queue_capacity_packets,
+                    queue.queue.iter().copied().map(semantic_packet).collect(),
+                    queue.in_service.map(semantic_packet),
+                    queue.tx_ready_pending,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    queues.sort_unstable_by_key(|queue| queue.0);
+
+    let mut departures = result
+        .departures
+        .iter()
+        .map(|departure| (semantic_packet(departure.payload), departure.time_ns))
+        .collect::<Vec<_>>();
+    departures.sort_unstable();
+    let mut arrivals = result
+        .arrivals
+        .iter()
+        .map(|arrival| {
+            let disposition = match arrival.disposition {
+                days_executor::ArrivalDisposition::Admitted => 0,
+                days_executor::ArrivalDisposition::Dropped => 1,
+                days_executor::ArrivalDisposition::Delivered => 2,
+                days_executor::ArrivalDisposition::Feedback => 3,
+            };
+            (
+                semantic_packet(arrival.payload),
+                arrival.time_ns,
+                disposition,
+            )
+        })
+        .collect::<Vec<_>>();
+    arrivals.sort_unstable();
+    let mut pending = result
+        .pending_events
+        .iter()
+        .map(|event| {
+            (
+                semantic_packet(event.payload),
+                event.key.time_ns,
+                event.kind as u16,
+                physical_target(event.target),
+            )
+        })
+        .collect::<Vec<_>>();
+    pending.sort_unstable();
+
+    NormalizedPhysicalResult {
+        summary: result.summary,
+        switch_counters: result.switch_states.iter().fold(
+            (0_u64, 0_u64, 0_u64),
+            |(arrived, dropped, departed), state| {
+                (
+                    arrived + state.arrived_packets,
+                    dropped + state.dropped_packets,
+                    departed + state.departed_packets,
+                )
+            },
+        ),
+        queues,
+        departures,
+        arrivals,
+        pending,
+    }
+}
+
 #[test]
-fn multi_queue_same_time_event_declines_tx_ready_continuation() {
+fn port_lps_take_independent_same_time_tx_ready_continuations() {
     let mut image = heterogeneous_image(1);
     image.flows.truncate(4);
     image.initial_packets.truncate(4);
@@ -1358,11 +1582,12 @@ fn multi_queue_same_time_event_declines_tx_ready_continuation() {
     image.switch_states[0].queues[0].in_service = Some(queue_a_in_service);
     image.switch_states[0].queues[0].tx_ready_pending = false;
     image.switch_states[0].queues[0].queue_capacity_packets = 1;
-    image.switch_states[0].queues[1].queue = VecDeque::from([queue_b_waiting]);
-    image.switch_states[0].queues[1].in_service = Some(queue_b_in_service);
-    image.switch_states[0].queues[1].tx_ready_pending = false;
-    image.switch_states[0].queues[1].queue_capacity_packets = 1;
-    image.switch_states[0].next_origin_seq = 2;
+    image.switch_states[1].queues[0].queue = VecDeque::from([queue_b_waiting]);
+    image.switch_states[1].queues[0].in_service = Some(queue_b_in_service);
+    image.switch_states[1].queues[0].tx_ready_pending = false;
+    image.switch_states[1].queues[0].queue_capacity_packets = 1;
+    image.switch_states[0].next_origin_seq = 1;
+    image.switch_states[1].next_origin_seq = 1;
     image.initial_events = vec![
         Event {
             key: EventKey {
@@ -1379,10 +1604,10 @@ fn multi_queue_same_time_event_declines_tx_ready_continuation() {
             key: EventKey {
                 time_ns: 10,
                 phase: event_phase(EventKind::TxComplete),
-                origin_node: NodeId(1),
-                origin_seq: 1,
+                origin_node: NodeId(2),
+                origin_seq: 0,
             },
-            target: NodeId(1),
+            target: NodeId(2),
             kind: EventKind::TxComplete,
             payload: queue_b_in_service,
         },
@@ -1416,7 +1641,7 @@ fn multi_queue_same_time_event_declines_tx_ready_continuation() {
             .flat_map(|round| &round.lp_work)
             .map(|work| work.same_time_continuations)
             .sum::<u64>(),
-        0
+        2
     );
     assert!(cpu.iter().all(|run| {
         run.rounds
@@ -1424,7 +1649,7 @@ fn multi_queue_same_time_event_declines_tx_ready_continuation() {
             .flat_map(|round| &round.semantic.lp_work)
             .map(|work| work.same_time_continuations)
             .sum::<u64>()
-            == 0
+            == 2
     }));
 
     let origin_sequence = |payload, kind| {
@@ -1442,8 +1667,58 @@ fn multi_queue_same_time_event_declines_tx_ready_continuation() {
             origin_sequence(queue_b_waiting, EventKind::TxComplete),
             origin_sequence(queue_b_waiting, EventKind::RemoteArrival),
         ),
-        (4, 5, 6, 7)
+        (2, 3, 2, 3)
     );
+}
+
+#[test]
+fn one_port_outbox_need_not_be_sorted_by_target_then_event_key() {
+    let image = heterogeneous_image(1);
+    let mut route_targets = image
+        .channels
+        .iter()
+        .filter(|channel| channel.link == LinkId(0))
+        .map(|channel| channel.target)
+        .collect::<Vec<_>>();
+    route_targets.sort_unstable();
+    route_targets.dedup();
+    assert_eq!(route_targets, vec![NodeId(1), NodeId(2)]);
+
+    // One source-port LP may serialize a packet for the higher target before a packet for the
+    // lower target. Its EventKeys advance, but the exchange's target-first composite key falls.
+    let first_key = EventKey {
+        time_ns: 100,
+        phase: event_phase(EventKind::RemoteArrival),
+        origin_node: NodeId(0),
+        origin_seq: 10,
+    };
+    let second_key = EventKey {
+        time_ns: 200,
+        phase: event_phase(EventKind::RemoteArrival),
+        origin_node: NodeId(0),
+        origin_seq: 12,
+    };
+    assert!(first_key < second_key);
+    assert!((NodeId(2), first_key) > (NodeId(1), second_key));
+}
+
+#[test]
+fn port_decomposition_preserves_pre_split_physical_outcomes() {
+    for seed in 0..128 {
+        let post_split = heterogeneous_image(seed);
+        let pre_split = pre_split_heterogeneous_image(seed);
+        for horizon in [None, Some(1 + (seed * 17) % post_split.stop_time_ns)] {
+            let before =
+                run_scalar_with_observations(&pre_split, horizon, ObservationMode::Full).unwrap();
+            let after =
+                run_scalar_with_observations(&post_split, horizon, ObservationMode::Full).unwrap();
+            assert_eq!(
+                normalized_physical_result(&after, true),
+                normalized_physical_result(&before, false),
+                "seed {seed}, horizon {horizon:?}"
+            );
+        }
+    }
 }
 
 #[test]

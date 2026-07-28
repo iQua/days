@@ -38,6 +38,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
             received_packets: 0,
         }],
         switch_states: vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: None,
                 scheduler: SchedulerKind::Fifo,

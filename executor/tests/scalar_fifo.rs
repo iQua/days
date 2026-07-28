@@ -60,6 +60,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             received_packets: 0,
         }],
         switch_states: vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: None,
                 scheduler: SchedulerKind::Fifo,
@@ -188,6 +189,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
     assert_eq!(
         result.switch_states,
         vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: None,
                 scheduler: SchedulerKind::Fifo,

@@ -11,10 +11,10 @@ use days::topos::topo::{
     installed_host_attachment_state,
 };
 use days_executor::{
-    ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId, NodeId,
-    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PayloadId, SchedulerKind,
-    SimulationImage, run_cpu, run_scalar, run_scalar_rounds, run_scalar_with_observations,
-    validate,
+    ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId,
+    NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture,
+    PayloadId, SchedulerKind, SimulationImage, run_cpu, run_scalar, run_scalar_rounds,
+    run_scalar_with_observations, validate,
 };
 use petgraph::graph::NodeIndex;
 use tempfile::TempDir;
@@ -84,6 +84,68 @@ fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
     delays
 }
 
+fn assert_port_lp_decomposition(image: &SimulationImage) {
+    let nodes = image
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let switch_egress_links = image
+        .links
+        .iter()
+        .filter(|link| nodes[&link.source].kind == NodeKind::Switch)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        image.switch_states.len(),
+        switch_egress_links.len(),
+        "every physical switch egress must own one switch LP state"
+    );
+    assert_eq!(
+        image
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Switch)
+            .count(),
+        switch_egress_links.len(),
+        "every physical switch egress must have one distinct LP identity"
+    );
+    assert_eq!(
+        switch_egress_links
+            .iter()
+            .map(|link| link.source)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        switch_egress_links.len(),
+        "switch egress LP origin identities must be unique"
+    );
+    assert!(
+        image
+            .switch_states
+            .iter()
+            .all(|state| { state.queues.len() == 1 && state.queues[0].egress_link.is_some() }),
+        "each switch LP must own exactly one egress queue"
+    );
+
+    for flow in &image.flows {
+        for (index, link_id) in flow.route.iter().enumerate() {
+            let link = &image.links[link_id.0 as usize];
+            let direct_target = flow
+                .route
+                .get(index + 1)
+                .map_or(flow.target, |next| image.links[next.0 as usize].source);
+            assert!(
+                image.channels.iter().any(|channel| {
+                    channel.link == *link_id
+                        && channel.source == link.source
+                        && channel.target == direct_target
+                }),
+                "physical link {link_id:?} must deliver directly to the route-selected next LP"
+            );
+        }
+    }
+}
+
 fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     let (graph, hosts) = build_graph(config_path).expect("legacy topology should build");
     let legacy_flows = Flow::flows_from_config(config_path, &hosts);
@@ -98,6 +160,9 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
         .iter()
         .map(|link| (link.id, link))
         .collect::<BTreeMap<_, _>>();
+    let physical_switch = |node: &NodeDescriptor| {
+        image.switch_states[node.state_slot as usize].physical_switch as usize
+    };
 
     let physical_links = |route: &[LinkId]| {
         route
@@ -107,7 +172,7 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
                 let source = nodes[&link.source];
                 let target = nodes[&link.target];
                 (source.kind == NodeKind::Switch && target.kind == NodeKind::Switch)
-                    .then_some((source.state_slot as usize, target.state_slot as usize))
+                    .then_some((physical_switch(source), physical_switch(target)))
             })
             .collect::<Vec<_>>()
     };
@@ -177,8 +242,8 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
             .route
             .last()
             .expect("lowered flow should have a sink attachment")];
-        let source = nodes[&first.target].state_slot as usize;
-        let target = nodes[&last.source].state_slot as usize;
+        let source = physical_switch(nodes[&first.target]);
+        let target = physical_switch(nodes[&last.source]);
         *image_routes
             .entry((
                 source,
@@ -320,7 +385,7 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
                 let target = nodes[&link.target];
                 match (source.kind, target.kind) {
                     (NodeKind::Host, NodeKind::Switch) => FlowStage::HostInjection {
-                        host: target.state_slot as usize,
+                        host: physical_switch(target),
                         rate_bps: link.rate_bps,
                         propagation_ns: link.propagation_ns,
                         capacity_packets: 0,
@@ -338,8 +403,8 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
                             "exact physical stage should use FIFO"
                         );
                         FlowStage::Physical {
-                            source: source.state_slot as usize,
-                            target: target.state_slot as usize,
+                            source: physical_switch(source),
+                            target: physical_switch(target),
                             rate_bps: link.rate_bps,
                             propagation_ns: link.propagation_ns,
                             capacity_packets: queue.queue_capacity_packets,
@@ -358,7 +423,7 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
                             "exact host delivery should use FIFO"
                         );
                         FlowStage::HostDelivery {
-                            host: source.state_slot as usize,
+                            host: physical_switch(source),
                             rate_bps: link.rate_bps,
                             propagation_ns: link.propagation_ns,
                             capacity_packets: queue.queue_capacity_packets,
@@ -706,7 +771,7 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
     );
     assert_eq!(
         first.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
-        (0..8).map(NodeId).collect::<Vec<_>>()
+        (0..16).map(NodeId).collect::<Vec<_>>()
     );
     assert_eq!(
         first.links.iter().map(|link| link.id).collect::<Vec<_>>(),
@@ -748,7 +813,7 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
             .filter(|node| node.kind == NodeKind::Switch)
             .map(|node| node.state_slot)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3]
+        (0..12).collect::<Vec<_>>()
     );
 
     assert!(!first.host_states.is_empty());
@@ -767,12 +832,22 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
             .collect::<BTreeMap<_, _>>(),
         certified
     );
+    assert_port_lp_decomposition(&first);
+    let channel_targets_by_link = first.channels.iter().fold(
+        BTreeMap::<LinkId, BTreeSet<NodeId>>::new(),
+        |mut targets, channel| {
+            targets
+                .entry(channel.link)
+                .or_default()
+                .insert(channel.target);
+            targets
+        },
+    );
     assert!(
-        first
-            .switch_states
-            .iter()
-            .all(|state| state.queues.len() == 3),
-        "each switch owns one FIFO/TailDrop queue per directed egress"
+        channel_targets_by_link
+            .values()
+            .any(|targets| targets.len() > 1),
+        "direct downstream routing must allow one physical inbound link to feed several egress LPs"
     );
     assert!(
         first
@@ -1014,8 +1089,16 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     }
     assert_eq!(first, second);
     assert_eq!(first.host_states.len(), 8);
-    assert_eq!(first.switch_states.len(), 20);
-    assert_eq!(first.nodes.len(), 28);
+    assert_eq!(
+        first.switch_states.len(),
+        72,
+        "old per-switch state count was 20; the 72 physical egress queues are now LPs"
+    );
+    assert_eq!(
+        first.nodes.len(),
+        80,
+        "old node count was 28; 8 hosts plus 72 switch egress LPs are now represented"
+    );
     assert_eq!(first.links.len(), 80);
     assert_eq!(
         first
@@ -1024,6 +1107,21 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
             .map(|channel| (channel.link, channel.min_delay_ns))
             .collect::<BTreeMap<_, _>>(),
         certified_delays(&first)
+    );
+    let pre_split_physical_lookahead = certified_delays(&first).values().copied().min();
+    let port_lp_lookahead = first
+        .channels
+        .iter()
+        .map(|channel| channel.min_delay_ns)
+        .min();
+    assert_eq!(
+        port_lp_lookahead, pre_split_physical_lookahead,
+        "duplicating physical-link channels by route-selected port must not change global lookahead"
+    );
+    assert_eq!(
+        port_lp_lookahead,
+        Some(25_000_000),
+        "the pre-split certified global lookahead was 25 ms"
     );
     assert_eq!(first.flows.len(), 8);
     assert_eq!(first.initial_packets.len(), first.flows.len());
@@ -1037,14 +1135,7 @@ fn p01_fifo_taildrop_flow_set_lowers_without_legacy_id_state() {
     );
     assert_eq!(first.initial_events.len(), first.flows.len());
     assert_eq!(first.stop_time_ns, 1_500_000_000_000);
-    assert_eq!(
-        first
-            .switch_states
-            .iter()
-            .map(|state| state.queues.len())
-            .sum::<usize>(),
-        72
-    );
+    assert_port_lp_decomposition(&first);
     assert!(
         first.links.iter().all(|link| link.propagation_ns == 0),
         "propagation defaults to zero"

@@ -1,8 +1,9 @@
 //! Canonical event records shared by every executor backend.
 
-/// Stable identifier for a physical topology node.
+/// Stable identifier for one logical process.
 ///
-/// Scenario lowering derives this value from a semantic topology key. It must not depend on
+/// Hosts own one logical process. Each switch egress port owns a distinct logical process derived
+/// from the semantic `(physical switch, directed egress link)` key. The value must not depend on
 /// allocation order, global counters, pointer values, or map iteration order.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -70,7 +71,7 @@ pub enum EventKind {
     TxReady = 1,
     /// A committed non-preemptive transmission finishes at its source.
     TxComplete = 2,
-    /// A transmitted packet reaches the target node.
+    /// A transmitted packet reaches the route-selected target logical process.
     RemoteArrival = 3,
 }
 

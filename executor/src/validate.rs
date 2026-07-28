@@ -287,117 +287,121 @@ fn validate_flows(image: &SimulationImage) -> Result<(), ValidationError> {
                 flow.id
             )));
         }
-
-        let mut expected_source = flow.source;
-        let mut visited_nodes = BTreeSet::from([flow.source]);
-        for (step, link_id) in flow.route.iter().enumerate() {
-            let link = link(image, *link_id).ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} route step {step} references unknown link {link_id:?}",
-                    flow.id
-                ))
-            })?;
-            if link.source != expected_source {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} route step {step} link {:?} starts at {:?}, expected {:?}",
-                    flow.id, link.id, link.source, expected_source
-                )));
-            }
-            if step > 0 {
-                let interior = node(image, link.source)
-                    .expect("link validation established every route source");
-                if interior.kind != NodeKind::Switch {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} route step {step} uses interior {:?} node {:?}; only Switch nodes may forward",
-                        flow.id, interior.kind, interior.id
-                    )));
-                }
-            }
-            if !visited_nodes.insert(link.target) {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} route revisits node {:?} at step {step}",
-                    flow.id, link.target
-                )));
-            }
-            if step + 1 < flow.route.len() {
-                let interior = node(image, link.target)
-                    .expect("link validation established every route target");
-                if interior.kind != NodeKind::Switch {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} route reaches interior {:?} node {:?} at step {step}; only Switch nodes may forward",
-                        flow.id, interior.kind, interior.id
-                    )));
-                }
-            }
-            expected_source = link.target;
-        }
-        if expected_source != flow.target {
-            return Err(ValidationError::new(format!(
-                "flow {:?} route ends at node {:?}, expected {:?}",
-                flow.id, expected_source, flow.target
-            )));
-        }
+        validate_route(image, flow, &flow.route, flow.source, flow.target, "route")?;
         if !flow.reverse_route.is_empty() {
-            validate_reverse_route(image, flow)?;
+            validate_route(
+                image,
+                flow,
+                &flow.reverse_route,
+                flow.target,
+                flow.source,
+                "reverse route",
+            )?;
         }
     }
     Ok(())
 }
 
-fn validate_reverse_route(
+fn validate_route(
     image: &SimulationImage,
     flow: &FlowDescriptor,
+    route: &[LinkId],
+    start: NodeId,
+    terminal: NodeId,
+    label: &str,
 ) -> Result<(), ValidationError> {
-    let mut expected_source = flow.target;
-    let mut visited_nodes = BTreeSet::from([flow.target]);
-    for (step, link_id) in flow.reverse_route.iter().enumerate() {
-        let link = link(image, *link_id).ok_or_else(|| {
-            ValidationError::new(format!(
-                "flow {:?} reverse route step {step} references unknown link {link_id:?}",
-                flow.id
-            ))
-        })?;
+    for (step, link_id) in route.iter().enumerate() {
+        if link(image, *link_id).is_none() {
+            return Err(ValidationError::new(format!(
+                "flow {:?} {label} step {step} references unknown link {link_id:?}",
+                flow.id,
+            )));
+        }
+    }
+
+    let mut expected_source = start;
+    let mut visited = BTreeSet::from([physical_location(image, start)]);
+    for (step, link_id) in route.iter().enumerate() {
+        let link = link(image, *link_id).expect("route links were resolved before validation");
         if link.source != expected_source {
             return Err(ValidationError::new(format!(
-                "flow {:?} reverse route step {step} link {:?} starts at {:?}, expected {:?}",
-                flow.id, link.id, link.source, expected_source
+                "flow {:?} {label} step {step} link {:?} starts at {:?}, expected {:?}",
+                flow.id, link.id, link.source, expected_source,
             )));
         }
         if step > 0 {
             let interior =
-                node(image, link.source).expect("link validation established reverse source");
+                node(image, link.source).expect("link validation established every route source");
             if interior.kind != NodeKind::Switch {
                 return Err(ValidationError::new(format!(
-                    "flow {:?} reverse route step {step} uses interior {:?} node {:?}; only Switch nodes may forward",
-                    flow.id, interior.kind, interior.id
+                    "flow {:?} {label} step {step} uses interior {:?} node {:?}; only Switch nodes may forward",
+                    flow.id, interior.kind, interior.id,
                 )));
             }
         }
-        if !visited_nodes.insert(link.target) {
+        let direct_target = route_target(image, route, step, terminal)
+            .expect("flow route lookup established the next link");
+        let physical_target = physical_location(image, link.target);
+        if step + 1 < route.len() && physical_target != physical_location(image, direct_target) {
             return Err(ValidationError::new(format!(
-                "flow {:?} reverse route revisits node {:?} at step {step}",
-                flow.id, link.target
+                "flow {:?} {label} step {step} physical link {:?} reaches {:?}, but next egress LP {:?} belongs to a different physical node",
+                flow.id, link.id, link.target, direct_target,
             )));
         }
-        if step + 1 < flow.reverse_route.len() {
-            let interior =
-                node(image, link.target).expect("link validation established reverse target");
+        if step + 1 == route.len() && link.target != terminal {
+            return Err(ValidationError::new(format!(
+                "flow {:?} {label} ends at node {:?}, expected {:?}",
+                flow.id, link.target, terminal,
+            )));
+        }
+        if !visited.insert(physical_target) {
+            return Err(ValidationError::new(format!(
+                "flow {:?} {label} revisits physical node {:?} at step {step}",
+                flow.id, link.target,
+            )));
+        }
+        if step + 1 < route.len() {
+            let interior = node(image, direct_target)
+                .expect("link validation established the direct route target");
             if interior.kind != NodeKind::Switch {
                 return Err(ValidationError::new(format!(
-                    "flow {:?} reverse route reaches interior {:?} node {:?} at step {step}; only Switch nodes may forward",
-                    flow.id, interior.kind, interior.id
+                    "flow {:?} {label} reaches interior {:?} node {:?} at step {step}; only Switch nodes may forward",
+                    flow.id, interior.kind, interior.id,
                 )));
             }
         }
-        expected_source = link.target;
-    }
-    if expected_source != flow.source {
-        return Err(ValidationError::new(format!(
-            "flow {:?} reverse route ends at node {:?}, expected {:?}",
-            flow.id, expected_source, flow.source
-        )));
+        expected_source = direct_target;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PhysicalLocation {
+    Host(NodeId),
+    Switch(u64),
+}
+
+fn physical_location(image: &SimulationImage, id: NodeId) -> PhysicalLocation {
+    let descriptor = node(image, id).expect("link and flow validation established the node");
+    match descriptor.kind {
+        NodeKind::Host => PhysicalLocation::Host(id),
+        NodeKind::Switch => PhysicalLocation::Switch(
+            image.switch_states[descriptor.state_slot as usize].physical_switch,
+        ),
+    }
+}
+
+fn route_target(
+    image: &SimulationImage,
+    route: &[LinkId],
+    index: usize,
+    terminal: NodeId,
+) -> Option<NodeId> {
+    route
+        .get(index + 1)
+        .and_then(|next| link(image, *next))
+        .map(|next| next.source)
+        .or_else(|| (index + 1 == route.len()).then_some(terminal))
 }
 
 fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
@@ -693,8 +697,8 @@ fn validate_scheduled_payload_sequence(
 
 fn validate_packets_and_derive_delays(
     image: &SimulationImage,
-) -> Result<BTreeMap<LinkId, u64>, ValidationError> {
-    let mut derived = BTreeMap::<LinkId, u64>::new();
+) -> Result<BTreeMap<(LinkId, NodeId), u64>, ValidationError> {
+    let mut derived = BTreeMap::<(LinkId, NodeId), u64>::new();
     for packet in &image.initial_packets {
         if packet.size_bytes == 0 {
             return Err(ValidationError::new(format!(
@@ -724,7 +728,9 @@ fn validate_packets_and_derive_delays(
             }
         }
         let mut cumulative_delay = 0_u64;
-        for link_id in packet_route(flow, packet.kind) {
+        let route = packet_route(flow, packet.kind);
+        let terminal = packet_terminal(flow, packet.kind);
+        for (index, link_id) in route.iter().enumerate() {
             let link = link(image, *link_id).expect("validated flow route names an existing link");
             let delay = link.delay_ns(packet.size_bytes).map_err(|error| {
                 ValidationError::new(format!(
@@ -739,7 +745,11 @@ fn validate_packets_and_derive_delays(
                 ))
             })?;
             derived
-                .entry(link.id)
+                .entry((
+                    link.id,
+                    route_target(image, route, index, terminal)
+                        .expect("validated route has a direct target"),
+                ))
                 .and_modify(|minimum| *minimum = (*minimum).min(delay))
                 .or_insert(delay);
         }
@@ -751,7 +761,7 @@ fn validate_packets_and_derive_delays(
             }
             let flow = flow(image, generator.flow).expect("generator validation established flow");
             let FlowGeneratorKind::Constant(constant) = generator.kind;
-            for link_id in &flow.route {
+            for (index, link_id) in flow.route.iter().enumerate() {
                 let link =
                     link(image, *link_id).expect("validated flow route names an existing link");
                 let delay = link.delay_ns(constant.packet_size_bytes).map_err(|error| {
@@ -761,7 +771,11 @@ fn validate_packets_and_derive_delays(
                     ))
                 })?;
                 derived
-                    .entry(link.id)
+                    .entry((
+                        link.id,
+                        route_target(image, &flow.route, index, flow.target)
+                            .expect("validated route has a direct target"),
+                    ))
                     .and_modify(|minimum| *minimum = (*minimum).min(delay))
                     .or_insert(delay);
             }
@@ -828,12 +842,20 @@ fn validate_owned_service_state(
         }
     }
 
+    let mut switch_egress_owners = BTreeMap::new();
     for owner in image
         .nodes
         .iter()
         .filter(|node| node.kind == NodeKind::Switch)
     {
         let state = &image.switch_states[owner.state_slot as usize];
+        if state.queues.len() > 1 {
+            return Err(ValidationError::new(format!(
+                "switch node {:?} owns {} egress queues; a switch LP may own at most one",
+                owner.id,
+                state.queues.len()
+            )));
+        }
         let mut egresses = BTreeSet::new();
         for (queue_index, queue) in state.queues.iter().enumerate() {
             match queue.scheduler {
@@ -872,6 +894,12 @@ fn validate_owned_service_state(
             if !egresses.insert(egress_id) {
                 return Err(ValidationError::new(format!(
                     "switch node {:?} has duplicate queues for egress link {egress_id:?}",
+                    owner.id
+                )));
+            }
+            if let Some(first_owner) = switch_egress_owners.insert(egress_id, owner.id) {
+                return Err(ValidationError::new(format!(
+                    "switch nodes {first_owner:?} and {:?} both own egress link {egress_id:?}",
                     owner.id
                 )));
             }
@@ -982,9 +1010,9 @@ fn validate_payload_egress(
 fn validate_channels(
     image: &SimulationImage,
     backend: Backend,
-    derived_delays: &BTreeMap<LinkId, u64>,
+    derived_delays: &BTreeMap<(LinkId, NodeId), u64>,
 ) -> Result<(), ValidationError> {
-    let mut channels_by_link = BTreeMap::<LinkId, usize>::new();
+    let mut channels_by_route = BTreeMap::<(LinkId, NodeId), usize>::new();
     for (index, channel) in image.channels.iter().enumerate() {
         let link = link(image, channel.link).ok_or_else(|| {
             ValidationError::new(format!(
@@ -992,10 +1020,22 @@ fn validate_channels(
                 channel.link
             ))
         })?;
-        if channel.source != link.source || channel.target != link.target {
+        if channel.source != link.source {
             return Err(ValidationError::new(format!(
-                "channel {index} endpoints {:?}->{:?} do not match link {:?} endpoints {:?}->{:?}",
-                channel.source, channel.target, link.id, link.source, link.target
+                "channel {index} source {:?} does not match physical link {:?} source {:?}",
+                channel.source, link.id, link.source,
+            )));
+        }
+        let target = node(image, channel.target).ok_or_else(|| {
+            ValidationError::new(format!(
+                "channel {index} names unknown target node {:?}",
+                channel.target
+            ))
+        })?;
+        if resolve_transition(target.kind, EventKind::RemoteArrival).is_none() {
+            return Err(ValidationError::new(format!(
+                "channel {index} targets {:?} node {:?}, which cannot receive RemoteArrival",
+                target.kind, target.id
             )));
         }
         if channel.event_kind != EventKind::RemoteArrival {
@@ -1004,16 +1044,16 @@ fn validate_channels(
                 channel.event_kind
             )));
         }
-        if let Some(first) = channels_by_link.insert(channel.link, index) {
+        if let Some(first) = channels_by_route.insert((channel.link, channel.target), index) {
             return Err(ValidationError::new(format!(
-                "channel {index} duplicates channel {first} for link {:?}",
-                channel.link
+                "channel {index} duplicates channel {first} for link {:?} to node {:?}",
+                channel.link, channel.target,
             )));
         }
-        let Some(derived) = derived_delays.get(&channel.link).copied() else {
+        let Some(derived) = derived_delays.get(&(channel.link, channel.target)).copied() else {
             return Err(ValidationError::new(format!(
-                "channel {index} references link {:?}, which has no possible packet emission",
-                channel.link
+                "channel {index} references link {:?} to node {:?}, which has no possible route-selected packet emission",
+                channel.link, channel.target,
             )));
         };
         if backend.is_parallel() && channel.min_delay_ns == 0 {
@@ -1029,12 +1069,12 @@ fn validate_channels(
         }
     }
 
-    for link_id in derived_delays.keys() {
-        if !channels_by_link.contains_key(link_id) {
-            let link = link(image, *link_id).expect("derived delay names a validated link");
+    for &(link_id, target) in derived_delays.keys() {
+        if !channels_by_route.contains_key(&(link_id, target)) {
+            let link = link(image, link_id).expect("derived delay names a validated link");
             return Err(ValidationError::new(format!(
                 "link {:?} can emit RemoteArrival from node {:?} to node {:?}, but no channel is declared",
-                link.id, link.source, link.target
+                link.id, link.source, target,
             )));
         }
     }
@@ -1541,8 +1581,12 @@ fn same_transmission_siblings(
     else {
         return false;
     };
+    let Some(remote_target) = packet_remote_target_after_link(image, completion.payload, egress.id)
+    else {
+        return false;
+    };
     completion.target == remote_arrival.key.origin_node
-        && remote_arrival.target == egress.target
+        && remote_arrival.target == remote_target
         && completion.key.time_ns.checked_add(egress.propagation_ns)
             == Some(remote_arrival.key.time_ns)
         && completion.key.origin_seq.checked_add(1) == Some(remote_arrival.key.origin_seq)
@@ -1584,13 +1628,17 @@ fn describe_initial_position(image: &SimulationImage, index: usize, event: crate
 fn remote_arrival_link(image: &SimulationImage, event: crate::Event) -> Option<LinkId> {
     let packet = packet(image, event.payload)?;
     let flow = flow(image, packet.flow)?;
-    packet_route(flow, packet.kind)
+    let route = packet_route(flow, packet.kind);
+    let terminal = packet_terminal(flow, packet.kind);
+    route
         .iter()
         .copied()
-        .find(|link_id| {
-            link(image, *link_id).is_some_and(|route_link| {
-                route_link.source == event.key.origin_node && route_link.target == event.target
-            })
+        .enumerate()
+        .find_map(|(index, link_id)| {
+            let route_link = link(image, link_id)?;
+            (route_link.source == event.key.origin_node
+                && route_target(image, route, index, terminal) == Some(event.target))
+            .then_some(link_id)
         })
 }
 
@@ -2068,10 +2116,29 @@ fn event_egress(image: &SimulationImage, event: &crate::Event) -> Option<LinkId>
     flow_egress_at(image, flow, packet.kind, event.target)
 }
 
+fn packet_remote_target_after_link(
+    image: &SimulationImage,
+    payload: PayloadId,
+    egress: LinkId,
+) -> Option<NodeId> {
+    let packet = packet(image, payload)?;
+    let flow = flow(image, packet.flow)?;
+    let route = packet_route(flow, packet.kind);
+    let index = route.iter().position(|link_id| *link_id == egress)?;
+    route_target(image, route, index, packet_terminal(flow, packet.kind))
+}
+
 fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
     match packet_kind {
         PacketKind::Data => &flow.route,
         PacketKind::Feedback => &flow.reverse_route,
+    }
+}
+
+fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
+    match packet_kind {
+        PacketKind::Data => flow.target,
+        PacketKind::Feedback => flow.source,
     }
 }
 

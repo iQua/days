@@ -696,6 +696,7 @@ mod tests {
                 state_slot: index as u32,
             });
             switch_states.push(SwitchState {
+                physical_switch: index as u64,
                 queues: vec![],
                 next_origin_seq: 0,
                 arrived_packets: 0,

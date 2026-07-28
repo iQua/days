@@ -39,7 +39,7 @@ pub struct HostState {
     pub received_packets: u64,
 }
 
-/// One switch-owned FIFO/TailDrop egress queue.
+/// One switch-port-owned FIFO/TailDrop egress queue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwitchQueueState {
     /// `None` is used only by terminal hand-built fixtures whose flow ends at the switch.
@@ -54,11 +54,15 @@ pub struct SwitchQueueState {
     pub tx_ready_pending: bool,
 }
 
-/// Switch-owned state containing one queue per directed egress.
+/// Switch-port-owned state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwitchState {
+    /// Stable physical topology identity shared by every egress LP of the same switch.
+    pub physical_switch: u64,
+    /// Lowered images contain exactly one queue. Hand-built images with zero queues remain useful
+    /// for terminal validation fixtures.
     pub queues: Vec<SwitchQueueState>,
-    /// One deterministic child-emission sequence shared by every queue owned by this node.
+    /// Deterministic child-emission sequence owned only by this LP.
     pub next_origin_seq: u64,
     pub arrived_packets: u64,
     pub dropped_packets: u64,
@@ -181,7 +185,10 @@ pub enum PacketKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkDescriptor {
     pub id: LinkId,
+    /// Logical process that owns transmission on this physical directed link.
     pub source: NodeId,
+    /// A logical-process representative of the physical receiving node. Packet delivery uses the
+    /// route-selected `RemoteChannel::target`, which may be another egress LP at that same switch.
     pub target: NodeId,
     pub rate_bps: u64,
     pub propagation_ns: u64,
@@ -204,6 +211,7 @@ impl LinkDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteChannel {
     pub source: NodeId,
+    /// Route-selected receiver LP after crossing `link`.
     pub target: NodeId,
     /// Directed physical link supplying serialization rate and propagation delay.
     pub link: LinkId,
@@ -217,9 +225,18 @@ impl RemoteChannel {
         link: LinkDescriptor,
         min_packet_size_bytes: u64,
     ) -> Result<Self, TimeError> {
+        Self::for_packet_link_to(link, link.target, min_packet_size_bytes)
+    }
+
+    /// Constructs a packet channel whose physical link feeds a route-selected downstream LP.
+    pub fn for_packet_link_to(
+        link: LinkDescriptor,
+        target: NodeId,
+        min_packet_size_bytes: u64,
+    ) -> Result<Self, TimeError> {
         Ok(Self {
             source: link.source,
-            target: link.target,
+            target,
             link: link.id,
             event_kind: EventKind::RemoteArrival,
             min_delay_ns: link.delay_ns(min_packet_size_bytes)?,

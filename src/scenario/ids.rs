@@ -7,9 +7,9 @@ use days_executor::{LinkId, NodeId};
 /// Role-tagged physical topology identity.
 ///
 /// A host attachment and its adjacent switch may share a topology number, but they are distinct
-/// semantic nodes. Variant order is part of the canonical dense-ID order.
+/// physical entities.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum NodeKey {
+pub(crate) enum PhysicalNodeKey {
     Host(u64),
     Switch(u64),
 }
@@ -17,8 +17,43 @@ pub(crate) enum NodeKey {
 /// Semantic identity of one directed physical link.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct LinkKey {
-    pub source: NodeKey,
-    pub target: NodeKey,
+    pub source: PhysicalNodeKey,
+    pub target: PhysicalNodeKey,
+}
+
+/// Semantic identity of one logical process.
+///
+/// Variant order is part of the canonical dense-ID order. A switch port is keyed by both the
+/// physical switch and its directed egress link, never by construction or enumeration order.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum LpKey {
+    Host(u64),
+    SwitchPort { switch: u64, egress: LinkKey },
+}
+
+impl LpKey {
+    pub(crate) const fn for_link_source(link: LinkKey) -> Self {
+        match link.source {
+            PhysicalNodeKey::Host(host) => Self::Host(host),
+            PhysicalNodeKey::Switch(switch) => Self::SwitchPort {
+                switch,
+                egress: link,
+            },
+        }
+    }
+
+    pub(crate) const fn for_link_target(link: LinkKey) -> Self {
+        match link.target {
+            PhysicalNodeKey::Host(host) => Self::Host(host),
+            PhysicalNodeKey::Switch(switch) => Self::SwitchPort {
+                switch,
+                egress: LinkKey {
+                    source: link.target,
+                    target: link.source,
+                },
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,13 +86,13 @@ where
 }
 
 pub(crate) struct StableIds {
-    nodes: BTreeMap<NodeKey, u64>,
+    nodes: BTreeMap<LpKey, u64>,
     links: BTreeMap<LinkKey, u64>,
 }
 
 impl StableIds {
     pub(crate) fn new(
-        nodes: impl IntoIterator<Item = NodeKey>,
+        nodes: impl IntoIterator<Item = LpKey>,
         links: impl IntoIterator<Item = LinkKey>,
     ) -> Result<Self, IdError> {
         Ok(Self {
@@ -66,7 +101,7 @@ impl StableIds {
         })
     }
 
-    pub(crate) fn node(&self, key: NodeKey) -> NodeId {
+    pub(crate) fn node(&self, key: LpKey) -> NodeId {
         NodeId(self.nodes[&key])
     }
 
@@ -74,7 +109,7 @@ impl StableIds {
         LinkId(self.links[&key])
     }
 
-    pub(crate) fn nodes(&self) -> impl Iterator<Item = (NodeKey, NodeId)> + '_ {
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = (LpKey, NodeId)> + '_ {
         self.nodes.iter().map(|(&key, &id)| (key, NodeId(id)))
     }
 
@@ -87,13 +122,12 @@ impl StableIds {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{LinkKey, NodeKey, StableIds};
+    use super::{LinkKey, LpKey, PhysicalNodeKey, StableIds};
 
     #[test]
     fn map_insertion_order_does_not_change_dense_ids() {
-        let host = NodeKey::Host(3);
-        let first_switch = NodeKey::Switch(3);
-        let second_switch = NodeKey::Switch(8);
+        let first_switch = PhysicalNodeKey::Switch(3);
+        let second_switch = PhysicalNodeKey::Switch(8);
         let forward = LinkKey {
             source: first_switch,
             target: second_switch,
@@ -102,9 +136,12 @@ mod tests {
             source: second_switch,
             target: first_switch,
         };
+        let host_lp = LpKey::Host(3);
+        let first_port = LpKey::for_link_source(forward);
+        let second_port = LpKey::for_link_source(reverse);
 
-        let first_nodes = HashMap::from([(second_switch, ()), (host, ()), (first_switch, ())]);
-        let second_nodes = HashMap::from([(first_switch, ()), (host, ()), (second_switch, ())]);
+        let first_nodes = HashMap::from([(second_port, ()), (host_lp, ()), (first_port, ())]);
+        let second_nodes = HashMap::from([(first_port, ()), (host_lp, ()), (second_port, ())]);
         let first_links = HashMap::from([(reverse, ()), (forward, ())]);
         let second_links = HashMap::from([(forward, ()), (reverse, ())]);
 

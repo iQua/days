@@ -62,6 +62,7 @@ fn valid_image() -> SimulationImage {
             },
         ],
         switch_states: vec![SwitchState {
+            physical_switch: 0,
             queues: vec![SwitchQueueState {
                 egress_link: Some(SWITCH_LINK),
                 scheduler: SchedulerKind::Fifo,
@@ -329,6 +330,27 @@ fn links_require_valid_endpoints_positive_rate_and_checked_delay() {
 
 #[test]
 fn routes_and_preloaded_service_state_must_be_executable() {
+    let mut unknown_forward_link = valid_image();
+    unknown_forward_link.flows[0].route[1] = LinkId(9);
+    assert_eq!(
+        rejection(&unknown_forward_link, Backend::Scalar),
+        "flow FlowId(0) route step 1 references unknown link LinkId(9)"
+    );
+
+    let mut unknown_reverse_link = valid_image();
+    unknown_reverse_link.links.push(LinkDescriptor {
+        id: LinkId(3),
+        source: SWITCH,
+        target: SOURCE,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    });
+    unknown_reverse_link.flows[0].reverse_route = vec![SINK_EGRESS, LinkId(9)];
+    assert_eq!(
+        rejection(&unknown_reverse_link, Backend::Scalar),
+        "flow FlowId(0) reverse route step 1 references unknown link LinkId(9)"
+    );
+
     let mut interior_host = valid_image();
     interior_host.links.push(LinkDescriptor {
         id: LinkId(3),
@@ -352,17 +374,27 @@ fn routes_and_preloaded_service_state_must_be_executable() {
         rate_bps: 8_000_000_000,
         propagation_ns: 0,
     });
-    wrong_queue.switch_states[0].queues.push(SwitchQueueState {
+    wrong_queue.switch_states[0].queues[0] = SwitchQueueState {
         egress_link: Some(other_egress),
         scheduler: SchedulerKind::Fifo,
         queue_capacity_packets: 2,
         queue: VecDeque::from([PACKET]),
         in_service: None,
         tx_ready_pending: true,
-    });
+    };
     assert_eq!(
         rejection(&wrong_queue, Backend::Scalar),
         "node NodeId(1) switch queue contains packet PayloadId(0) for egress Some(LinkId(1)), expected LinkId(3)"
+    );
+
+    let mut shared_switch_lp = valid_image();
+    let duplicate_queue = shared_switch_lp.switch_states[0].queues[0].clone();
+    shared_switch_lp.switch_states[0]
+        .queues
+        .push(duplicate_queue);
+    assert_eq!(
+        rejection(&shared_switch_lp, Backend::Scalar),
+        "switch node NodeId(1) owns 2 egress queues; a switch LP may own at most one"
     );
 }
 
@@ -372,7 +404,7 @@ fn channels_must_match_emissions_and_certified_bounds() {
     endpoints.channels[0].target = SINK;
     assert_eq!(
         rejection(&endpoints, Backend::Scalar),
-        "channel 0 endpoints NodeId(0)->NodeId(2) do not match link LinkId(0) endpoints NodeId(0)->NodeId(1)"
+        "channel 0 references link LinkId(0) to node NodeId(2), which has no possible route-selected packet emission"
     );
 
     let mut missing = valid_image();
@@ -426,20 +458,33 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
     image.channels[1].min_delay_ns = 267;
 
     let return_link = LinkId(3);
+    let return_port = NodeId(3);
+    image.nodes.push(NodeDescriptor {
+        id: return_port,
+        kind: NodeKind::Switch,
+        state_slot: 1,
+    });
     image.links.push(LinkDescriptor {
         id: return_link,
-        source: SWITCH,
+        source: return_port,
         target: SOURCE,
         rate_bps: 8_000_000_000,
         propagation_ns: 0,
     });
-    image.switch_states[0].queues.push(SwitchQueueState {
-        egress_link: Some(return_link),
-        scheduler: SchedulerKind::Fifo,
-        queue_capacity_packets: 2,
-        queue: VecDeque::new(),
-        in_service: None,
-        tx_ready_pending: false,
+    image.switch_states.push(SwitchState {
+        physical_switch: 0,
+        queues: vec![SwitchQueueState {
+            egress_link: Some(return_link),
+            scheduler: SchedulerKind::Fifo,
+            queue_capacity_packets: 2,
+            queue: VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+        }],
+        next_origin_seq: 0,
+        arrived_packets: 0,
+        dropped_packets: 0,
+        departed_packets: 0,
     });
     image.flows.push(FlowDescriptor {
         id: FlowId(1),
@@ -457,13 +502,13 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
     image.channels.extend([
         RemoteChannel {
             source: SINK,
-            target: SWITCH,
+            target: return_port,
             link: SINK_EGRESS,
             event_kind: EventKind::RemoteArrival,
             min_delay_ns: 1,
         },
         RemoteChannel {
-            source: SWITCH,
+            source: return_port,
             target: SOURCE,
             link: return_link,
             event_kind: EventKind::RemoteArrival,

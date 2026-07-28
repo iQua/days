@@ -912,7 +912,7 @@ impl<'image> TransitionState<'image> {
             node,
             event,
             ChildEmission {
-                target: link.target,
+                target: self.packet_remote_target(payload, link.id)?,
                 kind: EventKind::RemoteArrival,
                 payload,
                 time_ns: arrival_time_ns,
@@ -1157,7 +1157,7 @@ impl<'image> TransitionState<'image> {
             node,
             event,
             ChildEmission {
-                target: link.target,
+                target: self.packet_remote_target(payload, link.id)?,
                 kind: EventKind::RemoteArrival,
                 payload,
                 time_ns: arrival_time_ns,
@@ -1402,12 +1402,42 @@ impl<'image> TransitionState<'image> {
                 return Ok(Some(link.id));
             }
         }
-        if flow.target == node {
+        let terminal = match packet.kind {
+            PacketKind::Data => flow.target,
+            PacketKind::Feedback => flow.source,
+        };
+        if terminal == node {
             return Ok(None);
         }
         Err(ExecutionError::FlowRouteMiss {
             flow: flow.id,
             node,
+        })
+    }
+
+    fn packet_remote_target(
+        &self,
+        payload: PayloadId,
+        egress: LinkId,
+    ) -> Result<NodeId, ExecutionError> {
+        let packet = self.packet(payload)?;
+        let flow = self.flow(packet.flow)?;
+        let route = match packet.kind {
+            PacketKind::Data => &flow.route,
+            PacketKind::Feedback => &flow.reverse_route,
+        };
+        let Some(index) = route.iter().position(|link| *link == egress) else {
+            return Err(ExecutionError::FlowRouteMiss {
+                flow: flow.id,
+                node: self.link(egress)?.source,
+            });
+        };
+        if let Some(next) = route.get(index + 1) {
+            return Ok(self.link(*next)?.source);
+        }
+        Ok(match packet.kind {
+            PacketKind::Data => flow.target,
+            PacketKind::Feedback => flow.source,
         })
     }
 
