@@ -349,10 +349,12 @@ fn validate_config(config: CpuConfig) -> Result<(), ExecutionError> {
 
 /// Static, unclassified rounds keep deterministic LP ownership for the pool lifetime.
 ///
-/// Each command carries the horizon and the owner's fused remote inbox; each aggregate completion
-/// carries its local minimum, instrumentation, and source-worker × target-owner outbox batches.
-/// This is exactly one wake and one completion per worker per round. The command/reply channels and
-/// their bounded receive spin are per-round pool-lifecycle synchronization, never per-event work.
+/// Workers send round-tagged remote batches over direct owner channels. Completions return only
+/// local minima, instrumentation, and per-owner batch metadata; the coordinator folds the metadata
+/// and publishes each owner's exact preceding-round batch count with the next horizon or `Finish`.
+/// That count seals the inbox before the next drain or final assembly. Any worker error, panic, or
+/// channel failure aborts coordination and drops the command senders, so no partial `CpuRun`
+/// escapes.
 fn run_owned_static_cpu_with_observations(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,

@@ -2421,91 +2421,69 @@ fn randomized_small_heterogeneous_images_match_complete_global_state() {
 }
 
 #[test]
-fn cpu_worker_count_granularity_and_straggler_classification_preserve_complete_state() {
+fn cpu_configuration_matrix_preserves_complete_state_at_full_and_partial_horizons() {
     for seed in 0..128 {
         let image = heterogeneous_image(seed);
-        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        let full_expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
             .unwrap_or_else(|error| panic!("seed {seed} scalar execution failed: {error}"));
+        let cut = 1 + (seed * 17) % image.stop_time_ns;
+        let partial_expected =
+            run_scalar_with_observations(&image, Some(cut), ObservationMode::Full).unwrap_or_else(
+                |error| panic!("seed {seed}, horizon {cut} scalar execution failed: {error}"),
+            );
+        let horizons = [(None, &full_expected), (Some(cut), &partial_expected)];
 
         for static_partition in [
             StaticPartitionPolicy::Modulo,
             StaticPartitionPolicy::RouteLoad,
         ] {
-            let actual = run_cpu_with_observations(
-                &image,
-                None,
-                CpuConfig {
-                    workers: 4,
-                    granularity: ChunkGranularity::Static,
-                    static_partition,
-                    ..CpuConfig::default()
-                },
-                ObservationMode::Full,
-            )
-            .unwrap_or_else(|error| {
-                panic!("seed {seed}, static partition {static_partition:?} failed: {error}")
-            });
-            assert_eq!(
-                actual.result, expected,
-                "seed {seed}, static partition {static_partition:?}"
-            );
-        }
-
-        for workers in 1..=4 {
-            for granularity in [
-                ChunkGranularity::Static,
-                ChunkGranularity::Fixed(1),
-                ChunkGranularity::Fixed(3),
-            ] {
-                for straggler_threshold_events in [None, Some(0), Some(3)] {
-                    let config = CpuConfig {
-                        workers,
-                        granularity,
-                        straggler_threshold_events,
-                        ..CpuConfig::default()
-                    };
-                    let actual =
-                        run_cpu_with_observations(&image, None, config, ObservationMode::Full)
+            for workers in 1..=4 {
+                for granularity in [
+                    ChunkGranularity::Static,
+                    ChunkGranularity::Fixed(1),
+                    ChunkGranularity::Fixed(3),
+                ] {
+                    for straggler_threshold_events in [None, Some(0), Some(3)] {
+                        for (horizon, expected) in horizons {
+                            let config = CpuConfig {
+                                workers,
+                                granularity,
+                                static_partition,
+                                straggler_threshold_events,
+                                ..CpuConfig::default()
+                            };
+                            let actual = run_cpu_with_observations(
+                                &image,
+                                horizon,
+                                config,
+                                ObservationMode::Full,
+                            )
                             .unwrap_or_else(|error| {
                                 panic!(
-                                    "seed {seed}, workers {workers}, granularity {granularity:?}, \
-                                    threshold {straggler_threshold_events:?} failed: {error}"
+                                    "seed {seed}, horizon {horizon:?}, partition \
+                                    {static_partition:?}, workers {workers}, granularity \
+                                    {granularity:?}, threshold {straggler_threshold_events:?} \
+                                    failed: {error}"
                                 )
                             });
-                    let maximum_owner_batches =
-                        u64::try_from(workers * workers).expect("worker bound must fit u64");
-                    assert!(actual.rounds.iter().all(|round| {
-                        round.owner_batch_messages <= maximum_owner_batches
-                            && round.owner_batch_messages <= round.semantic.messages_exchanged
-                    }));
-                    assert_eq!(
-                        actual.result, expected,
-                        "seed {seed}, workers {workers}, granularity {granularity:?}, \
-                         threshold {straggler_threshold_events:?}"
-                    );
+                            let maximum_owner_batches = u64::try_from(workers * workers)
+                                .expect("worker bound must fit u64");
+                            assert!(actual.rounds.iter().all(|round| {
+                                round.owner_batch_messages <= maximum_owner_batches
+                                    && round.owner_batch_messages
+                                        <= round.semantic.messages_exchanged
+                            }));
+                            assert_eq!(
+                                &actual.result, expected,
+                                "seed {seed}, horizon {horizon:?}, partition \
+                                 {static_partition:?}, workers {workers}, granularity \
+                                 {granularity:?}, threshold {straggler_threshold_events:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
-
-        let cut = 1 + (seed * 17) % image.stop_time_ns;
-        let partial_expected =
-            run_scalar_with_observations(&image, Some(cut), ObservationMode::Full).unwrap();
-        let partial_actual = run_cpu_with_observations(
-            &image,
-            Some(cut),
-            CpuConfig {
-                workers: 4,
-                granularity: ChunkGranularity::Fixed(1),
-                straggler_threshold_events: Some(3),
-                ..CpuConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .unwrap();
-        assert_eq!(
-            partial_actual.result, partial_expected,
-            "partial-horizon seed {seed}"
-        );
     }
 }
 
