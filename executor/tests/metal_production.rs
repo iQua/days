@@ -1078,6 +1078,45 @@ fn metal_run_to_run_is_exactly_deterministic() {
 }
 
 #[test]
+fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
+    let image = fifo_taildrop_image();
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let ordinary = executor
+        .run_with_observations(
+            &image,
+            Some(27),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("ordinary production Metal run must succeed");
+    let profiled = executor
+        .run_with_observations_profiled(
+            &image,
+            Some(27),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("profiled production Metal run must succeed");
+
+    assert_eq!(profiled.result, ordinary.result);
+    assert_eq!(profiled.rounds, ordinary.rounds);
+    assert_eq!(profiled.transitions, ordinary.transitions);
+    assert!(ordinary.phase_profile.is_none());
+    let profile = profiled
+        .phase_profile
+        .expect("profiled run must return phase timestamps");
+    assert!(profile.estimate_complete);
+    assert_eq!(
+        profile.useful_attempts,
+        profiled.rounds + profiled.continuation_relaunches
+    );
+    assert!(profile.captured_attempts > profile.useful_attempts);
+    let estimated_ns = profile.estimated_total.total_ns();
+    assert!(estimated_ns > 0);
+    assert!(estimated_ns <= profiled.device_ns.saturating_mul(2));
+}
+
+#[test]
 fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     let image = generator_image(GeneratorTermination::Bytes(4));
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)

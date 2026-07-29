@@ -14,11 +14,14 @@ use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLComputePipelineState, MTLCounterErrorValue, MTLCounterResultTimestamp,
+    MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint,
+    MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary,
+    MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
 use crate::{
@@ -58,6 +61,9 @@ const MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER: usize = 16_384;
 const MAX_ENCODED_PAIRS_PER_WAVE: usize = 65_536;
 const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER;
 const MAX_COMMAND_BUFFERS: usize = 64;
+const PROFILED_ATTEMPTS: usize = 128;
+const PROFILE_PHASES: usize = 10;
+const PROFILE_SAMPLES_PER_ATTEMPT: usize = PROFILE_PHASES * 2;
 const HORIZON_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
@@ -75,6 +81,9 @@ const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 19;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type RawCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type RawCounterSampleBuffer = Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>;
+type RawCounterSet = Retained<ProtocolObject<dyn MTLCounterSet>>;
 type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 /// Bounded device arena reported by a production Metal capacity fault.
@@ -236,6 +245,111 @@ pub struct MetalRun {
     /// Wall time from the first encode through final device completion. Image planning, pipeline
     /// creation, and final Rust result normalization are intentionally outside this interval.
     pub wall_ns: u64,
+    /// Opt-in diagnostic timings. Normal production runs leave this `None`.
+    pub phase_profile: Option<MetalPhaseProfile>,
+}
+
+/// Dispatch-level GPU timestamp totals for one production round attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetalPhaseTimings {
+    pub horizon_ns: u64,
+    pub compaction_ns: u64,
+    pub drain_execute_ns: u64,
+    pub first_resolve_ns: u64,
+    pub completion_ns: u64,
+    pub exchange_prefix_ns: u64,
+    pub exchange_scatter_ns: u64,
+    pub target_merge_ns: u64,
+    pub second_resolve_ns: u64,
+    pub finalize_ns: u64,
+}
+
+impl MetalPhaseTimings {
+    /// Sum of all sampled dispatch intervals.
+    pub fn total_ns(self) -> u64 {
+        [
+            self.horizon_ns,
+            self.compaction_ns,
+            self.drain_execute_ns,
+            self.first_resolve_ns,
+            self.completion_ns,
+            self.exchange_prefix_ns,
+            self.exchange_scatter_ns,
+            self.target_merge_ns,
+            self.second_resolve_ns,
+            self.finalize_ns,
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
+    }
+
+    fn from_values(values: [u64; PROFILE_PHASES]) -> Self {
+        Self {
+            horizon_ns: values[0],
+            compaction_ns: values[1],
+            drain_execute_ns: values[2],
+            first_resolve_ns: values[3],
+            completion_ns: values[4],
+            exchange_prefix_ns: values[5],
+            exchange_scatter_ns: values[6],
+            target_merge_ns: values[7],
+            second_resolve_ns: values[8],
+            finalize_ns: values[9],
+        }
+    }
+
+    fn values(self) -> [u64; PROFILE_PHASES] {
+        [
+            self.horizon_ns,
+            self.compaction_ns,
+            self.drain_execute_ns,
+            self.first_resolve_ns,
+            self.completion_ns,
+            self.exchange_prefix_ns,
+            self.exchange_scatter_ns,
+            self.target_merge_ns,
+            self.second_resolve_ns,
+            self.finalize_ns,
+        ]
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self::from_values(std::array::from_fn(|index| {
+            self.values()[index].saturating_add(other.values()[index])
+        }))
+    }
+
+    fn saturating_mul(self, factor: u64) -> Self {
+        Self::from_values(self.values().map(|value| value.saturating_mul(factor)))
+    }
+
+    fn divided_by(self, divisor: u64) -> Self {
+        if divisor == 0 {
+            Self::default()
+        } else {
+            Self::from_values(self.values().map(|value| value / divisor))
+        }
+    }
+}
+
+/// Opt-in diagnostic phase decomposition from stage-boundary GPU timestamp samples.
+///
+/// The current Apple device cannot sample counters at dispatch boundaries, so profiling uses one
+/// compute pass per dispatch for the first 128 attempts. Remaining attempts use the normal encoder.
+/// `estimated_total` combines all captured useful work, the captured termination attempt, and the
+/// mean sampled no-op tail multiplied by the number of remaining encoded tail attempts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetalPhaseProfile {
+    pub timestamp_frequency_hz: u64,
+    pub encoded_attempts: u64,
+    pub captured_attempts: u64,
+    pub useful_attempts: u64,
+    pub idle_sample_attempts: u64,
+    pub estimate_complete: bool,
+    pub useful: MetalPhaseTimings,
+    pub termination: MetalPhaseTimings,
+    pub idle_mean: MetalPhaseTimings,
+    pub estimated_total: MetalPhaseTimings,
 }
 
 /// Runs the production Metal executor through the inclusive scenario stop.
@@ -296,6 +410,25 @@ impl MetalExecutor {
         )
     }
 
+    /// Runs the production backend with diagnostic stage-boundary phase timestamps enabled.
+    ///
+    /// This mode is intended for tests and benchmark evidence. It preserves simulation semantics
+    /// but splits the first 128 round attempts into separate compute passes, so its wall and device
+    /// totals are not production performance measurements.
+    pub fn run_profiled(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+    ) -> Result<MetalRun, MetalError> {
+        self.run_with_observations_profiled(
+            image,
+            exclusive_horizon_ns,
+            config,
+            ObservationMode::Summary,
+        )
+    }
+
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -303,13 +436,41 @@ impl MetalExecutor {
         config: MetalConfig,
         observation_mode: ObservationMode,
     ) -> Result<MetalRun, MetalError> {
+        self.run_with_observations_mode(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            false,
+        )
+    }
+
+    /// Full-observation counterpart of [`Self::run_profiled`].
+    pub fn run_with_observations_profiled(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        observation_mode: ObservationMode,
+    ) -> Result<MetalRun, MetalError> {
+        self.run_with_observations_mode(image, exclusive_horizon_ns, config, observation_mode, true)
+    }
+
+    fn run_with_observations_mode(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        observation_mode: ObservationMode,
+        profile: bool,
+    ) -> Result<MetalRun, MetalError> {
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
 
         let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
         let buffers = MetalBuffers::new(&self.direct.device, plan)?;
-        let timing = self.direct.run(&buffers, config)?;
+        let timing = self.direct.run(&buffers, config, profile)?;
         buffers.finish(image, observation_mode, timing)
     }
 }
@@ -1592,6 +1753,15 @@ impl MetalBuffers {
                 .collect();
         }
 
+        let phase_profile = (!timing.profiled_attempts.is_empty()).then(|| {
+            build_phase_profile(
+                &timing.profiled_attempts,
+                timing.encoded_attempts,
+                control[CONTROL_ROUNDS],
+                control[CONTROL_RELAUNCHES],
+                timing.timestamp_frequency_hz,
+            )
+        });
         Ok(MetalRun {
             result: RunResult {
                 host_states,
@@ -1615,6 +1785,7 @@ impl MetalBuffers {
             host_encode_submit_ns: timing.host_encode_submit_ns,
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
+            phase_profile,
         })
     }
 }
@@ -1894,7 +2065,12 @@ impl DirectMetal {
         })
     }
 
-    fn run(&self, buffers: &MetalBuffers, config: MetalConfig) -> Result<MetalTiming, MetalError> {
+    fn run(
+        &self,
+        buffers: &MetalBuffers,
+        config: MetalConfig,
+        profile: bool,
+    ) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
         let execution_width = self.round_pipeline.threadExecutionWidth();
         if !round_threads.is_multiple_of(execution_width) {
@@ -1924,6 +2100,20 @@ impl DirectMetal {
         let mut device_ns = 0_u64;
         let mut wave_boundary_syncs = 0_u64;
         let mut mid_round_wave_boundary_syncs = 0_u64;
+        let mut encoded_attempts = 0_u64;
+        let mut captured_attempts_encoded = 0_usize;
+        let mut profiled_attempts = Vec::new();
+        let timestamp_counter_set = profile.then(|| self.timestamp_counter_set()).transpose()?;
+        let timestamp_frequency_hz = if profile {
+            self.device.queryTimestampFrequency()
+        } else {
+            0
+        };
+        if profile && timestamp_frequency_hz == 0 {
+            return Err(MetalError::Unavailable(
+                "GPU timestamp frequency is zero".into(),
+            ));
+        }
         let (pairs_per_command_buffer, pairs_per_wave) =
             encoding_limits(config.rounds_per_command_buffer);
         let parallel_groups = buffers.node_count.div_ceil(round_threads).max(1);
@@ -1954,65 +2144,83 @@ impl DirectMetal {
                 let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
                     MetalError::Unavailable("command buffer creation failed".into())
                 })?;
-                let encoder = command_buffer
-                    .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
-                    .ok_or_else(|| {
-                        MetalError::Unavailable("serial compute encoder creation failed".into())
-                    })?;
-                buffers.bind(&encoder);
-                for _ in 0..encoded {
-                    encoder.setComputePipelineState(&self.horizon_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                        serial_grid,
-                        MTLSize {
-                            width: LANES,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                    encoder.setComputePipelineState(&self.prepare_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                        serial_grid,
-                        MTLSize {
-                            width: LANES,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                    encoder.setComputePipelineState(&self.round_pipeline);
-                    encoder
-                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
-                    encoder.setComputePipelineState(&self.resolve_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
-                    encoder.setComputePipelineState(&self.complete_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
-                    encoder.setComputePipelineState(&self.exchange_prefix_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
-                    encoder.setComputePipelineState(&self.exchange_scatter_pipeline);
-                    encoder
-                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
-                    encoder.setComputePipelineState(&self.exchange_merge_pipeline);
-                    encoder
-                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
-                    encoder.setComputePipelineState(&self.resolve_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
-                    encoder.setComputePipelineState(&self.finalize_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+                let captured = if timestamp_counter_set.is_some() {
+                    encoded.min(PROFILED_ATTEMPTS.saturating_sub(captured_attempts_encoded))
+                } else {
+                    0
+                };
+                let counter_buffer = if captured == 0 {
+                    None
+                } else {
+                    let sample_count = captured
+                        .checked_mul(PROFILE_SAMPLES_PER_ATTEMPT)
+                        .ok_or_else(|| {
+                            MetalError::Unavailable(
+                                "profile counter sample count overflows usize".into(),
+                            )
+                        })?;
+                    Some(
+                        self.counter_sample_buffer(
+                            timestamp_counter_set
+                                .as_deref()
+                                .expect("captured attempts require a counter set"),
+                            sample_count,
+                        )?,
+                    )
+                };
+                if let Some(counter_buffer) = counter_buffer.as_deref() {
+                    for attempt in 0..captured {
+                        self.encode_profiled_attempt(
+                            &command_buffer,
+                            counter_buffer,
+                            attempt * PROFILE_SAMPLES_PER_ATTEMPT,
+                            buffers,
+                            serial_grid,
+                            serial_group,
+                            parallel_grid,
+                            parallel_group,
+                        )?;
+                    }
                 }
-                encoder.endEncoding();
-                command_buffers.push(command_buffer);
+                if captured != encoded {
+                    let encoder = command_buffer
+                        .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                        .ok_or_else(|| {
+                            MetalError::Unavailable("serial compute encoder creation failed".into())
+                        })?;
+                    buffers.bind(&encoder);
+                    for _ in captured..encoded {
+                        self.encode_attempt(
+                            &encoder,
+                            serial_grid,
+                            serial_group,
+                            parallel_grid,
+                            parallel_group,
+                        );
+                    }
+                    encoder.endEncoding();
+                }
+                command_buffers.push(ProfiledCommandBuffer {
+                    command_buffer,
+                    counter_buffer,
+                    captured_attempts: captured,
+                });
+                captured_attempts_encoded = captured_attempts_encoded.saturating_add(captured);
+                encoded_attempts = encoded_attempts.saturating_add(encoded as u64);
                 wave_remaining -= encoded;
             }
-            for command_buffer in &command_buffers {
-                command_buffer.commit();
+            for encoded in &command_buffers {
+                encoded.command_buffer.commit();
             }
             host_encode_submit_ns =
                 host_encode_submit_ns.saturating_add(duration_ns(wave_started.elapsed()));
             command_buffers
                 .last()
                 .expect("nonzero wave produces a command buffer")
+                .command_buffer
                 .waitUntilCompleted();
-            for command_buffer in &command_buffers {
+            for encoded in &command_buffers {
+                let command_buffer = &encoded.command_buffer;
                 if command_buffer.status() != MTLCommandBufferStatus::Completed {
                     let detail = command_buffer
                         .error()
@@ -2031,6 +2239,12 @@ impl DirectMetal {
                     )));
                 }
                 device_ns = device_ns.saturating_add(seconds_ns(end - start));
+                if let Some(counter_buffer) = encoded.counter_buffer.as_deref() {
+                    profiled_attempts.extend(resolve_profile_attempts(
+                        counter_buffer,
+                        encoded.captured_attempts,
+                    )?);
+                }
             }
             wave_boundary_syncs = wave_boundary_syncs.saturating_add(1);
             remaining -= wave_rounds;
@@ -2051,7 +2265,151 @@ impl DirectMetal {
             wall_ns,
             wave_boundary_syncs,
             mid_round_wave_boundary_syncs,
+            encoded_attempts,
+            timestamp_frequency_hz,
+            profiled_attempts,
         })
+    }
+
+    fn encode_attempt(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        serial_grid: MTLSize,
+        serial_group: MTLSize,
+        parallel_grid: MTLSize,
+        parallel_group: MTLSize,
+    ) {
+        let horizon_group = MTLSize {
+            width: LANES,
+            height: 1,
+            depth: 1,
+        };
+        encoder.setComputePipelineState(&self.horizon_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, horizon_group);
+        encoder.setComputePipelineState(&self.prepare_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, horizon_group);
+        encoder.setComputePipelineState(&self.round_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+        encoder.setComputePipelineState(&self.resolve_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+        encoder.setComputePipelineState(&self.complete_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+        encoder.setComputePipelineState(&self.exchange_prefix_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+        encoder.setComputePipelineState(&self.exchange_scatter_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+        encoder.setComputePipelineState(&self.exchange_merge_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+        encoder.setComputePipelineState(&self.resolve_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+        encoder.setComputePipelineState(&self.finalize_pipeline);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_profiled_attempt(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        counter_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
+        first_sample: usize,
+        buffers: &MetalBuffers,
+        serial_grid: MTLSize,
+        serial_group: MTLSize,
+        parallel_grid: MTLSize,
+        parallel_group: MTLSize,
+    ) -> Result<(), MetalError> {
+        let horizon_group = MTLSize {
+            width: LANES,
+            height: 1,
+            depth: 1,
+        };
+        let phases = [
+            (&self.horizon_pipeline, serial_grid, horizon_group),
+            (&self.prepare_pipeline, serial_grid, horizon_group),
+            (&self.round_pipeline, parallel_grid, parallel_group),
+            (&self.resolve_pipeline, serial_grid, serial_group),
+            (&self.complete_pipeline, serial_grid, serial_group),
+            (&self.exchange_prefix_pipeline, serial_grid, serial_group),
+            (
+                &self.exchange_scatter_pipeline,
+                parallel_grid,
+                parallel_group,
+            ),
+            (&self.exchange_merge_pipeline, parallel_grid, parallel_group),
+            (&self.resolve_pipeline, serial_grid, serial_group),
+            (&self.finalize_pipeline, serial_grid, serial_group),
+        ];
+        for (phase, (pipeline, grid, group)) in phases.into_iter().enumerate() {
+            let descriptor = MTLComputePassDescriptor::new();
+            descriptor.setDispatchType(MTLDispatchType::Serial);
+            let attachment = unsafe {
+                descriptor
+                    .sampleBufferAttachments()
+                    .objectAtIndexedSubscript(0)
+            };
+            attachment.setSampleBuffer(Some(counter_buffer));
+            let sample = first_sample + phase * 2;
+            unsafe {
+                attachment.setStartOfEncoderSampleIndex(sample);
+                attachment.setEndOfEncoderSampleIndex(sample + 1);
+            }
+            let encoder = command_buffer
+                .computeCommandEncoderWithDescriptor(&descriptor)
+                .ok_or_else(|| {
+                    MetalError::Unavailable("profile compute encoder creation failed".into())
+                })?;
+            buffers.bind(&encoder);
+            encoder.setComputePipelineState(pipeline);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+            encoder.endEncoding();
+        }
+        Ok(())
+    }
+
+    fn timestamp_counter_set(&self) -> Result<RawCounterSet, MetalError> {
+        if !self
+            .device
+            .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+        {
+            return Err(MetalError::Unavailable(
+                "device does not support stage-boundary counter sampling".into(),
+            ));
+        }
+        let sets = self
+            .device
+            .counterSets()
+            .ok_or_else(|| MetalError::Unavailable("device exposes no counter sets".into()))?;
+        let expected = unsafe { MTLCommonCounterSetTimestamp }.to_string();
+        for index in 0..sets.count() {
+            let set = sets.objectAtIndex(index);
+            if set.name().to_string() == expected {
+                return Ok(set);
+            }
+        }
+        Err(MetalError::Unavailable(
+            "device exposes no timestamp counter set".into(),
+        ))
+    }
+
+    fn counter_sample_buffer(
+        &self,
+        counter_set: &ProtocolObject<dyn MTLCounterSet>,
+        sample_count: usize,
+    ) -> Result<RawCounterSampleBuffer, MetalError> {
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(counter_set));
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        unsafe {
+            descriptor.setSampleCount(sample_count);
+        }
+        self.device
+            .newCounterSampleBufferWithDescriptor_error(&descriptor)
+            .map_err(|error| {
+                MetalError::Unavailable(format!(
+                    "counter sample buffer creation failed: {}",
+                    error.localizedDescription()
+                ))
+            })
     }
 }
 
@@ -2083,12 +2441,129 @@ fn create_pipeline(
         })
 }
 
+struct ProfiledCommandBuffer {
+    command_buffer: RawCommandBuffer,
+    counter_buffer: Option<RawCounterSampleBuffer>,
+    captured_attempts: usize,
+}
+
 struct MetalTiming {
     host_encode_submit_ns: u64,
     device_ns: u64,
     wall_ns: u64,
     wave_boundary_syncs: u64,
     mid_round_wave_boundary_syncs: u64,
+    encoded_attempts: u64,
+    timestamp_frequency_hz: u64,
+    profiled_attempts: Vec<MetalPhaseTimings>,
+}
+
+fn resolve_profile_attempts(
+    counter_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
+    attempts: usize,
+) -> Result<Vec<MetalPhaseTimings>, MetalError> {
+    let sample_count = attempts
+        .checked_mul(PROFILE_SAMPLES_PER_ATTEMPT)
+        .ok_or_else(|| MetalError::Unavailable("profile sample count overflows usize".into()))?;
+    let data = unsafe { counter_buffer.resolveCounterRange(NSRange::new(0, sample_count)) }
+        .ok_or_else(|| MetalError::Unavailable("counter sample resolution failed".into()))?;
+    let expected_bytes = sample_count
+        .checked_mul(std::mem::size_of::<MTLCounterResultTimestamp>())
+        .ok_or_else(|| MetalError::Unavailable("profile byte count overflows usize".into()))?;
+    if data.length() != expected_bytes {
+        return Err(MetalError::Unavailable(format!(
+            "counter sample resolution returned {} bytes, expected {expected_bytes}",
+            data.length()
+        )));
+    }
+    let mut samples = vec![MTLCounterResultTimestamp { timestamp: 0 }; sample_count];
+    if expected_bytes != 0 {
+        let destination = std::ptr::NonNull::new(samples.as_mut_ptr().cast())
+            .expect("nonempty sample allocation has a nonnull pointer");
+        unsafe {
+            data.getBytes_length(destination, expected_bytes);
+        }
+    }
+    samples
+        .chunks_exact(PROFILE_SAMPLES_PER_ATTEMPT)
+        .map(|attempt| {
+            let mut values = [0_u64; PROFILE_PHASES];
+            for (phase, value) in values.iter_mut().enumerate() {
+                let start = attempt[phase * 2].timestamp;
+                let end = attempt[phase * 2 + 1].timestamp;
+                if start == 0
+                    || end == 0
+                    || start == MTLCounterErrorValue
+                    || end == MTLCounterErrorValue
+                    || end < start
+                {
+                    return Err(MetalError::Unavailable(format!(
+                        "invalid phase timestamp range {start}..{end}"
+                    )));
+                }
+                // Resolved counter timestamps use `MTLTimestamp`, whose unit is nanoseconds.
+                *value = end - start;
+            }
+            Ok(MetalPhaseTimings::from_values(values))
+        })
+        .collect()
+}
+
+fn build_phase_profile(
+    attempts: &[MetalPhaseTimings],
+    encoded_attempts: u64,
+    rounds: u64,
+    continuation_relaunches: u64,
+    timestamp_frequency_hz: u64,
+) -> MetalPhaseProfile {
+    let useful_attempts = rounds.saturating_add(continuation_relaunches);
+    let captured_useful = usize::try_from(useful_attempts)
+        .unwrap_or(usize::MAX)
+        .min(attempts.len());
+    let useful = attempts[..captured_useful].iter().copied().fold(
+        MetalPhaseTimings::default(),
+        MetalPhaseTimings::saturating_add,
+    );
+    let captured_all_useful = captured_useful as u64 == useful_attempts;
+    let captured_termination = captured_all_useful && attempts.len() > captured_useful;
+    let termination = if captured_termination {
+        attempts[captured_useful]
+    } else {
+        MetalPhaseTimings::default()
+    };
+    let idle_start = captured_useful.saturating_add(usize::from(captured_termination));
+    let idle_samples = attempts.get(idle_start..).unwrap_or_default();
+    let idle_sum = idle_samples.iter().copied().fold(
+        MetalPhaseTimings::default(),
+        MetalPhaseTimings::saturating_add,
+    );
+    let idle_mean = idle_sum.divided_by(idle_samples.len() as u64);
+    let encoded_idle = encoded_attempts
+        .saturating_sub(useful_attempts)
+        .saturating_sub(u64::from(captured_termination));
+    let estimate_complete = captured_termination && (encoded_idle == 0 || !idle_samples.is_empty());
+    let estimated_total = if estimate_complete {
+        useful
+            .saturating_add(termination)
+            .saturating_add(idle_mean.saturating_mul(encoded_idle))
+    } else {
+        attempts.iter().copied().fold(
+            MetalPhaseTimings::default(),
+            MetalPhaseTimings::saturating_add,
+        )
+    };
+    MetalPhaseProfile {
+        timestamp_frequency_hz,
+        encoded_attempts,
+        captured_attempts: attempts.len() as u64,
+        useful_attempts,
+        idle_sample_attempts: idle_samples.len() as u64,
+        estimate_complete,
+        useful,
+        termination,
+        idle_mean,
+        estimated_total,
+    }
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -2104,7 +2579,8 @@ fn seconds_ns(seconds: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, encoding_limits,
+        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalPhaseTimings,
+        PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS, build_phase_profile, encoding_limits,
     };
 
     #[test]
@@ -2117,5 +2593,39 @@ mod tests {
             )
         );
         assert_eq!(encoding_limits(1), (1, 64));
+    }
+
+    #[test]
+    fn phase_profile_separates_useful_termination_and_idle_tail_attempts() {
+        let attempts = [1_u64, 2, 3, 4].map(|value| MetalPhaseTimings::from_values([value; 10]));
+        let profile = build_phase_profile(&attempts, 10, 2, 0, 24_000_000);
+
+        assert!(profile.estimate_complete);
+        assert_eq!(profile.useful_attempts, 2);
+        assert_eq!(profile.idle_sample_attempts, 1);
+        assert_eq!(profile.useful.horizon_ns, 3);
+        assert_eq!(profile.termination.horizon_ns, 3);
+        assert_eq!(profile.idle_mean.horizon_ns, 4);
+        assert_eq!(profile.estimated_total.horizon_ns, 34);
+    }
+
+    #[test]
+    fn phase_profile_capture_fits_the_device_sample_buffer_limit() {
+        assert!(PROFILED_ATTEMPTS * PROFILE_SAMPLES_PER_ATTEMPT <= 4_096);
+    }
+
+    #[test]
+    fn phase_profile_does_not_invent_an_uncaptured_termination_attempt() {
+        let attempts = vec![MetalPhaseTimings::from_values([1; 10]); PROFILED_ATTEMPTS];
+        let profile = build_phase_profile(
+            &attempts,
+            PROFILED_ATTEMPTS as u64 + 1,
+            PROFILED_ATTEMPTS as u64,
+            0,
+            24_000_000,
+        );
+
+        assert!(!profile.estimate_complete);
+        assert_eq!(profile.termination, MetalPhaseTimings::default());
     }
 }

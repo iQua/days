@@ -2895,6 +2895,51 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
     }
 }
 
+fn multiple_high_lp_image(node_count: usize) -> SimulationImage {
+    assert!(node_count > 1_026);
+    let mut image = high_lp_only_image(node_count);
+    let source = NodeId(1_025);
+    let sink = NodeId(node_count as u64 - 1);
+    let flow = FlowId(1);
+    let link = image.links[source.0 as usize];
+    let packet =
+        PayloadId::from_node_sequence(source, node_count as u64, 0).expect("payload ID must fit");
+
+    image.host_states[source.0 as usize].next_origin_seq = 1;
+    image.flows.push(FlowDescriptor {
+        id: flow,
+        source,
+        target: sink,
+        route: vec![link.id],
+        reverse_route: vec![],
+    });
+    image.initial_packets.push(PacketDescriptor {
+        id: packet,
+        flow,
+        size_bytes: 1,
+        kind: PacketKind::Data,
+    });
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image
+        .channels
+        .push(RemoteChannel::for_packet_link(link, 1).expect("forward channel delay must fit"));
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::PacketArrival),
+            origin_node: source,
+            origin_seq: 0,
+        },
+        target: source,
+        kind: EventKind::PacketArrival,
+        payload: packet,
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image
+}
+
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
 fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
@@ -2908,6 +2953,31 @@ fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
             .expect("wide Metal image must run");
 
     assert_eq!(expected.summary.received_packets, 1);
+    assert_eq!(actual.result, expected);
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn production_metal_horizon_scans_multiple_active_lps_beyond_1024_lanes() {
+    let image = multiple_high_lp_image(2_000);
+    assert_eq!(image.initial_events.len(), 2);
+    assert!(
+        image
+            .initial_events
+            .iter()
+            .all(|event| event.target.0 > 1_024)
+    );
+    assert_ne!(
+        image.initial_events[0].target,
+        image.initial_events[1].target
+    );
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("wide scalar oracle must run");
+    let actual =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("wide Metal image must run");
+
+    assert_eq!(expected.summary.received_packets, 2);
     assert_eq!(actual.result, expected);
 }
 

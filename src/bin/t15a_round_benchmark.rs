@@ -177,6 +177,11 @@ fn main() {
         }
     }
 
+    fn after_same_kind_predecessor(mut run: impl FnMut() -> Measurement) -> Measurement {
+        let _ = run();
+        run()
+    }
+
     let mut arguments = std::env::args().skip(1);
     let relative = arguments.next().unwrap_or_else(|| {
         "configs/benchmarks/width_via_load_full/fattree_k32_load_10.toml".into()
@@ -230,17 +235,17 @@ fn main() {
         };
         let ordered = if order == "cpu_first" {
             [
-                scalar(&image),
-                cpu(&image, 4),
-                cpu(&image, 18),
-                metal(&executor, &image, threadgroup_width),
+                after_same_kind_predecessor(|| scalar(&image)),
+                after_same_kind_predecessor(|| cpu(&image, 4)),
+                after_same_kind_predecessor(|| cpu(&image, 18)),
+                after_same_kind_predecessor(|| metal(&executor, &image, threadgroup_width)),
             ]
         } else {
             [
-                metal(&executor, &image, threadgroup_width),
-                scalar(&image),
-                cpu(&image, 4),
-                cpu(&image, 18),
+                after_same_kind_predecessor(|| metal(&executor, &image, threadgroup_width)),
+                after_same_kind_predecessor(|| scalar(&image)),
+                after_same_kind_predecessor(|| cpu(&image, 4)),
+                after_same_kind_predecessor(|| cpu(&image, 18)),
             ]
         };
         for mut measurement in ordered {
