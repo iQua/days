@@ -1,10 +1,124 @@
 #![cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 
 use days_executor::metal_spike::{
-    ACTIVE_PORT_LPS, DEFAULT_SWEEP_POINTS, MetalSpikeBenchmarkConfig, REDUCTION_LANES, SweepPoint,
-    benchmark_metal, matched_workload_profile, run_metal_correctness_suite,
-    scaled_workload_profile, sweep_geometry,
+    ACTIVE_PORT_LPS, DEFAULT_SWEEP_POINTS, MetalSpikeBenchmarkConfig, REDUCTION_LANES,
+    RealReplayBenchmarkConfig, RealReplayLp, RealReplayRound, RealReplayTrace, ReplayStep,
+    SweepPoint, benchmark_metal, benchmark_real_replay, matched_workload_profile,
+    run_metal_correctness_suite, scaled_workload_profile, sweep_geometry,
 };
+use days_executor::{EventKind, NodeId};
+
+#[test]
+fn real_replay_step_retains_kind_order_children_and_queue_occupancy() {
+    let step = ReplayStep::new(EventKind::TxReady, true, 2, 1, Some(100))
+        .expect("the v1 fixture fits the packed replay step");
+
+    assert_eq!(step.kind(), EventKind::TxReady);
+    assert!(step.is_direct_continuation());
+    assert_eq!(step.local_fel_pushes(), 2);
+    assert_eq!(step.remote_outbox_writes(), 1);
+    assert_eq!(step.queue_occupancy(), Some(100));
+
+    let remote = ReplayStep::new(EventKind::RemoteArrival, false, 0, 0, None)
+        .expect("a non-TxReady step has no queue observation");
+    assert_eq!(remote.kind(), EventKind::RemoteArrival);
+    assert_eq!(remote.queue_occupancy(), None);
+}
+
+#[test]
+fn skewed_real_trace_replay_matches_persistent_cpu_and_metal() {
+    let steps = vec![
+        ReplayStep::new(EventKind::RemoteArrival, false, 1, 0, None).unwrap(),
+        ReplayStep::new(EventKind::TxComplete, false, 0, 0, None).unwrap(),
+        ReplayStep::new(EventKind::TxReady, true, 1, 1, Some(3)).unwrap(),
+        ReplayStep::new(EventKind::PacketArrival, false, 1, 0, None).unwrap(),
+        ReplayStep::new(EventKind::TxReady, false, 2, 2, Some(1)).unwrap(),
+    ];
+    let trace = RealReplayTrace {
+        source_round_count: 2,
+        rounds: vec![
+            RealReplayRound {
+                source_round: 0,
+                frontier_ns: 10,
+                exclusive_horizon_ns: 20,
+                events_processed: 4,
+                active_lp_count: 2,
+                maximum_events_per_lp: 3,
+                parallel_efficiency: 2.0 / 3.0,
+                lp_start: 0,
+                lp_count: 2,
+            },
+            RealReplayRound {
+                source_round: 1,
+                frontier_ns: 20,
+                exclusive_horizon_ns: 30,
+                events_processed: 1,
+                active_lp_count: 1,
+                maximum_events_per_lp: 1,
+                parallel_efficiency: 1.0,
+                lp_start: 2,
+                lp_count: 1,
+            },
+        ],
+        lps: vec![
+            RealReplayLp {
+                node: NodeId(3),
+                pending_events_below_horizon: 2,
+                next_time_ns_after_local_drain: 30,
+                step_start: 0,
+                step_count: 3,
+            },
+            RealReplayLp {
+                node: NodeId(7),
+                pending_events_below_horizon: 1,
+                next_time_ns_after_local_drain: 32,
+                step_start: 3,
+                step_count: 1,
+            },
+            RealReplayLp {
+                node: NodeId(3),
+                pending_events_below_horizon: 1,
+                next_time_ns_after_local_drain: 40,
+                step_start: 4,
+                step_count: 1,
+            },
+        ],
+        steps,
+    };
+    trace.validate().unwrap();
+    let warmup = trace.selected_rounds(&[0]).unwrap();
+    let measured = trace.selected_rounds(&[0, 1]).unwrap();
+
+    let report = benchmark_real_replay(
+        &warmup,
+        &measured,
+        RealReplayBenchmarkConfig {
+            samples: 3,
+            rounds_per_encoding: 1_024,
+            cpu_worker_counts: vec![1, 2],
+        },
+    )
+    .expect("the exact skewed trace should match on CPU and Metal");
+
+    assert_eq!(report.rounds, 2);
+    assert_eq!(report.samples.len(), 3);
+    assert_eq!(report.cpu_worker_counts, vec![1, 2]);
+    assert!(report.matched_checksums);
+    assert!(report.no_host_sync_between_rounds);
+    assert_eq!(
+        report.resident_parent_stream_bytes,
+        measured.steps.len() * 88
+    );
+    assert_eq!(report.local_fel_fused_bytes, report.padded_lanes * 2 * 88);
+    assert_eq!(
+        report.remote_outbox_fused_bytes,
+        report.padded_lanes * 2 * 88
+    );
+    assert!(report.trace_consistent_horizon_dependency);
+    assert!(report.variable_active_lp_guard);
+    assert_eq!(report.profile.minimum_active_lps, 1);
+    assert_eq!(report.profile.maximum_active_lps, 2);
+}
 
 #[test]
 fn matched_workload_carries_the_measured_k32_round_profile() {

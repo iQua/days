@@ -21,6 +21,8 @@ use objc2_metal::{
     MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
+use crate::{EventKind, NodeId};
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
@@ -58,9 +60,487 @@ const ERROR_NONE: u32 = 0;
 const ERROR_ZERO_OCCUPANCY: u32 = 1;
 const ERROR_OUTBOX_OVERFLOW: u32 = 2;
 const ERROR_TRANSITION_OVERFLOW: u32 = 3;
+const REAL_ERROR_KEY_OUTSIDE_HORIZON: u32 = 1 << 0;
+const REAL_ERROR_HORIZON_STATE_MISMATCH: u32 = 1 << 1;
+const REAL_ERROR_EVENT_KIND_MISMATCH: u32 = 1 << 2;
+const REAL_ERROR_KEY_ORDER_MISMATCH: u32 = 1 << 3;
+const REAL_ERROR_MINIMUM_MISMATCH: u32 = 1 << 4;
+const REPLAY_KIND_MASK: u32 = 0b11;
+const REPLAY_DIRECT_CONTINUATION_BIT: u32 = 1 << 2;
+const REPLAY_LOCAL_PUSH_SHIFT: u32 = 3;
+const REPLAY_REMOTE_WRITE_SHIFT: u32 = 7;
+const REPLAY_CHILD_COUNT_MASK: u32 = 0b1111;
+const REPLAY_QUEUE_PRESENT_BIT: u32 = 1 << 11;
+const REPLAY_QUEUE_SHIFT: u32 = 12;
+const REPLAY_QUEUE_MASK: u32 = u16::MAX as u32;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// One exact transition from a recorded real-image LP drain, packed for resident replay.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReplayStep(u32);
+
+impl ReplayStep {
+    pub fn new(
+        kind: EventKind,
+        direct_continuation: bool,
+        local_fel_pushes: u8,
+        remote_outbox_writes: u8,
+        queue_occupancy: Option<u16>,
+    ) -> Result<Self, MetalSpikeError> {
+        if local_fel_pushes > REPLAY_CHILD_COUNT_MASK as u8
+            || remote_outbox_writes > REPLAY_CHILD_COUNT_MASK as u8
+        {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "one replay step supports at most 15 local and 15 remote children",
+            ));
+        }
+        if (kind == EventKind::TxReady) != queue_occupancy.is_some() {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "only TxReady replay steps carry a queue occupancy",
+            ));
+        }
+        let mut packed = kind as u32;
+        if direct_continuation {
+            packed |= REPLAY_DIRECT_CONTINUATION_BIT;
+        }
+        packed |= u32::from(local_fel_pushes) << REPLAY_LOCAL_PUSH_SHIFT;
+        packed |= u32::from(remote_outbox_writes) << REPLAY_REMOTE_WRITE_SHIFT;
+        if let Some(queue_occupancy) = queue_occupancy {
+            packed |= REPLAY_QUEUE_PRESENT_BIT;
+            packed |= u32::from(queue_occupancy) << REPLAY_QUEUE_SHIFT;
+        }
+        Ok(Self(packed))
+    }
+
+    pub fn kind(self) -> EventKind {
+        match self.0 & REPLAY_KIND_MASK {
+            0 => EventKind::PacketArrival,
+            1 => EventKind::TxReady,
+            2 => EventKind::TxComplete,
+            3 => EventKind::RemoteArrival,
+            _ => unreachable!("the two-bit replay kind is exhaustive"),
+        }
+    }
+
+    pub const fn is_direct_continuation(self) -> bool {
+        self.0 & REPLAY_DIRECT_CONTINUATION_BIT != 0
+    }
+
+    pub const fn local_fel_pushes(self) -> u8 {
+        ((self.0 >> REPLAY_LOCAL_PUSH_SHIFT) & REPLAY_CHILD_COUNT_MASK) as u8
+    }
+
+    pub const fn remote_outbox_writes(self) -> u8 {
+        ((self.0 >> REPLAY_REMOTE_WRITE_SHIFT) & REPLAY_CHILD_COUNT_MASK) as u8
+    }
+
+    pub const fn queue_occupancy(self) -> Option<u16> {
+        if self.0 & REPLAY_QUEUE_PRESENT_BIT == 0 {
+            None
+        } else {
+            Some(((self.0 >> REPLAY_QUEUE_SHIFT) & REPLAY_QUEUE_MASK) as u16)
+        }
+    }
+
+    const fn packed(self) -> u32 {
+        self.0
+    }
+}
+
+/// Contiguous real rounds retained from one canonical safe-horizon CPU execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayTraceCapture {
+    pub start_round: usize,
+    pub rounds: usize,
+}
+
+impl ReplayTraceCapture {
+    pub const fn contains(self, round: usize) -> bool {
+        round >= self.start_round && round < self.start_round.saturating_add(self.rounds)
+    }
+}
+
+/// One real image round and its CSR range in [`RealReplayTrace::lps`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RealReplayRound {
+    pub source_round: usize,
+    pub frontier_ns: u64,
+    pub exclusive_horizon_ns: u128,
+    pub events_processed: u64,
+    pub active_lp_count: usize,
+    pub maximum_events_per_lp: u32,
+    pub parallel_efficiency: f64,
+    pub lp_start: usize,
+    pub lp_count: usize,
+}
+
+/// One real LP drain and its exact transition range in [`RealReplayTrace::steps`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealReplayLp {
+    pub node: NodeId,
+    pub pending_events_below_horizon: u32,
+    pub next_time_ns_after_local_drain: u64,
+    pub step_start: usize,
+    pub step_count: usize,
+}
+
+/// Spike-only real-image replay input.
+///
+/// Image lowering and the canonical CPU transition path produce this trace. The Metal spike later
+/// consumes the same LP membership, step order, event kinds, child movement, queue occupancies,
+/// widths, and skew without claiming to execute production transition semantics on device.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RealReplayTrace {
+    pub source_round_count: usize,
+    pub rounds: Vec<RealReplayRound>,
+    pub lps: Vec<RealReplayLp>,
+    pub steps: Vec<ReplayStep>,
+}
+
+impl RealReplayTrace {
+    pub fn validate(&self) -> Result<(), MetalSpikeError> {
+        let mut expected_lp_start = 0;
+        let mut expected_step_start = 0;
+        for round in &self.rounds {
+            if round.lp_start != expected_lp_start
+                || round.lp_count != round.active_lp_count
+                || round.lp_start.saturating_add(round.lp_count) > self.lps.len()
+            {
+                return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                    "real replay round CSR bounds are invalid",
+                ));
+            }
+            let rows = &self.lps[round.lp_start..round.lp_start + round.lp_count];
+            let events = rows.iter().map(|row| row.step_count as u64).sum::<u64>();
+            let maximum = rows.iter().map(|row| row.step_count).max().unwrap_or(0);
+            if events != round.events_processed || maximum != round.maximum_events_per_lp as usize {
+                return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                    "real replay round aggregates do not match its LP rows",
+                ));
+            }
+            for row in rows {
+                if row.step_start != expected_step_start
+                    || row.step_start.saturating_add(row.step_count) > self.steps.len()
+                {
+                    return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                        "real replay LP CSR bounds are invalid",
+                    ));
+                }
+                expected_step_start += row.step_count;
+            }
+            expected_lp_start += round.lp_count;
+        }
+        if expected_lp_start != self.lps.len() || expected_step_start != self.steps.len() {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "real replay trace contains unreferenced CSR records",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn selected_rounds(&self, indices: &[usize]) -> Result<Self, MetalSpikeError> {
+        self.validate()?;
+        let mut selected = Self {
+            source_round_count: self.source_round_count,
+            ..Self::default()
+        };
+        for &index in indices {
+            let round = self
+                .rounds
+                .get(index)
+                .ok_or(MetalSpikeError::InvalidBenchmarkConfig(
+                    "selected replay round index is out of bounds",
+                ))?;
+            let lp_start = selected.lps.len();
+            for row in &self.lps[round.lp_start..round.lp_start + round.lp_count] {
+                let step_start = selected.steps.len();
+                selected.steps.extend_from_slice(
+                    &self.steps[row.step_start..row.step_start + row.step_count],
+                );
+                selected.lps.push(RealReplayLp { step_start, ..*row });
+            }
+            selected.rounds.push(RealReplayRound {
+                lp_start,
+                ..round.clone()
+            });
+        }
+        selected.validate()?;
+        Ok(selected)
+    }
+}
+
+pub(crate) struct RecordedReplayLp {
+    pub node: NodeId,
+    pub pending_events_below_horizon: u32,
+    pub next_time_ns_after_local_drain: u64,
+    pub steps: Vec<ReplayStep>,
+}
+
+pub(crate) struct RealReplayTraceBuilder {
+    capture: ReplayTraceCapture,
+    trace: RealReplayTrace,
+}
+
+impl RealReplayTraceBuilder {
+    pub(crate) fn new(capture: ReplayTraceCapture) -> Self {
+        Self {
+            capture,
+            trace: RealReplayTrace::default(),
+        }
+    }
+
+    pub(crate) const fn captures(&self, round: usize) -> bool {
+        self.capture.contains(round)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_round(
+        &mut self,
+        source_round: usize,
+        frontier_ns: u64,
+        exclusive_horizon_ns: u128,
+        events_processed: u64,
+        parallel_efficiency: f64,
+        mut rows: Vec<RecordedReplayLp>,
+    ) {
+        rows.sort_unstable_by_key(|row| row.node);
+        let lp_start = self.trace.lps.len();
+        let maximum_events_per_lp =
+            rows.iter().map(|row| row.steps.len()).max().unwrap_or(0) as u32;
+        for row in rows {
+            let step_start = self.trace.steps.len();
+            let step_count = row.steps.len();
+            self.trace.steps.extend(row.steps);
+            self.trace.lps.push(RealReplayLp {
+                node: row.node,
+                pending_events_below_horizon: row.pending_events_below_horizon,
+                next_time_ns_after_local_drain: row.next_time_ns_after_local_drain,
+                step_start,
+                step_count,
+            });
+        }
+        let lp_count = self.trace.lps.len() - lp_start;
+        self.trace.rounds.push(RealReplayRound {
+            source_round,
+            frontier_ns,
+            exclusive_horizon_ns,
+            events_processed,
+            active_lp_count: lp_count,
+            maximum_events_per_lp,
+            parallel_efficiency,
+            lp_start,
+            lp_count,
+        });
+    }
+
+    pub(crate) fn finish(mut self, source_round_count: usize) -> RealReplayTrace {
+        self.trace.source_round_count = source_round_count;
+        self.trace
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RealReplayProfile {
+    pub rounds: usize,
+    pub lp_round_records: usize,
+    pub transitions: u64,
+    pub minimum_active_lps: usize,
+    pub maximum_active_lps: usize,
+    pub mean_active_lps: f64,
+    pub mean_parallel_efficiency: f64,
+    pub mean_achievable_speedup_ceiling: f64,
+    pub maximum_events_per_lp: u32,
+    pub event_kind_counts: [u64; 4],
+    pub direct_continuations: u64,
+    pub local_fel_pushes: u64,
+    pub remote_outbox_writes: u64,
+    pub tx_ready_queue_depth_sum: u64,
+    pub tx_ready_queue_depth_max: u16,
+    pub tx_ready_empty_checks: u64,
+}
+
+pub fn real_replay_profile(trace: &RealReplayTrace) -> Result<RealReplayProfile, MetalSpikeError> {
+    trace.validate()?;
+    if trace.rounds.is_empty() {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "real replay trace must contain at least one round",
+        ));
+    }
+    let mut event_kind_counts = [0_u64; 4];
+    let mut direct_continuations = 0_u64;
+    let mut local_fel_pushes = 0_u64;
+    let mut remote_outbox_writes = 0_u64;
+    let mut tx_ready_queue_depth_sum = 0_u64;
+    let mut tx_ready_queue_depth_max = 0_u16;
+    let mut tx_ready_empty_checks = 0_u64;
+    for step in &trace.steps {
+        event_kind_counts[step.kind() as usize] += 1;
+        direct_continuations += u64::from(step.is_direct_continuation());
+        local_fel_pushes += u64::from(step.local_fel_pushes());
+        remote_outbox_writes += u64::from(step.remote_outbox_writes());
+        if let Some(depth) = step.queue_occupancy() {
+            tx_ready_queue_depth_sum += u64::from(depth);
+            tx_ready_queue_depth_max = tx_ready_queue_depth_max.max(depth);
+            tx_ready_empty_checks += u64::from(depth == 0);
+        }
+    }
+    let rounds = trace.rounds.len();
+    let sum_active = trace
+        .rounds
+        .iter()
+        .map(|round| round.active_lp_count as u128)
+        .sum::<u128>();
+    let mean_parallel_efficiency = trace
+        .rounds
+        .iter()
+        .map(|round| round.parallel_efficiency)
+        .sum::<f64>()
+        / rounds as f64;
+    let mean_achievable_speedup_ceiling = trace
+        .rounds
+        .iter()
+        .map(|round| round.active_lp_count as f64 * round.parallel_efficiency)
+        .sum::<f64>()
+        / rounds as f64;
+    Ok(RealReplayProfile {
+        rounds,
+        lp_round_records: trace.lps.len(),
+        transitions: trace.steps.len() as u64,
+        minimum_active_lps: trace
+            .rounds
+            .iter()
+            .map(|round| round.active_lp_count)
+            .min()
+            .unwrap_or(0),
+        maximum_active_lps: trace
+            .rounds
+            .iter()
+            .map(|round| round.active_lp_count)
+            .max()
+            .unwrap_or(0),
+        mean_active_lps: sum_active as f64 / rounds as f64,
+        mean_parallel_efficiency,
+        mean_achievable_speedup_ceiling,
+        maximum_events_per_lp: trace
+            .rounds
+            .iter()
+            .map(|round| round.maximum_events_per_lp)
+            .max()
+            .unwrap_or(0),
+        event_kind_counts,
+        direct_continuations,
+        local_fel_pushes,
+        remote_outbox_writes,
+        tx_ready_queue_depth_sum,
+        tx_ready_queue_depth_max,
+        tx_ready_empty_checks,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealReplayBenchmarkConfig {
+    pub samples: usize,
+    pub rounds_per_encoding: usize,
+    pub cpu_worker_counts: Vec<usize>,
+}
+
+impl Default for RealReplayBenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            samples: 3,
+            rounds_per_encoding: DEFAULT_ROUNDS_PER_ENCODING,
+            cpu_worker_counts: vec![4],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealReplaySample {
+    pub host_encode_submit_ns: u64,
+    pub device_ns: u64,
+    pub gpu_wall_ns: u64,
+    pub cpu_ns: Vec<u64>,
+    pub cpu_checksums: Vec<u64>,
+    pub gpu_checksum: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RealReplayBenchmarkReport {
+    pub substrate: &'static str,
+    pub profile: RealReplayProfile,
+    pub rounds: usize,
+    pub warmup_rounds: usize,
+    pub padded_lanes: usize,
+    pub body_threadgroups: usize,
+    pub reduction_dispatches_per_round: usize,
+    pub dispatches_per_round: usize,
+    pub rounds_per_encoding: usize,
+    pub pipeline_setup_ns: u64,
+    pub cpu_worker_counts: Vec<usize>,
+    pub samples: Vec<RealReplaySample>,
+    pub matched_checksums: bool,
+    pub no_host_sync_between_rounds: bool,
+    pub resident_parent_stream_bytes: usize,
+    pub local_fel_fused_bytes: usize,
+    pub remote_outbox_fused_bytes: usize,
+    pub trace_consistent_horizon_dependency: bool,
+    pub variable_active_lp_guard: bool,
+}
+
+impl RealReplayBenchmarkReport {
+    pub fn median_host_encode_submit_ns_per_round(&self) -> f64 {
+        median(
+            &self
+                .samples
+                .iter()
+                .map(|sample| sample.host_encode_submit_ns)
+                .collect::<Vec<_>>(),
+        ) as f64
+            / self.rounds as f64
+    }
+
+    pub fn median_device_ns_per_round(&self) -> f64 {
+        median(
+            &self
+                .samples
+                .iter()
+                .map(|sample| sample.device_ns)
+                .collect::<Vec<_>>(),
+        ) as f64
+            / self.rounds as f64
+    }
+
+    pub fn median_gpu_wall_ns_per_round(&self) -> f64 {
+        median(
+            &self
+                .samples
+                .iter()
+                .map(|sample| sample.gpu_wall_ns)
+                .collect::<Vec<_>>(),
+        ) as f64
+            / self.rounds as f64
+    }
+
+    pub fn median_cpu_ns_per_round(&self, workers: usize) -> Option<f64> {
+        let worker = self
+            .cpu_worker_counts
+            .iter()
+            .position(|candidate| *candidate == workers)?;
+        Some(
+            median(
+                &self
+                    .samples
+                    .iter()
+                    .map(|sample| sample.cpu_ns[worker])
+                    .collect::<Vec<_>>(),
+            ) as f64
+                / self.rounds as f64,
+        )
+    }
+}
 
 /// One T13c width and its bounded timing protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1009,6 +1489,648 @@ fn take_mut_prefix<'a, T>(remainder: &mut &'a mut [T], len: usize) -> &'a mut [T
     prefix
 }
 
+struct RealReplayPlan {
+    active_lps: Vec<u32>,
+    row_starts: Vec<usize>,
+    node_ids: Vec<u64>,
+    pending_events: Vec<u32>,
+    step_starts: Vec<u32>,
+    step_counts: Vec<u32>,
+    next_time_ns: Vec<u64>,
+    frontier_ns: Vec<u64>,
+    exclusive_horizon_ns: Vec<u64>,
+    steps: Vec<u32>,
+    // Deterministic spike data, not captured production payload state. There is one complete
+    // Event+Packet record per real transition so both replay paths pay resident 88-byte reads.
+    parent_fused: Vec<u64>,
+    expected_minimum_ns: Vec<u64>,
+    next_horizon_ns: Vec<u64>,
+    local_child_capacity: u32,
+    remote_child_capacity: u32,
+}
+
+impl RealReplayPlan {
+    fn new(trace: &RealReplayTrace) -> Result<Self, MetalSpikeError> {
+        trace.validate()?;
+        if trace.rounds.is_empty() {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "real replay trace must contain at least one round",
+            ));
+        }
+        let active_lps = trace
+            .rounds
+            .iter()
+            .map(|round| {
+                u32::try_from(round.active_lp_count).map_err(|_| {
+                    MetalSpikeError::InvalidBenchmarkConfig(
+                        "real replay active-LP width exceeds u32",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let step_starts = trace
+            .lps
+            .iter()
+            .map(|row| {
+                u32::try_from(row.step_start).map_err(|_| {
+                    MetalSpikeError::InvalidBenchmarkConfig("real replay step offset exceeds u32")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let step_counts = trace
+            .lps
+            .iter()
+            .map(|row| {
+                u32::try_from(row.step_count).map_err(|_| {
+                    MetalSpikeError::InvalidBenchmarkConfig(
+                        "one real replay LP step count exceeds u32",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let exclusive_horizon_ns = trace
+            .rounds
+            .iter()
+            .map(|round| {
+                u64::try_from(round.exclusive_horizon_ns).map_err(|_| {
+                    MetalSpikeError::InvalidBenchmarkConfig(
+                        "real replay horizon exceeds the u64 device domain",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let local_child_capacity = replay_child_capacity(trace, ReplayStep::local_fel_pushes)?;
+        let remote_child_capacity = replay_child_capacity(trace, ReplayStep::remote_outbox_writes)?;
+        let mut parent_fused = vec![0_u64; trace.steps.len() * FUSED_EVENT_PACKET_WORDS];
+        let mut expected_minimum_ns = Vec::with_capacity(trace.rounds.len());
+        for round in &trace.rounds {
+            let rows = &trace.lps[round.lp_start..round.lp_start + round.lp_count];
+            expected_minimum_ns.push(
+                rows.iter()
+                    .map(|row| row.next_time_ns_after_local_drain)
+                    .min()
+                    .unwrap_or(u64::MAX),
+            );
+            for row in rows {
+                for local_step in 0..row.step_count {
+                    let step_index = row.step_start + local_step;
+                    let sequence = u64::try_from(step_index).map_err(|_| {
+                        MetalSpikeError::InvalidBenchmarkConfig(
+                            "real replay parent sequence exceeds u64",
+                        )
+                    })?;
+                    let record = simulated_replay_parent(
+                        round,
+                        row,
+                        local_step,
+                        sequence,
+                        trace.steps[step_index],
+                    )?;
+                    parent_fused[step_index * FUSED_EVENT_PACKET_WORDS
+                        ..(step_index + 1) * FUSED_EVENT_PACKET_WORDS]
+                        .copy_from_slice(&record);
+                }
+            }
+        }
+        let mut next_horizon_ns = exclusive_horizon_ns
+            .iter()
+            .copied()
+            .skip(1)
+            .collect::<Vec<_>>();
+        let final_round = trace
+            .rounds
+            .last()
+            .expect("nonempty trace established a final round");
+        let final_minimum = *expected_minimum_ns
+            .last()
+            .expect("nonempty trace established a final minimum");
+        let final_lookahead = u64::try_from(
+            final_round
+                .exclusive_horizon_ns
+                .saturating_sub(u128::from(final_round.frontier_ns)),
+        )
+        .unwrap_or(u64::MAX);
+        next_horizon_ns.push(if final_minimum == u64::MAX {
+            *exclusive_horizon_ns
+                .last()
+                .expect("nonempty trace established a horizon")
+        } else {
+            final_minimum.saturating_add(final_lookahead)
+        });
+        Ok(Self {
+            active_lps,
+            row_starts: trace.rounds.iter().map(|round| round.lp_start).collect(),
+            node_ids: trace.lps.iter().map(|row| row.node.0).collect(),
+            pending_events: trace
+                .lps
+                .iter()
+                .map(|row| row.pending_events_below_horizon)
+                .collect(),
+            step_starts,
+            step_counts,
+            next_time_ns: trace
+                .lps
+                .iter()
+                .map(|row| row.next_time_ns_after_local_drain)
+                .collect(),
+            frontier_ns: trace.rounds.iter().map(|round| round.frontier_ns).collect(),
+            exclusive_horizon_ns,
+            steps: trace.steps.iter().map(|step| step.packed()).collect(),
+            parent_fused,
+            expected_minimum_ns,
+            next_horizon_ns,
+            local_child_capacity,
+            remote_child_capacity,
+        })
+    }
+
+    fn rounds(&self) -> usize {
+        self.active_lps.len()
+    }
+
+    fn maximum_active_lps(&self) -> usize {
+        self.active_lps
+            .iter()
+            .copied()
+            .map(|width| width as usize)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+fn replay_child_capacity(
+    trace: &RealReplayTrace,
+    count: fn(ReplayStep) -> u8,
+) -> Result<u32, MetalSpikeError> {
+    let maximum = trace
+        .lps
+        .iter()
+        .map(|row| {
+            trace.steps[row.step_start..row.step_start + row.step_count]
+                .iter()
+                .try_fold(0_u32, |total, step| {
+                    total.checked_add(u32::from(count(*step))).ok_or(
+                        MetalSpikeError::InvalidBenchmarkConfig(
+                            "real replay child capacity exceeds u32",
+                        ),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    Ok(maximum.max(1))
+}
+
+fn simulated_replay_parent(
+    round: &RealReplayRound,
+    row: &RealReplayLp,
+    local_step: usize,
+    sequence: u64,
+    step: ReplayStep,
+) -> Result<[u64; FUSED_EVENT_PACKET_WORDS], MetalSpikeError> {
+    let exclusive_horizon_ns = u64::try_from(round.exclusive_horizon_ns).map_err(|_| {
+        MetalSpikeError::InvalidBenchmarkConfig("real replay horizon exceeds the u64 device domain")
+    })?;
+    let time_ns = round
+        .frontier_ns
+        .saturating_add(local_step as u64)
+        .min(exclusive_horizon_ns.saturating_sub(1));
+    let payload = row.node.0.rotate_left(17) ^ sequence;
+    Ok([
+        time_ns,
+        replay_event_phase(step.kind()),
+        row.node.0,
+        sequence,
+        row.node.0,
+        step.kind() as u64,
+        payload,
+        payload,
+        sequence,
+        [64, 1_000, 1_500, 9_000][local_step % 4],
+        sequence & 1,
+    ])
+}
+
+const fn replay_event_phase(kind: EventKind) -> u64 {
+    match kind {
+        EventKind::PacketArrival | EventKind::RemoteArrival => 0,
+        EventKind::TxComplete => 1,
+        EventKind::TxReady => 2,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RealReplayState {
+    next_time: Vec<u64>,
+    device_horizon: Vec<u64>,
+    local_fel_fused: Vec<u64>,
+    remote_outbox_fused: Vec<u64>,
+    queue_head: Vec<u32>,
+    local_child_count: Vec<u32>,
+    remote_child_count: Vec<u32>,
+    errors: Vec<u32>,
+    audit: Vec<u64>,
+}
+
+impl RealReplayState {
+    fn initial(padded_lanes: usize, initial_horizon: u64, plan: &RealReplayPlan) -> Self {
+        Self {
+            next_time: vec![u64::MAX; padded_lanes],
+            device_horizon: vec![initial_horizon],
+            local_fel_fused: vec![
+                0;
+                padded_lanes
+                    * plan.local_child_capacity as usize
+                    * FUSED_EVENT_PACKET_WORDS
+            ],
+            remote_outbox_fused: vec![
+                0;
+                padded_lanes
+                    * plan.remote_child_capacity as usize
+                    * FUSED_EVENT_PACKET_WORDS
+            ],
+            queue_head: vec![0; padded_lanes],
+            local_child_count: vec![0; padded_lanes],
+            remote_child_count: vec![0; padded_lanes],
+            errors: vec![0; padded_lanes],
+            audit: vec![0; padded_lanes],
+        }
+    }
+
+    fn planes(&self) -> Vec<&[u8]> {
+        vec![
+            bytes(&self.next_time),
+            bytes(&self.device_horizon),
+            bytes(&self.local_fel_fused),
+            bytes(&self.remote_outbox_fused),
+            bytes(&self.queue_head),
+            bytes(&self.local_child_count),
+            bytes(&self.remote_child_count),
+            bytes(&self.errors),
+            bytes(&self.audit),
+        ]
+    }
+}
+
+struct RealCpuReplayShard<'a> {
+    base_lane: usize,
+    next_time: &'a mut [u64],
+    local_fel_fused: &'a mut [u64],
+    remote_outbox_fused: &'a mut [u64],
+    queue_head: &'a mut [u32],
+    local_child_count: &'a mut [u32],
+    remote_child_count: &'a mut [u32],
+    errors: &'a mut [u32],
+    audit: &'a mut [u64],
+}
+
+fn execute_real_cpu_round(
+    plan: &RealReplayPlan,
+    round: usize,
+    state: &mut RealCpuReplayShard<'_>,
+    device_horizon: u64,
+    previous_active_lps: usize,
+) -> u64 {
+    let active_lps = plan.active_lps[round] as usize;
+    let row_start = plan.row_starts[round];
+    let active_end = active_lps
+        .saturating_sub(state.base_lane)
+        .min(state.next_time.len());
+    let previous_active_end = previous_active_lps
+        .saturating_sub(state.base_lane)
+        .min(state.next_time.len());
+    for local_lane in 0..active_end {
+        let lane = state.base_lane + local_lane;
+        let row = row_start + lane;
+        let local_start =
+            local_lane * plan.local_child_capacity as usize * FUSED_EVENT_PACKET_WORDS;
+        let remote_start =
+            local_lane * plan.remote_child_capacity as usize * FUSED_EVENT_PACKET_WORDS;
+        execute_real_cpu_lp(
+            plan,
+            round,
+            row,
+            lane,
+            &mut state.local_fel_fused[local_start
+                ..local_start + plan.local_child_capacity as usize * FUSED_EVENT_PACKET_WORDS],
+            &mut state.remote_outbox_fused[remote_start
+                ..remote_start + plan.remote_child_capacity as usize * FUSED_EVENT_PACKET_WORDS],
+            &mut state.queue_head[local_lane],
+            &mut state.local_child_count[local_lane],
+            &mut state.remote_child_count[local_lane],
+            &mut state.errors[local_lane],
+            &mut state.audit[local_lane],
+            device_horizon,
+        );
+        state.next_time[local_lane] = plan.next_time_ns[row];
+    }
+    if previous_active_end > active_end {
+        for next_time in &mut state.next_time[active_end..previous_active_end] {
+            *next_time = u64::MAX;
+        }
+    }
+    state.next_time[..active_end]
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_real_cpu_lp(
+    plan: &RealReplayPlan,
+    round: usize,
+    row: usize,
+    lane: usize,
+    local_fel_fused: &mut [u64],
+    remote_outbox_fused: &mut [u64],
+    queue_head: &mut u32,
+    local_child_count: &mut u32,
+    remote_child_count: &mut u32,
+    errors: &mut u32,
+    audit: &mut u64,
+    device_horizon: u64,
+) {
+    let node = plan.node_ids[row];
+    let pending = plan.pending_events[row];
+    *local_child_count = 0;
+    *remote_child_count = 0;
+    if device_horizon != plan.exclusive_horizon_ns[round] {
+        *errors |= REAL_ERROR_HORIZON_STATE_MISMATCH;
+    }
+    let mut value = audit
+        .wrapping_add(node)
+        .wrapping_add(u64::from(pending) << 8)
+        .wrapping_add(plan.frontier_ns[round])
+        .wrapping_add(plan.exclusive_horizon_ns[round])
+        .wrapping_add(device_horizon);
+    let step_start = plan.step_starts[row] as usize;
+    let step_count = plan.step_counts[row] as usize;
+    for step_index in 0..step_count {
+        let global_step = step_start + step_index;
+        let packed = plan.steps[global_step];
+        let kind = packed & REPLAY_KIND_MASK;
+        let parent_start = global_step * FUSED_EVENT_PACKET_WORDS;
+        let parent = &plan.parent_fused[parent_start..parent_start + FUSED_EVENT_PACKET_WORDS];
+        let parent_time = parent[EVENT_TIME];
+        let parent_phase = parent[EVENT_PHASE];
+        let parent_origin = parent[EVENT_ORIGIN];
+        let parent_sequence = parent[EVENT_SEQUENCE];
+        let parent_target = parent[EVENT_TARGET];
+        let parent_kind = parent[EVENT_KIND];
+        let parent_payload = parent[EVENT_PAYLOAD];
+        let parent_packet_id = parent[PACKET_ID];
+        let parent_flow = parent[PACKET_FLOW];
+        let parent_size = parent[PACKET_SIZE];
+        let parent_packet_kind = parent[PACKET_KIND];
+        if parent_time >= plan.exclusive_horizon_ns[round] || parent_time >= device_horizon {
+            *errors |= REAL_ERROR_KEY_OUTSIDE_HORIZON;
+        }
+        if parent_kind != u64::from(kind) {
+            *errors |= REAL_ERROR_EVENT_KIND_MISMATCH;
+        }
+        if !replay_event_less_cpu(
+            parent_time,
+            parent_phase,
+            parent_origin,
+            parent_sequence,
+            parent_time,
+            parent_phase,
+            parent_origin,
+            parent_sequence.wrapping_add(1),
+        ) {
+            *errors |= REAL_ERROR_KEY_ORDER_MISMATCH;
+        }
+        value = value
+            .wrapping_add(parent_time)
+            .wrapping_add(parent_phase)
+            .wrapping_add(parent_origin)
+            .wrapping_add(parent_sequence)
+            .wrapping_add(parent_target)
+            .wrapping_add(parent_kind)
+            .wrapping_add(parent_payload)
+            .wrapping_add(parent_packet_id)
+            .wrapping_add(parent_flow)
+            .wrapping_add(parent_size)
+            .wrapping_add(parent_packet_kind);
+        if kind == EventKind::PacketArrival as u32 {
+            value ^= 0xa076_1d64_78bd_642f;
+        } else if kind == EventKind::TxReady as u32 {
+            let occupancy = (packed >> REPLAY_QUEUE_SHIFT) & REPLAY_QUEUE_MASK;
+            if occupancy == 0 {
+                value ^= 0xe703_7ed1_a0b4_28db;
+            } else {
+                *queue_head = queue_head.wrapping_add(1) % occupancy;
+                value = value
+                    .wrapping_add(u64::from(occupancy))
+                    .wrapping_add(u64::from(*queue_head));
+            }
+        } else if kind == EventKind::TxComplete as u32 {
+            value = value.wrapping_add(u64::from(pending).wrapping_mul(3));
+        } else if kind == EventKind::RemoteArrival as u32 {
+            value ^= node.wrapping_add(step_index as u64);
+        }
+        if packed & REPLAY_DIRECT_CONTINUATION_BIT != 0 {
+            value = value.wrapping_add(0x8ebc_6af0_9c88_c6e3);
+        }
+        let local_pushes = (packed >> REPLAY_LOCAL_PUSH_SHIFT) & REPLAY_CHILD_COUNT_MASK;
+        let remote_writes = (packed >> REPLAY_REMOTE_WRITE_SHIFT) & REPLAY_CHILD_COUNT_MASK;
+        for child in 0..local_pushes {
+            let slot = *local_child_count + child;
+            replay_fused_child_cpu(
+                local_fel_fused,
+                slot,
+                parent,
+                lane,
+                step_index,
+                child,
+                false,
+                &mut value,
+            );
+        }
+        *local_child_count += local_pushes;
+        for child in 0..remote_writes {
+            let slot = *remote_child_count + child;
+            replay_fused_child_cpu(
+                remote_outbox_fused,
+                slot,
+                parent,
+                lane,
+                step_index,
+                child,
+                true,
+                &mut value,
+            );
+        }
+        *remote_child_count += remote_writes;
+    }
+    *audit = value;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_event_less_cpu(
+    left_time: u64,
+    left_phase: u64,
+    left_origin: u64,
+    left_sequence: u64,
+    right_time: u64,
+    right_phase: u64,
+    right_origin: u64,
+    right_sequence: u64,
+) -> bool {
+    (left_time, left_phase, left_origin, left_sequence)
+        < (right_time, right_phase, right_origin, right_sequence)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_fused_child_cpu(
+    scratch: &mut [u64],
+    slot: u32,
+    parent: &[u64],
+    lane: usize,
+    step_index: usize,
+    child: u32,
+    remote: bool,
+    audit: &mut u64,
+) {
+    let start = slot as usize * FUSED_EVENT_PACKET_WORDS;
+    let child_payload = parent[EVENT_PAYLOAD].wrapping_add(u64::from(child) + 1);
+    let child_record = [
+        parent[EVENT_TIME].wrapping_add(u64::from(child) + 1),
+        if remote { 0 } else { 2 },
+        parent[EVENT_ORIGIN],
+        parent[EVENT_SEQUENCE]
+            .wrapping_add(u64::from(child))
+            .wrapping_add(1),
+        parent[EVENT_TARGET].wrapping_add(u64::from(remote)),
+        if remote {
+            EventKind::RemoteArrival as u64
+        } else {
+            EventKind::TxReady as u64
+        },
+        child_payload,
+        child_payload,
+        parent[PACKET_FLOW],
+        parent[PACKET_SIZE],
+        parent[PACKET_KIND],
+    ];
+    for (word, child_word) in child_record.into_iter().enumerate() {
+        scratch[start + word] = child_word;
+        *audit = audit
+            .wrapping_add(child_word)
+            .wrapping_add(lane as u64)
+            .wrapping_add(step_index as u64);
+    }
+}
+
+fn measure_real_cpu_replay(
+    state: &mut RealReplayState,
+    plan: &RealReplayPlan,
+    workers: usize,
+) -> u64 {
+    let device_horizon = AtomicU64::new(state.device_horizon[0]);
+    let worker_minima = (0..workers)
+        .map(|_| AtomicU64::new(u64::MAX))
+        .collect::<Vec<_>>();
+    let ready_barrier = Barrier::new(workers + 1);
+    let start_barrier = Barrier::new(workers + 1);
+    let finish_barrier = Barrier::new(workers + 1);
+    let round_barrier = Barrier::new(workers);
+    let shards = real_cpu_replay_shards(state, plan, workers);
+
+    let elapsed = std::thread::scope(|scope| {
+        for (worker, mut shard) in shards.into_iter().enumerate() {
+            let device_horizon = &device_horizon;
+            let worker_minima = &worker_minima;
+            let ready_barrier = &ready_barrier;
+            let start_barrier = &start_barrier;
+            let finish_barrier = &finish_barrier;
+            let round_barrier = &round_barrier;
+            scope.spawn(move || {
+                ready_barrier.wait();
+                start_barrier.wait();
+                let mut previous_active_lps = 0;
+                for round in 0..plan.rounds() {
+                    let minimum = execute_real_cpu_round(
+                        plan,
+                        round,
+                        &mut shard,
+                        device_horizon.load(Ordering::Relaxed),
+                        previous_active_lps,
+                    );
+                    previous_active_lps = plan.active_lps[round] as usize;
+                    worker_minima[worker].store(minimum, Ordering::Relaxed);
+                    round_barrier.wait();
+                    if worker == 0 {
+                        let minimum = worker_minima
+                            .iter()
+                            .map(|value| value.load(Ordering::Relaxed))
+                            .min()
+                            .unwrap_or(u64::MAX);
+                        if minimum != plan.expected_minimum_ns[round] {
+                            shard.errors[0] |= REAL_ERROR_MINIMUM_MISMATCH;
+                        }
+                        device_horizon.store(plan.next_horizon_ns[round], Ordering::Relaxed);
+                    }
+                    round_barrier.wait();
+                }
+                finish_barrier.wait();
+            });
+        }
+
+        ready_barrier.wait();
+        let started = Instant::now();
+        start_barrier.wait();
+        finish_barrier.wait();
+        started.elapsed()
+    });
+    state.device_horizon[0] = device_horizon.load(Ordering::Relaxed);
+    duration_ns(elapsed)
+}
+
+fn real_cpu_replay_shards<'state>(
+    state: &'state mut RealReplayState,
+    plan: &RealReplayPlan,
+    workers: usize,
+) -> Vec<RealCpuReplayShard<'state>> {
+    let padded_lanes = state.next_time.len();
+    let mut next_time = state.next_time.as_mut_slice();
+    let mut local_fel_fused = state.local_fel_fused.as_mut_slice();
+    let mut remote_outbox_fused = state.remote_outbox_fused.as_mut_slice();
+    let mut queue_head = state.queue_head.as_mut_slice();
+    let mut local_child_count = state.local_child_count.as_mut_slice();
+    let mut remote_child_count = state.remote_child_count.as_mut_slice();
+    let mut errors = state.errors.as_mut_slice();
+    let mut audit = state.audit.as_mut_slice();
+    let mut shards = Vec::with_capacity(workers);
+    let mut base_lane = 0;
+    for worker in 0..workers {
+        let next_end = padded_lanes * (worker + 1) / workers;
+        let lanes = next_end - base_lane;
+        shards.push(RealCpuReplayShard {
+            base_lane,
+            next_time: take_mut_prefix(&mut next_time, lanes),
+            local_fel_fused: take_mut_prefix(
+                &mut local_fel_fused,
+                lanes * plan.local_child_capacity as usize * FUSED_EVENT_PACKET_WORDS,
+            ),
+            remote_outbox_fused: take_mut_prefix(
+                &mut remote_outbox_fused,
+                lanes * plan.remote_child_capacity as usize * FUSED_EVENT_PACKET_WORDS,
+            ),
+            queue_head: take_mut_prefix(&mut queue_head, lanes),
+            local_child_count: take_mut_prefix(&mut local_child_count, lanes),
+            remote_child_count: take_mut_prefix(&mut remote_child_count, lanes),
+            errors: take_mut_prefix(&mut errors, lanes),
+            audit: take_mut_prefix(&mut audit, lanes),
+        });
+        base_lane = next_end;
+    }
+    shards
+}
+
 #[cube]
 fn cube_event_less(
     left_time: u64,
@@ -1298,6 +2420,182 @@ fn matched_round_kernel(
 }
 
 #[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn real_replay_round_kernel(
+    node_ids: &[u64],
+    pending_events: &[u32],
+    step_starts: &[u32],
+    step_counts: &[u32],
+    planned_next_time: &[u64],
+    steps: &[u32],
+    parent_fused: &[u64],
+    frontier_ns: &[u64],
+    exclusive_horizon_ns: &[u64],
+    next_time: &mut [u64],
+    device_horizon: &[u64],
+    local_fel_fused: &mut [u64],
+    remote_outbox_fused: &mut [u64],
+    queue_head: &mut [u32],
+    local_child_count: &mut [u32],
+    remote_child_count: &mut [u32],
+    errors: &mut [u32],
+    audit: &mut [u64],
+    active_lps: &[u32],
+    local_child_capacity: &[u32],
+    remote_child_capacity: &[u32],
+) {
+    let lp = ABSOLUTE_POS;
+    if lp < active_lps[0usize] as usize {
+        let node = node_ids[lp];
+        let pending = pending_events[lp];
+        local_child_count[lp] = 0u32;
+        remote_child_count[lp] = 0u32;
+        if device_horizon[0usize] != exclusive_horizon_ns[0usize] {
+            errors[lp] |= REAL_ERROR_HORIZON_STATE_MISMATCH;
+        }
+        let mut value = audit[lp]
+            + node
+            + pending as u64 * 256u64
+            + frontier_ns[0usize]
+            + exclusive_horizon_ns[0usize]
+            + device_horizon[0usize];
+        let step_start = step_starts[lp];
+        let step_count = step_counts[lp];
+        let mut step_index = 0u32;
+        while step_index < step_count {
+            let global_step = step_start + step_index;
+            let packed = steps[global_step as usize];
+            let kind = packed & REPLAY_KIND_MASK;
+            let parent = global_step as usize * FUSED_EVENT_PACKET_WORDS;
+            let parent_time = parent_fused[parent + EVENT_TIME];
+            let parent_phase = parent_fused[parent + EVENT_PHASE];
+            let parent_origin = parent_fused[parent + EVENT_ORIGIN];
+            let parent_sequence = parent_fused[parent + EVENT_SEQUENCE];
+            let parent_target = parent_fused[parent + EVENT_TARGET];
+            let parent_kind = parent_fused[parent + EVENT_KIND];
+            let parent_payload = parent_fused[parent + EVENT_PAYLOAD];
+            let parent_packet_id = parent_fused[parent + PACKET_ID];
+            let parent_flow = parent_fused[parent + PACKET_FLOW];
+            let parent_size = parent_fused[parent + PACKET_SIZE];
+            let parent_packet_kind = parent_fused[parent + PACKET_KIND];
+            if parent_time >= exclusive_horizon_ns[0usize] || parent_time >= device_horizon[0usize]
+            {
+                errors[lp] |= REAL_ERROR_KEY_OUTSIDE_HORIZON;
+            }
+            if parent_kind != kind as u64 {
+                errors[lp] |= REAL_ERROR_EVENT_KIND_MISMATCH;
+            }
+            if !cube_event_less(
+                parent_time,
+                parent_phase,
+                parent_origin,
+                parent_sequence,
+                parent_time,
+                parent_phase,
+                parent_origin,
+                parent_sequence + 1u64,
+            ) {
+                errors[lp] |= REAL_ERROR_KEY_ORDER_MISMATCH;
+            }
+            value = value
+                + parent_time
+                + parent_phase
+                + parent_origin
+                + parent_sequence
+                + parent_target
+                + parent_kind
+                + parent_payload
+                + parent_packet_id
+                + parent_flow
+                + parent_size
+                + parent_packet_kind;
+            if kind == EventKind::PacketArrival as u32 {
+                value ^= 0xa076_1d64_78bd_642fu64;
+            } else if kind == EventKind::TxReady as u32 {
+                let occupancy = (packed >> REPLAY_QUEUE_SHIFT) & REPLAY_QUEUE_MASK;
+                if occupancy == 0u32 {
+                    value ^= 0xe703_7ed1_a0b4_28dbu64;
+                } else {
+                    queue_head[lp] = (queue_head[lp] + 1u32) % occupancy;
+                    value = value + occupancy as u64 + queue_head[lp] as u64;
+                }
+            } else if kind == EventKind::TxComplete as u32 {
+                value += pending as u64 * 3u64;
+            } else if kind == EventKind::RemoteArrival as u32 {
+                value ^= node + step_index as u64;
+            }
+            if packed & REPLAY_DIRECT_CONTINUATION_BIT != 0u32 {
+                value += 0x8ebc_6af0_9c88_c6e3u64;
+            }
+
+            let local_pushes = (packed >> REPLAY_LOCAL_PUSH_SHIFT) & REPLAY_CHILD_COUNT_MASK;
+            let remote_writes = (packed >> REPLAY_REMOTE_WRITE_SHIFT) & REPLAY_CHILD_COUNT_MASK;
+            let mut child = 0u32;
+            while child < local_pushes {
+                let child_slot = local_child_count[lp] + child;
+                let slot = (lp * local_child_capacity[0usize] as usize + child_slot as usize)
+                    * FUSED_EVENT_PACKET_WORDS;
+                let child_payload = parent_payload + child as u64 + 1u64;
+                local_fel_fused[slot + EVENT_TIME] = parent_time + child as u64 + 1u64;
+                local_fel_fused[slot + EVENT_PHASE] = 2u64;
+                local_fel_fused[slot + EVENT_ORIGIN] = parent_origin;
+                local_fel_fused[slot + EVENT_SEQUENCE] = parent_sequence + child as u64 + 1u64;
+                local_fel_fused[slot + EVENT_TARGET] = parent_target;
+                local_fel_fused[slot + EVENT_KIND] = EventKind::TxReady as u64;
+                local_fel_fused[slot + EVENT_PAYLOAD] = child_payload;
+                local_fel_fused[slot + PACKET_ID] = child_payload;
+                local_fel_fused[slot + PACKET_FLOW] = parent_flow;
+                local_fel_fused[slot + PACKET_SIZE] = parent_size;
+                local_fel_fused[slot + PACKET_KIND] = parent_packet_kind;
+                let mut word = 0u32;
+                while word < FUSED_EVENT_PACKET_WORDS as u32 {
+                    value = value
+                        + local_fel_fused[slot + word as usize]
+                        + lp as u64
+                        + step_index as u64;
+                    word += 1u32;
+                }
+                child += 1u32;
+            }
+            local_child_count[lp] += local_pushes;
+            child = 0u32;
+            while child < remote_writes {
+                let child_slot = remote_child_count[lp] + child;
+                let slot = (lp * remote_child_capacity[0usize] as usize + child_slot as usize)
+                    * FUSED_EVENT_PACKET_WORDS;
+                let child_payload = parent_payload + child as u64 + 1u64;
+                remote_outbox_fused[slot + EVENT_TIME] = parent_time + child as u64 + 1u64;
+                remote_outbox_fused[slot + EVENT_PHASE] = 0u64;
+                remote_outbox_fused[slot + EVENT_ORIGIN] = parent_origin;
+                remote_outbox_fused[slot + EVENT_SEQUENCE] = parent_sequence + child as u64 + 1u64;
+                remote_outbox_fused[slot + EVENT_TARGET] = parent_target + 1u64;
+                remote_outbox_fused[slot + EVENT_KIND] = EventKind::RemoteArrival as u64;
+                remote_outbox_fused[slot + EVENT_PAYLOAD] = child_payload;
+                remote_outbox_fused[slot + PACKET_ID] = child_payload;
+                remote_outbox_fused[slot + PACKET_FLOW] = parent_flow;
+                remote_outbox_fused[slot + PACKET_SIZE] = parent_size;
+                remote_outbox_fused[slot + PACKET_KIND] = parent_packet_kind;
+                let mut word = 0u32;
+                while word < FUSED_EVENT_PACKET_WORDS as u32 {
+                    value = value
+                        + remote_outbox_fused[slot + word as usize]
+                        + lp as u64
+                        + step_index as u64;
+                    word += 1u32;
+                }
+                child += 1u32;
+            }
+            remote_child_count[lp] += remote_writes;
+            step_index += 1u32;
+        }
+        audit[lp] = value;
+        next_time[lp] = planned_next_time[lp];
+    } else {
+        next_time[lp] = u64::MAX;
+    }
+}
+
+#[cube(launch_unchecked)]
 fn block_reduction_kernel(next_time: &[u64], block_minima: &mut [u64], #[comptime] width: u32) {
     let lane = UNIT_POS as usize;
     let mut minima = Shared::<[u64]>::new_slice(width as usize);
@@ -1347,6 +2645,40 @@ fn horizon_reduction_kernel(
     }
     if UNIT_POS == 0u32 {
         horizon[0usize] = minima[0usize] + lookahead_ns;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn real_replay_horizon_reduction_kernel(
+    minima_input: &[u64],
+    horizon: &mut [u64],
+    expected_minimum: &[u64],
+    next_horizon: &[u64],
+    errors: &mut [u32],
+    #[comptime] width: u32,
+) {
+    let lane = UNIT_POS as usize;
+    let mut minima = Shared::<[u64]>::new_slice(width as usize);
+    minima[lane] = minima_input[lane];
+    sync_cube();
+
+    let stride = RuntimeCell::<u32>::new(width / 2u32);
+    while stride.read() > 0u32 {
+        let current_stride = stride.read();
+        if UNIT_POS < current_stride {
+            let right = lane + current_stride as usize;
+            if minima[right] < minima[lane] {
+                minima[lane] = minima[right];
+            }
+        }
+        sync_cube();
+        stride.store(current_stride / 2u32);
+    }
+    if UNIT_POS == 0u32 {
+        if minima[0usize] != expected_minimum[0usize] {
+            errors[0usize] |= REAL_ERROR_MINIMUM_MISMATCH;
+        }
+        horizon[0usize] = next_horizon[0usize];
     }
 }
 
@@ -1422,6 +2754,67 @@ fn generated_kernels(
         buffer,
         REDUCTION_LANES as u32,
         LOOKAHEAD_NS,
+    );
+    Ok((
+        compile_kernel(round)?,
+        compile_kernel(block_reduction)?,
+        compile_kernel(reduction)?,
+    ))
+}
+
+fn generated_real_replay_kernels()
+-> Result<(GeneratedKernel, GeneratedKernel, GeneratedKernel), MetalSpikeError> {
+    let client = MetalRuntime::client(&MetalDevice::DefaultDevice);
+    let buffer = BufferCompilationArg { inplace: None };
+    let round = real_replay_round_kernel::RealReplayRoundKernel::<MetalRuntime>::new(
+        KernelSettings::default()
+            .cube_dim(CubeDim::new_1d(REDUCTION_LANES as u32))
+            .kernel_name("real_replay_round_kernel"),
+        client.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+    );
+    let block_reduction = block_reduction_kernel::BlockReductionKernel::<MetalRuntime>::new(
+        KernelSettings::default()
+            .cube_dim(CubeDim::new_1d(REDUCTION_LANES as u32))
+            .kernel_name("block_reduction_kernel"),
+        client.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        REDUCTION_LANES as u32,
+    );
+    let reduction = real_replay_horizon_reduction_kernel::RealReplayHorizonReductionKernel::<
+        MetalRuntime,
+    >::new(
+        KernelSettings::default()
+            .cube_dim(CubeDim::new_1d(REDUCTION_LANES as u32))
+            .kernel_name("real_replay_horizon_reduction_kernel"),
+        client,
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer,
+        REDUCTION_LANES as u32,
     );
     Ok((
         compile_kernel(round)?,
@@ -1540,6 +2933,195 @@ impl MetalBuffers {
         unsafe {
             std::slice::from_raw_parts(self.planes[index].raw.contents().cast::<T>().as_ptr(), len)
                 .to_vec()
+        }
+    }
+}
+
+struct RealReplayMetalBuffers {
+    node_ids: UntypedMetalBuffer,
+    pending_events: UntypedMetalBuffer,
+    step_starts: UntypedMetalBuffer,
+    step_counts: UntypedMetalBuffer,
+    planned_next_time: UntypedMetalBuffer,
+    steps: UntypedMetalBuffer,
+    parent_fused: UntypedMetalBuffer,
+    frontier_ns: UntypedMetalBuffer,
+    exclusive_horizon_ns: UntypedMetalBuffer,
+    expected_minimum_ns: UntypedMetalBuffer,
+    next_horizon_ns: UntypedMetalBuffer,
+    active_lps: UntypedMetalBuffer,
+    local_child_capacity: UntypedMetalBuffer,
+    remote_child_capacity: UntypedMetalBuffer,
+    state: Vec<UntypedMetalBuffer>,
+    block_minima: UntypedMetalBuffer,
+    padded_lanes: usize,
+    local_child_slots: usize,
+    remote_child_slots: usize,
+}
+
+impl RealReplayMetalBuffers {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        plan: &RealReplayPlan,
+        state: &RealReplayState,
+    ) -> Result<Self, MetalSpikeError> {
+        let padded_lanes = state.next_time.len();
+        Ok(Self {
+            node_ids: UntypedMetalBuffer::new(device, bytes(&plan.node_ids))?,
+            pending_events: UntypedMetalBuffer::new(device, bytes(&plan.pending_events))?,
+            step_starts: UntypedMetalBuffer::new(device, bytes(&plan.step_starts))?,
+            step_counts: UntypedMetalBuffer::new(device, bytes(&plan.step_counts))?,
+            planned_next_time: UntypedMetalBuffer::new(device, bytes(&plan.next_time_ns))?,
+            steps: UntypedMetalBuffer::new(device, bytes(&plan.steps))?,
+            parent_fused: UntypedMetalBuffer::new(device, bytes(&plan.parent_fused))?,
+            frontier_ns: UntypedMetalBuffer::new(device, bytes(&plan.frontier_ns))?,
+            exclusive_horizon_ns: UntypedMetalBuffer::new(
+                device,
+                bytes(&plan.exclusive_horizon_ns),
+            )?,
+            expected_minimum_ns: UntypedMetalBuffer::new(device, bytes(&plan.expected_minimum_ns))?,
+            next_horizon_ns: UntypedMetalBuffer::new(device, bytes(&plan.next_horizon_ns))?,
+            active_lps: UntypedMetalBuffer::new(device, bytes(&plan.active_lps))?,
+            local_child_capacity: UntypedMetalBuffer::new(
+                device,
+                bytes(&[plan.local_child_capacity]),
+            )?,
+            remote_child_capacity: UntypedMetalBuffer::new(
+                device,
+                bytes(&[plan.remote_child_capacity]),
+            )?,
+            state: state
+                .planes()
+                .into_iter()
+                .map(|plane| UntypedMetalBuffer::new(device, plane))
+                .collect::<Result<Vec<_>, _>>()?,
+            block_minima: UntypedMetalBuffer::new(device, bytes(&vec![u64::MAX; REDUCTION_LANES]))?,
+            padded_lanes,
+            local_child_slots: plan.local_child_capacity as usize,
+            remote_child_slots: plan.remote_child_capacity as usize,
+        })
+    }
+
+    fn write_state(&self, state: &RealReplayState) {
+        let planes = state.planes();
+        assert_eq!(self.state.len(), planes.len());
+        for (buffer, contents) in self.state.iter().zip(planes) {
+            buffer.write(contents);
+        }
+    }
+
+    fn bind_round(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        plan: &RealReplayPlan,
+        round: usize,
+    ) {
+        let row_start = plan.row_starts[round];
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.node_ids.raw),
+                row_start * std::mem::size_of::<u64>(),
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.pending_events.raw),
+                row_start * std::mem::size_of::<u32>(),
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.step_starts.raw),
+                row_start * std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.step_counts.raw),
+                row_start * std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.planned_next_time.raw),
+                row_start * std::mem::size_of::<u64>(),
+                4,
+            );
+            encoder.setBuffer_offset_atIndex(Some(&self.steps.raw), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&self.parent_fused.raw), 0, 6);
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.frontier_ns.raw),
+                round * std::mem::size_of::<u64>(),
+                7,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.exclusive_horizon_ns.raw),
+                round * std::mem::size_of::<u64>(),
+                8,
+            );
+            encoder.setBuffer_offset_atIndex(Some(&self.state[0].raw), 0, 9);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[1].raw), 0, 10);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[2].raw), 0, 11);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[3].raw), 0, 12);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[4].raw), 0, 13);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[5].raw), 0, 14);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[6].raw), 0, 15);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[7].raw), 0, 16);
+            encoder.setBuffer_offset_atIndex(Some(&self.state[8].raw), 0, 17);
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.active_lps.raw),
+                round * std::mem::size_of::<u32>(),
+                18,
+            );
+            encoder.setBuffer_offset_atIndex(Some(&self.local_child_capacity.raw), 0, 19);
+            encoder.setBuffer_offset_atIndex(Some(&self.remote_child_capacity.raw), 0, 20);
+        }
+    }
+
+    fn bind_reduction_round(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        round: usize,
+    ) {
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&self.state[1].raw), 0, 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.expected_minimum_ns.raw),
+                round * std::mem::size_of::<u64>(),
+                2,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&self.next_horizon_ns.raw),
+                round * std::mem::size_of::<u64>(),
+                3,
+            );
+            encoder.setBuffer_offset_atIndex(Some(&self.state[7].raw), 0, 4);
+        }
+    }
+
+    fn read_state(&self) -> RealReplayState {
+        assert_eq!(self.state.len(), 9);
+        RealReplayState {
+            next_time: self.read_state_plane(0, self.padded_lanes),
+            device_horizon: self.read_state_plane(1, 1),
+            local_fel_fused: self.read_state_plane(
+                2,
+                self.padded_lanes * self.local_child_slots * FUSED_EVENT_PACKET_WORDS,
+            ),
+            remote_outbox_fused: self.read_state_plane(
+                3,
+                self.padded_lanes * self.remote_child_slots * FUSED_EVENT_PACKET_WORDS,
+            ),
+            queue_head: self.read_state_plane(4, self.padded_lanes),
+            local_child_count: self.read_state_plane(5, self.padded_lanes),
+            remote_child_count: self.read_state_plane(6, self.padded_lanes),
+            errors: self.read_state_plane(7, self.padded_lanes),
+            audit: self.read_state_plane(8, self.padded_lanes),
+        }
+    }
+
+    fn read_state_plane<T: Copy>(&self, index: usize, len: usize) -> Vec<T> {
+        let buffer = &self.state[index];
+        let expected = len * std::mem::size_of::<T>();
+        assert_eq!(buffer.bytes, expected);
+        unsafe {
+            std::slice::from_raw_parts(buffer.raw.contents().cast::<T>().as_ptr(), len).to_vec()
         }
     }
 }
@@ -1686,6 +3268,165 @@ impl DirectMetalSpike {
         command_buffers
             .last()
             .expect("nonzero rounds produce a command buffer")
+            .waitUntilCompleted();
+        let wall_ns = duration_ns(wall_started.elapsed());
+
+        let mut device_ns = 0_u64;
+        for command_buffer in &command_buffers {
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                let detail = command_buffer
+                    .error()
+                    .map(|error| error.localizedDescription().to_string())
+                    .unwrap_or_else(|| "no NSError detail".into());
+                return Err(MetalSpikeError::Metal(format!(
+                    "Metal command buffer status {:?}: {detail}",
+                    command_buffer.status()
+                )));
+            }
+            let start = command_buffer.GPUStartTime();
+            let end = command_buffer.GPUEndTime();
+            if !start.is_finite() || !end.is_finite() || end < start {
+                return Err(MetalSpikeError::Metal(format!(
+                    "invalid Metal GPU timestamps {start}..{end}"
+                )));
+            }
+            device_ns = device_ns.saturating_add(seconds_ns(end - start));
+        }
+        Ok(GpuSample {
+            host_encode_submit_ns,
+            device_ns,
+            wall_ns,
+        })
+    }
+}
+
+struct DirectRealReplay {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    round_pipeline: MetalPipeline,
+    block_reduction_pipeline: MetalPipeline,
+    reduction_pipeline: MetalPipeline,
+    geometry: SweepGeometry,
+    pipeline_setup_ns: u64,
+}
+
+impl DirectRealReplay {
+    fn new(maximum_active_lps: usize) -> Result<Self, MetalSpikeError> {
+        let setup_started = Instant::now();
+        let geometry = sweep_geometry(maximum_active_lps)?;
+        let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
+            MetalSpikeError::Metal("Metal system default device is unavailable".into())
+        })?;
+        let queue = device
+            .newCommandQueue()
+            .ok_or_else(|| MetalSpikeError::Metal("Metal command queue creation failed".into()))?;
+        let (round_source, block_reduction_source, reduction_source) =
+            generated_real_replay_kernels()?;
+        let round_pipeline = create_pipeline(&device, round_source)?;
+        let block_reduction_pipeline = create_pipeline(&device, block_reduction_source)?;
+        let reduction_pipeline = create_pipeline(&device, reduction_source)?;
+        for (name, pipeline) in [
+            ("real replay round", &round_pipeline),
+            ("real replay block reduction", &block_reduction_pipeline),
+            ("real replay final reduction", &reduction_pipeline),
+        ] {
+            if pipeline.maxTotalThreadsPerThreadgroup() < REDUCTION_LANES {
+                return Err(MetalSpikeError::Metal(format!(
+                    "{name} pipeline supports only {} threads per threadgroup",
+                    pipeline.maxTotalThreadsPerThreadgroup()
+                )));
+            }
+        }
+        if device.maxThreadgroupMemoryLength() < REDUCTION_THREADGROUP_BYTES {
+            return Err(MetalSpikeError::Metal(format!(
+                "device exposes only {} bytes of threadgroup memory",
+                device.maxThreadgroupMemoryLength()
+            )));
+        }
+        Ok(Self {
+            device,
+            queue,
+            round_pipeline,
+            block_reduction_pipeline,
+            reduction_pipeline,
+            geometry,
+            pipeline_setup_ns: duration_ns(setup_started.elapsed()),
+        })
+    }
+
+    fn run(
+        &self,
+        plan: &RealReplayPlan,
+        buffers: &RealReplayMetalBuffers,
+        rounds_per_encoding: usize,
+    ) -> Result<GpuSample, MetalSpikeError> {
+        let encoding_count = plan.rounds().div_ceil(rounds_per_encoding);
+        if encoding_count > MAX_OUTSTANDING_COMMAND_BUFFERS {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "real replay needs more than 64 outstanding Metal command buffers",
+            ));
+        }
+        let body_group_count = MTLSize {
+            width: self.geometry.body_threadgroups,
+            height: 1,
+            depth: 1,
+        };
+        let final_group_count = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: REDUCTION_LANES,
+            height: 1,
+            depth: 1,
+        };
+        let wall_started = Instant::now();
+        let mut command_buffers = Vec::with_capacity(encoding_count);
+        let mut next_round = 0;
+        while next_round < plan.rounds() {
+            let encoded_rounds = (plan.rounds() - next_round).min(rounds_per_encoding);
+            let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
+                MetalSpikeError::Metal("Metal command buffer creation failed".into())
+            })?;
+            let encoder = command_buffer
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                .ok_or_else(|| {
+                    MetalSpikeError::Metal("serial compute encoder creation failed".into())
+                })?;
+            for round in next_round..next_round + encoded_rounds {
+                buffers.bind_round(&encoder, plan, round);
+                encoder.setComputePipelineState(&self.round_pipeline);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(body_group_count, threadgroup);
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&buffers.state[0].raw), 0, 0);
+                }
+                if self.geometry.body_threadgroups > 1 {
+                    encoder.setComputePipelineState(&self.block_reduction_pipeline);
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.block_minima.raw), 0, 1);
+                    }
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(body_group_count, threadgroup);
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.block_minima.raw), 0, 0);
+                    }
+                }
+                buffers.bind_reduction_round(&encoder, round);
+                encoder.setComputePipelineState(&self.reduction_pipeline);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(final_group_count, threadgroup);
+            }
+            encoder.endEncoding();
+            command_buffers.push(command_buffer);
+            next_round += encoded_rounds;
+        }
+        for command_buffer in &command_buffers {
+            command_buffer.commit();
+        }
+        let host_encode_submit_ns = duration_ns(wall_started.elapsed());
+        command_buffers
+            .last()
+            .expect("nonempty real replay produces a command buffer")
             .waitUntilCompleted();
         let wall_ns = duration_ns(wall_started.elapsed());
 
@@ -1957,6 +3698,237 @@ pub fn benchmark_metal(
         workload: matched_workload_profile(),
         scales,
     })
+}
+
+/// Replays one real-image trace window through the same persistent CPU workers and direct Metal
+/// drain/reduction shape. The trace supplies real LP membership, work distribution, event-kind
+/// order, child counts, queue occupancy, skew, and next-time minima. Event/payload words are
+/// deterministic simulated 88-byte records, and all mutated state remains spike-local rather than
+/// production simulator state. Metal dispatches the fixed maximum geometry but gates every body on
+/// that real round's active width.
+pub fn benchmark_real_replay(
+    warmup_trace: &RealReplayTrace,
+    measured_trace: &RealReplayTrace,
+    config: RealReplayBenchmarkConfig,
+) -> Result<RealReplayBenchmarkReport, MetalSpikeError> {
+    validate_real_replay_benchmark(warmup_trace, measured_trace, &config)?;
+    let warmup_plan = RealReplayPlan::new(warmup_trace)?;
+    let measured_plan = RealReplayPlan::new(measured_trace)?;
+    let maximum_active_lps = warmup_plan
+        .maximum_active_lps()
+        .max(measured_plan.maximum_active_lps());
+    let direct = DirectRealReplay::new(maximum_active_lps)?;
+    let geometry = direct.geometry;
+
+    let warmup_initial = RealReplayState::initial(
+        geometry.padded_lanes,
+        warmup_plan.exclusive_horizon_ns[0],
+        &warmup_plan,
+    );
+    let warmup_buffers =
+        RealReplayMetalBuffers::new(&direct.device, &warmup_plan, &warmup_initial)?;
+    let mut cpu_warmup = warmup_initial.clone();
+    measure_real_cpu_replay(&mut cpu_warmup, &warmup_plan, config.cpu_worker_counts[0]);
+    direct.run(&warmup_plan, &warmup_buffers, config.rounds_per_encoding)?;
+    let gpu_warmup = warmup_buffers.read_state();
+    ensure_real_replay_states_match(None, "warmup", &cpu_warmup, &gpu_warmup)?;
+
+    let initial = RealReplayState::initial(
+        geometry.padded_lanes,
+        measured_plan.exclusive_horizon_ns[0],
+        &measured_plan,
+    );
+    let buffers = RealReplayMetalBuffers::new(&direct.device, &measured_plan, &initial)?;
+    let mut samples = Vec::with_capacity(config.samples);
+    for sample in 0..config.samples {
+        let run_cpu_samples = || {
+            config
+                .cpu_worker_counts
+                .iter()
+                .copied()
+                .map(|workers| {
+                    let mut state = initial.clone();
+                    let elapsed = measure_real_cpu_replay(&mut state, &measured_plan, workers);
+                    (elapsed, checksum_real_replay(&state), state)
+                })
+                .collect::<Vec<_>>()
+        };
+        let run_gpu = || -> Result<(GpuSample, RealReplayState), MetalSpikeError> {
+            buffers.write_state(&initial);
+            let measurement = direct.run(&measured_plan, &buffers, config.rounds_per_encoding)?;
+            Ok((measurement, buffers.read_state()))
+        };
+        let (cpu_results, gpu_measurement, gpu_state) = if sample % 2 == 0 {
+            let cpu = run_cpu_samples();
+            let (gpu, state) = run_gpu()?;
+            (cpu, gpu, state)
+        } else {
+            let (gpu, state) = run_gpu()?;
+            let cpu = run_cpu_samples();
+            (cpu, gpu, state)
+        };
+        let gpu_checksum = checksum_real_replay(&gpu_state);
+        let mut cpu_ns = Vec::with_capacity(cpu_results.len());
+        let mut cpu_checksums = Vec::with_capacity(cpu_results.len());
+        for (worker_index, (elapsed, cpu_checksum, cpu_state)) in
+            cpu_results.into_iter().enumerate()
+        {
+            ensure_real_replay_states_match(
+                Some(sample),
+                "measured sample",
+                &cpu_state,
+                &gpu_state,
+            )?;
+            if cpu_checksum != gpu_checksum {
+                return Err(MetalSpikeError::StateMismatch(format!(
+                    "real replay checksum divergence at sample {sample}, W{}: CPU {} != GPU {}",
+                    config.cpu_worker_counts[worker_index], cpu_checksum, gpu_checksum
+                )));
+            }
+            cpu_ns.push(elapsed);
+            cpu_checksums.push(cpu_checksum);
+        }
+        samples.push(RealReplaySample {
+            host_encode_submit_ns: gpu_measurement.host_encode_submit_ns,
+            device_ns: gpu_measurement.device_ns,
+            gpu_wall_ns: gpu_measurement.wall_ns,
+            cpu_ns,
+            cpu_checksums,
+            gpu_checksum,
+        });
+    }
+
+    Ok(RealReplayBenchmarkReport {
+        substrate: SUBSTRATE_VERSION,
+        profile: real_replay_profile(measured_trace)?,
+        rounds: measured_plan.rounds(),
+        warmup_rounds: warmup_plan.rounds(),
+        padded_lanes: geometry.padded_lanes,
+        body_threadgroups: geometry.body_threadgroups,
+        reduction_dispatches_per_round: geometry.reduction_dispatches_per_round,
+        dispatches_per_round: geometry.dispatches_per_round,
+        rounds_per_encoding: config.rounds_per_encoding,
+        pipeline_setup_ns: direct.pipeline_setup_ns,
+        cpu_worker_counts: config.cpu_worker_counts,
+        samples,
+        matched_checksums: true,
+        no_host_sync_between_rounds: true,
+        resident_parent_stream_bytes: measured_plan.parent_fused.len() * std::mem::size_of::<u64>(),
+        local_fel_fused_bytes: initial.local_fel_fused.len() * std::mem::size_of::<u64>(),
+        remote_outbox_fused_bytes: initial.remote_outbox_fused.len() * std::mem::size_of::<u64>(),
+        trace_consistent_horizon_dependency: true,
+        variable_active_lp_guard: true,
+    })
+}
+
+fn validate_real_replay_benchmark(
+    warmup_trace: &RealReplayTrace,
+    measured_trace: &RealReplayTrace,
+    config: &RealReplayBenchmarkConfig,
+) -> Result<(), MetalSpikeError> {
+    warmup_trace.validate()?;
+    measured_trace.validate()?;
+    if warmup_trace.rounds.is_empty() || measured_trace.rounds.is_empty() {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "real replay requires nonempty warmup and measured traces",
+        ));
+    }
+    if config.samples != 3 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "the real-image gate requires exactly three measured samples",
+        ));
+    }
+    if config.rounds_per_encoding < 1_024 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "real replay long residency requires at least 1,024 rounds per encoding",
+        ));
+    }
+    if config.cpu_worker_counts.is_empty() || config.cpu_worker_counts.contains(&0) || {
+        let mut sorted = config.cpu_worker_counts.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len() != config.cpu_worker_counts.len()
+    } {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "real replay CPU worker counts must be nonzero and unique",
+        ));
+    }
+    let maximum_active_lps = warmup_trace
+        .rounds
+        .iter()
+        .chain(&measured_trace.rounds)
+        .map(|round| round.active_lp_count)
+        .max()
+        .unwrap_or(0);
+    let geometry = sweep_geometry(maximum_active_lps)?;
+    if config
+        .cpu_worker_counts
+        .iter()
+        .any(|workers| *workers > geometry.padded_lanes)
+    {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "real replay CPU workers exceed the padded replay width",
+        ));
+    }
+    if [warmup_trace.rounds.len(), measured_trace.rounds.len()]
+        .into_iter()
+        .any(|rounds| rounds.div_ceil(config.rounds_per_encoding) > MAX_OUTSTANDING_COMMAND_BUFFERS)
+    {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "one real replay sample may use at most 64 command buffers",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_real_replay_states_match(
+    sample: Option<usize>,
+    phase: &str,
+    cpu: &RealReplayState,
+    gpu: &RealReplayState,
+) -> Result<(), MetalSpikeError> {
+    if let Some((lane, error)) = cpu
+        .errors
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, error)| *error != 0)
+    {
+        return Err(MetalSpikeError::StateMismatch(format!(
+            "real replay CPU error at lane {lane} during {phase}: flags=0x{error:x}"
+        )));
+    }
+    if let Some((lane, error)) = gpu
+        .errors
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, error)| *error != 0)
+    {
+        return Err(MetalSpikeError::StateMismatch(format!(
+            "real replay GPU error at lane {lane} during {phase}: flags=0x{error:x}"
+        )));
+    }
+    if cpu == gpu {
+        return Ok(());
+    }
+    let sample = sample
+        .map(|sample| format!(" sample {sample}"))
+        .unwrap_or_default();
+    Err(MetalSpikeError::StateMismatch(format!(
+        "real replay state divergence{sample} during {phase}"
+    )))
+}
+
+fn checksum_real_replay(state: &RealReplayState) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for plane in state.planes() {
+        for byte in plane {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
 }
 
 fn validate_benchmark_config(config: &MetalSpikeBenchmarkConfig) -> Result<(), MetalSpikeError> {

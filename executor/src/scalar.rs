@@ -635,6 +635,20 @@ impl<'image> TransitionState<'image> {
         }
     }
 
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    pub(crate) fn queue_occupancy(&self, node_id: NodeId) -> Result<usize, ExecutionError> {
+        let node = self.node(node_id)?;
+        match node.kind {
+            NodeKind::Host => Ok(self.host_state(node)?.queue.len()),
+            NodeKind::Switch => Ok(self
+                .switch_state(node)?
+                .queues
+                .iter()
+                .map(|queue| queue.queue.len())
+                .sum()),
+        }
+    }
+
     pub(crate) fn dispatch(
         &mut self,
         event: Event,
@@ -1346,6 +1360,18 @@ impl<'image> TransitionState<'image> {
     fn host_state(&self, node: NodeDescriptor) -> Result<&HostState, ExecutionError> {
         let state_slot = self.local_state_slot(node)?;
         self.host_states
+            .get(state_slot)
+            .ok_or(ExecutionError::InvalidStateSlot {
+                node: node.id,
+                kind: node.kind,
+                state_slot: node.state_slot,
+            })
+    }
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    fn switch_state(&self, node: NodeDescriptor) -> Result<&SwitchState, ExecutionError> {
+        let state_slot = self.local_state_slot(node)?;
+        self.switch_states
             .get(state_slot)
             .ok_or(ExecutionError::InvalidStateSlot {
                 node: node.id,

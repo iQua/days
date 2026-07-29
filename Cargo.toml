@@ -21,6 +21,7 @@ l2_pfc = ["l2"]
 dcqcn = []
 lean = []
 perf_stats = ["nexosim/perf_stats"]
+metal-spike = ["days-executor/metal-spike"]
 
 [dependencies]
 csv = "1.4"

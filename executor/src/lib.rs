@@ -26,7 +26,11 @@ pub use image::{
     HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, RemoteChannel,
     ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
 };
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};
 pub use model::{NodeKind, SchedulerKind, TransitionHandler, resolve_transition};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{
     LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
     run_scalar_rounds_with_observations,

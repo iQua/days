@@ -8,6 +8,10 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::event::is_same_time_tx_ready_continuation;
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use crate::metal_spike::{
+    RealReplayTrace, RealReplayTraceBuilder, RecordedReplayLp, ReplayStep, ReplayTraceCapture,
+};
 use crate::scalar::{ExecutionError, ObservationMode, RunResult, TransitionState};
 use crate::{Event, EventKey, NodeId, SimulationImage};
 
@@ -78,6 +82,23 @@ pub fn run_scalar_rounds_with_observations(
     observation_mode: ObservationMode,
 ) -> Result<ScalarRoundRun, ExecutionError> {
     RoundExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
+}
+
+/// Records a bounded real-image window while executing the canonical safe-horizon CPU path.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub fn run_scalar_rounds_with_replay_trace(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    capture: ReplayTraceCapture,
+) -> Result<(ScalarRoundRun, RealReplayTrace), ExecutionError> {
+    if capture.rounds == 0 {
+        return Err(ExecutionError::InvalidCpuConfig(
+            "real replay trace capture requires at least one round",
+        ));
+    }
+    let mut executor = RoundExecutor::new(image, ObservationMode::Summary)?;
+    executor.replay_trace = Some(RealReplayTraceBuilder::new(capture));
+    executor.run_with_replay_trace(exclusive_horizon_ns)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -171,6 +192,15 @@ struct RoundExecutor<'image> {
     pending_keys: BTreeSet<EventKey>,
     frontier: OwnerFrontierIndex,
     minimum_lookahead_ns: Option<u64>,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    replay_trace: Option<RealReplayTraceBuilder>,
+}
+
+struct DrainedLp {
+    work: LpRoundWork,
+    outbox: Vec<Event>,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    replay: Option<RecordedReplayLp>,
 }
 
 impl<'image> RoundExecutor<'image> {
@@ -225,6 +255,8 @@ impl<'image> RoundExecutor<'image> {
             pending_keys,
             frontier,
             minimum_lookahead_ns,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            replay_trace: None,
         })
     }
 
@@ -236,6 +268,25 @@ impl<'image> RoundExecutor<'image> {
             .min(configured_stop);
         let rounds = self.execute_rounds(run_end)?;
         Ok(self.finish(rounds))
+    }
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    fn run_with_replay_trace(
+        mut self,
+        exclusive_horizon_ns: Option<u64>,
+    ) -> Result<(ScalarRoundRun, RealReplayTrace), ExecutionError> {
+        let configured_stop = u128::from(self.image.stop_time_ns) + 1;
+        let run_end = exclusive_horizon_ns
+            .map(u128::from)
+            .unwrap_or(TIME_AFTER_U64_MAX)
+            .min(configured_stop);
+        let rounds = self.execute_rounds(run_end)?;
+        let trace = self
+            .replay_trace
+            .take()
+            .expect("trace execution installs a trace builder")
+            .finish(rounds.len());
+        Ok((self.finish(rounds), trace))
     }
 
     fn execute_rounds(&mut self, run_end: u128) -> Result<Vec<RoundMetrics>, ExecutionError> {
@@ -276,15 +327,32 @@ impl<'image> RoundExecutor<'image> {
             let mut children = Vec::new();
             let mut outboxes = Vec::with_capacity(active.len());
             let mut lp_work = Vec::with_capacity(active.len());
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let capture_replay = self
+                .replay_trace
+                .as_ref()
+                .is_some_and(|trace| trace.captures(rounds.len()));
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let mut replay_rows = Vec::with_capacity(if capture_replay { active.len() } else { 0 });
             let mut events_processed = 0_u64;
             let mut frontier_updates = 0_u64;
             for entry in active {
                 physical_lp_probes = physical_lp_probes.saturating_add(1);
-                let (work, outbox) = self.drain_lp(entry.lp_slot, horizon, &mut children)?;
-                events_processed = events_processed.saturating_add(work.events_processed);
-                lp_work.push(work);
-                if !outbox.is_empty() {
-                    outboxes.push(outbox);
+                let drained = self.drain_lp(
+                    entry.lp_slot,
+                    horizon,
+                    &mut children,
+                    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                    capture_replay,
+                )?;
+                events_processed = events_processed.saturating_add(drained.work.events_processed);
+                lp_work.push(drained.work);
+                if !drained.outbox.is_empty() {
+                    outboxes.push(drained.outbox);
+                }
+                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                if let Some(replay) = drained.replay {
+                    replay_rows.push(replay);
                 }
                 self.update_frontier(entry.lp_slot, &mut physical_lp_probes)?;
                 frontier_updates = frontier_updates.saturating_add(1);
@@ -346,6 +414,20 @@ impl<'image> RoundExecutor<'image> {
             } else {
                 events_processed as f64 / (active_lp_count as f64 * max_work as f64)
             };
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            if capture_replay {
+                self.replay_trace
+                    .as_mut()
+                    .expect("capture flag requires a trace builder")
+                    .push_round(
+                        rounds.len(),
+                        frontier_ns,
+                        horizon,
+                        events_processed,
+                        parallel_efficiency,
+                        replay_rows,
+                    );
+            }
             rounds.push(RoundMetrics {
                 frontier_ns,
                 exclusive_horizon_ns: horizon,
@@ -383,17 +465,34 @@ impl<'image> RoundExecutor<'image> {
         lp_slot: usize,
         exclusive_horizon_ns: u128,
         children: &mut Vec<Event>,
-    ) -> Result<(LpRoundWork, Vec<Event>), ExecutionError> {
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))] capture_replay: bool,
+    ) -> Result<DrainedLp, ExecutionError> {
         let node = self.image.nodes[lp_slot].id;
         let mut events_processed = 0_u64;
         let mut same_time_continuations = 0_u64;
         let mut outbox = Vec::new();
         let mut continuation = None;
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        let pending_events_below_horizon = if capture_replay {
+            u32::try_from(
+                self.futures[lp_slot]
+                    .values()
+                    .take_while(|event| u128::from(event.key.time_ns) < exclusive_horizon_ns)
+                    .count(),
+            )
+            .map_err(|_| ExecutionError::CounterOverflow(node))?
+        } else {
+            0
+        };
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        let mut replay_steps = Vec::new();
         while continuation.is_some()
             || self.futures[lp_slot]
                 .first_key_value()
                 .is_some_and(|(key, _)| u128::from(key.time_ns) < exclusive_horizon_ns)
         {
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let direct_continuation = continuation.is_some();
             let event = if let Some(event) = continuation.take() {
                 event
             } else {
@@ -405,6 +504,15 @@ impl<'image> RoundExecutor<'image> {
             let removed = self.pending_keys.remove(&event.key);
             debug_assert!(removed, "executing event must own a pending key");
 
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let queue_occupancy = if capture_replay && event.kind == crate::EventKind::TxReady {
+                Some(
+                    u16::try_from(self.transitions.queue_occupancy(node)?)
+                        .map_err(|_| ExecutionError::CounterOverflow(node))?,
+                )
+            } else {
+                None
+            };
             self.transitions.dispatch(event, children)?;
             let direct_child = match children.as_slice() {
                 [child]
@@ -419,6 +527,10 @@ impl<'image> RoundExecutor<'image> {
                 }
                 _ => None,
             };
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let mut local_fel_pushes = 0_u8;
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let mut remote_outbox_writes = 0_u8;
             for child in children.drain(..) {
                 if !self.pending_keys.insert(child.key) {
                     return Err(ExecutionError::DuplicateEventKey(child.key));
@@ -429,22 +541,57 @@ impl<'image> RoundExecutor<'image> {
                         same_time_continuations = same_time_continuations.saturating_add(1);
                     } else if self.futures[lp_slot].insert(child.key, child).is_some() {
                         return Err(ExecutionError::DuplicateEventKey(child.key));
+                    } else {
+                        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                        if capture_replay {
+                            local_fel_pushes = local_fel_pushes
+                                .checked_add(1)
+                                .ok_or(ExecutionError::CounterOverflow(node))?;
+                        }
                     }
                 } else {
+                    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                    if capture_replay {
+                        remote_outbox_writes = remote_outbox_writes
+                            .checked_add(1)
+                            .ok_or(ExecutionError::CounterOverflow(node))?;
+                    }
                     outbox.push(child);
                 }
+            }
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            if capture_replay {
+                replay_steps.push(
+                    ReplayStep::new(
+                        event.kind,
+                        direct_continuation,
+                        local_fel_pushes,
+                        remote_outbox_writes,
+                        queue_occupancy,
+                    )
+                    .map_err(|_| ExecutionError::CounterOverflow(node))?,
+                );
             }
             events_processed = events_processed.saturating_add(1);
         }
 
-        Ok((
-            LpRoundWork {
+        Ok(DrainedLp {
+            work: LpRoundWork {
                 node,
                 events_processed,
                 same_time_continuations,
             },
             outbox,
-        ))
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            replay: capture_replay.then(|| RecordedReplayLp {
+                node,
+                pending_events_below_horizon,
+                next_time_ns_after_local_drain: self.futures[lp_slot]
+                    .first_key_value()
+                    .map_or(u64::MAX, |(key, _)| key.time_ns),
+                steps: replay_steps,
+            }),
+        })
     }
 
     fn update_frontier(
