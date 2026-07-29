@@ -148,7 +148,7 @@ fn assert_port_lp_decomposition(image: &SimulationImage) {
 
 fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     let (graph, hosts) = build_graph(config_path).expect("legacy topology should build");
-    let legacy_flows = Flow::flows_from_config(config_path, &hosts);
+    let legacy_flows = Flow::flows_from_config_with_attachments(config_path, &hosts);
     let forwarding = installed_forwarding_state(&graph, &legacy_flows);
     let nodes = image
         .nodes
@@ -265,7 +265,12 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     };
     assert_eq!(
         attachments.hosts.len(),
-        hosts.iter().copied().collect::<BTreeSet<_>>().len(),
+        hosts
+            .host_ids()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len(),
         "legacy must install exactly one shared full-duplex attachment per host"
     );
     if legacy_flows.len() > attachments.hosts.len() {

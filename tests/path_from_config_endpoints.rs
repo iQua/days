@@ -41,7 +41,7 @@ pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
     let config_path = temp_file.path().to_str().expect("Invalid temp file path.");
 
     let (graph, hosts) = build_graph(config_path).expect("Failed to build graph.");
-    let mut flows = Flow::flows_from_config(config_path, &hosts);
+    let mut flows = Flow::flows_from_config_with_attachments(config_path, &hosts);
     assert_eq!(flows.len(), 1);
 
     let flow = flows.first_mut().expect("Expected one flow.");

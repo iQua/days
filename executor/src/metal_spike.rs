@@ -470,7 +470,7 @@ pub struct RealReplayBenchmarkConfig {
 impl Default for RealReplayBenchmarkConfig {
     fn default() -> Self {
         Self {
-            samples: 3,
+            samples: 4,
             rounds_per_encoding: DEFAULT_ROUNDS_PER_ENCODING,
             cpu_worker_counts: vec![4],
         }
@@ -3618,7 +3618,7 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
 }
 
 /// Runs the fair T13c sweep: same state and LP body, paired on one machine with a genuine
-/// persistent CPU worker configuration, one warmup per width, and median-of-three samples.
+/// persistent CPU worker configuration, one warmup per width, and four balanced-order samples.
 pub fn benchmark_metal(
     config: MetalSpikeBenchmarkConfig,
 ) -> Result<MetalSpikeBenchmarkReport, MetalSpikeError> {
@@ -3853,9 +3853,9 @@ fn validate_real_replay_benchmark(
             "real replay requires nonempty warmup and measured traces",
         ));
     }
-    if config.samples != 3 {
+    if config.samples != 4 {
         return Err(MetalSpikeError::InvalidBenchmarkConfig(
-            "the real-image gate requires exactly three measured samples",
+            "the real-image gate requires exactly four measured samples",
         ));
     }
     if config.rounds_per_encoding < 1_024 {
@@ -4065,5 +4065,10 @@ fn events_per_second(events_per_round: u64, nanoseconds_per_round: f64) -> f64 {
 fn median(values: &[u64]) -> u64 {
     let mut values = values.to_vec();
     values.sort_unstable();
-    values[values.len() / 2]
+    let upper = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        ((u128::from(values[upper - 1]) + u128::from(values[upper])) / 2) as u64
+    } else {
+        values[upper]
+    }
 }

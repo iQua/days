@@ -6,12 +6,12 @@ use std::fs;
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
-use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
 use serde::Deserialize;
 
 use crate::flows::route::{ECMP, PathFromConfig, Routing, RoutingConfig, ShortestPath};
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
+use crate::topos::build::HostAttachments;
 use crate::{next_flow_id, seed_from_config, update_next_flow_id};
 
 /// Represents the type of a flow.
@@ -95,10 +95,14 @@ pub struct Flow {
     pub starts_after: Vec<usize>,
     /// Type of the flow.
     pub flow_type: FlowType,
-    /// ID of the host switch that the source attaches to.
+    /// ID of the source host.
     pub source_host: usize,
-    /// ID of the host switch that the sink attaches to.
+    /// ID of the sink host.
     pub sink_host: usize,
+    /// ID of the topology switch adjacent to the source host.
+    pub source_switch: usize,
+    /// ID of the topology switch adjacent to the sink host.
+    pub sink_switch: usize,
     /// ID of the PacketSource.
     pub source_id: usize,
     /// ID of the PacketSink.
@@ -124,6 +128,15 @@ fn checked_priority(priority: Option<u8>) -> u8 {
 }
 
 impl Flow {
+    pub(crate) fn set_attachment_switches(&mut self, hosts: &HostAttachments) {
+        self.source_switch = hosts
+            .switch_for(self.source_host)
+            .expect("flow source must be a configured host");
+        self.sink_switch = hosts
+            .switch_for(self.sink_host)
+            .expect("flow sink must be a configured host");
+    }
+
     /// Creates a new `Flow` instance based on the provided parameters.
     ///
     /// # Arguments
@@ -168,6 +181,8 @@ impl Flow {
             flow_type: params.flow_type,
             source_host: params.source_host,
             sink_host: params.sink_host,
+            source_switch: params.source_host,
+            sink_switch: params.sink_host,
             source_id: 0,
             sink_id: 0,
             traffic: params.traffic,
@@ -230,6 +245,15 @@ impl Flow {
     ///
     /// * A vector of initialized `Flow` instances.
     pub fn flows_from_config(file_path: &str, hosts: &[usize]) -> Vec<Flow> {
+        let attachments = HostAttachments::identity(hosts.to_vec())
+            .expect("identity host attachments should construct");
+        Self::flows_from_config_with_attachments(file_path, &attachments)
+    }
+
+    pub fn flows_from_config_with_attachments(
+        file_path: &str,
+        hosts: &HostAttachments,
+    ) -> Vec<Flow> {
         let content =
             fs::read_to_string(file_path).expect("The configuration file could not be read.");
 
@@ -261,19 +285,27 @@ impl Flow {
 
                     if let Some(ref path) = flow.path {
                         let (source_host, sink_host) = &flow.graph[0];
+                        let source_switch = hosts
+                            .switch_for(*source_host as usize)
+                            .expect("explicit flow source must be a configured host");
+                        let sink_switch = hosts
+                            .switch_for(*sink_host as usize)
+                            .expect("explicit flow sink must be a configured host");
                         assert!(
-                            path[0] == *source_host as usize,
-                            "Flow {}'s source specified in path ({}) should match graph ({})",
+                            path[0] == source_switch,
+                            "Flow {}'s source specified in path ({}) should match host {}'s attachment switch ({})",
                             flow_id,
                             path[0],
-                            source_host
+                            source_host,
+                            source_switch,
                         );
                         assert!(
-                            path[path.len() - 1] == *sink_host as usize,
-                            "Flow {}'s sink specified in path ({}) should match graph ({})",
+                            path[path.len() - 1] == sink_switch,
+                            "Flow {}'s sink specified in path ({}) should match host {}'s attachment switch ({})",
                             flow_id,
                             path[path.len() - 1],
-                            sink_host
+                            sink_host,
+                            sink_switch,
                         );
                     }
 
@@ -282,19 +314,23 @@ impl Flow {
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
                     let priority = checked_priority(flow.priority);
 
-                    flows.push(Flow::new(FlowParams {
+                    let source_host = edge.source().index();
+                    let sink_host = edge.target().index();
+                    let mut lowered_flow = Flow::new(FlowParams {
                         id: flow_id,
                         path: flow.path.clone(),
                         starts_before,
                         starts_after,
                         flow_type: flow.flow_type.clone(),
-                        source_host: edge.source().index(),
-                        sink_host: edge.target().index(),
+                        source_host,
+                        sink_host,
                         routing: flow.routing.clone(),
                         traffic,
                         priority,
                         seed: flow_id,
-                    }));
+                    });
+                    lowered_flow.set_attachment_switches(hosts);
+                    flows.push(lowered_flow);
                 }
             }
         }
@@ -314,28 +350,31 @@ impl Flow {
                     first_flow_id = new_first_flow_id;
                 }
                 let priority = checked_priority(flow_set.priority);
+                let host_pairs = hosts
+                    .sample_flow_pairs(&mut rng, flow_set.flow_count as usize)
+                    .unwrap_or_else(|error| panic!("{error}"));
 
-                for id_counter in 0..flow_set.flow_count {
-                    let host_pair: Vec<usize> = hosts.sample(&mut rng, 2).cloned().collect();
-
-                    let flow_id = first_flow_id + id_counter as usize;
+                for (id_counter, (source_host, sink_host)) in host_pairs.into_iter().enumerate() {
+                    let flow_id = first_flow_id + id_counter;
                     let starts_before = flow_set.starts_before.clone().unwrap_or_default();
                     let starts_after = flow_set.starts_after.clone().unwrap_or_default();
                     let traffic = TrafficCharacteristics::clone(&flow_set.traffic);
 
-                    flows.push(Flow::new(FlowParams {
+                    let mut lowered_flow = Flow::new(FlowParams {
                         id: flow_id,
                         path: None,
                         starts_before,
                         starts_after,
                         flow_type: flow_set.flow_type.clone(),
-                        source_host: host_pair[0],
-                        sink_host: host_pair[1],
+                        source_host,
+                        sink_host,
                         routing: flow_set.routing.clone(),
                         traffic,
                         priority,
                         seed: flow_id,
-                    }));
+                    });
+                    lowered_flow.set_attachment_switches(hosts);
+                    flows.push(lowered_flow);
                 }
                 update_next_flow_id(first_flow_id + flow_set.flow_count as usize);
             }
@@ -365,8 +404,8 @@ impl Flow {
 
                 path.append(&mut ShortestPath::compute_route_in(
                     graph,
-                    NodeIndex::new(self.source_host),
-                    NodeIndex::new(self.sink_host),
+                    NodeIndex::new(self.source_switch),
+                    NodeIndex::new(self.sink_switch),
                 ));
 
                 path.push(NodeIndex::new(self.sink_id));
@@ -390,8 +429,8 @@ impl Flow {
                     self.id,
                     self.source_host,
                     self.sink_host,
-                    NodeIndex::new(self.source_host),
-                    NodeIndex::new(self.sink_host),
+                    NodeIndex::new(self.source_switch),
+                    NodeIndex::new(self.sink_switch),
                 ));
 
                 path.push(NodeIndex::new(self.sink_id));
@@ -446,6 +485,8 @@ mod tests {
             flow_type: FlowType::PacketDistribution,
             source_host: 0,
             sink_host: 3,
+            source_switch: 0,
+            sink_switch: 3,
             source_id: 0,
             sink_id: 3,
             routing: Routing::ShortestPath(ShortestPath::new(
@@ -475,6 +516,8 @@ mod tests {
             flow_type: FlowType::TCP,
             source_host: 0,
             sink_host: 3,
+            source_switch: 0,
+            sink_switch: 3,
             source_id: 0,
             sink_id: 3,
             routing: Routing::ECMP(ECMP::new(
@@ -510,6 +553,8 @@ mod tests {
             flow_type: FlowType::PacketDistribution,
             source_host: 0,
             sink_host: 4,
+            source_switch: 0,
+            sink_switch: 4,
             source_id: 0,
             sink_id: 4,
             routing: Routing::PathFromConfig(PathFromConfig::new(vec![1, 2, 3])),

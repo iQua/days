@@ -12,7 +12,6 @@ use days_executor::{
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
-use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
@@ -20,7 +19,7 @@ use thiserror::Error;
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::flows::DistributionInfo;
 use crate::flows::route::{RouteTableError, compute_shortest_path_route_table};
-use crate::topos::build::{TopologyError, build_graph};
+use crate::topos::build::{HostAttachments, TopologyError, build_graph};
 
 /// Failure while lowering supported Days source configuration.
 #[derive(Debug, Error)]
@@ -569,9 +568,23 @@ fn image_route(
     ids: &StableIds,
 ) -> Vec<LinkId> {
     let mut route = Vec::with_capacity(switch_path.len() + 1);
+    let source_switch = u64::try_from(
+        switch_path
+            .first()
+            .expect("a topology route must include the source attachment switch")
+            .index(),
+    )
+    .expect("topology switch identities were checked before route construction");
+    let target_switch = u64::try_from(
+        switch_path
+            .last()
+            .expect("a topology route must include the target attachment switch")
+            .index(),
+    )
+    .expect("topology switch identities were checked before route construction");
     route.push(ids.link(LinkKey {
         source: PhysicalNodeKey::Host(source),
-        target: PhysicalNodeKey::Switch(source),
+        target: PhysicalNodeKey::Switch(source_switch),
     }));
     for pair in switch_path.windows(2) {
         let source = u64::try_from(pair[0].index())
@@ -584,7 +597,7 @@ fn image_route(
         }));
     }
     route.push(ids.link(LinkKey {
-        source: PhysicalNodeKey::Switch(target),
+        source: PhysicalNodeKey::Switch(target_switch),
         target: PhysicalNodeKey::Host(target),
     }));
     route
@@ -593,7 +606,7 @@ fn image_route(
 fn lower(
     model: SupportedModel,
     graph: &petgraph::graph::UnGraph<usize, ()>,
-    hosts: Vec<usize>,
+    hosts: HostAttachments,
 ) -> Result<SimulationImage, CompileError> {
     let switch_topology_ids = graph
         .node_indices()
@@ -602,7 +615,9 @@ fn lower(
         .map_err(|_| CompileError::Invalid("topology node identity exceeds u64".to_owned()))?;
     let host_count = hosts.len();
     let host_topology_ids = hosts
-        .into_iter()
+        .host_ids()
+        .iter()
+        .copied()
         .map(u64::try_from)
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|_| CompileError::Invalid("host topology identity exceeds u64".to_owned()))?;
@@ -612,10 +627,23 @@ fn lower(
         ));
     }
 
-    for host in &host_topology_ids {
-        if !switch_topology_ids.contains(host) {
+    let host_attachment_switches = hosts
+        .iter()
+        .map(|host| {
+            Ok((
+                u64::try_from(host.host_id).map_err(|_| {
+                    CompileError::Invalid("host topology identity exceeds u64".to_owned())
+                })?,
+                u64::try_from(host.switch_id).map_err(|_| {
+                    CompileError::Invalid("host attachment switch identity exceeds u64".to_owned())
+                })?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, CompileError>>()?;
+    for (&host, &switch) in &host_attachment_switches {
+        if !switch_topology_ids.contains(&switch) {
             return Err(CompileError::Invalid(format!(
-                "host topology identity {host} does not name a switch attachment"
+                "host topology identity {host} attaches to missing switch {switch}"
             )));
         }
     }
@@ -648,14 +676,14 @@ fn lower(
             target: PhysicalNodeKey::Switch(left),
         });
     }
-    for host in &host_topology_ids {
+    for (&host, &switch) in &host_attachment_switches {
         link_keys.insert(LinkKey {
-            source: PhysicalNodeKey::Host(*host),
-            target: PhysicalNodeKey::Switch(*host),
+            source: PhysicalNodeKey::Host(host),
+            target: PhysicalNodeKey::Switch(switch),
         });
         link_keys.insert(LinkKey {
-            source: PhysicalNodeKey::Switch(*host),
-            target: PhysicalNodeKey::Host(*host),
+            source: PhysicalNodeKey::Switch(switch),
+            target: PhysicalNodeKey::Host(host),
         });
     }
 
@@ -678,6 +706,7 @@ fn lower(
         model.explicit_flows,
         model.flow_sets,
         &host_topology_ids,
+        &hosts,
         model.seed,
     )?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
@@ -686,8 +715,8 @@ fn lower(
         flows.iter().enumerate().map(|(index, flow)| {
             (
                 index,
-                NodeIndex::new(flow.source as usize),
-                NodeIndex::new(flow.target as usize),
+                NodeIndex::new(host_attachment_switches[&flow.source] as usize),
+                NodeIndex::new(host_attachment_switches[&flow.target] as usize),
             )
         }),
     )
@@ -845,9 +874,10 @@ fn lower(
         .iter()
         .map(|host| {
             let node_key = LpKey::Host(*host);
+            let switch = host_attachment_switches[host];
             let egress_key = LinkKey {
                 source: PhysicalNodeKey::Host(*host),
-                target: PhysicalNodeKey::Switch(*host),
+                target: PhysicalNodeKey::Switch(switch),
             };
             Ok(HostState {
                 egress_link: ids.link(egress_key),
@@ -963,6 +993,7 @@ fn canonical_flows(
     mut explicit: Vec<ExplicitFlowKey>,
     mut flow_sets: Vec<FlowSetKey>,
     hosts: &BTreeSet<u64>,
+    host_attachments: &HostAttachments,
     seed: u64,
 ) -> Result<Vec<FlowInput>, CompileError> {
     explicit.sort();
@@ -1001,7 +1032,6 @@ fn canonical_flows(
             "flow sets require at least two configured host attachments".to_owned(),
         ));
     }
-    let host_candidates = hosts.iter().copied().collect::<Vec<_>>();
     let mut rng = SmallRng::seed_from_u64(seed);
     let mut set_duplicates = BTreeMap::<FlowSetKey, u64>::new();
     for semantic in flow_sets {
@@ -1017,13 +1047,16 @@ fn canonical_flows(
         flows.try_reserve_exact(member_count).map_err(|error| {
             CompileError::Invalid(format!("flow-set expansion is too large: {error}"))
         })?;
-        for member_ordinal in 0..semantic.flow_count {
-            let pair = host_candidates
-                .sample(&mut rng, 2)
-                .copied()
-                .collect::<Vec<_>>();
-            let source = pair[0];
-            let target = pair[1];
+        let pairs = host_attachments
+            .sample_canonical_flow_pairs(&mut rng, member_count)
+            .map_err(CompileError::Invalid)?;
+        for (member_ordinal, (source, target)) in (0..semantic.flow_count).zip(pairs) {
+            let source = u64::try_from(source).map_err(|_| {
+                CompileError::Invalid("source host identity exceeds u64".to_owned())
+            })?;
+            let target = u64::try_from(target).map_err(|_| {
+                CompileError::Invalid("target host identity exceeds u64".to_owned())
+            })?;
             flows.push(FlowInput {
                 key: FlowKey::SetMember {
                     semantic: semantic.clone(),

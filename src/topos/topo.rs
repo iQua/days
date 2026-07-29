@@ -43,6 +43,7 @@ use crate::schedulers::wfq::WFQServer;
 use crate::schedulers::wrr::WRRServer;
 use crate::switches::SchedulingDiscipline;
 use crate::switches::switch::PacketSwitch;
+use crate::topos::build::HostAttachments;
 use crate::utils::logger::CsvLogger;
 use crate::utils::time::set_time_quantum_ns;
 use crate::utils::tracing::start_wall_clock_concurrency_sampler;
@@ -65,8 +66,8 @@ fn physical_flow_paths(graph: &UnGraph<usize, ()>, flows: &[Flow]) -> Vec<Vec<No
         flows.iter().filter_map(|flow| {
             matches!(flow.routing, Routing::ShortestPath(_)).then_some((
                 flow.id,
-                NodeIndex::new(flow.source_host),
-                NodeIndex::new(flow.sink_host),
+                NodeIndex::new(flow.source_switch),
+                NodeIndex::new(flow.sink_switch),
             ))
         }),
     )
@@ -280,6 +281,8 @@ pub enum TopoCategory {
 #[derive(Deserialize)]
 pub struct FatTreeConfig {
     pub k: usize,
+    #[serde(default)]
+    pub hosts_per_edge: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -371,7 +374,7 @@ impl Config {
 
 fn build_host_attachment_state(
     spec: HostAttachmentSpec,
-    hosts: &[usize],
+    hosts: &HostAttachments,
     flows: &[Flow],
 ) -> InstalledHostAttachmentState {
     let injection = InstalledHostStage {
@@ -387,6 +390,7 @@ fn build_host_attachment_state(
         capacity_packets: spec.delivery_capacity_packets,
     };
     let mut installed_hosts = hosts
+        .host_ids()
         .iter()
         .copied()
         .collect::<BTreeSet<_>>()
@@ -574,7 +578,7 @@ enum FlowDirection {
 /// Instantiates the legacy endpoint models and snapshots their installed stage wiring.
 pub fn installed_host_attachment_state(
     config_path: &str,
-    hosts: &[usize],
+    hosts: &HostAttachments,
     expected_flows: &[Flow],
 ) -> Option<InstalledHostAttachmentState> {
     let content = fs::read_to_string(config_path).expect("The configuration is not valid");
@@ -590,7 +594,7 @@ pub fn installed_host_attachment_state(
 
     let switches = hosts
         .iter()
-        .copied()
+        .map(|host| host.switch_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|host_id| {
@@ -610,7 +614,7 @@ pub fn installed_host_attachment_state(
         sim_init: SimInit::new(),
         runtime_num_threads: 1,
         graph: UnGraph::default(),
-        hosts: hosts.to_vec(),
+        hosts: hosts.clone(),
         switches,
         flows,
         collectives: Vec::new(),
@@ -658,8 +662,8 @@ pub struct Topology {
     runtime_num_threads: usize,
     /// undirected graph of the topology
     graph: UnGraph<usize, ()>,
-    /// a hash map of switch ids that connects to endpoints
-    hosts: Vec<usize>,
+    /// Host identities and their adjacent topology switches.
+    hosts: HostAttachments,
     /// switch id -> switch
     switches: HashMap<usize, PacketSwitch>,
     /// switch id -> switch mailbox
@@ -823,7 +827,7 @@ impl Topology {
     pub fn new(
         config_path: &str,
         graph: UnGraph<usize, ()>,
-        hosts: Vec<usize>,
+        hosts: HostAttachments,
         flows: Vec<Flow>,
         collectives: Vec<Collective>,
     ) -> Topology {
@@ -1369,6 +1373,9 @@ impl Topology {
                 }
             }
         }
+        for flow in &mut self.flows {
+            flow.set_attachment_switches(&self.hosts);
+        }
     }
 
     /// Connects two adjacent switches in the network graph.
@@ -1638,7 +1645,7 @@ impl Topology {
     fn assemble_host_attachments(
         spec: HostAttachmentSpec,
         mailbox_capacity: usize,
-        hosts: &[usize],
+        hosts: &HostAttachments,
         flows: &[Flow],
         switch_mailboxes: &HashMap<usize, Mailbox<PacketSwitch>>,
     ) -> (
@@ -1651,6 +1658,9 @@ impl Topology {
             .hosts
             .iter()
             .map(|(&host_id, plan)| {
+                let switch_id = hosts
+                    .switch_for(host_id)
+                    .expect("planned host attachment must name a configured host");
                 let mut injection = PendingHostStage {
                     direction: InstalledHostStageDirection::Injection,
                     port: Port::new(
@@ -1687,7 +1697,7 @@ impl Topology {
 
                 let (injection_wire, delivery_wire) = if spec.propagation_ns == 0 {
                     let edge_mbox = switch_mailboxes
-                        .get(&host_id)
+                        .get(&switch_id)
                         .expect("host attachment switch mailbox should exist");
                     injection
                         .port
@@ -1710,7 +1720,7 @@ impl Topology {
                         .output
                         .connect(Wire::packet_received, &injection_wire_mbox);
                     let edge_mbox = switch_mailboxes
-                        .get(&host_id)
+                        .get(&switch_id)
                         .expect("host attachment switch mailbox should exist");
                     injection_wire
                         .output
@@ -1856,8 +1866,8 @@ impl Topology {
             flow.sink_id = sink.id();
 
             // obtains the host switch and its mailbox for the packet source
-            let source_host = self.switches.get_mut(&flow.source_host).unwrap();
-            let host_mbox = self.switch_mailboxes.get(&flow.source_host).unwrap();
+            let source_host = self.switches.get_mut(&flow.source_switch).unwrap();
+            let host_mbox = self.switch_mailboxes.get(&flow.source_switch).unwrap();
 
             // establishes a bi-directional connection between the packet source
             // and the host
@@ -1889,8 +1899,8 @@ impl Topology {
             source_host.outputs.insert(source.id(), output);
 
             // obtains the host switch and its mailbox for the packet sink
-            let sink_host = self.switches.get_mut(&flow.sink_host).unwrap();
-            let host_mbox = self.switch_mailboxes.get(&flow.sink_host).unwrap();
+            let sink_host = self.switches.get_mut(&flow.sink_switch).unwrap();
+            let host_mbox = self.switch_mailboxes.get(&flow.sink_switch).unwrap();
 
             // establishes a bi-directional connection between the packet sink
             // and the host
@@ -2313,7 +2323,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts: sources.clone(),
+            hosts: HostAttachments::identity(sources.clone()).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),
@@ -2512,7 +2522,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts: (0..n).collect(),
+            hosts: HostAttachments::identity((0..n).collect()).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),
@@ -2591,7 +2601,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts,
+            hosts: HostAttachments::identity(hosts).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),
@@ -2689,7 +2699,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts,
+            hosts: HostAttachments::identity(hosts).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),
@@ -2783,7 +2793,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts: vec![0, 1, 2, 3],
+            hosts: HostAttachments::identity(vec![0, 1, 2, 3]).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),
@@ -2827,7 +2837,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts: vec![0, 1, 2, 3],
+            hosts: HostAttachments::identity(vec![0, 1, 2, 3]).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),
@@ -2882,7 +2892,7 @@ mod ring_allreduce_serialization_tests {
             sim_init: SimInit::new(),
             runtime_num_threads: 1,
             graph: UnGraph::<usize, ()>::default(),
-            hosts: vec![0, 1, 2],
+            hosts: HostAttachments::identity(vec![0, 1, 2]).unwrap(),
             switches: HashMap::new(),
             switch_mailboxes: HashMap::new(),
             flows: Vec::new(),

@@ -130,8 +130,8 @@ pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
     let _ = seed_from_config(config_path);
 
     let (graph, hosts) = build_graph(config_path).map_err(|e| e.to_string())?;
-    let flows = Flow::flows_from_config(config_path, &hosts);
-    let collectives = Collective::collectives_from_config(config_path, &hosts);
+    let flows = Flow::flows_from_config_with_attachments(config_path, &hosts);
+    let collectives = Collective::collectives_from_config(config_path, hosts.host_ids());
 
     let topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
     topology.run(graph);

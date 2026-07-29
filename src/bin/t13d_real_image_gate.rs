@@ -613,7 +613,7 @@ mod app {
             &warmup,
             &measured,
             RealReplayBenchmarkConfig {
-                samples: 3,
+                samples: 4,
                 rounds_per_encoding: 16_384,
                 cpu_worker_counts: cpu_worker_counts.to_vec(),
             },
@@ -651,7 +651,7 @@ mod app {
                 &bucket_warmup,
                 &bucket,
                 RealReplayBenchmarkConfig {
-                    samples: 3,
+                    samples: 4,
                     rounds_per_encoding: 16_384,
                     cpu_worker_counts: vec![4],
                 },
@@ -671,12 +671,18 @@ mod app {
         report: &RealReplayBenchmarkReport,
     ) -> Result<(), BoxError> {
         for (sample_index, sample) in report.samples.iter().enumerate() {
+            let order = if sample_index % 2 == 0 {
+                "cpu_first"
+            } else {
+                "gpu_first"
+            };
             println!(
-                "record=gate_gpu_sample config={} label={} sample={} rounds={} \
+                "record=gate_gpu_sample config={} label={} sample={} order={} rounds={} \
                  host_encode_submit_ns={} device_ns={} gpu_wall_ns={} gpu_checksum={}",
                 display_path(config),
                 label,
                 sample_index,
+                order,
                 report.rounds,
                 sample.host_encode_submit_ns,
                 sample.device_ns,
@@ -685,11 +691,12 @@ mod app {
             );
             for (worker_index, workers) in report.cpu_worker_counts.iter().copied().enumerate() {
                 println!(
-                    "record=gate_cpu_sample config={} label={} sample={} rounds={} workers={} \
+                    "record=gate_cpu_sample config={} label={} sample={} order={} rounds={} workers={} \
                      cpu_ns={} cpu_checksum={}",
                     display_path(config),
                     label,
                     sample_index,
+                    order,
                     report.rounds,
                     workers,
                     sample.cpu_ns[worker_index],
@@ -763,6 +770,56 @@ mod app {
             report.trace_consistent_horizon_dependency,
             report.variable_active_lp_guard,
         );
+        for (cpu_first, order) in [(true, "cpu_first"), (false, "gpu_first")] {
+            let sample_indices = report
+                .samples
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| ((index % 2 == 0) == cpu_first).then_some(index))
+                .collect::<Vec<_>>();
+            let host = median_per_round(
+                sample_indices
+                    .iter()
+                    .map(|&index| report.samples[index].host_encode_submit_ns),
+                report.rounds,
+            )?;
+            let device = median_per_round(
+                sample_indices
+                    .iter()
+                    .map(|&index| report.samples[index].device_ns),
+                report.rounds,
+            )?;
+            let gpu = median_per_round(
+                sample_indices
+                    .iter()
+                    .map(|&index| report.samples[index].gpu_wall_ns),
+                report.rounds,
+            )?;
+            for (worker_index, workers) in report.cpu_worker_counts.iter().copied().enumerate() {
+                let cpu = median_per_round(
+                    sample_indices
+                        .iter()
+                        .map(|&index| report.samples[index].cpu_ns[worker_index]),
+                    report.rounds,
+                )?;
+                println!(
+                    "record=gate_order_summary config={} label={} order={} samples={} \
+                     median_host_ns_per_round={:.9} median_device_ns_per_round={:.9} \
+                     median_gpu_wall_ns_per_round={:.9} workers={} \
+                     median_cpu_ns_per_round={:.9} gpu_wall_over_cpu={:.9}",
+                    display_path(config),
+                    label,
+                    order,
+                    sample_indices.len(),
+                    host,
+                    device,
+                    gpu,
+                    workers,
+                    cpu,
+                    gpu / cpu,
+                );
+            }
+        }
         println!(
             "record=gate_event_mix config={} label={} packet_arrival={} tx_ready={} \
              tx_complete={} remote_arrival={} direct_continuations={} local_fel_pushes={} \
@@ -782,6 +839,21 @@ mod app {
             report.profile.tx_ready_empty_checks,
         );
         Ok(())
+    }
+
+    fn median_per_round(values: impl Iterator<Item = u64>, rounds: usize) -> Result<f64, BoxError> {
+        let mut values = values.collect::<Vec<_>>();
+        if values.is_empty() || rounds == 0 {
+            return Err(input_error("median requires nonempty values and rounds"));
+        }
+        values.sort_unstable();
+        let upper = values.len() / 2;
+        let median = if values.len().is_multiple_of(2) {
+            (values[upper - 1] as f64 + values[upper] as f64) / 2.0
+        } else {
+            values[upper] as f64
+        };
+        Ok(median / rounds as f64)
     }
 
     fn lower_image(config: &str) -> Result<(SimulationImage, u128), BoxError> {

@@ -93,7 +93,7 @@ fn skewed_real_trace_replay_matches_persistent_cpu_and_metal() {
         &warmup,
         &measured,
         RealReplayBenchmarkConfig {
-            samples: 3,
+            samples: 4,
             rounds_per_encoding: 1_024,
             cpu_worker_counts: vec![1, 2],
         },
@@ -101,7 +101,7 @@ fn skewed_real_trace_replay_matches_persistent_cpu_and_metal() {
     .expect("the exact skewed trace should match on CPU and Metal");
 
     assert_eq!(report.rounds, 2);
-    assert_eq!(report.samples.len(), 3);
+    assert_eq!(report.samples.len(), 4);
     assert_eq!(report.cpu_worker_counts, vec![1, 2]);
     assert!(report.matched_checksums);
     assert!(report.no_host_sync_between_rounds);

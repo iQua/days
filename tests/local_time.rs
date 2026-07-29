@@ -23,10 +23,10 @@ fn test_local_time() {
     };
     info!("The network graph has been initialized.");
 
-    let flows = Flow::flows_from_config(&path, &hosts);
+    let flows = Flow::flows_from_config_with_attachments(&path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());
 
-    let collectives = Collective::collectives_from_config(&path, &hosts);
+    let collectives = Collective::collectives_from_config(&path, hosts.host_ids());
     info!(
         "A total of {} collective communication operations has been initialized.",
         collectives.len()
