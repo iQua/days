@@ -1,11 +1,11 @@
 //! Correctness-first production Metal executor.
 //!
 //! The backend keeps the safe-horizon round loop resident on the device within bounded encoding
-//! waves. A deterministic 1,024-lane reduction publishes each horizon and a serial controller
-//! kernel performs the correctness path: stable active-LP compaction, per-LP chronological drains,
-//! real transitions, local FEL insertion, and boundary-only remote exchange. The host synchronizes
-//! only at wave boundaries, and every such synchronization is reported in [`MetalRun`]. Role-split
-//! parallel transition kernels are intentionally deferred to the optimization milestone.
+//! waves. A deterministic 1,024-lane reduction publishes each horizon and stably compacts the
+//! active LPs. One lane per active LP then performs chronological drains and real transitions,
+//! followed by a deterministic boundary-only remote exchange. The host synchronizes only at wave
+//! boundaries, and every such synchronization is reported in [`MetalRun`]. Role-split transition
+//! kernels are intentionally deferred to a later optimization milestone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -39,9 +39,15 @@ const SUMMARY_COUNTERS: usize = 12;
 const OBSERVED_WORDS: usize = 4;
 const DEPARTURE_WORDS: usize = 9;
 const ARRIVAL_WORDS: usize = 10;
+const LP_STATE_WORDS: usize = 6;
+const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
+const INBOUND_META_WORDS: usize = 2;
 // The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
-// rounds single-launch while putting a finite ceiling on pathological serial device work.
+// LP drains single-launch while putting a finite ceiling on pathological device work per lane.
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
+// Eight SIMD32 groups amortize dispatch overhead without consuming the maximum 1,024-thread
+// residency footprint. Work assignment depends only on compacted LP rank, so this is tunable.
+const DEFAULT_ROUND_THREADS_PER_THREADGROUP: usize = 256;
 // The retained T13 direct-Metal benchmark encodes two-dispatch round pairs at about 0.4 us/pair on
 // the development Apple system. Metal practice favors a small number of substantial command
 // buffers:
@@ -64,10 +70,6 @@ const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
 const CONTROL_ROUNDS: usize = 9;
-const CONTROL_TRANSITIONS: usize = 10;
-const CONTROL_OBSERVED: usize = 12;
-const CONTROL_DEPARTURES: usize = 13;
-const CONTROL_ARRIVALS: usize = 14;
 const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 19;
@@ -184,11 +186,15 @@ pub struct MetalConfig {
     pub max_outbox_events: Option<usize>,
     /// Optional bound applied independently to full-mode observed, departure, and arrival logs.
     pub max_observations: Option<usize>,
-    /// Physical transition budget for one serial device dispatch. The historical field name is
-    /// retained for API compatibility; exhausting the budget relaunches the same semantic round
-    /// with its horizon, worklist, FELs, and outbox preserved.
+    /// Physical transition budget for each active LP lane in one `days_round` dispatch. Exhausting
+    /// the budget relaunches the same semantic round with its horizon, worklist, FELs, and
+    /// producer-local outboxes preserved.
     pub max_transitions_per_lp_per_round: usize,
-    /// Requested round pairs per serial command buffer. Production execution clamps this to
+    /// Threads per threadgroup for parallel round and exchange dispatches. Correctness is
+    /// independent of this geometry; the value must be a nonzero multiple of the device execution
+    /// width and no larger than the round pipelines support.
+    pub round_threads_per_threadgroup: usize,
+    /// Requested encoded round attempts per command buffer. Production execution clamps this to
     /// 16,384 independently of caller configuration.
     pub rounds_per_command_buffer: usize,
     /// Optional hard cap overriding the conservative encoded round bound.
@@ -203,6 +209,7 @@ impl Default for MetalConfig {
             max_outbox_events: None,
             max_observations: None,
             max_transitions_per_lp_per_round: DEFAULT_TRANSITIONS_PER_DISPATCH,
+            round_threads_per_threadgroup: DEFAULT_ROUND_THREADS_PER_THREADGROUP,
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
         }
@@ -215,7 +222,7 @@ pub struct MetalRun {
     pub result: RunResult,
     pub rounds: u64,
     pub transitions: u64,
-    /// Device-resident `days_round` continuation dispatches beyond the first launch per round.
+    /// Encoded `days_round` continuation dispatches beyond the first launch per round.
     pub continuation_relaunches: u64,
     /// `waitUntilCompleted()` calls, exactly one after each committed bounded wave, including the
     /// final completion wait.
@@ -318,6 +325,11 @@ fn validate_config(config: MetalConfig) -> Result<(), MetalError> {
             "max_transitions_per_lp_per_round must be nonzero".into(),
         ));
     }
+    if config.round_threads_per_threadgroup == 0 {
+        return Err(MetalError::Validation(
+            "round_threads_per_threadgroup must be nonzero".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -349,6 +361,13 @@ struct MetalPlan {
     observed: Vec<u64>,
     departures: Vec<u64>,
     arrivals: Vec<u64>,
+    lp_state: Vec<u64>,
+    remote_meta: Vec<u64>,
+    remote_staging: Vec<u64>,
+    observation_meta: Vec<u64>,
+    inbound_meta: Vec<u64>,
+    inbound_producers: Vec<u64>,
+    merge_cursors: Vec<u64>,
     orphan_packets: Vec<PacketDescriptor>,
     round_capacity: usize,
     dispatch_capacity: usize,
@@ -613,12 +632,35 @@ impl MetalPlan {
             minimum_lookahead_ns,
         );
         let outbox_capacity = config.max_outbox_events.unwrap_or(remote_bound.max(1));
+        let mut remote_capacities = derived_remote_capacities(
+            image,
+            &flow_packet_counts,
+            &flow_feedback_counts,
+            minimum_lookahead_ns,
+        );
+        if let Some(capacity) = config.max_outbox_events {
+            remote_capacities.fill(capacity);
+        }
+        let mut remote_meta = vec![0_u64; node_count * ARENA_META_WORDS];
+        let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts);
         let observation_capacity = if observation_mode == ObservationMode::Full {
             config.max_observations.unwrap_or(event_bound.max(1))
         } else {
             0
         };
+        let mut observation_capacities = if observation_mode == ObservationMode::Full {
+            derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
+        } else {
+            vec![0; node_count]
+        };
+        if let Some(capacity) = config.max_observations {
+            observation_capacities.fill(capacity);
+        }
+        let mut observation_meta = vec![0_u64; node_count * OBSERVATION_META_WORDS];
+        let observation_slots =
+            assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
+        let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -664,10 +706,17 @@ impl MetalPlan {
             in_service,
             outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
             worklist: vec![0_u64; node_count.max(1)],
-            summary: vec![0_u64; SUMMARY_COUNTERS * 2],
-            observed: zero_words(observation_capacity, OBSERVED_WORDS)?,
-            departures: zero_words(observation_capacity, DEPARTURE_WORDS)?,
-            arrivals: zero_words(observation_capacity, ARRIVAL_WORDS)?,
+            summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
+            observed: zero_words(observation_slots, OBSERVED_WORDS)?,
+            departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
+            arrivals: zero_words(observation_slots, ARRIVAL_WORDS)?,
+            lp_state: vec![0_u64; node_count.max(1) * LP_STATE_WORDS],
+            remote_meta,
+            remote_staging: zero_words(remote_staging_slots, EVENT_WORDS)?,
+            observation_meta,
+            inbound_meta,
+            merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
+            inbound_producers,
             orphan_packets,
             round_capacity,
             dispatch_capacity,
@@ -945,6 +994,121 @@ fn derived_remote_capacity(
         .fold(image.nodes.len().saturating_mul(2), usize::saturating_add)
 }
 
+fn derived_remote_capacities(
+    image: &SimulationImage,
+    counts: &[usize],
+    feedback_counts: &[usize],
+    lookahead: Option<u64>,
+) -> Vec<usize> {
+    let mut capacities = vec![2_usize; image.nodes.len()];
+    for (index, flow) in image.flows.iter().enumerate() {
+        let feedback_count = feedback_counts[index];
+        let data_count = counts[index].saturating_sub(feedback_count);
+        for (route, packet_count, packet_kind) in [
+            (flow.route.as_slice(), data_count, PacketKind::Data),
+            (
+                flow.reverse_route.as_slice(),
+                feedback_count,
+                PacketKind::Feedback,
+            ),
+        ] {
+            for link_id in route {
+                let producer = image.links[link_id.0 as usize].source.0 as usize;
+                capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
+                    image,
+                    index,
+                    packet_count,
+                    packet_kind,
+                    *link_id,
+                    lookahead,
+                ));
+            }
+        }
+    }
+    capacities
+}
+
+fn derived_observation_capacities(
+    image: &SimulationImage,
+    counts: &[usize],
+    feedback_counts: &[usize],
+) -> Vec<usize> {
+    let mut capacities = vec![1_usize; image.nodes.len()];
+    for event in &image.initial_events {
+        let target = event.target.0 as usize;
+        capacities[target] = capacities[target].saturating_add(1);
+    }
+    for (index, flow) in image.flows.iter().enumerate() {
+        let feedback_count = feedback_counts[index];
+        let data_count = counts[index].saturating_sub(feedback_count);
+        capacities[flow.source.0 as usize] =
+            capacities[flow.source.0 as usize].saturating_add(data_count);
+        capacities[flow.target.0 as usize] =
+            capacities[flow.target.0 as usize].saturating_add(feedback_count);
+        add_route_observation_capacities(
+            image,
+            &flow.route,
+            flow.target,
+            data_count,
+            &mut capacities,
+        );
+        add_route_observation_capacities(
+            image,
+            &flow.reverse_route,
+            flow.source,
+            feedback_count,
+            &mut capacities,
+        );
+    }
+    capacities
+}
+
+fn add_route_observation_capacities(
+    image: &SimulationImage,
+    route: &[crate::LinkId],
+    terminal: NodeId,
+    packet_count: usize,
+    capacities: &mut [usize],
+) {
+    for (step, link_id) in route.iter().enumerate() {
+        let producer = image.links[link_id.0 as usize].source.0 as usize;
+        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
+        let target = route
+            .get(step + 1)
+            .map_or(terminal, |next| image.links[next.0 as usize].source)
+            .0 as usize;
+        capacities[target] = capacities[target].saturating_add(packet_count);
+    }
+}
+
+fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
+    let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
+    for flow in &image.flows {
+        for (route, terminal) in [
+            (flow.route.as_slice(), flow.target),
+            (flow.reverse_route.as_slice(), flow.source),
+        ] {
+            for (step, link_id) in route.iter().enumerate() {
+                let producer = image.links[link_id.0 as usize].source.0;
+                let target = route
+                    .get(step + 1)
+                    .map_or(terminal, |next| image.links[next.0 as usize].source)
+                    .0 as usize;
+                inbound[target].insert(producer);
+            }
+        }
+    }
+    let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
+    let mut producers = Vec::new();
+    for (target, target_producers) in inbound.into_iter().enumerate() {
+        let base = target * INBOUND_META_WORDS;
+        meta[base] = producers.len() as u64;
+        meta[base + 1] = target_producers.len() as u64;
+        producers.extend(target_producers);
+    }
+    (meta, producers)
+}
+
 fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> usize {
     image
         .flows
@@ -1003,6 +1167,22 @@ fn assign_arena_offsets(meta: &mut [u64], capacities: &[usize]) -> Result<usize,
         offset = offset
             .checked_add(capacity)
             .ok_or_else(|| MetalError::Validation("device arena size overflows usize".into()))?;
+    }
+    Ok(offset)
+}
+
+fn assign_observation_offsets(meta: &mut [u64], capacities: &[usize]) -> Result<usize, MetalError> {
+    let mut offset = 0_usize;
+    for (slot, capacity) in capacities.iter().copied().enumerate() {
+        let base = slot * OBSERVATION_META_WORDS;
+        for log in 0..3 {
+            let log_base = base + log * ARENA_META_WORDS;
+            meta[log_base] = offset as u64;
+            meta[log_base + 1] = capacity as u64;
+        }
+        offset = offset
+            .checked_add(capacity)
+            .ok_or_else(|| MetalError::Validation("observation arena size overflows".into()))?;
     }
     Ok(offset)
 }
@@ -1167,6 +1347,7 @@ impl SharedBuffer {
 struct MetalBuffers {
     planes: Vec<SharedBuffer>,
     orphan_packets: Vec<PacketDescriptor>,
+    node_count: usize,
     round_capacity: usize,
     dispatch_capacity: usize,
 }
@@ -1176,6 +1357,7 @@ impl MetalBuffers {
         let round_capacity = plan.round_capacity;
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
+        let node_count = plan.params[0] as usize;
         let planes = vec![
             plan.control,
             plan.params,
@@ -1195,6 +1377,13 @@ impl MetalBuffers {
             plan.observed,
             plan.departures,
             plan.arrivals,
+            plan.lp_state,
+            plan.remote_meta,
+            plan.remote_staging,
+            plan.observation_meta,
+            plan.inbound_meta,
+            plan.inbound_producers,
+            plan.merge_cursors,
         ]
         .into_iter()
         .map(|words| SharedBuffer::new(device, words))
@@ -1202,6 +1391,7 @@ impl MetalBuffers {
         Ok(Self {
             planes,
             orphan_packets,
+            node_count,
             round_capacity,
             dispatch_capacity,
         })
@@ -1247,6 +1437,8 @@ impl MetalBuffers {
         let observed_words = &planes[15];
         let departure_words = &planes[16];
         let arrival_words = &planes[17];
+        let lp_state = &planes[18];
+        let observation_meta = &planes[21];
 
         let mut host_states = image.host_states.clone();
         let mut switch_states = image.switch_states.clone();
@@ -1321,20 +1513,39 @@ impl MetalBuffers {
         }
         pending_events.sort_unstable_by_key(|event| event.key);
 
-        let summary = decode_summary(summary_words);
+        let summary = decode_summary_rows(summary_words, image.nodes.len());
         let mut observed_packets = BTreeMap::new();
         let mut departures = Vec::new();
         let mut arrivals = Vec::new();
         if observation_mode == ObservationMode::Full {
-            for index in 0..control[CONTROL_OBSERVED] as usize {
-                let offset = index * OBSERVED_WORDS;
-                let packet = decode_packet_words(&observed_words[offset..offset + OBSERVED_WORDS])?;
+            let observed_words = compact_lp_log(
+                observed_words,
+                observation_meta,
+                image.nodes.len(),
+                0,
+                OBSERVED_WORDS,
+            );
+            let departure_words = compact_lp_log(
+                departure_words,
+                observation_meta,
+                image.nodes.len(),
+                ARENA_META_WORDS,
+                DEPARTURE_WORDS,
+            );
+            let arrival_words = compact_lp_log(
+                arrival_words,
+                observation_meta,
+                image.nodes.len(),
+                2 * ARENA_META_WORDS,
+                ARRIVAL_WORDS,
+            );
+            for words in observed_words.chunks_exact(OBSERVED_WORDS) {
+                let packet = decode_packet_words(words)?;
                 observed_packets.entry(packet.id).or_insert(packet);
             }
             let mut keyed_departures = Vec::new();
-            for index in 0..control[CONTROL_DEPARTURES] as usize {
-                let offset = index * DEPARTURE_WORDS;
-                let words = &departure_words[offset..offset + DEPARTURE_WORDS];
+            let mut keyed_arrivals = Vec::new();
+            for words in departure_words.chunks_exact(DEPARTURE_WORDS) {
                 let key = decode_key(words)?;
                 let packet = PacketDescriptor {
                     id: PayloadId(words[4]),
@@ -1351,16 +1562,7 @@ impl MetalBuffers {
                     },
                 ));
             }
-            keyed_departures.sort_unstable_by_key(|(key, _)| *key);
-            departures = keyed_departures
-                .into_iter()
-                .map(|(_, departure)| departure)
-                .collect();
-
-            let mut keyed_arrivals = Vec::new();
-            for index in 0..control[CONTROL_ARRIVALS] as usize {
-                let offset = index * ARRIVAL_WORDS;
-                let words = &arrival_words[offset..offset + ARRIVAL_WORDS];
+            for words in arrival_words.chunks_exact(ARRIVAL_WORDS) {
                 let key = decode_key(words)?;
                 let packet = PacketDescriptor {
                     id: PayloadId(words[4]),
@@ -1378,6 +1580,11 @@ impl MetalBuffers {
                     },
                 ));
             }
+            keyed_departures.sort_unstable_by_key(|(key, _)| *key);
+            departures = keyed_departures
+                .into_iter()
+                .map(|(_, departure)| departure)
+                .collect();
             keyed_arrivals.sort_unstable_by_key(|(key, _)| *key);
             arrivals = keyed_arrivals
                 .into_iter()
@@ -1397,7 +1604,11 @@ impl MetalBuffers {
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],
-            transitions: control[CONTROL_TRANSITIONS],
+            transitions: lp_state
+                .chunks_exact(LP_STATE_WORDS)
+                .take(image.nodes.len())
+                .map(|state| state[1])
+                .fold(0_u64, u64::saturating_add),
             continuation_relaunches: control[CONTROL_RELAUNCHES],
             wave_boundary_syncs: timing.wave_boundary_syncs,
             mid_round_wave_boundary_syncs: timing.mid_round_wave_boundary_syncs,
@@ -1436,6 +1647,33 @@ fn decode_arena(value: u64) -> MetalArena {
         7 => MetalArena::Arrivals,
         _ => MetalArena::Fel,
     }
+}
+
+fn compact_lp_log(
+    records: &[u64],
+    meta: &[u64],
+    node_count: usize,
+    log_meta_offset: usize,
+    record_words: usize,
+) -> Vec<u64> {
+    let mut output_offsets = Vec::with_capacity(node_count + 1);
+    output_offsets.push(0_usize);
+    for node in 0..node_count {
+        let base = node * OBSERVATION_META_WORDS + log_meta_offset;
+        let next = output_offsets[node].saturating_add(meta[base + 3] as usize);
+        output_offsets.push(next);
+    }
+    let mut compact = vec![0_u64; output_offsets[node_count].saturating_mul(record_words)];
+    for (node, output_offset) in output_offsets.iter().copied().take(node_count).enumerate() {
+        let base = node * OBSERVATION_META_WORDS + log_meta_offset;
+        let source_record = meta[base] as usize;
+        let count = meta[base + 3] as usize;
+        let source = source_record * record_words;
+        let destination = output_offset * record_words;
+        let words = count * record_words;
+        compact[destination..destination + words].copy_from_slice(&records[source..source + words]);
+    }
+    compact
 }
 
 fn read_record(storage: &[u64], slot: usize) -> &[u64] {
@@ -1566,9 +1804,14 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, MetalError> {
     })
 }
 
-fn decode_summary(words: &[u64]) -> RunSummary {
+fn decode_summary_rows(words: &[u64], node_count: usize) -> RunSummary {
     let counter = |index: usize| -> u128 {
-        u128::from(words[index * 2]) | (u128::from(words[index * 2 + 1]) << 64)
+        (0..node_count)
+            .map(|node| {
+                let offset = node * SUMMARY_COUNTERS * 2 + index * 2;
+                u128::from(words[offset]) | (u128::from(words[offset + 1]) << 64)
+            })
+            .sum()
     };
     RunSummary {
         sourced_packets: counter(0),
@@ -1590,7 +1833,14 @@ struct DirectMetal {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     horizon_pipeline: MetalPipeline,
+    prepare_pipeline: MetalPipeline,
     round_pipeline: MetalPipeline,
+    resolve_pipeline: MetalPipeline,
+    complete_pipeline: MetalPipeline,
+    exchange_prefix_pipeline: MetalPipeline,
+    exchange_scatter_pipeline: MetalPipeline,
+    exchange_merge_pipeline: MetalPipeline,
+    finalize_pipeline: MetalPipeline,
 }
 
 impl DirectMetal {
@@ -1603,11 +1853,24 @@ impl DirectMetal {
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
         let source = include_str!("metal_kernels.metal");
         let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
+        let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
         let round_pipeline = create_pipeline(&device, source, "days_round")?;
+        let resolve_pipeline = create_pipeline(&device, source, "days_round_resolve")?;
+        let complete_pipeline = create_pipeline(&device, source, "days_round_complete")?;
+        let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
+        let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
+        let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
+        let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
         if horizon_pipeline.maxTotalThreadsPerThreadgroup() < LANES {
             return Err(MetalError::Unavailable(format!(
                 "horizon pipeline supports only {} threads per threadgroup",
                 horizon_pipeline.maxTotalThreadsPerThreadgroup()
+            )));
+        }
+        if prepare_pipeline.maxTotalThreadsPerThreadgroup() < LANES {
+            return Err(MetalError::Unavailable(format!(
+                "round-prepare pipeline supports only {} threads per threadgroup",
+                prepare_pipeline.maxTotalThreadsPerThreadgroup()
             )));
         }
         if device.maxThreadgroupMemoryLength() < HORIZON_THREADGROUP_BYTES {
@@ -1620,11 +1883,42 @@ impl DirectMetal {
             device,
             queue,
             horizon_pipeline,
+            prepare_pipeline,
             round_pipeline,
+            resolve_pipeline,
+            complete_pipeline,
+            exchange_prefix_pipeline,
+            exchange_scatter_pipeline,
+            exchange_merge_pipeline,
+            finalize_pipeline,
         })
     }
 
     fn run(&self, buffers: &MetalBuffers, config: MetalConfig) -> Result<MetalTiming, MetalError> {
+        let round_threads = config.round_threads_per_threadgroup;
+        let execution_width = self.round_pipeline.threadExecutionWidth();
+        if !round_threads.is_multiple_of(execution_width) {
+            return Err(MetalError::Validation(format!(
+                "round_threads_per_threadgroup must be a multiple of the device execution width \
+                 {execution_width}"
+            )));
+        }
+        let parallel_pipelines = [
+            &self.round_pipeline,
+            &self.exchange_scatter_pipeline,
+            &self.exchange_merge_pipeline,
+        ];
+        let supported_threads = parallel_pipelines
+            .iter()
+            .map(|pipeline| pipeline.maxTotalThreadsPerThreadgroup())
+            .min()
+            .unwrap_or(0);
+        if round_threads > supported_threads {
+            return Err(MetalError::Validation(format!(
+                "round_threads_per_threadgroup {round_threads} exceeds the supported maximum \
+                 {supported_threads}"
+            )));
+        }
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
@@ -1632,6 +1926,23 @@ impl DirectMetal {
         let mut mid_round_wave_boundary_syncs = 0_u64;
         let (pairs_per_command_buffer, pairs_per_wave) =
             encoding_limits(config.rounds_per_command_buffer);
+        let parallel_groups = buffers.node_count.div_ceil(round_threads).max(1);
+        let parallel_grid = MTLSize {
+            width: parallel_groups,
+            height: 1,
+            depth: 1,
+        };
+        let parallel_group = MTLSize {
+            width: round_threads,
+            height: 1,
+            depth: 1,
+        };
+        let serial_grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let serial_group = serial_grid;
         let mut remaining = buffers.dispatch_capacity;
         while remaining != 0 {
             let wave_started = Instant::now();
@@ -1652,11 +1963,16 @@ impl DirectMetal {
                 for _ in 0..encoded {
                     encoder.setComputePipelineState(&self.horizon_pipeline);
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        serial_grid,
                         MTLSize {
-                            width: 1,
+                            width: LANES,
                             height: 1,
                             depth: 1,
                         },
+                    );
+                    encoder.setComputePipelineState(&self.prepare_pipeline);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        serial_grid,
                         MTLSize {
                             width: LANES,
                             height: 1,
@@ -1664,18 +1980,24 @@ impl DirectMetal {
                         },
                     );
                     encoder.setComputePipelineState(&self.round_pipeline);
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: 1,
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: 1,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+                    encoder.setComputePipelineState(&self.resolve_pipeline);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+                    encoder.setComputePipelineState(&self.complete_pipeline);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+                    encoder.setComputePipelineState(&self.exchange_prefix_pipeline);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+                    encoder.setComputePipelineState(&self.exchange_scatter_pipeline);
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+                    encoder.setComputePipelineState(&self.exchange_merge_pipeline);
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+                    encoder.setComputePipelineState(&self.resolve_pipeline);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
+                    encoder.setComputePipelineState(&self.finalize_pipeline);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(serial_grid, serial_group);
                 }
                 encoder.endEncoding();
                 command_buffers.push(command_buffer);

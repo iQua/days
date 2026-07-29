@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use days::scenario::compile_config;
-use days_executor::{MetalConfig, MetalRun, run_metal, run_scalar};
+use days_executor::{
+    MetalConfig, MetalRun, ObservationMode, run_metal, run_metal_with_observations, run_scalar,
+};
 
 const BASELINE_FIXTURES: [&str; 2] = [
     "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
@@ -39,6 +41,35 @@ fn baseline_fattree_k4_and_k8_match_scalar_complete_result() {
     for fixture in BASELINE_FIXTURES {
         assert_metal_matches_scalar(fixture);
     }
+}
+
+#[test]
+fn fattree_k8_result_is_independent_of_round_threadgroup_geometry() {
+    let path = fixture_path(BASELINE_FIXTURES[1]);
+    let image = compile_config(&path)
+        .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+    let run = |round_threads_per_threadgroup| {
+        run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                round_threads_per_threadgroup,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "Metal geometry {round_threads_per_threadgroup} failed for {}: {error}",
+                path.display()
+            )
+        })
+    };
+
+    let narrow = run(32);
+    let wide = run(256);
+
+    assert_eq!(narrow.result, wide.result);
 }
 
 #[test]

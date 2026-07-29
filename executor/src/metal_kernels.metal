@@ -7,6 +7,9 @@ constant uint GENERATOR_WORDS = 16;
 constant uint FLOW_WORDS = 6;
 constant uint LINK_WORDS = 4;
 constant uint META_WORDS = 4;
+constant uint LP_STATE_WORDS = 6;
+constant uint OBSERVATION_META_WORDS = 12;
+constant uint INBOUND_META_WORDS = 2;
 constant ulong NONE = 0xfffffffffffffffful;
 
 constant uint C_ERROR = 0;
@@ -87,6 +90,13 @@ constant ulong ARENA_OBSERVED = 5;
 constant ulong ARENA_DEPARTURES = 6;
 constant ulong ARENA_ARRIVALS = 7;
 
+constant uint L_FINISHED = 0;
+constant uint L_TRANSITIONS = 1;
+constant uint L_ERROR = 2;
+constant uint L_ERROR_ARENA = 3;
+constant uint L_ERROR_NODE = 4;
+constant uint L_ERROR_CAPACITY = 5;
+
 inline bool key_less(const thread ulong *left, const thread ulong *right) {
     if (left[E_TIME] != right[E_TIME]) {
         return left[E_TIME] < right[E_TIME];
@@ -165,30 +175,30 @@ inline void swap_records(device ulong *records, ulong left_slot, ulong right_slo
 }
 
 inline void set_capacity_error(
-    device ulong *control,
+    device ulong *error,
     ulong arena,
     ulong node,
     ulong capacity
 ) {
-    if (control[C_ERROR] == 0) {
-        control[C_ERROR] = ERROR_CAPACITY;
-        control[C_ERROR_ARENA] = arena;
-        control[C_ERROR_NODE] = node;
-        control[C_ERROR_CAPACITY] = capacity;
+    if (error[L_ERROR] == 0) {
+        error[L_ERROR] = ERROR_CAPACITY;
+        error[L_ERROR_ARENA] = arena;
+        error[L_ERROR_NODE] = node;
+        error[L_ERROR_CAPACITY] = capacity;
     }
 }
 
-inline void set_semantic_error(device ulong *control, ulong code, ulong node) {
-    if (control[C_ERROR] == 0) {
-        control[C_ERROR] = ERROR_SEMANTIC + code;
-        control[C_ERROR_NODE] = node;
+inline void set_semantic_error(device ulong *error, ulong code, ulong node) {
+    if (error[L_ERROR] == 0) {
+        error[L_ERROR] = ERROR_SEMANTIC + code;
+        error[L_ERROR_NODE] = node;
     }
 }
 
 inline bool heap_push(
     ulong node,
     const thread ulong *record,
-    device ulong *control,
+    device ulong *error,
     device ulong *meta,
     device ulong *records
 ) {
@@ -197,7 +207,7 @@ inline bool heap_push(
     ulong capacity = meta[base + 1];
     ulong count = meta[base + 3];
     if (count >= capacity) {
-        set_capacity_error(control, ARENA_FEL, node, capacity);
+        set_capacity_error(error, ARENA_FEL, node, capacity);
         return false;
     }
     ulong child = count;
@@ -274,7 +284,7 @@ inline bool before_horizon(ulong time, const device ulong *control) {
 inline bool queue_push(
     ulong node,
     const thread ulong *record,
-    device ulong *control,
+    device ulong *error,
     device ulong *meta,
     device ulong *records
 ) {
@@ -284,7 +294,7 @@ inline bool queue_push(
     ulong head = meta[base + 2];
     ulong count = meta[base + 3];
     if (count >= capacity) {
-        set_capacity_error(control, ARENA_QUEUE, node, capacity);
+        set_capacity_error(error, ARENA_QUEUE, node, capacity);
         return false;
     }
     ulong physical = (head + count) % max(capacity, 1ul);
@@ -314,7 +324,7 @@ inline bool source_queue_key_less_or_equal(
 inline bool source_queue_insert(
     ulong node,
     const thread ulong *record,
-    device ulong *control,
+    device ulong *error,
     device ulong *meta,
     device ulong *records
 ) {
@@ -324,7 +334,7 @@ inline bool source_queue_insert(
     ulong head = meta[base + 2];
     ulong count = meta[base + 3];
     if (count >= capacity) {
-        set_capacity_error(control, ARENA_QUEUE, node, capacity);
+        set_capacity_error(error, ARENA_QUEUE, node, capacity);
         return false;
     }
     ulong insertion = count;
@@ -391,8 +401,13 @@ inline ulong event_phase(ulong kind) {
     return 0;
 }
 
-inline void add_summary(device ulong *summary, uint counter, ulong value) {
-    uint offset = counter * 2;
+inline void add_summary(
+    device ulong *summary,
+    ulong node,
+    uint counter,
+    ulong value
+) {
+    ulong offset = node * 24 + counter * 2;
     ulong previous = summary[offset];
     ulong next = previous + value;
     summary[offset] = next;
@@ -402,64 +417,86 @@ inline void add_summary(device ulong *summary, uint counter, ulong value) {
 }
 
 inline bool append_observed(
+    ulong node,
     const thread ulong *packet,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
+    device ulong *observation_meta,
     device ulong *observed
 ) {
     if (params[P_FULL_OBSERVATIONS] == 0) {
         return true;
     }
-    ulong index = control[C_OBSERVED];
-    ulong capacity = params[P_OBSERVED_CAPACITY];
+    ulong meta = node * OBSERVATION_META_WORDS;
+    ulong index = observation_meta[meta + 3];
+    ulong capacity = observation_meta[meta + 1];
     if (index >= capacity) {
-        set_capacity_error(control, ARENA_OBSERVED, NONE, capacity);
+        set_capacity_error(error, ARENA_OBSERVED, NONE, params[P_OBSERVED_CAPACITY]);
         return false;
     }
-    ulong offset = index * 4;
+    ulong offset = (observation_meta[meta] + index) * 4;
     observed[offset] = packet[PK_ID];
     observed[offset + 1] = packet[PK_FLOW];
     observed[offset + 2] = packet[PK_SIZE];
     observed[offset + 3] = packet[PK_KIND];
-    control[C_OBSERVED] = index + 1;
+    observation_meta[meta + 3] = index + 1;
     return true;
 }
 
 inline bool record_sourced(
+    ulong node,
     const thread ulong *packet,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
     device ulong *summary,
+    device ulong *observation_meta,
     device ulong *observed
 ) {
-    add_summary(summary, 0, 1);
-    add_summary(summary, 1, packet[PK_SIZE]);
-    return append_observed(packet, control, params, observed);
+    add_summary(summary, node, 0, 1);
+    add_summary(summary, node, 1, packet[PK_SIZE]);
+    return append_observed(
+        node,
+        packet,
+        error,
+        params,
+        observation_meta,
+        observed
+    );
 }
 
 inline bool record_departure(
+    ulong node,
     const thread ulong *event,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
     device ulong *summary,
+    device ulong *observation_meta,
     device ulong *observed,
     device ulong *departures
 ) {
-    add_summary(summary, 2, 1);
-    add_summary(summary, 3, event[PK_SIZE]);
-    if (!append_observed(event, control, params, observed)) {
+    add_summary(summary, node, 2, 1);
+    add_summary(summary, node, 3, event[PK_SIZE]);
+    if (!append_observed(
+        node,
+        event,
+        error,
+        params,
+        observation_meta,
+        observed
+    )) {
         return false;
     }
     if (params[P_FULL_OBSERVATIONS] == 0) {
         return true;
     }
-    ulong index = control[C_DEPARTURES];
-    ulong capacity = params[P_DEPARTURE_CAPACITY];
+    ulong meta = node * OBSERVATION_META_WORDS + META_WORDS;
+    ulong index = observation_meta[meta + 3];
+    ulong capacity = observation_meta[meta + 1];
     if (index >= capacity) {
-        set_capacity_error(control, ARENA_DEPARTURES, NONE, capacity);
+        set_capacity_error(error, ARENA_DEPARTURES, NONE, params[P_DEPARTURE_CAPACITY]);
         return false;
     }
-    ulong offset = index * 9;
+    ulong offset = (observation_meta[meta] + index) * 9;
     departures[offset] = event[E_TIME];
     departures[offset + 1] = event[E_PHASE];
     departures[offset + 2] = event[E_ORIGIN];
@@ -469,16 +506,18 @@ inline bool record_departure(
     departures[offset + 6] = event[PK_FLOW];
     departures[offset + 7] = event[PK_SIZE];
     departures[offset + 8] = event[PK_KIND];
-    control[C_DEPARTURES] = index + 1;
+    observation_meta[meta + 3] = index + 1;
     return true;
 }
 
 inline bool record_arrival(
+    ulong node,
     const thread ulong *event,
     ulong disposition,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
     device ulong *summary,
+    device ulong *observation_meta,
     device ulong *observed,
     device ulong *arrivals
 ) {
@@ -490,21 +529,29 @@ inline bool record_arrival(
     } else if (disposition == 3) {
         counter = 10;
     }
-    add_summary(summary, counter, 1);
-    add_summary(summary, counter + 1, event[PK_SIZE]);
-    if (!append_observed(event, control, params, observed)) {
+    add_summary(summary, node, counter, 1);
+    add_summary(summary, node, counter + 1, event[PK_SIZE]);
+    if (!append_observed(
+        node,
+        event,
+        error,
+        params,
+        observation_meta,
+        observed
+    )) {
         return false;
     }
     if (params[P_FULL_OBSERVATIONS] == 0) {
         return true;
     }
-    ulong index = control[C_ARRIVALS];
-    ulong capacity = params[P_ARRIVAL_CAPACITY];
+    ulong meta = node * OBSERVATION_META_WORDS + 2 * META_WORDS;
+    ulong index = observation_meta[meta + 3];
+    ulong capacity = observation_meta[meta + 1];
     if (index >= capacity) {
-        set_capacity_error(control, ARENA_ARRIVALS, NONE, capacity);
+        set_capacity_error(error, ARENA_ARRIVALS, NONE, params[P_ARRIVAL_CAPACITY]);
         return false;
     }
-    ulong offset = index * 10;
+    ulong offset = (observation_meta[meta] + index) * 10;
     arrivals[offset] = event[E_TIME];
     arrivals[offset + 1] = event[E_PHASE];
     arrivals[offset + 2] = event[E_ORIGIN];
@@ -515,24 +562,44 @@ inline bool record_arrival(
     arrivals[offset + 7] = event[PK_FLOW];
     arrivals[offset + 8] = event[PK_SIZE];
     arrivals[offset + 9] = event[PK_KIND];
-    control[C_ARRIVALS] = index + 1;
+    observation_meta[meta + 3] = index + 1;
     return true;
 }
 
 inline bool append_remote(
+    ulong node,
     const thread ulong *record,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
-    device ulong *outbox
+    device ulong *remote_meta,
+    device ulong *remote_staging
 ) {
-    ulong index = control[C_OUTBOX];
-    ulong capacity = params[P_OUTBOX_CAPACITY];
+    ulong base = node * META_WORDS;
+    ulong offset = remote_meta[base];
+    ulong capacity = remote_meta[base + 1];
+    ulong index = remote_meta[base + 3];
     if (index >= capacity) {
-        set_capacity_error(control, ARENA_OUTBOX, NONE, capacity);
+        set_capacity_error(error, ARENA_OUTBOX, NONE, params[P_OUTBOX_CAPACITY]);
         return false;
     }
-    copy_thread_to_device(record, outbox, index);
-    control[C_OUTBOX] = index + 1;
+    copy_thread_to_device(record, remote_staging, offset + index);
+    remote_meta[base + 3] = index + 1;
+    ulong insertion = index;
+    while (
+        insertion != 0 &&
+        stored_key_less(
+            remote_staging,
+            offset + insertion,
+            offset + insertion - 1
+        )
+    ) {
+        swap_records(
+            remote_staging,
+            offset + insertion,
+            offset + insertion - 1
+        );
+        insertion -= 1;
+    }
     return true;
 }
 
@@ -543,17 +610,18 @@ inline bool emit_child(
     ulong kind,
     ulong time,
     const thread ulong *packet,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
     device ulong *node_state,
     device ulong *fel_meta,
     device ulong *fel_records,
-    device ulong *outbox
+    device ulong *remote_meta,
+    device ulong *remote_staging
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
     if (sequence == NONE) {
-        set_semantic_error(control, 1, node);
+        set_semantic_error(error, 1, node);
         return false;
     }
     node_state[node_base + N_NEXT_ORIGIN] = sequence + 1;
@@ -570,13 +638,20 @@ inline bool emit_child(
     child[PK_SIZE] = packet[PK_SIZE];
     child[PK_KIND] = packet[PK_KIND];
     if (!key_less(parent, child)) {
-        set_semantic_error(control, 2, node);
+        set_semantic_error(error, 2, node);
         return false;
     }
     if (target == node) {
-        return heap_push(node, child, control, fel_meta, fel_records);
+        return heap_push(node, child, error, fel_meta, fel_records);
     }
-    return append_remote(child, control, params, outbox);
+    return append_remote(
+        node,
+        child,
+        error,
+        params,
+        remote_meta,
+        remote_staging
+    );
 }
 
 inline bool checked_add(ulong left, ulong right, thread ulong &result) {
@@ -700,7 +775,7 @@ inline bool packet_remote_target(
 inline bool dispatch_event(
     ulong node,
     thread ulong *event,
-    device ulong *control,
+    device ulong *error,
     const device ulong *params,
     device ulong *node_state,
     device ulong *generators,
@@ -712,8 +787,10 @@ inline bool dispatch_event(
     device ulong *queue_meta,
     device ulong *queue_records,
     device ulong *in_service,
-    device ulong *outbox,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
     device ulong *summary,
+    device ulong *observation_meta,
     device ulong *observed,
     device ulong *departures,
     device ulong *arrivals
@@ -724,7 +801,7 @@ inline bool dispatch_event(
 
     if (kind == PACKET_ARRIVAL) {
         if (role != HOST) {
-            set_semantic_error(control, 3, node);
+            set_semantic_error(error, 3, node);
             return false;
         }
         ulong generator_base = event[PK_FLOW] * GENERATOR_WORDS;
@@ -738,14 +815,14 @@ inline bool dispatch_event(
                 generators[generator_base + 5] != event[E_TIME] ||
                 generators[generator_base + 6] != event[PK_ID]
             ) {
-                set_semantic_error(control, 4, node);
+                set_semantic_error(error, 4, node);
                 return false;
             }
             if (
                 generators[generator_base + 2] == NONE ||
                 generators[generator_base + 3] > NONE - event[PK_SIZE]
             ) {
-                set_semantic_error(control, 5, node);
+                set_semantic_error(error, 5, node);
                 return false;
             }
             generators[generator_base + 2] += 1;
@@ -764,7 +841,7 @@ inline bool dispatch_event(
                         candidate
                     )
                 ) {
-                    set_semantic_error(control, 6, node);
+                    set_semantic_error(error, 6, node);
                     return false;
                 }
             } else {
@@ -774,7 +851,7 @@ inline bool dispatch_event(
                     generators[generator_base + 15],
                     end
                 )) {
-                    set_semantic_error(control, 6, node);
+                    set_semantic_error(error, 6, node);
                     return false;
                 }
                 if (!checked_add(
@@ -782,7 +859,7 @@ inline bool dispatch_event(
                     generators[generator_base + 12],
                     candidate
                 )) {
-                    set_semantic_error(control, 6, node);
+                    set_semantic_error(error, 6, node);
                     return false;
                 }
                 semantic_next = candidate < end;
@@ -790,7 +867,7 @@ inline bool dispatch_event(
             if (semantic_next && candidate <= params[P_STOP_TIME]) {
                 ulong sequence = node_state[node_base + N_NEXT_PAYLOAD];
                 if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT]) {
-                    set_semantic_error(control, 7, node);
+                    set_semantic_error(error, 7, node);
                     return false;
                 }
                 ulong payload = sequence * params[P_NODE_COUNT] + node;
@@ -813,12 +890,13 @@ inline bool dispatch_event(
                     PACKET_ARRIVAL,
                     candidate,
                     next_packet,
-                    control,
+                    error,
                     params,
                     node_state,
                     fel_meta,
                     fel_records,
-                    outbox
+                    remote_meta,
+                    remote_staging
                 )) {
                     return false;
                 }
@@ -830,7 +908,7 @@ inline bool dispatch_event(
             }
         }
         if (node_state[node_base + N_COUNTER_0] == NONE) {
-            set_semantic_error(control, 8, node);
+            set_semantic_error(error, 8, node);
             return false;
         }
         node_state[node_base + N_COUNTER_0] += 1;
@@ -842,13 +920,21 @@ inline bool dispatch_event(
         if (!source_queue_insert(
             node,
             sourced_packet,
-            control,
+            error,
             queue_meta,
             queue_records
         )) {
             return false;
         }
-        if (!record_sourced(event, control, params, summary, observed)) {
+        if (!record_sourced(
+            node,
+            event,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed
+        )) {
             return false;
         }
         if (
@@ -863,12 +949,13 @@ inline bool dispatch_event(
                 TX_READY,
                 event[E_TIME],
                 event,
-                control,
+                error,
                 params,
                 node_state,
                 fel_meta,
                 fel_records,
-                outbox
+                remote_meta,
+                remote_staging
             )) {
                 return false;
             }
@@ -879,7 +966,7 @@ inline bool dispatch_event(
     if (kind == TX_READY) {
         node_state[node_base + N_READY_PENDING] = 0;
         if (node_state[node_base + N_SERVICE_VALID] != 0) {
-            set_semantic_error(control, 9, node);
+            set_semantic_error(error, 9, node);
             return false;
         }
         ulong selected[EVENT_WORDS];
@@ -890,17 +977,17 @@ inline bool dispatch_event(
         copy_thread_to_device(selected, in_service, node);
         ulong egress = node_state[node_base + N_EGRESS];
         if (egress == NONE || egress >= params[P_LINK_COUNT]) {
-            set_semantic_error(control, 10, node);
+            set_semantic_error(error, 10, node);
             return false;
         }
         ulong link_base = egress * LINK_WORDS;
         if (links[link_base] != node) {
-            set_semantic_error(control, 11, node);
+            set_semantic_error(error, 11, node);
             return false;
         }
         ulong serialization;
         if (!serialization_ns(selected[PK_SIZE], links[link_base + 2], serialization)) {
-            set_semantic_error(control, 12, node);
+            set_semantic_error(error, 12, node);
             return false;
         }
         ulong departure_time;
@@ -909,12 +996,12 @@ inline bool dispatch_event(
             !checked_add(event[E_TIME], serialization, departure_time) ||
             !checked_add(departure_time, links[link_base + 3], arrival_time)
         ) {
-            set_semantic_error(control, 13, node);
+            set_semantic_error(error, 13, node);
             return false;
         }
         ulong target;
         if (!packet_remote_target(selected, egress, flows, routes, links, target)) {
-            set_semantic_error(control, 14, node);
+            set_semantic_error(error, 14, node);
             return false;
         }
         if (!emit_child(
@@ -924,12 +1011,13 @@ inline bool dispatch_event(
             TX_COMPLETE,
             departure_time,
             selected,
-            control,
+            error,
             params,
             node_state,
             fel_meta,
             fel_records,
-            outbox
+            remote_meta,
+            remote_staging
         )) {
             return false;
         }
@@ -940,12 +1028,13 @@ inline bool dispatch_event(
             REMOTE_ARRIVAL,
             arrival_time,
             selected,
-            control,
+            error,
             params,
             node_state,
             fel_meta,
             fel_records,
-            outbox
+            remote_meta,
+            remote_staging
         );
     }
 
@@ -954,21 +1043,23 @@ inline bool dispatch_event(
             node_state[node_base + N_SERVICE_VALID] == 0 ||
             in_service[node * EVENT_WORDS + PK_ID] != event[PK_ID]
         ) {
-            set_semantic_error(control, 15, node);
+            set_semantic_error(error, 15, node);
             return false;
         }
         node_state[node_base + N_SERVICE_VALID] = 0;
         uint departure_counter = role == HOST ? N_COUNTER_1 : N_COUNTER_2;
         if (node_state[node_base + departure_counter] == NONE) {
-            set_semantic_error(control, 16, node);
+            set_semantic_error(error, 16, node);
             return false;
         }
         node_state[node_base + departure_counter] += 1;
         if (!record_departure(
+            node,
             event,
-            control,
+            error,
             params,
             summary,
+            observation_meta,
             observed,
             departures
         )) {
@@ -980,7 +1071,7 @@ inline bool dispatch_event(
         ) {
             ulong next[EVENT_WORDS];
             if (!queue_front(node, queue_meta, queue_records, next)) {
-                set_semantic_error(control, 17, node);
+                set_semantic_error(error, 17, node);
                 return false;
             }
             node_state[node_base + N_READY_PENDING] = 1;
@@ -991,12 +1082,13 @@ inline bool dispatch_event(
                 TX_READY,
                 event[E_TIME],
                 next,
-                control,
+                error,
                 params,
                 node_state,
                 fel_meta,
                 fel_records,
-                outbox
+                remote_meta,
+                remote_staging
             );
         }
         return true;
@@ -1004,46 +1096,50 @@ inline bool dispatch_event(
 
     if (kind == REMOTE_ARRIVAL && role == SWITCH) {
         if (node_state[node_base + N_COUNTER_0] == NONE) {
-            set_semantic_error(control, 18, node);
+            set_semantic_error(error, 18, node);
             return false;
         }
         node_state[node_base + N_COUNTER_0] += 1;
         ulong egress;
         if (!packet_egress(node, event, flows, routes, links, egress)) {
-            set_semantic_error(control, 19, node);
+            set_semantic_error(error, 19, node);
             return false;
         }
         if (egress != node_state[node_base + N_EGRESS]) {
-            set_semantic_error(control, 20, node);
+            set_semantic_error(error, 20, node);
             return false;
         }
         ulong waiting = queue_meta[node * META_WORDS + 3];
         ulong semantic_capacity = node_state[node_base + N_SEMANTIC_QUEUE_CAPACITY];
         if (semantic_capacity != 0 && waiting >= semantic_capacity) {
             if (node_state[node_base + N_COUNTER_1] == NONE) {
-                set_semantic_error(control, 21, node);
+                set_semantic_error(error, 21, node);
                 return false;
             }
             node_state[node_base + N_COUNTER_1] += 1;
             return record_arrival(
+                node,
                 event,
                 1,
-                control,
+                error,
                 params,
                 summary,
+                observation_meta,
                 observed,
                 arrivals
             );
         }
-        if (!queue_push(node, event, control, queue_meta, queue_records)) {
+        if (!queue_push(node, event, error, queue_meta, queue_records)) {
             return false;
         }
         if (!record_arrival(
+            node,
             event,
             0,
-            control,
+            error,
             params,
             summary,
+            observation_meta,
             observed,
             arrivals
         )) {
@@ -1062,12 +1158,13 @@ inline bool dispatch_event(
                 TX_READY,
                 event[E_TIME],
                 event,
-                control,
+                error,
                 params,
                 node_state,
                 fel_meta,
                 fel_records,
-                outbox
+                remote_meta,
+                remote_staging
             );
         }
         return true;
@@ -1084,7 +1181,7 @@ inline bool dispatch_event(
         ) {
             ulong generator_base = event[PK_FLOW] * GENERATOR_WORDS;
             if (generators[generator_base + 8] == NONE) {
-                set_semantic_error(control, 22, node);
+                set_semantic_error(error, 22, node);
                 return false;
             }
             generators[generator_base + 8] += 1;
@@ -1093,27 +1190,29 @@ inline bool dispatch_event(
             ulong expected =
                 event[PK_KIND] == DATA_PACKET ? flows[flow_base + 1] : flows[flow_base];
             if (expected != node) {
-                set_semantic_error(control, 23, node);
+                set_semantic_error(error, 23, node);
                 return false;
             }
             if (node_state[node_base + N_COUNTER_2] == NONE) {
-                set_semantic_error(control, 24, node);
+                set_semantic_error(error, 24, node);
                 return false;
             }
             node_state[node_base + N_COUNTER_2] += 1;
         }
         return record_arrival(
+            node,
             event,
             disposition,
-            control,
+            error,
             params,
             summary,
+            observation_meta,
             observed,
             arrivals
         );
     }
 
-    set_semantic_error(control, 25, node);
+    set_semantic_error(error, 25, node);
     return false;
 }
 
@@ -1193,6 +1292,85 @@ kernel void days_horizon(
     control[C_HORIZON_HI] = horizon_hi;
 }
 
+kernel void days_round_prepare(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *fel_meta [[buffer(7)]],
+    const device ulong *fel_records [[buffer(8)]],
+    device ulong *worklist [[buffer(13)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong counts[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+
+    ulong nodes = params[P_NODE_COUNT];
+    ulong chunk = nodes / 1024;
+    ulong remainder = nodes % 1024;
+    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
+    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong local_count = 0;
+    for (ulong node = start; node < end; ++node) {
+        ulong state = node * LP_STATE_WORDS;
+        lp_state[state + L_ERROR] = 0;
+        lp_state[state + L_ERROR_ARENA] = 0;
+        lp_state[state + L_ERROR_NODE] = NONE;
+        lp_state[state + L_ERROR_CAPACITY] = 0;
+        remote_meta[node * META_WORDS + 3] = 0;
+        ulong time;
+        if (
+            heap_root_time(node, fel_meta, fel_records, time) &&
+            before_horizon(time, control)
+        ) {
+            local_count += 1;
+        }
+    }
+
+    counts[lane] = local_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1; offset < 1024; offset <<= 1) {
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        counts[lane] += addend;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    ulong write = counts[lane] - local_count;
+    for (ulong node = start; node < end; ++node) {
+        ulong time;
+        if (
+            heap_root_time(node, fel_meta, fel_records, time) &&
+            before_horizon(time, control)
+        ) {
+            if (write >= params[P_WORKLIST_CAPACITY]) {
+                if (lane == 0) {
+                    control[C_ERROR] = ERROR_CAPACITY;
+                    control[C_ERROR_ARENA] = ARENA_WORKLIST;
+                    control[C_ERROR_NODE] = NONE;
+                    control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+                }
+                return;
+            }
+            worklist[write++] = node;
+            lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        control[C_ACTIVE] = counts[1023];
+        control[C_OUTBOX] = 0;
+        control[C_CONTINUATION] = 1;
+    }
+}
+
 kernel void days_round(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -1206,116 +1384,291 @@ kernel void days_round(
     device ulong *queue_meta [[buffer(9)]],
     device ulong *queue_records [[buffer(10)]],
     device ulong *in_service [[buffer(11)]],
-    device ulong *outbox [[buffer(12)]],
-    device ulong *worklist [[buffer(13)]],
+    const device ulong *worklist [[buffer(13)]],
     device ulong *summary [[buffer(14)]],
     device ulong *observed [[buffer(15)]],
     device ulong *departures [[buffer(16)]],
-    device ulong *arrivals [[buffer(17)]]
+    device ulong *arrivals [[buffer(17)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *remote_staging [[buffer(20)]],
+    device ulong *observation_meta [[buffer(21)]],
+    uint active_index [[thread_position_in_grid]]
 ) {
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
-        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+        control[C_CONTINUATION] != 1 ||
+        active_index >= control[C_ACTIVE]
     ) {
         return;
     }
-    if (control[C_CONTINUATION] == 0) {
-        ulong active = 0;
-        for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
-            ulong time;
-            if (
-                heap_root_time(node, fel_meta, fel_records, time) &&
-                before_horizon(time, control)
-            ) {
-                if (active >= params[P_WORKLIST_CAPACITY]) {
-                    set_capacity_error(
-                        control,
-                        ARENA_WORKLIST,
-                        NONE,
-                        params[P_WORKLIST_CAPACITY]
-                    );
-                    return;
-                }
-                worklist[active++] = node;
-            }
-        }
-        control[C_ACTIVE] = active;
-        control[C_OUTBOX] = 0;
-        control[C_CONTINUATION] = 1;
-    } else {
-        control[C_RELAUNCHES] += 1;
+    ulong node = worklist[active_index];
+    device ulong *state = lp_state + node * LP_STATE_WORDS;
+    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
+        return;
     }
 
-    ulong active = control[C_ACTIVE];
-    ulong active_index = control[C_CONTINUATION] - 1;
     ulong dispatch_transitions = 0;
-    for (; active_index < active; ++active_index) {
-        ulong node = worklist[active_index];
-        while (true) {
-            ulong time;
-            if (
-                !heap_root_time(node, fel_meta, fel_records, time) ||
-                !before_horizon(time, control)
-            ) {
-                break;
-            }
-            if (dispatch_transitions >= params[P_TRANSITION_CAPACITY]) {
-                control[C_CONTINUATION] = active_index + 1;
-                return;
-            }
-            ulong event[EVENT_WORDS];
-            if (!heap_pop(node, fel_meta, fel_records, event)) {
-                set_semantic_error(control, 26, node);
-                return;
-            }
-            if (!dispatch_event(
-                node,
-                event,
-                control,
-                params,
-                node_state,
-                generators,
-                flows,
-                routes,
-                links,
-                fel_meta,
-                fel_records,
-                queue_meta,
-                queue_records,
-                in_service,
-                outbox,
-                summary,
-                observed,
-                departures,
-                arrivals
-            )) {
-                return;
-            }
-            dispatch_transitions += 1;
-            if (control[C_TRANSITIONS] == NONE) {
-                set_semantic_error(control, 27, node);
-                return;
-            }
-            control[C_TRANSITIONS] += 1;
-        }
-    }
-
-    ulong remote_count = control[C_OUTBOX];
-    for (ulong index = 0; index < remote_count; ++index) {
-        ulong event[EVENT_WORDS];
-        copy_device_to_thread(outbox, index, event);
-        if (before_horizon(event[E_TIME], control)) {
-            set_semantic_error(control, 28, event[E_TARGET]);
+    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
+        ulong time;
+        if (
+            !heap_root_time(node, fel_meta, fel_records, time) ||
+            !before_horizon(time, control)
+        ) {
+            state[L_FINISHED] = 1;
             return;
         }
-        if (!heap_push(
-            event[E_TARGET],
+        ulong event[EVENT_WORDS];
+        if (!heap_pop(node, fel_meta, fel_records, event)) {
+            set_semantic_error(state, 26, node);
+            return;
+        }
+        if (!dispatch_event(
+            node,
             event,
-            control,
+            state,
+            params,
+            node_state,
+            generators,
+            flows,
+            routes,
+            links,
             fel_meta,
-            fel_records
+            fel_records,
+            queue_meta,
+            queue_records,
+            in_service,
+            remote_meta,
+            remote_staging,
+            summary,
+            observation_meta,
+            observed,
+            departures,
+            arrivals
         )) {
+            return;
+        }
+        if (state[L_TRANSITIONS] == NONE) {
+            set_semantic_error(state, 27, node);
+            return;
+        }
+        state[L_TRANSITIONS] += 1;
+        dispatch_transitions += 1;
+    }
+
+}
+
+kernel void days_round_resolve(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *lp_state [[buffer(18)]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] == 0
+    ) {
+        return;
+    }
+    for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
+        ulong state = node * LP_STATE_WORDS;
+        if (lp_state[state + L_ERROR] != 0) {
+            control[C_ERROR] = lp_state[state + L_ERROR];
+            control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
+            control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
+            control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+            return;
+        }
+    }
+}
+
+kernel void days_round_complete(
+    device ulong *control [[buffer(0)]],
+    const device ulong *worklist [[buffer(13)]],
+    const device ulong *lp_state [[buffer(18)]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1
+    ) {
+        return;
+    }
+    for (ulong active = 0; active < control[C_ACTIVE]; ++active) {
+        ulong node = worklist[active];
+        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
+            control[C_RELAUNCHES] += 1;
+            return;
+        }
+    }
+    control[C_CONTINUATION] = 2;
+}
+
+kernel void days_exchange_prefix(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *remote_meta [[buffer(19)]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+    ulong total = 0;
+    ulong capacity = params[P_OUTBOX_CAPACITY];
+    for (ulong producer = 0; producer < params[P_NODE_COUNT]; ++producer) {
+        ulong base = producer * META_WORDS;
+        ulong count = remote_meta[base + 3];
+        remote_meta[base + 2] = total;
+        if (total > capacity || count > capacity - total) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = ARENA_OUTBOX;
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = capacity;
+            return;
+        }
+        total += count;
+    }
+    control[C_OUTBOX] = total;
+}
+
+kernel void days_exchange_scatter(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *outbox [[buffer(12)]],
+    const device ulong *remote_meta [[buffer(19)]],
+    const device ulong *remote_staging [[buffer(20)]],
+    uint producer [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2 ||
+        producer >= params[P_NODE_COUNT]
+    ) {
+        return;
+    }
+    ulong base = ulong(producer) * META_WORDS;
+    ulong staging = remote_meta[base];
+    ulong compact = remote_meta[base + 2];
+    ulong count = remote_meta[base + 3];
+    for (ulong index = 0; index < count; ++index) {
+        copy_device_record(
+            remote_staging,
+            staging + index,
+            outbox,
+            compact + index
+        );
+    }
+}
+
+kernel void days_exchange_merge(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    const device ulong *outbox [[buffer(12)]],
+    device ulong *lp_state [[buffer(18)]],
+    const device ulong *remote_meta [[buffer(19)]],
+    const device ulong *inbound_meta [[buffer(22)]],
+    const device ulong *inbound_producers [[buffer(23)]],
+    device ulong *merge_cursors [[buffer(24)]],
+    uint target [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2 ||
+        target >= params[P_NODE_COUNT]
+    ) {
+        return;
+    }
+    ulong inbound_base = ulong(target) * INBOUND_META_WORDS;
+    ulong edge_start = inbound_meta[inbound_base];
+    ulong edge_count = inbound_meta[inbound_base + 1];
+    for (ulong edge = edge_start; edge < edge_start + edge_count; ++edge) {
+        merge_cursors[edge] = 0;
+    }
+
+    device ulong *error = lp_state + ulong(target) * LP_STATE_WORDS;
+    while (true) {
+        ulong best_edge = NONE;
+        ulong best_slot = 0;
+        for (ulong edge = edge_start; edge < edge_start + edge_count; ++edge) {
+            ulong producer = inbound_producers[edge];
+            ulong producer_base = producer * META_WORDS;
+            ulong count = remote_meta[producer_base + 3];
+            ulong cursor = merge_cursors[edge];
+            while (cursor < count) {
+                ulong slot = remote_meta[producer_base + 2] + cursor;
+                if (outbox[slot * EVENT_WORDS + E_TARGET] == target) {
+                    break;
+                }
+                cursor += 1;
+            }
+            merge_cursors[edge] = cursor;
+            if (cursor == count) {
+                continue;
+            }
+            ulong slot = remote_meta[producer_base + 2] + cursor;
+            if (
+                best_edge == NONE ||
+                stored_key_less(outbox, slot, best_slot)
+            ) {
+                best_edge = edge;
+                best_slot = slot;
+            }
+        }
+        if (best_edge == NONE) {
+            break;
+        }
+        ulong event[EVENT_WORDS];
+        copy_device_to_thread(outbox, best_slot, event);
+        if (before_horizon(event[E_TIME], control)) {
+            set_semantic_error(error, 28, target);
+            return;
+        }
+        if (!heap_push(target, event, error, fel_meta, fel_records)) {
+            return;
+        }
+        merge_cursors[best_edge] += 1;
+    }
+}
+
+kernel void days_round_finalize(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *observation_meta [[buffer(21)]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+    ulong totals[3] = {0, 0, 0};
+    for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
+        ulong base = node * OBSERVATION_META_WORDS;
+        totals[0] += observation_meta[base + 3];
+        totals[1] += observation_meta[base + META_WORDS + 3];
+        totals[2] += observation_meta[base + 2 * META_WORDS + 3];
+    }
+    ulong capacities[3] = {
+        params[P_OBSERVED_CAPACITY],
+        params[P_DEPARTURE_CAPACITY],
+        params[P_ARRIVAL_CAPACITY]
+    };
+    ulong arenas[3] = {ARENA_OBSERVED, ARENA_DEPARTURES, ARENA_ARRIVALS};
+    for (uint log = 0; log < 3; ++log) {
+        if (totals[log] > capacities[log]) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = arenas[log];
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = capacities[log];
             return;
         }
     }

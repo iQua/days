@@ -1346,7 +1346,9 @@ fn metal_continuations_advance_across_uneven_active_lps() {
     assert_eq!(capped.result, scalar);
     assert_eq!(capped.result, uncapped.result);
     assert_eq!(uncapped.continuation_relaunches, 0);
-    assert!(capped.continuation_relaunches > 20);
+    // The per-LP cap advances all active LPs in the same encoded dispatch, unlike T14's shared
+    // serial cap. This fixture still requires many physical continuation launches.
+    assert!(capped.continuation_relaunches > 10);
     assert_eq!(capped.rounds, uncapped.rounds);
     assert_eq!(capped.transitions, uncapped.transitions);
     assert_eq!(capped.wave_boundary_syncs, 1);
