@@ -12,7 +12,8 @@ use days_executor::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{
-    RoundMetricsWindow, run_cpu_with_metrics_window, run_scalar_rounds_with_windowed_replay_trace,
+    MetalConfig, RoundMetricsWindow, run_cpu_with_metrics_window, run_metal_with_observations,
+    run_scalar_rounds_with_windowed_replay_trace,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -2510,6 +2511,35 @@ fn randomized_small_heterogeneous_images_match_complete_global_state() {
         assert_equivalent(&image, None);
         let cut = 1 + (seed * 17) % image.stop_time_ns;
         assert_equivalent(&image, Some(cut));
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn production_metal_matches_representative_cartesian_images() {
+    // Metal has no CPU worker/partition axes. Sixteen stable seeds at full and partial horizons
+    // retain the image/queue/rate/propagation/capacity axes while keeping the feature suite quick.
+    for seed in 0..16 {
+        let image = heterogeneous_image(seed);
+        validate(&image, Backend::Metal)
+            .unwrap_or_else(|error| panic!("seed {seed} Metal validation failed: {error}"));
+        let cut = 1 + (seed * 17) % image.stop_time_ns;
+        for horizon in [None, Some(cut)] {
+            let expected = run_scalar_with_observations(&image, horizon, ObservationMode::Full)
+                .unwrap_or_else(|error| {
+                    panic!("seed {seed}, horizon {horizon:?} scalar execution failed: {error}")
+                });
+            let actual = run_metal_with_observations(
+                &image,
+                horizon,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .unwrap_or_else(|error| {
+                panic!("seed {seed}, horizon {horizon:?} Metal execution failed: {error}")
+            });
+            assert_eq!(actual.result, expected, "seed {seed}, horizon {horizon:?}");
+        }
     }
 }
 

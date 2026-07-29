@@ -7,6 +7,8 @@ pub mod cpu;
 pub mod event;
 pub mod image;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub mod metal;
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub mod metal_spike;
 pub mod model;
 pub mod safe_horizon;
@@ -27,6 +29,10 @@ pub use image::{
     GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, RemoteChannel,
     ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
+};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub use metal::{
+    MetalArena, MetalConfig, MetalError, MetalRun, run_metal, run_metal_with_observations,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};
