@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,8 @@ struct Fixture {
     name: &'static str,
     seed: i64,
     target_width: u64,
-    flow_count: u64,
+    generator_count: u64,
+    flow_set_count: usize,
     flow_bytes: u64,
     stop_time: f64,
     cohort_flow_counts: &'static [u64],
@@ -25,7 +27,8 @@ const FIXTURES: [Fixture; 5] = [
         name: "fattree_k32_target_w01000.toml",
         seed: 13_001,
         target_width: 1_000,
-        flow_count: 480,
+        generator_count: 480,
+        flow_set_count: 2,
         flow_bytes: 524_288,
         stop_time: 0.000_119,
         cohort_flow_counts: &[240, 240],
@@ -35,7 +38,8 @@ const FIXTURES: [Fixture; 5] = [
         name: "fattree_k32_target_w03000.toml",
         seed: 13_003,
         target_width: 3_000,
-        flow_count: 1_660,
+        generator_count: 1_660,
+        flow_set_count: 1,
         flow_bytes: 524_288,
         stop_time: 0.000_045,
         cohort_flow_counts: &[1_660],
@@ -45,7 +49,8 @@ const FIXTURES: [Fixture; 5] = [
         name: "fattree_k32_target_w07000.toml",
         seed: 13_007,
         target_width: 7_000,
-        flow_count: 4_555,
+        generator_count: 4_555,
+        flow_set_count: 1,
         flow_bytes: 524_288,
         stop_time: 0.000_035,
         cohort_flow_counts: &[4_555],
@@ -55,7 +60,8 @@ const FIXTURES: [Fixture; 5] = [
         name: "fattree_k32_target_w15000.toml",
         seed: 13_015,
         target_width: 15_000,
-        flow_count: 10_000,
+        generator_count: 10_000,
+        flow_set_count: 1,
         flow_bytes: 524_288,
         stop_time: 0.000_025,
         cohort_flow_counts: &[10_000],
@@ -65,7 +71,8 @@ const FIXTURES: [Fixture; 5] = [
         name: "fattree_k32_target_w30000.toml",
         seed: 13_030,
         target_width: 30_000,
-        flow_count: 32_768,
+        generator_count: 32_768,
+        flow_set_count: 1,
         flow_bytes: 131_072,
         stop_time: 0.000_010,
         cohort_flow_counts: &[32_768],
@@ -88,15 +95,24 @@ fn read_fixture(path: &Path) -> toml::Table {
 
 #[test]
 fn width_via_load_fixtures_hold_the_t13e_design_invariants() {
-    let mut previous_flow_count = 0;
+    let mut previous_generator_count = 0;
 
     for fixture in FIXTURES {
         let path = fixture_path(fixture.name);
         let config = read_fixture(&path);
+        let explicit_flow_count = config
+            .get("flow")
+            .map(|flows| {
+                flows
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{} flow must be a TOML array", fixture.name))
+                    .len()
+            })
+            .unwrap_or_default();
         let flow_sets = config["flow_set"]
             .as_array()
             .expect("fixture must contain flow sets");
-        let flow_count = flow_sets
+        let generator_count = flow_sets
             .iter()
             .map(|flow_set| {
                 u64::try_from(
@@ -125,14 +141,30 @@ fn width_via_load_fixtures_hold_the_t13e_design_invariants() {
             "{} must use its budget-derived stop time",
             fixture.name
         );
-        assert_eq!(flow_count, fixture.flow_count);
+        assert_eq!(
+            explicit_flow_count, 0,
+            "{} must not declare explicit flows",
+            fixture.name
+        );
+        assert_eq!(
+            flow_sets.len(),
+            fixture.flow_set_count,
+            "{} must declare exactly {} flow sets",
+            fixture.name,
+            fixture.flow_set_count
+        );
+        assert_eq!(
+            generator_count, fixture.generator_count,
+            "{} must declare exactly {} flow generators",
+            fixture.name, fixture.generator_count
+        );
         assert_eq!(flow_sets.len(), fixture.initial_delays.len());
         assert_eq!(flow_sets.len(), fixture.cohort_flow_counts.len());
         assert!(
-            flow_count > previous_flow_count,
+            generator_count > previous_generator_count,
             "offered load must increase strictly across the target-width sweep"
         );
-        previous_flow_count = flow_count;
+        previous_generator_count = generator_count;
 
         let mut previous_initial_delay = None;
         let mut offered_bytes = 0_u64;
@@ -209,7 +241,7 @@ fn width_via_load_fixtures_hold_the_t13e_design_invariants() {
 
         assert_eq!(
             offered_bytes,
-            fixture.flow_count * fixture.flow_bytes,
+            fixture.generator_count * fixture.flow_bytes,
             "{} must offer the exact finite byte budget",
             fixture.name
         );
@@ -271,6 +303,20 @@ fn smallest_width_via_load_fixture_lowers_and_truncates_pending_tail() {
                     && constant.termination == GeneratorTermination::Bytes(524_288)
         )
     }));
+    let first_departure_counts =
+        generators
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, generator| {
+                let first_departure_ns = match generator.kind {
+                    FlowGeneratorKind::Constant(constant) => constant.first_departure_ns,
+                };
+                *counts.entry(first_departure_ns).or_insert(0_usize) += 1;
+                counts
+            });
+    assert_eq!(
+        first_departure_counts,
+        BTreeMap::from([(0_u64, 240_usize), (40_000_u64, 240_usize)])
+    );
 
     let run = run_scalar_rounds(&image, None)
         .unwrap_or_else(|error| panic!("failed to execute {}: {error}", path.display()));
