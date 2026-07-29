@@ -6,8 +6,8 @@ use days_executor::{
     ArrivalDisposition, Backend, ConstantGenerator, Event, EventKey, EventKind, FlowDescriptor,
     FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
     GeneratorTermination, HostState, LinkDescriptor, LinkId, MetalArena, MetalConfig, MetalError,
-    NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId,
-    RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState,
+    MetalExecutor, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
+    PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState,
     SwitchState, event_phase, run_metal, run_metal_with_observations, run_scalar_with_observations,
     validate,
 };
@@ -561,6 +561,307 @@ fn fifo_taildrop_image() -> SimulationImage {
     }
 }
 
+fn backlog_drain_image() -> SimulationImage {
+    const PACKET_COUNT: u64 = 12;
+    let forward = LinkDescriptor {
+        id: LinkId(0),
+        source: GENERATOR_SOURCE,
+        target: GENERATOR_SINK,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 99,
+    };
+    let reverse = LinkDescriptor {
+        id: LinkId(1),
+        source: GENERATOR_SINK,
+        target: GENERATOR_SOURCE,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let packets = (0..PACKET_COUNT)
+        .map(|sequence| PacketDescriptor {
+            id: PayloadId::from_node_sequence(GENERATOR_SOURCE, 2, sequence)
+                .expect("backlog payload IDs must fit"),
+            flow: GENERATOR_FLOW,
+            size_bytes: 1,
+            kind: PacketKind::Data,
+        })
+        .collect::<Vec<_>>();
+
+    SimulationImage {
+        stop_time_ns: 11,
+        nodes: vec![
+            NodeDescriptor {
+                id: GENERATOR_SOURCE,
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: GENERATOR_SINK,
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+        ],
+        host_states: vec![
+            HostState {
+                egress_link: forward.id,
+                queue: packets.iter().map(|packet| packet.id).collect(),
+                in_service: None,
+                tx_ready_pending: true,
+                generators: vec![FlowGeneratorState {
+                    flow: GENERATOR_FLOW,
+                    packets_emitted: 0,
+                    bytes_emitted: 0,
+                    next_emission: ScheduledEmission {
+                        status: GeneratorStatus::Finished,
+                        departure_time_ns: 0,
+                        payload: packets[0].id,
+                    },
+                    rng_state: 1,
+                    feedback: GeneratorFeedbackState {
+                        arrivals: 0,
+                        outstanding_bytes: 0,
+                        unacknowledged_bytes: 0,
+                    },
+                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                        first_departure_ns: 0,
+                        interval_ns: 1_000,
+                        packet_size_bytes: 1,
+                        termination: GeneratorTermination::Bytes(0),
+                    }),
+                }],
+                next_origin_seq: 1,
+                next_payload_seq: PACKET_COUNT,
+                sourced_packets: PACKET_COUNT,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: reverse.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ],
+        switch_states: vec![],
+        flows: vec![FlowDescriptor {
+            id: GENERATOR_FLOW,
+            source: GENERATOR_SOURCE,
+            target: GENERATOR_SINK,
+            route: vec![forward.id],
+            reverse_route: vec![],
+        }],
+        initial_packets: packets.clone(),
+        links: vec![forward, reverse],
+        channels: vec![
+            RemoteChannel::for_packet_link(forward, 1).expect("backlog channel delay must fit"),
+        ],
+        initial_events: vec![Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::TxReady),
+                origin_node: GENERATOR_SOURCE,
+                origin_seq: 0,
+            },
+            target: GENERATOR_SOURCE,
+            kind: EventKind::TxReady,
+            payload: packets[0].id,
+        }],
+        seed: 19,
+    }
+}
+
+fn long_flight_backlog_image() -> SimulationImage {
+    const PACKET_COUNT: u64 = 12;
+    const SOURCE: NodeId = NodeId(0);
+    const SWITCH: NodeId = NodeId(1);
+    const SINK: NodeId = NodeId(2);
+    const INGRESS: LinkId = LinkId(0);
+    const LONG_EGRESS: LinkId = LinkId(1);
+    const SINK_EGRESS: LinkId = LinkId(2);
+    const FLOW: FlowId = FlowId(0);
+
+    let packets = (0..PACKET_COUNT)
+        .map(|sequence| PacketDescriptor {
+            id: PayloadId::from_node_sequence(SOURCE, 3, sequence)
+                .expect("long-flight payload IDs must fit"),
+            flow: FLOW,
+            size_bytes: 1,
+            kind: PacketKind::Data,
+        })
+        .collect::<Vec<_>>();
+    let ingress = LinkDescriptor {
+        id: INGRESS,
+        source: SOURCE,
+        target: SWITCH,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let long_egress = LinkDescriptor {
+        id: LONG_EGRESS,
+        source: SWITCH,
+        target: SINK,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 100,
+    };
+
+    SimulationImage {
+        stop_time_ns: 11,
+        nodes: vec![
+            NodeDescriptor {
+                id: SOURCE,
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: SWITCH,
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: SINK,
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+        ],
+        host_states: vec![
+            HostState {
+                egress_link: INGRESS,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: PACKET_COUNT,
+                next_payload_seq: PACKET_COUNT,
+                sourced_packets: PACKET_COUNT,
+                departed_packets: PACKET_COUNT,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: SINK_EGRESS,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ],
+        switch_states: vec![SwitchState {
+            physical_switch: 0,
+            queues: vec![SwitchQueueState {
+                egress_link: Some(LONG_EGRESS),
+                scheduler: SchedulerKind::Fifo,
+                queue_capacity_packets: 1,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+            }],
+            next_origin_seq: 0,
+            arrived_packets: 0,
+            dropped_packets: 0,
+            departed_packets: 0,
+        }],
+        flows: vec![FlowDescriptor {
+            id: FLOW,
+            source: SOURCE,
+            target: SINK,
+            route: vec![INGRESS, LONG_EGRESS],
+            reverse_route: vec![],
+        }],
+        initial_packets: packets.clone(),
+        links: vec![
+            ingress,
+            long_egress,
+            LinkDescriptor {
+                id: SINK_EGRESS,
+                source: SINK,
+                target: SOURCE,
+                rate_bps: 8_000_000_000,
+                propagation_ns: 0,
+            },
+        ],
+        channels: vec![
+            RemoteChannel::for_packet_link(ingress, 1).expect("ingress channel delay must fit"),
+            RemoteChannel::for_packet_link(long_egress, 1)
+                .expect("long egress channel delay must fit"),
+        ],
+        initial_events: packets
+            .iter()
+            .enumerate()
+            .map(|(sequence, packet)| Event {
+                key: EventKey {
+                    time_ns: sequence as u64,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: SOURCE,
+                    origin_seq: sequence as u64,
+                },
+                target: SWITCH,
+                kind: EventKind::RemoteArrival,
+                payload: packet.id,
+            })
+            .collect(),
+        seed: 23,
+    }
+}
+
+fn rich_mid_state_image() -> SimulationImage {
+    let mut image = generator_image(GeneratorTermination::Bytes(12));
+    let FlowGeneratorKind::Constant(mut generator) = image.host_states[0].generators[0].kind;
+    generator.interval_ns = 1;
+    image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(generator);
+
+    let feedback = PacketDescriptor {
+        id: PayloadId::from_node_sequence(GENERATOR_SINK, 2, 0)
+            .expect("feedback payload ID must fit"),
+        flow: GENERATOR_FLOW,
+        size_bytes: 2,
+        kind: PacketKind::Feedback,
+    };
+    image.initial_packets.push(feedback);
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image.host_states[1].queue.push_back(feedback.id);
+    image.host_states[1].tx_ready_pending = true;
+    image.host_states[1].next_origin_seq = 1;
+    image.channels.push(
+        RemoteChannel::for_packet_link(image.links[1], feedback.size_bytes)
+            .expect("feedback channel delay must fit"),
+    );
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 5,
+            phase: event_phase(EventKind::TxReady),
+            origin_node: GENERATOR_SINK,
+            origin_seq: 0,
+        },
+        target: GENERATOR_SINK,
+        kind: EventKind::TxReady,
+        payload: feedback.id,
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+
+    let partial = run_scalar_with_observations(&image, Some(5), ObservationMode::Full)
+        .expect("partial scalar checkpoint construction must run");
+    image.host_states = partial.host_states;
+    image.switch_states = partial.switch_states;
+    image.initial_packets = partial.resident_packets;
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image.initial_events = partial.pending_events;
+    image
+}
+
 fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>) {
     validate(image, Backend::Metal).expect("production Metal fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
@@ -637,21 +938,89 @@ fn metal_run_to_run_is_exactly_deterministic() {
 }
 
 #[test]
-fn metal_reports_explicit_fel_capacity_exhaustion() {
-    let image = fifo_taildrop_image();
-    let config = MetalConfig {
-        max_fel_events_per_lp: Some(0),
-        ..MetalConfig::default()
-    };
-    let error: MetalError = match run_metal(&image, Some(27), config) {
-        Ok(_) => panic!("zero FEL capacity must fail explicitly"),
-        Err(error) => error,
-    };
-    let message = error.to_string();
+fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
+    let image = generator_image(GeneratorTermination::Bytes(4));
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar recovery oracle must run");
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
 
-    assert!(
-        message.to_ascii_lowercase().contains("fel"),
-        "capacity error must identify the FEL, got: {message}"
+    let fel = executor
+        .run(
+            &image,
+            None,
+            MetalConfig {
+                max_fel_events_per_lp: Some(1),
+                ..MetalConfig::default()
+            },
+        )
+        .expect_err("the second device-generated local child must exhaust the FEL");
+    assert_eq!(
+        fel,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::Fel,
+            node: Some(GENERATOR_SOURCE),
+            capacity: 1,
+        }
+    );
+    assert_eq!(
+        executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+            .expect("the same executor must recover after the FEL fault")
+            .result,
+        expected
+    );
+
+    let outbox = executor
+        .run(
+            &image,
+            None,
+            MetalConfig {
+                max_outbox_events: Some(0),
+                ..MetalConfig::default()
+            },
+        )
+        .expect_err("the first remote device child must exhaust the outbox");
+    assert_eq!(
+        outbox,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::Outbox,
+            node: None,
+            capacity: 0,
+        }
+    );
+    assert_eq!(
+        executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+            .expect("the same executor must recover after the outbox fault")
+            .result,
+        expected
+    );
+
+    let observed = executor
+        .run_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_observations: Some(0),
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("the first device observation must exhaust the log");
+    assert_eq!(
+        observed,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::ObservedPackets,
+            node: None,
+            capacity: 0,
+        }
+    );
+    assert_eq!(
+        executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+            .expect("the same executor must recover after the observation fault")
+            .result,
+        expected
     );
 }
 
@@ -715,6 +1084,129 @@ fn metal_reverse_route_switch_capacity_is_sized_for_feedback() {
 }
 
 #[test]
+fn metal_default_capacity_handles_a_service_rate_backlog_drain() {
+    let image = backlog_drain_image();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar backlog oracle must run");
+    let metal =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("derived Metal capacities must cover the backlog drain");
+
+    assert_eq!(scalar.summary.departed_packets, 11);
+    assert!(scalar.host_states[0].in_service.is_some());
+    assert_eq!(scalar.pending_events.len(), 13);
+    assert_eq!(metal.result, scalar);
+
+    let raised = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_fel_events_per_lp: Some(12),
+            max_outbox_events: Some(12),
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("an explicit capacity must be able to raise the old derived FEL/outbox bounds");
+    assert_eq!(raised.result, scalar);
+}
+
+#[test]
+fn metal_default_fel_capacity_covers_packets_resident_on_a_long_link() {
+    let image = long_flight_backlog_image();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar long-flight backlog oracle must run");
+    let metal =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("derived Metal FEL capacity must cover accumulated in-flight packets");
+
+    assert_eq!(scalar.summary.departed_packets, 11);
+    assert!(scalar.switch_states[0].queues[0].in_service.is_some());
+    assert_eq!(scalar.pending_events.len(), 13);
+    assert_eq!(metal.result, scalar);
+}
+
+#[test]
+fn metal_tiny_physical_transition_chunks_relaunch_to_exact_parity() {
+    let image = backlog_drain_image();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar backlog oracle must run");
+    let default =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("default Metal chunks must run");
+    let uncapped = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_transitions_per_lp_per_round: usize::MAX,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("the explicit uncapped Metal run must run");
+    let tiny = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_transitions_per_lp_per_round: 1,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("one-transition dispatches must continue the same semantic round");
+
+    assert!(default.transitions > 1);
+    assert_eq!(default.continuation_relaunches, 0);
+    assert_eq!(default.result, scalar);
+    assert_eq!(tiny.result, scalar);
+    assert!(tiny.continuation_relaunches > 10);
+    assert_eq!(tiny.rounds, default.rounds);
+    assert_eq!(tiny.transitions, default.transitions);
+    assert_eq!(uncapped.result, scalar);
+    assert_eq!(uncapped.continuation_relaunches, 0);
+    assert_eq!(uncapped.rounds, default.rounds);
+    assert_eq!(uncapped.transitions, default.transitions);
+}
+
+#[test]
+fn metal_full_path_matches_scalar_from_a_rich_mid_state() {
+    let image = rich_mid_state_image();
+    assert!(
+        image
+            .host_states
+            .iter()
+            .any(|state| !state.queue.is_empty())
+    );
+    assert!(
+        image
+            .host_states
+            .iter()
+            .any(|state| state.in_service.is_some())
+    );
+    assert!(image.host_states.iter().any(|state| state.tx_ready_pending));
+    assert!(
+        image
+            .initial_events
+            .iter()
+            .any(|event| event.kind == EventKind::TxComplete)
+    );
+    assert!(
+        image
+            .initial_events
+            .iter()
+            .any(|event| event.kind == EventKind::RemoteArrival)
+    );
+    assert!(image.host_states.iter().any(|state| {
+        state.generators.iter().any(|generator| {
+            generator.packets_emitted > 0
+                && generator.next_emission.status == GeneratorStatus::Scheduled
+        })
+    }));
+
+    assert_full_parity(&image, None);
+}
+
+#[test]
 fn metal_full_domain_stop_uses_the_one_past_u64_sentinel() {
     let mut image = generator_image(GeneratorTermination::Bytes(2));
     image.stop_time_ns = u64::MAX;
@@ -733,6 +1225,52 @@ fn metal_full_domain_stop_uses_the_one_past_u64_sentinel() {
     };
 
     assert_full_parity(&image, None);
+}
+
+fn terminal_arrival_at_max(stop_time_ns: u64) -> SimulationImage {
+    let mut image = generator_image(GeneratorTermination::Bytes(2));
+    image.stop_time_ns = stop_time_ns;
+    image.host_states[0].generators.clear();
+    image.host_states[0].next_payload_seq = 0;
+    image.initial_events[0] = Event {
+        key: EventKey {
+            time_ns: u64::MAX,
+            phase: event_phase(EventKind::RemoteArrival),
+            origin_node: GENERATOR_SOURCE,
+            origin_seq: 0,
+        },
+        target: GENERATOR_SINK,
+        kind: EventKind::RemoteArrival,
+        payload: GENERATOR_FIRST_PACKET,
+    };
+    image
+}
+
+#[test]
+fn metal_executes_a_real_event_at_u64_max_through_the_inclusive_stop() {
+    let image = terminal_arrival_at_max(u64::MAX);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar must execute the endpoint event");
+    let metal =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("Metal must execute the endpoint event");
+
+    assert_eq!(scalar.summary.received_packets, 1);
+    assert!(scalar.pending_events.is_empty());
+    assert_eq!(metal.result, scalar);
+}
+
+#[test]
+fn metal_keeps_a_u64_max_event_pending_above_an_earlier_stop() {
+    let image = terminal_arrival_at_max(u64::MAX - 1);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar must stop before the endpoint event");
+    let metal =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("Metal must stop before the endpoint event");
+
+    assert_eq!(scalar.pending_events, image.initial_events);
+    assert_eq!(metal.result, scalar);
 }
 
 #[test]

@@ -32,7 +32,8 @@ pub use image::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
-    MetalArena, MetalConfig, MetalError, MetalRun, run_metal, run_metal_with_observations,
+    MetalArena, MetalConfig, MetalError, MetalExecutor, MetalRun, run_metal,
+    run_metal_with_observations,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};

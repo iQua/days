@@ -85,7 +85,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_owned_service_state(image, backend)?;
     validate_channels(image, backend, &derived_delays)?;
     validate_events(image)?;
-    validate_global_time_capacity(image)?;
+    validate_global_time_capacity(image, backend)?;
     validate_service_event_consistency(image)?;
     let future_work = validate_counters(image)?;
     validate_origin_sequences(image, &future_work)?;
@@ -1276,8 +1276,39 @@ fn validate_remaining_route_time(
     Ok(())
 }
 
-fn validate_global_time_capacity(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_global_time_capacity(
+    image: &SimulationImage,
+    backend: Backend,
+) -> Result<(), ValidationError> {
     let mut service_bound = 0_u64;
+    let service_payloads = if backend == Backend::Metal {
+        let mut payloads = image
+            .host_states
+            .iter()
+            .flat_map(|state| state.queue.iter().copied().chain(state.in_service))
+            .chain(image.switch_states.iter().flat_map(|state| {
+                state
+                    .queues
+                    .iter()
+                    .flat_map(|queue| queue.queue.iter().copied().chain(queue.in_service))
+            }))
+            .collect::<BTreeSet<_>>();
+        for event in &image.initial_events {
+            let packet =
+                packet(image, event.payload).expect("event validation established the packet");
+            let flow = flow(image, packet.flow).expect("packet validation established the flow");
+            let terminal = match packet.kind {
+                PacketKind::Data => flow.target,
+                PacketKind::Feedback => flow.source,
+            };
+            if event.kind != EventKind::RemoteArrival || event.target != terminal {
+                payloads.insert(event.payload);
+            }
+        }
+        Some(payloads)
+    } else {
+        None
+    };
     let scheduled_payloads = image
         .host_states
         .iter()
@@ -1286,7 +1317,11 @@ fn validate_global_time_capacity(image: &SimulationImage) -> Result<(), Validati
         .map(|generator| generator.next_emission.payload)
         .collect::<BTreeSet<_>>();
     for packet in &image.initial_packets {
-        if scheduled_payloads.contains(&packet.id) {
+        if scheduled_payloads.contains(&packet.id)
+            || service_payloads
+                .as_ref()
+                .is_some_and(|payloads| !payloads.contains(&packet.id))
+        {
             continue;
         }
         let flow = flow(image, packet.flow).expect("packet validation established the flow");

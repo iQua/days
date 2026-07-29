@@ -26,6 +26,8 @@ constant uint C_DEPARTURES = 13;
 constant uint C_ARRIVALS = 14;
 constant uint C_ACTIVE = 15;
 constant uint C_FRONTIER = 16;
+constant uint C_CONTINUATION = 17;
+constant uint C_RELAUNCHES = 18;
 
 constant uint P_NODE_COUNT = 0;
 constant uint P_FLOW_COUNT = 1;
@@ -40,6 +42,7 @@ constant uint P_LOOKAHEAD = 9;
 constant uint P_TRANSITION_CAPACITY = 10;
 constant uint P_STOP_TIME = 11;
 constant uint P_HAS_LOOKAHEAD = 12;
+constant uint P_ROUND_CAPACITY = 13;
 
 constant uint N_KIND = 0;
 constant uint N_EGRESS = 1;
@@ -250,16 +253,18 @@ inline bool heap_pop(
     return true;
 }
 
-inline ulong heap_root_time(
+inline bool heap_root_time(
     ulong node,
     const device ulong *meta,
-    const device ulong *records
+    const device ulong *records,
+    thread ulong &time
 ) {
     ulong base = node * META_WORDS;
     if (meta[base + 3] == 0) {
-        return NONE;
+        return false;
     }
-    return records[meta[base] * EVENT_WORDS + E_TIME];
+    time = records[meta[base] * EVENT_WORDS + E_TIME];
+    return true;
 }
 
 inline bool before_horizon(ulong time, const device ulong *control) {
@@ -1120,18 +1125,42 @@ kernel void days_horizon(
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong minima[1024];
-    if (control[C_ERROR] != 0 || control[C_DONE] != 0) {
+    threadgroup uint validity[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
         return;
     }
-    ulong minimum = NONE;
+    ulong minimum = 0;
+    bool valid = false;
     for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
-        minimum = min(minimum, heap_root_time(node, fel_meta, fel_records));
+        ulong candidate;
+        if (
+            heap_root_time(node, fel_meta, fel_records, candidate) &&
+            (!valid || candidate < minimum)
+        ) {
+            minimum = candidate;
+            valid = true;
+        }
     }
     minima[lane] = minimum;
+    validity[lane] = valid ? 1 : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = 512; stride != 0; stride >>= 1) {
         if (lane < stride) {
-            minima[lane] = min(minima[lane], minima[lane + stride]);
+            if (
+                validity[lane + stride] != 0 &&
+                (
+                    validity[lane] == 0 ||
+                    minima[lane + stride] < minima[lane]
+                )
+            ) {
+                minima[lane] = minima[lane + stride];
+                validity[lane] = 1;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1139,14 +1168,14 @@ kernel void days_horizon(
         return;
     }
     minimum = minima[0];
-    control[C_FRONTIER] = minimum;
     if (
-        minimum == NONE ||
+        validity[0] == 0 ||
         (control[C_RUN_END_HI] == 0 && minimum >= control[C_RUN_END_LO])
     ) {
         control[C_DONE] = 1;
         return;
     }
+    control[C_FRONTIER] = minimum;
     ulong horizon_lo = control[C_RUN_END_LO];
     ulong horizon_hi = control[C_RUN_END_HI];
     if (params[P_HAS_LOOKAHEAD] != 0) {
@@ -1184,40 +1213,55 @@ kernel void days_round(
     device ulong *departures [[buffer(16)]],
     device ulong *arrivals [[buffer(17)]]
 ) {
-    if (control[C_ERROR] != 0 || control[C_DONE] != 0) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
         return;
     }
-    ulong active = 0;
-    for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
-        ulong time = heap_root_time(node, fel_meta, fel_records);
-        if (time != NONE && before_horizon(time, control)) {
-            if (active >= params[P_WORKLIST_CAPACITY]) {
-                set_capacity_error(
-                    control,
-                    ARENA_WORKLIST,
-                    NONE,
-                    params[P_WORKLIST_CAPACITY]
-                );
-                return;
+    if (control[C_CONTINUATION] == 0) {
+        ulong active = 0;
+        for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
+            ulong time;
+            if (
+                heap_root_time(node, fel_meta, fel_records, time) &&
+                before_horizon(time, control)
+            ) {
+                if (active >= params[P_WORKLIST_CAPACITY]) {
+                    set_capacity_error(
+                        control,
+                        ARENA_WORKLIST,
+                        NONE,
+                        params[P_WORKLIST_CAPACITY]
+                    );
+                    return;
+                }
+                worklist[active++] = node;
             }
-            worklist[active++] = node;
         }
+        control[C_ACTIVE] = active;
+        control[C_OUTBOX] = 0;
+        control[C_CONTINUATION] = 1;
+    } else {
+        control[C_RELAUNCHES] += 1;
     }
-    control[C_ACTIVE] = active;
-    control[C_OUTBOX] = 0;
 
-    for (ulong active_index = 0; active_index < active; ++active_index) {
+    ulong active = control[C_ACTIVE];
+    ulong active_index = control[C_CONTINUATION] - 1;
+    ulong dispatch_transitions = 0;
+    for (; active_index < active; ++active_index) {
         ulong node = worklist[active_index];
-        ulong local_transitions = 0;
         while (true) {
-            ulong time = heap_root_time(node, fel_meta, fel_records);
-            if (time == NONE || !before_horizon(time, control)) {
+            ulong time;
+            if (
+                !heap_root_time(node, fel_meta, fel_records, time) ||
+                !before_horizon(time, control)
+            ) {
                 break;
             }
-            if (local_transitions >= params[P_TRANSITION_CAPACITY]) {
-                control[C_ERROR] = ERROR_TRANSITION_CAPACITY;
-                control[C_ERROR_NODE] = node;
-                control[C_ERROR_CAPACITY] = params[P_TRANSITION_CAPACITY];
+            if (dispatch_transitions >= params[P_TRANSITION_CAPACITY]) {
+                control[C_CONTINUATION] = active_index + 1;
                 return;
             }
             ulong event[EVENT_WORDS];
@@ -1248,7 +1292,7 @@ kernel void days_round(
             )) {
                 return;
             }
-            local_transitions += 1;
+            dispatch_transitions += 1;
             if (control[C_TRANSITIONS] == NONE) {
                 set_semantic_error(control, 27, node);
                 return;
@@ -1275,5 +1319,6 @@ kernel void days_round(
             return;
         }
     }
+    control[C_CONTINUATION] = 0;
     control[C_ROUNDS] += 1;
 }

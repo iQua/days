@@ -38,8 +38,13 @@ const SUMMARY_COUNTERS: usize = 12;
 const OBSERVED_WORDS: usize = 4;
 const DEPARTURE_WORDS: usize = 9;
 const ARRIVAL_WORDS: usize = 10;
+// The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
+// rounds single-launch while putting a finite ceiling on pathological serial device work.
+const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
 const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = 16_384;
 const MAX_COMMAND_BUFFERS: usize = 64;
+const HORIZON_THREADGROUP_BYTES: usize =
+    LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
 
 const CONTROL_ERROR: usize = 0;
@@ -54,7 +59,8 @@ const CONTROL_TRANSITIONS: usize = 10;
 const CONTROL_OBSERVED: usize = 12;
 const CONTROL_DEPARTURES: usize = 13;
 const CONTROL_ARRIVALS: usize = 14;
-const CONTROL_WORDS: usize = 18;
+const CONTROL_RELAUNCHES: usize = 18;
+const CONTROL_WORDS: usize = 19;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -159,16 +165,18 @@ impl Error for MetalError {}
 /// Physical capacity and resident-encoding policy for one Metal run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetalConfig {
-    /// Optional uniform upper bound applied to every derived per-LP FEL capacity.
+    /// Optional exact per-LP FEL capacity override. Raising the derived default consumes more
+    /// device memory; lowering it retains an explicit device capacity fault on overflow.
     pub max_fel_events_per_lp: Option<usize>,
-    /// Optional uniform upper bound applied to every derived per-LP packet-queue capacity.
+    /// Optional exact per-LP packet-queue capacity override, with the same memory/fault tradeoff.
     pub max_queue_packets_per_lp: Option<usize>,
     /// Optional bound for all remote children produced in one round.
     pub max_outbox_events: Option<usize>,
     /// Optional bound applied independently to full-mode observed, departure, and arrival logs.
     pub max_observations: Option<usize>,
-    /// Optional diagnostic bound on one LP's transitions in a semantic round. The default is
-    /// effectively unbounded; this is not scheduler batching or a physical launch chunk.
+    /// Physical transition budget for one serial device dispatch. The historical field name is
+    /// retained for API compatibility; exhausting the budget relaunches the same semantic round
+    /// with its horizon, worklist, FELs, and outbox preserved.
     pub max_transitions_per_lp_per_round: usize,
     /// Round pairs encoded into one serial command buffer.
     pub rounds_per_command_buffer: usize,
@@ -183,7 +191,7 @@ impl Default for MetalConfig {
             max_queue_packets_per_lp: None,
             max_outbox_events: None,
             max_observations: None,
-            max_transitions_per_lp_per_round: usize::MAX,
+            max_transitions_per_lp_per_round: DEFAULT_TRANSITIONS_PER_DISPATCH,
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
         }
@@ -196,6 +204,8 @@ pub struct MetalRun {
     pub result: RunResult,
     pub rounds: u64,
     pub transitions: u64,
+    /// Device-resident `days_round` continuation dispatches beyond the first launch per round.
+    pub continuation_relaunches: u64,
     /// Host time spent encoding and committing resident command buffers.
     pub host_encode_submit_ns: u64,
     /// Sum of Metal command-buffer GPU timestamp intervals.
@@ -226,14 +236,59 @@ pub fn run_metal_with_observations(
     config: MetalConfig,
     observation_mode: ObservationMode,
 ) -> Result<MetalRun, MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
-    validate_config(config)?;
+    MetalExecutor::new()?.run_with_observations(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+    )
+}
 
-    let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-    let direct = DirectMetal::new()?;
-    let buffers = MetalBuffers::new(&direct.device, plan)?;
-    let timing = direct.run(&buffers, config)?;
-    buffers.finish(image, observation_mode, timing)
+/// Reusable production Metal pipelines and command queue.
+///
+/// Each run allocates fresh state buffers, so an explicit device fault cannot contaminate a
+/// subsequent run through the same executor.
+pub struct MetalExecutor {
+    direct: DirectMetal,
+}
+
+impl MetalExecutor {
+    pub fn new() -> Result<Self, MetalError> {
+        Ok(Self {
+            direct: DirectMetal::new()?,
+        })
+    }
+
+    pub fn run(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+    ) -> Result<MetalRun, MetalError> {
+        self.run_with_observations(
+            image,
+            exclusive_horizon_ns,
+            config,
+            ObservationMode::Summary,
+        )
+    }
+
+    pub fn run_with_observations(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        observation_mode: ObservationMode,
+    ) -> Result<MetalRun, MetalError> {
+        validate(image, Backend::Metal)
+            .map_err(|error| MetalError::Validation(error.to_string()))?;
+        validate_config(config)?;
+
+        let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
+        let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+        let timing = self.direct.run(&buffers, config)?;
+        buffers.finish(image, observation_mode, timing)
+    }
 }
 
 fn validate_config(config: MetalConfig) -> Result<(), MetalError> {
@@ -271,6 +326,7 @@ struct MetalPlan {
     arrivals: Vec<u64>,
     orphan_packets: Vec<PacketDescriptor>,
     round_capacity: usize,
+    dispatch_capacity: usize,
 }
 
 impl MetalPlan {
@@ -340,22 +396,21 @@ impl MetalPlan {
             queue_caps[source_slot] = queue_caps[source_slot].saturating_add(data_count);
             fel_caps[source_slot] = fel_caps[source_slot].saturating_add(4);
 
-            let data_burst = flow_round_burst(image, flow_index, data_count, minimum_lookahead_ns);
-            add_route_capacities(
+            add_flow_route_capacities(
                 image,
-                &flow.route,
-                flow.target,
+                flow_index,
                 data_count,
-                data_burst,
+                PacketKind::Data,
+                minimum_lookahead_ns,
                 &mut fel_caps,
                 &mut queue_caps,
             );
-            add_route_capacities(
+            add_flow_route_capacities(
                 image,
-                &flow.reverse_route,
-                flow.source,
+                flow_index,
                 feedback_count,
-                feedback_count,
+                PacketKind::Feedback,
+                minimum_lookahead_ns,
                 &mut fel_caps,
                 &mut queue_caps,
             );
@@ -383,10 +438,10 @@ impl MetalPlan {
                 }
             }
             if let Some(limit) = config.max_fel_events_per_lp {
-                fel_caps[slot] = fel_caps[slot].min(limit);
+                fel_caps[slot] = limit;
             }
             if let Some(limit) = config.max_queue_packets_per_lp {
-                queue_caps[slot] = queue_caps[slot].min(limit);
+                queue_caps[slot] = limit;
             }
         }
 
@@ -543,6 +598,8 @@ impl MetalPlan {
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
             .max(1);
+        let dispatch_capacity = round_capacity
+            .saturating_add(event_bound.div_ceil(config.max_transitions_per_lp_per_round));
         let run_end = exclusive_horizon_ns
             .map(u128::from)
             .unwrap_or(1_u128 << 64)
@@ -564,6 +621,7 @@ impl MetalPlan {
             config.max_transitions_per_lp_per_round as u64,
             image.stop_time_ns,
             u64::from(minimum_lookahead_ns.is_some()),
+            round_capacity as u64,
         ];
 
         Ok(Self {
@@ -587,6 +645,7 @@ impl MetalPlan {
             arrivals: zero_words(observation_capacity, ARRIVAL_WORDS)?,
             orphan_packets,
             round_capacity,
+            dispatch_capacity,
         })
     }
 }
@@ -640,52 +699,185 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, MetalError>
     Ok(counts)
 }
 
-fn flow_round_burst(
+fn generator_round_burst(
     image: &SimulationImage,
     flow_index: usize,
     packet_count: usize,
     lookahead: Option<u64>,
 ) -> usize {
-    let interval = image
+    image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .find(|generator| generator.flow.0 as usize == flow_index)
+        .filter(|generator| {
+            generator.flow.0 as usize == flow_index
+                && generator.next_emission.status == GeneratorStatus::Scheduled
+        })
         .map(|generator| {
             let FlowGeneratorKind::Constant(constant) = generator.kind;
-            constant.interval_ns
-        });
-    match (lookahead, interval) {
-        (Some(lookahead), Some(interval)) if interval != 0 => {
-            packet_count.min((lookahead / interval) as usize + 3)
-        }
-        _ => packet_count.max(1),
-    }
+            match lookahead {
+                Some(lookahead) => packet_count.min(
+                    usize::try_from(lookahead / constant.interval_ns)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(1),
+                ),
+                None => packet_count,
+            }
+        })
+        .fold(0, usize::saturating_add)
 }
 
-fn add_route_capacities(
+fn add_flow_route_capacities(
     image: &SimulationImage,
-    route: &[crate::LinkId],
-    terminal: NodeId,
+    flow_index: usize,
     packet_count: usize,
-    burst: usize,
+    packet_kind: PacketKind,
+    lookahead: Option<u64>,
     fel_caps: &mut [usize],
     queue_caps: &mut [usize],
 ) {
     if packet_count == 0 {
         return;
     }
+    let flow = &image.flows[flow_index];
+    let (route, terminal) = match packet_kind {
+        PacketKind::Data => (flow.route.as_slice(), flow.target),
+        PacketKind::Feedback => (flow.reverse_route.as_slice(), flow.source),
+    };
     for index in 0..route.len() {
         let target = route
             .get(index + 1)
             .map(|next| image.links[next.0 as usize].source)
             .unwrap_or(terminal);
         let target_slot = target.0 as usize;
+        let burst = flow_link_fel_bound(
+            image,
+            flow_index,
+            packet_count,
+            packet_kind,
+            route[index],
+            lookahead,
+        );
         fel_caps[target_slot] = fel_caps[target_slot].saturating_add(burst);
         if image.nodes[target_slot].kind == NodeKind::Switch {
             queue_caps[target_slot] = queue_caps[target_slot].saturating_add(packet_count);
         }
     }
+}
+
+fn flow_link_serialization_ns(
+    image: &SimulationImage,
+    flow_index: usize,
+    packet_kind: PacketKind,
+    link: crate::LinkDescriptor,
+) -> u64 {
+    let minimum_size = image
+        .initial_packets
+        .iter()
+        .filter(|packet| packet.flow.0 as usize == flow_index && packet.kind == packet_kind)
+        .map(|packet| packet.size_bytes)
+        .chain(
+            (packet_kind == PacketKind::Data)
+                .then(|| {
+                    image
+                        .host_states
+                        .iter()
+                        .flat_map(|state| &state.generators)
+                        .filter(move |generator| generator.flow.0 as usize == flow_index)
+                        .map(|generator| {
+                            let FlowGeneratorKind::Constant(constant) = generator.kind;
+                            constant.packet_size_bytes
+                        })
+                })
+                .into_iter()
+                .flatten(),
+        )
+        .min()
+        .unwrap_or(1);
+    crate::time::serialization_time_ns(minimum_size, link.rate_bps)
+        .expect("Metal validation established a positive finite serialization interval")
+}
+
+fn flow_link_round_bound(
+    image: &SimulationImage,
+    flow_index: usize,
+    packet_count: usize,
+    packet_kind: PacketKind,
+    link_id: crate::LinkId,
+    lookahead: Option<u64>,
+) -> usize {
+    if packet_count == 0 {
+        return 0;
+    }
+    let link = image.links[link_id.0 as usize];
+    let source = image.nodes[link.source.0 as usize];
+    let (current_queue, queue_capacity) = match source.kind {
+        NodeKind::Host => {
+            let state = &image.host_states[source.state_slot as usize];
+            (state.queue.len(), packet_count)
+        }
+        NodeKind::Switch => {
+            let queue = image.switch_states[source.state_slot as usize]
+                .queues
+                .first();
+            let current = queue.map_or(0, |queue| queue.queue.len());
+            let capacity = queue
+                .map(|queue| queue.queue_capacity_packets)
+                .filter(|capacity| *capacity != 0)
+                .and_then(|capacity| usize::try_from(capacity).ok())
+                .unwrap_or(packet_count);
+            (current, capacity)
+        }
+    };
+    let queue_bound = current_queue.max(queue_capacity);
+    let serialization = flow_link_serialization_ns(image, flow_index, packet_kind, link);
+    let service_burst = lookahead.map_or(packet_count, |lookahead| {
+        usize::try_from(lookahead.div_ceil(serialization)).unwrap_or(usize::MAX)
+    });
+    let generator_burst =
+        if packet_kind == PacketKind::Data && link.source == image.flows[flow_index].source {
+            generator_round_burst(image, flow_index, packet_count, lookahead)
+        } else {
+            0
+        };
+
+    // One horizon can expose a checkpoint queue, one packet already in service, link-rate
+    // completions, and newly generated packets. The whole-flow count remains the absolute cap.
+    packet_count.min(
+        queue_bound
+            .saturating_add(1)
+            .saturating_add(service_burst)
+            .saturating_add(generator_burst),
+    )
+}
+
+fn flow_link_fel_bound(
+    image: &SimulationImage,
+    flow_index: usize,
+    packet_count: usize,
+    packet_kind: PacketKind,
+    link_id: crate::LinkId,
+    lookahead: Option<u64>,
+) -> usize {
+    if packet_count == 0 {
+        return 0;
+    }
+    let link = image.links[link_id.0 as usize];
+    let serialization = flow_link_serialization_ns(image, flow_index, packet_kind, link);
+    let in_flight =
+        usize::try_from(link.propagation_ns.div_ceil(serialization)).unwrap_or(usize::MAX);
+
+    packet_count.min(
+        flow_link_round_bound(
+            image,
+            flow_index,
+            packet_count,
+            packet_kind,
+            link_id,
+            lookahead,
+        )
+        .saturating_add(in_flight),
+    )
 }
 
 fn derived_remote_capacity(
@@ -701,9 +893,29 @@ fn derived_remote_capacity(
         .map(|(index, flow)| {
             let feedback_count = feedback_counts[index];
             let data_count = counts[index].saturating_sub(feedback_count);
-            flow_round_burst(image, index, data_count, lookahead)
-                .saturating_mul(flow.route.len())
-                .saturating_add(feedback_count.saturating_mul(flow.reverse_route.len()))
+            flow.route
+                .iter()
+                .map(|link| {
+                    flow_link_round_bound(
+                        image,
+                        index,
+                        data_count,
+                        PacketKind::Data,
+                        *link,
+                        lookahead,
+                    )
+                })
+                .chain(flow.reverse_route.iter().map(|link| {
+                    flow_link_round_bound(
+                        image,
+                        index,
+                        feedback_count,
+                        PacketKind::Feedback,
+                        *link,
+                        lookahead,
+                    )
+                }))
+                .fold(0, usize::saturating_add)
         })
         .fold(image.nodes.len().saturating_mul(2), usize::saturating_add)
 }
@@ -931,11 +1143,13 @@ struct MetalBuffers {
     planes: Vec<SharedBuffer>,
     orphan_packets: Vec<PacketDescriptor>,
     round_capacity: usize,
+    dispatch_capacity: usize,
 }
 
 impl MetalBuffers {
     fn new(device: &ProtocolObject<dyn MTLDevice>, plan: MetalPlan) -> Result<Self, MetalError> {
         let round_capacity = plan.round_capacity;
+        let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
         let planes = vec![
             plan.control,
@@ -964,6 +1178,7 @@ impl MetalBuffers {
             planes,
             orphan_packets,
             round_capacity,
+            dispatch_capacity,
         })
     }
 
@@ -1158,6 +1373,7 @@ impl MetalBuffers {
             },
             rounds: control[CONTROL_ROUNDS],
             transitions: control[CONTROL_TRANSITIONS],
+            continuation_relaunches: control[CONTROL_RELAUNCHES],
             host_encode_submit_ns: timing.host_encode_submit_ns,
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
@@ -1367,7 +1583,7 @@ impl DirectMetal {
                 horizon_pipeline.maxTotalThreadsPerThreadgroup()
             )));
         }
-        if device.maxThreadgroupMemoryLength() < LANES * std::mem::size_of::<u64>() {
+        if device.maxThreadgroupMemoryLength() < HORIZON_THREADGROUP_BYTES {
             return Err(MetalError::Unavailable(format!(
                 "device exposes only {} bytes of threadgroup memory",
                 device.maxThreadgroupMemoryLength()
@@ -1385,7 +1601,7 @@ impl DirectMetal {
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
-        let mut remaining = buffers.round_capacity;
+        let mut remaining = buffers.dispatch_capacity;
         while remaining != 0 {
             let wave_started = Instant::now();
             let wave_capacity = config

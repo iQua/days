@@ -2757,6 +2757,160 @@ fn incast_image(sender_count: usize) -> SimulationImage {
     }
 }
 
+fn high_lp_only_image(node_count: usize) -> SimulationImage {
+    assert!(node_count > 1_024);
+    let source = NodeId(node_count as u64 - 2);
+    let sink = NodeId(node_count as u64 - 1);
+    let forward = LinkId(source.0);
+    let sink_egress = LinkId(sink.0);
+    let packet =
+        PayloadId::from_node_sequence(source, node_count as u64, 0).expect("payload ID must fit");
+    let mut nodes = Vec::with_capacity(node_count);
+    let mut host_states = Vec::with_capacity(node_count);
+    let mut links = Vec::with_capacity(node_count);
+
+    for index in 0..source.0 {
+        let node = NodeId(index);
+        let egress = LinkId(index);
+        nodes.push(NodeDescriptor {
+            id: node,
+            kind: NodeKind::Host,
+            state_slot: index as u32,
+        });
+        host_states.push(HostState {
+            egress_link: egress,
+            queue: VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+            generators: vec![],
+            next_origin_seq: 0,
+            next_payload_seq: 0,
+            sourced_packets: 0,
+            departed_packets: 0,
+            received_packets: 0,
+        });
+        links.push(LinkDescriptor {
+            id: egress,
+            source: node,
+            target: sink,
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        });
+    }
+
+    nodes.push(NodeDescriptor {
+        id: source,
+        kind: NodeKind::Host,
+        state_slot: source.0 as u32,
+    });
+    host_states.push(HostState {
+        egress_link: forward,
+        queue: VecDeque::new(),
+        in_service: None,
+        tx_ready_pending: false,
+        generators: vec![],
+        next_origin_seq: 1,
+        next_payload_seq: 0,
+        sourced_packets: 0,
+        departed_packets: 0,
+        received_packets: 0,
+    });
+    links.push(LinkDescriptor {
+        id: forward,
+        source,
+        target: sink,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    });
+
+    nodes.push(NodeDescriptor {
+        id: sink,
+        kind: NodeKind::Host,
+        state_slot: sink.0 as u32,
+    });
+    host_states.push(HostState {
+        egress_link: sink_egress,
+        queue: VecDeque::new(),
+        in_service: None,
+        tx_ready_pending: false,
+        generators: vec![],
+        next_origin_seq: 0,
+        next_payload_seq: 0,
+        sourced_packets: 0,
+        departed_packets: 0,
+        received_packets: 0,
+    });
+    links.push(LinkDescriptor {
+        id: sink_egress,
+        source: sink,
+        target: source,
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    });
+
+    SimulationImage {
+        stop_time_ns: 2,
+        nodes,
+        host_states,
+        switch_states: vec![],
+        flows: vec![FlowDescriptor {
+            id: FLOW,
+            source,
+            target: sink,
+            route: vec![forward],
+            reverse_route: vec![],
+        }],
+        initial_packets: vec![PacketDescriptor {
+            id: packet,
+            flow: FLOW,
+            size_bytes: 1,
+            kind: PacketKind::Data,
+        }],
+        links,
+        channels: vec![
+            RemoteChannel::for_packet_link(
+                LinkDescriptor {
+                    id: forward,
+                    source,
+                    target: sink,
+                    rate_bps: 8_000_000_000,
+                    propagation_ns: 0,
+                },
+                1,
+            )
+            .expect("forward channel delay must fit"),
+        ],
+        initial_events: vec![Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::PacketArrival),
+                origin_node: source,
+                origin_seq: 0,
+            },
+            target: source,
+            kind: EventKind::PacketArrival,
+            payload: packet,
+        }],
+        seed: 29,
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
+    let image = high_lp_only_image(2_000);
+    assert_eq!(image.initial_events.len(), 1);
+    assert!(image.initial_events[0].target.0 >= 1_024);
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("wide scalar oracle must run");
+    let actual =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("wide Metal image must run");
+
+    assert_eq!(expected.summary.received_packets, 1);
+    assert_eq!(actual.result, expected);
+}
+
 #[test]
 fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
     let image = incast_image(16);

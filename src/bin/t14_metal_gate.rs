@@ -37,6 +37,9 @@ fn main() {
         .unwrap_or_else(|error| panic!("Metal failed for {}: {error}", path.display()));
     let metal_end_to_end_ns = metal_started.elapsed().as_nanos();
     assert_eq!(metal.result, scalar, "Metal differs from scalar");
+    if relative == "configs/benchmarks/width_via_load_full/fattree_k32_load_10.toml" {
+        assert_eq!(metal.transitions, 10_604_109);
+    }
 
     println!("fixture={}", path.display());
     println!(
