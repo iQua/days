@@ -233,7 +233,11 @@ fn assert_equivalent(image: &SimulationImage, exclusive_horizon_ns: Option<u64>)
     for round in &rounds.rounds {
         assert_eq!(
             round.events_processed,
-            round.lp_work.iter().map(|work| work.events_processed).sum()
+            round
+                .lp_work
+                .iter()
+                .map(|work| work.events_processed)
+                .sum::<u64>()
         );
         assert_eq!(round.active_lp_count, round.lp_work.len());
         assert!(round.lp_work.iter().all(|work| work.events_processed > 0));

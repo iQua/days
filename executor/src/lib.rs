@@ -6,6 +6,8 @@
 pub mod cpu;
 pub mod event;
 pub mod image;
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub mod metal_spike;
 pub mod model;
 pub mod safe_horizon;
 pub mod scalar;

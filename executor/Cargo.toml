@@ -7,5 +7,16 @@ license = "AGPL-3.0-only"
 [lib]
 name = "days_executor"
 
+[features]
+default = []
+metal-spike = ["dep:cubecl", "cubecl/metal-native"]
+
 [dependencies]
 crossbeam = "0.8.4"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+cubecl = { version = "=0.11.0-pre.1", default-features = false, optional = true }
+
+[[example]]
+name = "t13_metal_spike"
+required-features = ["metal-spike"]
