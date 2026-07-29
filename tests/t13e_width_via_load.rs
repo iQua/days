@@ -2,9 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use days::scenario::compile_config;
-use days_executor::{FlowGeneratorKind, GeneratorTermination};
+use days_executor::{FlowGeneratorKind, GeneratorTermination, SchedulerKind, run_scalar_rounds};
 
 const FIXTURE_DIRECTORY: &str = "configs/benchmarks/width_via_load";
+const MIN_EVENTS: u128 = 10_000_000;
+const MAX_EVENTS: u128 = 50_000_000;
 
 #[derive(Clone, Copy)]
 struct Fixture {
@@ -135,6 +137,9 @@ fn width_via_load_fixtures_hold_the_t13e_design_invariants() {
         let mut previous_initial_delay = None;
         let mut offered_bytes = 0_u64;
         for (cohort, flow_set) in flow_sets.iter().enumerate() {
+            let flow_set_table = flow_set
+                .as_table()
+                .expect("each flow set must be a TOML table");
             let traffic = &flow_set["traffic"];
             let flow_bytes = traffic["size"]
                 .as_integer()
@@ -146,6 +151,13 @@ fn width_via_load_fixtures_hold_the_t13e_design_invariants() {
             let packet_size = &traffic["pkt_size_dist"];
 
             assert_eq!(flow_set["flow_type"].as_str(), Some("PacketDistribution"));
+            for field in ["routing", "starts_before", "starts_after"] {
+                assert!(
+                    !flow_set_table.contains_key(field),
+                    "{} cohort {cohort} must omit compiler-significant field {field}",
+                    fixture.name
+                );
+            }
             assert_eq!(
                 flow_set["flow_count"].as_integer(),
                 i64::try_from(fixture.cohort_flow_counts[cohort]).ok(),
@@ -209,35 +221,86 @@ fn width_via_load_fixtures_hold_the_t13e_design_invariants() {
 }
 
 #[test]
-#[ignore = "explicit T13e k32 sweep lowering gate"]
-fn width_via_load_fixtures_lower_to_finite_constant_generators() {
-    for fixture in FIXTURES {
-        let path = fixture_path(fixture.name);
-        let config = read_fixture(&path);
-        let expected_flow_count = config["flow_set"]
-            .as_array()
-            .expect("fixture must contain flow sets")
-            .iter()
-            .map(|flow_set| usize::try_from(flow_set["flow_count"].as_integer().unwrap()).unwrap())
-            .sum::<usize>();
-        let image = compile_config(&path)
-            .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
-        let generators = image
-            .host_states
-            .iter()
-            .flat_map(|host| &host.generators)
-            .collect::<Vec<_>>();
+fn smallest_width_via_load_fixture_lowers_and_truncates_pending_tail() {
+    let fixture = FIXTURES[0];
+    let path = fixture_path(fixture.name);
+    let image = compile_config(&path)
+        .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
 
-        assert_eq!(image.flows.len(), expected_flow_count);
-        assert_eq!(generators.len(), expected_flow_count);
-        assert!(generators.iter().all(|generator| {
-            matches!(
-                generator.kind,
-                FlowGeneratorKind::Constant(constant)
-                    if constant.interval_ns == 21
-                        && constant.packet_size_bytes == 256
-                        && matches!(constant.termination, GeneratorTermination::Bytes(_))
-            )
-        }));
-    }
+    assert_eq!(image.stop_time_ns, 119_000);
+    assert_eq!(image.seed, 13_001);
+    assert_eq!(image.host_states.len(), 512);
+    assert_eq!(image.switch_states.len(), 33_280);
+    assert_eq!(image.nodes.len(), 33_792);
+    assert!(
+        image
+            .switch_states
+            .iter()
+            .all(|switch| switch.queues.len() == 1)
+    );
+    assert!(
+        image
+            .links
+            .iter()
+            .all(|link| { link.rate_bps == 100_000_000_000 && link.propagation_ns == 1_000 })
+    );
+
+    let queues = image
+        .switch_states
+        .iter()
+        .flat_map(|switch| &switch.queues)
+        .collect::<Vec<_>>();
+    assert_eq!(queues.len(), 33_280);
+    assert!(queues.iter().all(|queue| {
+        queue.scheduler == SchedulerKind::Fifo && queue.queue_capacity_packets == 1_024
+    }));
+
+    let generators = image
+        .host_states
+        .iter()
+        .flat_map(|host| &host.generators)
+        .collect::<Vec<_>>();
+    assert_eq!(image.flows.len(), 480);
+    assert_eq!(generators.len(), 480);
+    assert!(generators.iter().all(|generator| {
+        matches!(
+            generator.kind,
+            FlowGeneratorKind::Constant(constant)
+                if constant.interval_ns == 21
+                    && constant.packet_size_bytes == 256
+                    && constant.termination == GeneratorTermination::Bytes(524_288)
+        )
+    }));
+
+    let run = run_scalar_rounds(&image, None)
+        .unwrap_or_else(|error| panic!("failed to execute {}: {error}", path.display()));
+    let total_events = run
+        .rounds
+        .iter()
+        .map(|round| u128::from(round.events_processed))
+        .sum::<u128>();
+
+    assert!(
+        (MIN_EVENTS..=MAX_EVENTS).contains(&total_events),
+        "{} processed {total_events} events, outside [{MIN_EVENTS}, {MAX_EVENTS}]",
+        fixture.name
+    );
+    assert!(
+        !run.result.pending_events.is_empty(),
+        "{} must retain pending work at its configured stop",
+        fixture.name
+    );
+    assert!(
+        run.result
+            .pending_events
+            .iter()
+            .all(|event| event.key.time_ns > image.stop_time_ns),
+        "{} must stop before its pending tail",
+        fixture.name
+    );
+    assert!(
+        !run.result.resident_packets.is_empty(),
+        "{} must retain in-flight or queued packets at its configured stop",
+        fixture.name
+    );
 }

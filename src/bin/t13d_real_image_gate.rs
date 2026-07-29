@@ -19,8 +19,20 @@ mod app {
     };
 
     const LOWER_CPU_VALIDATION_WORKERS: usize = 4;
+    const T13E_MIN_EVENTS: u128 = 10_000_000;
+    const T13E_MAX_EVENTS: u128 = 50_000_000;
 
     type BoxError = Box<dyn Error>;
+
+    fn enforce_t13e_event_budget(total_events: u128) -> Result<(), BoxError> {
+        if !(T13E_MIN_EVENTS..=T13E_MAX_EVENTS).contains(&total_events) {
+            return Err(input_error(&format!(
+                "T13e event budget violation: total_events={total_events} is outside the hard \
+                 inclusive range [{T13E_MIN_EVENTS}, {T13E_MAX_EVENTS}]"
+            )));
+        }
+        Ok(())
+    }
 
     pub fn main() -> Result<(), BoxError> {
         match parse_args()? {
@@ -494,6 +506,25 @@ mod app {
                 "T13e full scalar and W4 CPU round/event totals differ",
             ));
         }
+        let total_events = scalar.totals.whole_run.events_processed;
+        let event_budget_status = if (T13E_MIN_EVENTS..=T13E_MAX_EVENTS).contains(&total_events) {
+            "pass"
+        } else {
+            "fail"
+        };
+        println!(
+            "record=t13e_budget config={} contract=hard_event_budget min_events={} \
+             max_events={} total_events={} event_budget_status={} scalar_wall_ns={} \
+             cpu_wall_ns={} wall_budget_status=reported_not_enforced",
+            display_path(config),
+            T13E_MIN_EVENTS,
+            T13E_MAX_EVENTS,
+            total_events,
+            event_budget_status,
+            scalar_wall_ns,
+            cpu_wall_ns,
+        );
+        enforce_t13e_event_budget(total_events)?;
         println!(
             "record=t13e_path_equality config={} scalar_mode=t13e_scalar_gate_trace \
              cpu_mode=t13e_cpu cpu_workers=4 result_equal=true totals_equal=true \
@@ -1263,6 +1294,30 @@ mod app {
             stats.occupancy_maximum,
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn t13e_event_budget_accepts_inclusive_bounds() {
+            enforce_t13e_event_budget(T13E_MIN_EVENTS).unwrap();
+            enforce_t13e_event_budget(T13E_MAX_EVENTS).unwrap();
+        }
+
+        #[test]
+        fn t13e_event_budget_rejects_out_of_range_counts() {
+            let below = enforce_t13e_event_budget(T13E_MIN_EVENTS - 1)
+                .expect_err("an event count below the T13e budget must fail")
+                .to_string();
+            let above = enforce_t13e_event_budget(T13E_MAX_EVENTS + 1)
+                .expect_err("an event count above the T13e budget must fail")
+                .to_string();
+
+            assert!(below.contains("[10000000, 50000000]"));
+            assert!(above.contains("[10000000, 50000000]"));
+        }
     }
 }
 
