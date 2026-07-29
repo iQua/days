@@ -254,7 +254,7 @@ suffix is recorded must have been co-pending before the first step. The second c
 unchanged commutation conclusion, now restricted to well-formed, co-pending steps tied to that
 actual emission trace.
 
-The scope is necessary. Without well-formed co-pendingness, arbitrary machines admit equal-key,
+The scope is necessary. Without well-formed co-pendingness, arbitrary machines permit equal-key,
 different-payload arrivals that no concrete executor can contain, and a proposed reversal may put
 a child before the step that creates it. This is the F5 analogue of F2's reachable-start premise:
 the theorem covers executor states and actual emissions rather than malformed countermodels.
