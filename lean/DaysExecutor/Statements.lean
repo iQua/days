@@ -232,22 +232,58 @@ def CrossLPSameKindClusteringLicensed : Prop :=
     IntraRoundIndependent emissions left right
 
 /--
-Explicit commutation premise required for abstract heterogeneous handlers: swapping any declared
-independent adjacent pair yields the same normalized result. Rust's deterministic dispatch alone at
-`executor/src/scalar.rs:638-663` does not imply this property.
+The exact child-emission suffix of one quantified materialized step is present in the supplied
+round emission trace. This prevents a commutation license from naming an unrelated trace while
+silently omitting a child that makes two consecutive events causally dependent.
+-/
+def StepEmissionsRecorded
+    (emissions : List (Event × Event))
+    (event : Event)
+    (before after : MachineState State) : Prop :=
+  ∃ children : List Event,
+    after.emissions =
+      before.emissions ++ children.map (fun child => (event, child)) ∧
+    ∀ child ∈ children,
+      RecordedEmissionEdge emissions event child
+
+/--
+Explicit scoped commutation premise required for abstract heterogeneous handlers.
+
+The first clause is dependency completeness: an independent consecutive pair whose actual child
+suffix is recorded must have been co-pending before the first step. The second clause is the
+unchanged commutation conclusion, now restricted to well-formed, co-pending steps tied to that
+actual emission trace.
+
+The scope is necessary. Without well-formed co-pendingness, arbitrary machines admit equal-key,
+different-payload arrivals that no concrete executor can contain, and a proposed reversal may put
+a child before the step that creates it. This is the F5 analogue of F2's reachable-start premise:
+the theorem covers executor states and actual emissions rather than malformed countermodels.
 -/
 def IndependentStepsCommute
     (image : SimulationImage State)
     (transition : TransitionRelation State)
     (emissions : List (Event × Event)) : Prop :=
-  ∀ before left right afterLeft afterLeftRight,
-    IntraRoundIndependent emissions left right →
-    AvailableEventStep image transition left before afterLeft →
-    AvailableEventStep image transition right afterLeft afterLeftRight →
-    ∃ afterRight afterRightLeft,
-      AvailableEventStep image transition right before afterRight ∧
-      AvailableEventStep image transition left afterRight afterRightLeft ∧
-      SameMachineResult image afterLeftRight afterRightLeft
+  (∀ before left right afterLeft afterLeftRight,
+      MachineWellFormed image before →
+      StepEmissionsRecorded emissions left before afterLeft →
+      StepEmissionsRecorded emissions right afterLeft afterLeftRight →
+      IntraRoundIndependent emissions left right →
+      AvailableEventStep image transition left before afterLeft →
+      AvailableEventStep image transition right afterLeft afterLeftRight →
+      right ∈ before.pending) ∧
+    ∀ before left right afterLeft afterLeftRight,
+      MachineWellFormed image before →
+      left ∈ before.pending →
+      right ∈ before.pending →
+      StepEmissionsRecorded emissions left before afterLeft →
+      StepEmissionsRecorded emissions right afterLeft afterLeftRight →
+      IntraRoundIndependent emissions left right →
+      AvailableEventStep image transition left before afterLeft →
+      AvailableEventStep image transition right afterLeft afterLeftRight →
+      ∃ afterRight afterRightLeft,
+        AvailableEventStep image transition right before afterRight ∧
+        AvailableEventStep image transition left afterRight afterRightLeft ∧
+        SameMachineResult image afterLeftRight afterRightLeft
 
 /--
 F5 theorem statement from plan §8: under an explicit dependency-completeness/commutation premise,
@@ -259,9 +295,9 @@ handlers at
 
 The commutation premise records an implementation/specification tension: those two base orders are
 not consequences of deterministic abstract handlers, and literal `EventKind` equality would miss
-arrival-versus-service capacity conflicts. This is intentionally a `Prop`-valued definition for
-T11. T12 proves the conditional theorem; because handler bodies remain abstract, establishing
-commutation for concrete handlers is a separate future obligation.
+arrival-versus-service capacity conflicts. The premise is scoped to well-formed, co-pending actual
+steps because unrestricted arbitrary-machine quantification admits the malformed countermodels
+described above.
 -/
 def F5IntraRoundReordering
     (image : SimulationImage State)

@@ -17,17 +17,16 @@ theorem child_key_mem_allocated_after
     (List.mem_map.mpr ⟨child, hchild, rfl⟩)
 
 /--
-An inverted adjacent pair on distinct LPs can be replayed in the opposite order. Endpoint
-equivalence is established separately after both materialized steps are available.
+Two distinct-LP steps that were both pending before the first step can be replayed in the opposite
+order. Endpoint equivalence is established separately after both materialized steps are available.
 -/
-theorem inverted_cross_lp_steps_replay
+theorem cross_lp_co_pending_steps_replay
     (image : SimulationImage State)
     (transition : TransitionRelation State)
     (hunique : UniqueNodeIds image)
     (horacle : DescriptorOracleWellFormed image)
     (hgenerated : GeneratedEventsRoleCorrect image transition)
     (hdescriptors : TransitionDescriptorEffectsCoherent image transition)
-    (hadvance : ChildrenAdvanceParent transition)
     (before afterLeft afterLeftRight : MachineState State)
     (left right : Event)
     (hbefore : MachineWellFormed image before)
@@ -36,7 +35,7 @@ theorem inverted_cross_lp_steps_replay
     (hright :
       AvailableEventStep image transition right afterLeft afterLeftRight)
     (htarget : left.target ≠ right.target)
-    (hkey : right.key < left.key) :
+    (hrightMem : right ∈ before.pending) :
     ∃ afterRight afterRightLeft,
       AvailableEventStep image transition right before afterRight ∧
       AvailableEventStep image transition left afterRight afterRightLeft ∧
@@ -80,9 +79,7 @@ theorem inverted_cross_lp_steps_replay
     (hleftOther rightNode hrightNode (Ne.symm hnodeIds)).1
   have hrightMemBefore :
       right ∈ before.pending :=
-    right_mem_before_of_inverted_steps image transition hadvance
-      left right before afterLeft afterLeftRight
-      hleftSaved hrightSaved hkey
+    hrightMem
   have hrightTransitionBefore :
       transition rightNode right (before.localState rightNode)
         rightResult := by
@@ -202,19 +199,17 @@ theorem inverted_cross_lp_steps_replay
     hleftMaterialized.1, hleftMaterialized.2⟩
 
 /--
-The inverted cross-LP replay has the same complete owner-preserving result.  Public equality is a
-corollary of this stronger relation.
+The key-inverted replay used by canonical sorting is the co-pending replay specialization: strict
+child-key advance proves that the smaller second event was already pending.
 -/
-theorem inverted_cross_lp_steps_commute
+theorem inverted_cross_lp_steps_replay
     (image : SimulationImage State)
     (transition : TransitionRelation State)
     (hunique : UniqueNodeIds image)
     (horacle : DescriptorOracleWellFormed image)
     (hgenerated : GeneratedEventsRoleCorrect image transition)
     (hdescriptors : TransitionDescriptorEffectsCoherent image transition)
-    (hdeterministic : TransitionDeterministic transition)
     (hadvance : ChildrenAdvanceParent transition)
-    (hobservations : TransitionObservationsUseEventKey transition)
     (before afterLeft afterLeftRight : MachineState State)
     (left right : Event)
     (hbefore : MachineWellFormed image before)
@@ -224,6 +219,39 @@ theorem inverted_cross_lp_steps_commute
       AvailableEventStep image transition right afterLeft afterLeftRight)
     (htarget : left.target ≠ right.target)
     (hkey : right.key < left.key) :
+    ∃ afterRight afterRightLeft,
+      AvailableEventStep image transition right before afterRight ∧
+      AvailableEventStep image transition left afterRight afterRightLeft ∧
+      MachineWellFormed image afterRightLeft := by
+  apply cross_lp_co_pending_steps_replay image transition hunique horacle
+    hgenerated hdescriptors before afterLeft afterLeftRight left right
+    hbefore hleft hright htarget
+  exact right_mem_before_of_inverted_steps image transition hadvance
+    left right before afterLeft afterLeftRight hleft hright hkey
+
+/--
+The co-pending cross-LP replay has the same complete owner-preserving result. Public equality is a
+corollary of this stronger relation.
+-/
+theorem cross_lp_co_pending_steps_commute
+    (image : SimulationImage State)
+    (transition : TransitionRelation State)
+    (hunique : UniqueNodeIds image)
+    (horacle : DescriptorOracleWellFormed image)
+    (hgenerated : GeneratedEventsRoleCorrect image transition)
+    (hdescriptors : TransitionDescriptorEffectsCoherent image transition)
+    (hdeterministic : TransitionDeterministic transition)
+    (hobservations : TransitionObservationsUseEventKey transition)
+    (before afterLeft afterLeftRight : MachineState State)
+    (left right : Event)
+    (hbefore : MachineWellFormed image before)
+    (hleft :
+      AvailableEventStep image transition left before afterLeft)
+    (hright :
+      AvailableEventStep image transition right afterLeft afterLeftRight)
+    (htarget : left.target ≠ right.target)
+    (hrightMem : right ∈ before.pending)
+    (hkeyNe : left.key ≠ right.key) :
     ∃ afterRight afterRightLeft,
       AvailableEventStep image transition right before afterRight ∧
       AvailableEventStep image transition left afterRight afterRightLeft ∧
@@ -240,9 +268,9 @@ theorem inverted_cross_lp_steps_commute
       afterLeftRight hafterLeft hrightSaved
   obtain ⟨afterRight, afterRightLeft, hrightFirst, hleftSecond,
       hafterRightLeft⟩ :=
-    inverted_cross_lp_steps_replay image transition hunique horacle
-      hgenerated hdescriptors hadvance before afterLeft afterLeftRight
-      left right hbefore hleftSaved hrightSaved htarget hkey
+    cross_lp_co_pending_steps_replay image transition hunique horacle
+      hgenerated hdescriptors before afterLeft afterLeftRight
+      left right hbefore hleftSaved hrightSaved htarget hrightMem
   have hrightFirstSaved := hrightFirst
   have hleftSecondSaved := hleftSecond
   have hafterRight :=
@@ -338,11 +366,8 @@ theorem inverted_cross_lp_steps_commute
     exact htarget (congrArg Event.target heq)
   have hrightNotLeftChild : right ∉ leftResult.children := by
     intro hchild
-    have hforward :=
-      hadvance leftNode left (before.localState leftNode)
-        leftResult hleftTransition right hchild
-    exact (EventKey.lt_irrefl right.key)
-      (EventKey.lt_trans hkey hforward)
+    exact (hleftAllocates.2.2.1 right hchild)
+      ((hbefore.2.2.2.1 right hrightMem).1)
   have hleftNotRightChild : left ∉ rightResult.children := by
     intro hchild
     have hrightFresh := hrightAllocates.2.2.1 left hchild
@@ -428,10 +453,6 @@ theorem inverted_cross_lp_steps_commute
         · rw [hrightDescriptors first hfirst,
             hrightDescriptors second hsecond, hid])
       before.observedPackets
-  have hkeyNe : left.key ≠ right.key :=
-    fun heq => by
-      rw [← heq] at hkey
-      exact EventKey.lt_irrefl _ hkey
   have hleftObservation :=
     hobservations leftNode left (before.localState leftNode)
       leftResult hleftTransition
@@ -513,5 +534,41 @@ theorem inverted_cross_lp_steps_commute
     hrightFirstSaved, hleftSecondSaved,
     ⟨hlocal, hstores, hsummary, hobserved, hdepartures, harrivals,
       hpending, hcursors, hallocated, hemissions⟩⟩
+
+/--
+The inverted cross-LP diamond remains the sorting specialization of the scoped co-pending
+diamond.
+-/
+theorem inverted_cross_lp_steps_commute
+    (image : SimulationImage State)
+    (transition : TransitionRelation State)
+    (hunique : UniqueNodeIds image)
+    (horacle : DescriptorOracleWellFormed image)
+    (hgenerated : GeneratedEventsRoleCorrect image transition)
+    (hdescriptors : TransitionDescriptorEffectsCoherent image transition)
+    (hdeterministic : TransitionDeterministic transition)
+    (hadvance : ChildrenAdvanceParent transition)
+    (hobservations : TransitionObservationsUseEventKey transition)
+    (before afterLeft afterLeftRight : MachineState State)
+    (left right : Event)
+    (hbefore : MachineWellFormed image before)
+    (hleft :
+      AvailableEventStep image transition left before afterLeft)
+    (hright :
+      AvailableEventStep image transition right afterLeft afterLeftRight)
+    (htarget : left.target ≠ right.target)
+    (hkey : right.key < left.key) :
+    ∃ afterRight afterRightLeft,
+      AvailableEventStep image transition right before afterRight ∧
+      AvailableEventStep image transition left afterRight afterRightLeft ∧
+      StrongMachineReplay image afterLeftRight afterRightLeft := by
+  apply cross_lp_co_pending_steps_commute image transition hunique horacle
+    hgenerated hdescriptors hdeterministic hobservations
+    before afterLeft afterLeftRight left right hbefore hleft hright htarget
+  · exact right_mem_before_of_inverted_steps image transition hadvance
+      left right before afterLeft afterLeftRight hleft hright hkey
+  · intro heq
+    rw [← heq] at hkey
+    exact EventKey.lt_irrefl _ hkey
 
 end DaysExecutor

@@ -381,6 +381,110 @@ theorem independent_inverted_targets_ne
   exact Or.inr
     ⟨htarget.symm, by simp [fifoQueueConflictClass], hinverted⟩
 
+theorem independent_consecutive_targets_ne
+    (image : SimulationImage State)
+    (transition : TransitionRelation State)
+    (hadvance : ChildrenAdvanceParent transition)
+    (before afterLeft afterLeftRight : MachineState State)
+    (left right : Event)
+    (hbefore : MachineWellFormed image before)
+    (hindependent : IntraRoundIndependent emissions left right)
+    (hleft :
+      AvailableEventStep image transition left before afterLeft)
+    (hright :
+      AvailableEventStep image transition right afterLeft afterLeftRight) :
+    left.target ≠ right.target := by
+  have hkeyNe :=
+    adjacent_available_steps_key_ne image transition hadvance
+      before afterLeft afterLeftRight left right hbefore hleft hright
+  rcases EventKey.lt_trichotomy left.key right.key with hlt | heq | hgt
+  · intro htarget
+    exact hindependent.1
+      (Or.inr ⟨htarget, by simp [fifoQueueConflictClass], hlt⟩)
+  · exact False.elim (hkeyNe heq)
+  · intro htarget
+    exact hindependent.2
+      (Or.inr ⟨htarget.symm, by simp [fifoQueueConflictClass], hgt⟩)
+
+theorem acceptedModel_independentStepsCommute
+    (image : SimulationImage State)
+    (transition : TransitionRelation State)
+    (emissions : List (Event × Event))
+    (haccepted : AcceptedModel image transition)
+    (hpayload :
+      ∀ parent child,
+        RecordedEmissionEdge emissions parent child →
+          parent.payload = child.payload) :
+    IndependentStepsCommute image transition emissions := by
+  rcases haccepted with
+    ⟨⟨hunique, _, _, _, _, _, _, _, _, horacle, _, _, _, _, _, _, _⟩,
+      _, haxioms, _⟩
+  rcases haxioms with
+    ⟨hdeterministic, _, hgenerated, hadvance, _, _, _, _, _,
+      hdescriptors, hobservations⟩
+  constructor
+  · intro before left right afterLeft afterLeftRight
+      hbefore hleftRecorded _ hindependent hleft hright
+    rcases hleft with
+      ⟨_, node, _, result, _, _, _, _, _, _, _,
+        hpending, hemissions⟩
+    have hrightAfter : right ∈ afterLeft.pending := hright.1
+    rw [hpending, mem_insertEvents_iff] at hrightAfter
+    rcases hrightAfter with hchild | hremaining
+    · rcases hleftRecorded with
+        ⟨recordedChildren, hrecordedEmissions, hrecorded⟩
+      have hmaps :
+          result.children.map (fun child => (left, child)) =
+            recordedChildren.map (fun child => (left, child)) := by
+        exact List.append_cancel_left
+          (hemissions.symm.trans hrecordedEmissions)
+      have hpair :
+          (left, right) ∈
+            recordedChildren.map (fun child => (left, child)) := by
+        rw [← hmaps]
+        exact List.mem_map.mpr ⟨right, hchild, rfl⟩
+      rcases List.mem_map.mp hpair with
+        ⟨recordedChild, hrecordedChild, hpairEq⟩
+      have hchildEq : recordedChild = right := by
+        injection hpairEq
+      subst recordedChild
+      have hedge : RecordedEmissionEdge emissions left right :=
+        hrecorded right hrecordedChild
+      exact False.elim
+        (hindependent.1
+          (Or.inl ⟨hpayload left right hedge,
+            RecordedCausalBefore.direct hedge⟩))
+    · exact List.mem_of_mem_erase hremaining
+  · intro before left right afterLeft afterLeftRight
+      hbefore _ hrightPending _ _ hindependent hleft hright
+    have htarget :=
+      independent_consecutive_targets_ne image transition hadvance
+        before afterLeft afterLeftRight left right hbefore
+        hindependent hleft hright
+    have hkeyNe :=
+      adjacent_available_steps_key_ne image transition hadvance
+        before afterLeft afterLeftRight left right hbefore hleft hright
+    obtain ⟨afterRight, afterRightLeft, hrightFirst, hleftSecond,
+        hreplay⟩ :=
+      cross_lp_co_pending_steps_commute image transition
+        hunique horacle hgenerated hdescriptors hdeterministic
+        hobservations before afterLeft afterLeftRight left right
+        hbefore hleft hright htarget hrightPending hkeyNe
+    exact ⟨afterRight, afterRightLeft, hrightFirst, hleftSecond,
+      strongMachineReplay_implies_result image
+        afterLeftRight afterRightLeft hreplay⟩
+
+theorem perm_cancel_common_prefix
+    (common left right : List α)
+    (hperm : (common ++ left).Perm (common ++ right)) :
+    left.Perm right := by
+  induction common with
+  | nil =>
+      simpa using hperm
+  | cons head tail ih =>
+      apply ih
+      exact List.Perm.cons_inv (a := head) (by simpa using hperm)
+
 theorem independentAdjacentSwapTrace_replay
     (image : SimulationImage State)
     (transition : TransitionRelation State)
@@ -400,7 +504,8 @@ theorem independentAdjacentSwapTrace_replay
       IndependentAdjacentSwapTrace emissions candidate canonical)
     (hcanonical :
       ExecutionInOrder image transition
-        before canonical canonicalFinish) :
+        before canonical canonicalFinish)
+    (hdelta : RoundEmissionDelta before canonicalFinish emissions) :
     ∃ candidateFinish,
       ExecutionInOrder image transition
         before candidate candidateFinish ∧
@@ -417,9 +522,11 @@ theorem independentAdjacentSwapTrace_replay
           (right :: left :: afterPart) before closerFinish
           (by simpa using hcloserExecution)
       cases hpairAndSuffix with
-      | step hright hleftAndSuffix =>
+      | @step _ _ rightAfter _ _ hright hleftAndSuffix =>
           cases hleftAndSuffix with
-          | step hleft hsuffix =>
+          | @step _ _ leftAfter _ _ hleft hsuffix =>
+              have hrightSaved := hright
+              have hleftSaved := hleft
               have hpairBefore :
                   MachineWellFormed image pairBefore :=
                 executionInOrder_preserves_machineWellFormed image transition
@@ -428,10 +535,64 @@ theorem independentAdjacentSwapTrace_replay
               have hindependentReverse :
                   IntraRoundIndependent emissions right left :=
                 ⟨hindependent.2, hindependent.1⟩
+              obtain ⟨prefixDelta, hprefixEmissions, _⟩ :=
+                executionInOrder_emission_suffix_advances
+                  image transition hadvance before pairBefore
+                  beforePart hprefix
+              obtain ⟨suffixDelta, hsuffixEmissions, _⟩ :=
+                executionInOrder_emission_suffix_advances
+                  image transition hadvance _ closerFinish
+                  afterPart hsuffix
+              rcases hright with
+                ⟨_, rightNode, _, rightResult, _, _, _, _, _, _, _,
+                  _, hrightEmissions⟩
+              rcases hleft with
+                ⟨_, leftNode, _, leftResult, _, _, _, _, _, _, _,
+                  _, hleftEmissions⟩
+              let closerDelta :=
+                prefixDelta ++
+                  rightResult.children.map (fun child => (right, child)) ++
+                  leftResult.children.map (fun child => (left, child)) ++
+                  suffixDelta
+              have hcloserEmissions :
+                  closerFinish.emissions =
+                    before.emissions ++ closerDelta := by
+                rw [hsuffixEmissions, hleftEmissions,
+                  hrightEmissions, hprefixEmissions]
+                simp only [closerDelta, List.append_assoc]
+              have hemissionsPerm :
+                  (before.emissions ++ emissions).Perm
+                    (before.emissions ++ closerDelta) := by
+                rw [← hdelta, ← hcloserEmissions]
+                exact hcloserReplay.2.2.2.2.2.2.2.2.2
+              have hdeltaPerm : emissions.Perm closerDelta :=
+                perm_cancel_common_prefix before.emissions
+                  emissions closerDelta hemissionsPerm
+              have hrightRecorded :
+                  StepEmissionsRecorded emissions right pairBefore
+                    rightAfter := by
+                refine ⟨rightResult.children, hrightEmissions, ?_⟩
+                intro child hchild
+                apply hdeltaPerm.mem_iff.mpr
+                simp [closerDelta, hchild]
+              have hleftRecorded :
+                  StepEmissionsRecorded emissions left rightAfter
+                    leftAfter := by
+                refine ⟨leftResult.children, hleftEmissions, ?_⟩
+                intro child hchild
+                apply hdeltaPerm.mem_iff.mpr
+                simp [closerDelta, hchild]
+              have hleftPending :
+                  left ∈ pairBefore.pending :=
+                hcommute.1 pairBefore right left _ _
+                  hpairBefore hrightRecorded hleftRecorded
+                  hindependentReverse hrightSaved hleftSaved
               obtain ⟨afterLeft, afterLeftRight, hleftFirst,
                   hrightSecond, _⟩ :=
-                hcommute pairBefore right left _ _
-                  hindependentReverse hright hleft
+                hcommute.2 pairBefore right left _ _
+                  hpairBefore hrightSaved.1 hleftPending
+                  hrightRecorded hleftRecorded
+                  hindependentReverse hrightSaved hleftSaved
               obtain ⟨afterRightAgain, afterRightLeftAgain,
                   hrightAgain, hleftAgain, hinvertedReplay⟩ :=
                 inverted_cross_lp_steps_commute image transition
@@ -446,12 +607,12 @@ theorem independentAdjacentSwapTrace_replay
                   StrongMachineReplay image _ _ :=
                 availableEventStep_same_before_strong image transition
                   hunique hdeterministic right pairBefore
-                  _ _ hright hrightAgain
+                  _ _ hrightSaved hrightAgain
               have hsortedPairReplay :
                   StrongMachineReplay image _ _ :=
                 availableEventStep_strong_congr image transition
                   hunique hdeterministic left _ _ _ _
-                  hrightMiddleReplay hleft hleftAgain
+                  hrightMiddleReplay hleftSaved hleftAgain
               have horiginalToCandidate :
                   StrongMachineReplay image _ afterLeftRight :=
                 strongMachineReplay_trans image hsortedPairReplay
@@ -556,7 +717,7 @@ theorem f5IntraRoundReordering_proved
       hunique horacle hgenerated hdescriptors hdeterministic
       hadvance hobservations roundEmissions hcommute
       start.machine canonicalFinish candidateOrder canonicalOrder
-      hstartWellFormed htrace hcanonicalExecution
+      hstartWellFormed htrace hcanonicalExecution hdelta
   exact ⟨candidateFinish, hcandExecution,
     strongMachineReplay_implies_result image
       canonicalFinish candidateFinish hcandReplay⟩
