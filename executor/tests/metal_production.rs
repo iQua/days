@@ -676,6 +676,146 @@ fn backlog_drain_image() -> SimulationImage {
     }
 }
 
+fn uneven_multi_lp_backlog_image() -> SimulationImage {
+    const NODE_COUNT: usize = 6;
+    const PACKET_COUNTS: [u64; 3] = [3, 7, 40];
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    let mut host_states = Vec::with_capacity(NODE_COUNT);
+    let mut flows = Vec::with_capacity(PACKET_COUNTS.len());
+    let mut packets = Vec::new();
+    let mut links = Vec::with_capacity(PACKET_COUNTS.len() * 2);
+    let mut channels = Vec::with_capacity(PACKET_COUNTS.len());
+    let mut initial_events = Vec::with_capacity(PACKET_COUNTS.len());
+
+    for (index, packet_count) in PACKET_COUNTS.into_iter().enumerate() {
+        let source = NodeId((index * 2) as u64);
+        let sink = NodeId(source.0 + 1);
+        let flow = FlowId(index as u64);
+        let forward = LinkDescriptor {
+            id: LinkId((index * 2) as u64),
+            source,
+            target: sink,
+            rate_bps: 8_000_000_000,
+            propagation_ns: 99,
+        };
+        let reverse = LinkDescriptor {
+            id: LinkId(forward.id.0 + 1),
+            source: sink,
+            target: source,
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        };
+        let flow_packets = (0..packet_count)
+            .map(|sequence| PacketDescriptor {
+                id: PayloadId::from_node_sequence(source, NODE_COUNT as u64, sequence)
+                    .expect("multi-LP backlog payload IDs must fit"),
+                flow,
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            })
+            .collect::<Vec<_>>();
+
+        nodes.extend([
+            NodeDescriptor {
+                id: source,
+                kind: NodeKind::Host,
+                state_slot: (index * 2) as u32,
+            },
+            NodeDescriptor {
+                id: sink,
+                kind: NodeKind::Host,
+                state_slot: (index * 2 + 1) as u32,
+            },
+        ]);
+        host_states.extend([
+            HostState {
+                egress_link: forward.id,
+                queue: flow_packets.iter().map(|packet| packet.id).collect(),
+                in_service: None,
+                tx_ready_pending: true,
+                generators: vec![FlowGeneratorState {
+                    flow,
+                    packets_emitted: 0,
+                    bytes_emitted: 0,
+                    next_emission: ScheduledEmission {
+                        status: GeneratorStatus::Finished,
+                        departure_time_ns: 0,
+                        payload: flow_packets[0].id,
+                    },
+                    rng_state: 1,
+                    feedback: GeneratorFeedbackState {
+                        arrivals: 0,
+                        outstanding_bytes: 0,
+                        unacknowledged_bytes: 0,
+                    },
+                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                        first_departure_ns: 0,
+                        interval_ns: 1_000,
+                        packet_size_bytes: 1,
+                        termination: GeneratorTermination::Bytes(0),
+                    }),
+                }],
+                next_origin_seq: 1,
+                next_payload_seq: packet_count,
+                sourced_packets: packet_count,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: reverse.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ]);
+        flows.push(FlowDescriptor {
+            id: flow,
+            source,
+            target: sink,
+            route: vec![forward.id],
+            reverse_route: vec![],
+        });
+        packets.extend_from_slice(&flow_packets);
+        links.extend([forward, reverse]);
+        channels.push(
+            RemoteChannel::for_packet_link(forward, 1)
+                .expect("multi-LP backlog channel delay must fit"),
+        );
+        initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::TxReady),
+                origin_node: source,
+                origin_seq: 0,
+            },
+            target: source,
+            kind: EventKind::TxReady,
+            payload: flow_packets[0].id,
+        });
+    }
+    packets.sort_unstable_by_key(|packet| packet.id);
+    initial_events.sort_unstable_by_key(|event| event.key);
+
+    SimulationImage {
+        stop_time_ns: 39,
+        nodes,
+        host_states,
+        switch_states: vec![],
+        flows,
+        initial_packets: packets,
+        links,
+        channels,
+        initial_events,
+        seed: 29,
+    }
+}
+
 fn long_flight_backlog_image() -> SimulationImage {
     const PACKET_COUNT: u64 = 12;
     const SOURCE: NodeId = NodeId(0);
@@ -1166,6 +1306,90 @@ fn metal_tiny_physical_transition_chunks_relaunch_to_exact_parity() {
     assert_eq!(uncapped.continuation_relaunches, 0);
     assert_eq!(uncapped.rounds, default.rounds);
     assert_eq!(uncapped.transitions, default.transitions);
+}
+
+#[test]
+fn metal_continuations_advance_across_uneven_active_lps() {
+    let image = uneven_multi_lp_backlog_image();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar multi-LP backlog oracle must run");
+    let uncapped = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_transitions_per_lp_per_round: usize::MAX,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("uncapped multi-LP Metal run must run");
+    let capped = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_transitions_per_lp_per_round: 4,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("small dispatch chunks must advance across active LPs");
+
+    assert_eq!(
+        [
+            scalar.host_states[0].departed_packets,
+            scalar.host_states[2].departed_packets,
+            scalar.host_states[4].departed_packets,
+        ],
+        [3, 7, 39]
+    );
+    assert_eq!(uncapped.result, scalar);
+    assert_eq!(capped.result, scalar);
+    assert_eq!(capped.result, uncapped.result);
+    assert_eq!(uncapped.continuation_relaunches, 0);
+    assert!(capped.continuation_relaunches > 20);
+    assert_eq!(capped.rounds, uncapped.rounds);
+    assert_eq!(capped.transitions, uncapped.transitions);
+    assert_eq!(capped.wave_boundary_syncs, 1);
+    assert_eq!(capped.mid_round_wave_boundary_syncs, 0);
+}
+
+#[test]
+fn metal_continuations_cross_a_bounded_encoding_wave_exactly() {
+    let image = uneven_multi_lp_backlog_image();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar wave-boundary oracle must run");
+    let uncapped = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_transitions_per_lp_per_round: usize::MAX,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("uncapped wave-boundary Metal run must run");
+    let crossed = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_transitions_per_lp_per_round: 1,
+            rounds_per_command_buffer: 1,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("one-pair command buffers must continue across a bounded wave");
+
+    assert_eq!(uncapped.result, scalar);
+    assert_eq!(crossed.result, scalar);
+    assert_eq!(crossed.result, uncapped.result);
+    assert!(crossed.continuation_relaunches > 64);
+    assert_eq!(crossed.rounds, uncapped.rounds);
+    assert_eq!(crossed.transitions, uncapped.transitions);
+    assert_eq!(crossed.wave_boundary_syncs, 2);
+    assert_eq!(crossed.mid_round_wave_boundary_syncs, 1);
+    assert_eq!(uncapped.wave_boundary_syncs, 1);
+    assert_eq!(uncapped.mid_round_wave_boundary_syncs, 0);
 }
 
 #[test]

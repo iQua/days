@@ -1,10 +1,11 @@
 //! Correctness-first production Metal executor.
 //!
-//! The backend keeps the safe-horizon round loop resident on the device. A deterministic
-//! 1,024-lane reduction publishes each horizon and a serial controller kernel performs the
-//! correctness path: stable active-LP compaction, per-LP chronological drains, real transitions,
-//! local FEL insertion, and boundary-only remote exchange. Role-split parallel transition kernels
-//! are intentionally deferred to the optimization milestone.
+//! The backend keeps the safe-horizon round loop resident on the device within bounded encoding
+//! waves. A deterministic 1,024-lane reduction publishes each horizon and a serial controller
+//! kernel performs the correctness path: stable active-LP compaction, per-LP chronological drains,
+//! real transitions, local FEL insertion, and boundary-only remote exchange. The host synchronizes
+//! only at wave boundaries, and every such synchronization is reported in [`MetalRun`]. Role-split
+//! parallel transition kernels are intentionally deferred to the optimization milestone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -41,7 +42,15 @@ const ARRIVAL_WORDS: usize = 10;
 // The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
 // rounds single-launch while putting a finite ceiling on pathological serial device work.
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
-const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = 16_384;
+// The retained T13 direct-Metal benchmark encodes two-dispatch round pairs at about 0.4 us/pair on
+// the development Apple system. Metal practice favors a small number of substantial command
+// buffers:
+// 16,384 pairs is the proven long-resident setting (~6.7 ms host encoding), while 65,536 pairs
+// bounds one pre-commit wave to four default-sized buffers (~27 ms). MAX_COMMAND_BUFFERS remains
+// the absolute buffer-count bound when callers deliberately request shorter buffers.
+const MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER: usize = 16_384;
+const MAX_ENCODED_PAIRS_PER_WAVE: usize = 65_536;
+const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER;
 const MAX_COMMAND_BUFFERS: usize = 64;
 const HORIZON_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
@@ -59,6 +68,7 @@ const CONTROL_TRANSITIONS: usize = 10;
 const CONTROL_OBSERVED: usize = 12;
 const CONTROL_DEPARTURES: usize = 13;
 const CONTROL_ARRIVALS: usize = 14;
+const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 19;
 
@@ -143,7 +153,7 @@ impl fmt::Display for MetalError {
             ),
             Self::RoundLimitExceeded { capacity } => write!(
                 formatter,
-                "Metal resident encoding exhausted its capacity of {capacity} rounds before \
+                "Metal bounded-wave encoding exhausted its capacity of {capacity} rounds before \
                  termination"
             ),
             Self::DeviceExecution { code, node } => {
@@ -162,7 +172,7 @@ impl fmt::Display for MetalError {
 
 impl Error for MetalError {}
 
-/// Physical capacity and resident-encoding policy for one Metal run.
+/// Physical capacity and bounded-wave encoding policy for one Metal run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetalConfig {
     /// Optional exact per-LP FEL capacity override. Raising the derived default consumes more
@@ -178,9 +188,10 @@ pub struct MetalConfig {
     /// retained for API compatibility; exhausting the budget relaunches the same semantic round
     /// with its horizon, worklist, FELs, and outbox preserved.
     pub max_transitions_per_lp_per_round: usize,
-    /// Round pairs encoded into one serial command buffer.
+    /// Requested round pairs per serial command buffer. Production execution clamps this to
+    /// 16,384 independently of caller configuration.
     pub rounds_per_command_buffer: usize,
-    /// Optional hard cap overriding the conservative resident round bound.
+    /// Optional hard cap overriding the conservative encoded round bound.
     pub max_rounds: Option<usize>,
 }
 
@@ -198,7 +209,7 @@ impl Default for MetalConfig {
     }
 }
 
-/// Complete production Metal result and coarse resident-submission timing.
+/// Complete production Metal result and bounded-wave submission diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalRun {
     pub result: RunResult,
@@ -206,7 +217,12 @@ pub struct MetalRun {
     pub transitions: u64,
     /// Device-resident `days_round` continuation dispatches beyond the first launch per round.
     pub continuation_relaunches: u64,
-    /// Host time spent encoding and committing resident command buffers.
+    /// `waitUntilCompleted()` calls, exactly one after each committed bounded wave, including the
+    /// final completion wait.
+    pub wave_boundary_syncs: u64,
+    /// Wave-boundary waits after which the next wave resumed the same semantic round.
+    pub mid_round_wave_boundary_syncs: u64,
+    /// Host time spent encoding and committing bounded command-buffer waves.
     pub host_encode_submit_ns: u64,
     /// Sum of Metal command-buffer GPU timestamp intervals.
     pub device_ns: u64,
@@ -303,6 +319,15 @@ fn validate_config(config: MetalConfig) -> Result<(), MetalError> {
         ));
     }
     Ok(())
+}
+
+fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
+    let pairs_per_command_buffer =
+        rounds_per_command_buffer.min(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER);
+    let pairs_per_wave = pairs_per_command_buffer
+        .saturating_mul(MAX_COMMAND_BUFFERS)
+        .min(MAX_ENCODED_PAIRS_PER_WAVE);
+    (pairs_per_command_buffer, pairs_per_wave)
 }
 
 struct MetalPlan {
@@ -1374,6 +1399,8 @@ impl MetalBuffers {
             rounds: control[CONTROL_ROUNDS],
             transitions: control[CONTROL_TRANSITIONS],
             continuation_relaunches: control[CONTROL_RELAUNCHES],
+            wave_boundary_syncs: timing.wave_boundary_syncs,
+            mid_round_wave_boundary_syncs: timing.mid_round_wave_boundary_syncs,
             host_encode_submit_ns: timing.host_encode_submit_ns,
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
@@ -1601,17 +1628,18 @@ impl DirectMetal {
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
+        let mut wave_boundary_syncs = 0_u64;
+        let mut mid_round_wave_boundary_syncs = 0_u64;
+        let (pairs_per_command_buffer, pairs_per_wave) =
+            encoding_limits(config.rounds_per_command_buffer);
         let mut remaining = buffers.dispatch_capacity;
         while remaining != 0 {
             let wave_started = Instant::now();
-            let wave_capacity = config
-                .rounds_per_command_buffer
-                .saturating_mul(MAX_COMMAND_BUFFERS);
-            let wave_rounds = remaining.min(wave_capacity);
+            let wave_rounds = remaining.min(pairs_per_wave);
             let mut wave_remaining = wave_rounds;
             let mut command_buffers = Vec::new();
             while wave_remaining != 0 {
-                let encoded = wave_remaining.min(config.rounds_per_command_buffer);
+                let encoded = wave_remaining.min(pairs_per_command_buffer);
                 let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
                     MetalError::Unavailable("command buffer creation failed".into())
                 })?;
@@ -1682,10 +1710,15 @@ impl DirectMetal {
                 }
                 device_ns = device_ns.saturating_add(seconds_ns(end - start));
             }
+            wave_boundary_syncs = wave_boundary_syncs.saturating_add(1);
             remaining -= wave_rounds;
-            if buffers.planes[0].word(CONTROL_DONE) != 0
-                || buffers.planes[0].word(CONTROL_ERROR) != 0
-            {
+            let control = &buffers.planes[0];
+            let done = control.word(CONTROL_DONE) != 0;
+            let error = control.word(CONTROL_ERROR) != 0;
+            if !done && !error && control.word(CONTROL_CONTINUATION) != 0 {
+                mid_round_wave_boundary_syncs = mid_round_wave_boundary_syncs.saturating_add(1);
+            }
+            if done || error {
                 break;
             }
         }
@@ -1694,6 +1727,8 @@ impl DirectMetal {
             host_encode_submit_ns,
             device_ns,
             wall_ns,
+            wave_boundary_syncs,
+            mid_round_wave_boundary_syncs,
         })
     }
 }
@@ -1730,6 +1765,8 @@ struct MetalTiming {
     host_encode_submit_ns: u64,
     device_ns: u64,
     wall_ns: u64,
+    wave_boundary_syncs: u64,
+    mid_round_wave_boundary_syncs: u64,
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -1740,4 +1777,23 @@ fn seconds_ns(seconds: f64) -> u64 {
     Duration::from_secs_f64(seconds)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, encoding_limits,
+    };
+
+    #[test]
+    fn encoding_limits_clamp_each_buffer_and_the_total_wave() {
+        assert_eq!(
+            encoding_limits(usize::MAX),
+            (
+                MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER,
+                MAX_ENCODED_PAIRS_PER_WAVE
+            )
+        );
+        assert_eq!(encoding_limits(1), (1, 64));
+    }
 }
