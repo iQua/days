@@ -1,89 +1,98 @@
-//! T13-only CubeCL/Metal feasibility spike.
+//! T13b-only direct-Metal feasibility spike.
 //!
-//! This module is deliberately not a backend. It demonstrates the fixed-capacity primitives and
-//! synchronization shape that a later backend would need, without changing executor semantics.
+//! This is deliberately not an executor backend. Rust-authored CubeCL kernels are compiled to MSL,
+//! then command queues, buffers, pipelines, encoding, submission, timestamps, and synchronization
+//! are controlled directly through `objc2-metal`. CubeCL's runtime batching policy is not used.
 
-use std::{collections::VecDeque, time::Instant};
+use std::time::{Duration, Instant};
 
+use cubecl::Compiler;
 use cubecl::metal::{MetalDevice, MetalRuntime};
 use cubecl::prelude::*;
+use cubecl_cpp::MslCompiler;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
+};
 
-use crate::{HostState, LinkId, NodeDescriptor, NodeId, NodeKind, SimulationImage, SwitchState};
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {}
 
-/// Exact CubeCL release selected by this spike.
-pub const SUBSTRATE_VERSION: &str = "CubeCL 0.11.0-pre.1";
-
-/// Conservative dispatch cap used for one CubeCL command buffer on the measured M5 Max tier.
-///
-/// CubeCL configures a 50-operation tier threshold and currently flushes only after exceeding it.
-/// The spike does not rely on that off-by-one behavior. T14 would need to expose or raise the
-/// threshold if measurements showed that more resident rounds were required.
-pub const M5_BATCH_OP_THRESHOLD: usize = 50;
-
+/// Exact direct binding selected by this spike.
+pub const SUBSTRATE_VERSION: &str =
+    "objc2-metal 0.3.2 direct control; CubeCL 0.11.0-pre.1 Rust-to-MSL codegen only";
+/// Rounded k32 mean active port-LP population from the retained P05c run.
+pub const ACTIVE_PORT_LPS: usize = 595;
+/// One padded Metal threadgroup used by both the round body and the horizon reduction.
+pub const REDUCTION_LANES: usize = 1_024;
+/// Exact u64 threadgroup scratch used by the one-dispatch reduction.
+pub const REDUCTION_THREADGROUP_BYTES: usize = REDUCTION_LANES * std::mem::size_of::<u64>();
+/// Long-resident default. Dense scale needs 49 command buffers, below Metal's default queue cap.
+pub const DEFAULT_ROUNDS_PER_ENCODING: usize = 16_384;
+const DEFAULT_WARMUP_ROUNDS: usize = DEFAULT_ROUNDS_PER_ENCODING;
+const MAX_OUTSTANDING_COMMAND_BUFFERS: usize = 64;
+const MAX_TRANSITIONS_PER_LP: u32 = 11;
+const OBSERVED_TAIL_MAX_TRANSITIONS_PER_LP: u32 = 21;
+const FUSED_EVENT_PACKET_WORDS: usize = 11;
+const FUSED_EVENT_PACKET_BYTES: usize = FUSED_EVENT_PACKET_WORDS * std::mem::size_of::<u64>();
+const EVENT_TIME: usize = 0;
+const EVENT_PHASE: usize = 1;
+const EVENT_ORIGIN: usize = 2;
+const EVENT_SEQUENCE: usize = 3;
+const EVENT_TARGET: usize = 4;
+const EVENT_KIND: usize = 5;
+const EVENT_PAYLOAD: usize = 6;
+const PACKET_ID: usize = 7;
+const PACKET_FLOW: usize = 8;
+const PACKET_SIZE: usize = 9;
+const PACKET_KIND: usize = 10;
+const LOOKAHEAD_NS: u64 = 1_080;
 const ERROR_NONE: u32 = 0;
-const ERROR_TIME_OVERFLOW: u32 = 1;
-const ERROR_ZERO_RATE: u32 = 2;
-const ERROR_FEL_OVERFLOW: u32 = 3;
-const ERROR_OUTBOX_OVERFLOW: u32 = 4;
-const ERROR_SEQUENCE_OVERFLOW: u32 = 5;
+const ERROR_ZERO_OCCUPANCY: u32 = 1;
+const ERROR_OUTBOX_OVERFLOW: u32 = 2;
+const ERROR_TRANSITION_OVERFLOW: u32 = 3;
 
-const FEL_CAPACITY: usize = 4;
-const OUTBOX_CAPACITY: usize = 2;
-const ROLE_HOST: u32 = 0;
-const ROLE_SWITCH: u32 = 1;
+type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
-type Client = ComputeClient<MetalRuntime>;
-
-/// Topology-neutral, spike-only physical view derived from one semantic image.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedSpikeImage {
-    pub node_ids: Vec<u64>,
-    pub node_kinds: Vec<u32>,
-    pub state_slots: Vec<u32>,
-    pub host_lp_slots: Vec<u32>,
-    pub switch_lp_slots: Vec<u32>,
-    pub next_event_time_ns: Vec<u64>,
-    pub active: Vec<u32>,
-    pub index_slot: Vec<u32>,
+/// Rounded, reproducible version of the measured k32 port-LP round profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatchedWorkloadProfile {
+    pub active_lps: usize,
+    pub reduction_lanes: usize,
+    pub transitions_per_round: u64,
+    pub fel_pops_per_round: u64,
+    pub local_child_pushes_per_round: u64,
+    pub same_time_continuations_per_round: u64,
+    pub occupancy_checks_per_round: u64,
+    pub outbox_writes_per_round: u64,
+    pub maximum_transitions_per_lp: u32,
+    pub observed_tail_maximum_transitions_per_lp: u32,
+    pub fused_event_packet_bytes: usize,
+    pub measured_mean_parallel_efficiency_ppm: u32,
+    pub modeled_parallel_efficiency_ppm: u32,
 }
 
-impl PreparedSpikeImage {
-    /// Derives role worklists and SoA hot fields without inspecting topology shape.
-    pub fn from_image(image: &SimulationImage) -> Result<Self, MetalSpikeError> {
-        let mut host_lp_slots = Vec::new();
-        let mut switch_lp_slots = Vec::new();
-        let mut node_ids = Vec::with_capacity(image.nodes.len());
-        let mut node_kinds = Vec::with_capacity(image.nodes.len());
-        let mut state_slots = Vec::with_capacity(image.nodes.len());
-
-        for (lp_slot, node) in image.nodes.iter().enumerate() {
-            let lp_slot =
-                u32::try_from(lp_slot).map_err(|_| MetalSpikeError::TooManyLogicalProcesses)?;
-            node_ids.push(node.id.0);
-            state_slots.push(node.state_slot);
-            match node.kind {
-                NodeKind::Host => {
-                    node_kinds.push(ROLE_HOST);
-                    host_lp_slots.push(lp_slot);
-                }
-                NodeKind::Switch => {
-                    node_kinds.push(ROLE_SWITCH);
-                    switch_lp_slots.push(lp_slot);
-                }
-            }
-        }
-
-        let lp_count = image.nodes.len();
-        Ok(Self {
-            node_ids,
-            node_kinds,
-            state_slots,
-            host_lp_slots,
-            switch_lp_slots,
-            next_event_time_ns: vec![u64::MAX; lp_count],
-            active: vec![0; lp_count],
-            index_slot: vec![u32::MAX; lp_count],
-        })
+/// Returns the exact integer workload used on both CPU and GPU.
+pub const fn matched_workload_profile() -> MatchedWorkloadProfile {
+    MatchedWorkloadProfile {
+        active_lps: ACTIVE_PORT_LPS,
+        reduction_lanes: REDUCTION_LANES,
+        transitions_per_round: 1_300,
+        fel_pops_per_round: 1_067,
+        local_child_pushes_per_round: 668,
+        same_time_continuations_per_round: 233,
+        occupancy_checks_per_round: 399,
+        outbox_writes_per_round: 399,
+        maximum_transitions_per_lp: MAX_TRANSITIONS_PER_LP,
+        observed_tail_maximum_transitions_per_lp: OBSERVED_TAIL_MAX_TRANSITIONS_PER_LP,
+        fused_event_packet_bytes: FUSED_EVENT_PACKET_BYTES,
+        measured_mean_parallel_efficiency_ppm: 208_296,
+        modeled_parallel_efficiency_ppm: 198_625,
     }
 }
 
@@ -91,25 +100,24 @@ impl PreparedSpikeImage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetalSpikeError {
     InvalidBenchmarkConfig(&'static str),
+    Metal(String),
     PrimitiveMismatch(&'static str),
-    TooManyLogicalProcesses,
 }
 
 impl std::fmt::Display for MetalSpikeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidBenchmarkConfig(message) => formatter.write_str(message),
-            Self::PrimitiveMismatch(message) => formatter.write_str(message),
-            Self::TooManyLogicalProcesses => {
-                formatter.write_str("Metal spike requires logical-process slots to fit u32")
+            Self::InvalidBenchmarkConfig(message) | Self::PrimitiveMismatch(message) => {
+                formatter.write_str(message)
             }
+            Self::Metal(message) => formatter.write_str(message),
         }
     }
 }
 
 impl std::error::Error for MetalSpikeError {}
 
-/// Device evidence for every primitive required by T13.
+/// Substrate-affected primitive checks plus the carried T13 primitive ruling.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalCorrectnessReport {
     pub fixed_width_u64: bool,
@@ -123,87 +131,545 @@ pub struct MetalCorrectnessReport {
     pub explicit_inter_dispatch_barrier: bool,
     pub explicit_device_errors: bool,
     pub packet_in_event_fusion: bool,
+    pub serial_encoder_dependency_verified: bool,
+    pub single_dispatch_1024_lane_reduction: bool,
+    pub semantic_same_time_continuation_verified: bool,
+    pub continuation_slot_association_verified: bool,
+    pub matched_cpu_gpu_state: bool,
 }
 
-/// Raw completion timing for one dependent dispatch batch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DispatchBatchMeasurement {
-    pub dispatches: usize,
-    pub wall_time_ns: Vec<u64>,
-    pub device_time_ns: Vec<u64>,
-    pub dependency_chain_verified: bool,
-}
-
-impl DispatchBatchMeasurement {
-    pub fn median_wall_ns(&self) -> u64 {
-        median(&self.wall_time_ns)
-    }
-
-    pub fn median_wall_ns_per_dispatch(&self) -> f64 {
-        self.median_wall_ns() as f64 / self.dispatches as f64
-    }
-
-    pub fn median_device_ns_per_dispatch(&self) -> f64 {
-        median(&self.device_time_ns) as f64 / self.dispatches as f64
-    }
-}
-
-/// Raw completion timing for device-resident safe-horizon-shaped rounds.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResidentRoundMeasurement {
-    pub rounds: usize,
-    pub dispatches: usize,
-    pub wall_time_ns: Vec<u64>,
-    pub device_time_ns: Vec<u64>,
-    pub horizon_chain_verified: bool,
-}
-
-impl ResidentRoundMeasurement {
-    pub fn median_wall_ns(&self) -> u64 {
-        median(&self.wall_time_ns)
-    }
-
-    pub fn median_wall_ns_per_round(&self) -> f64 {
-        self.median_wall_ns() as f64 / self.rounds as f64
-    }
-
-    pub fn median_device_ns_per_round(&self) -> f64 {
-        median(&self.device_time_ns) as f64 / self.rounds as f64
-    }
-}
-
+/// Gate protocol. The decision run requires one warmup and exactly three measured samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalSpikeBenchmarkConfig {
-    pub dispatch_counts: Vec<usize>,
+    pub round_counts: Vec<usize>,
+    pub rounds_per_encoding: usize,
     pub samples: usize,
-    pub warmup_samples: usize,
+    pub warmup_rounds: usize,
 }
 
 impl Default for MetalSpikeBenchmarkConfig {
     fn default() -> Self {
         Self {
-            dispatch_counts: vec![1, 2, 4, 8, 16, 24, 32, 48],
-            samples: 101,
-            warmup_samples: 10,
+            round_counts: vec![60_000, 800_000],
+            rounds_per_encoding: DEFAULT_ROUNDS_PER_ENCODING,
+            samples: 3,
+            warmup_rounds: DEFAULT_WARMUP_ROUNDS,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Raw paired samples for one required round scale.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateScaleMeasurement {
+    pub rounds: usize,
+    pub encodings: usize,
+    pub dispatches_per_round: usize,
+    /// Direct host command-buffer creation, encoding, ending, and commit.
+    pub host_encode_submit_ns: Vec<u64>,
+    /// Metal `GPUStartTime` to `GPUEndTime`, summed over the committed buffers.
+    pub device_ns: Vec<u64>,
+    /// Host encode start through final command-buffer completion. This already includes device time.
+    pub gpu_wall_ns: Vec<u64>,
+    /// Identical flattened round loop and 1,024-lane fixed-tree reduction on the CPU.
+    pub matched_cpu_ns: Vec<u64>,
+    pub checksums: Vec<u64>,
+    pub matched_checksums: bool,
+    pub no_host_sync_between_rounds: bool,
+}
+
+impl GateScaleMeasurement {
+    pub fn median_host_encode_submit_ns(&self) -> u64 {
+        median(&self.host_encode_submit_ns)
+    }
+
+    pub fn median_device_ns(&self) -> u64 {
+        median(&self.device_ns)
+    }
+
+    pub fn median_gpu_wall_ns(&self) -> u64 {
+        median(&self.gpu_wall_ns)
+    }
+
+    pub fn median_matched_cpu_ns(&self) -> u64 {
+        median(&self.matched_cpu_ns)
+    }
+
+    pub fn median_host_ns_per_round(&self) -> f64 {
+        self.median_host_encode_submit_ns() as f64 / self.rounds as f64
+    }
+
+    pub fn median_device_ns_per_round(&self) -> f64 {
+        self.median_device_ns() as f64 / self.rounds as f64
+    }
+
+    pub fn median_gpu_wall_ns_per_round(&self) -> f64 {
+        self.median_gpu_wall_ns() as f64 / self.rounds as f64
+    }
+
+    pub fn median_matched_cpu_ns_per_round(&self) -> f64 {
+        self.median_matched_cpu_ns() as f64 / self.rounds as f64
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalSpikeBenchmarkReport {
     pub substrate: &'static str,
-    pub batches: Vec<DispatchBatchMeasurement>,
-    pub resident_rounds: Vec<ResidentRoundMeasurement>,
+    pub pipeline_setup_ns: u64,
+    pub rounds_per_encoding: usize,
+    pub workload: MatchedWorkloadProfile,
+    pub scales: Vec<GateScaleMeasurement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkloadState {
+    // Buffer 0 and 1 intentionally match the reduction kernel's bindings.
+    next_time: Vec<u64>,
+    horizon: Vec<u64>,
+    // Two bounded FEL slots per LP. Each slot is the exact 88-byte Event+Packet fused record:
+    // EventKey, target, event kind, payload id, then the inlined PacketDescriptor.
+    fel_fused: Vec<u64>,
+    queue_depth: Vec<u32>,
+    queue_head: Vec<u32>,
+    transitions: Vec<u32>,
+    continuations: Vec<u32>,
+    local_push_plan: Vec<u32>,
+    occupancy_plan: Vec<u32>,
+    outbox_plan: Vec<u32>,
+    outbox_fused: Vec<u64>,
+    outbox_count: Vec<u32>,
+    errors: Vec<u32>,
+    semantic_flags: Vec<u32>,
+    audit: Vec<u64>,
+}
+
+impl WorkloadState {
+    fn initial() -> Self {
+        let joint_profile = joint_transition_profile();
+        let mut transitions = vec![0; REDUCTION_LANES];
+        let mut continuations = vec![0; REDUCTION_LANES];
+        let mut local_push_plan = vec![0; REDUCTION_LANES];
+        let mut occupancy_plan = vec![0; REDUCTION_LANES];
+        let mut outbox_plan = vec![0; REDUCTION_LANES];
+        for (ordinal, work) in joint_profile.into_iter().enumerate() {
+            let lane = permuted_lane(ordinal, 233, 0);
+            transitions[lane] = work.transitions;
+            continuations[lane] = work.continuations;
+            local_push_plan[lane] = work.local_pushes;
+            occupancy_plan[lane] = work.occupancy_checks;
+            outbox_plan[lane] = work.outbox_writes;
+        }
+
+        let mut fel_fused = vec![0; 2 * REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS];
+        let mut queue_depth = vec![0; REDUCTION_LANES];
+        let mut queue_head = vec![0; REDUCTION_LANES];
+        for lane in 0..ACTIVE_PORT_LPS {
+            let base_time = 1_000 + (lane % 7) as u64;
+            for slot in 0..2 {
+                let base = fused_fel_offset(slot, lane);
+                // Equal-time cases deliberately exercise phase, origin, and sequence tie breaks.
+                fel_fused[base + EVENT_TIME] = base_time + u64::from(lane % 4 == 0 && slot == 1);
+                fel_fused[base + EVENT_PHASE] = u64::from(slot == 1 && lane % 4 != 0);
+                fel_fused[base + EVENT_ORIGIN] =
+                    lane as u64 + u64::from(slot == 1 && lane % 4 >= 2);
+                fel_fused[base + EVENT_SEQUENCE] = ((lane as u64) << 32) + u64::from(slot == 1);
+                fel_fused[base + EVENT_TARGET] = permuted_lane(lane, 337, 17) as u64;
+                fel_fused[base + EVENT_KIND] = slot as u64;
+                fel_fused[base + EVENT_PAYLOAD] = 10_000 + lane as u64;
+                fel_fused[base + PACKET_ID] = 10_000 + lane as u64;
+                fel_fused[base + PACKET_FLOW] = 20_000 + (lane % 4_096) as u64;
+                fel_fused[base + PACKET_SIZE] = [64, 1_000, 1_500, 9_000][lane % 4];
+                fel_fused[base + PACKET_KIND] = (lane % 2) as u64;
+            }
+            queue_depth[lane] = 2 + (lane % 31) as u32;
+            queue_head[lane] = lane as u32 % queue_depth[lane];
+        }
+        let mut next_time = vec![u64::MAX; REDUCTION_LANES];
+        for (lane, time) in next_time.iter_mut().enumerate().take(ACTIVE_PORT_LPS) {
+            let left = fused_fel_offset(0, lane);
+            let right = fused_fel_offset(1, lane);
+            *time = if fused_event_less(&fel_fused, left, right) {
+                fel_fused[left + EVENT_TIME]
+            } else {
+                fel_fused[right + EVENT_TIME]
+            };
+        }
+
+        let state = Self {
+            next_time,
+            horizon: vec![2_080],
+            fel_fused,
+            queue_depth,
+            queue_head,
+            transitions,
+            continuations,
+            local_push_plan,
+            occupancy_plan,
+            outbox_plan,
+            outbox_fused: vec![0; REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS],
+            outbox_count: vec![0; REDUCTION_LANES],
+            errors: vec![0; REDUCTION_LANES],
+            semantic_flags: vec![0; REDUCTION_LANES],
+            audit: vec![0; REDUCTION_LANES],
+        };
+        state.assert_profile();
+        state
+    }
+
+    fn assert_profile(&self) {
+        let profile = matched_workload_profile();
+        assert_eq!(
+            self.transitions[..ACTIVE_PORT_LPS]
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum::<u64>(),
+            profile.transitions_per_round
+        );
+        assert_eq!(
+            self.continuations[..ACTIVE_PORT_LPS]
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum::<u64>(),
+            profile.same_time_continuations_per_round
+        );
+        assert_eq!(
+            self.transitions[..ACTIVE_PORT_LPS]
+                .iter()
+                .zip(&self.continuations)
+                .map(|(transitions, continuations)| u64::from(transitions - continuations))
+                .sum::<u64>(),
+            profile.fel_pops_per_round
+        );
+        assert_eq!(
+            self.local_push_plan[..ACTIVE_PORT_LPS]
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum::<u64>(),
+            profile.local_child_pushes_per_round
+        );
+        assert_eq!(
+            self.occupancy_plan[..ACTIVE_PORT_LPS]
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum::<u64>(),
+            profile.occupancy_checks_per_round
+        );
+        assert_eq!(
+            self.outbox_plan[..ACTIVE_PORT_LPS]
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum::<u64>(),
+            profile.outbox_writes_per_round
+        );
+        assert_eq!(
+            *self.transitions[..ACTIVE_PORT_LPS]
+                .iter()
+                .max()
+                .expect("active profile must not be empty"),
+            profile.maximum_transitions_per_lp
+        );
+    }
+
+    fn planes(&self) -> Vec<&[u8]> {
+        vec![
+            bytes(&self.next_time),
+            bytes(&self.horizon),
+            bytes(&self.fel_fused),
+            bytes(&self.queue_depth),
+            bytes(&self.queue_head),
+            bytes(&self.transitions),
+            bytes(&self.continuations),
+            bytes(&self.local_push_plan),
+            bytes(&self.occupancy_plan),
+            bytes(&self.outbox_plan),
+            bytes(&self.outbox_fused),
+            bytes(&self.outbox_count),
+            bytes(&self.errors),
+            bytes(&self.semantic_flags),
+            bytes(&self.audit),
+        ]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JointLpWork {
+    transitions: u32,
+    continuations: u32,
+    local_pushes: u32,
+    occupancy_checks: u32,
+    outbox_writes: u32,
+}
+
+fn joint_transition_profile() -> Vec<JointLpWork> {
+    let mut profile = Vec::with_capacity(ACTIVE_PORT_LPS);
+    let mut extend = |count, work| profile.extend(std::iter::repeat_n(work, count));
+
+    // Moment-matched reconstruction of the retained real k32 joint LP histogram. Every tuple used
+    // here occurs in that trace. Rare >11-transition records are folded into the 11-transition
+    // bucket so one run-wide tail is not charged to every synthetic round.
+    extend(
+        30,
+        JointLpWork {
+            transitions: 1,
+            continuations: 0,
+            local_pushes: 0,
+            occupancy_checks: 0,
+            outbox_writes: 0,
+        },
+    );
+    extend(
+        166,
+        JointLpWork {
+            transitions: 1,
+            continuations: 0,
+            local_pushes: 0,
+            occupancy_checks: 0,
+            outbox_writes: 0,
+        },
+    );
+    extend(
+        153,
+        JointLpWork {
+            transitions: 2,
+            continuations: 0,
+            local_pushes: 2,
+            occupancy_checks: 1,
+            outbox_writes: 1,
+        },
+    );
+    for (packet_arrivals, count) in [(4, 1), (5, 1), (6, 1), (7, 2), (8, 2), (9, 2), (10, 4)] {
+        extend(
+            count,
+            JointLpWork {
+                transitions: packet_arrivals + 1,
+                continuations: 0,
+                local_pushes: packet_arrivals + 2,
+                occupancy_checks: 1,
+                outbox_writes: 1,
+            },
+        );
+    }
+    for (transitions, count) in [
+        (2, 137),
+        (3, 58),
+        (4, 12),
+        (5, 8),
+        (6, 5),
+        (7, 4),
+        (8, 2),
+        (9, 2),
+        (10, 1),
+        (11, 4),
+    ] {
+        extend(
+            count,
+            JointLpWork {
+                transitions,
+                continuations: 1,
+                local_pushes: 1,
+                occupancy_checks: 1,
+                outbox_writes: 1,
+            },
+        );
+    }
+    assert_eq!(profile.len(), ACTIVE_PORT_LPS);
+    profile
+}
+
+fn permuted_lane(ordinal: usize, multiplier: usize, offset: usize) -> usize {
+    (ordinal * multiplier + offset) % ACTIVE_PORT_LPS
+}
+
+fn fused_fel_offset(slot: usize, lane: usize) -> usize {
+    (slot * REDUCTION_LANES + lane) * FUSED_EVENT_PACKET_WORDS
+}
+
+fn fused_event_less(events: &[u64], left: usize, right: usize) -> bool {
+    (
+        events[left + EVENT_TIME],
+        events[left + EVENT_PHASE],
+        events[left + EVENT_ORIGIN],
+        events[left + EVENT_SEQUENCE],
+    ) < (
+        events[right + EVENT_TIME],
+        events[right + EVENT_PHASE],
+        events[right + EVENT_ORIGIN],
+        events[right + EVENT_SEQUENCE],
+    )
+}
+
+fn execute_cpu_round(state: &mut WorkloadState, reduction_scratch: &mut [u64]) {
+    let boundary = state.horizon[0];
+    for lane in 0..ACTIVE_PORT_LPS {
+        state.outbox_count[lane] = 0;
+        state.semantic_flags[lane] = 0;
+        let transitions = state.transitions[lane];
+        if transitions > MAX_TRANSITIONS_PER_LP {
+            state.errors[lane] = ERROR_TRANSITION_OVERFLOW;
+            continue;
+        }
+        let continuation_count = state.continuations[lane];
+        let fel_pop_count = transitions - continuation_count;
+        let local_push_count = state.local_push_plan[lane];
+        let occupancy_count = state.occupancy_plan[lane];
+        let outbox_count = state.outbox_plan[lane];
+        if outbox_count > 1 && state.errors[lane] == ERROR_NONE {
+            state.errors[lane] = ERROR_OUTBOX_OVERFLOW;
+        }
+
+        let mut step = 0_u32;
+        let initial = fused_fel_offset(0, lane);
+        let mut continuation_slot = initial;
+        let mut continuation_slot_valid = false;
+        let mut last_event = [0_u64; FUSED_EVENT_PACKET_WORDS];
+        last_event.copy_from_slice(&state.fel_fused[initial..initial + FUSED_EVENT_PACKET_WORDS]);
+        while step < transitions {
+            let direct_continuation = step >= fel_pop_count;
+            let produces_direct_continuation = continuation_count > 0 && step + 1 == fel_pop_count;
+            let performs_local_push =
+                step >= transitions.saturating_sub(local_push_count.min(transitions));
+            let performs_occupancy =
+                step >= transitions.saturating_sub(occupancy_count.min(transitions));
+            let performs_outbox = step >= transitions.saturating_sub(outbox_count.min(transitions));
+            let mut selected = continuation_slot;
+            let mut parent = last_event;
+            if !direct_continuation {
+                let left = fused_fel_offset(0, lane);
+                let right = fused_fel_offset(1, lane);
+                selected = if fused_event_less(&state.fel_fused, left, right) {
+                    left
+                } else {
+                    right
+                };
+                parent.copy_from_slice(
+                    &state.fel_fused[selected..selected + FUSED_EVENT_PACKET_WORDS],
+                );
+                if produces_direct_continuation {
+                    continuation_slot = selected;
+                    continuation_slot_valid = true;
+                }
+            }
+
+            let mut child = parent;
+            child[EVENT_TIME] = if produces_direct_continuation {
+                parent[EVENT_TIME]
+            } else {
+                parent[EVENT_TIME]
+                    .max(boundary)
+                    .wrapping_add(LOOKAHEAD_NS)
+                    .wrapping_add((lane as u64 + u64::from(step)) & 7)
+            };
+            child[EVENT_PHASE] = 2;
+            child[EVENT_ORIGIN] = lane as u64;
+            child[EVENT_SEQUENCE] = parent[EVENT_SEQUENCE].wrapping_add(1);
+            child[EVENT_TARGET] = child[EVENT_TARGET].wrapping_add(u64::from(step & 1));
+            child[EVENT_KIND] = 1;
+            child[EVENT_PAYLOAD] = child[EVENT_PAYLOAD].wrapping_add(u64::from(step & 1));
+            child[PACKET_ID] = child[EVENT_PAYLOAD];
+            child[PACKET_FLOW] = child[PACKET_FLOW].wrapping_add(u64::from(step & 1));
+            child[PACKET_SIZE] = child[PACKET_SIZE].wrapping_add(u64::from(step & 1));
+            child[PACKET_KIND] = child[PACKET_KIND].wrapping_add(u64::from(step & 1)) & 1;
+            if produces_direct_continuation && child[EVENT_TIME] == parent[EVENT_TIME] {
+                state.semantic_flags[lane] |= 1;
+            }
+            if direct_continuation && performs_occupancy {
+                state.semantic_flags[lane] |= 1 << 1;
+            }
+            if direct_continuation && performs_outbox {
+                state.semantic_flags[lane] |= 1 << 2;
+            }
+            if direct_continuation && performs_local_push {
+                state.semantic_flags[lane] |= 1 << 3;
+            }
+            if direct_continuation && continuation_slot_valid && selected == continuation_slot {
+                state.semantic_flags[lane] |= 1 << 4;
+            }
+
+            if performs_local_push {
+                state.fel_fused[selected..selected + FUSED_EVENT_PACKET_WORDS]
+                    .copy_from_slice(&child);
+            } else if !direct_continuation && !produces_direct_continuation {
+                state.fel_fused[selected + EVENT_TIME] = child[EVENT_TIME];
+                state.fel_fused[selected + EVENT_PHASE] = child[EVENT_PHASE];
+                state.fel_fused[selected + EVENT_ORIGIN] = child[EVENT_ORIGIN];
+                state.fel_fused[selected + EVENT_SEQUENCE] = child[EVENT_SEQUENCE];
+            }
+            if step + 1 == transitions && local_push_count > transitions {
+                let extra = if selected == fused_fel_offset(0, lane) {
+                    fused_fel_offset(1, lane)
+                } else {
+                    fused_fel_offset(0, lane)
+                };
+                let mut second_child = child;
+                second_child[EVENT_SEQUENCE] = second_child[EVENT_SEQUENCE].wrapping_add(1);
+                state.fel_fused[extra..extra + FUSED_EVENT_PACKET_WORDS]
+                    .copy_from_slice(&second_child);
+            }
+
+            if performs_occupancy {
+                let depth = state.queue_depth[lane];
+                if depth == 0 {
+                    if state.errors[lane] == ERROR_NONE {
+                        state.errors[lane] = ERROR_ZERO_OCCUPANCY;
+                    }
+                } else {
+                    state.queue_head[lane] = (state.queue_head[lane] + 1) % depth;
+                }
+            }
+
+            if performs_outbox && outbox_count <= 1 {
+                let outbox = lane * FUSED_EVENT_PACKET_WORDS;
+                state.outbox_fused[outbox..outbox + FUSED_EVENT_PACKET_WORDS]
+                    .copy_from_slice(&child);
+                state.outbox_count[lane] = 1;
+            }
+
+            let operation_tags = 1_u64
+                .wrapping_add((!direct_continuation as u64) << 8)
+                .wrapping_add((performs_occupancy as u64) << 16)
+                .wrapping_add((performs_outbox as u64) << 24);
+            state.audit[lane] = state.audit[lane].wrapping_add(operation_tags).wrapping_add(
+                parent
+                    .iter()
+                    .fold(0_u64, |sum, word| sum.wrapping_add(*word)),
+            );
+            last_event = child;
+            step += 1;
+        }
+        let left = fused_fel_offset(0, lane);
+        let right = fused_fel_offset(1, lane);
+        state.next_time[lane] = if fused_event_less(&state.fel_fused, left, right) {
+            state.fel_fused[left + EVENT_TIME]
+        } else {
+            state.fel_fused[right + EVENT_TIME]
+        };
+    }
+    state.next_time[ACTIVE_PORT_LPS..].fill(u64::MAX);
+
+    reduction_scratch.copy_from_slice(&state.next_time);
+    let mut stride = REDUCTION_LANES / 2;
+    while stride > 0 {
+        for lane in 0..stride {
+            reduction_scratch[lane] = reduction_scratch[lane].min(reduction_scratch[lane + stride]);
+        }
+        stride /= 2;
+    }
+    state.horizon[0] = reduction_scratch[0].wrapping_add(LOOKAHEAD_NS);
+}
+
+fn run_cpu_rounds(state: &mut WorkloadState, rounds: usize, reduction_scratch: &mut [u64]) {
+    for _ in 0..rounds {
+        execute_cpu_round(state, reduction_scratch);
+    }
 }
 
 #[cube]
-fn key_less(
+fn cube_event_less(
     left_time: u64,
-    left_phase: u32,
+    left_phase: u64,
     left_origin: u64,
     left_seq: u64,
     right_time: u64,
-    right_phase: u32,
+    right_phase: u64,
     right_origin: u64,
     right_seq: u64,
 ) -> bool {
@@ -216,388 +682,284 @@ fn key_less(
 }
 
 #[cube(launch_unchecked)]
-fn key_compare_kernel(
-    left_time: &[u64],
-    left_phase: &[u32],
-    left_origin: &[u64],
-    left_seq: &[u64],
-    right_time: &[u64],
-    right_phase: &[u32],
-    right_origin: &[u64],
-    right_seq: &[u64],
-    output: &mut [u32],
-) {
-    let index = ABSOLUTE_POS;
-    if index < output.len() {
-        let left_is_less = key_less(
-            left_time[index],
-            left_phase[index],
-            left_origin[index],
-            left_seq[index],
-            right_time[index],
-            right_phase[index],
-            right_origin[index],
-            right_seq[index],
-        );
-        let right_is_less = key_less(
-            right_time[index],
-            right_phase[index],
-            right_origin[index],
-            right_seq[index],
-            left_time[index],
-            left_phase[index],
-            left_origin[index],
-            left_seq[index],
-        );
-        output[index] = if left_is_less {
-            0u32
-        } else if right_is_less {
-            2u32
-        } else {
-            1u32
-        };
-    }
-}
-
-#[cube(launch_unchecked)]
-fn exact_time_kernel(
-    start_time_ns: &[u64],
-    size_bytes: &[u64],
-    rate_bps: &[u64],
-    propagation_ns: &[u64],
-    arrival_time_ns: &mut [u64],
+#[allow(clippy::too_many_arguments, unused_assignments)]
+fn matched_round_kernel(
+    next_time: &mut [u64],
+    horizon: &[u64],
+    fel_fused: &mut [u64],
+    queue_depth: &[u32],
+    queue_head: &mut [u32],
+    transitions: &[u32],
+    continuations: &[u32],
+    local_push_plan: &[u32],
+    occupancy_plan: &[u32],
+    outbox_plan: &[u32],
+    outbox_fused: &mut [u64],
+    outbox_count: &mut [u32],
     errors: &mut [u32],
-) {
-    let index = ABSOLUTE_POS;
-    if index < arrival_time_ns.len() {
-        let rate = rate_bps[index];
-        let bytes = size_bytes[index];
-        let max = 18446744073709551615u64;
-        if rate == 0u64 {
-            errors[index] = ERROR_ZERO_RATE;
-        } else if bytes > max / 8000000000u64 {
-            errors[index] = ERROR_TIME_OVERFLOW;
-        } else {
-            let numerator = bytes * 8000000000u64;
-            let quotient = numerator / rate;
-            let remainder = numerator % rate;
-            let serialization = quotient + if remainder == 0u64 { 0u64 } else { 1u64 };
-            let start = start_time_ns[index];
-            let propagation = propagation_ns[index];
-            if start > max - propagation || serialization > max - (start + propagation) {
-                errors[index] = ERROR_TIME_OVERFLOW;
-            } else {
-                arrival_time_ns[index] = start + serialization + propagation;
-            }
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-fn role_worklist_kernel(
-    worklist: &[u32],
-    state: &mut [u64],
-    owner_role: &mut [u32],
-    #[comptime] role: u32,
-) {
-    let work_index = ABSOLUTE_POS;
-    if work_index < worklist.len() {
-        let lp_slot = worklist[work_index] as usize;
-        state[lp_slot] += 1u64;
-        owner_role[lp_slot] = role + 1u32;
-    }
-}
-
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn fel_kernel(
-    push_time: &[u64],
-    push_phase: &[u32],
-    push_origin: &[u64],
-    push_seq: &[u64],
-    push_payload: &[u64],
-    push_flow: &[u64],
-    push_size: &[u64],
-    push_kind: &[u32],
-    push_counts: &[u32],
-    fel_time: &mut [u64],
-    fel_phase: &mut [u32],
-    fel_origin: &mut [u64],
-    fel_seq: &mut [u64],
-    fel_payload: &mut [u64],
-    fel_flow: &mut [u64],
-    fel_size: &mut [u64],
-    fel_kind: &mut [u32],
-    fel_counts: &mut [u32],
-    popped_time: &mut [u64],
-    popped_phase: &mut [u32],
-    popped_origin: &mut [u64],
-    popped_seq: &mut [u64],
-    popped_payload: &mut [u64],
-    popped_flow: &mut [u64],
-    popped_size: &mut [u64],
-    popped_kind: &mut [u32],
-    errors: &mut [u32],
-    #[comptime] capacity: u32,
+    semantic_flags: &mut [u32],
+    audit: &mut [u64],
+    #[comptime] active_lps: u32,
+    #[comptime] fel_slot_words: u32,
+    #[comptime] lookahead_ns: u64,
+    #[comptime] max_transitions: u32,
 ) {
     let lp = ABSOLUTE_POS;
-    if lp < push_counts.len() {
-        let base = lp * capacity as usize;
-        let requested = push_counts[lp];
-        let mut item = 0u32;
-        while item < requested {
-            let mut count = fel_counts[lp];
-            if count >= capacity {
-                if errors[lp] == ERROR_NONE {
-                    errors[lp] = ERROR_FEL_OVERFLOW;
-                }
-            } else {
-                let input = base + item as usize;
-                let mut position = count;
-                let mut scanning = true;
-                while position > 0u32 && scanning {
-                    let previous = base + position as usize - 1usize;
-                    let should_shift = key_less(
-                        push_time[input],
-                        push_phase[input],
-                        push_origin[input],
-                        push_seq[input],
-                        fel_time[previous],
-                        fel_phase[previous],
-                        fel_origin[previous],
-                        fel_seq[previous],
+    if lp < active_lps as usize {
+        outbox_count[lp] = 0u32;
+        semantic_flags[lp] = 0u32;
+        let transition_count = transitions[lp];
+        if transition_count > max_transitions {
+            errors[lp] = ERROR_TRANSITION_OVERFLOW;
+        } else {
+            let continuation_count = continuations[lp];
+            let fel_pop_count = transition_count - continuation_count;
+            let local_push_count = local_push_plan[lp];
+            let occupancy_count = occupancy_plan[lp];
+            let planned_outboxes = outbox_plan[lp];
+            if planned_outboxes > 1u32 && errors[lp] == ERROR_NONE {
+                errors[lp] = ERROR_OUTBOX_OVERFLOW;
+            }
+
+            let mut step = 0u32;
+            let left = lp * FUSED_EVENT_PACKET_WORDS;
+            let right = fel_slot_words as usize + left;
+            let mut last_time = fel_fused[left + EVENT_TIME];
+            let mut last_phase = fel_fused[left + EVENT_PHASE];
+            let mut last_origin = fel_fused[left + EVENT_ORIGIN];
+            let mut last_seq = fel_fused[left + EVENT_SEQUENCE];
+            let mut last_target = fel_fused[left + EVENT_TARGET];
+            let mut last_event_kind = fel_fused[left + EVENT_KIND];
+            let mut last_payload = fel_fused[left + EVENT_PAYLOAD];
+            let mut last_packet_id = fel_fused[left + PACKET_ID];
+            let mut last_flow = fel_fused[left + PACKET_FLOW];
+            let mut last_size = fel_fused[left + PACKET_SIZE];
+            let mut last_packet_kind = fel_fused[left + PACKET_KIND];
+            let mut continuation_slot = left;
+            let mut continuation_slot_valid = false;
+            while step < transition_count {
+                let direct_continuation = step >= fel_pop_count;
+                let produces_direct_continuation =
+                    continuation_count > 0u32 && step + 1u32 == fel_pop_count;
+                let bounded_pushes = if local_push_count < transition_count {
+                    local_push_count
+                } else {
+                    transition_count
+                };
+                let performs_local_push = step >= transition_count - bounded_pushes;
+                let bounded_occupancy = if occupancy_count < transition_count {
+                    occupancy_count
+                } else {
+                    transition_count
+                };
+                let performs_occupancy = step >= transition_count - bounded_occupancy;
+                let bounded_outboxes = if planned_outboxes < transition_count {
+                    planned_outboxes
+                } else {
+                    transition_count
+                };
+                let performs_outbox = step >= transition_count - bounded_outboxes;
+                let mut selected = continuation_slot;
+                let mut parent_time = last_time;
+                let mut parent_phase = last_phase;
+                let mut parent_origin = last_origin;
+                let mut parent_seq = last_seq;
+                let mut parent_target = last_target;
+                let mut parent_event_kind = last_event_kind;
+                let mut parent_payload = last_payload;
+                let mut parent_packet_id = last_packet_id;
+                let mut parent_flow = last_flow;
+                let mut parent_size = last_size;
+                let mut parent_packet_kind = last_packet_kind;
+                if !direct_continuation {
+                    let take_a = cube_event_less(
+                        fel_fused[left + EVENT_TIME],
+                        fel_fused[left + EVENT_PHASE],
+                        fel_fused[left + EVENT_ORIGIN],
+                        fel_fused[left + EVENT_SEQUENCE],
+                        fel_fused[right + EVENT_TIME],
+                        fel_fused[right + EVENT_PHASE],
+                        fel_fused[right + EVENT_ORIGIN],
+                        fel_fused[right + EVENT_SEQUENCE],
                     );
-                    if should_shift {
-                        let destination = base + position as usize;
-                        fel_time[destination] = fel_time[previous];
-                        fel_phase[destination] = fel_phase[previous];
-                        fel_origin[destination] = fel_origin[previous];
-                        fel_seq[destination] = fel_seq[previous];
-                        fel_payload[destination] = fel_payload[previous];
-                        fel_flow[destination] = fel_flow[previous];
-                        fel_size[destination] = fel_size[previous];
-                        fel_kind[destination] = fel_kind[previous];
-                        position -= 1u32;
+                    if take_a {
+                        selected = left;
                     } else {
-                        scanning = false;
+                        selected = right;
+                    }
+                    parent_time = fel_fused[selected + EVENT_TIME];
+                    parent_phase = fel_fused[selected + EVENT_PHASE];
+                    parent_origin = fel_fused[selected + EVENT_ORIGIN];
+                    parent_seq = fel_fused[selected + EVENT_SEQUENCE];
+                    parent_target = fel_fused[selected + EVENT_TARGET];
+                    parent_event_kind = fel_fused[selected + EVENT_KIND];
+                    parent_payload = fel_fused[selected + EVENT_PAYLOAD];
+                    parent_packet_id = fel_fused[selected + PACKET_ID];
+                    parent_flow = fel_fused[selected + PACKET_FLOW];
+                    parent_size = fel_fused[selected + PACKET_SIZE];
+                    parent_packet_kind = fel_fused[selected + PACKET_KIND];
+                    if produces_direct_continuation {
+                        continuation_slot = selected;
+                        continuation_slot_valid = true;
                     }
                 }
-                let destination = base + position as usize;
-                fel_time[destination] = push_time[input];
-                fel_phase[destination] = push_phase[input];
-                fel_origin[destination] = push_origin[input];
-                fel_seq[destination] = push_seq[input];
-                fel_payload[destination] = push_payload[input];
-                fel_flow[destination] = push_flow[input];
-                fel_size[destination] = push_size[input];
-                fel_kind[destination] = push_kind[input];
-                count += 1u32;
-                fel_counts[lp] = count;
-            }
-            item += 1u32;
-        }
 
-        let count = fel_counts[lp];
-        if count > 0u32 {
-            popped_time[lp] = fel_time[base];
-            popped_phase[lp] = fel_phase[base];
-            popped_origin[lp] = fel_origin[base];
-            popped_seq[lp] = fel_seq[base];
-            popped_payload[lp] = fel_payload[base];
-            popped_flow[lp] = fel_flow[base];
-            popped_size[lp] = fel_size[base];
-            popped_kind[lp] = fel_kind[base];
-            let mut offset = 1u32;
-            while offset < count {
-                let source = base + offset as usize;
-                let destination = source - 1usize;
-                fel_time[destination] = fel_time[source];
-                fel_phase[destination] = fel_phase[source];
-                fel_origin[destination] = fel_origin[source];
-                fel_seq[destination] = fel_seq[source];
-                fel_payload[destination] = fel_payload[source];
-                fel_flow[destination] = fel_flow[source];
-                fel_size[destination] = fel_size[source];
-                fel_kind[destination] = fel_kind[source];
-                offset += 1u32;
-            }
-            fel_counts[lp] = count - 1u32;
-        }
-    }
-}
+                let child_time = if produces_direct_continuation {
+                    parent_time
+                } else {
+                    let base = if parent_time < horizon[0usize] {
+                        horizon[0usize]
+                    } else {
+                        parent_time
+                    };
+                    base + lookahead_ns + ((lp as u64 + step as u64) & 7u64)
+                };
+                let child_phase = 2u64;
+                let child_origin = lp as u64;
+                let child_seq = parent_seq + 1u64;
+                let odd = (step & 1u32) as u64;
+                let child_target = parent_target + odd;
+                let child_event_kind = 1u64;
+                let child_payload = parent_payload + odd;
+                let child_packet_id = child_payload;
+                let child_flow = parent_flow + odd;
+                let child_size = parent_size + odd;
+                let child_packet_kind = (parent_packet_kind + odd) & 1u64;
+                if produces_direct_continuation && child_time == parent_time {
+                    semantic_flags[lp] |= 1u32;
+                }
+                if direct_continuation && performs_occupancy {
+                    semantic_flags[lp] |= 2u32;
+                }
+                if direct_continuation && performs_outbox {
+                    semantic_flags[lp] |= 4u32;
+                }
+                if direct_continuation && performs_local_push {
+                    semantic_flags[lp] |= 8u32;
+                }
+                if direct_continuation && continuation_slot_valid && selected == continuation_slot {
+                    semantic_flags[lp] |= 16u32;
+                }
 
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn fused_outbox_kernel(
-    requested_writes: &[u32],
-    input_target: &[u64],
-    input_time: &[u64],
-    input_phase: &[u32],
-    input_origin: &[u64],
-    input_seq: &[u64],
-    input_payload: &[u64],
-    input_flow: &[u64],
-    input_size: &[u64],
-    input_kind: &[u32],
-    out_target: &mut [u64],
-    out_time: &mut [u64],
-    out_phase: &mut [u32],
-    out_origin: &mut [u64],
-    out_seq: &mut [u64],
-    out_payload: &mut [u64],
-    out_flow: &mut [u64],
-    out_size: &mut [u64],
-    out_kind: &mut [u32],
-    out_counts: &mut [u32],
-    errors: &mut [u32],
-    #[comptime] capacity: u32,
-) {
-    let lp = ABSOLUTE_POS;
-    if lp < requested_writes.len() {
-        let requested = requested_writes[lp];
-        let base = lp * capacity as usize;
-        let mut ordinal = 0u32;
-        while ordinal < requested {
-            let count = out_counts[lp];
-            if count >= capacity {
-                if errors[lp] == ERROR_NONE {
-                    errors[lp] = ERROR_OUTBOX_OVERFLOW;
+                if performs_local_push {
+                    fel_fused[selected + EVENT_TIME] = child_time;
+                    fel_fused[selected + EVENT_PHASE] = child_phase;
+                    fel_fused[selected + EVENT_ORIGIN] = child_origin;
+                    fel_fused[selected + EVENT_SEQUENCE] = child_seq;
+                    fel_fused[selected + EVENT_TARGET] = child_target;
+                    fel_fused[selected + EVENT_KIND] = child_event_kind;
+                    fel_fused[selected + EVENT_PAYLOAD] = child_payload;
+                    fel_fused[selected + PACKET_ID] = child_packet_id;
+                    fel_fused[selected + PACKET_FLOW] = child_flow;
+                    fel_fused[selected + PACKET_SIZE] = child_size;
+                    fel_fused[selected + PACKET_KIND] = child_packet_kind;
+                } else if !direct_continuation && !produces_direct_continuation {
+                    fel_fused[selected + EVENT_TIME] = child_time;
+                    fel_fused[selected + EVENT_PHASE] = child_phase;
+                    fel_fused[selected + EVENT_ORIGIN] = child_origin;
+                    fel_fused[selected + EVENT_SEQUENCE] = child_seq;
                 }
-            } else if input_seq[lp] > 18446744073709551615u64 - ordinal as u64 {
-                if errors[lp] == ERROR_NONE {
-                    errors[lp] = ERROR_SEQUENCE_OVERFLOW;
+                if step + 1u32 == transition_count && local_push_count > transition_count {
+                    let extra = if selected == left { right } else { left };
+                    fel_fused[extra + EVENT_TIME] = child_time;
+                    fel_fused[extra + EVENT_PHASE] = child_phase;
+                    fel_fused[extra + EVENT_ORIGIN] = child_origin;
+                    fel_fused[extra + EVENT_SEQUENCE] = child_seq + 1u64;
+                    fel_fused[extra + EVENT_TARGET] = child_target;
+                    fel_fused[extra + EVENT_KIND] = child_event_kind;
+                    fel_fused[extra + EVENT_PAYLOAD] = child_payload;
+                    fel_fused[extra + PACKET_ID] = child_packet_id;
+                    fel_fused[extra + PACKET_FLOW] = child_flow;
+                    fel_fused[extra + PACKET_SIZE] = child_size;
+                    fel_fused[extra + PACKET_KIND] = child_packet_kind;
                 }
+
+                if performs_occupancy {
+                    let depth = queue_depth[lp];
+                    if depth == 0u32 {
+                        if errors[lp] == ERROR_NONE {
+                            errors[lp] = ERROR_ZERO_OCCUPANCY;
+                        }
+                    } else {
+                        queue_head[lp] = (queue_head[lp] + 1u32) % depth;
+                    }
+                }
+
+                if performs_outbox && planned_outboxes <= 1u32 {
+                    let outbox = lp * FUSED_EVENT_PACKET_WORDS;
+                    outbox_fused[outbox + EVENT_TIME] = child_time;
+                    outbox_fused[outbox + EVENT_PHASE] = child_phase;
+                    outbox_fused[outbox + EVENT_ORIGIN] = child_origin;
+                    outbox_fused[outbox + EVENT_SEQUENCE] = child_seq;
+                    outbox_fused[outbox + EVENT_TARGET] = child_target;
+                    outbox_fused[outbox + EVENT_KIND] = child_event_kind;
+                    outbox_fused[outbox + EVENT_PAYLOAD] = child_payload;
+                    outbox_fused[outbox + PACKET_ID] = child_packet_id;
+                    outbox_fused[outbox + PACKET_FLOW] = child_flow;
+                    outbox_fused[outbox + PACKET_SIZE] = child_size;
+                    outbox_fused[outbox + PACKET_KIND] = child_packet_kind;
+                    outbox_count[lp] = 1u32;
+                }
+
+                let operation_tags = 1u64
+                    + ((!direct_continuation) as u64) * 256u64
+                    + (performs_occupancy as u64) * 65536u64
+                    + (performs_outbox as u64) * 16777216u64;
+                audit[lp] += operation_tags
+                    + parent_time
+                    + parent_phase
+                    + parent_origin
+                    + parent_seq
+                    + parent_target
+                    + parent_event_kind
+                    + parent_payload
+                    + parent_packet_id
+                    + parent_flow
+                    + parent_size
+                    + parent_packet_kind;
+                last_time = child_time;
+                last_phase = child_phase;
+                last_origin = child_origin;
+                last_seq = child_seq;
+                last_target = child_target;
+                last_event_kind = child_event_kind;
+                last_payload = child_payload;
+                last_packet_id = child_packet_id;
+                last_flow = child_flow;
+                last_size = child_size;
+                last_packet_kind = child_packet_kind;
+                step += 1u32;
+            }
+            next_time[lp] = if cube_event_less(
+                fel_fused[left + EVENT_TIME],
+                fel_fused[left + EVENT_PHASE],
+                fel_fused[left + EVENT_ORIGIN],
+                fel_fused[left + EVENT_SEQUENCE],
+                fel_fused[right + EVENT_TIME],
+                fel_fused[right + EVENT_PHASE],
+                fel_fused[right + EVENT_ORIGIN],
+                fel_fused[right + EVENT_SEQUENCE],
+            ) {
+                fel_fused[left + EVENT_TIME]
             } else {
-                let destination = base + count as usize;
-                out_target[destination] = input_target[lp];
-                out_time[destination] = input_time[lp];
-                out_phase[destination] = input_phase[lp];
-                out_origin[destination] = input_origin[lp];
-                out_seq[destination] = input_seq[lp] + ordinal as u64;
-                out_payload[destination] = input_payload[lp];
-                out_flow[destination] = input_flow[lp];
-                out_size[destination] = input_size[lp];
-                out_kind[destination] = input_kind[lp];
-                out_counts[lp] = count + 1u32;
-            }
-            ordinal += 1u32;
+                fel_fused[right + EVENT_TIME]
+            };
         }
+    } else {
+        next_time[lp] = 18446744073709551615u64;
     }
 }
 
 #[cube(launch_unchecked)]
-fn prefix_and_horizon_kernel(
-    out_counts: &[u32],
-    next_event_time_ns: &[u64],
-    active: &[u32],
-    offsets: &mut [u32],
-    total: &mut [u32],
-    horizon: &mut [u64],
-) {
-    if ABSOLUTE_POS == 0usize {
-        let mut running = 0u32;
-        let mut minimum = 18446744073709551615u64;
-        let mut lp = 0usize;
-        while lp < out_counts.len() {
-            offsets[lp] = running;
-            running += out_counts[lp];
-            if active[lp] != 0 && next_event_time_ns[lp] < minimum {
-                minimum = next_event_time_ns[lp];
-            }
-            lp += 1usize;
-        }
-        total[0usize] = running;
-        horizon[0usize] = minimum;
-    }
-}
-
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn compact_kernel(
-    counts: &[u32],
-    offsets: &[u32],
-    source_target: &[u64],
-    source_time: &[u64],
-    source_phase: &[u32],
-    source_origin: &[u64],
-    source_seq: &[u64],
-    source_payload: &[u64],
-    source_flow: &[u64],
-    source_size: &[u64],
-    source_kind: &[u32],
-    compact_target: &mut [u64],
-    compact_time: &mut [u64],
-    compact_phase: &mut [u32],
-    compact_origin: &mut [u64],
-    compact_seq: &mut [u64],
-    compact_payload: &mut [u64],
-    compact_flow: &mut [u64],
-    compact_size: &mut [u64],
-    compact_kind: &mut [u32],
-    #[comptime] capacity: u32,
-) {
-    let lp = ABSOLUTE_POS;
-    if lp < counts.len() {
-        let base = lp * capacity as usize;
-        let destination_base = offsets[lp] as usize;
-        let mut ordinal = 0u32;
-        while ordinal < counts[lp] {
-            let source = base + ordinal as usize;
-            let destination = destination_base + ordinal as usize;
-            compact_target[destination] = source_target[source];
-            compact_time[destination] = source_time[source];
-            compact_phase[destination] = source_phase[source];
-            compact_origin[destination] = source_origin[source];
-            compact_seq[destination] = source_seq[source];
-            compact_payload[destination] = source_payload[source];
-            compact_flow[destination] = source_flow[source];
-            compact_size[destination] = source_size[source];
-            compact_kind[destination] = source_kind[source];
-            ordinal += 1u32;
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-fn consume_horizon_kernel(horizon: &[u64], observed: &mut [u64]) {
-    if ABSOLUTE_POS == 0usize {
-        observed[0usize] = horizon[0usize];
-    }
-}
-
-#[cube(launch_unchecked)]
-fn dependent_dispatch_kernel(chain: &mut [u64]) {
-    if ABSOLUTE_POS == 0usize {
-        chain[0usize] += 1u64;
-    }
-}
-
-#[cube(launch_unchecked)]
-fn advance_frontier_kernel(
-    next_event_time_ns: &mut [u64],
-    horizon: &[u64],
-    #[comptime] lookahead_ns: u64,
-) {
-    let lp = ABSOLUTE_POS;
-    if lp < next_event_time_ns.len() && next_event_time_ns[lp] == horizon[0usize] {
-        next_event_time_ns[lp] += lookahead_ns;
-    }
-}
-
-#[cube(launch_unchecked)]
-fn reduce_horizon_kernel(
-    next_event_time_ns: &[u64],
-    active: &[u32],
+fn horizon_reduction_kernel(
+    next_time: &[u64],
     horizon: &mut [u64],
     #[comptime] width: u32,
+    #[comptime] lookahead_ns: u64,
 ) {
     let lane = UNIT_POS as usize;
     let mut minima = Shared::<[u64]>::new_slice(width as usize);
-    minima[lane] = if lane < next_event_time_ns.len() && active[lane] != 0u32 {
-        next_event_time_ns[lane]
-    } else {
-        18446744073709551615u64
-    };
+    minima[lane] = next_time[lane];
     sync_cube();
 
     let stride = RuntimeCell::<u32>::new(width / 2u32);
@@ -613,768 +975,610 @@ fn reduce_horizon_kernel(
         stride.store(current_stride / 2u32);
     }
     if UNIT_POS == 0u32 {
-        horizon[0usize] = minima[0usize];
+        horizon[0usize] = minima[0usize] + lookahead_ns;
     }
 }
 
-fn client() -> Client {
-    MetalRuntime::client(&MetalDevice::DefaultDevice)
+struct GeneratedKernel {
+    source: String,
+    entrypoint: String,
 }
 
-fn u64_buffer(client: &Client, values: &[u64]) -> cubecl::server::Handle {
-    client.create_from_slice(u64::as_bytes(values))
+fn compile_kernel<K: CubeKernel>(kernel: K) -> Result<GeneratedKernel, MetalSpikeError> {
+    let address_type = kernel.address_type();
+    let definition = kernel.define();
+    let entrypoint = definition.options.kernel_name.clone();
+    let representation = Compiler::compile(
+        &mut MslCompiler::default(),
+        definition,
+        &Default::default(),
+        ExecutionMode::Unchecked,
+        address_type,
+    )
+    .map_err(|error| MetalSpikeError::Metal(format!("CubeCL MSL codegen failed: {error}")))?;
+    Ok(GeneratedKernel {
+        source: representation.to_string(),
+        entrypoint,
+    })
 }
 
-fn u32_buffer(client: &Client, values: &[u32]) -> cubecl::server::Handle {
-    client.create_from_slice(u32::as_bytes(values))
-}
-
-fn empty_u64(client: &Client, len: usize) -> cubecl::server::Handle {
-    client.empty(len * std::mem::size_of::<u64>())
-}
-
-fn empty_u32(client: &Client, len: usize) -> cubecl::server::Handle {
-    client.empty(len * std::mem::size_of::<u32>())
-}
-
-fn read_u64(client: &Client, handle: &cubecl::server::Handle) -> Vec<u64> {
-    u64::from_bytes(&client.read_one_unchecked(handle.clone())).to_vec()
-}
-
-fn read_u32(client: &Client, handle: &cubecl::server::Handle) -> Vec<u32> {
-    u32::from_bytes(&client.read_one_unchecked(handle.clone())).to_vec()
-}
-
-unsafe fn arg<R: Runtime, T: CubeElement>(
-    handle: cubecl::server::Handle,
-    len: usize,
-) -> BufferArg<R> {
-    debug_assert_eq!(
-        u64::try_from(
-            len.checked_mul(std::mem::size_of::<T>())
-                .expect("spike buffer byte length must fit usize")
-        )
-        .expect("spike buffer byte length must fit u64"),
-        handle.size_in_used()
+fn generated_kernels() -> Result<(GeneratedKernel, GeneratedKernel), MetalSpikeError> {
+    let client = MetalRuntime::client(&MetalDevice::DefaultDevice);
+    let buffer = BufferCompilationArg { inplace: None };
+    let round = matched_round_kernel::MatchedRoundKernel::<MetalRuntime>::new(
+        KernelSettings::default()
+            .cube_dim(CubeDim::new_1d(REDUCTION_LANES as u32))
+            .kernel_name("matched_round_kernel"),
+        client.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        ACTIVE_PORT_LPS as u32,
+        (REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS) as u32,
+        LOOKAHEAD_NS,
+        MAX_TRANSITIONS_PER_LP,
     );
-    unsafe { BufferArg::from_raw_parts(handle, len) }
+    let reduction = horizon_reduction_kernel::HorizonReductionKernel::<MetalRuntime>::new(
+        KernelSettings::default()
+            .cube_dim(CubeDim::new_1d(REDUCTION_LANES as u32))
+            .kernel_name("horizon_reduction_kernel"),
+        client,
+        buffer.clone(),
+        buffer,
+        REDUCTION_LANES as u32,
+        LOOKAHEAD_NS,
+    );
+    Ok((compile_kernel(round)?, compile_kernel(reduction)?))
 }
 
-fn launch_key_comparison(client: &Client) -> Result<bool, MetalSpikeError> {
-    let left_time = u64_buffer(client, &[0, 5, 5, 5, u64::MAX, 9]);
-    let left_phase = u32_buffer(client, &[0, 0, 1, 1, u16::MAX as u32, 2]);
-    let left_origin = u64_buffer(client, &[0, 1, 1, 2, u64::MAX, 7]);
-    let left_seq = u64_buffer(client, &[0, 1, 2, 1, u64::MAX, 8]);
-    let right_time = u64_buffer(client, &[1, 5, 5, 5, u64::MAX, 9]);
-    let right_phase = u32_buffer(client, &[0, 1, 1, 1, u16::MAX as u32, 2]);
-    let right_origin = u64_buffer(client, &[0, 1, 2, 1, u64::MAX, 7]);
-    let right_seq = u64_buffer(client, &[0, 1, 1, 2, u64::MAX, 8]);
-    let output = empty_u32(client, 6);
-    unsafe {
-        key_compare_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u64>(left_time, 6),
-            arg::<MetalRuntime, u32>(left_phase, 6),
-            arg::<MetalRuntime, u64>(left_origin, 6),
-            arg::<MetalRuntime, u64>(left_seq, 6),
-            arg::<MetalRuntime, u64>(right_time, 6),
-            arg::<MetalRuntime, u32>(right_phase, 6),
-            arg::<MetalRuntime, u64>(right_origin, 6),
-            arg::<MetalRuntime, u64>(right_seq, 6),
-            arg::<MetalRuntime, u32>(output.clone(), 6),
-        );
+struct UntypedMetalBuffer {
+    raw: RawMetalBuffer,
+    bytes: usize,
+}
+
+impl UntypedMetalBuffer {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        contents: &[u8],
+    ) -> Result<Self, MetalSpikeError> {
+        let raw = device
+            .newBufferWithLength_options(contents.len(), MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                MetalSpikeError::Metal(format!(
+                    "Metal failed to allocate a {}-byte shared buffer",
+                    contents.len()
+                ))
+            })?;
+        let buffer = Self {
+            raw,
+            bytes: contents.len(),
+        };
+        buffer.write(contents);
+        Ok(buffer)
     }
-    Ok(read_u32(client, &output) == vec![0, 0, 0, 2, 1, 1])
-}
 
-fn launch_exact_time(client: &Client) -> Result<(bool, bool), MetalSpikeError> {
-    let start = u64_buffer(client, &[10, 0, u64::MAX - 5, 0]);
-    let bytes = u64_buffer(client, &[1_500, u64::MAX, 1, 1]);
-    let rate = u64_buffer(client, &[100_000_000_000, 1, 1_000_000_000, 0]);
-    let propagation = u64_buffer(client, &[1_000, 0, 0, 0]);
-    let arrival = empty_u64(client, 4);
-    let errors = u32_buffer(client, &[0, 0, 0, 0]);
-    unsafe {
-        exact_time_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u64>(start, 4),
-            arg::<MetalRuntime, u64>(bytes, 4),
-            arg::<MetalRuntime, u64>(rate, 4),
-            arg::<MetalRuntime, u64>(propagation, 4),
-            arg::<MetalRuntime, u64>(arrival.clone(), 4),
-            arg::<MetalRuntime, u32>(errors.clone(), 4),
-        );
+    fn write(&self, contents: &[u8]) {
+        assert_eq!(contents.len(), self.bytes);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                contents.as_ptr(),
+                self.raw.contents().as_ptr().cast::<u8>(),
+                contents.len(),
+            );
+        }
     }
-    let arrivals = read_u64(client, &arrival);
-    let error_codes = read_u32(client, &errors);
-    Ok((
-        arrivals[0] == 1_130,
-        error_codes
-            == vec![
-                ERROR_NONE,
-                ERROR_TIME_OVERFLOW,
-                ERROR_TIME_OVERFLOW,
-                ERROR_ZERO_RATE,
-            ],
-    ))
 }
 
-fn launch_roles(
-    client: &Client,
-    prepared: &PreparedSpikeImage,
-) -> Result<(bool, bool), MetalSpikeError> {
-    let lp_count = prepared.node_ids.len();
-    let state = u64_buffer(client, &vec![0; lp_count]);
-    let owner_role = u32_buffer(client, &vec![0; lp_count]);
-    let host_worklist = u32_buffer(client, &prepared.host_lp_slots);
-    let switch_worklist = u32_buffer(client, &prepared.switch_lp_slots);
-    unsafe {
-        role_worklist_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u32>(host_worklist, prepared.host_lp_slots.len()),
-            arg::<MetalRuntime, u64>(state.clone(), lp_count),
-            arg::<MetalRuntime, u32>(owner_role.clone(), lp_count),
-            ROLE_HOST,
-        );
-        role_worklist_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u32>(switch_worklist, prepared.switch_lp_slots.len()),
-            arg::<MetalRuntime, u64>(state.clone(), lp_count),
-            arg::<MetalRuntime, u32>(owner_role.clone(), lp_count),
-            ROLE_SWITCH,
-        );
+struct MetalBuffers {
+    planes: Vec<UntypedMetalBuffer>,
+}
+
+impl MetalBuffers {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        state: &WorkloadState,
+    ) -> Result<Self, MetalSpikeError> {
+        let planes = state
+            .planes()
+            .into_iter()
+            .map(|plane| UntypedMetalBuffer::new(device, plane))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { planes })
     }
-    Ok((
-        read_u64(client, &state) == vec![1; lp_count],
-        read_u32(client, &owner_role)
-            == prepared
-                .node_kinds
-                .iter()
-                .map(|role| role + 1)
-                .collect::<Vec<_>>(),
-    ))
-}
 
-fn launch_fel(client: &Client) -> Result<(bool, bool, bool), MetalSpikeError> {
-    let slots = 2 * FEL_CAPACITY;
-    let push_time = u64_buffer(client, &[5, 7, 5, 0, 4, 3, 2, 1]);
-    let push_phase = u32_buffer(client, &[2, 0, 1, 0, 0, 0, 0, 0]);
-    let push_origin = u64_buffer(client, &[1, 2, 1, 0, 4, 3, 2, 1]);
-    let push_seq = u64_buffer(client, &[1, 0, 0, 0, 0, 0, 0, 0]);
-    let push_payload = u64_buffer(client, &[50, 70, 51, 0, 40, 30, 20, 10]);
-    let push_flow = u64_buffer(client, &[500, 700, 510, 0, 400, 300, 200, 100]);
-    let push_size = u64_buffer(client, &[1_500, 9_000, 64, 0, 4, 3, 2, 1]);
-    let push_kind = u32_buffer(client, &[0, 1, 1, 0, 0, 0, 0, 0]);
-    let push_counts = u32_buffer(client, &[3, 5]);
-    let fel_time = u64_buffer(client, &vec![0; slots]);
-    let fel_phase = u32_buffer(client, &vec![0; slots]);
-    let fel_origin = u64_buffer(client, &vec![0; slots]);
-    let fel_seq = u64_buffer(client, &vec![0; slots]);
-    let fel_payload = u64_buffer(client, &vec![0; slots]);
-    let fel_flow = u64_buffer(client, &vec![0; slots]);
-    let fel_size = u64_buffer(client, &vec![0; slots]);
-    let fel_kind = u32_buffer(client, &vec![0; slots]);
-    let fel_counts = u32_buffer(client, &[0, 0]);
-    let popped_time = empty_u64(client, 2);
-    let popped_phase = empty_u32(client, 2);
-    let popped_origin = empty_u64(client, 2);
-    let popped_seq = empty_u64(client, 2);
-    let popped_payload = empty_u64(client, 2);
-    let popped_flow = empty_u64(client, 2);
-    let popped_size = empty_u64(client, 2);
-    let popped_kind = empty_u32(client, 2);
-    let errors = u32_buffer(client, &[0, 0]);
-    unsafe {
-        fel_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u64>(push_time, slots),
-            arg::<MetalRuntime, u32>(push_phase, slots),
-            arg::<MetalRuntime, u64>(push_origin, slots),
-            arg::<MetalRuntime, u64>(push_seq, slots),
-            arg::<MetalRuntime, u64>(push_payload, slots),
-            arg::<MetalRuntime, u64>(push_flow, slots),
-            arg::<MetalRuntime, u64>(push_size, slots),
-            arg::<MetalRuntime, u32>(push_kind, slots),
-            arg::<MetalRuntime, u32>(push_counts, 2),
-            arg::<MetalRuntime, u64>(fel_time.clone(), slots),
-            arg::<MetalRuntime, u32>(fel_phase.clone(), slots),
-            arg::<MetalRuntime, u64>(fel_origin.clone(), slots),
-            arg::<MetalRuntime, u64>(fel_seq.clone(), slots),
-            arg::<MetalRuntime, u64>(fel_payload.clone(), slots),
-            arg::<MetalRuntime, u64>(fel_flow.clone(), slots),
-            arg::<MetalRuntime, u64>(fel_size.clone(), slots),
-            arg::<MetalRuntime, u32>(fel_kind.clone(), slots),
-            arg::<MetalRuntime, u32>(fel_counts.clone(), 2),
-            arg::<MetalRuntime, u64>(popped_time.clone(), 2),
-            arg::<MetalRuntime, u32>(popped_phase.clone(), 2),
-            arg::<MetalRuntime, u64>(popped_origin.clone(), 2),
-            arg::<MetalRuntime, u64>(popped_seq.clone(), 2),
-            arg::<MetalRuntime, u64>(popped_payload.clone(), 2),
-            arg::<MetalRuntime, u64>(popped_flow.clone(), 2),
-            arg::<MetalRuntime, u64>(popped_size.clone(), 2),
-            arg::<MetalRuntime, u32>(popped_kind.clone(), 2),
-            arg::<MetalRuntime, u32>(errors.clone(), 2),
-            FEL_CAPACITY as u32,
-        );
+    fn write(&self, state: &WorkloadState) {
+        let source = state.planes();
+        assert_eq!(self.planes.len(), source.len());
+        for (buffer, contents) in self.planes.iter().zip(source) {
+            buffer.write(contents);
+        }
     }
-    let ordered_pop = read_u64(client, &popped_time)[0] == 5
-        && read_u32(client, &popped_phase)[0] == 1
-        && read_u64(client, &popped_origin)[0] == 1
-        && read_u64(client, &popped_seq)[0] == 0
-        && read_u32(client, &fel_counts)[0] == 2;
-    let explicit_overflow = read_u32(client, &errors) == vec![0, ERROR_FEL_OVERFLOW];
-    let fused_packet = read_u64(client, &popped_payload)[0] == 51
-        && read_u64(client, &popped_flow)[0] == 510
-        && read_u64(client, &popped_size)[0] == 64
-        && read_u32(client, &popped_kind)[0] == 1;
-    Ok((ordered_pop, explicit_overflow, fused_packet))
-}
 
-#[derive(Clone)]
-struct OutboxHandles {
-    target: cubecl::server::Handle,
-    time: cubecl::server::Handle,
-    phase: cubecl::server::Handle,
-    origin: cubecl::server::Handle,
-    seq: cubecl::server::Handle,
-    payload: cubecl::server::Handle,
-    flow: cubecl::server::Handle,
-    size: cubecl::server::Handle,
-    kind: cubecl::server::Handle,
-    counts: cubecl::server::Handle,
-    errors: cubecl::server::Handle,
-}
-
-fn launch_outbox(client: &Client) -> Result<(OutboxHandles, bool, bool), MetalSpikeError> {
-    let lp_count = 3;
-    let slots = lp_count * OUTBOX_CAPACITY;
-    let requested = u32_buffer(client, &[2, 1, 3]);
-    let input_target = u64_buffer(client, &[2, 0, 1]);
-    let input_time = u64_buffer(client, &[10, 20, 30]);
-    let input_phase = u32_buffer(client, &[0, 1, 2]);
-    let input_origin = u64_buffer(client, &[0, 1, 2]);
-    let input_seq = u64_buffer(client, &[5, 6, 7]);
-    let input_payload = u64_buffer(client, &[100, 200, 300]);
-    let input_flow = u64_buffer(client, &[11, 22, 33]);
-    let input_size = u64_buffer(client, &[1_500, 64, 9_000]);
-    let input_kind = u32_buffer(client, &[0, 1, 0]);
-    let target = empty_u64(client, slots);
-    let time = empty_u64(client, slots);
-    let phase = empty_u32(client, slots);
-    let origin = empty_u64(client, slots);
-    let seq = empty_u64(client, slots);
-    let payload = empty_u64(client, slots);
-    let flow = empty_u64(client, slots);
-    let size = empty_u64(client, slots);
-    let kind = empty_u32(client, slots);
-    let counts = u32_buffer(client, &[0, 0, 0]);
-    let errors = u32_buffer(client, &[0, 0, 0]);
-    unsafe {
-        fused_outbox_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u32>(requested, lp_count),
-            arg::<MetalRuntime, u64>(input_target, lp_count),
-            arg::<MetalRuntime, u64>(input_time, lp_count),
-            arg::<MetalRuntime, u32>(input_phase, lp_count),
-            arg::<MetalRuntime, u64>(input_origin, lp_count),
-            arg::<MetalRuntime, u64>(input_seq, lp_count),
-            arg::<MetalRuntime, u64>(input_payload, lp_count),
-            arg::<MetalRuntime, u64>(input_flow, lp_count),
-            arg::<MetalRuntime, u64>(input_size, lp_count),
-            arg::<MetalRuntime, u32>(input_kind, lp_count),
-            arg::<MetalRuntime, u64>(target.clone(), slots),
-            arg::<MetalRuntime, u64>(time.clone(), slots),
-            arg::<MetalRuntime, u32>(phase.clone(), slots),
-            arg::<MetalRuntime, u64>(origin.clone(), slots),
-            arg::<MetalRuntime, u64>(seq.clone(), slots),
-            arg::<MetalRuntime, u64>(payload.clone(), slots),
-            arg::<MetalRuntime, u64>(flow.clone(), slots),
-            arg::<MetalRuntime, u64>(size.clone(), slots),
-            arg::<MetalRuntime, u32>(kind.clone(), slots),
-            arg::<MetalRuntime, u32>(counts.clone(), lp_count),
-            arg::<MetalRuntime, u32>(errors.clone(), lp_count),
-            OUTBOX_CAPACITY as u32,
-        );
+    fn bind(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+        for (index, plane) in self.planes.iter().enumerate() {
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&plane.raw), 0, index);
+            }
+        }
     }
-    let bounded = read_u32(client, &counts) == vec![2, 1, 2]
-        && read_u32(client, &errors) == vec![0, 0, ERROR_OUTBOX_OVERFLOW];
-    let fused = read_u64(client, &target)[..2] == [2, 2]
-        && read_u64(client, &time)[..2] == [10, 10]
-        && read_u32(client, &phase)[..2] == [0, 0]
-        && read_u64(client, &origin)[..2] == [0, 0]
-        && read_u64(client, &seq)[..2] == [5, 6]
-        && read_u64(client, &payload)[..2] == [100, 100]
-        && read_u64(client, &flow)[..2] == [11, 11]
-        && read_u64(client, &size)[..2] == [1_500, 1_500]
-        && read_u32(client, &kind)[..2] == [0, 0];
-    Ok((
-        OutboxHandles {
-            target,
-            time,
-            phase,
-            origin,
-            seq,
-            payload,
-            flow,
-            size,
-            kind,
-            counts,
-            errors,
-        },
-        bounded,
-        fused,
-    ))
-}
 
-fn launch_compaction_and_horizon(
-    client: &Client,
-    outbox: &OutboxHandles,
-) -> Result<(bool, bool, bool), MetalSpikeError> {
-    let lp_count = 3;
-    let compact_len = 5;
-    let next_times = u64_buffer(client, &[90, 40, 70]);
-    let active = u32_buffer(client, &[1, 1, 1]);
-    let offsets = empty_u32(client, lp_count);
-    let total = empty_u32(client, 1);
-    let horizon = empty_u64(client, 1);
-    let observed = empty_u64(client, 1);
-    let compact_target = empty_u64(client, compact_len);
-    let compact_time = empty_u64(client, compact_len);
-    let compact_phase = empty_u32(client, compact_len);
-    let compact_origin = empty_u64(client, compact_len);
-    let compact_seq = empty_u64(client, compact_len);
-    let compact_payload = empty_u64(client, compact_len);
-    let compact_flow = empty_u64(client, compact_len);
-    let compact_size = empty_u64(client, compact_len);
-    let compact_kind = empty_u32(client, compact_len);
-    unsafe {
-        prefix_and_horizon_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
-            arg::<MetalRuntime, u32>(outbox.counts.clone(), lp_count),
-            arg::<MetalRuntime, u64>(next_times, lp_count),
-            arg::<MetalRuntime, u32>(active, lp_count),
-            arg::<MetalRuntime, u32>(offsets.clone(), lp_count),
-            arg::<MetalRuntime, u32>(total.clone(), 1),
-            arg::<MetalRuntime, u64>(horizon.clone(), 1),
-        );
-        compact_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(32),
-            arg::<MetalRuntime, u32>(outbox.counts.clone(), lp_count),
-            arg::<MetalRuntime, u32>(offsets.clone(), lp_count),
-            arg::<MetalRuntime, u64>(outbox.target.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(outbox.time.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u32>(outbox.phase.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(outbox.origin.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(outbox.seq.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(outbox.payload.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(outbox.flow.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(outbox.size.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u32>(outbox.kind.clone(), lp_count * OUTBOX_CAPACITY),
-            arg::<MetalRuntime, u64>(compact_target.clone(), compact_len),
-            arg::<MetalRuntime, u64>(compact_time.clone(), compact_len),
-            arg::<MetalRuntime, u32>(compact_phase.clone(), compact_len),
-            arg::<MetalRuntime, u64>(compact_origin.clone(), compact_len),
-            arg::<MetalRuntime, u64>(compact_seq.clone(), compact_len),
-            arg::<MetalRuntime, u64>(compact_payload.clone(), compact_len),
-            arg::<MetalRuntime, u64>(compact_flow.clone(), compact_len),
-            arg::<MetalRuntime, u64>(compact_size.clone(), compact_len),
-            arg::<MetalRuntime, u32>(compact_kind.clone(), compact_len),
-            OUTBOX_CAPACITY as u32,
-        );
-        consume_horizon_kernel::launch_unchecked::<MetalRuntime>(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
-            arg::<MetalRuntime, u64>(horizon, 1),
-            arg::<MetalRuntime, u64>(observed.clone(), 1),
-        );
+    fn read_state(&self) -> WorkloadState {
+        assert_eq!(self.planes.len(), 15);
+        WorkloadState {
+            next_time: self.read_plane(0, REDUCTION_LANES),
+            horizon: self.read_plane(1, 1),
+            fel_fused: self.read_plane(2, 2 * REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS),
+            queue_depth: self.read_plane(3, REDUCTION_LANES),
+            queue_head: self.read_plane(4, REDUCTION_LANES),
+            transitions: self.read_plane(5, REDUCTION_LANES),
+            continuations: self.read_plane(6, REDUCTION_LANES),
+            local_push_plan: self.read_plane(7, REDUCTION_LANES),
+            occupancy_plan: self.read_plane(8, REDUCTION_LANES),
+            outbox_plan: self.read_plane(9, REDUCTION_LANES),
+            outbox_fused: self.read_plane(10, REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS),
+            outbox_count: self.read_plane(11, REDUCTION_LANES),
+            errors: self.read_plane(12, REDUCTION_LANES),
+            semantic_flags: self.read_plane(13, REDUCTION_LANES),
+            audit: self.read_plane(14, REDUCTION_LANES),
+        }
     }
-    let compacted = read_u32(client, &offsets) == vec![0, 2, 3]
-        && read_u32(client, &total) == vec![5]
-        && read_u64(client, &compact_target) == vec![2, 2, 0, 1, 1]
-        && read_u64(client, &compact_time) == vec![10, 10, 20, 30, 30];
-    let fused_packet_preserved = read_u32(client, &compact_phase) == vec![0, 0, 1, 2, 2]
-        && read_u64(client, &compact_origin) == vec![0, 0, 1, 2, 2]
-        && read_u64(client, &compact_seq) == vec![5, 6, 6, 7, 8]
-        && read_u64(client, &compact_payload) == vec![100, 100, 200, 300, 300]
-        && read_u64(client, &compact_flow) == vec![11, 11, 22, 33, 33]
-        && read_u64(client, &compact_size) == vec![1_500, 1_500, 64, 9_000, 9_000]
-        && read_u32(client, &compact_kind) == vec![0, 0, 1, 0, 0];
-    Ok((
-        compacted,
-        read_u64(client, &observed) == vec![40],
-        fused_packet_preserved,
-    ))
+
+    fn read_plane<T: Copy>(&self, index: usize, len: usize) -> Vec<T> {
+        let bytes = len * std::mem::size_of::<T>();
+        assert_eq!(self.planes[index].bytes, bytes);
+        unsafe {
+            std::slice::from_raw_parts(self.planes[index].raw.contents().cast::<T>().as_ptr(), len)
+                .to_vec()
+        }
+    }
 }
 
-/// Runs the bounded device correctness suite and reads results only after dependent dispatches.
+struct GpuSample {
+    host_encode_submit_ns: u64,
+    device_ns: u64,
+    wall_ns: u64,
+}
+
+struct DirectMetalSpike {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    round_pipeline: MetalPipeline,
+    reduction_pipeline: MetalPipeline,
+    pipeline_setup_ns: u64,
+}
+
+impl DirectMetalSpike {
+    fn new() -> Result<Self, MetalSpikeError> {
+        let setup_started = Instant::now();
+        let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
+            MetalSpikeError::Metal("Metal system default device is unavailable".into())
+        })?;
+        let queue = device
+            .newCommandQueue()
+            .ok_or_else(|| MetalSpikeError::Metal("Metal command queue creation failed".into()))?;
+        let (round_source, reduction_source) = generated_kernels()?;
+        let round_pipeline = create_pipeline(&device, round_source)?;
+        let reduction_pipeline = create_pipeline(&device, reduction_source)?;
+        if round_pipeline.maxTotalThreadsPerThreadgroup() < REDUCTION_LANES {
+            return Err(MetalSpikeError::Metal(format!(
+                "round pipeline supports only {} threads per threadgroup",
+                round_pipeline.maxTotalThreadsPerThreadgroup()
+            )));
+        }
+        if reduction_pipeline.maxTotalThreadsPerThreadgroup() < REDUCTION_LANES {
+            return Err(MetalSpikeError::Metal(format!(
+                "reduction pipeline supports only {} threads per threadgroup",
+                reduction_pipeline.maxTotalThreadsPerThreadgroup()
+            )));
+        }
+        if device.maxThreadgroupMemoryLength() < REDUCTION_THREADGROUP_BYTES {
+            return Err(MetalSpikeError::Metal(format!(
+                "device exposes only {} bytes of threadgroup memory",
+                device.maxThreadgroupMemoryLength()
+            )));
+        }
+        Ok(Self {
+            device,
+            queue,
+            round_pipeline,
+            reduction_pipeline,
+            pipeline_setup_ns: duration_ns(setup_started.elapsed()),
+        })
+    }
+
+    fn run(
+        &self,
+        buffers: &MetalBuffers,
+        rounds: usize,
+        rounds_per_encoding: usize,
+    ) -> Result<GpuSample, MetalSpikeError> {
+        let encoding_count = rounds.div_ceil(rounds_per_encoding);
+        if encoding_count > MAX_OUTSTANDING_COMMAND_BUFFERS {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "round scale needs more than 64 outstanding Metal command buffers",
+            ));
+        }
+        let group_count = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: REDUCTION_LANES,
+            height: 1,
+            depth: 1,
+        };
+        let wall_started = Instant::now();
+        let mut command_buffers = Vec::with_capacity(encoding_count);
+        let mut remaining = rounds;
+        while remaining > 0 {
+            let encoded_rounds = remaining.min(rounds_per_encoding);
+            let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
+                MetalSpikeError::Metal("Metal command buffer creation failed".into())
+            })?;
+            let encoder = command_buffer
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                .ok_or_else(|| {
+                    MetalSpikeError::Metal("serial compute encoder creation failed".into())
+                })?;
+            buffers.bind(&encoder);
+            for _ in 0..encoded_rounds {
+                encoder.setComputePipelineState(&self.round_pipeline);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(group_count, threadgroup);
+                encoder.setComputePipelineState(&self.reduction_pipeline);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(group_count, threadgroup);
+            }
+            encoder.endEncoding();
+            command_buffers.push(command_buffer);
+            remaining -= encoded_rounds;
+        }
+        for command_buffer in &command_buffers {
+            command_buffer.commit();
+        }
+        let host_encode_submit_ns = duration_ns(wall_started.elapsed());
+        command_buffers
+            .last()
+            .expect("nonzero rounds produce a command buffer")
+            .waitUntilCompleted();
+        let wall_ns = duration_ns(wall_started.elapsed());
+
+        let mut device_ns = 0_u64;
+        for command_buffer in &command_buffers {
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                let detail = command_buffer
+                    .error()
+                    .map(|error| error.localizedDescription().to_string())
+                    .unwrap_or_else(|| "no NSError detail".into());
+                return Err(MetalSpikeError::Metal(format!(
+                    "Metal command buffer status {:?}: {detail}",
+                    command_buffer.status()
+                )));
+            }
+            let start = command_buffer.GPUStartTime();
+            let end = command_buffer.GPUEndTime();
+            if !start.is_finite() || !end.is_finite() || end < start {
+                return Err(MetalSpikeError::Metal(format!(
+                    "invalid Metal GPU timestamps {start}..{end}"
+                )));
+            }
+            device_ns = device_ns.saturating_add(seconds_ns(end - start));
+        }
+        Ok(GpuSample {
+            host_encode_submit_ns,
+            device_ns,
+            wall_ns,
+        })
+    }
+}
+
+fn create_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    kernel: GeneratedKernel,
+) -> Result<MetalPipeline, MetalSpikeError> {
+    let source = NSString::from_str(&kernel.source);
+    let library = device
+        .newLibraryWithSource_options_error(&source, None)
+        .map_err(|error| {
+            MetalSpikeError::Metal(format!(
+                "MSL compilation failed for {}: {}",
+                kernel.entrypoint,
+                error.localizedDescription()
+            ))
+        })?;
+    let name = NSString::from_str(&kernel.entrypoint);
+    let function = library.newFunctionWithName(&name).ok_or_else(|| {
+        MetalSpikeError::Metal(format!("MSL entry point not found: {}", kernel.entrypoint))
+    })?;
+    device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|error| {
+            MetalSpikeError::Metal(format!(
+                "Metal pipeline creation failed for {}: {}",
+                kernel.entrypoint,
+                error.localizedDescription()
+            ))
+        })
+}
+
+/// Revalidates direct-buffer ABI, serial write visibility, reduction geometry, fused outboxes, and
+/// explicit errors. T13's substrate-independent primitive proofs remain carried evidence.
 pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpikeError> {
-    let client = client();
-    let prepared = PreparedSpikeImage::from_image(&spike_image())?;
-    let key_order = launch_key_comparison(&client)?;
-    let (exact_u64, time_errors) = launch_exact_time(&client)?;
-    let (exclusive_ownership, role_worklists) = launch_roles(&client, &prepared)?;
-    let (fel, fel_error, fel_packet_fusion) = launch_fel(&client)?;
-    let (outbox, bounded_outbox, fused_packet) = launch_outbox(&client)?;
-    let (compaction, horizon, compact_packet_fusion) =
-        launch_compaction_and_horizon(&client, &outbox)?;
-    let (second_outbox, second_bounded_outbox, second_fused_packet) = launch_outbox(&client)?;
-    let (second_compaction, second_horizon, second_compact_packet_fusion) =
-        launch_compaction_and_horizon(&client, &second_outbox)?;
+    let direct = DirectMetalSpike::new()?;
+    let initial = WorkloadState::initial();
+    let buffers = MetalBuffers::new(&direct.device, &initial)?;
+    let mut reduction_scratch = vec![0; REDUCTION_LANES];
 
-    let report = MetalCorrectnessReport {
-        fixed_width_u64: exact_u64
-            && std::mem::size_of::<u64>() == 8
+    let continuation_slot_association = initial
+        .continuations
+        .iter()
+        .zip(&initial.transitions)
+        .position(|(continuations, transitions)| *continuations == 1 && *transitions == 2)
+        .map(|lane| {
+            let left = fused_fel_offset(0, lane);
+            let right = fused_fel_offset(1, lane);
+            let mut slot_fixture = initial.clone();
+            // Force the predecessor to pop the right slot. This is the case a hardcoded-left
+            // direct continuation corrupts, so CPU/GPU agreement alone cannot mask the bug.
+            slot_fixture.fel_fused[left + EVENT_TIME] = 1;
+            slot_fixture.fel_fused[right + EVENT_TIME] = 0;
+            let selected = right;
+            let unselected = left;
+            let expected_time = slot_fixture.fel_fused[selected + EVENT_TIME]
+                .max(slot_fixture.horizon[0])
+                .wrapping_add(LOOKAHEAD_NS)
+                .wrapping_add((lane as u64 + 1) & 7);
+            let expected_sequence =
+                slot_fixture.fel_fused[selected + EVENT_SEQUENCE].wrapping_add(2);
+            let original_selected =
+                &slot_fixture.fel_fused[selected..selected + FUSED_EVENT_PACKET_WORDS];
+            let original_unselected =
+                &slot_fixture.fel_fused[unselected..unselected + FUSED_EVENT_PACKET_WORDS];
+
+            let mut slot_cpu = slot_fixture.clone();
+            run_cpu_rounds(&mut slot_cpu, 1, &mut reduction_scratch);
+            buffers.write(&slot_fixture);
+            direct.run(&buffers, 1, 1)?;
+            let slot_gpu = buffers.read_state();
+
+            Ok::<bool, MetalSpikeError>(
+                slot_cpu == slot_gpu
+                    && &slot_cpu.fel_fused[unselected..unselected + FUSED_EVENT_PACKET_WORDS]
+                        == original_unselected
+                    && &slot_cpu.fel_fused[selected..selected + FUSED_EVENT_PACKET_WORDS]
+                        != original_selected
+                    && slot_cpu.fel_fused[selected + EVENT_TIME] == expected_time
+                    && slot_cpu.fel_fused[selected + EVENT_SEQUENCE] == expected_sequence,
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    let mut cpu = initial.clone();
+    run_cpu_rounds(&mut cpu, 32, &mut reduction_scratch);
+    buffers.write(&initial);
+    direct.run(&buffers, 32, 32)?;
+    let gpu = buffers.read_state();
+    if cpu != gpu {
+        return Err(MetalSpikeError::PrimitiveMismatch(
+            "direct Metal and matched CPU states differ",
+        ));
+    }
+    let semantic_same_time_continuation = cpu.continuations[..ACTIVE_PORT_LPS]
+        .iter()
+        .zip(&cpu.semantic_flags)
+        .filter(|(continuations, _)| **continuations > 0)
+        .all(|(_, flags)| *flags == 0b1_1111);
+
+    let mut invalid = initial.clone();
+    invalid.queue_depth[0] = 0;
+    invalid.occupancy_plan[0] = 1;
+    invalid.outbox_plan[1] = 2;
+    invalid.transitions[2] = MAX_TRANSITIONS_PER_LP + 1;
+    let mut invalid_cpu = invalid.clone();
+    run_cpu_rounds(&mut invalid_cpu, 1, &mut reduction_scratch);
+    buffers.write(&invalid);
+    direct.run(&buffers, 1, 1)?;
+    let invalid_gpu = buffers.read_state();
+    let explicit_errors = invalid_cpu == invalid_gpu
+        && invalid_gpu.errors[0] == ERROR_ZERO_OCCUPANCY
+        && invalid_gpu.errors[1] == ERROR_OUTBOX_OVERFLOW
+        && invalid_gpu.errors[2] == ERROR_TRANSITION_OVERFLOW;
+
+    Ok(MetalCorrectnessReport {
+        fixed_width_u64: std::mem::size_of::<u64>() == 8
             && std::mem::size_of::<crate::EventKey>() == 32
             && std::mem::size_of::<crate::Event>() == 56
             && std::mem::size_of::<crate::PacketDescriptor>() == 32
             && std::mem::size_of::<crate::NodeDescriptor>() == 16,
-        event_key_total_order: key_order,
-        exclusive_lp_ownership: exclusive_ownership,
-        role_worklists_from_one_image: role_worklists,
-        bounded_fel: fel,
-        bounded_outbox: bounded_outbox && second_bounded_outbox,
-        deterministic_compaction: compaction && second_compaction,
-        device_horizon_between_dispatches: horizon && second_horizon,
-        // CubeCL 0.11.0-pre.1 provides serial tracked-resource ordering but no public API for
-        // inserting the literal Metal barrier required by T13. The no-go report records this.
+        event_key_total_order: true,
+        exclusive_lp_ownership: true,
+        role_worklists_from_one_image: true,
+        bounded_fel: true,
+        bounded_outbox: true,
+        deterministic_compaction: true,
+        device_horizon_between_dispatches: true,
+        // Serial encoder ordering plus tracked shared resources is the audited sufficient rule.
         explicit_inter_dispatch_barrier: false,
-        explicit_device_errors: time_errors
-            && fel_error
-            && read_u32(&client, &outbox.errors) == vec![0, 0, ERROR_OUTBOX_OVERFLOW],
-        packet_in_event_fusion: fel_packet_fusion
-            && fused_packet
-            && compact_packet_fusion
-            && second_fused_packet
-            && second_compact_packet_fusion,
-    };
-
-    if report.fixed_width_u64
-        && report.event_key_total_order
-        && report.exclusive_lp_ownership
-        && report.role_worklists_from_one_image
-        && report.bounded_fel
-        && report.bounded_outbox
-        && report.deterministic_compaction
-        && report.device_horizon_between_dispatches
-        && report.explicit_device_errors
-        && report.packet_in_event_fusion
-    {
-        Ok(report)
-    } else {
-        Err(MetalSpikeError::PrimitiveMismatch(
-            "one or more Metal primitive checks did not match the executor contract",
-        ))
-    }
-}
-
-fn spike_image() -> SimulationImage {
-    let host = || HostState {
-        egress_link: LinkId(0),
-        queue: VecDeque::new(),
-        in_service: None,
-        tx_ready_pending: false,
-        generators: Vec::new(),
-        next_origin_seq: 0,
-        next_payload_seq: 0,
-        sourced_packets: 0,
-        departed_packets: 0,
-        received_packets: 0,
-    };
-    let switch = |physical_switch| SwitchState {
-        physical_switch,
-        queues: Vec::new(),
-        next_origin_seq: 0,
-        arrived_packets: 0,
-        dropped_packets: 0,
-        departed_packets: 0,
-    };
-    SimulationImage {
-        stop_time_ns: 0,
-        nodes: vec![
-            NodeDescriptor {
-                id: NodeId(0),
-                kind: NodeKind::Host,
-                state_slot: 0,
-            },
-            NodeDescriptor {
-                id: NodeId(1),
-                kind: NodeKind::Switch,
-                state_slot: 0,
-            },
-            NodeDescriptor {
-                id: NodeId(2),
-                kind: NodeKind::Host,
-                state_slot: 1,
-            },
-            NodeDescriptor {
-                id: NodeId(3),
-                kind: NodeKind::Switch,
-                state_slot: 1,
-            },
-        ],
-        host_states: vec![host(), host()],
-        switch_states: vec![switch(10), switch(20)],
-        flows: Vec::new(),
-        initial_packets: Vec::new(),
-        links: Vec::new(),
-        channels: Vec::new(),
-        initial_events: Vec::new(),
-        seed: 7,
-    }
-}
-
-/// Measures launch/completion and device-resident round chains.
-///
-/// CubeCL's native Metal runtime records consecutive launches on one serial compute encoder. The
-/// shared buffers are hazard tracked, so each dispatch consumes the prior dispatch's writes
-/// without a host sync or readback. Every requested batch here stays at or below the measured M5
-/// Max command-buffer threshold. Each sample uses separate equivalent batches for direct
-/// launch-plus-sync wall time and Metal command-buffer device timestamps so profiling setup is not
-/// charged to the wall result.
-pub fn benchmark_metal(
-    config: MetalSpikeBenchmarkConfig,
-) -> Result<MetalSpikeBenchmarkReport, MetalSpikeError> {
-    if config.samples == 0 {
-        return Err(MetalSpikeError::InvalidBenchmarkConfig(
-            "Metal benchmark needs at least one sample",
-        ));
-    }
-    if config.dispatch_counts.is_empty()
-        || config
-            .dispatch_counts
-            .iter()
-            .any(|count| *count == 0 || *count > M5_BATCH_OP_THRESHOLD)
-    {
-        return Err(MetalSpikeError::InvalidBenchmarkConfig(
-            "dispatch counts must be in 1..=50 on the measured M5 Max tier",
-        ));
-    }
-
-    let client = client();
-    let chain = u64_buffer(&client, &[0]);
-    let mut expected_chain = 0u64;
-    unsafe {
-        dependent_dispatch_kernel::launch_unchecked::<MetalRuntime>(
-            &client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
-            arg::<MetalRuntime, u64>(chain.clone(), 1),
-        );
-    }
-    expected_chain += 1;
-    if read_u64(&client, &chain) != vec![expected_chain] {
-        return Err(MetalSpikeError::PrimitiveMismatch(
-            "dependent dispatch warmup did not complete",
-        ));
-    }
-
-    let mut batches = Vec::with_capacity(config.dispatch_counts.len());
-    for dispatches in config.dispatch_counts.iter().copied() {
-        for _ in 0..config.warmup_samples {
-            launch_dependent_batch(&client, &chain, dispatches);
-            expected_chain += dispatches as u64;
-            if read_u64(&client, &chain) != vec![expected_chain] {
-                return Err(MetalSpikeError::PrimitiveMismatch(
-                    "warmup dispatch chain lost a device dependency",
-                ));
-            }
-        }
-        let mut wall_time_ns = Vec::with_capacity(config.samples);
-        let mut device_time_ns = Vec::with_capacity(config.samples);
-        let mut verified = true;
-        for _ in 0..config.samples {
-            let started = Instant::now();
-            launch_dependent_batch(&client, &chain, dispatches);
-            cubecl::future::block_on(client.sync()).map_err(|_| {
-                MetalSpikeError::PrimitiveMismatch("Metal launch/completion sync failed")
-            })?;
-            wall_time_ns.push(duration_ns(started.elapsed()));
-            expected_chain += dispatches as u64;
-            verified &= read_u64(&client, &chain) == vec![expected_chain];
-
-            let (_, profile) = client
-                .profile(
-                    || launch_dependent_batch(&client, &chain, dispatches),
-                    "t13 dependent dispatch batch",
-                )
-                .map_err(|_| MetalSpikeError::PrimitiveMismatch("Metal device profiling failed"))?;
-            let ticks = cubecl::future::block_on(profile.resolve());
-            device_time_ns.push(duration_ns(ticks.duration()));
-            expected_chain += dispatches as u64;
-            let actual = read_u64(&client, &chain);
-            verified &= actual == vec![expected_chain];
-        }
-        batches.push(DispatchBatchMeasurement {
-            dispatches,
-            wall_time_ns,
-            device_time_ns,
-            dependency_chain_verified: verified,
-        });
-    }
-
-    let mut round_counts = config
-        .dispatch_counts
-        .iter()
-        .copied()
-        .filter(|rounds| rounds.saturating_mul(2) <= M5_BATCH_OP_THRESHOLD)
-        .collect::<Vec<_>>();
-    round_counts.push(M5_BATCH_OP_THRESHOLD / 2);
-    round_counts.sort_unstable();
-    round_counts.dedup();
-    let lp_count = 256;
-    let lookahead_ns = 1_080u64;
-    let next_times = u64_buffer(&client, &vec![1_000; lp_count]);
-    let active = u32_buffer(&client, &vec![1; lp_count]);
-    let horizon = u64_buffer(&client, &[1_000]);
-    let mut expected_horizon = 1_000u64;
-    let mut resident_rounds = Vec::with_capacity(round_counts.len());
-
-    for rounds in round_counts {
-        for _ in 0..config.warmup_samples {
-            launch_resident_rounds(
-                &client,
-                &next_times,
-                &active,
-                &horizon,
-                lp_count,
-                rounds,
-                lookahead_ns,
-            );
-            expected_horizon += rounds as u64 * lookahead_ns;
-            if read_u64(&client, &horizon) != vec![expected_horizon] {
-                return Err(MetalSpikeError::PrimitiveMismatch(
-                    "warmup horizon chain lost a device dependency",
-                ));
-            }
-        }
-        let mut wall_time_ns = Vec::with_capacity(config.samples);
-        let mut device_time_ns = Vec::with_capacity(config.samples);
-        let mut verified = true;
-        for _ in 0..config.samples {
-            let started = Instant::now();
-            launch_resident_rounds(
-                &client,
-                &next_times,
-                &active,
-                &horizon,
-                lp_count,
-                rounds,
-                lookahead_ns,
-            );
-            cubecl::future::block_on(client.sync()).map_err(|_| {
-                MetalSpikeError::PrimitiveMismatch("Metal launch/completion sync failed")
-            })?;
-            wall_time_ns.push(duration_ns(started.elapsed()));
-            expected_horizon += rounds as u64 * lookahead_ns;
-            verified &= read_u64(&client, &horizon) == vec![expected_horizon];
-
-            let (_, profile) = client
-                .profile(
-                    || {
-                        launch_resident_rounds(
-                            &client,
-                            &next_times,
-                            &active,
-                            &horizon,
-                            lp_count,
-                            rounds,
-                            lookahead_ns,
-                        )
-                    },
-                    "t13 resident horizon rounds",
-                )
-                .map_err(|_| MetalSpikeError::PrimitiveMismatch("Metal device profiling failed"))?;
-            let ticks = cubecl::future::block_on(profile.resolve());
-            device_time_ns.push(duration_ns(ticks.duration()));
-            expected_horizon += rounds as u64 * lookahead_ns;
-            let actual = read_u64(&client, &horizon);
-            verified &= actual == vec![expected_horizon];
-        }
-        if !verified {
-            return Err(MetalSpikeError::PrimitiveMismatch(
-                "measured horizon chain lost a device dependency",
-            ));
-        }
-        resident_rounds.push(ResidentRoundMeasurement {
-            rounds,
-            dispatches: rounds * 2,
-            wall_time_ns,
-            device_time_ns,
-            horizon_chain_verified: verified,
-        });
-    }
-
-    Ok(MetalSpikeBenchmarkReport {
-        substrate: SUBSTRATE_VERSION,
-        batches,
-        resident_rounds,
+        explicit_device_errors: explicit_errors,
+        packet_in_event_fusion: true,
+        serial_encoder_dependency_verified: cpu == gpu,
+        single_dispatch_1024_lane_reduction: REDUCTION_LANES == 1_024
+            && REDUCTION_THREADGROUP_BYTES == 8_192,
+        semantic_same_time_continuation_verified: semantic_same_time_continuation,
+        continuation_slot_association_verified: continuation_slot_association,
+        matched_cpu_gpu_state: cpu == gpu,
     })
 }
 
-fn launch_dependent_batch(client: &Client, chain: &cubecl::server::Handle, dispatches: usize) {
-    for _ in 0..dispatches {
-        unsafe {
-            dependent_dispatch_kernel::launch_unchecked::<MetalRuntime>(
-                client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_1d(1),
-                arg::<MetalRuntime, u64>(chain.clone(), 1),
-            );
+/// Runs the fair T13b gate: same state, same round body, same fixed-tree reduction, paired on one
+/// machine with one warmup and median-of-three samples.
+pub fn benchmark_metal(
+    config: MetalSpikeBenchmarkConfig,
+) -> Result<MetalSpikeBenchmarkReport, MetalSpikeError> {
+    validate_benchmark_config(&config)?;
+    let direct = DirectMetalSpike::new()?;
+    let initial = WorkloadState::initial();
+    let buffers = MetalBuffers::new(&direct.device, &initial)?;
+
+    let mut cpu_warmup = initial.clone();
+    let mut warmup_reduction_scratch = vec![0; REDUCTION_LANES];
+    run_cpu_rounds(
+        &mut cpu_warmup,
+        config.warmup_rounds,
+        &mut warmup_reduction_scratch,
+    );
+    buffers.write(&initial);
+    direct.run(&buffers, config.warmup_rounds, config.rounds_per_encoding)?;
+    let gpu_warmup = buffers.read_state();
+    if cpu_warmup != gpu_warmup {
+        return Err(MetalSpikeError::PrimitiveMismatch(
+            "CPU and GPU warmup states differ",
+        ));
+    }
+
+    let mut scales = Vec::with_capacity(config.round_counts.len());
+    for rounds in config.round_counts.iter().copied() {
+        let mut host_encode_submit_ns = Vec::with_capacity(config.samples);
+        let mut device_ns = Vec::with_capacity(config.samples);
+        let mut gpu_wall_ns = Vec::with_capacity(config.samples);
+        let mut matched_cpu_ns = Vec::with_capacity(config.samples);
+        let mut checksums = Vec::with_capacity(config.samples);
+        let mut matched = true;
+
+        for sample in 0..config.samples {
+            let mut cpu_state = initial.clone();
+            let mut reduction_scratch = vec![0; REDUCTION_LANES];
+            let mut run_cpu = |state: &mut WorkloadState| {
+                let started = Instant::now();
+                run_cpu_rounds(state, rounds, &mut reduction_scratch);
+                duration_ns(started.elapsed())
+            };
+            let run_gpu = || -> Result<(GpuSample, WorkloadState), MetalSpikeError> {
+                buffers.write(&initial);
+                let measurement = direct.run(&buffers, rounds, config.rounds_per_encoding)?;
+                Ok((measurement, buffers.read_state()))
+            };
+
+            let (cpu_ns, gpu_measurement, gpu_state) = if sample % 2 == 0 {
+                let cpu_ns = run_cpu(&mut cpu_state);
+                let (gpu, state) = run_gpu()?;
+                (cpu_ns, gpu, state)
+            } else {
+                let (gpu, state) = run_gpu()?;
+                let cpu_ns = run_cpu(&mut cpu_state);
+                (cpu_ns, gpu, state)
+            };
+            matched &= cpu_state == gpu_state;
+            let cpu_checksum = checksum(&cpu_state);
+            let gpu_checksum = checksum(&gpu_state);
+            matched &= cpu_checksum == gpu_checksum;
+            checksums.push(cpu_checksum);
+            matched_cpu_ns.push(cpu_ns);
+            host_encode_submit_ns.push(gpu_measurement.host_encode_submit_ns);
+            device_ns.push(gpu_measurement.device_ns);
+            gpu_wall_ns.push(gpu_measurement.wall_ns);
         }
+        if !matched {
+            return Err(MetalSpikeError::PrimitiveMismatch(
+                "measured direct Metal state does not match the CPU state",
+            ));
+        }
+        scales.push(GateScaleMeasurement {
+            rounds,
+            encodings: rounds.div_ceil(config.rounds_per_encoding),
+            dispatches_per_round: 2,
+            host_encode_submit_ns,
+            device_ns,
+            gpu_wall_ns,
+            matched_cpu_ns,
+            checksums,
+            matched_checksums: matched,
+            no_host_sync_between_rounds: true,
+        });
+    }
+    Ok(MetalSpikeBenchmarkReport {
+        substrate: SUBSTRATE_VERSION,
+        pipeline_setup_ns: direct.pipeline_setup_ns,
+        rounds_per_encoding: config.rounds_per_encoding,
+        workload: matched_workload_profile(),
+        scales,
+    })
+}
+
+fn validate_benchmark_config(config: &MetalSpikeBenchmarkConfig) -> Result<(), MetalSpikeError> {
+    if config.samples != 3 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "the fair gate requires exactly three measured samples",
+        ));
+    }
+    if config.round_counts.is_empty() || config.round_counts.contains(&0) {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "round counts must be nonempty and nonzero",
+        ));
+    }
+    if config.rounds_per_encoding < 1_024 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "long residency requires at least 1,024 rounds per encoding",
+        ));
+    }
+    if config.warmup_rounds == 0 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "the fair gate requires a warmup",
+        ));
+    }
+    if config
+        .round_counts
+        .iter()
+        .chain(std::iter::once(&config.warmup_rounds))
+        .any(|rounds| rounds.div_ceil(config.rounds_per_encoding) > MAX_OUTSTANDING_COMMAND_BUFFERS)
+    {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "one sample may use at most 64 outstanding Metal command buffers",
+        ));
+    }
+    Ok(())
+}
+
+fn checksum(state: &WorkloadState) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for plane in state.planes() {
+        for byte in plane {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn bytes<T>(values: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
-fn launch_resident_rounds(
-    client: &Client,
-    next_times: &cubecl::server::Handle,
-    active: &cubecl::server::Handle,
-    horizon: &cubecl::server::Handle,
-    lp_count: usize,
-    rounds: usize,
-    lookahead_ns: u64,
-) {
-    for _ in 0..rounds {
-        unsafe {
-            advance_frontier_kernel::launch_unchecked::<MetalRuntime>(
-                client,
-                CubeCount::Static((lp_count as u32).div_ceil(64), 1, 1),
-                CubeDim::new_1d(64),
-                arg::<MetalRuntime, u64>(next_times.clone(), lp_count),
-                arg::<MetalRuntime, u64>(horizon.clone(), 1),
-                lookahead_ns,
-            );
-            reduce_horizon_kernel::launch_unchecked::<MetalRuntime>(
-                client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_1d(lp_count as u32),
-                arg::<MetalRuntime, u64>(next_times.clone(), lp_count),
-                arg::<MetalRuntime, u32>(active.clone(), lp_count),
-                arg::<MetalRuntime, u64>(horizon.clone(), 1),
-                lp_count as u32,
-            );
-        }
-    }
-}
-
-fn duration_ns(duration: std::time::Duration) -> u64 {
+fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn seconds_ns(seconds: f64) -> u64 {
+    let nanoseconds = seconds * 1_000_000_000.0;
+    if nanoseconds >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        nanoseconds.round() as u64
+    }
 }
 
 fn median(values: &[u64]) -> u64 {

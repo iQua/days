@@ -10,30 +10,25 @@ fn main() {
 
     let report =
         benchmark_metal(MetalSpikeBenchmarkConfig::default()).expect("Metal benchmark failed");
-    println!("kind,count,dispatches,sample,wall_ns,device_ns");
-    for batch in &report.batches {
-        for (sample, (wall_ns, device_ns)) in batch
-            .wall_time_ns
-            .iter()
-            .zip(&batch.device_time_ns)
-            .enumerate()
-        {
+    eprintln!(
+        "substrate={};pipeline_setup_ns={};rounds_per_encoding={};workload={:?}",
+        report.substrate, report.pipeline_setup_ns, report.rounds_per_encoding, report.workload
+    );
+    println!(
+        "scale,sample,rounds,encodings,rounds_per_encoding,host_encode_submit_ns,device_ns,gpu_wall_ns,matched_cpu_ns,checksum"
+    );
+    for (scale, measurement) in report.scales.iter().enumerate() {
+        for sample in 0..measurement.host_encode_submit_ns.len() {
             println!(
-                "dispatch,{},{},{sample},{wall_ns},{device_ns}",
-                batch.dispatches, batch.dispatches
-            );
-        }
-    }
-    for rounds in &report.resident_rounds {
-        for (sample, (wall_ns, device_ns)) in rounds
-            .wall_time_ns
-            .iter()
-            .zip(&rounds.device_time_ns)
-            .enumerate()
-        {
-            println!(
-                "resident_round,{},{},{sample},{wall_ns},{device_ns}",
-                rounds.rounds, rounds.dispatches
+                "{scale},{sample},{},{},{},{},{},{},{},{}",
+                measurement.rounds,
+                measurement.encodings,
+                report.rounds_per_encoding,
+                measurement.host_encode_submit_ns[sample],
+                measurement.device_ns[sample],
+                measurement.gpu_wall_ns[sample],
+                measurement.matched_cpu_ns[sample],
+                measurement.checksums[sample],
             );
         }
     }

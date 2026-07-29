@@ -9,13 +9,36 @@ name = "days_executor"
 
 [features]
 default = []
-metal-spike = ["dep:cubecl", "cubecl/metal-native"]
+metal-spike = [
+    "dep:cubecl",
+    "cubecl/metal-native",
+    "dep:cubecl-cpp",
+    "cubecl-cpp/metal",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-metal",
+]
 
 [dependencies]
 crossbeam = "0.8.4"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 cubecl = { version = "=0.11.0-pre.1", default-features = false, optional = true }
+cubecl-cpp = { version = "=0.11.0-pre.1", default-features = false, optional = true }
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"], optional = true }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSError", "NSString", "std"], optional = true }
+objc2-metal = { version = "=0.3.2", default-features = false, features = [
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLTypes",
+    "objc2-core-foundation",
+    "std",
+], optional = true }
 
 [[example]]
 name = "t13_metal_spike"
