@@ -1097,21 +1097,8 @@ fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
             ObservationMode::Full,
         )
         .expect("profiled production Metal run must succeed");
-    let capped_profiled = executor
-        .run_with_observations_profiled(
-            &image,
-            Some(27),
-            MetalConfig {
-                max_transitions_per_lp_per_round: 1,
-                ..MetalConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .expect("profiled cap-1 mixed-role run must succeed");
 
     assert_eq!(profiled.result, ordinary.result);
-    assert_eq!(capped_profiled.result, ordinary.result);
-    assert!(capped_profiled.continuation_relaunches > 0);
     assert_eq!(profiled.rounds, ordinary.rounds);
     assert_eq!(profiled.transitions, ordinary.transitions);
     assert_eq!(profiled.encoded_attempts, ordinary.encoded_attempts);

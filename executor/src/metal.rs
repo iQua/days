@@ -4,9 +4,9 @@
 //! waves. Deterministic 1,024-lane reductions publish each horizon, stably compact active LPs, and
 //! resolve round control. One lane per active LP then performs chronological drains and real
 //! transitions, followed by a stable parallel prefix and deterministic boundary-only remote
-//! exchange. Host and switch LPs drain the same worklist through role-specialized kernels. The host
-//! synchronizes only at wave boundaries, and every such synchronization is reported in
-//! [`MetalRun`].
+//! exchange. The host synchronizes only at wave boundaries, and every such synchronization is
+//! reported in [`MetalRun`]. Role-split transition kernels are intentionally deferred to a later
+//! optimization milestone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -75,15 +75,6 @@ enum AttemptPhase {
     FinalControl,
 }
 
-impl AttemptPhase {
-    const fn dispatch_count(self) -> usize {
-        match self {
-            Self::DrainExecute => 2,
-            _ => 1,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchGeometry {
     FixedControl,
@@ -114,7 +105,8 @@ const ATTEMPT_PHASES: [(AttemptPhase, DispatchGeometry); 8] = [
 ];
 const PROFILE_PHASES: usize = ATTEMPT_PHASES.len();
 const PROFILE_SAMPLES_PER_ATTEMPT: usize = PROFILE_PHASES * 2;
-const CONTROL_THREADGROUP_BYTES: usize = LANES * std::mem::size_of::<u64>() * 2;
+const CONTROL_THREADGROUP_BYTES: usize =
+    LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
 
 const CONTROL_ERROR: usize = 0;
@@ -127,9 +119,7 @@ const CONTROL_RUN_END_HI: usize = 8;
 const CONTROL_ROUNDS: usize = 9;
 const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
-const CONTROL_WORDS: usize = 21;
-const PARAM_HOST_NODE_COUNT: usize = 14;
-const PARAM_SWITCH_NODE_COUNT: usize = 15;
+const CONTROL_WORDS: usize = 19;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type RawCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
@@ -554,14 +544,6 @@ fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
     (pairs_per_command_buffer, pairs_per_wave)
 }
 
-fn dispatch_grid(item_count: usize, threads_per_threadgroup: usize) -> MTLSize {
-    MTLSize {
-        width: item_count.div_ceil(threads_per_threadgroup).max(1),
-        height: 1,
-        depth: 1,
-    }
-}
-
 struct MetalPlan {
     control: Vec<u64>,
     params: Vec<u64>,
@@ -894,12 +876,6 @@ impl MetalPlan {
         let mut control = vec![0_u64; CONTROL_WORDS];
         control[CONTROL_RUN_END_LO] = run_end as u64;
         control[CONTROL_RUN_END_HI] = (run_end >> 64) as u64;
-        let host_node_count = image
-            .nodes
-            .iter()
-            .filter(|node| node.kind == NodeKind::Host)
-            .count();
-        let switch_node_count = node_count.saturating_sub(host_node_count);
         let params = vec![
             node_count as u64,
             image.flows.len() as u64,
@@ -915,8 +891,6 @@ impl MetalPlan {
             image.stop_time_ns,
             u64::from(minimum_lookahead_ns.is_some()),
             round_capacity as u64,
-            host_node_count as u64,
-            switch_node_count as u64,
         ];
 
         Ok(Self {
@@ -1576,8 +1550,6 @@ struct MetalBuffers {
     planes: Vec<SharedBuffer>,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
-    host_node_count: usize,
-    switch_node_count: usize,
     round_capacity: usize,
     dispatch_capacity: usize,
 }
@@ -1588,8 +1560,6 @@ impl MetalBuffers {
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
         let node_count = plan.params[0] as usize;
-        let host_node_count = plan.params[PARAM_HOST_NODE_COUNT] as usize;
-        let switch_node_count = plan.params[PARAM_SWITCH_NODE_COUNT] as usize;
         let planes = vec![
             plan.control,
             plan.params,
@@ -1624,8 +1594,6 @@ impl MetalBuffers {
             planes,
             orphan_packets,
             node_count,
-            host_node_count,
-            switch_node_count,
             round_capacity,
             dispatch_capacity,
         })
@@ -2081,8 +2049,7 @@ struct DirectMetal {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     horizon_pipeline: MetalPipeline,
     prepare_pipeline: MetalPipeline,
-    host_round_pipeline: MetalPipeline,
-    switch_round_pipeline: MetalPipeline,
+    round_pipeline: MetalPipeline,
     control_pipeline: MetalPipeline,
     exchange_prefix_pipeline: MetalPipeline,
     exchange_scatter_pipeline: MetalPipeline,
@@ -2101,8 +2068,7 @@ impl DirectMetal {
         let source = include_str!("metal_kernels.metal");
         let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
         let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
-        let host_round_pipeline = create_pipeline(&device, source, "days_round_host")?;
-        let switch_round_pipeline = create_pipeline(&device, source, "days_round_switch")?;
+        let round_pipeline = create_pipeline(&device, source, "days_round")?;
         let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
         let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
@@ -2133,8 +2099,7 @@ impl DirectMetal {
             queue,
             horizon_pipeline,
             prepare_pipeline,
-            host_round_pipeline,
-            switch_round_pipeline,
+            round_pipeline,
             control_pipeline,
             exchange_prefix_pipeline,
             exchange_scatter_pipeline,
@@ -2150,21 +2115,15 @@ impl DirectMetal {
         profile: bool,
     ) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
-        for (role, pipeline) in [
-            ("host", &self.host_round_pipeline),
-            ("switch", &self.switch_round_pipeline),
-        ] {
-            let execution_width = pipeline.threadExecutionWidth();
-            if !round_threads.is_multiple_of(execution_width) {
-                return Err(MetalError::Validation(format!(
-                    "round_threads_per_threadgroup must be a multiple of the {role} round \
-                     pipeline execution width {execution_width}"
-                )));
-            }
+        let execution_width = self.round_pipeline.threadExecutionWidth();
+        if !round_threads.is_multiple_of(execution_width) {
+            return Err(MetalError::Validation(format!(
+                "round_threads_per_threadgroup must be a multiple of the device execution width \
+                 {execution_width}"
+            )));
         }
         let parallel_pipelines = [
-            &self.host_round_pipeline,
-            &self.switch_round_pipeline,
+            &self.round_pipeline,
             &self.exchange_scatter_pipeline,
             &self.exchange_merge_pipeline,
         ];
@@ -2202,9 +2161,12 @@ impl DirectMetal {
         }
         let (pairs_per_command_buffer, pairs_per_wave) =
             encoding_limits(config.rounds_per_command_buffer);
-        let parallel_grid = dispatch_grid(buffers.node_count, round_threads);
-        let host_round_grid = dispatch_grid(buffers.host_node_count, round_threads);
-        let switch_round_grid = dispatch_grid(buffers.switch_node_count, round_threads);
+        let parallel_groups = buffers.node_count.div_ceil(round_threads).max(1);
+        let parallel_grid = MTLSize {
+            width: parallel_groups,
+            height: 1,
+            depth: 1,
+        };
         let parallel_group = MTLSize {
             width: round_threads,
             height: 1,
@@ -2265,8 +2227,6 @@ impl DirectMetal {
                             control_grid,
                             control_group,
                             parallel_grid,
-                            host_round_grid,
-                            switch_round_grid,
                             parallel_group,
                         )?;
                     }
@@ -2284,8 +2244,6 @@ impl DirectMetal {
                             control_grid,
                             control_group,
                             parallel_grid,
-                            host_round_grid,
-                            switch_round_grid,
                             parallel_group,
                         );
                     }
@@ -2367,15 +2325,12 @@ impl DirectMetal {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn encode_attempt(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         control_grid: MTLSize,
         control_group: MTLSize,
         parallel_grid: MTLSize,
-        host_round_grid: MTLSize,
-        switch_round_grid: MTLSize,
         parallel_group: MTLSize,
     ) {
         for (phase, geometry) in ATTEMPT_PHASES {
@@ -2383,14 +2338,8 @@ impl DirectMetal {
                 DispatchGeometry::FixedControl => (control_grid, control_group),
                 DispatchGeometry::Parallel => (parallel_grid, parallel_group),
             };
-            self.encode_phase(
-                encoder,
-                phase,
-                grid,
-                host_round_grid,
-                switch_round_grid,
-                group,
-            );
+            encoder.setComputePipelineState(self.pipeline(phase));
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         }
     }
 
@@ -2404,8 +2353,6 @@ impl DirectMetal {
         control_grid: MTLSize,
         control_group: MTLSize,
         parallel_grid: MTLSize,
-        host_round_grid: MTLSize,
-        switch_round_grid: MTLSize,
         parallel_group: MTLSize,
     ) -> Result<(), MetalError> {
         for (phase_index, (phase, geometry)) in ATTEMPT_PHASES.into_iter().enumerate() {
@@ -2432,49 +2379,18 @@ impl DirectMetal {
                     MetalError::Unavailable("profile compute encoder creation failed".into())
                 })?;
             buffers.bind(&encoder);
-            self.encode_phase(
-                &encoder,
-                phase,
-                grid,
-                host_round_grid,
-                switch_round_grid,
-                group,
-            );
+            encoder.setComputePipelineState(self.pipeline(phase));
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
             encoder.endEncoding();
         }
         Ok(())
-    }
-
-    fn encode_phase(
-        &self,
-        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-        phase: AttemptPhase,
-        grid: MTLSize,
-        host_round_grid: MTLSize,
-        switch_round_grid: MTLSize,
-        group: MTLSize,
-    ) {
-        if phase == AttemptPhase::DrainExecute {
-            debug_assert_eq!(phase.dispatch_count(), 2);
-            for (pipeline, role_grid) in [
-                (&self.host_round_pipeline, host_round_grid),
-                (&self.switch_round_pipeline, switch_round_grid),
-            ] {
-                encoder.setComputePipelineState(pipeline);
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(role_grid, group);
-            }
-        } else {
-            debug_assert_eq!(phase.dispatch_count(), 1);
-            encoder.setComputePipelineState(self.pipeline(phase));
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
-        }
     }
 
     fn pipeline(&self, phase: AttemptPhase) -> &ProtocolObject<dyn MTLComputePipelineState> {
         match phase {
             AttemptPhase::Horizon => &self.horizon_pipeline,
             AttemptPhase::Compaction => &self.prepare_pipeline,
-            AttemptPhase::DrainExecute => unreachable!("drain phase uses two role pipelines"),
+            AttemptPhase::DrainExecute => &self.round_pipeline,
             AttemptPhase::ContinuationControl => &self.control_pipeline,
             AttemptPhase::ExchangePrefix => &self.exchange_prefix_pipeline,
             AttemptPhase::ExchangeScatter => &self.exchange_scatter_pipeline,
@@ -2776,14 +2692,6 @@ mod tests {
             assert_eq!(geometry, DispatchGeometry::FixedControl);
             assert_eq!(geometry.threads_per_threadgroup(256), LANES);
         }
-        assert_eq!(AttemptPhase::DrainExecute.dispatch_count(), 2);
-        assert_eq!(
-            ATTEMPT_PHASES
-                .into_iter()
-                .map(|(phase, _)| phase.dispatch_count())
-                .sum::<usize>(),
-            9
-        );
     }
 
     #[test]

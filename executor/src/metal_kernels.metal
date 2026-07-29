@@ -31,8 +31,6 @@ constant uint C_ACTIVE = 15;
 constant uint C_FRONTIER = 16;
 constant uint C_CONTINUATION = 17;
 constant uint C_RELAUNCHES = 18;
-constant uint C_ACTIVE_HOSTS = 19;
-constant uint C_ACTIVE_SWITCHES = 20;
 
 constant uint P_NODE_COUNT = 0;
 constant uint P_FLOW_COUNT = 1;
@@ -777,7 +775,6 @@ inline bool packet_remote_target(
 inline bool dispatch_event(
     ulong node,
     thread ulong *event,
-    ulong role,
     device ulong *error,
     const device ulong *params,
     device ulong *node_state,
@@ -799,6 +796,7 @@ inline bool dispatch_event(
     device ulong *arrivals
 ) {
     ulong node_base = node * NODE_WORDS;
+    ulong role = node_state[node_base + N_KIND];
     ulong kind = event[E_KIND];
 
     if (kind == PACKET_ARRIVAL) {
@@ -1297,7 +1295,6 @@ kernel void days_horizon(
 kernel void days_round_prepare(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
-    const device ulong *node_state [[buffer(2)]],
     const device ulong *fel_meta [[buffer(7)]],
     const device ulong *fel_records [[buffer(8)]],
     device ulong *worklist [[buffer(13)]],
@@ -1305,8 +1302,7 @@ kernel void days_round_prepare(
     device ulong *remote_meta [[buffer(19)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
-    threadgroup ulong host_counts[1024];
-    threadgroup ulong switch_counts[1024];
+    threadgroup ulong counts[1024];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
@@ -1321,8 +1317,7 @@ kernel void days_round_prepare(
     ulong remainder = nodes % 1024;
     ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
     ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
-    ulong local_hosts = 0;
-    ulong local_switches = 0;
+    ulong local_count = 0;
     for (ulong node = start; node < end; ++node) {
         ulong state = node * LP_STATE_WORDS;
         lp_state[state + L_ERROR] = 0;
@@ -1335,42 +1330,26 @@ kernel void days_round_prepare(
             heap_root_time(node, fel_meta, fel_records, time) &&
             before_horizon(time, control)
         ) {
-            if (node_state[node * NODE_WORDS + N_KIND] == HOST) {
-                local_hosts += 1;
-            } else {
-                local_switches += 1;
-            }
+            local_count += 1;
         }
     }
 
-    host_counts[lane] = local_hosts;
-    switch_counts[lane] = local_switches;
+    counts[lane] = local_count;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint offset = 1; offset < 1024; offset <<= 1) {
-        ulong host_addend = lane >= offset ? host_counts[lane - offset] : 0;
-        ulong switch_addend = lane >= offset ? switch_counts[lane - offset] : 0;
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        host_counts[lane] += host_addend;
-        switch_counts[lane] += switch_addend;
+        counts[lane] += addend;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    ulong active_hosts = host_counts[1023];
-    ulong active_switches = switch_counts[1023];
-    ulong host_write = host_counts[lane] - local_hosts;
-    ulong switch_write = active_hosts + switch_counts[lane] - local_switches;
+    ulong write = counts[lane] - local_count;
     for (ulong node = start; node < end; ++node) {
         ulong time;
         if (
             heap_root_time(node, fel_meta, fel_records, time) &&
             before_horizon(time, control)
         ) {
-            ulong write;
-            if (node_state[node * NODE_WORDS + N_KIND] == HOST) {
-                write = host_write++;
-            } else {
-                write = switch_write++;
-            }
             if (write >= params[P_WORKLIST_CAPACITY]) {
                 if (lane == 0) {
                     control[C_ERROR] = ERROR_CAPACITY;
@@ -1386,57 +1365,45 @@ kernel void days_round_prepare(
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (lane == 0) {
-        control[C_ACTIVE_HOSTS] = active_hosts;
-        control[C_ACTIVE_SWITCHES] = active_switches;
-        control[C_ACTIVE] = active_hosts + active_switches;
+        control[C_ACTIVE] = counts[1023];
         control[C_OUTBOX] = 0;
         control[C_CONTINUATION] = 1;
     }
 }
 
-inline void days_round_role(
-    ulong role,
-    device ulong *control,
-    const device ulong *params,
-    device ulong *node_state,
-    device ulong *generators,
-    const device ulong *flows,
-    const device ulong *routes,
-    const device ulong *links,
-    device ulong *fel_meta,
-    device ulong *fel_records,
-    device ulong *queue_meta,
-    device ulong *queue_records,
-    device ulong *in_service,
-    const device ulong *worklist,
-    device ulong *summary,
-    device ulong *observed,
-    device ulong *departures,
-    device ulong *arrivals,
-    device ulong *lp_state,
-    device ulong *remote_meta,
-    device ulong *remote_staging,
-    device ulong *observation_meta,
-    uint active_index
+kernel void days_round(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *node_state [[buffer(2)]],
+    device ulong *generators [[buffer(3)]],
+    const device ulong *flows [[buffer(4)]],
+    const device ulong *routes [[buffer(5)]],
+    const device ulong *links [[buffer(6)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    device ulong *queue_meta [[buffer(9)]],
+    device ulong *queue_records [[buffer(10)]],
+    device ulong *in_service [[buffer(11)]],
+    const device ulong *worklist [[buffer(13)]],
+    device ulong *summary [[buffer(14)]],
+    device ulong *observed [[buffer(15)]],
+    device ulong *departures [[buffer(16)]],
+    device ulong *arrivals [[buffer(17)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *remote_staging [[buffer(20)]],
+    device ulong *observation_meta [[buffer(21)]],
+    uint active_index [[thread_position_in_grid]]
 ) {
-    ulong role_active = role == HOST
-        ? control[C_ACTIVE_HOSTS]
-        : control[C_ACTIVE_SWITCHES];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 1 ||
-        active_index >= role_active
+        active_index >= control[C_ACTIVE]
     ) {
         return;
     }
-    ulong worklist_index = role == HOST
-        ? ulong(active_index)
-        : control[C_ACTIVE_HOSTS] + ulong(active_index);
-    ulong node = worklist[worklist_index];
-    if (node_state[node * NODE_WORDS + N_KIND] != role) {
-        return;
-    }
+    ulong node = worklist[active_index];
     device ulong *state = lp_state + node * LP_STATE_WORDS;
     if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
         return;
@@ -1460,7 +1427,6 @@ inline void days_round_role(
         if (!dispatch_event(
             node,
             event,
-            role,
             state,
             params,
             node_state,
@@ -1490,108 +1456,7 @@ inline void days_round_role(
         state[L_TRANSITIONS] += 1;
         dispatch_transitions += 1;
     }
-}
 
-kernel void days_round_host(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *node_state [[buffer(2)]],
-    device ulong *generators [[buffer(3)]],
-    const device ulong *flows [[buffer(4)]],
-    const device ulong *routes [[buffer(5)]],
-    const device ulong *links [[buffer(6)]],
-    device ulong *fel_meta [[buffer(7)]],
-    device ulong *fel_records [[buffer(8)]],
-    device ulong *queue_meta [[buffer(9)]],
-    device ulong *queue_records [[buffer(10)]],
-    device ulong *in_service [[buffer(11)]],
-    const device ulong *worklist [[buffer(13)]],
-    device ulong *summary [[buffer(14)]],
-    device ulong *observed [[buffer(15)]],
-    device ulong *departures [[buffer(16)]],
-    device ulong *arrivals [[buffer(17)]],
-    device ulong *lp_state [[buffer(18)]],
-    device ulong *remote_meta [[buffer(19)]],
-    device ulong *remote_staging [[buffer(20)]],
-    device ulong *observation_meta [[buffer(21)]],
-    uint active_index [[thread_position_in_grid]]
-) {
-    days_round_role(
-        HOST,
-        control,
-        params,
-        node_state,
-        generators,
-        flows,
-        routes,
-        links,
-        fel_meta,
-        fel_records,
-        queue_meta,
-        queue_records,
-        in_service,
-        worklist,
-        summary,
-        observed,
-        departures,
-        arrivals,
-        lp_state,
-        remote_meta,
-        remote_staging,
-        observation_meta,
-        active_index
-    );
-}
-
-kernel void days_round_switch(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *node_state [[buffer(2)]],
-    device ulong *generators [[buffer(3)]],
-    const device ulong *flows [[buffer(4)]],
-    const device ulong *routes [[buffer(5)]],
-    const device ulong *links [[buffer(6)]],
-    device ulong *fel_meta [[buffer(7)]],
-    device ulong *fel_records [[buffer(8)]],
-    device ulong *queue_meta [[buffer(9)]],
-    device ulong *queue_records [[buffer(10)]],
-    device ulong *in_service [[buffer(11)]],
-    const device ulong *worklist [[buffer(13)]],
-    device ulong *summary [[buffer(14)]],
-    device ulong *observed [[buffer(15)]],
-    device ulong *departures [[buffer(16)]],
-    device ulong *arrivals [[buffer(17)]],
-    device ulong *lp_state [[buffer(18)]],
-    device ulong *remote_meta [[buffer(19)]],
-    device ulong *remote_staging [[buffer(20)]],
-    device ulong *observation_meta [[buffer(21)]],
-    uint active_index [[thread_position_in_grid]]
-) {
-    days_round_role(
-        SWITCH,
-        control,
-        params,
-        node_state,
-        generators,
-        flows,
-        routes,
-        links,
-        fel_meta,
-        fel_records,
-        queue_meta,
-        queue_records,
-        in_service,
-        worklist,
-        summary,
-        observed,
-        departures,
-        arrivals,
-        lp_state,
-        remote_meta,
-        remote_staging,
-        observation_meta,
-        active_index
-    );
 }
 
 kernel void days_round_control(
