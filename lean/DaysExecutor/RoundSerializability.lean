@@ -82,4 +82,20 @@ theorem roundSerializabilityOverCut_proved
   exact ⟨serialOrder, serialFinish, hserial, hmembership,
     strongMachineReplay_implies_result image serialFinish finish.machine hreplay⟩
 
+theorem f2GlobalTimePrefixCorollary_core :
+    F2GlobalTimePrefixCorollary := by
+  intro emissions startPending drainedEvents bounds horizon cut
+      hconstant hdrained event
+  subst bounds
+  rw [hdrained.2.2 event]
+  unfold TimePrefix
+  rw [belowConstantTimeBound_iff]
+
+theorem f2RoundSerializability_core
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) :
+    F2RoundSerializability image transition :=
+  ⟨roundSerializabilityOverCut_proved image transition,
+    f2GlobalTimePrefixCorollary_core⟩
+
 end DaysExecutor

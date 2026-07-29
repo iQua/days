@@ -1,4 +1,5 @@
 import DaysExecutor.Counterexamples
+import DaysExecutor.DecisionPointScope
 import DaysExecutor.Event
 import DaysExecutor.Execution
 import DaysExecutor.Image
