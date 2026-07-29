@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use assert_cmd::cargo::cargo_bin_cmd;
 use days::flows::flow::Flow;
 use days::scenario::compile_config;
 use days::topos::build::build_graph;
@@ -13,7 +14,7 @@ use days::topos::topo::{
 use days_executor::{
     ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId,
     NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture,
-    PayloadId, SchedulerKind, SimulationImage, run_cpu, run_scalar, run_scalar_rounds,
+    PacketKind, PayloadId, SchedulerKind, SimulationImage, run_cpu, run_scalar, run_scalar_rounds,
     run_scalar_with_observations, validate,
 };
 use petgraph::graph::NodeIndex;
@@ -213,22 +214,28 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
 
     let mut legacy_routes = BTreeMap::new();
     for flow in &legacy_flows {
+        let source_switch = hosts
+            .switch_for(flow.source_host)
+            .expect("legacy flow source must have an attachment switch");
+        let sink_switch = hosts
+            .switch_for(flow.sink_host)
+            .expect("legacy flow sink must have an attachment switch");
         let forward = walk_installed_route(
             flow.id,
-            flow.source_host,
-            flow.sink_host,
+            source_switch,
+            sink_switch,
             &forwarding.fibs,
             "forward",
         );
         let reverse = walk_installed_route(
             flow.id,
-            flow.sink_host,
-            flow.source_host,
+            sink_switch,
+            source_switch,
             &forwarding.reverse_fibs,
             "reverse",
         );
         *legacy_routes
-            .entry((flow.source_host, flow.sink_host, forward, reverse))
+            .entry((source_switch, sink_switch, forward, reverse))
             .or_insert(0_usize) += 1;
     }
 
@@ -342,17 +349,23 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
     };
     let mut legacy_complete_routes = BTreeMap::new();
     for flow in &legacy_flows {
+        let source_switch = hosts
+            .switch_for(flow.source_host)
+            .expect("legacy flow source must have an attachment switch");
+        let sink_switch = hosts
+            .switch_for(flow.sink_host)
+            .expect("legacy flow sink must have an attachment switch");
         let forward_physical = walk_installed_route(
             flow.id,
-            flow.source_host,
-            flow.sink_host,
+            source_switch,
+            sink_switch,
             &forwarding.fibs,
             "forward",
         );
         let reverse_physical = walk_installed_route(
             flow.id,
-            flow.sink_host,
-            flow.source_host,
+            sink_switch,
+            source_switch,
             &forwarding.reverse_fibs,
             "reverse",
         );
@@ -364,20 +377,20 @@ fn assert_legacy_physical_routes(config_path: &str, image: &SimulationImage) {
         assert!(sink_attachment.forward_delivery_flows.contains(&flow.id));
         let forward = legacy_stages(
             forward_physical,
-            flow.source_host,
-            flow.sink_host,
+            source_switch,
+            sink_switch,
             source_attachment.injection,
             sink_attachment.delivery,
         );
         let reverse = legacy_stages(
             reverse_physical,
-            flow.sink_host,
-            flow.source_host,
+            sink_switch,
+            source_switch,
             sink_attachment.injection,
             source_attachment.delivery,
         );
         *legacy_complete_routes
-            .entry((flow.source_host, flow.sink_host, forward, reverse))
+            .entry((source_switch, sink_switch, forward, reverse))
             .or_insert(0_usize) += 1;
     }
 
@@ -470,6 +483,49 @@ fn compile_for_legacy_comparison(path: &Path) -> SimulationImage {
         &image,
     );
     image
+}
+
+fn legacy_flow_observations(
+    csv_path: &Path,
+    packet_column: &str,
+    byte_column: &str,
+) -> BTreeMap<usize, (u128, u128)> {
+    let mut reader = csv::Reader::from_path(csv_path).unwrap_or_else(|error| {
+        panic!(
+            "legacy observation {} should open: {error}",
+            csv_path.display()
+        )
+    });
+    let headers = reader
+        .headers()
+        .expect("legacy observation CSV should have a header")
+        .clone();
+    let column = |name: &str| {
+        headers
+            .iter()
+            .position(|header| header == name)
+            .unwrap_or_else(|| panic!("legacy observation CSV should have a {name} column"))
+    };
+    let flow_column = column("flow_id");
+    let packet_column = column(packet_column);
+    let byte_column = column(byte_column);
+    let mut observations = BTreeMap::<usize, (u128, u128)>::new();
+    for record in reader.records() {
+        let record = record.expect("legacy observation row should parse");
+        let flow = record[flow_column]
+            .parse::<usize>()
+            .expect("legacy flow identity should parse");
+        let packets = record[packet_column]
+            .parse::<u128>()
+            .expect("legacy packet count should parse");
+        let bytes = record[byte_column]
+            .parse::<u128>()
+            .expect("legacy byte count should parse");
+        let observation = observations.entry(flow).or_default();
+        observation.0 += packets;
+        observation.1 += bytes;
+    }
+    observations
 }
 
 #[test]
@@ -1224,6 +1280,160 @@ fn key_on_legacy_endpoint_stage_sequences_match_the_exact_image() {
         let image = compile_config(&enabled).expect("enabled fixture should lower");
         assert_legacy_physical_routes(&enabled, &image);
     }
+}
+
+#[test]
+fn legacy_fattree_with_distinct_host_and_switch_ids_matches_exact_observations() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let log_path = directory.path().join("legacy");
+    let path = write_config(
+        &directory,
+        "fattree-k4-h2.toml",
+        &format!(
+            r#"
+seed = 91
+duration = 0.0001
+threading = "single"
+log_path = "{}"
+model_host_attachment = true
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 4
+hosts_per_edge = 2
+
+[switch]
+port_rate = 8_000_000_000
+capacity = 32
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 7
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[8, 9]]
+[flow.traffic]
+initial_delay = 0.000001
+size = 3000
+arr_dist = {{ type = "Uniform", low = 0.0000001, high = 0.0000001 }}
+pkt_size_dist = {{ type = "Uniform", low = 1000, high = 1000 }}
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[10, 12]]
+[flow.traffic]
+initial_delay = 0.000002
+size = 4000
+arr_dist = {{ type = "Uniform", low = 0.0000001, high = 0.0000001 }}
+pkt_size_dist = {{ type = "Uniform", low = 1000, high = 1000 }}
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[15, 11]]
+[flow.traffic]
+initial_delay = 0.000003
+size = 5000
+arr_dist = {{ type = "Uniform", low = 0.0000001, high = 0.0000001 }}
+pkt_size_dist = {{ type = "Uniform", low = 1000, high = 1000 }}
+"#,
+            log_path.display()
+        ),
+    );
+
+    let image = compile_config(&path).expect("multi-host fixture should lower");
+    assert_legacy_physical_routes(&path, &image);
+    let exact = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("multi-host fixture should run exactly");
+
+    let mut command = cargo_bin_cmd!("days");
+    command
+        .env("RUST_LOG", "error")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    let legacy_sources = legacy_flow_observations(
+        &log_path.join("sources.csv"),
+        "sent_packets",
+        "packet_sizes",
+    );
+    let legacy_sinks = legacy_flow_observations(
+        &log_path.join("sinks.csv"),
+        "received_packets",
+        "received_sizes",
+    );
+    let packets = exact
+        .observed_packets
+        .iter()
+        .map(|packet| (packet.id, packet))
+        .collect::<BTreeMap<_, _>>();
+    let mut exact_sources = BTreeMap::<usize, (u128, u128)>::new();
+    for packet in exact
+        .observed_packets
+        .iter()
+        .filter(|packet| packet.kind == PacketKind::Data)
+    {
+        let observation = exact_sources.entry(packet.flow.0 as usize).or_default();
+        observation.0 += 1;
+        observation.1 += u128::from(packet.size_bytes);
+    }
+    let mut exact_sinks = BTreeMap::<usize, (u128, u128)>::new();
+    for arrival in exact
+        .arrivals
+        .iter()
+        .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
+    {
+        let packet = packets[&arrival.payload];
+        let observation = exact_sinks.entry(packet.flow.0 as usize).or_default();
+        observation.0 += 1;
+        observation.1 += u128::from(packet.size_bytes);
+    }
+    assert_eq!(
+        legacy_sources,
+        BTreeMap::from([(0, (3, 3000)), (1, (4, 4000)), (2, (5, 5000))]),
+        "legacy sources must remain attached to all three distinct host identities"
+    );
+    assert_eq!(
+        legacy_sources, exact_sources,
+        "legacy source observations must match the exact scalar executor by flow"
+    );
+    assert_eq!(
+        legacy_sinks, exact_sinks,
+        "legacy endpoint wiring and attachment demultiplexing must match exact deliveries by flow"
+    );
+
+    let exact_summary = exact.summary;
+    let legacy_total = legacy_sources
+        .values()
+        .copied()
+        .fold((0_u128, 0_u128), |(packets, bytes), observation| {
+            (packets + observation.0, bytes + observation.1)
+        });
+    assert_eq!(
+        (
+            exact_summary.sourced_packets,
+            exact_summary.sourced_bytes,
+            exact_summary.received_packets,
+            exact_summary.received_bytes,
+            exact_summary.dropped_packets,
+            exact_summary.dropped_bytes,
+        ),
+        (
+            legacy_total.0,
+            legacy_total.1,
+            legacy_total.0,
+            legacy_total.1,
+            0,
+            0,
+        ),
+        "legacy terminal source/sink observations must match the exact scalar executor"
+    );
 }
 
 #[test]

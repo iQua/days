@@ -309,3 +309,45 @@ fn smallest_width_via_load_full_fixture_lowers_and_truncates_pending_tail() {
     );
     assert!(!run.result.resident_packets.is_empty());
 }
+
+#[cfg(feature = "metal-spike")]
+#[test]
+fn remaining_width_via_load_full_fixtures_hold_the_runtime_contract() {
+    for fixture in FIXTURES.into_iter().skip(1) {
+        let path = fixture_path(fixture.name);
+        let image = compile_config(&path)
+            .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+        let run = run_scalar_rounds(&image, None)
+            .unwrap_or_else(|error| panic!("failed to execute {}: {error}", path.display()));
+        let total_events = run
+            .rounds
+            .iter()
+            .map(|round| u128::from(round.events_processed))
+            .sum::<u128>();
+
+        assert_eq!(
+            run.result.summary.sourced_bytes,
+            sourced_bytes_through_stop(fixture),
+            "{} sourced-byte total changed",
+            fixture.name
+        );
+        assert!(
+            (MIN_EVENTS..=MAX_EVENTS).contains(&total_events),
+            "{} processed {total_events} events, outside [{MIN_EVENTS}, {MAX_EVENTS}]",
+            fixture.name
+        );
+        assert!(
+            !run.result.pending_events.is_empty(),
+            "{} must retain a pending tail",
+            fixture.name
+        );
+        assert!(
+            run.result
+                .pending_events
+                .iter()
+                .all(|event| event.key.time_ns > image.stop_time_ns),
+            "{} retained an event at or before the stop time",
+            fixture.name
+        );
+    }
+}

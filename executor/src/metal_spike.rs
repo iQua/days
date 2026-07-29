@@ -512,36 +512,36 @@ pub struct RealReplayBenchmarkReport {
 
 impl RealReplayBenchmarkReport {
     pub fn median_host_encode_submit_ns_per_round(&self) -> f64 {
-        median(
+        median_ns_per_round(
             &self
                 .samples
                 .iter()
                 .map(|sample| sample.host_encode_submit_ns)
                 .collect::<Vec<_>>(),
-        ) as f64
-            / self.rounds as f64
+            self.rounds,
+        )
     }
 
     pub fn median_device_ns_per_round(&self) -> f64 {
-        median(
+        median_ns_per_round(
             &self
                 .samples
                 .iter()
                 .map(|sample| sample.device_ns)
                 .collect::<Vec<_>>(),
-        ) as f64
-            / self.rounds as f64
+            self.rounds,
+        )
     }
 
     pub fn median_gpu_wall_ns_per_round(&self) -> f64 {
-        median(
+        median_ns_per_round(
             &self
                 .samples
                 .iter()
                 .map(|sample| sample.gpu_wall_ns)
                 .collect::<Vec<_>>(),
-        ) as f64
-            / self.rounds as f64
+            self.rounds,
+        )
     }
 
     pub fn median_cpu_ns_per_round(&self, workers: usize) -> Option<f64> {
@@ -549,16 +549,14 @@ impl RealReplayBenchmarkReport {
             .cpu_worker_counts
             .iter()
             .position(|candidate| *candidate == workers)?;
-        Some(
-            median(
-                &self
-                    .samples
-                    .iter()
-                    .map(|sample| sample.cpu_ns[worker])
-                    .collect::<Vec<_>>(),
-            ) as f64
-                / self.rounds as f64,
-        )
+        Some(median_ns_per_round(
+            &self
+                .samples
+                .iter()
+                .map(|sample| sample.cpu_ns[worker])
+                .collect::<Vec<_>>(),
+            self.rounds,
+        ))
     }
 }
 
@@ -3618,7 +3616,7 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
 }
 
 /// Runs the fair T13c sweep: same state and LP body, paired on one machine with a genuine
-/// persistent CPU worker configuration, one warmup per width, and four balanced-order samples.
+/// persistent CPU worker configuration, one warmup per width, and three alternating-order samples.
 pub fn benchmark_metal(
     config: MetalSpikeBenchmarkConfig,
 ) -> Result<MetalSpikeBenchmarkReport, MetalSpikeError> {
@@ -3752,6 +3750,10 @@ pub fn benchmark_real_replay(
     direct.run(&warmup_plan, &warmup_buffers, config.rounds_per_encoding)?;
     let gpu_warmup = warmup_buffers.read_state();
     ensure_real_replay_states_match(None, "warmup", &cpu_warmup, &gpu_warmup)?;
+    drop(cpu_warmup);
+    drop(gpu_warmup);
+    drop(warmup_buffers);
+    drop(warmup_initial);
 
     let initial = RealReplayState::initial(
         geometry.padded_lanes,
@@ -3759,55 +3761,80 @@ pub fn benchmark_real_replay(
         &measured_plan,
     );
     let buffers = RealReplayMetalBuffers::new(&direct.device, &measured_plan, &initial)?;
+    // Keep one GPU-produced equality oracle. Timed CPU states are checked against it and released
+    // before any GPU timing, so only compact durations and checksums cross an order boundary.
+    buffers.write_state(&initial);
+    direct.run(&measured_plan, &buffers, config.rounds_per_encoding)?;
+    let gpu_reference = buffers.read_state();
+    let gpu_reference_checksum = checksum_real_replay(&gpu_reference);
+
     let mut samples = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
-        let run_cpu_samples = || {
-            config
-                .cpu_worker_counts
-                .iter()
-                .copied()
-                .map(|workers| {
-                    let mut state = initial.clone();
-                    let elapsed = measure_real_cpu_replay(&mut state, &measured_plan, workers);
-                    (elapsed, checksum_real_replay(&state), state)
-                })
-                .collect::<Vec<_>>()
+        let run_cpu_samples = || -> Result<(Vec<u64>, Vec<u64>), MetalSpikeError> {
+            let mut cpu_ns = Vec::with_capacity(config.cpu_worker_counts.len());
+            let mut cpu_checksums = Vec::with_capacity(config.cpu_worker_counts.len());
+            for (worker_index, workers) in config.cpu_worker_counts.iter().copied().enumerate() {
+                let mut neutral_state = initial.clone();
+                let mut cpu_state = initial.clone();
+                // Give every timed CPU replay the same immediate predecessor at this width.
+                measure_real_cpu_replay(&mut neutral_state, &measured_plan, workers);
+                drop(neutral_state);
+
+                let elapsed = measure_real_cpu_replay(&mut cpu_state, &measured_plan, workers);
+                let cpu_checksum = checksum_real_replay(&cpu_state);
+                ensure_real_replay_states_match(
+                    Some(sample),
+                    "measured CPU sample",
+                    &cpu_state,
+                    &gpu_reference,
+                )?;
+                if cpu_checksum != gpu_reference_checksum {
+                    return Err(MetalSpikeError::StateMismatch(format!(
+                        "real replay checksum divergence at sample {sample}, W{}: CPU {} != GPU {}",
+                        config.cpu_worker_counts[worker_index],
+                        cpu_checksum,
+                        gpu_reference_checksum
+                    )));
+                }
+                drop(cpu_state);
+                cpu_ns.push(elapsed);
+                cpu_checksums.push(cpu_checksum);
+            }
+            Ok((cpu_ns, cpu_checksums))
         };
-        let run_gpu = || -> Result<(GpuSample, RealReplayState), MetalSpikeError> {
+        let run_gpu = || -> Result<(GpuSample, u64), MetalSpikeError> {
+            // Give every timed GPU replay the same immediate predecessor in either order.
+            buffers.write_state(&initial);
+            direct.run(&measured_plan, &buffers, config.rounds_per_encoding)?;
+
             buffers.write_state(&initial);
             let measurement = direct.run(&measured_plan, &buffers, config.rounds_per_encoding)?;
-            Ok((measurement, buffers.read_state()))
-        };
-        let (cpu_results, gpu_measurement, gpu_state) = if sample % 2 == 0 {
-            let cpu = run_cpu_samples();
-            let (gpu, state) = run_gpu()?;
-            (cpu, gpu, state)
-        } else {
-            let (gpu, state) = run_gpu()?;
-            let cpu = run_cpu_samples();
-            (cpu, gpu, state)
-        };
-        let gpu_checksum = checksum_real_replay(&gpu_state);
-        let mut cpu_ns = Vec::with_capacity(cpu_results.len());
-        let mut cpu_checksums = Vec::with_capacity(cpu_results.len());
-        for (worker_index, (elapsed, cpu_checksum, cpu_state)) in
-            cpu_results.into_iter().enumerate()
-        {
+            let gpu_state = buffers.read_state();
+            let gpu_checksum = checksum_real_replay(&gpu_state);
             ensure_real_replay_states_match(
                 Some(sample),
-                "measured sample",
-                &cpu_state,
+                "measured GPU sample",
+                &gpu_reference,
                 &gpu_state,
             )?;
-            if cpu_checksum != gpu_checksum {
+            if gpu_checksum != gpu_reference_checksum {
                 return Err(MetalSpikeError::StateMismatch(format!(
-                    "real replay checksum divergence at sample {sample}, W{}: CPU {} != GPU {}",
-                    config.cpu_worker_counts[worker_index], cpu_checksum, gpu_checksum
+                    "real replay GPU checksum divergence at sample {sample}: reference {} != sample {}",
+                    gpu_reference_checksum, gpu_checksum
                 )));
             }
-            cpu_ns.push(elapsed);
-            cpu_checksums.push(cpu_checksum);
-        }
+            drop(gpu_state);
+            Ok((measurement, gpu_checksum))
+        };
+        let ((cpu_ns, cpu_checksums), gpu_measurement, gpu_checksum) = if sample % 2 == 0 {
+            let cpu = run_cpu_samples()?;
+            let (gpu, checksum) = run_gpu()?;
+            (cpu, gpu, checksum)
+        } else {
+            let (gpu, checksum) = run_gpu()?;
+            let cpu = run_cpu_samples()?;
+            (cpu, gpu, checksum)
+        };
         samples.push(RealReplaySample {
             host_encode_submit_ns: gpu_measurement.host_encode_submit_ns,
             device_ns: gpu_measurement.device_ns,
@@ -3817,6 +3844,7 @@ pub fn benchmark_real_replay(
             gpu_checksum,
         });
     }
+    drop(gpu_reference);
 
     Ok(RealReplayBenchmarkReport {
         substrate: SUBSTRATE_VERSION,
@@ -4070,5 +4098,29 @@ fn median(values: &[u64]) -> u64 {
         ((u128::from(values[upper - 1]) + u128::from(values[upper])) / 2) as u64
     } else {
         values[upper]
+    }
+}
+
+fn median_ns_per_round(values: &[u64], rounds: usize) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    assert!(rounds > 0, "per-round median requires at least one round");
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let upper = values.len() / 2;
+    let twice_median_ns = if values.len().is_multiple_of(2) {
+        u128::from(values[upper - 1]) + u128::from(values[upper])
+    } else {
+        u128::from(values[upper]) * 2
+    };
+    twice_median_ns as f64 / 2.0 / rounds as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::median_ns_per_round;
+
+    #[test]
+    fn even_sample_median_preserves_the_half_nanosecond_before_round_division() {
+        assert_eq!(median_ns_per_round(&[1, 3, 4, 5], 4), 0.875);
     }
 }
