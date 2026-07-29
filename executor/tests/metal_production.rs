@@ -1101,6 +1101,13 @@ fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
     assert_eq!(profiled.result, ordinary.result);
     assert_eq!(profiled.rounds, ordinary.rounds);
     assert_eq!(profiled.transitions, ordinary.transitions);
+    assert_eq!(profiled.encoded_attempts, ordinary.encoded_attempts);
+    let required_attempts = ordinary
+        .rounds
+        .saturating_add(ordinary.continuation_relaunches)
+        .saturating_add(1);
+    assert!(ordinary.encoded_attempts >= required_attempts);
+    assert!(ordinary.encoded_attempts - required_attempts <= 63);
     assert!(ordinary.phase_profile.is_none());
     let profile = profiled
         .phase_profile

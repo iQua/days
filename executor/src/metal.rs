@@ -52,14 +52,13 @@ const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
 // Eight SIMD32 groups amortize dispatch overhead without consuming the maximum 1,024-thread
 // residency footprint. Work assignment depends only on compacted LP rank, so this is tunable.
 const DEFAULT_ROUND_THREADS_PER_THREADGROUP: usize = 256;
-// The retained T13 direct-Metal benchmark encodes two-dispatch round pairs at about 0.4 us/pair on
-// the development Apple system. Metal practice favors a small number of substantial command
-// buffers:
-// 16,384 pairs is the proven long-resident setting (~6.7 ms host encoding), while 65,536 pairs
-// bounds one pre-commit wave to four default-sized buffers (~27 ms). MAX_COMMAND_BUFFERS remains
-// the absolute buffer-count bound when callers deliberately request shorter buffers.
+// Command buffers retain the proven 16,384-attempt cap. Waves are deliberately much shorter:
+// every attempt contains wide dispatches even after C_DONE makes them no-ops, so a 64-attempt
+// device-state check bounds speculative tail waste while still amortizing one host synchronization
+// across many semantic rounds. MAX_COMMAND_BUFFERS remains the absolute buffer-count bound when
+// callers deliberately request shorter buffers.
 const MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER: usize = 16_384;
-const MAX_ENCODED_PAIRS_PER_WAVE: usize = 65_536;
+const MAX_ENCODED_PAIRS_PER_WAVE: usize = 64;
 const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER;
 const MAX_COMMAND_BUFFERS: usize = 64;
 const PROFILED_ATTEMPTS: usize = 128;
@@ -273,6 +272,9 @@ pub struct MetalRun {
     pub result: RunResult,
     pub rounds: u64,
     pub transitions: u64,
+    /// Physical round attempts encoded into submitted command buffers, including termination and
+    /// speculative no-op tail attempts.
+    pub encoded_attempts: u64,
     /// Encoded `days_round` continuation dispatches beyond the first launch per round.
     pub continuation_relaunches: u64,
     /// `waitUntilCompleted()` calls, exactly one after each committed bounded wave, including the
@@ -379,6 +381,11 @@ pub struct MetalPhaseProfile {
     pub captured_attempts: u64,
     pub useful_attempts: u64,
     pub idle_sample_attempts: u64,
+    /// Gaps between consecutive sampled compute passes within captured command buffers.
+    pub captured_pass_gap_ns: u64,
+    /// Overlap between consecutive sampled pass intervals. Stage-boundary timestamps can overlap
+    /// slightly even when the compute passes use serial dispatch.
+    pub captured_pass_overlap_ns: u64,
     pub estimate_complete: bool,
     pub useful: MetalPhaseTimings,
     pub termination: MetalPhaseTimings,
@@ -1794,6 +1801,8 @@ impl MetalBuffers {
                 control[CONTROL_ROUNDS],
                 control[CONTROL_RELAUNCHES],
                 timing.timestamp_frequency_hz,
+                timing.profiled_pass_gap_ns,
+                timing.profiled_pass_overlap_ns,
             )
         });
         Ok(MetalRun {
@@ -1813,6 +1822,7 @@ impl MetalBuffers {
                 .take(image.nodes.len())
                 .map(|state| state[1])
                 .fold(0_u64, u64::saturating_add),
+            encoded_attempts: timing.encoded_attempts,
             continuation_relaunches: control[CONTROL_RELAUNCHES],
             wave_boundary_syncs: timing.wave_boundary_syncs,
             mid_round_wave_boundary_syncs: timing.mid_round_wave_boundary_syncs,
@@ -2136,6 +2146,8 @@ impl DirectMetal {
         let mut encoded_attempts = 0_u64;
         let mut captured_attempts_encoded = 0_usize;
         let mut profiled_attempts = Vec::new();
+        let mut profiled_pass_gap_ns = 0_u64;
+        let mut profiled_pass_overlap_ns = 0_u64;
         let timestamp_counter_set = profile.then(|| self.timestamp_counter_set()).transpose()?;
         let timestamp_frequency_hz = if profile {
             self.device.queryTimestampFrequency()
@@ -2277,10 +2289,13 @@ impl DirectMetal {
                 }
                 device_ns = device_ns.saturating_add(seconds_ns(end - start));
                 if let Some(counter_buffer) = encoded.counter_buffer.as_deref() {
-                    profiled_attempts.extend(resolve_profile_attempts(
-                        counter_buffer,
-                        encoded.captured_attempts,
-                    )?);
+                    let resolved =
+                        resolve_profile_attempts(counter_buffer, encoded.captured_attempts)?;
+                    profiled_attempts.extend(resolved.attempts);
+                    profiled_pass_gap_ns =
+                        profiled_pass_gap_ns.saturating_add(resolved.pass_gap_ns);
+                    profiled_pass_overlap_ns =
+                        profiled_pass_overlap_ns.saturating_add(resolved.pass_overlap_ns);
                 }
             }
             wave_boundary_syncs = wave_boundary_syncs.saturating_add(1);
@@ -2305,6 +2320,8 @@ impl DirectMetal {
             encoded_attempts,
             timestamp_frequency_hz,
             profiled_attempts,
+            profiled_pass_gap_ns,
+            profiled_pass_overlap_ns,
         })
     }
 
@@ -2472,12 +2489,40 @@ struct MetalTiming {
     encoded_attempts: u64,
     timestamp_frequency_hz: u64,
     profiled_attempts: Vec<MetalPhaseTimings>,
+    profiled_pass_gap_ns: u64,
+    profiled_pass_overlap_ns: u64,
+}
+
+struct ResolvedProfileAttempts {
+    attempts: Vec<MetalPhaseTimings>,
+    pass_gap_ns: u64,
+    pass_overlap_ns: u64,
+}
+
+fn accumulate_profile_interval(
+    frontier: &mut Option<u64>,
+    start: u64,
+    end: u64,
+    pass_gap_ns: &mut u64,
+    pass_overlap_ns: &mut u64,
+) {
+    if let Some(previous) = *frontier {
+        if start >= previous {
+            *pass_gap_ns = pass_gap_ns.saturating_add(start - previous);
+        } else {
+            *pass_overlap_ns =
+                pass_overlap_ns.saturating_add(previous.min(end).saturating_sub(start));
+        }
+        *frontier = Some(previous.max(end));
+    } else {
+        *frontier = Some(end);
+    }
 }
 
 fn resolve_profile_attempts(
     counter_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
     attempts: usize,
-) -> Result<Vec<MetalPhaseTimings>, MetalError> {
+) -> Result<ResolvedProfileAttempts, MetalError> {
     let sample_count = attempts
         .checked_mul(PROFILE_SAMPLES_PER_ATTEMPT)
         .ok_or_else(|| MetalError::Unavailable("profile sample count overflows usize".into()))?;
@@ -2500,7 +2545,10 @@ fn resolve_profile_attempts(
             data.getBytes_length(destination, expected_bytes);
         }
     }
-    samples
+    let mut frontier = None;
+    let mut pass_gap_ns = 0_u64;
+    let mut pass_overlap_ns = 0_u64;
+    let attempts = samples
         .chunks_exact(PROFILE_SAMPLES_PER_ATTEMPT)
         .map(|attempt| {
             let mut values = [0_u64; PROFILE_PHASES];
@@ -2517,12 +2565,24 @@ fn resolve_profile_attempts(
                         "invalid phase timestamp range {start}..{end}"
                     )));
                 }
+                accumulate_profile_interval(
+                    &mut frontier,
+                    start,
+                    end,
+                    &mut pass_gap_ns,
+                    &mut pass_overlap_ns,
+                );
                 // Resolved counter timestamps use `MTLTimestamp`, whose unit is nanoseconds.
                 *value = end - start;
             }
             Ok(MetalPhaseTimings::from_values(values))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ResolvedProfileAttempts {
+        attempts,
+        pass_gap_ns,
+        pass_overlap_ns,
+    })
 }
 
 fn build_phase_profile(
@@ -2531,6 +2591,8 @@ fn build_phase_profile(
     rounds: u64,
     continuation_relaunches: u64,
     timestamp_frequency_hz: u64,
+    captured_pass_gap_ns: u64,
+    captured_pass_overlap_ns: u64,
 ) -> MetalPhaseProfile {
     let useful_attempts = rounds.saturating_add(continuation_relaunches);
     let captured_useful = usize::try_from(useful_attempts)
@@ -2574,6 +2636,8 @@ fn build_phase_profile(
         captured_attempts: attempts.len() as u64,
         useful_attempts,
         idle_sample_attempts: idle_samples.len() as u64,
+        captured_pass_gap_ns,
+        captured_pass_overlap_ns,
         estimate_complete,
         useful,
         termination,
@@ -2597,7 +2661,8 @@ mod tests {
     use super::{
         ATTEMPT_PHASES, AttemptPhase, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalPhaseTimings,
-        PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS, build_phase_profile, encoding_limits,
+        PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS, accumulate_profile_interval,
+        build_phase_profile, encoding_limits,
     };
 
     #[test]
@@ -2642,13 +2707,23 @@ mod tests {
     }
 
     #[test]
+    fn default_encoding_wave_limits_speculative_tail_attempts() {
+        assert_eq!(
+            encoding_limits(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER),
+            (MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, 64)
+        );
+    }
+
+    #[test]
     fn phase_profile_separates_useful_termination_and_idle_tail_attempts() {
         let attempts = [1_u64, 2, 3, 4].map(|value| MetalPhaseTimings::from_values([value; 8]));
-        let profile = build_phase_profile(&attempts, 10, 2, 0, 24_000_000);
+        let profile = build_phase_profile(&attempts, 10, 2, 0, 24_000_000, 17, 3);
 
         assert!(profile.estimate_complete);
         assert_eq!(profile.useful_attempts, 2);
         assert_eq!(profile.idle_sample_attempts, 1);
+        assert_eq!(profile.captured_pass_gap_ns, 17);
+        assert_eq!(profile.captured_pass_overlap_ns, 3);
         assert_eq!(profile.useful.horizon_ns, 3);
         assert_eq!(profile.termination.horizon_ns, 3);
         assert_eq!(profile.idle_mean.horizon_ns, 4);
@@ -2657,7 +2732,9 @@ mod tests {
 
     #[test]
     fn phase_profile_capture_fits_the_device_sample_buffer_limit() {
-        assert!(PROFILED_ATTEMPTS * PROFILE_SAMPLES_PER_ATTEMPT <= 4_096);
+        const {
+            assert!(PROFILED_ATTEMPTS * PROFILE_SAMPLES_PER_ATTEMPT <= 4_096);
+        }
     }
 
     #[test]
@@ -2669,6 +2746,8 @@ mod tests {
             PROFILED_ATTEMPTS as u64,
             0,
             24_000_000,
+            0,
+            0,
         );
 
         assert!(!profile.estimate_complete);
@@ -2684,5 +2763,19 @@ mod tests {
         assert_eq!(timing.continuation_control_ns, 4);
         assert_eq!(timing.exchange_prefix_ns, 5);
         assert_eq!(timing.final_control_ns, 8);
+    }
+
+    #[test]
+    fn phase_profile_interval_accounting_handles_gaps_overlaps_and_nesting() {
+        let mut frontier = None;
+        let mut gaps = 0;
+        let mut overlaps = 0;
+        for (start, end) in [(0, 10), (12, 20), (18, 25), (19, 22), (30, 35)] {
+            accumulate_profile_interval(&mut frontier, start, end, &mut gaps, &mut overlaps);
+        }
+
+        assert_eq!(frontier, Some(35));
+        assert_eq!(gaps, 7);
+        assert_eq!(overlaps, 5);
     }
 }

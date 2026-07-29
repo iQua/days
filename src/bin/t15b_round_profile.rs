@@ -49,6 +49,10 @@ fn main() {
         }
     }
 
+    fn signed_difference(left: u64, right: u64) -> i128 {
+        i128::from(left) - i128::from(right)
+    }
+
     fn median_timing(
         profiles: &[MetalPhaseProfile],
         selected: impl Fn(MetalPhaseProfile) -> MetalPhaseTimings,
@@ -80,6 +84,9 @@ fn main() {
         "configs/benchmarks/width_via_load_full/fattree_k32_load_90.toml".into()
     });
     let mut samples = 3_usize;
+    let mut max_rounds = None;
+    let mut max_transitions_per_lp_per_round = None;
+    let mut rounds_per_command_buffer = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--samples" => {
@@ -89,10 +96,45 @@ fn main() {
                     .parse()
                     .expect("--samples must be an integer");
             }
+            "--max-rounds" => {
+                max_rounds = Some(
+                    arguments
+                        .next()
+                        .expect("--max-rounds requires a value")
+                        .parse()
+                        .expect("--max-rounds must be an integer"),
+                );
+            }
+            "--max-transitions-per-lp-per-round" => {
+                max_transitions_per_lp_per_round = Some(
+                    arguments
+                        .next()
+                        .expect("--max-transitions-per-lp-per-round requires a value")
+                        .parse()
+                        .expect("--max-transitions-per-lp-per-round must be an integer"),
+                );
+            }
+            "--rounds-per-command-buffer" => {
+                rounds_per_command_buffer = Some(
+                    arguments
+                        .next()
+                        .expect("--rounds-per-command-buffer requires a value")
+                        .parse()
+                        .expect("--rounds-per-command-buffer must be an integer"),
+                );
+            }
             unknown => panic!("unknown argument {unknown}"),
         }
     }
     assert!(samples > 0, "--samples must be nonzero");
+    let run_config = MetalConfig {
+        max_rounds,
+        max_transitions_per_lp_per_round: max_transitions_per_lp_per_round
+            .unwrap_or(MetalConfig::default().max_transitions_per_lp_per_round),
+        rounds_per_command_buffer: rounds_per_command_buffer
+            .unwrap_or(MetalConfig::default().rounds_per_command_buffer),
+        ..MetalConfig::default()
+    };
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative);
     let image = compile_config(&path)
@@ -151,6 +193,7 @@ fn main() {
     }
     println!(
         "record=t15b_divergence config={relative} nodes={} rounds={} transitions={} \
+         configured_max_rounds={} configured_transition_cap={} \
          active_lp_rounds={active_lp_rounds} mean_active_lps={:.6} \
          maximum_active_lps={maximum_active_lps} maximum_lp_work={maximum_lp_work} \
          mean_parallel_efficiency={:.9} host_events={} switch_events={} \
@@ -159,6 +202,8 @@ fn main() {
         image.nodes.len(),
         expected.rounds,
         expected.transitions,
+        run_config.max_rounds.unwrap_or(0),
+        run_config.max_transitions_per_lp_per_round,
         active_lp_rounds as f64 / expected.rounds as f64,
         efficiency_sum / expected.rounds as f64,
         role_events[0],
@@ -169,10 +214,9 @@ fn main() {
     let expected_result = scalar.result;
 
     let executor = MetalExecutor::new().expect("Metal profile executor must initialize");
-    let profile_config = MetalConfig::default();
     drop(
         executor
-            .run_profiled(&image, None, profile_config)
+            .run_profiled(&image, None, run_config)
             .expect("profile warmup must run"),
     );
     let mut standard_device_ns = Vec::with_capacity(samples);
@@ -181,11 +225,11 @@ fn main() {
     for sample in 0..samples {
         drop(
             executor
-                .run(&image, None, MetalConfig::default())
+                .run(&image, None, run_config)
                 .expect("standard predecessor must run"),
         );
         let standard = executor
-            .run(&image, None, MetalConfig::default())
+            .run(&image, None, run_config)
             .expect("standard profile comparison must run");
         assert_eq!(metal_outcome(&standard), expected);
         assert_eq!(standard.result, expected_result);
@@ -193,11 +237,11 @@ fn main() {
 
         drop(
             executor
-                .run_profiled(&image, None, profile_config)
+                .run_profiled(&image, None, run_config)
                 .expect("profile predecessor must run"),
         );
         let profiled = executor
-            .run_profiled(&image, None, profile_config)
+            .run_profiled(&image, None, run_config)
             .expect("profile sample must run");
         assert_eq!(metal_outcome(&profiled), expected);
         assert_eq!(profiled.result, expected_result);
@@ -216,8 +260,9 @@ fn main() {
         println!(
             "record=t15b_profile_sample config={relative} sample={sample} rounds={} \
              transitions={} standard_device_ns={} profiled_device_ns={} frequency_hz={} \
-             encoded_attempts={} captured_attempts={} useful_attempts={} idle_sample_attempts={} \
-             captured_active_ns={captured_active_ns} \
+         encoded_attempts={} captured_attempts={} useful_attempts={} idle_sample_attempts={} \
+         captured_pass_gap_ns={} captured_pass_overlap_ns={} \
+         captured_active_ns={captured_active_ns} \
              instrumented_residual_ns={instrumented_residual_ns} idle_extrapolated_total_ns={}",
             expected.rounds,
             expected.transitions,
@@ -228,6 +273,8 @@ fn main() {
             profile.captured_attempts,
             profile.useful_attempts,
             profile.idle_sample_attempts,
+            profile.captured_pass_gap_ns,
+            profile.captured_pass_overlap_ns,
             profile.estimated_total.total_ns(),
         );
         for (index, (phase, idle_extrapolated_ns)) in
@@ -260,6 +307,46 @@ fn main() {
         profiles.push(profile);
     }
 
+    let mut profiled_order = (0..profiles.len()).collect::<Vec<_>>();
+    profiled_order.sort_unstable_by_key(|index| profiled_device_ns[*index]);
+    let attribution_sample = profiled_order[profiled_order.len() / 2];
+    let attribution_profile = profiles[attribution_sample];
+    let attribution_standard_ns = standard_device_ns[attribution_sample];
+    let attribution_profiled_ns = profiled_device_ns[attribution_sample];
+    let attribution_useful_ns = attribution_profile
+        .useful
+        .total_ns()
+        .saturating_add(attribution_profile.termination.total_ns());
+    let attribution_all_active_ns = attribution_profile.estimated_total.total_ns();
+    let attribution_idle_active_ns =
+        attribution_all_active_ns.saturating_sub(attribution_useful_ns);
+    let attribution_net_pass_gap_ns = signed_difference(
+        attribution_profile.captured_pass_gap_ns,
+        attribution_profile.captured_pass_overlap_ns,
+    );
+    let attribution_envelope_ns = i128::from(attribution_profiled_ns)
+        - i128::from(attribution_all_active_ns)
+        - attribution_net_pass_gap_ns;
+    println!(
+        "record=t15d_attribution_summary config={relative} sample={attribution_sample} \
+         rounds={} transitions={} captured_all_attempts={} encoded_attempts={} \
+         captured_attempts={} useful_attempts={} standard_device_ns={attribution_standard_ns} \
+         profiled_device_ns={attribution_profiled_ns} profiling_perturbation_ns={} \
+         useful_active_ns={attribution_useful_ns} idle_active_ns={attribution_idle_active_ns} \
+         pass_gap_ns={} pass_overlap_ns={} net_pass_gap_ns={attribution_net_pass_gap_ns} \
+         envelope_ns={attribution_envelope_ns} instrumented_residual_ns={}",
+        expected.rounds,
+        expected.transitions,
+        u8::from(attribution_profile.encoded_attempts == attribution_profile.captured_attempts),
+        attribution_profile.encoded_attempts,
+        attribution_profile.captured_attempts,
+        attribution_profile.useful_attempts,
+        signed_difference(attribution_profiled_ns, attribution_standard_ns),
+        attribution_profile.captured_pass_gap_ns,
+        attribution_profile.captured_pass_overlap_ns,
+        attribution_profiled_ns.saturating_sub(attribution_useful_ns),
+    );
+
     let estimated = median_timing(&profiles, |profile| profile.estimated_total);
     let useful = median_timing(&profiles, |profile| profile.useful);
     let termination = median_timing(&profiles, |profile| profile.termination);
@@ -268,9 +355,11 @@ fn main() {
     let captured_active_ns = useful.total_ns().saturating_add(termination.total_ns());
     let instrumented_residual_ns = median_profiled_device_ns.saturating_sub(captured_active_ns);
     println!(
-        "record=t15b_profile_summary config={relative} samples={samples} rounds={} transitions={} \
+        "record=t15b_profile_summary config={relative} samples={samples} \
+         aggregation=component_medians rounds={} transitions={} \
          standard_device_ns={} profiled_device_ns={} frequency_hz={} encoded_attempts={} \
          captured_attempts={} useful_attempts={} idle_sample_attempts={} \
+         captured_pass_gap_ns={} captured_pass_overlap_ns={} \
          captured_active_ns={captured_active_ns} \
          instrumented_residual_ns={instrumented_residual_ns} idle_extrapolated_total_ns={}",
         expected.rounds,
@@ -282,6 +371,18 @@ fn main() {
         profiles[0].captured_attempts,
         profiles[0].useful_attempts,
         profiles[0].idle_sample_attempts,
+        median(
+            profiles
+                .iter()
+                .map(|profile| profile.captured_pass_gap_ns)
+                .collect(),
+        ),
+        median(
+            profiles
+                .iter()
+                .map(|profile| profile.captured_pass_overlap_ns)
+                .collect(),
+        ),
         estimated.total_ns(),
     );
     for (index, (phase, idle_extrapolated_ns)) in phases(estimated).into_iter().enumerate() {

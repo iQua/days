@@ -29,6 +29,7 @@ fn main() {
         backend_wall_ns: u64,
         device_ns: u64,
         host_encode_submit_ns: u64,
+        encoded_attempts: u64,
         continuation_relaunches: u64,
         wave_boundary_syncs: u64,
         mid_round_wave_boundary_syncs: u64,
@@ -56,6 +57,7 @@ fn main() {
             backend_wall_ns: 0,
             device_ns: 0,
             host_encode_submit_ns: 0,
+            encoded_attempts: 0,
             continuation_relaunches: 0,
             wave_boundary_syncs: 0,
             mid_round_wave_boundary_syncs: 0,
@@ -96,6 +98,7 @@ fn main() {
             backend_wall_ns: 0,
             device_ns: 0,
             host_encode_submit_ns: 0,
+            encoded_attempts: 0,
             continuation_relaunches: 0,
             wave_boundary_syncs: 0,
             mid_round_wave_boundary_syncs: 0,
@@ -136,6 +139,7 @@ fn main() {
             backend_wall_ns: run.wall_ns,
             device_ns: run.device_ns,
             host_encode_submit_ns: run.host_encode_submit_ns,
+            encoded_attempts: run.encoded_attempts,
             continuation_relaunches: run.continuation_relaunches,
             wave_boundary_syncs: run.wave_boundary_syncs,
             mid_round_wave_boundary_syncs: run.mid_round_wave_boundary_syncs,
@@ -148,7 +152,7 @@ fn main() {
         println!(
             "record=t15a_{kind} config={fixture} sample={} order={} backend={} workers={} \
              threadgroup_width={} rounds={} transitions={} end_to_end_ns={} backend_wall_ns={} \
-             device_ns={} host_encode_submit_ns={} continuation_relaunches={} \
+             device_ns={} host_encode_submit_ns={} encoded_attempts={} continuation_relaunches={} \
              wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
             measurement.sample,
             measurement.order,
@@ -161,6 +165,7 @@ fn main() {
             measurement.backend_wall_ns,
             measurement.device_ns,
             measurement.host_encode_submit_ns,
+            measurement.encoded_attempts,
             measurement.continuation_relaunches,
             measurement.wave_boundary_syncs,
             measurement.mid_round_wave_boundary_syncs,
