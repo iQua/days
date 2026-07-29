@@ -9,6 +9,8 @@ use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, boun
 
 use crate::event::is_same_time_tx_ready_continuation;
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use crate::safe_horizon::{RoundMetricsWindow, WindowedRunTotals};
 use crate::scalar::{
     ExecutionError, LocalNodeState, LocalTransitionResult, ObservationMode,
     PacketArrivalObservation, PacketDeparture, RunResult, RunSummary, TransitionState,
@@ -203,6 +205,104 @@ pub struct CpuRun {
     pub rounds: Vec<CpuRoundMetrics>,
 }
 
+/// CPU result with only one requested round-metrics window retained.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowedCpuRun {
+    pub result: RunResult,
+    pub rounds: Vec<CpuRoundMetrics>,
+    pub totals: WindowedRunTotals,
+}
+
+#[derive(Clone, Copy)]
+enum CpuMetricsRetention {
+    All,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    Window(RoundMetricsWindow),
+}
+
+impl CpuMetricsRetention {
+    fn retains(self, _round: usize) -> bool {
+        match self {
+            Self::All => true,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            Self::Window(window) => window.contains(_round),
+        }
+    }
+
+    fn retained_index(self, round: usize) -> Option<usize> {
+        if !self.retains(round) {
+            return None;
+        }
+        match self {
+            Self::All => Some(round),
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            Self::Window(window) => Some(round - window.start_round),
+        }
+    }
+}
+
+struct CpuMetricsCollector {
+    retention: CpuMetricsRetention,
+    rounds: Vec<CpuRoundMetrics>,
+    total_rounds: usize,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    window_totals: Option<WindowedRunTotals>,
+}
+
+impl CpuMetricsCollector {
+    fn new(retention: CpuMetricsRetention) -> Self {
+        Self {
+            retention,
+            rounds: Vec::new(),
+            total_rounds: 0,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            window_totals: match retention {
+                CpuMetricsRetention::All => None,
+                CpuMetricsRetention::Window(_) => Some(WindowedRunTotals::default()),
+            },
+        }
+    }
+
+    fn push(&mut self, round: u64, metrics: CpuRoundMetrics) -> Result<(), ExecutionError> {
+        let round =
+            usize::try_from(round).map_err(|_| ExecutionError::CounterOverflow(NodeId(0)))?;
+        if round != self.total_rounds {
+            return Err(ExecutionError::WorkerChannelDisconnected);
+        }
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        if let (CpuMetricsRetention::Window(window), Some(totals)) =
+            (self.retention, self.window_totals.as_mut())
+        {
+            totals.observe(
+                window,
+                round,
+                metrics.semantic.events_processed,
+                metrics.semantic.active_lp_count,
+            );
+        }
+        if self.retention.retains(round) {
+            self.rounds.push(metrics);
+        }
+        self.total_rounds = self
+            .total_rounds
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+        Ok(())
+    }
+
+    fn retained_mut(&mut self, round: u64) -> Option<&mut CpuRoundMetrics> {
+        let round = usize::try_from(round).ok()?;
+        let retained = self.retention.retained_index(round)?;
+        self.rounds.get_mut(retained)
+    }
+}
+
+struct CollectedCpuRun {
+    result: RunResult,
+    metrics: CpuMetricsCollector,
+}
+
 /// Runs exact safe-horizon rounds with persistent CPU workers.
 pub fn run_cpu(
     image: &SimulationImage,
@@ -224,6 +324,52 @@ pub fn run_cpu_with_observations(
     config: CpuConfig,
     observation_mode: ObservationMode,
 ) -> Result<CpuRun, ExecutionError> {
+    let run = run_cpu_collecting_metrics(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        CpuMetricsRetention::All,
+    )?;
+    Ok(CpuRun {
+        result: run.result,
+        rounds: run.metrics.rounds,
+    })
+}
+
+/// Runs the full CPU path while retaining only one contiguous metrics window.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub fn run_cpu_with_metrics_window(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: CpuConfig,
+    window: RoundMetricsWindow,
+) -> Result<WindowedCpuRun, ExecutionError> {
+    window.end_round()?;
+    let run = run_cpu_collecting_metrics(
+        image,
+        exclusive_horizon_ns,
+        config,
+        ObservationMode::Summary,
+        CpuMetricsRetention::Window(window),
+    )?;
+    Ok(WindowedCpuRun {
+        result: run.result,
+        rounds: run.metrics.rounds,
+        totals: run
+            .metrics
+            .window_totals
+            .expect("windowed CPU execution collects phase totals"),
+    })
+}
+
+fn run_cpu_collecting_metrics(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: CpuConfig,
+    observation_mode: ObservationMode,
+    retention: CpuMetricsRetention,
+) -> Result<CollectedCpuRun, ExecutionError> {
     validate_config(config)?;
     if config.granularity == ChunkGranularity::Static && config.straggler_threshold_events.is_some()
     {
@@ -232,6 +378,7 @@ pub fn run_cpu_with_observations(
             exclusive_horizon_ns,
             config,
             observation_mode,
+            retention,
         );
     }
     if config.granularity == ChunkGranularity::Static {
@@ -240,6 +387,7 @@ pub fn run_cpu_with_observations(
             exclusive_horizon_ns,
             config,
             observation_mode,
+            retention,
         );
     }
     let lps = build_lps(image, observation_mode)?;
@@ -311,6 +459,7 @@ pub fn run_cpu_with_observations(
             &commands,
             &reply_rx,
             &routes,
+            retention,
         );
         drop(commands);
         match result {
@@ -360,7 +509,8 @@ fn run_owned_static_cpu_with_observations(
     exclusive_horizon_ns: Option<u64>,
     config: CpuConfig,
     observation_mode: ObservationMode,
-) -> Result<CpuRun, ExecutionError> {
+    retention: CpuMetricsRetention,
+) -> Result<CollectedCpuRun, ExecutionError> {
     let lps = build_lps(image, observation_mode)?;
     let (shards, placement) = partition_static_ownership(lps, image, config)?;
     let minimum_lookahead_ns = image
@@ -433,6 +583,7 @@ fn run_owned_static_cpu_with_observations(
             minimum_lookahead_ns,
             &commands,
             &reply_rx,
+            retention,
         );
         drop(commands);
         match result {
@@ -452,7 +603,8 @@ fn run_classified_static_cpu_with_observations(
     exclusive_horizon_ns: Option<u64>,
     config: CpuConfig,
     observation_mode: ObservationMode,
-) -> Result<CpuRun, ExecutionError> {
+    retention: CpuMetricsRetention,
+) -> Result<CollectedCpuRun, ExecutionError> {
     let lps = build_lps(image, observation_mode)?;
     let ownership_config = CpuConfig {
         straggler_threshold_events: None,
@@ -550,6 +702,7 @@ fn run_classified_static_cpu_with_observations(
             minimum_lookahead_ns,
             &commands,
             &reply_rx,
+            retention,
         );
         drop(commands);
         match result {
@@ -1996,6 +2149,7 @@ impl RoundExecution<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_coordinator<'image>(
     image: &'image SimulationImage,
     config: CpuConfig,
@@ -2004,9 +2158,10 @@ fn run_coordinator<'image>(
     commands: &[Sender<WorkerCommand<'image>>],
     replies: &Receiver<WorkerReply<'image>>,
     routes: &[OwnerRoutes],
-) -> Result<CpuRun, ExecutionError> {
+    retention: CpuMetricsRetention,
+) -> Result<CollectedCpuRun, ExecutionError> {
     let mut previous_horizon = None;
-    let mut rounds = Vec::new();
+    let mut metrics = CpuMetricsCollector::new(retention);
     let mut round_number = 0_u64;
     let mut minima = vec![None; config.workers];
     for _ in 0..config.workers {
@@ -2194,62 +2349,65 @@ fn run_coordinator<'image>(
         } else {
             total_worker_busy as f64 / available_worker_time as f64
         };
-        rounds.push(CpuRoundMetrics {
-            semantic: RoundMetrics {
-                frontier_ns,
-                exclusive_horizon_ns,
-                horizon_advance_ns,
-                events_processed,
-                active_lp_count,
-                lp_work,
-                parallel_efficiency,
-                messages_exchanged,
-                frontier_updates,
-                frontier_heap_pops,
-                physical_lp_probes,
+        metrics.push(
+            round_number,
+            CpuRoundMetrics {
+                semantic: RoundMetrics {
+                    frontier_ns,
+                    exclusive_horizon_ns,
+                    horizon_advance_ns,
+                    events_processed,
+                    active_lp_count,
+                    lp_work,
+                    parallel_efficiency,
+                    messages_exchanged,
+                    frontier_updates,
+                    frontier_heap_pops,
+                    physical_lp_probes,
+                },
+                partition,
+                owner_batch_messages,
+                worker_wake_messages: u64::try_from(
+                    config
+                        .workers
+                        .saturating_mul(2)
+                        .saturating_add(round_chunks),
+                )
+                .unwrap_or(u64::MAX),
+                worker_completion_messages: u64::try_from(
+                    config
+                        .workers
+                        .saturating_mul(2)
+                        .saturating_add(round_chunks.saturating_mul(2)),
+                )
+                .unwrap_or(u64::MAX),
+                chunk_request_messages: 0,
+                classification_presence_messages: 0,
+                classification_work_messages: 0,
+                classification_return_messages: 0,
+                owner_delivery_messages: owner_batch_messages,
+                owner_batches_merged: 0,
+                early_owner_batches_merged: 0,
+                owner_merge_ns: 0,
+                early_owner_merge_ns: 0,
+                lp_timings,
+                worker_timings,
+                lp_time_parallel_efficiency,
+                worker_parallel_efficiency,
+                worker_utilization,
+                coordinator_partition_ns: 0,
+                worker_wait_ns: 0,
+                coordinator_exchange_ns: 0,
+                round_wall_time_ns,
             },
-            partition,
-            owner_batch_messages,
-            worker_wake_messages: u64::try_from(
-                config
-                    .workers
-                    .saturating_mul(2)
-                    .saturating_add(round_chunks),
-            )
-            .unwrap_or(u64::MAX),
-            worker_completion_messages: u64::try_from(
-                config
-                    .workers
-                    .saturating_mul(2)
-                    .saturating_add(round_chunks.saturating_mul(2)),
-            )
-            .unwrap_or(u64::MAX),
-            chunk_request_messages: 0,
-            classification_presence_messages: 0,
-            classification_work_messages: 0,
-            classification_return_messages: 0,
-            owner_delivery_messages: owner_batch_messages,
-            owner_batches_merged: 0,
-            early_owner_batches_merged: 0,
-            owner_merge_ns: 0,
-            early_owner_merge_ns: 0,
-            lp_timings,
-            worker_timings,
-            lp_time_parallel_efficiency,
-            worker_parallel_efficiency,
-            worker_utilization,
-            coordinator_partition_ns: 0,
-            worker_wait_ns: 0,
-            coordinator_exchange_ns: 0,
-            round_wall_time_ns,
-        });
+        )?;
         previous_horizon = Some(exclusive_horizon_ns);
         round_number = round_number
             .checked_add(1)
             .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
     }
 
-    finish_workers(image, commands, replies, rounds)
+    finish_workers(image, commands, replies, metrics)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2260,7 +2418,8 @@ fn run_owned_static_coordinator<'image>(
     minimum_lookahead_ns: Option<u64>,
     commands: &[Sender<OwnedWorkerCommand>],
     replies: &Receiver<OwnedWorkerReply<'image>>,
-) -> Result<CpuRun, ExecutionError> {
+    retention: CpuMetricsRetention,
+) -> Result<CollectedCpuRun, ExecutionError> {
     let mut minima = vec![None; config.workers];
     let mut ready = vec![false; config.workers];
     for _ in 0..config.workers {
@@ -2276,7 +2435,7 @@ fn run_owned_static_coordinator<'image>(
 
     let mut expected_inbound_batches = vec![0_u64; config.workers];
     let mut previous_horizon = None;
-    let mut rounds = Vec::<CpuRoundMetrics>::new();
+    let mut metrics = CpuMetricsCollector::new(retention);
     let mut round_number = 0_u64;
     while let Some(frontier_ns) = minima.iter().copied().flatten().min() {
         if u128::from(frontier_ns) >= run_end {
@@ -2368,7 +2527,10 @@ fn run_owned_static_coordinator<'image>(
         let worker_wait_ns = elapsed_ns(wait_started);
         // Resident workers merge the preceding barrier's inbox on this wake. Keep the physical
         // timing here, but attribute its deterministic frontier work to the producing round.
-        if let Some(previous) = rounds.last_mut() {
+        if let Some(previous) = round_number
+            .checked_sub(1)
+            .and_then(|round| metrics.retained_mut(round))
+        {
             previous.semantic.frontier_updates = previous
                 .semantic
                 .frontier_updates
@@ -2501,55 +2663,58 @@ fn run_owned_static_coordinator<'image>(
         } else {
             total_worker_busy as f64 / available_worker_time as f64
         };
-        rounds.push(CpuRoundMetrics {
-            semantic: RoundMetrics {
-                frontier_ns,
-                exclusive_horizon_ns,
-                horizon_advance_ns,
-                events_processed,
-                active_lp_count,
-                lp_work,
-                parallel_efficiency,
-                messages_exchanged,
-                frontier_updates,
-                frontier_heap_pops,
-                physical_lp_probes,
+        metrics.push(
+            round_number,
+            CpuRoundMetrics {
+                semantic: RoundMetrics {
+                    frontier_ns,
+                    exclusive_horizon_ns,
+                    horizon_advance_ns,
+                    events_processed,
+                    active_lp_count,
+                    lp_work,
+                    parallel_efficiency,
+                    messages_exchanged,
+                    frontier_updates,
+                    frontier_heap_pops,
+                    physical_lp_probes,
+                },
+                partition,
+                owner_batch_messages,
+                worker_wake_messages: config.workers as u64,
+                worker_completion_messages: config.workers as u64,
+                chunk_request_messages: 0,
+                classification_presence_messages: if classified {
+                    u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                classification_work_messages: if classified {
+                    u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                classification_return_messages: if classified {
+                    u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                owner_delivery_messages: owner_batch_messages,
+                owner_batches_merged: if classified { owner_batch_messages } else { 0 },
+                early_owner_batches_merged: 0,
+                owner_merge_ns: 0,
+                early_owner_merge_ns: 0,
+                lp_timings,
+                worker_timings,
+                lp_time_parallel_efficiency,
+                worker_parallel_efficiency,
+                worker_utilization,
+                coordinator_partition_ns,
+                worker_wait_ns,
+                coordinator_exchange_ns,
+                round_wall_time_ns,
             },
-            partition,
-            owner_batch_messages,
-            worker_wake_messages: config.workers as u64,
-            worker_completion_messages: config.workers as u64,
-            chunk_request_messages: 0,
-            classification_presence_messages: if classified {
-                u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
-            } else {
-                0
-            },
-            classification_work_messages: if classified {
-                u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
-            } else {
-                0
-            },
-            classification_return_messages: if classified {
-                u64::try_from(config.workers.saturating_mul(config.workers)).unwrap_or(u64::MAX)
-            } else {
-                0
-            },
-            owner_delivery_messages: owner_batch_messages,
-            owner_batches_merged: if classified { owner_batch_messages } else { 0 },
-            early_owner_batches_merged: 0,
-            owner_merge_ns: 0,
-            early_owner_merge_ns: 0,
-            lp_timings,
-            worker_timings,
-            lp_time_parallel_efficiency,
-            worker_parallel_efficiency,
-            worker_utilization,
-            coordinator_partition_ns,
-            worker_wait_ns,
-            coordinator_exchange_ns,
-            round_wall_time_ns,
-        });
+        )?;
         previous_horizon = Some(exclusive_horizon_ns);
         round_number = round_number
             .checked_add(1)
@@ -2603,7 +2768,10 @@ fn run_owned_static_coordinator<'image>(
         }
     }
     // Messages at or beyond run_end are merged only for final-state assembly.
-    if let Some(last) = rounds.last_mut() {
+    if let Some(last) = round_number
+        .checked_sub(1)
+        .and_then(|round| metrics.retained_mut(round))
+    {
         last.semantic.frontier_updates = last
             .semantic
             .frontier_updates
@@ -2633,9 +2801,9 @@ fn run_owned_static_coordinator<'image>(
             add_worker_merge_timing(last, worker, busy_ns);
         }
     }
-    Ok(CpuRun {
+    Ok(CollectedCpuRun {
         result: assemble_result(image, lps)?,
-        rounds,
+        metrics,
     })
 }
 
@@ -3343,8 +3511,8 @@ fn finish_workers<'image>(
     image: &SimulationImage,
     commands: &[Sender<WorkerCommand<'image>>],
     replies: &Receiver<WorkerReply<'image>>,
-    rounds: Vec<CpuRoundMetrics>,
-) -> Result<CpuRun, ExecutionError> {
+    metrics: CpuMetricsCollector,
+) -> Result<CollectedCpuRun, ExecutionError> {
     for command in commands {
         send_command(command, WorkerCommand::Finish)?;
     }
@@ -3363,9 +3531,9 @@ fn finish_workers<'image>(
         .flatten()
         .flatten()
         .collect::<Vec<_>>();
-    Ok(CpuRun {
+    Ok(CollectedCpuRun {
         result: assemble_result(image, lps)?,
-        rounds,
+        metrics,
     })
 }
 

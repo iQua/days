@@ -270,6 +270,26 @@ impl RealReplayTrace {
         selected.validate()?;
         Ok(selected)
     }
+
+    /// Counts one event kind in each retained source round.
+    pub fn event_counts_by_round(&self, kind: EventKind) -> Result<Vec<u64>, MetalSpikeError> {
+        self.validate()?;
+        self.rounds
+            .iter()
+            .map(|round| {
+                let count = self.lps[round.lp_start..round.lp_start + round.lp_count]
+                    .iter()
+                    .flat_map(|lp| &self.steps[lp.step_start..lp.step_start + lp.step_count])
+                    .filter(|step| step.kind() == kind)
+                    .count();
+                u64::try_from(count).map_err(|_| {
+                    MetalSpikeError::InvalidBenchmarkConfig(
+                        "per-round replay event count exceeds u64",
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct RecordedReplayLp {

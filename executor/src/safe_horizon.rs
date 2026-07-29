@@ -64,6 +64,99 @@ pub struct ScalarRoundRun {
     pub rounds: Vec<RoundMetrics>,
 }
 
+/// Contiguous safe-horizon round window retained by the T13e spike harness.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoundMetricsWindow {
+    pub start_round: usize,
+    pub rounds: usize,
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+impl RoundMetricsWindow {
+    pub(crate) fn end_round(self) -> Result<usize, ExecutionError> {
+        if self.rounds == 0 {
+            return Err(ExecutionError::InvalidCpuConfig(
+                "round metrics window requires at least one round",
+            ));
+        }
+        self.start_round
+            .checked_add(self.rounds)
+            .ok_or(ExecutionError::InvalidCpuConfig(
+                "round metrics window end overflows usize",
+            ))
+    }
+
+    pub(crate) fn contains(self, round: usize) -> bool {
+        round >= self.start_round && round - self.start_round < self.rounds
+    }
+}
+
+/// Lightweight aggregate for one phase of a windowed full run.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoundRunTotals {
+    pub rounds: usize,
+    pub events_processed: u128,
+    pub active_lp_rounds: u128,
+    pub maximum_active_lps: usize,
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+impl RoundRunTotals {
+    fn observe(&mut self, events_processed: u64, active_lp_count: usize) {
+        self.rounds = self.rounds.saturating_add(1);
+        self.events_processed = self
+            .events_processed
+            .saturating_add(u128::from(events_processed));
+        self.active_lp_rounds = self
+            .active_lp_rounds
+            .saturating_add(active_lp_count as u128);
+        self.maximum_active_lps = self.maximum_active_lps.max(active_lp_count);
+    }
+}
+
+/// Whole-run and phase totals retained without keeping per-LP metrics outside the window.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowedRunTotals {
+    pub whole_run: RoundRunTotals,
+    pub before_window: RoundRunTotals,
+    pub retained_window: RoundRunTotals,
+    pub after_window: RoundRunTotals,
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+impl WindowedRunTotals {
+    pub(crate) fn observe(
+        &mut self,
+        window: RoundMetricsWindow,
+        round: usize,
+        events_processed: u64,
+        active_lp_count: usize,
+    ) {
+        self.whole_run.observe(events_processed, active_lp_count);
+        if round < window.start_round {
+            self.before_window
+                .observe(events_processed, active_lp_count);
+        } else if window.contains(round) {
+            self.retained_window
+                .observe(events_processed, active_lp_count);
+        } else {
+            self.after_window.observe(events_processed, active_lp_count);
+        }
+    }
+}
+
+/// Scalar result with only one requested round-metrics window retained.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowedScalarRoundRun {
+    pub result: RunResult,
+    pub rounds: Vec<RoundMetrics>,
+    pub totals: WindowedRunTotals,
+}
+
 /// Runs the single-threaded safe-horizon executor through the configured inclusive stop.
 ///
 /// `exclusive_horizon_ns` is an optional half-open partial-run boundary, exactly as in
@@ -99,6 +192,47 @@ pub fn run_scalar_rounds_with_replay_trace(
     let mut executor = RoundExecutor::new(image, ObservationMode::Summary)?;
     executor.replay_trace = Some(RealReplayTraceBuilder::new(capture));
     executor.run_with_replay_trace(exclusive_horizon_ns)
+}
+
+/// Records and retains only the requested real-image window while executing the full scalar run.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub fn run_scalar_rounds_with_windowed_replay_trace(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    window: RoundMetricsWindow,
+) -> Result<(WindowedScalarRoundRun, RealReplayTrace), ExecutionError> {
+    window.end_round()?;
+    let mut executor = RoundExecutor::new(image, ObservationMode::Summary)?;
+    executor.replay_trace = Some(RealReplayTraceBuilder::new(ReplayTraceCapture {
+        start_round: window.start_round,
+        rounds: window.rounds,
+    }));
+    executor.run_with_windowed_replay_trace(exclusive_horizon_ns, window)
+}
+
+#[derive(Clone, Copy)]
+enum RoundRetention {
+    All,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    Window(RoundMetricsWindow),
+}
+
+impl RoundRetention {
+    fn retains(self, _round: usize) -> bool {
+        match self {
+            Self::All => true,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            Self::Window(window) => window.contains(_round),
+        }
+    }
+}
+
+struct ExecutedRounds {
+    retained: Vec<RoundMetrics>,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    total_rounds: usize,
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    window_totals: Option<WindowedRunTotals>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -266,8 +400,8 @@ impl<'image> RoundExecutor<'image> {
             .map(u128::from)
             .unwrap_or(TIME_AFTER_U64_MAX)
             .min(configured_stop);
-        let rounds = self.execute_rounds(run_end)?;
-        Ok(self.finish(rounds))
+        let rounds = self.execute_rounds(run_end, RoundRetention::All)?;
+        Ok(self.finish(rounds.retained))
     }
 
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -280,18 +414,57 @@ impl<'image> RoundExecutor<'image> {
             .map(u128::from)
             .unwrap_or(TIME_AFTER_U64_MAX)
             .min(configured_stop);
-        let rounds = self.execute_rounds(run_end)?;
+        let rounds = self.execute_rounds(run_end, RoundRetention::All)?;
         let trace = self
             .replay_trace
             .take()
             .expect("trace execution installs a trace builder")
-            .finish(rounds.len());
-        Ok((self.finish(rounds), trace))
+            .finish(rounds.total_rounds);
+        Ok((self.finish(rounds.retained), trace))
     }
 
-    fn execute_rounds(&mut self, run_end: u128) -> Result<Vec<RoundMetrics>, ExecutionError> {
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    fn run_with_windowed_replay_trace(
+        mut self,
+        exclusive_horizon_ns: Option<u64>,
+        window: RoundMetricsWindow,
+    ) -> Result<(WindowedScalarRoundRun, RealReplayTrace), ExecutionError> {
+        let configured_stop = u128::from(self.image.stop_time_ns) + 1;
+        let run_end = exclusive_horizon_ns
+            .map(u128::from)
+            .unwrap_or(TIME_AFTER_U64_MAX)
+            .min(configured_stop);
+        let rounds = self.execute_rounds(run_end, RoundRetention::Window(window))?;
+        let trace = self
+            .replay_trace
+            .take()
+            .expect("trace execution installs a trace builder")
+            .finish(rounds.total_rounds);
+        Ok((
+            WindowedScalarRoundRun {
+                result: self.finish_result(),
+                rounds: rounds.retained,
+                totals: rounds
+                    .window_totals
+                    .expect("windowed execution collects phase totals"),
+            },
+            trace,
+        ))
+    }
+
+    fn execute_rounds(
+        &mut self,
+        run_end: u128,
+        retention: RoundRetention,
+    ) -> Result<ExecutedRounds, ExecutionError> {
         let mut previous_horizon = None;
         let mut rounds = Vec::new();
+        let mut total_rounds = 0_usize;
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        let mut window_totals = match retention {
+            RoundRetention::All => None,
+            RoundRetention::Window(_) => Some(WindowedRunTotals::default()),
+        };
 
         loop {
             let mut frontier_heap_pops = 0;
@@ -331,7 +504,7 @@ impl<'image> RoundExecutor<'image> {
             let capture_replay = self
                 .replay_trace
                 .as_ref()
-                .is_some_and(|trace| trace.captures(rounds.len()));
+                .is_some_and(|trace| trace.captures(total_rounds));
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             let mut replay_rows = Vec::with_capacity(if capture_replay { active.len() } else { 0 });
             let mut events_processed = 0_u64;
@@ -420,7 +593,7 @@ impl<'image> RoundExecutor<'image> {
                     .as_mut()
                     .expect("capture flag requires a trace builder")
                     .push_round(
-                        rounds.len(),
+                        total_rounds,
                         frontier_ns,
                         horizon,
                         events_processed,
@@ -428,7 +601,7 @@ impl<'image> RoundExecutor<'image> {
                         replay_rows,
                     );
             }
-            rounds.push(RoundMetrics {
+            let metrics = RoundMetrics {
                 frontier_ns,
                 exclusive_horizon_ns: horizon,
                 horizon_advance_ns,
@@ -440,24 +613,51 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates,
                 frontier_heap_pops,
                 physical_lp_probes,
-            });
+            };
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            if let (RoundRetention::Window(window), Some(totals)) =
+                (retention, window_totals.as_mut())
+            {
+                totals.observe(
+                    window,
+                    total_rounds,
+                    events_processed,
+                    metrics.active_lp_count,
+                );
+            }
+            if retention.retains(total_rounds) {
+                rounds.push(metrics);
+            }
+            total_rounds = total_rounds
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
             previous_horizon = Some(horizon);
         }
 
-        Ok(rounds)
+        Ok(ExecutedRounds {
+            retained: rounds,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            total_rounds,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            window_totals,
+        })
     }
 
     fn finish(self, rounds: Vec<RoundMetrics>) -> ScalarRoundRun {
+        ScalarRoundRun {
+            result: self.finish_result(),
+            rounds,
+        }
+    }
+
+    fn finish_result(self) -> RunResult {
         let mut pending_events = self
             .futures
             .into_iter()
             .flat_map(BTreeMap::into_values)
             .collect::<Vec<_>>();
         pending_events.sort_unstable_by_key(|event| event.key);
-        ScalarRoundRun {
-            result: self.transitions.finish(pending_events),
-            rounds,
-        }
+        self.transitions.finish(pending_events)
     }
 
     fn drain_lp(
@@ -926,7 +1126,9 @@ mod tests {
         let run_end = u128::from(image.stop_time_ns) + 1;
         let mut executor = RoundExecutor::new(&image, ObservationMode::Summary).unwrap();
         let start = Instant::now();
-        let rounds = executor.execute_rounds(run_end).unwrap();
+        let rounds = executor
+            .execute_rounds(run_end, RoundRetention::All)
+            .unwrap();
         let elapsed = start.elapsed().as_nanos();
         black_box(rounds);
         elapsed

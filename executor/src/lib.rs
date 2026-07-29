@@ -19,6 +19,8 @@ pub use cpu::{
     LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass, WorkPartition,
     WorkerRoundTiming, run_cpu, run_cpu_with_observations,
 };
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub use cpu::{WindowedCpuRun, run_cpu_with_metrics_window};
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
     ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
@@ -34,6 +36,11 @@ pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{
     LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
     run_scalar_rounds_with_observations,
+};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+pub use safe_horizon::{
+    RoundMetricsWindow, RoundRunTotals, WindowedRunTotals, WindowedScalarRoundRun,
+    run_scalar_rounds_with_windowed_replay_trace,
 };
 pub use scalar::{
     ArrivalDisposition, ExecutionError, ObservationMode, PacketArrivalObservation, PacketDeparture,

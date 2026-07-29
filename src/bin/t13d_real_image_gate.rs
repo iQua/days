@@ -1,6 +1,6 @@
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 mod app {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::error::Error;
     use std::io;
@@ -13,8 +13,9 @@ mod app {
     };
     use days_executor::{
         Backend, CpuConfig, EventKind, RealReplayTrace, ReplayTraceCapture, RoundMetrics,
-        RunResult, RunSummary, SimulationImage, run_cpu, run_scalar_rounds_with_replay_trace,
-        validate,
+        RoundMetricsWindow, RunResult, RunSummary, SimulationImage, WindowedRunTotals, run_cpu,
+        run_cpu_with_metrics_window, run_scalar_rounds_with_replay_trace,
+        run_scalar_rounds_with_windowed_replay_trace, validate,
     };
 
     const LOWER_CPU_VALIDATION_WORKERS: usize = 4;
@@ -44,6 +45,19 @@ mod app {
                 measured_rounds,
                 &cpu_worker_counts,
             ),
+            Command::T13eGate {
+                config,
+                start_round,
+                warmup_rounds,
+                measured_rounds,
+                cpu_worker_counts,
+            } => t13e_gate(
+                &config,
+                start_round,
+                warmup_rounds,
+                measured_rounds,
+                &cpu_worker_counts,
+            ),
         }
     }
 
@@ -62,6 +76,13 @@ mod app {
             workers: usize,
         },
         Gate {
+            config: String,
+            start_round: usize,
+            warmup_rounds: usize,
+            measured_rounds: usize,
+            cpu_worker_counts: Vec<usize>,
+        },
+        T13eGate {
             config: String,
             start_round: usize,
             warmup_rounds: usize,
@@ -109,6 +130,22 @@ mod app {
                     "cpu_worker_counts",
                 )?)?,
             },
+            "t13e-gate" => Command::T13eGate {
+                config: required_arg(&mut args, "config")?,
+                start_round: parse_usize(required_arg(&mut args, "start_round")?, "start_round")?,
+                warmup_rounds: parse_usize(
+                    required_arg(&mut args, "warmup_rounds")?,
+                    "warmup_rounds",
+                )?,
+                measured_rounds: parse_usize(
+                    required_arg(&mut args, "measured_rounds")?,
+                    "measured_rounds",
+                )?,
+                cpu_worker_counts: parse_worker_counts(required_arg(
+                    &mut args,
+                    "cpu_worker_counts",
+                )?)?,
+            },
             _ => return Err(usage_error()),
         };
         if args.next().is_some() {
@@ -122,6 +159,12 @@ mod app {
                 ..
             }
             | Command::Gate {
+                start_round,
+                warmup_rounds,
+                measured_rounds,
+                ..
+            }
+            | Command::T13eGate {
                 start_round,
                 warmup_rounds,
                 measured_rounds,
@@ -151,7 +194,8 @@ mod app {
             "usage: t13d_real_image_gate lower CONFIG | \
              scalar-trace CONFIG START_ROUND WARMUP_ROUNDS MEASURED_ROUNDS | \
              cpu CONFIG WORKERS | \
-             gate CONFIG START_ROUND WARMUP_ROUNDS MEASURED_ROUNDS CPU_WORKERS_CSV",
+             gate CONFIG START_ROUND WARMUP_ROUNDS MEASURED_ROUNDS CPU_WORKERS_CSV | \
+             t13e-gate CONFIG START_ROUND WARMUP_ROUNDS MEASURED_ROUNDS CPU_WORKERS_CSV",
         )
     }
 
@@ -338,6 +382,194 @@ mod app {
         print_trace(&trace, start_round, warmup_rounds, measured_rounds)?;
         drop(scalar);
 
+        run_resident_gate(
+            config,
+            trace,
+            warmup_rounds,
+            measured_rounds,
+            cpu_worker_counts,
+        )
+    }
+
+    fn t13e_gate(
+        config: &str,
+        start_round: usize,
+        warmup_rounds: usize,
+        measured_rounds: usize,
+        cpu_worker_counts: &[usize],
+    ) -> Result<(), BoxError> {
+        if warmup_rounds == 0 {
+            return Err(input_error(
+                "the T13e real-image gate requires warmup rounds",
+            ));
+        }
+        let capture_rounds = warmup_rounds
+            .checked_add(measured_rounds)
+            .ok_or_else(|| input_error("warmup_rounds + measured_rounds overflows usize"))?;
+        let window = RoundMetricsWindow {
+            start_round,
+            rounds: capture_rounds,
+        };
+        let (image, lowering_wall_ns) = lower_image(config)?;
+        validate(&image, Backend::Scalar)?;
+        for &workers in cpu_worker_counts {
+            validate(&image, Backend::Cpu { workers })?;
+        }
+
+        eprintln!(
+            "running full scalar path with retained rounds [{}, {})",
+            start_round,
+            start_round + capture_rounds,
+        );
+        let scalar_timer = Instant::now();
+        let (scalar, trace) = run_scalar_rounds_with_windowed_replay_trace(&image, None, window)?;
+        let scalar_wall_ns = scalar_timer.elapsed().as_nanos();
+        trace.validate()?;
+        validate_capture(&trace, start_round, capture_rounds)?;
+        let source_activity =
+            validate_measured_source_activity(&trace, warmup_rounds, measured_rounds)?;
+        let scalar_stats = summarize_rounds(scalar.rounds.iter())?;
+
+        print_image(config, &image, lowering_wall_ns);
+        print_run(
+            config,
+            "t13e_scalar_gate_trace",
+            1,
+            scalar_wall_ns,
+            &scalar_stats,
+            None,
+        );
+        print_window_totals(
+            config,
+            "t13e_scalar_gate_trace",
+            1,
+            scalar.rounds.len(),
+            &scalar.totals,
+        );
+        print_result("t13e_scalar_gate_trace", 1, &scalar.result);
+        print_trace(&trace, start_round, warmup_rounds, measured_rounds)?;
+        println!(
+            "record=t13e_source_activity config={} measured_rounds={} \
+             source_active_rounds={} minimum_packet_arrivals_per_round={} \
+             total_packet_arrivals={}",
+            display_path(config),
+            measured_rounds,
+            source_activity.active_rounds,
+            source_activity.minimum_packet_arrivals_per_round,
+            source_activity.total_packet_arrivals,
+        );
+
+        eprintln!("running full W4 CPU path with the same retained window");
+        let cpu_timer = Instant::now();
+        let cpu = run_cpu_with_metrics_window(
+            &image,
+            None,
+            CpuConfig {
+                workers: 4,
+                ..CpuConfig::default()
+            },
+            window,
+        )?;
+        let cpu_wall_ns = cpu_timer.elapsed().as_nanos();
+        let cpu_stats = summarize_rounds(cpu.rounds.iter().map(|round| &round.semantic))?;
+        let mean_round_wall_ns = mean_u64(cpu.rounds.iter().map(|round| round.round_wall_time_ns))?;
+        print_run(
+            config,
+            "t13e_cpu",
+            4,
+            cpu_wall_ns,
+            &cpu_stats,
+            Some(mean_round_wall_ns),
+        );
+        print_window_totals(config, "t13e_cpu", 4, cpu.rounds.len(), &cpu.totals);
+        print_result("t13e_cpu", 4, &cpu.result);
+
+        if scalar.result != cpu.result {
+            return Err(input_error(
+                "T13e full scalar and W4 CPU results differ for the same image",
+            ));
+        }
+        if scalar.totals != cpu.totals {
+            return Err(input_error(
+                "T13e full scalar and W4 CPU round/event totals differ",
+            ));
+        }
+        println!(
+            "record=t13e_path_equality config={} scalar_mode=t13e_scalar_gate_trace \
+             cpu_mode=t13e_cpu cpu_workers=4 result_equal=true totals_equal=true \
+             scalar_wall_ns={} cpu_wall_ns={}",
+            display_path(config),
+            scalar_wall_ns,
+            cpu_wall_ns,
+        );
+        drop(cpu);
+        drop(scalar);
+        drop(image);
+
+        run_resident_gate(
+            config,
+            trace,
+            warmup_rounds,
+            measured_rounds,
+            cpu_worker_counts,
+        )
+    }
+
+    struct SourceActivity {
+        active_rounds: usize,
+        minimum_packet_arrivals_per_round: u64,
+        total_packet_arrivals: u128,
+    }
+
+    fn validate_measured_source_activity(
+        trace: &RealReplayTrace,
+        warmup_rounds: usize,
+        measured_rounds: usize,
+    ) -> Result<SourceActivity, BoxError> {
+        let measured_end = warmup_rounds
+            .checked_add(measured_rounds)
+            .ok_or_else(|| input_error("measured source-activity window overflows usize"))?;
+        let rounds = trace
+            .rounds
+            .get(warmup_rounds..measured_end)
+            .ok_or_else(|| input_error("measured source-activity window exceeds trace"))?;
+        let packet_arrivals = trace.event_counts_by_round(EventKind::PacketArrival)?;
+        let packet_arrivals = packet_arrivals
+            .get(warmup_rounds..measured_end)
+            .ok_or_else(|| input_error("measured source-activity counts exceed trace"))?;
+        let mut active_rounds = 0;
+        let mut minimum_packet_arrivals_per_round = u64::MAX;
+        let mut total_packet_arrivals = 0_u128;
+
+        for (round, &packet_arrivals) in rounds.iter().zip(packet_arrivals) {
+            if packet_arrivals == 0 {
+                return Err(input_error(&format!(
+                    "T13e measured source round {} has no PacketArrival events",
+                    round.source_round
+                )));
+            }
+            active_rounds += 1;
+            minimum_packet_arrivals_per_round =
+                minimum_packet_arrivals_per_round.min(packet_arrivals);
+            total_packet_arrivals = total_packet_arrivals
+                .checked_add(u128::from(packet_arrivals))
+                .ok_or_else(|| input_error("measured source-activity total overflows u128"))?;
+        }
+
+        Ok(SourceActivity {
+            active_rounds,
+            minimum_packet_arrivals_per_round,
+            total_packet_arrivals,
+        })
+    }
+
+    fn run_resident_gate(
+        config: &str,
+        trace: RealReplayTrace,
+        warmup_rounds: usize,
+        measured_rounds: usize,
+        cpu_worker_counts: &[usize],
+    ) -> Result<(), BoxError> {
         let warmup_indices = (0..warmup_rounds).collect::<Vec<_>>();
         let measured_indices = (warmup_rounds..warmup_rounds + measured_rounds).collect::<Vec<_>>();
         let warmup = trace.selected_rounds(&warmup_indices)?;
@@ -535,10 +767,40 @@ mod app {
     }
 
     fn print_image(config: &str, image: &SimulationImage, lowering_wall_ns: u128) {
+        let route_source_lps = image
+            .flows
+            .iter()
+            .flat_map(|flow| &flow.route)
+            .filter_map(|link_id| {
+                usize::try_from(link_id.0)
+                    .ok()
+                    .and_then(|slot| image.links.get(slot))
+                    .filter(|link| link.id == *link_id)
+                    .map(|link| link.source)
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        let route_exposed_lps = image
+            .flows
+            .iter()
+            .flat_map(|flow| {
+                flow.route
+                    .iter()
+                    .filter_map(|link_id| {
+                        usize::try_from(link_id.0)
+                            .ok()
+                            .and_then(|slot| image.links.get(slot))
+                            .filter(|link| link.id == *link_id)
+                            .map(|link| link.source)
+                    })
+                    .chain(std::iter::once(flow.target))
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
         println!(
             "record=image config={} lowering_wall_ns={} stop_time_ns={} seed={} nodes={} \
              host_states={} switch_states={} flows={} initial_packets={} links={} channels={} \
-             initial_events={}",
+             initial_events={} route_source_lps={} route_exposed_lps={}",
             display_path(config),
             lowering_wall_ns,
             image.stop_time_ns,
@@ -551,6 +813,8 @@ mod app {
             image.links.len(),
             image.channels.len(),
             image.initial_events.len(),
+            route_source_lps,
+            route_exposed_lps,
         );
     }
 
@@ -704,6 +968,46 @@ mod app {
             stats.same_time_continuations,
             stats.physical_lp_probes,
             mean_round_wall_ns.map_or_else(|| "na".to_owned(), |value| format!("{value:.6}")),
+        );
+    }
+
+    fn print_window_totals(
+        config: &str,
+        mode: &str,
+        workers: usize,
+        retained_metrics: usize,
+        totals: &WindowedRunTotals,
+    ) {
+        println!(
+            "record=window_totals config={} mode={} workers={} total_rounds={} total_events={} \
+             whole_mean_active_lps={:.9} whole_max_active_lps={} retained_metrics={} \
+             retained_run_record_scope=retained_window ramp_rounds={} ramp_events={} \
+             ramp_mean_active_lps={:.9} ramp_max_active_lps={} retained_rounds={} \
+             retained_events={} retained_mean_active_lps={:.9} retained_max_active_lps={} \
+             drain_rounds={} drain_events={} drain_mean_active_lps={:.9} \
+             drain_max_active_lps={}",
+            display_path(config),
+            mode,
+            workers,
+            totals.whole_run.rounds,
+            totals.whole_run.events_processed,
+            totals.whole_run.active_lp_rounds as f64 / totals.whole_run.rounds.max(1) as f64,
+            totals.whole_run.maximum_active_lps,
+            retained_metrics,
+            totals.before_window.rounds,
+            totals.before_window.events_processed,
+            totals.before_window.active_lp_rounds as f64
+                / totals.before_window.rounds.max(1) as f64,
+            totals.before_window.maximum_active_lps,
+            totals.retained_window.rounds,
+            totals.retained_window.events_processed,
+            totals.retained_window.active_lp_rounds as f64
+                / totals.retained_window.rounds.max(1) as f64,
+            totals.retained_window.maximum_active_lps,
+            totals.after_window.rounds,
+            totals.after_window.events_processed,
+            totals.after_window.active_lp_rounds as f64 / totals.after_window.rounds.max(1) as f64,
+            totals.after_window.maximum_active_lps,
         );
     }
 

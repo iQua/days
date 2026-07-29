@@ -1,0 +1,30 @@
+# T13e empirical target ~30,000 mean active LPs: one 32,768-flow cohort.
+# Ceiling probe: measured offered host load is 6,252.1%, outside the intended 10-90% range.
+# The target is requested, not assumed: deterministic shortest-path lowering yields only 5,222
+# route-exposed LPs at f32,768.
+# The 128 KiB byte termination remains active through the measured window; the stop truncates it.
+seed = 13030
+duration = 0.000010
+threading = "single"
+log_path = "logs/width_via_load/fattree_k32_target_w30000"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 32768
+traffic = { initial_delay = 0.0, size = 131_072, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }

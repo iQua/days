@@ -10,6 +10,10 @@ use days_executor::{
     run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
     validate,
 };
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{
+    RoundMetricsWindow, run_cpu_with_metrics_window, run_scalar_rounds_with_windowed_replay_trace,
+};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -445,6 +449,91 @@ fn direct_packets(channel_delay_ns: u64, packet_count: u64) -> SimulationImage {
         });
     }
     image
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn windowed_round_metrics_match_full_runs_without_retaining_the_tail() {
+    let image = direct_packets(1, 8);
+    let scalar_full =
+        run_scalar_rounds_with_observations(&image, None, ObservationMode::Summary).unwrap();
+    let cpu_config = CpuConfig {
+        workers: 4,
+        ..CpuConfig::default()
+    };
+    let cpu_full =
+        run_cpu_with_observations(&image, None, cpu_config, ObservationMode::Summary).unwrap();
+    assert!(
+        scalar_full.rounds.len() > 4,
+        "the fixture needs a tail after the retained window"
+    );
+    assert_eq!(cpu_full.rounds.len(), scalar_full.rounds.len());
+
+    let window = RoundMetricsWindow {
+        start_round: 1,
+        rounds: 2,
+    };
+    let (scalar, trace) =
+        run_scalar_rounds_with_windowed_replay_trace(&image, None, window).unwrap();
+    let cpu = run_cpu_with_metrics_window(&image, None, cpu_config, window).unwrap();
+    let packet_arrivals = trace
+        .event_counts_by_round(days_executor::EventKind::PacketArrival)
+        .unwrap();
+
+    assert_eq!(scalar.result, scalar_full.result);
+    assert_eq!(cpu.result, scalar_full.result);
+    assert_eq!(scalar.rounds, scalar_full.rounds[1..3]);
+    assert_eq!(cpu.rounds.len(), 2);
+    for (retained, full) in cpu.rounds.iter().zip(&cpu_full.rounds[1..3]) {
+        assert_eq!(retained.semantic, full.semantic);
+        assert_eq!(retained.owner_batch_messages, full.owner_batch_messages);
+        assert_eq!(retained.owner_batches_merged, full.owner_batches_merged);
+        assert_eq!(
+            retained.early_owner_batches_merged,
+            full.early_owner_batches_merged
+        );
+    }
+
+    let total_events = scalar_full
+        .rounds
+        .iter()
+        .map(|round| u128::from(round.events_processed))
+        .sum::<u128>();
+    assert_eq!(scalar.totals.whole_run.rounds, scalar_full.rounds.len());
+    assert_eq!(scalar.totals.whole_run.events_processed, total_events);
+    assert_eq!(scalar.totals.before_window.rounds, 1);
+    assert_eq!(scalar.totals.retained_window.rounds, 2);
+    assert_eq!(
+        scalar.totals.retained_window.active_lp_rounds,
+        scalar_full.rounds[1..3]
+            .iter()
+            .map(|round| round.active_lp_count as u128)
+            .sum::<u128>()
+    );
+    assert_eq!(
+        scalar.totals.retained_window.maximum_active_lps,
+        scalar_full.rounds[1..3]
+            .iter()
+            .map(|round| round.active_lp_count)
+            .max()
+            .unwrap()
+    );
+    assert_eq!(
+        scalar.totals.after_window.rounds,
+        scalar_full.rounds.len() - 3
+    );
+    assert_eq!(cpu.totals, scalar.totals);
+    assert_eq!(trace.source_round_count, scalar_full.rounds.len());
+    assert_eq!(
+        trace
+            .rounds
+            .iter()
+            .map(|round| round.source_round)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(packet_arrivals.len(), trace.rounds.len());
+    assert!(packet_arrivals.iter().any(|&count| count > 0));
 }
 
 #[test]
