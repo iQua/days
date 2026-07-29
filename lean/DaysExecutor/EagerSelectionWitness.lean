@@ -866,9 +866,10 @@ theorem queueCounterexample_execution (eager : Bool) :
 Concrete safe-horizon execution witness.
 
 The first round uses the constant horizon `6` and drains only the arrival at time `5`. The second
-uses the exclusive endpoint `11`, drains the `TxReady` at time `10`, and leaves its two children at
-time `11`. The local completion remains in the switch future while the remote arrival is buffered
-as an envelope and transferred to the terminal host by the canonical exchange.
+uses horizon `11`, drains the `TxReady` at time `10`, and leaves its two children at time `11`.
+Canonical exchange transfers the remote envelope to the terminal host. The third round uses the
+exclusive endpoint `12` and executes both the host arrival and the switch completion through their
+distinct local transition branches.
 -/
 
 private def queueCounterexampleTerminalNode : NodeDescriptor :=
@@ -911,6 +912,9 @@ private def queueCounterexampleRoundOneBounds : BoundFamily :=
 
 private def queueCounterexampleRoundTwoBounds : BoundFamily :=
   fun _ => 11
+
+private def queueCounterexampleRoundThreeBounds : BoundFamily :=
+  fun _ => 12
 
 private def queueCounterexampleRoundStart :
     RoundState TinyQueueStateFamily :=
@@ -957,6 +961,38 @@ private def queueCounterexampleAfterReadyDrain :
 private def queueCounterexampleRoundFinish :
     RoundState TinyQueueStateFamily :=
   { machine := queueCounterexampleFinish false
+    outboxes := fun _ => [] }
+
+private def queueCounterexampleAfterRemoteMachine :
+    MachineState TinyQueueStateFamily :=
+  materializeScalarResult
+    queueCounterexampleImage queueCounterexampleTerminalNode
+    queueCounterexampleRemote
+    (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+      queueCounterexampleRemote
+      ((queueCounterexampleFinish false).localState
+        queueCounterexampleTerminalNode))
+    (queueCounterexampleFinish false)
+
+private def queueCounterexampleAfterRemote :
+    RoundState TinyQueueStateFamily :=
+  { machine := queueCounterexampleAfterRemoteMachine
+    outboxes := fun _ => [] }
+
+private def queueCounterexampleAfterCompletionMachine :
+    MachineState TinyQueueStateFamily :=
+  materializeScalarResult
+    queueCounterexampleImage queueCounterexampleNode
+    queueCounterexampleCompletion
+    (tinyQueueTransitionResult false queueCounterexampleNode
+      queueCounterexampleCompletion
+      (queueCounterexampleAfterRemoteMachine.localState
+        queueCounterexampleNode))
+    queueCounterexampleAfterRemoteMachine
+
+private def queueCounterexampleRoundFinal :
+    RoundState TinyQueueStateFamily :=
+  { machine := queueCounterexampleAfterCompletionMachine
     outboxes := fun _ => [] }
 
 private theorem roundReferencesHeld_empty
@@ -1008,6 +1044,15 @@ private theorem queueCounterexample_finish_pending :
       [queueCounterexampleRemote, queueCounterexampleCompletion] := by
   decide
 
+private theorem queueCounterexample_afterRemote_pending :
+    queueCounterexampleAfterRemoteMachine.pending =
+      [queueCounterexampleCompletion] := by
+  decide
+
+private theorem queueCounterexample_afterCompletion_pending :
+    queueCounterexampleAfterCompletionMachine.pending = [] := by
+  decide
+
 private theorem queueCounterexample_switch_dispatch :
     tinyQueueTransition false queueCounterexampleNode
       queueCounterexampleReady
@@ -1041,6 +1086,97 @@ private theorem queueCounterexample_host_dispatch :
         roleSupports],
       by simp [queueCounterexampleRemote],
       rfl⟩
+
+private theorem queueCounterexample_completion_dispatch :
+    tinyQueueTransition false queueCounterexampleNode
+      queueCounterexampleCompletion
+      (queueCounterexampleAfterRemoteMachine.localState
+        queueCounterexampleNode)
+      (tinyQueueTransitionResult false queueCounterexampleNode
+        queueCounterexampleCompletion
+        (queueCounterexampleAfterRemoteMachine.localState
+          queueCounterexampleNode)) := by
+  exact
+    ⟨by simp [queueCounterexampleNode, queueCounterexampleImage],
+      rfl,
+      by simp [queueCounterexampleNode, queueCounterexampleCompletion,
+        roleSupports],
+      by decide,
+      rfl⟩
+
+private theorem queueCounterexample_remote_step :
+    AvailableEventStep
+        queueCounterexampleImage (tinyQueueTransition false)
+        queueCounterexampleRemote (queueCounterexampleFinish false)
+        queueCounterexampleAfterRemoteMachine ∧
+      MachineWellFormed queueCounterexampleImage
+        queueCounterexampleAfterRemoteMachine := by
+  have hbefore := (queueCounterexample_ready_step false).2
+  apply materializeScalarResult_available
+    queueCounterexampleImage (tinyQueueTransition false)
+    queueCounterexample_static.1
+    (by intro payload; exact ⟨rfl, rfl⟩)
+    (tinyQueueTransition_generated_roles false)
+    (tinyQueueTransition_descriptors false)
+    queueCounterexampleTerminalNode
+    (by simp [queueCounterexampleTerminalNode,
+      queueCounterexampleImage])
+    queueCounterexampleRemote
+    (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+      queueCounterexampleRemote
+      ((queueCounterexampleFinish false).localState
+        queueCounterexampleTerminalNode))
+    (queueCounterexampleFinish false) hbefore
+  · rw [queueCounterexample_finish_pending]
+    simp
+  · rfl
+  · exact queueCounterexample_host_dispatch
+  · simp [ChildrenUseOriginSequence, tinyQueueTransitionResult,
+      tinyQueueServiceChildren, queueCounterexampleRemote]
+  · simp [tinyQueueTransitionResult, tinyQueueServiceChildren,
+      queueCounterexampleRemote]
+  · simp [tinyQueueTransitionResult, tinyQueueServiceChildren,
+      queueCounterexampleRemote]
+  · rfl
+  · simp [ReferenceIncrementsValid, tinyQueueTransitionResult,
+      queueCounterexampleRemote]
+  · decide
+
+private theorem queueCounterexample_completion_step :
+    AvailableEventStep
+        queueCounterexampleImage (tinyQueueTransition false)
+        queueCounterexampleCompletion queueCounterexampleAfterRemoteMachine
+        queueCounterexampleAfterCompletionMachine ∧
+      MachineWellFormed queueCounterexampleImage
+        queueCounterexampleAfterCompletionMachine := by
+  have hbefore := queueCounterexample_remote_step.2
+  apply materializeScalarResult_available
+    queueCounterexampleImage (tinyQueueTransition false)
+    queueCounterexample_static.1
+    (by intro payload; exact ⟨rfl, rfl⟩)
+    (tinyQueueTransition_generated_roles false)
+    (tinyQueueTransition_descriptors false)
+    queueCounterexampleNode
+    (by simp [queueCounterexampleNode, queueCounterexampleImage])
+    queueCounterexampleCompletion
+    (tinyQueueTransitionResult false queueCounterexampleNode
+      queueCounterexampleCompletion
+      (queueCounterexampleAfterRemoteMachine.localState
+        queueCounterexampleNode))
+    queueCounterexampleAfterRemoteMachine hbefore
+  · decide
+  · rfl
+  · exact queueCounterexample_completion_dispatch
+  · simp [ChildrenUseOriginSequence, tinyQueueTransitionResult,
+      tinyQueueServiceChildren, queueCounterexampleCompletion]
+  · simp [tinyQueueTransitionResult, tinyQueueServiceChildren,
+      queueCounterexampleCompletion]
+  · simp [tinyQueueTransitionResult, tinyQueueServiceChildren,
+      queueCounterexampleCompletion]
+  · rfl
+  · simp [ReferenceIncrementsValid, tinyQueueTransitionResult,
+      queueCounterexampleCompletion]
+  · decide
 
 private theorem queueCounterexample_arrival_localRoundStep :
     LocalRoundStep queueCounterexampleImage (tinyQueueTransition false)
@@ -1340,6 +1476,239 @@ private theorem queueCounterexample_ready_localRoundStep :
     simp [queueCounterexampleRoundMiddle,
       queueCounterexampleAfterReadyDrain, hotherId]
 
+private theorem queueCounterexample_remote_localRoundStep :
+    LocalRoundStep queueCounterexampleImage (tinyQueueTransition false)
+      queueCounterexampleRoundThreeBounds queueCounterexampleTerminalNode
+      queueCounterexampleRoundFinish queueCounterexampleRemote
+      queueCounterexampleAfterRemote := by
+  have havailable := queueCounterexample_remote_step.1
+  rcases havailable with
+    ⟨hevent, node, hnode, result, htarget, htransition, _,
+      hallocates, happlies, hcoherent, _, hpending, hemissions⟩
+  have hnodeEq : node = queueCounterexampleTerminalNode := by
+    apply node_eq_of_unique_ids
+      queueCounterexample_static.1 hnode
+      (by simp [queueCounterexampleTerminalNode,
+        queueCounterexampleImage])
+    simpa [queueCounterexampleTerminalNode,
+      queueCounterexampleRemote] using htarget.symm
+  subst node
+  have hresultEq :
+      result =
+        tinyQueueTransitionResult false queueCounterexampleTerminalNode
+          queueCounterexampleRemote
+          ((queueCounterexampleFinish false).localState
+            queueCounterexampleTerminalNode) :=
+    htransition.2.2.2.2
+  subst result
+  have hchildren :
+      (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+        queueCounterexampleRemote
+        ((queueCounterexampleFinish false).localState
+          queueCounterexampleTerminalNode)).children = [] := by
+    decide
+  rcases happlies with
+    ⟨hlocal, hstore, hother, houtput, hconsumptions, hincrements⟩
+  have happliesRound :
+      AppliesTransitionResult queueCounterexampleImage
+        queueCounterexampleTerminalNode queueCounterexampleRemote
+        (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+          queueCounterexampleRemote
+          ((queueCounterexampleFinish false).localState
+            queueCounterexampleTerminalNode))
+        (queueCounterexampleFinish false)
+        queueCounterexampleAfterRemoteMachine := by
+    refine ⟨hlocal, ?_, ?_, houtput, hconsumptions, hincrements⟩
+    · simpa [hchildren] using hstore
+    · intro other hotherMem hotherId
+      have hsame := hother other hotherMem hotherId
+      simpa [hchildren] using hsame
+  have hafterWellFormed := queueCounterexample_remote_step.2
+  refine
+    ⟨by simp [queueCounterexampleTerminalNode,
+        queueCounterexampleImage],
+      ?_,
+      (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+        queueCounterexampleRemote
+        (queueCounterexampleRoundFinish.machine.localState
+          queueCounterexampleTerminalNode)),
+      ?_, ?_, ?_, ?_, hcoherent, ?_, ?_, ?_, ?_, [], ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · simpa [queueCounterexampleRoundFinish] using hevent
+    · constructor
+      · rfl
+      · decide
+    · intro other hother _
+      have hcases :
+          other = queueCounterexampleRemote ∨
+            other = queueCounterexampleCompletion := by
+        change other ∈ (queueCounterexampleFinish false).pending at hother
+        rw [queueCounterexample_finish_pending] at hother
+        simpa using hother
+      rcases hcases with rfl | rfl
+      · exact EventKey.le_refl _
+      · decide
+  · simpa [queueCounterexampleRoundFinish] using htransition
+  · change FreshEventKeys
+      (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+        queueCounterexampleRemote
+        ((queueCounterexampleFinish false).localState
+          queueCounterexampleTerminalNode)).children _
+    rw [hchildren]
+    simp [FreshEventKeys]
+  · simpa [queueCounterexampleRoundFinish,
+      queueCounterexampleAfterRemote] using hallocates
+  · simpa [queueCounterexampleRoundFinish,
+      queueCounterexampleAfterRemote] using happliesRound
+  · change ChildDescriptorsAvailable queueCounterexampleImage
+      queueCounterexampleTerminalNode.id
+      (queueCounterexampleAfterRemoteMachine.packetStore
+        queueCounterexampleTerminalNode)
+      (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+        queueCounterexampleRemote
+        ((queueCounterexampleFinish false).localState
+          queueCounterexampleTerminalNode)).children
+    rw [hchildren]
+    intro reference hreference
+    simp at hreference
+  · simpa [queueCounterexampleRoundFinish,
+      queueCounterexampleAfterRemote, hchildren] using hpending
+  · simpa [queueCounterexampleRoundFinish,
+      queueCounterexampleAfterRemote, hchildren] using hemissions
+  · simpa [queueCounterexampleAfterRemote] using
+      roundReferencesHeld_empty
+        queueCounterexampleAfterRemoteMachine hafterWellFormed
+  · change RemoteEnvelopesFromStore queueCounterexampleImage
+      queueCounterexampleTerminalNode.id
+      (queueCounterexampleAfterRemoteMachine.packetStore
+        queueCounterexampleTerminalNode)
+      (remoteChildren queueCounterexampleTerminalNode.id
+        (tinyQueueTransitionResult false queueCounterexampleTerminalNode
+          queueCounterexampleRemote
+          ((queueCounterexampleFinish false).localState
+            queueCounterexampleTerminalNode)).children) []
+    rw [hchildren]
+    trivial
+  · simp [queueCounterexampleRoundFinish,
+      queueCounterexampleAfterRemote]
+  · intro other _ _
+    simp [queueCounterexampleRoundFinish,
+      queueCounterexampleAfterRemote]
+
+private theorem queueCounterexample_completion_localRoundStep :
+    LocalRoundStep queueCounterexampleImage (tinyQueueTransition false)
+      queueCounterexampleRoundThreeBounds queueCounterexampleNode
+      queueCounterexampleAfterRemote queueCounterexampleCompletion
+      queueCounterexampleRoundFinal := by
+  have havailable := queueCounterexample_completion_step.1
+  rcases havailable with
+    ⟨hevent, node, hnode, result, htarget, htransition, _,
+      hallocates, happlies, hcoherent, _, hpending, hemissions⟩
+  have hnodeEq : node = queueCounterexampleNode := by
+    apply node_eq_of_unique_ids
+      queueCounterexample_static.1 hnode
+      (by simp [queueCounterexampleNode, queueCounterexampleImage])
+    simpa [queueCounterexampleNode,
+      queueCounterexampleCompletion] using htarget.symm
+  subst node
+  have hresultEq :
+      result =
+        tinyQueueTransitionResult false queueCounterexampleNode
+          queueCounterexampleCompletion
+          (queueCounterexampleAfterRemoteMachine.localState
+            queueCounterexampleNode) :=
+    htransition.2.2.2.2
+  subst result
+  have hchildren :
+      (tinyQueueTransitionResult false queueCounterexampleNode
+        queueCounterexampleCompletion
+        (queueCounterexampleAfterRemoteMachine.localState
+          queueCounterexampleNode)).children = [] := by
+    decide
+  rcases happlies with
+    ⟨hlocal, hstore, hother, houtput, hconsumptions, hincrements⟩
+  have happliesRound :
+      AppliesTransitionResult queueCounterexampleImage
+        queueCounterexampleNode queueCounterexampleCompletion
+        (tinyQueueTransitionResult false queueCounterexampleNode
+          queueCounterexampleCompletion
+          (queueCounterexampleAfterRemoteMachine.localState
+            queueCounterexampleNode))
+        queueCounterexampleAfterRemoteMachine
+        queueCounterexampleAfterCompletionMachine := by
+    refine ⟨hlocal, ?_, ?_, houtput, hconsumptions, hincrements⟩
+    · simpa [hchildren] using hstore
+    · intro other hotherMem hotherId
+      have hsame := hother other hotherMem hotherId
+      simpa [hchildren] using hsame
+  have hafterWellFormed := queueCounterexample_completion_step.2
+  refine
+    ⟨by simp [queueCounterexampleNode, queueCounterexampleImage],
+      ?_,
+      (tinyQueueTransitionResult false queueCounterexampleNode
+        queueCounterexampleCompletion
+        (queueCounterexampleAfterRemote.machine.localState
+          queueCounterexampleNode)),
+      ?_, ?_, ?_, ?_, hcoherent, ?_, ?_, ?_, ?_, [], ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · simpa [queueCounterexampleAfterRemote] using hevent
+    · constructor
+      · rfl
+      · decide
+    · intro other hother _
+      have heq : other = queueCounterexampleCompletion := by
+        change other ∈ queueCounterexampleAfterRemoteMachine.pending at hother
+        rw [queueCounterexample_afterRemote_pending] at hother
+        simpa using hother
+      subst other
+      exact EventKey.le_refl _
+  · simpa [queueCounterexampleAfterRemote] using htransition
+  · change FreshEventKeys
+      (tinyQueueTransitionResult false queueCounterexampleNode
+        queueCounterexampleCompletion
+        (queueCounterexampleAfterRemoteMachine.localState
+          queueCounterexampleNode)).children _
+    rw [hchildren]
+    simp [FreshEventKeys]
+  · simpa [queueCounterexampleAfterRemote,
+      queueCounterexampleRoundFinal] using hallocates
+  · simpa [queueCounterexampleAfterRemote,
+      queueCounterexampleRoundFinal] using happliesRound
+  · change ChildDescriptorsAvailable queueCounterexampleImage
+      queueCounterexampleNode.id
+      (queueCounterexampleAfterCompletionMachine.packetStore
+        queueCounterexampleNode)
+      (tinyQueueTransitionResult false queueCounterexampleNode
+        queueCounterexampleCompletion
+        (queueCounterexampleAfterRemoteMachine.localState
+          queueCounterexampleNode)).children
+    rw [hchildren]
+    intro reference hreference
+    simp at hreference
+  · simpa [queueCounterexampleAfterRemote,
+      queueCounterexampleRoundFinal, hchildren] using hpending
+  · simpa [queueCounterexampleAfterRemote,
+      queueCounterexampleRoundFinal, hchildren] using hemissions
+  · simpa [queueCounterexampleRoundFinal] using
+      roundReferencesHeld_empty
+        queueCounterexampleAfterCompletionMachine hafterWellFormed
+  · change RemoteEnvelopesFromStore queueCounterexampleImage
+      queueCounterexampleNode.id
+      (queueCounterexampleAfterCompletionMachine.packetStore
+        queueCounterexampleNode)
+      (remoteChildren queueCounterexampleNode.id
+        (tinyQueueTransitionResult false queueCounterexampleNode
+          queueCounterexampleCompletion
+          (queueCounterexampleAfterRemoteMachine.localState
+            queueCounterexampleNode)).children) []
+    rw [hchildren]
+    trivial
+  · simp [queueCounterexampleAfterRemote,
+      queueCounterexampleRoundFinal]
+  · intro other _ _
+    simp [queueCounterexampleAfterRemote,
+      queueCounterexampleRoundFinal]
+
 private theorem queueCounterexample_roundOne_drain :
     SequentialRoundDrain queueCounterexampleImage
       (tinyQueueTransition false) queueCounterexampleRoundOneBounds
@@ -1481,6 +1850,82 @@ private theorem queueCounterexample_roundTwo_drain :
           hterminalDone
           (DrainLPsInOrder.nil queueCounterexampleAfterReadyDrain))))
 
+private theorem queueCounterexample_roundThree_drain :
+    SequentialRoundDrain queueCounterexampleImage
+      (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+      queueCounterexampleRoundFinish
+      [queueCounterexampleRemote, queueCounterexampleCompletion]
+      queueCounterexampleRoundFinal := by
+  have hsourceDone :
+      SequentialDrainLP queueCounterexampleImage
+        (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+        queueCounterexampleSourceNode queueCounterexampleRoundFinish []
+        queueCounterexampleRoundFinish := by
+    apply SequentialDrainLP.done
+    intro event hevent heligible
+    change event ∈ (queueCounterexampleFinish false).pending at hevent
+    rw [queueCounterexample_finish_pending] at hevent
+    rcases List.mem_cons.mp hevent with rfl | htail
+    · exact
+        (show queueCounterexampleRemote.target ≠
+          queueCounterexampleSourceNode.id by decide) heligible.1
+    · have heq := List.mem_singleton.mp htail
+      subst event
+      exact
+        (show queueCounterexampleCompletion.target ≠
+          queueCounterexampleSourceNode.id by decide) heligible.1
+  have hterminalDone :
+      SequentialDrainLP queueCounterexampleImage
+        (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+        queueCounterexampleTerminalNode queueCounterexampleAfterRemote []
+        queueCounterexampleAfterRemote := by
+    apply SequentialDrainLP.done
+    intro event hevent heligible
+    change event ∈ queueCounterexampleAfterRemoteMachine.pending at hevent
+    rw [queueCounterexample_afterRemote_pending] at hevent
+    have heq := List.mem_singleton.mp hevent
+    subst event
+    exact
+      (show queueCounterexampleCompletion.target ≠
+        queueCounterexampleTerminalNode.id by decide) heligible.1
+  have hterminalDrain :
+      SequentialDrainLP queueCounterexampleImage
+        (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+        queueCounterexampleTerminalNode queueCounterexampleRoundFinish
+        [queueCounterexampleRemote] queueCounterexampleAfterRemote :=
+    .step queueCounterexample_remote_localRoundStep hterminalDone
+  have hswitchDone :
+      SequentialDrainLP queueCounterexampleImage
+        (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+        queueCounterexampleNode queueCounterexampleRoundFinal []
+        queueCounterexampleRoundFinal := by
+    apply SequentialDrainLP.done
+    intro event hevent _
+    change event ∈ queueCounterexampleAfterCompletionMachine.pending at hevent
+    rw [queueCounterexample_afterCompletion_pending] at hevent
+    simp at hevent
+  have hswitchDrain :
+      SequentialDrainLP queueCounterexampleImage
+        (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+        queueCounterexampleNode queueCounterexampleAfterRemote
+        [queueCounterexampleCompletion] queueCounterexampleRoundFinal :=
+    .step queueCounterexample_completion_localRoundStep hswitchDone
+  refine ⟨[0, 2, 1], by decide, ?_⟩
+  simpa using
+    (DrainLPsInOrder.cons
+      (by simp [queueCounterexampleSourceNode,
+        queueCounterexampleImage])
+      hsourceDone
+      (DrainLPsInOrder.cons
+        (by simp [queueCounterexampleTerminalNode,
+          queueCounterexampleImage])
+        hterminalDrain
+        (DrainLPsInOrder.cons
+          (by simp [queueCounterexampleNode,
+            queueCounterexampleImage])
+          hswitchDrain
+          (DrainLPsInOrder.nil queueCounterexampleRoundFinal))))
+
 private theorem queueCounterexample_roundOne_exchange :
     CompleteCanonicalExchange queueCounterexampleImage
       queueCounterexampleRoundMiddle queueCounterexampleRoundMiddle := by
@@ -1538,11 +1983,37 @@ private theorem queueCounterexample_roundTwo_exchange :
   · intro node _
     rfl
 
+private theorem queueCounterexample_roundThree_exchange :
+    CompleteCanonicalExchange queueCounterexampleImage
+      queueCounterexampleRoundFinal queueCounterexampleRoundFinal := by
+  have hwellFormed := queueCounterexample_completion_step.2
+  have hheld :
+      RoundReferencesHeld queueCounterexampleImage
+        queueCounterexampleRoundFinal := by
+    simpa [queueCounterexampleRoundFinal] using
+      roundReferencesHeld_empty
+        queueCounterexampleAfterCompletionMachine hwellFormed
+  refine ⟨[], ?_, by simp, by simp, ?_, ?_, rfl, rfl, rfl,
+    rfl, rfl, rfl, rfl, rfl, hheld, ?_⟩
+  · simp [flattenedOutboxes, queueCounterexampleImage,
+      queueCounterexampleRoundFinal]
+  · intro node _ reference hreference
+    simp at hreference
+  · intro node _
+    simp [queueCounterexampleRoundFinal,
+      installRemoteEnvelopesFor, consumeRemoteEnvelopesFor]
+  · intro node _
+    rfl
+
 private def queueCounterexampleRoundOneCut (event : Event) : Prop :=
   event = queueCounterexampleArrival
 
 private def queueCounterexampleRoundTwoCut (event : Event) : Prop :=
   event = queueCounterexampleReady
+
+private def queueCounterexampleRoundThreeCut (event : Event) : Prop :=
+  event = queueCounterexampleRemote ∨
+    event = queueCounterexampleCompletion
 
 private theorem recordedReachable_nil_iff
     (startPending : List Event)
@@ -1715,6 +2186,48 @@ private theorem queueCounterexample_roundTwo_cut :
           ((show ¬ belowBound queueCounterexampleRoundTwoBounds
             queueCounterexampleRemote by decide) hbelow).elim
 
+private theorem queueCounterexample_roundThree_cut :
+    DrainedConsistentCut []
+      [queueCounterexampleRemote, queueCounterexampleCompletion]
+      [queueCounterexampleRemote, queueCounterexampleCompletion]
+      queueCounterexampleRoundThreeBounds
+      queueCounterexampleRoundThreeCut := by
+  refine ⟨⟨?_, ?_, ?_⟩, ?_, ?_⟩
+  · intro event hcut
+    rcases hcut with hremote | hcompletion
+    · subst event
+      exact .seed (by simp)
+    · subst event
+      exact .seed (by simp)
+  · intro _ _ earlier hearlier _ _
+    have hmember :=
+      (recordedReachable_nil_iff
+        [queueCounterexampleRemote, queueCounterexampleCompletion]
+        earlier).mp hearlier
+    rcases List.mem_cons.mp hmember with hremote | htail
+    · exact Or.inl hremote
+    · exact Or.inr (List.mem_singleton.mp htail)
+  · intro parent child hcausal _
+    exact (noRecordedCausalBefore_nil parent child hcausal).elim
+  · intro event
+    simp [queueCounterexampleRoundThreeCut]
+  · intro event
+    constructor
+    · intro hcut
+      rcases hcut with hremote | hcompletion
+      · subst event
+        exact ⟨.seed (by simp), by decide⟩
+      · subst event
+        exact ⟨.seed (by simp), by decide⟩
+    · rintro ⟨hreachable, _⟩
+      have hmember :=
+        (recordedReachable_nil_iff
+          [queueCounterexampleRemote, queueCounterexampleCompletion]
+          event).mp hreachable
+      rcases List.mem_cons.mp hmember with hremote | htail
+      · exact Or.inl hremote
+      · exact Or.inr (List.mem_singleton.mp htail)
+
 theorem queueCounterexample_results_differ :
     ¬ SameMachineResult queueCounterexampleImage
       (queueCounterexampleFinish false)
@@ -1811,7 +2324,7 @@ private theorem queueCounterexample_roundOne :
       BoundFamilyWithinStop queueCounterexampleImage
         queueCounterexampleRoundOneBounds := by
     intro node _
-    change 6 ≤ 11
+    change 6 ≤ 12
     decide
   refine ⟨hstart, hvalid, hprogress, hwithin,
     queueCounterexampleRoundMiddle,
@@ -1870,7 +2383,7 @@ private theorem queueCounterexample_roundTwo :
       BoundFamilyWithinStop queueCounterexampleImage
         queueCounterexampleRoundTwoBounds := by
     intro node _
-    change 11 ≤ 11
+    change 11 ≤ 12
     decide
   refine ⟨hstart, hvalid, hprogress, hwithin,
     queueCounterexampleAfterReadyDrain,
@@ -1886,11 +2399,71 @@ private theorem queueCounterexample_roundTwo :
         (queueCounterexampleFinish false)
         (queueCounterexample_ready_step false).2
 
+private theorem queueCounterexample_roundThree :
+    SafeHorizonRound queueCounterexampleImage
+      (tinyQueueTransition false) queueCounterexampleRoundThreeBounds
+      queueCounterexampleRoundThreeCut queueCounterexampleRoundFinish
+      [queueCounterexampleRemote, queueCounterexampleCompletion]
+      queueCounterexampleRoundFinal := by
+  have hstart :
+      PostExchangeStart queueCounterexampleImage
+        queueCounterexampleRoundFinish := by
+    simpa [queueCounterexampleRoundFinish] using
+      postExchangeStart_empty
+        (queueCounterexampleFinish false)
+        (queueCounterexample_ready_step false).2
+  have hglobal :
+      globalHorizon queueCounterexampleImage
+        queueCounterexampleRoundFinish.machine = 12 := by
+    decide
+  have hvalid :
+      BoundFamilyValid (tinyQueueTransition false)
+        queueCounterexampleRoundFinish.machine
+        queueCounterexampleRoundThreeBounds := by
+    have hconstant :=
+      constantGlobalBoundsValid queueCounterexampleImage
+        (tinyQueueTransition false) (tinyQueue_accepted_model false)
+        queueCounterexampleRoundFinish hstart
+    simpa [ConstantGlobalBoundsValid, constantGlobalBounds,
+      queueCounterexampleRoundThreeBounds, hglobal] using hconstant
+  have hprogress :
+      BoundFamilyMakesProgress queueCounterexampleImage
+        queueCounterexampleRoundFinish.machine
+        queueCounterexampleRoundThreeBounds := by
+    intro _
+    exact
+      ⟨queueCounterexampleRemote,
+        by
+          change queueCounterexampleRemote ∈
+            (queueCounterexampleFinish false).pending
+          rw [queueCounterexample_finish_pending]
+          simp,
+        by decide⟩
+  have hwithin :
+      BoundFamilyWithinStop queueCounterexampleImage
+        queueCounterexampleRoundThreeBounds := by
+    intro node _
+    change 12 ≤ 12
+    decide
+  refine ⟨hstart, hvalid, hprogress, hwithin,
+    queueCounterexampleRoundFinal,
+    queueCounterexample_roundThree_drain, [], ?_, ?_,
+    queueCounterexample_roundThree_exchange, ?_⟩
+  · unfold RoundEmissionDelta
+    decide
+  · simpa [queueCounterexampleRoundFinish] using
+      queueCounterexample_roundThree_cut
+  · simpa [queueCounterexampleRoundFinal] using
+      postExchangeStart_empty
+        queueCounterexampleAfterCompletionMachine
+        queueCounterexample_completion_step.2
+
 private theorem queueCounterexample_canonicalThroughStop :
     CanonicalSerialThroughStop queueCounterexampleImage
       (tinyQueueTransition false) queueCounterexampleMachine
-      [queueCounterexampleArrival, queueCounterexampleReady]
-      (queueCounterexampleFinish false) := by
+      [queueCounterexampleArrival, queueCounterexampleReady,
+        queueCounterexampleRemote, queueCounterexampleCompletion]
+      queueCounterexampleAfterCompletionMachine := by
   have harrivalLeast :
       IsLeastEligible
         (withinInclusiveStop queueCounterexampleImage.stopTimeNs)
@@ -1918,35 +2491,59 @@ private theorem queueCounterexample_canonicalThroughStop :
       have heq := List.mem_singleton.mp hother
       subst other
       exact EventKey.le_refl _
+  have hremoteLeast :
+      IsLeastEligible
+        (withinInclusiveStop queueCounterexampleImage.stopTimeNs)
+        queueCounterexampleRemote
+        (queueCounterexampleFinish false).pending := by
+    refine ⟨?_, by decide, ?_⟩
+    · rw [queueCounterexample_finish_pending]
+      simp
+    · intro other hother _
+      rw [queueCounterexample_finish_pending] at hother
+      rcases List.mem_cons.mp hother with rfl | htail
+      · exact EventKey.le_refl _
+      · have heq := List.mem_singleton.mp htail
+        subst other
+        decide
+  have hcompletionLeast :
+      IsLeastEligible
+        (withinInclusiveStop queueCounterexampleImage.stopTimeNs)
+        queueCounterexampleCompletion
+        queueCounterexampleAfterRemoteMachine.pending := by
+    refine ⟨?_, by decide, ?_⟩
+    · rw [queueCounterexample_afterRemote_pending]
+      simp
+    · intro other hother _
+      rw [queueCounterexample_afterRemote_pending] at hother
+      have heq := List.mem_singleton.mp hother
+      subst other
+      exact EventKey.le_refl _
   refine ⟨.step
     ⟨harrivalLeast, (queueCounterexample_arrival_step false).1⟩
     (.step
       ⟨hreadyLeast, (queueCounterexample_ready_step false).1⟩
-      (.refl _)), ?_⟩
+      (.step
+        ⟨hremoteLeast, queueCounterexample_remote_step.1⟩
+        (.step
+          ⟨hcompletionLeast, queueCounterexample_completion_step.1⟩
+          (.refl _)))), ?_⟩
   intro event hevent hwithin
-  rw [queueCounterexample_finish_pending] at hevent
-  rcases List.mem_cons.mp hevent with rfl | htail
-  · exact
-      (show ¬ withinInclusiveStop
-        queueCounterexampleImage.stopTimeNs
-        queueCounterexampleRemote by decide) hwithin
-  · have heq := List.mem_singleton.mp htail
-    subst event
-    exact
-      (show ¬ withinInclusiveStop
-        queueCounterexampleImage.stopTimeNs
-        queueCounterexampleCompletion by decide) hwithin
+  rw [queueCounterexample_afterCompletion_pending] at hevent
+  simp at hevent
 
 /--
-Concrete non-vacuity witness for the F2/F3 premise surface. Two actual constant-bound rounds start
-from the accepted three-LP initial machine. The second switch step leaves a local completion and a
-descriptor-carrying remote envelope; canonical exchange transfers that envelope to the terminal
-host and produces exactly the canonical scalar endpoint through the inclusive stop.
+Concrete non-vacuity witness for the F2/F3 premise surface. Three actual constant-bound rounds
+start from the accepted three-LP initial machine. The second switch step leaves a local completion
+and a descriptor-carrying remote envelope; canonical exchange transfers that envelope to the
+terminal host. The third round executes the host arrival and switch completion through distinct
+`LocalRoundStep` branches and produces exactly the canonical scalar endpoint through the
+inclusive stop.
 -/
 theorem tinyQueue_multiRound_heterogeneous_witness :
     AcceptedModel queueCounterexampleImage (tinyQueueTransition false) ∧
       CompleteActualServiceStartDiscipline (tinyQueueTransition false) ∧
-      ∃ start middle afterReadyDrain finish :
+      ∃ start middle afterReadyDrain afterExchange afterRemote finish :
           RoundState TinyQueueStateFamily,
         InitialMachine queueCounterexampleImage start.machine ∧
           PostExchangeStart queueCounterexampleImage start ∧
@@ -1966,40 +2563,54 @@ theorem tinyQueue_multiRound_heterogeneous_witness :
           afterReadyDrain.outboxes 1 =
             [queueCounterexampleRemoteEnvelope] ∧
           CompleteCanonicalExchange queueCounterexampleImage
-            afterReadyDrain finish ∧
+            afterReadyDrain afterExchange ∧
           SafeHorizonRound queueCounterexampleImage
             (tinyQueueTransition false) (fun _ => 11)
             (fun event => event = queueCounterexampleReady)
-            middle [queueCounterexampleReady] finish ∧
+            middle [queueCounterexampleReady] afterExchange ∧
+          SequentialRoundDrain queueCounterexampleImage
+            (tinyQueueTransition false) (fun _ => 12)
+            afterExchange
+            [queueCounterexampleRemote, queueCounterexampleCompletion]
+            finish ∧
+          SafeHorizonRound queueCounterexampleImage
+            (tinyQueueTransition false) (fun _ => 12)
+            (fun event =>
+              event = queueCounterexampleRemote ∨
+                event = queueCounterexampleCompletion)
+            afterExchange
+            [queueCounterexampleRemote, queueCounterexampleCompletion]
+            finish ∧
           SafeHorizonRounds queueCounterexampleImage
             (tinyQueueTransition false) start
-            [(fun _ => 6), (fun _ => 11)] finish ∧
+            [(fun _ => 6), (fun _ => 11), (fun _ => 12)] finish ∧
           StoppedThroughInclusiveStop queueCounterexampleImage finish ∧
           CanonicalSerialThroughStop queueCounterexampleImage
             (tinyQueueTransition false) start.machine
-            [queueCounterexampleArrival, queueCounterexampleReady]
+            [queueCounterexampleArrival, queueCounterexampleReady,
+              queueCounterexampleRemote, queueCounterexampleCompletion]
             finish.machine ∧
-          finish.machine = queueCounterexampleFinish false ∧
-          (∃ switchResult,
-            tinyQueueTransition false
-              { id := 1, kind := .switch, stateSlot := 0 }
-              queueCounterexampleReady
-              (middle.machine.localState
-                { id := 1, kind := .switch, stateSlot := 0 })
-              switchResult) ∧
-          ∃ hostResult,
-            tinyQueueTransition false
-              { id := 2, kind := .host, stateSlot := 1 }
-              queueCounterexampleRemote
-              (finish.machine.localState
-                { id := 2, kind := .host, stateSlot := 1 })
-              hostResult := by
+          finish.machine = queueCounterexampleAfterCompletionMachine ∧
+          LocalRoundStep queueCounterexampleImage
+            (tinyQueueTransition false) (fun _ => 11)
+            { id := 1, kind := .switch, stateSlot := 0 }
+            middle queueCounterexampleReady afterReadyDrain ∧
+          LocalRoundStep queueCounterexampleImage
+            (tinyQueueTransition false) (fun _ => 12)
+            { id := 2, kind := .host, stateSlot := 1 }
+            afterExchange queueCounterexampleRemote afterRemote ∧
+          LocalRoundStep queueCounterexampleImage
+            (tinyQueueTransition false) (fun _ => 12)
+            { id := 1, kind := .switch, stateSlot := 0 }
+            afterRemote queueCounterexampleCompletion finish := by
   refine ⟨tinyQueue_accepted_model false,
     tinyQueue_complete_canonical,
     queueCounterexampleRoundStart,
     queueCounterexampleRoundMiddle,
     queueCounterexampleAfterReadyDrain,
-    queueCounterexampleRoundFinish, ?_⟩
+    queueCounterexampleRoundFinish,
+    queueCounterexampleAfterRemote,
+    queueCounterexampleRoundFinal, ?_⟩
   have hinitial :
       InitialMachine queueCounterexampleImage
         queueCounterexampleRoundStart.machine := by
@@ -2026,52 +2637,34 @@ theorem tinyQueue_multiRound_heterogeneous_witness :
       SafeHorizonRounds queueCounterexampleImage
         (tinyQueueTransition false) queueCounterexampleRoundStart
         [queueCounterexampleRoundOneBounds,
-          queueCounterexampleRoundTwoBounds]
-        queueCounterexampleRoundFinish :=
+          queueCounterexampleRoundTwoBounds,
+          queueCounterexampleRoundThreeBounds]
+        queueCounterexampleRoundFinal :=
     .step queueCounterexample_roundOne
-      (.step queueCounterexample_roundTwo (.refl _))
+      (.step queueCounterexample_roundTwo
+        (.step queueCounterexample_roundThree (.refl _)))
   refine ⟨hinitial, hstart, hreachableStart,
     queueCounterexample_roundOne, hreachableMiddle,
     queueCounterexample_roundTwo_drain,
     queueCounterexample_afterReadyDrain_pending, rfl,
     queueCounterexample_roundTwo_exchange,
-    queueCounterexample_roundTwo, hrounds, ?_,
-    ?_, rfl, ?_, ?_⟩
+    queueCounterexample_roundTwo,
+    queueCounterexample_roundThree_drain,
+    queueCounterexample_roundThree,
+    hrounds, ?_, ?_, rfl, ?_, ?_, ?_⟩
   · intro event hevent hwithin
-    change event ∈ (queueCounterexampleFinish false).pending at hevent
-    rw [queueCounterexample_finish_pending] at hevent
-    rcases List.mem_cons.mp hevent with rfl | htail
-    · exact
-        (show ¬ withinInclusiveStop
-          queueCounterexampleImage.stopTimeNs
-          queueCounterexampleRemote by decide) hwithin
-    · have heq := List.mem_singleton.mp htail
-      subst event
-      exact
-        (show ¬ withinInclusiveStop
-          queueCounterexampleImage.stopTimeNs
-          queueCounterexampleCompletion by decide) hwithin
+    change event ∈ queueCounterexampleAfterCompletionMachine.pending at hevent
+    rw [queueCounterexample_afterCompletion_pending] at hevent
+    simp at hevent
   · simpa [queueCounterexampleRoundStart,
-      queueCounterexampleRoundFinish] using
+      queueCounterexampleRoundFinal] using
       queueCounterexample_canonicalThroughStop
-  · exact
-      ⟨tinyQueueTransitionResult false queueCounterexampleNode
-          queueCounterexampleReady
-          ((queueCounterexampleAfterArrival false).localState
-            queueCounterexampleNode),
-        by
-          simpa [queueCounterexampleNode,
-            queueCounterexampleRoundMiddle] using
-            queueCounterexample_switch_dispatch⟩
-  · exact
-      ⟨tinyQueueTransitionResult false queueCounterexampleTerminalNode
-          queueCounterexampleRemote
-          ((queueCounterexampleFinish false).localState
-            queueCounterexampleTerminalNode),
-        by
-          simpa [queueCounterexampleTerminalNode,
-            queueCounterexampleRoundFinish] using
-            queueCounterexample_host_dispatch⟩
+  · simpa [queueCounterexampleNode] using
+      queueCounterexample_ready_localRoundStep
+  · simpa [queueCounterexampleTerminalNode] using
+      queueCounterexample_remote_localRoundStep
+  · simpa [queueCounterexampleNode] using
+      queueCounterexample_completion_localRoundStep
 
 theorem reachableEagerSelectionCountermodel_proved :
     ReachableEagerSelectionCountermodel := by

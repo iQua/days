@@ -520,7 +520,7 @@ Packet IDs 12 and 21 belong to source LP 0 under the three-node allocation rule 
 lines 791-807.
 -/
 def queueCounterexampleImage : SimulationImage TinyQueueStateFamily :=
-  { stopTimeNs := 10
+  { stopTimeNs := 11
     nodes :=
       [ { id := 0, kind := .host, stateSlot := 0 },
         { id := 1, kind := .switch, stateSlot := 0 },
@@ -792,7 +792,7 @@ def referenceCountBpacCommutativityCheck : Bool :=
 
 theorem referenceCountBpacCommutativity :
     referenceCountBpacCommutativityCheck = true := by
-  native_decide
+  decide
 
 theorem reversedDescriptorStoreCountermodel_incoherent :
     ¬ DescriptorStoreCoherent queueCounterexampleImage
@@ -1265,7 +1265,7 @@ def referenceProvenanceLaundererRejectedCheck : Bool :=
 /-- The session-6 foreign-owner consume-and-reacquire transition is structurally rejected. -/
 theorem referenceProvenanceLaundererRejected :
     referenceProvenanceLaundererRejectedCheck = true := by
-  native_decide
+  decide
 
 /--
 Executable regression for the former cross-LP observation-key countermodel. Two independent LPs
