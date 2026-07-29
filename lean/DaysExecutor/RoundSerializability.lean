@@ -3,12 +3,23 @@ import DaysExecutor.Statements
 
 namespace DaysExecutor
 
-/-- One valid sequential LP drain/exchange round has a canonical scalar replay of the same cut. -/
-theorem roundSerializabilityOverCut_proved
+/--
+Internal strengthening of F2: the serial endpoint retains exact owner provenance and allocation
+ghosts, so a later round can be replayed from it.
+-/
+theorem roundSerializabilityOverCut_strong
     (image : SimulationImage State)
     (transition : TransitionRelation State) :
-    RoundSerializabilityOverCut image transition := by
-  intro haccepted _ bounds cut start drainedEvents finish _ hround
+    AcceptedModel image transition →
+    ∀ bounds cut start drainedEvents finish,
+      SafeHorizonRound image transition bounds cut
+        start drainedEvents finish →
+      ∃ serialOrder serialFinish,
+        CanonicalSerialRestricted image transition cut
+          start.machine serialOrder serialFinish ∧
+        (∀ event, event ∈ serialOrder ↔ event ∈ drainedEvents) ∧
+        StrongMachineReplay image serialFinish finish.machine := by
+  intro haccepted bounds cut start drainedEvents finish hround
   rcases haccepted with
     ⟨⟨hunique, _, _, _, _, _, _, _, _, horacle, _, _, _, _, _, _, _⟩,
       _, haxioms, _⟩
@@ -55,10 +66,20 @@ theorem roundSerializabilityOverCut_proved
   refine ⟨serialOrder, serialFinish, hcanonical, ?_, ?_⟩
   · intro event
     exact hserialPerm.mem_iff
-  · exact strongMachineReplay_implies_result image
-      serialFinish finish.machine
-      (strongMachineReplay_trans image
-        (strongMachineReplay_symm image hsortReplay)
-        hscalarFinish)
+  · exact strongMachineReplay_trans image
+      (strongMachineReplay_symm image hsortReplay)
+      hscalarFinish
+
+/-- One valid sequential LP drain/exchange round has a canonical scalar replay of the same cut. -/
+theorem roundSerializabilityOverCut_proved
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) :
+    RoundSerializabilityOverCut image transition := by
+  intro haccepted _ bounds cut start drainedEvents finish _ hround
+  obtain ⟨serialOrder, serialFinish, hserial, hmembership, hreplay⟩ :=
+    roundSerializabilityOverCut_strong image transition haccepted
+      bounds cut start drainedEvents finish hround
+  exact ⟨serialOrder, serialFinish, hserial, hmembership,
+    strongMachineReplay_implies_result image serialFinish finish.machine hreplay⟩
 
 end DaysExecutor

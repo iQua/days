@@ -1,4 +1,4 @@
-import DaysExecutor.RoundSerializability
+import DaysExecutor.RunComposition
 
 namespace DaysExecutor
 
