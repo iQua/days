@@ -27,18 +27,16 @@ fn main() {
         }
     }
 
-    fn phases(timing: MetalPhaseTimings) -> [(&'static str, u64); 10] {
+    fn phases(timing: MetalPhaseTimings) -> [(&'static str, u64); 8] {
         [
             ("horizon", timing.horizon_ns),
             ("compaction", timing.compaction_ns),
             ("drain_execute", timing.drain_execute_ns),
-            ("first_resolve", timing.first_resolve_ns),
-            ("completion", timing.completion_ns),
+            ("continuation_control", timing.continuation_control_ns),
             ("exchange_prefix", timing.exchange_prefix_ns),
             ("exchange_scatter", timing.exchange_scatter_ns),
             ("target_merge", timing.target_merge_ns),
-            ("second_resolve", timing.second_resolve_ns),
-            ("finalize", timing.finalize_ns),
+            ("final_control", timing.final_control_ns),
         ]
     }
 
@@ -61,7 +59,7 @@ fn main() {
             .map(selected)
             .map(phases)
             .collect::<Vec<_>>();
-        let mut values = [0_u64; 10];
+        let mut values = [0_u64; 8];
         for (index, value) in values.iter_mut().enumerate() {
             *value = median(rows.iter().map(|row| row[index].1).collect());
         }
@@ -69,13 +67,11 @@ fn main() {
             horizon_ns: values[0],
             compaction_ns: values[1],
             drain_execute_ns: values[2],
-            first_resolve_ns: values[3],
-            completion_ns: values[4],
-            exchange_prefix_ns: values[5],
-            exchange_scatter_ns: values[6],
-            target_merge_ns: values[7],
-            second_resolve_ns: values[8],
-            finalize_ns: values[9],
+            continuation_control_ns: values[3],
+            exchange_prefix_ns: values[4],
+            exchange_scatter_ns: values[5],
+            target_merge_ns: values[6],
+            final_control_ns: values[7],
         }
     }
 

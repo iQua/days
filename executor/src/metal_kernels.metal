@@ -1459,35 +1459,15 @@ kernel void days_round(
 
 }
 
-kernel void days_round_resolve(
+kernel void days_round_control(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
-    const device ulong *lp_state [[buffer(18)]]
-) {
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] == 0
-    ) {
-        return;
-    }
-    for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
-        ulong state = node * LP_STATE_WORDS;
-        if (lp_state[state + L_ERROR] != 0) {
-            control[C_ERROR] = lp_state[state + L_ERROR];
-            control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
-            control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
-            control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
-            return;
-        }
-    }
-}
-
-kernel void days_round_complete(
-    device ulong *control [[buffer(0)]],
     const device ulong *worklist [[buffer(13)]],
-    const device ulong *lp_state [[buffer(18)]]
+    const device ulong *lp_state [[buffer(18)]],
+    uint lane [[thread_index_in_threadgroup]]
 ) {
+    threadgroup ulong first_errors[1024];
+    threadgroup uint unfinished_lanes[1024];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
@@ -1495,21 +1475,57 @@ kernel void days_round_complete(
     ) {
         return;
     }
-    for (ulong active = 0; active < control[C_ACTIVE]; ++active) {
-        ulong node = worklist[active];
-        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
-            control[C_RELAUNCHES] += 1;
-            return;
+
+    ulong first_error = NONE;
+    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
+        ulong state = node * LP_STATE_WORDS;
+        if (lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+            break;
         }
     }
-    control[C_CONTINUATION] = 2;
+    uint unfinished = 0;
+    for (ulong active = lane; active < control[C_ACTIVE]; active += 1024) {
+        ulong node = worklist[active];
+        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
+            unfinished = 1;
+            break;
+        }
+    }
+    first_errors[lane] = first_error;
+    unfinished_lanes[lane] = unfinished;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 512; stride != 0; stride >>= 1) {
+        if (lane < stride) {
+            first_errors[lane] = min(first_errors[lane], first_errors[lane + stride]);
+            unfinished_lanes[lane] |= unfinished_lanes[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane != 0) {
+        return;
+    }
+    if (first_errors[0] != NONE) {
+        ulong state = first_errors[0] * LP_STATE_WORDS;
+        control[C_ERROR] = lp_state[state + L_ERROR];
+        control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
+        control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
+        control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+    } else if (unfinished_lanes[0] != 0) {
+        control[C_RELAUNCHES] += 1;
+    } else {
+        control[C_CONTINUATION] = 2;
+    }
 }
 
 kernel void days_exchange_prefix(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
-    device ulong *remote_meta [[buffer(19)]]
+    device ulong *remote_meta [[buffer(19)]],
+    uint lane [[thread_index_in_threadgroup]]
 ) {
+    threadgroup ulong sums[1024];
+    threadgroup uint exceeded[1024];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
@@ -1517,22 +1533,74 @@ kernel void days_exchange_prefix(
     ) {
         return;
     }
-    ulong total = 0;
+
+    ulong producers = params[P_NODE_COUNT];
     ulong capacity = params[P_OUTBOX_CAPACITY];
-    for (ulong producer = 0; producer < params[P_NODE_COUNT]; ++producer) {
+    ulong chunk = producers / 1024;
+    ulong remainder = producers % 1024;
+    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
+    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong local_sum = 0;
+    uint local_exceeded = 0;
+    for (ulong producer = start; producer < end; ++producer) {
         ulong base = producer * META_WORDS;
         ulong count = remote_meta[base + 3];
-        remote_meta[base + 2] = total;
-        if (total > capacity || count > capacity - total) {
-            control[C_ERROR] = ERROR_CAPACITY;
-            control[C_ERROR_ARENA] = ARENA_OUTBOX;
-            control[C_ERROR_NODE] = NONE;
-            control[C_ERROR_CAPACITY] = capacity;
-            return;
+        if (
+            local_exceeded == 0 &&
+            (local_sum > capacity || count > capacity - local_sum)
+        ) {
+            local_sum = capacity;
+            local_exceeded = 1;
+        } else if (local_exceeded == 0) {
+            local_sum += count;
         }
-        total += count;
     }
-    control[C_OUTBOX] = total;
+
+    sums[lane] = local_sum;
+    exceeded[lane] = local_exceeded;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1; offset < 1024; offset <<= 1) {
+        ulong left_sum = lane >= offset ? sums[lane - offset] : 0;
+        uint left_exceeded = lane >= offset ? exceeded[lane - offset] : 0;
+        ulong own_sum = sums[lane];
+        uint own_exceeded = exceeded[lane];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane >= offset) {
+            uint combined_exceeded = left_exceeded | own_exceeded;
+            if (
+                combined_exceeded == 0 &&
+                (left_sum > capacity || own_sum > capacity - left_sum)
+            ) {
+                combined_exceeded = 1;
+            }
+            sums[lane] =
+                combined_exceeded != 0 ? capacity : left_sum + own_sum;
+            exceeded[lane] = combined_exceeded;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0 && exceeded[1023] != 0) {
+        control[C_ERROR] = ERROR_CAPACITY;
+        control[C_ERROR_ARENA] = ARENA_OUTBOX;
+        control[C_ERROR_NODE] = NONE;
+        control[C_ERROR_CAPACITY] = capacity;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (exceeded[1023] != 0) {
+        return;
+    }
+
+    ulong write = sums[lane] - local_sum;
+    for (ulong producer = start; producer < end; ++producer) {
+        ulong base = producer * META_WORDS;
+        remote_meta[base + 2] = write;
+        write += remote_meta[base + 3];
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        control[C_OUTBOX] = sums[1023];
+    }
 }
 
 kernel void days_exchange_scatter(
@@ -1641,8 +1709,12 @@ kernel void days_exchange_merge(
 kernel void days_round_finalize(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
-    const device ulong *observation_meta [[buffer(21)]]
+    const device ulong *lp_state [[buffer(18)]],
+    const device ulong *observation_meta [[buffer(21)]],
+    uint lane [[thread_index_in_threadgroup]]
 ) {
+    threadgroup ulong values[1024];
+    threadgroup uint exceeded[1024];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
@@ -1650,28 +1722,99 @@ kernel void days_round_finalize(
     ) {
         return;
     }
-    ulong totals[3] = {0, 0, 0};
-    for (ulong node = 0; node < params[P_NODE_COUNT]; ++node) {
-        ulong base = node * OBSERVATION_META_WORDS;
-        totals[0] += observation_meta[base + 3];
-        totals[1] += observation_meta[base + META_WORDS + 3];
-        totals[2] += observation_meta[base + 2 * META_WORDS + 3];
-    }
+
     ulong capacities[3] = {
         params[P_OBSERVED_CAPACITY],
         params[P_DEPARTURE_CAPACITY],
         params[P_ARRIVAL_CAPACITY]
     };
+    ulong local_totals[3] = {0, 0, 0};
+    uint local_exceeded[3] = {0, 0, 0};
+    ulong first_error = NONE;
+    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
+        ulong state = node * LP_STATE_WORDS;
+        if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+        }
+        if (params[P_FULL_OBSERVATIONS] != 0) {
+            ulong base = node * OBSERVATION_META_WORDS;
+            for (uint log = 0; log < 3; ++log) {
+                ulong count = observation_meta[base + log * META_WORDS + 3];
+                if (
+                    local_exceeded[log] == 0 &&
+                    (
+                        local_totals[log] > capacities[log] ||
+                        count > capacities[log] - local_totals[log]
+                    )
+                ) {
+                    local_totals[log] = capacities[log];
+                    local_exceeded[log] = 1;
+                } else if (local_exceeded[log] == 0) {
+                    local_totals[log] += count;
+                }
+            }
+        }
+    }
+
+    values[lane] = first_error;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 512; stride != 0; stride >>= 1) {
+        if (lane < stride) {
+            values[lane] = min(values[lane], values[lane + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0 && values[0] != NONE) {
+        ulong state = values[0] * LP_STATE_WORDS;
+        control[C_ERROR] = lp_state[state + L_ERROR];
+        control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
+        control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
+        control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (values[0] != NONE) {
+        return;
+    }
+    if (params[P_FULL_OBSERVATIONS] == 0) {
+        if (lane == 0) {
+            control[C_CONTINUATION] = 0;
+            control[C_ROUNDS] += 1;
+        }
+        return;
+    }
+
     ulong arenas[3] = {ARENA_OBSERVED, ARENA_DEPARTURES, ARENA_ARRIVALS};
     for (uint log = 0; log < 3; ++log) {
-        if (totals[log] > capacities[log]) {
+        values[lane] = local_totals[log];
+        exceeded[lane] = local_exceeded[log];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong left = values[lane];
+                ulong right = values[lane + stride];
+                uint combined_exceeded = exceeded[lane] | exceeded[lane + stride];
+                if (
+                    combined_exceeded == 0 &&
+                    (left > capacities[log] || right > capacities[log] - left)
+                ) {
+                    combined_exceeded = 1;
+                }
+                values[lane] =
+                    combined_exceeded != 0 ? capacities[log] : left + right;
+                exceeded[lane] = combined_exceeded;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0 && exceeded[0] != 0 && control[C_ERROR] == 0) {
             control[C_ERROR] = ERROR_CAPACITY;
             control[C_ERROR_ARENA] = arenas[log];
             control[C_ERROR_NODE] = NONE;
             control[C_ERROR_CAPACITY] = capacities[log];
-            return;
         }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
-    control[C_CONTINUATION] = 0;
-    control[C_ROUNDS] += 1;
+    if (lane == 0 && control[C_ERROR] == 0) {
+        control[C_CONTINUATION] = 0;
+        control[C_ROUNDS] += 1;
+    }
 }
