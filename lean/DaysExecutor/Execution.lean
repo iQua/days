@@ -338,7 +338,7 @@ private theorem acquireOwnedReference_before
       simp [acquireOwnedReference, hne, hle]
 
 /-- A positive exact-owner count identifies a payload entry in the store. -/
-private theorem exists_payload_of_ownedReferenceCount_positive
+theorem exists_payload_of_ownedReferenceCount_positive
     (reference : OwnedPacketReference)
     (store : List PacketStoreEntry)
     (hpositive : 0 < ownedReferenceCount reference store) :
@@ -429,7 +429,7 @@ theorem acquire_releaseOwnedReference_commutes_of_distinct_owner
         · exact htailHeld
 
 /-- Every acquired entry is either the new descriptor or preserves an existing descriptor. -/
-private theorem mem_acquireOwnedReference_cases
+theorem mem_acquireOwnedReference_cases
     (candidate : PacketStoreEntry)
     (reference : OwnedPacketReference)
     (store : List PacketStoreEntry)
@@ -507,7 +507,7 @@ theorem acquireOwnedReference_preserves_sorted
           · exact ih htail
 
 /-- Every released entry preserves the descriptor of an existing entry. -/
-private theorem mem_releaseOwnedReference_cases
+theorem mem_releaseOwnedReference_cases
     (candidate : PacketStoreEntry)
     (reference : OwnedPacketReference)
     (store : List PacketStoreEntry)

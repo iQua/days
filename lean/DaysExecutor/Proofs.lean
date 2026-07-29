@@ -1,4 +1,4 @@
-import DaysExecutor.Statements
+import DaysExecutor.RoundSerializability
 
 namespace DaysExecutor
 
@@ -437,5 +437,12 @@ theorem f2GlobalTimePrefixCorollary_proved :
   rw [hdrained.2.2 event]
   unfold TimePrefix
   rw [belowConstantTimeBound_iff]
+
+theorem f2RoundSerializability_proved
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) :
+    F2RoundSerializability image transition := by
+  exact ⟨roundSerializabilityOverCut_proved image transition,
+    f2GlobalTimePrefixCorollary_proved⟩
 
 end DaysExecutor
