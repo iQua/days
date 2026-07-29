@@ -116,7 +116,7 @@ private inductive TinyQueueReachableShape
 private theorem queueCounterexample_uniqueNodes :
     UniqueNodeIds queueCounterexampleImage := by
   unfold UniqueNodeIds
-  native_decide
+  decide
 
 private theorem queueCounterexample_descriptorOracle :
     DescriptorOracleWellFormed queueCounterexampleImage := by
@@ -139,7 +139,7 @@ private theorem tinyQueueReachableShape_initial
     ⟨hpending, _, _, _, _, hcursor, _, _, hnodes, _⟩
   apply TinyQueueReachableShape.initial
   · rw [hpending]
-    native_decide
+    decide
   · have hstate :=
       (hnodes tinyQueueSwitchNode tinyQueueSwitchNode_mem).1
     simpa [stateAt?, listGet?, queueCounterexampleImage,
@@ -181,7 +181,7 @@ private theorem tinyQueueReachableShape_step
           have himpossible :
               ¬ queueCounterexampleReady.key ≤
                 queueCounterexampleArrival.key := by
-            native_decide
+            decide
           exact (himpossible horder).elim
       subst event
       have hnodeEq : node = tinyQueueSwitchNode := by
@@ -230,7 +230,7 @@ private theorem tinyQueueReachableShape_step
       apply TinyQueueReachableShape.afterReady
       · rw [hpending, hbeforePending, hbeforeSwitch]
         cases eager <;>
-          native_decide
+          decide
       · rw [happlies.1, hbeforeSwitch]
         rfl
       · rw [(happlies.2.2.1 tinyQueueTerminalNode
@@ -246,7 +246,7 @@ private theorem tinyQueueReachableShape_step
           have horder := hleast.2.2 tinyQueueRemote (by simp) trivial
           have himpossible :
               ¬ tinyQueueCompletion.key ≤ tinyQueueRemote.key := by
-            native_decide
+            decide
           exact (himpossible horder).elim
       subst event
       have hnodeEq : node = tinyQueueTerminalNode := by
@@ -500,7 +500,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
           have himpossible :
               ¬ queueCounterexampleReady.key ≤
                 queueCounterexampleArrival.key := by
-            native_decide
+            decide
           exact (himpossible horder).elim
       subst event
       have hnodeEq : node = tinyQueueSwitchNode := by
@@ -520,7 +520,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
           queueCounterexampleArrival]
       · rw [hswitch]
         cases eager <;>
-          native_decide
+          decide
   | afterArrival hpending hswitch _ hcursor =>
       have heventEq : event = queueCounterexampleReady := by
         simpa [hpending] using hevent
@@ -546,7 +546,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
               (tinyQueueSwitchAfterArrival eager)).children =
               [tinyQueueCompletion, tinyQueueRemote] := by
           cases eager <;>
-            native_decide
+            decide
         rw [hchildren]
         simp [ChildrenUseOriginSequence, tinyQueueSwitchNode,
           tinyQueueCompletion, tinyQueueRemote]
@@ -558,7 +558,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
               (tinyQueueSwitchAfterArrival eager)).children =
               [tinyQueueCompletion, tinyQueueRemote] := by
           cases eager <;>
-            native_decide
+            decide
         rw [hchildren] at hchild
         rcases List.mem_cons.mp hchild with heq | htail
         · subst child
@@ -572,7 +572,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
           simp [tinyQueueRemote, hcursor] at hlt
       · rw [hswitch]
         cases eager <;>
-          native_decide
+          decide
   | afterReady hpending hswitch hterminal =>
       rw [hpending] at hevent
       rcases List.mem_cons.mp hevent with heventEq | htail
@@ -593,7 +593,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
             tinyQueueRemote]
         · rw [hterminal]
           cases eager <;>
-            native_decide
+            decide
       · have heventEq := List.mem_singleton.mp htail
         subst event
         have hnodeEq : node = tinyQueueSwitchNode := by
@@ -607,7 +607,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
         · intro _
           rw [hswitch]
           cases eager <;>
-            native_decide
+            decide
         · simp [ChildrenUseOriginSequence, tinyQueueTransitionResult,
             tinyQueueServiceChildren,
             tinyQueueCompletion]
@@ -615,7 +615,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
             tinyQueueCompletion]
         · rw [hswitch]
           cases eager <;>
-            native_decide
+            decide
   | afterRemote hpending hswitch _ =>
       have heventEq : event = tinyQueueCompletion := by
         simpa [hpending] using hevent
@@ -631,7 +631,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
       · intro _
         rw [hswitch]
         cases eager <;>
-          native_decide
+          decide
       · simp [ChildrenUseOriginSequence, tinyQueueTransitionResult,
           tinyQueueServiceChildren,
           tinyQueueCompletion]
@@ -639,7 +639,7 @@ theorem tinyQueueTransition_enabledOnReachable (eager : Bool) :
           tinyQueueCompletion]
       · rw [hswitch]
         cases eager <;>
-          native_decide
+          decide
   | finished hpending _ _ =>
       rw [hpending] at hevent
       simp at hevent

@@ -19,7 +19,7 @@ private theorem queueCounterexample_static :
     · intro node hnode
       simp [queueCounterexampleImage] at hnode
       rcases hnode with rfl | rfl | rfl
-      all_goals native_decide
+      all_goals decide
     · intro kind slot
       cases kind <;>
         simp [queueCounterexampleImage] <;>
@@ -29,13 +29,13 @@ private theorem queueCounterexample_static :
       simp [queueCounterexampleImage] at hstate
     all_goals simp_all
   · unfold UniqueEventKeys
-    native_decide
+    decide
   · unfold InitialEventsOrdered
-    native_decide
+    decide
   · unfold UniqueLinkIds
-    native_decide
+    decide
   · unfold UniqueChannelRoutes
-    native_decide
+    decide
   · intro event hevent
     simp [queueCounterexampleImage, queueCounterexampleStartPending] at hevent
     rcases hevent with rfl | rfl
@@ -107,7 +107,7 @@ private theorem queueCounterexample_static :
       simp [queueCounterexampleImage, queueCounterexampleArrival,
         queueCounterexampleReady] at horigin ⊢
   · unfold PositiveLinkRates
-    native_decide
+    decide
   · intro link hlink
     simp [queueCounterexampleImage] at hlink
     rcases hlink with rfl | rfl | rfl
@@ -134,7 +134,7 @@ private theorem queueCounterexample_static :
             ⟨{ id := 2, kind := .host, stateSlot := 1 },
               by simp [queueCounterexampleImage], rfl⟩
   · unfold PositiveChannelBounds
-    native_decide
+    decide
   · intro channel hchannel
     simp [queueCounterexampleImage] at hchannel
     rcases hchannel with rfl | rfl
@@ -346,7 +346,7 @@ private theorem tinyQueueTransition_bound_sound (eager : Bool) :
                   by
                     rw [show
                       queueCounterexampleImage.payloadBytes packet = 1 from rfl]
-                    native_decide,
+                    decide,
                   by
                     change event.key.timeNs + 1 ≤ event.key.timeNs + 1
                     exact Nat.le_refl _⟩
@@ -669,7 +669,7 @@ theorem tinyQueue_eager_private_relevant :
           { privateState := alternatePrivate
             serviceQueue := smuggled.serviceQueue
             committedService := smuggled.committedService }) := by
-    native_decide
+    decide
   exact hnot hsame
 
 private theorem tinyQueue_complete_canonical :
@@ -787,7 +787,7 @@ private theorem queueCounterexample_arrival_step (eager : Bool) :
       queueCounterexampleArrival
       (queueCounterexampleMachine.localState queueCounterexampleNode))
     queueCounterexampleMachine hwellFormed
-  · native_decide
+  · decide
   · rfl
   · exact
       ⟨by simp [queueCounterexampleNode, queueCounterexampleImage],
@@ -804,7 +804,7 @@ private theorem queueCounterexample_arrival_step (eager : Bool) :
   · simp [ReferenceIncrementsValid, tinyQueueTransitionResult,
       queueCounterexampleArrival]
   · cases eager <;>
-      native_decide
+      decide
 
 private theorem queueCounterexample_ready_step (eager : Bool) :
     AvailableEventStep
@@ -828,7 +828,7 @@ private theorem queueCounterexample_ready_step (eager : Bool) :
       ((queueCounterexampleAfterArrival eager).localState
         queueCounterexampleNode))
     (queueCounterexampleAfterArrival eager) hbefore
-  · cases eager <;> native_decide
+  · cases eager <;> decide
   · rfl
   · exact
       ⟨by simp [queueCounterexampleNode, queueCounterexampleImage],
@@ -845,12 +845,12 @@ private theorem queueCounterexample_ready_step (eager : Bool) :
         queueCounterexamplePrivateState, queueCounterexampleImage]
       <;> simp [ChildrenUseOriginSequence]
   · cases eager <;>
-      native_decide
+      decide
   · cases eager <;>
-      native_decide
+      decide
   · rfl
   · exact List.Perm.refl _
-  · cases eager <;> native_decide
+  · cases eager <;> decide
 
 theorem queueCounterexample_execution (eager : Bool) :
     ExecutionInOrder
@@ -2077,10 +2077,10 @@ theorem reachableEagerSelectionCountermodel_proved :
     ReachableEagerSelectionCountermodel := by
   refine ⟨by
       unfold EagerSelectionCounterexampleShape
-      native_decide,
+      decide,
     by
       unfold eagerSelectionPrivateSmugglingCheck
-      native_decide,
+      decide,
     tinyQueue_accepted_model false,
     tinyQueue_accepted_model true,
     queueCounterexample_initial_machine,
