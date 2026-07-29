@@ -1,9 +1,11 @@
-//! T13b-only direct-Metal feasibility spike.
+//! T13b/T13c-only direct-Metal feasibility spike.
 //!
 //! This is deliberately not an executor backend. Rust-authored CubeCL kernels are compiled to MSL,
 //! then command queues, buffers, pipelines, encoding, submission, timestamps, and synchronization
 //! are controlled directly through `objc2-metal`. CubeCL's runtime batching policy is not used.
 
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cubecl::Compiler;
@@ -27,13 +29,14 @@ pub const SUBSTRATE_VERSION: &str =
     "objc2-metal 0.3.2 direct control; CubeCL 0.11.0-pre.1 Rust-to-MSL codegen only";
 /// Rounded k32 mean active port-LP population from the retained P05c run.
 pub const ACTIVE_PORT_LPS: usize = 595;
-/// One padded Metal threadgroup used by both the round body and the horizon reduction.
+/// One padded Metal threadgroup used by the round body and each reduction level.
 pub const REDUCTION_LANES: usize = 1_024;
 /// Exact u64 threadgroup scratch used by the one-dispatch reduction.
 pub const REDUCTION_THREADGROUP_BYTES: usize = REDUCTION_LANES * std::mem::size_of::<u64>();
+/// The two-level reduction supports one full leaf grid followed by one final threadgroup.
+pub const MAX_SWEEP_ACTIVE_LPS: usize = REDUCTION_LANES * REDUCTION_LANES;
 /// Long-resident default. Dense scale needs 49 command buffers, below Metal's default queue cap.
 pub const DEFAULT_ROUNDS_PER_ENCODING: usize = 16_384;
-const DEFAULT_WARMUP_ROUNDS: usize = DEFAULT_ROUNDS_PER_ENCODING;
 const MAX_OUTSTANDING_COMMAND_BUFFERS: usize = 64;
 const MAX_TRANSITIONS_PER_LP: u32 = 11;
 const OBSERVED_TAIL_MAX_TRANSITIONS_PER_LP: u32 = 21;
@@ -58,6 +61,97 @@ const ERROR_TRANSITION_OVERFLOW: u32 = 3;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// One T13c width and its bounded timing protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SweepPoint {
+    pub active_lps: usize,
+    pub rounds: usize,
+    pub warmup_rounds: usize,
+}
+
+/// Exact repetitions of the retained 595-LP profile, chosen near the requested widths.
+pub const DEFAULT_SWEEP_POINTS: [SweepPoint; 7] = [
+    SweepPoint {
+        active_lps: 595,
+        rounds: 16_384,
+        warmup_rounds: 16_384,
+    },
+    SweepPoint {
+        active_lps: 1_785,
+        rounds: 4_096,
+        warmup_rounds: 4_096,
+    },
+    SweepPoint {
+        active_lps: 4_760,
+        rounds: 2_048,
+        warmup_rounds: 2_048,
+    },
+    SweepPoint {
+        active_lps: 20_230,
+        rounds: 512,
+        warmup_rounds: 512,
+    },
+    SweepPoint {
+        active_lps: 49_980,
+        rounds: 256,
+        warmup_rounds: 256,
+    },
+    SweepPoint {
+        active_lps: 199_920,
+        rounds: 64,
+        warmup_rounds: 64,
+    },
+    SweepPoint {
+        active_lps: 499_800,
+        rounds: 32,
+        warmup_rounds: 32,
+    },
+];
+
+/// Dispatch geometry and the explicitly modeled occupancy proxies used by the evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SweepGeometry {
+    pub active_lps: usize,
+    pub padded_lanes: usize,
+    pub body_threadgroups: usize,
+    pub reduction_dispatches_per_round: usize,
+    pub dispatches_per_round: usize,
+}
+
+impl SweepGeometry {
+    /// Useful lanes divided by one 1,024-lane threadgroup per GPU core, capped at saturation.
+    pub fn modeled_useful_lane_coverage_ppm(&self, gpu_cores: usize) -> u32 {
+        coverage_ppm(self.active_lps, gpu_cores.saturating_mul(REDUCTION_LANES))
+    }
+
+    /// Body threadgroups divided by GPU cores, capped at saturation.
+    pub fn modeled_threadgroup_core_coverage_ppm(&self, gpu_cores: usize) -> u32 {
+        coverage_ppm(self.body_threadgroups, gpu_cores)
+    }
+}
+
+pub fn sweep_geometry(active_lps: usize) -> Result<SweepGeometry, MetalSpikeError> {
+    if active_lps == 0 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "active-LP width must be nonzero",
+        ));
+    }
+    if active_lps > MAX_SWEEP_ACTIVE_LPS {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "active-LP width exceeds the two-level reduction capacity",
+        ));
+    }
+    let body_threadgroups = active_lps.div_ceil(REDUCTION_LANES);
+    let reduction_dispatches_per_round = if body_threadgroups == 1 { 1 } else { 2 };
+    Ok(SweepGeometry {
+        active_lps,
+        padded_lanes: body_threadgroups * REDUCTION_LANES,
+        body_threadgroups,
+        reduction_dispatches_per_round,
+        dispatches_per_round: 1 + reduction_dispatches_per_round,
+    })
+}
 
 /// Rounded, reproducible version of the measured k32 port-LP round profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,12 +190,40 @@ pub const fn matched_workload_profile() -> MatchedWorkloadProfile {
     }
 }
 
+/// Scales only by exact repetitions so every synthetic LP keeps a retained joint-profile body.
+pub fn scaled_workload_profile(
+    active_lps: usize,
+) -> Result<MatchedWorkloadProfile, MetalSpikeError> {
+    let geometry = sweep_geometry(active_lps)?;
+    if !active_lps.is_multiple_of(ACTIVE_PORT_LPS) {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "active-LP width must be an exact multiple of the retained 595-LP profile",
+        ));
+    }
+    let scale = u64::try_from(active_lps / ACTIVE_PORT_LPS).map_err(|_| {
+        MetalSpikeError::InvalidBenchmarkConfig("active-LP scale does not fit in u64")
+    })?;
+    let base = matched_workload_profile();
+    Ok(MatchedWorkloadProfile {
+        active_lps,
+        reduction_lanes: geometry.padded_lanes,
+        transitions_per_round: base.transitions_per_round * scale,
+        fel_pops_per_round: base.fel_pops_per_round * scale,
+        local_child_pushes_per_round: base.local_child_pushes_per_round * scale,
+        same_time_continuations_per_round: base.same_time_continuations_per_round * scale,
+        occupancy_checks_per_round: base.occupancy_checks_per_round * scale,
+        outbox_writes_per_round: base.outbox_writes_per_round * scale,
+        ..base
+    })
+}
+
 /// Explicit host-visible failure from the bounded spike harness.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetalSpikeError {
     InvalidBenchmarkConfig(&'static str),
     Metal(String),
     PrimitiveMismatch(&'static str),
+    StateMismatch(String),
 }
 
 impl std::fmt::Display for MetalSpikeError {
@@ -110,7 +232,7 @@ impl std::fmt::Display for MetalSpikeError {
             Self::InvalidBenchmarkConfig(message) | Self::PrimitiveMismatch(message) => {
                 formatter.write_str(message)
             }
-            Self::Metal(message) => formatter.write_str(message),
+            Self::Metal(message) | Self::StateMismatch(message) => formatter.write_str(message),
         }
     }
 }
@@ -141,38 +263,46 @@ pub struct MetalCorrectnessReport {
 /// Gate protocol. The decision run requires one warmup and exactly three measured samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalSpikeBenchmarkConfig {
-    pub round_counts: Vec<usize>,
+    pub sweep_points: Vec<SweepPoint>,
     pub rounds_per_encoding: usize,
     pub samples: usize,
-    pub warmup_rounds: usize,
+    pub cpu_workers: usize,
 }
 
 impl Default for MetalSpikeBenchmarkConfig {
     fn default() -> Self {
         Self {
-            round_counts: vec![60_000, 800_000],
+            sweep_points: DEFAULT_SWEEP_POINTS.to_vec(),
             rounds_per_encoding: DEFAULT_ROUNDS_PER_ENCODING,
             samples: 3,
-            warmup_rounds: DEFAULT_WARMUP_ROUNDS,
+            cpu_workers: 4,
         }
     }
 }
 
-/// Raw paired samples for one required round scale.
+/// Raw paired samples for one active-LP width.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GateScaleMeasurement {
+    pub active_lps: usize,
+    pub padded_lanes: usize,
+    pub body_threadgroups: usize,
+    pub reduction_dispatches_per_round: usize,
     pub rounds: usize,
+    pub warmup_rounds: usize,
     pub encodings: usize,
     pub dispatches_per_round: usize,
+    pub workload: MatchedWorkloadProfile,
+    pub pipeline_setup_ns: u64,
     /// Direct host command-buffer creation, encoding, ending, and commit.
     pub host_encode_submit_ns: Vec<u64>,
     /// Metal `GPUStartTime` to `GPUEndTime`, summed over the committed buffers.
     pub device_ns: Vec<u64>,
     /// Host encode start through final command-buffer completion. This already includes device time.
     pub gpu_wall_ns: Vec<u64>,
-    /// Identical flattened round loop and 1,024-lane fixed-tree reduction on the CPU.
+    /// Identical flattened LP body on the requested persistent CPU worker count.
     pub matched_cpu_ns: Vec<u64>,
-    pub checksums: Vec<u64>,
+    pub cpu_checksums: Vec<u64>,
+    pub gpu_checksums: Vec<u64>,
     pub matched_checksums: bool,
     pub no_host_sync_between_rounds: bool,
 }
@@ -209,6 +339,27 @@ impl GateScaleMeasurement {
     pub fn median_matched_cpu_ns_per_round(&self) -> f64 {
         self.median_matched_cpu_ns() as f64 / self.rounds as f64
     }
+
+    pub fn median_device_events_per_second(&self) -> f64 {
+        events_per_second(
+            self.workload.transitions_per_round,
+            self.median_device_ns_per_round(),
+        )
+    }
+
+    pub fn median_gpu_wall_events_per_second(&self) -> f64 {
+        events_per_second(
+            self.workload.transitions_per_round,
+            self.median_gpu_wall_ns_per_round(),
+        )
+    }
+
+    pub fn median_matched_cpu_events_per_second(&self) -> f64 {
+        events_per_second(
+            self.workload.transitions_per_round,
+            self.median_matched_cpu_ns_per_round(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,12 +367,15 @@ pub struct MetalSpikeBenchmarkReport {
     pub substrate: &'static str,
     pub pipeline_setup_ns: u64,
     pub rounds_per_encoding: usize,
+    pub cpu_workers: usize,
     pub workload: MatchedWorkloadProfile,
     pub scales: Vec<GateScaleMeasurement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkloadState {
+    active_lps: usize,
+    padded_lanes: usize,
     // Buffer 0 and 1 intentionally match the reduction kernel's bindings.
     next_time: Vec<u64>,
     horizon: Vec<u64>,
@@ -243,50 +397,65 @@ struct WorkloadState {
 }
 
 impl WorkloadState {
-    fn initial() -> Self {
+    fn initial(active_lps: usize) -> Result<Self, MetalSpikeError> {
+        let geometry = sweep_geometry(active_lps)?;
+        let profile_scale = active_lps / ACTIVE_PORT_LPS;
+        if profile_scale * ACTIVE_PORT_LPS != active_lps {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "active-LP width must repeat the complete retained profile",
+            ));
+        }
         let joint_profile = joint_transition_profile();
-        let mut transitions = vec![0; REDUCTION_LANES];
-        let mut continuations = vec![0; REDUCTION_LANES];
-        let mut local_push_plan = vec![0; REDUCTION_LANES];
-        let mut occupancy_plan = vec![0; REDUCTION_LANES];
-        let mut outbox_plan = vec![0; REDUCTION_LANES];
-        for (ordinal, work) in joint_profile.into_iter().enumerate() {
-            let lane = permuted_lane(ordinal, 233, 0);
-            transitions[lane] = work.transitions;
-            continuations[lane] = work.continuations;
-            local_push_plan[lane] = work.local_pushes;
-            occupancy_plan[lane] = work.occupancy_checks;
-            outbox_plan[lane] = work.outbox_writes;
+        let mut transitions = vec![0; geometry.padded_lanes];
+        let mut continuations = vec![0; geometry.padded_lanes];
+        let mut local_push_plan = vec![0; geometry.padded_lanes];
+        let mut occupancy_plan = vec![0; geometry.padded_lanes];
+        let mut outbox_plan = vec![0; geometry.padded_lanes];
+        for block in 0..profile_scale {
+            let block_start = block * ACTIVE_PORT_LPS;
+            for (ordinal, work) in joint_profile.iter().copied().enumerate() {
+                let lane = block_start + permuted_profile_lane(ordinal, 233, 0);
+                transitions[lane] = work.transitions;
+                continuations[lane] = work.continuations;
+                local_push_plan[lane] = work.local_pushes;
+                occupancy_plan[lane] = work.occupancy_checks;
+                outbox_plan[lane] = work.outbox_writes;
+            }
         }
 
-        let mut fel_fused = vec![0; 2 * REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS];
-        let mut queue_depth = vec![0; REDUCTION_LANES];
-        let mut queue_head = vec![0; REDUCTION_LANES];
-        for lane in 0..ACTIVE_PORT_LPS {
-            let base_time = 1_000 + (lane % 7) as u64;
+        let mut fel_fused = vec![0; 2 * geometry.padded_lanes * FUSED_EVENT_PACKET_WORDS];
+        let mut queue_depth = vec![0; geometry.padded_lanes];
+        let mut queue_head = vec![0; geometry.padded_lanes];
+        for lane in 0..active_lps {
+            let profile_lane = lane % ACTIVE_PORT_LPS;
+            let block_start = lane - profile_lane;
+            let base_time = 1_000 + (profile_lane % 7) as u64;
             for slot in 0..2 {
-                let base = fused_fel_offset(slot, lane);
+                let base = fused_fel_offset(slot, lane, geometry.padded_lanes);
                 // Equal-time cases deliberately exercise phase, origin, and sequence tie breaks.
-                fel_fused[base + EVENT_TIME] = base_time + u64::from(lane % 4 == 0 && slot == 1);
-                fel_fused[base + EVENT_PHASE] = u64::from(slot == 1 && lane % 4 != 0);
+                fel_fused[base + EVENT_TIME] =
+                    base_time + u64::from(profile_lane.is_multiple_of(4) && slot == 1);
+                fel_fused[base + EVENT_PHASE] =
+                    u64::from(slot == 1 && !profile_lane.is_multiple_of(4));
                 fel_fused[base + EVENT_ORIGIN] =
-                    lane as u64 + u64::from(slot == 1 && lane % 4 >= 2);
+                    lane as u64 + u64::from(slot == 1 && profile_lane % 4 >= 2);
                 fel_fused[base + EVENT_SEQUENCE] = ((lane as u64) << 32) + u64::from(slot == 1);
-                fel_fused[base + EVENT_TARGET] = permuted_lane(lane, 337, 17) as u64;
+                fel_fused[base + EVENT_TARGET] =
+                    (block_start + permuted_profile_lane(profile_lane, 337, 17)) as u64;
                 fel_fused[base + EVENT_KIND] = slot as u64;
                 fel_fused[base + EVENT_PAYLOAD] = 10_000 + lane as u64;
                 fel_fused[base + PACKET_ID] = 10_000 + lane as u64;
-                fel_fused[base + PACKET_FLOW] = 20_000 + (lane % 4_096) as u64;
-                fel_fused[base + PACKET_SIZE] = [64, 1_000, 1_500, 9_000][lane % 4];
-                fel_fused[base + PACKET_KIND] = (lane % 2) as u64;
+                fel_fused[base + PACKET_FLOW] = 20_000 + (profile_lane % 4_096) as u64;
+                fel_fused[base + PACKET_SIZE] = [64, 1_000, 1_500, 9_000][profile_lane % 4];
+                fel_fused[base + PACKET_KIND] = (profile_lane % 2) as u64;
             }
-            queue_depth[lane] = 2 + (lane % 31) as u32;
-            queue_head[lane] = lane as u32 % queue_depth[lane];
+            queue_depth[lane] = 2 + (profile_lane % 31) as u32;
+            queue_head[lane] = profile_lane as u32 % queue_depth[lane];
         }
-        let mut next_time = vec![u64::MAX; REDUCTION_LANES];
-        for (lane, time) in next_time.iter_mut().enumerate().take(ACTIVE_PORT_LPS) {
-            let left = fused_fel_offset(0, lane);
-            let right = fused_fel_offset(1, lane);
+        let mut next_time = vec![u64::MAX; geometry.padded_lanes];
+        for (lane, time) in next_time.iter_mut().enumerate().take(active_lps) {
+            let left = fused_fel_offset(0, lane, geometry.padded_lanes);
+            let right = fused_fel_offset(1, lane, geometry.padded_lanes);
             *time = if fused_event_less(&fel_fused, left, right) {
                 fel_fused[left + EVENT_TIME]
             } else {
@@ -295,6 +464,8 @@ impl WorkloadState {
         }
 
         let state = Self {
+            active_lps,
+            padded_lanes: geometry.padded_lanes,
             next_time,
             horizon: vec![2_080],
             fel_fused,
@@ -305,34 +476,35 @@ impl WorkloadState {
             local_push_plan,
             occupancy_plan,
             outbox_plan,
-            outbox_fused: vec![0; REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS],
-            outbox_count: vec![0; REDUCTION_LANES],
-            errors: vec![0; REDUCTION_LANES],
-            semantic_flags: vec![0; REDUCTION_LANES],
-            audit: vec![0; REDUCTION_LANES],
+            outbox_fused: vec![0; geometry.padded_lanes * FUSED_EVENT_PACKET_WORDS],
+            outbox_count: vec![0; geometry.padded_lanes],
+            errors: vec![0; geometry.padded_lanes],
+            semantic_flags: vec![0; geometry.padded_lanes],
+            audit: vec![0; geometry.padded_lanes],
         };
         state.assert_profile();
-        state
+        Ok(state)
     }
 
     fn assert_profile(&self) {
-        let profile = matched_workload_profile();
+        let profile =
+            scaled_workload_profile(self.active_lps).expect("initialized workload width is valid");
         assert_eq!(
-            self.transitions[..ACTIVE_PORT_LPS]
+            self.transitions[..self.active_lps]
                 .iter()
                 .map(|value| u64::from(*value))
                 .sum::<u64>(),
             profile.transitions_per_round
         );
         assert_eq!(
-            self.continuations[..ACTIVE_PORT_LPS]
+            self.continuations[..self.active_lps]
                 .iter()
                 .map(|value| u64::from(*value))
                 .sum::<u64>(),
             profile.same_time_continuations_per_round
         );
         assert_eq!(
-            self.transitions[..ACTIVE_PORT_LPS]
+            self.transitions[..self.active_lps]
                 .iter()
                 .zip(&self.continuations)
                 .map(|(transitions, continuations)| u64::from(transitions - continuations))
@@ -340,28 +512,28 @@ impl WorkloadState {
             profile.fel_pops_per_round
         );
         assert_eq!(
-            self.local_push_plan[..ACTIVE_PORT_LPS]
+            self.local_push_plan[..self.active_lps]
                 .iter()
                 .map(|value| u64::from(*value))
                 .sum::<u64>(),
             profile.local_child_pushes_per_round
         );
         assert_eq!(
-            self.occupancy_plan[..ACTIVE_PORT_LPS]
+            self.occupancy_plan[..self.active_lps]
                 .iter()
                 .map(|value| u64::from(*value))
                 .sum::<u64>(),
             profile.occupancy_checks_per_round
         );
         assert_eq!(
-            self.outbox_plan[..ACTIVE_PORT_LPS]
+            self.outbox_plan[..self.active_lps]
                 .iter()
                 .map(|value| u64::from(*value))
                 .sum::<u64>(),
             profile.outbox_writes_per_round
         );
         assert_eq!(
-            *self.transitions[..ACTIVE_PORT_LPS]
+            *self.transitions[..self.active_lps]
                 .iter()
                 .max()
                 .expect("active profile must not be empty"),
@@ -475,12 +647,12 @@ fn joint_transition_profile() -> Vec<JointLpWork> {
     profile
 }
 
-fn permuted_lane(ordinal: usize, multiplier: usize, offset: usize) -> usize {
+fn permuted_profile_lane(ordinal: usize, multiplier: usize, offset: usize) -> usize {
     (ordinal * multiplier + offset) % ACTIVE_PORT_LPS
 }
 
-fn fused_fel_offset(slot: usize, lane: usize) -> usize {
-    (slot * REDUCTION_LANES + lane) * FUSED_EVENT_PACKET_WORDS
+fn fused_fel_offset(slot: usize, lane: usize, padded_lanes: usize) -> usize {
+    (slot * padded_lanes + lane) * FUSED_EVENT_PACKET_WORDS
 }
 
 fn fused_event_less(events: &[u64], left: usize, right: usize) -> bool {
@@ -497,31 +669,48 @@ fn fused_event_less(events: &[u64], left: usize, right: usize) -> bool {
     )
 }
 
-fn execute_cpu_round(state: &mut WorkloadState, reduction_scratch: &mut [u64]) {
-    let boundary = state.horizon[0];
-    for lane in 0..ACTIVE_PORT_LPS {
-        state.outbox_count[lane] = 0;
-        state.semantic_flags[lane] = 0;
-        let transitions = state.transitions[lane];
+struct CpuWorkloadShard<'a> {
+    base_lane: usize,
+    next_time: &'a mut [u64],
+    fel_left: &'a mut [u64],
+    fel_right: &'a mut [u64],
+    queue_depth: &'a [u32],
+    queue_head: &'a mut [u32],
+    transitions: &'a [u32],
+    continuations: &'a [u32],
+    local_push_plan: &'a [u32],
+    occupancy_plan: &'a [u32],
+    outbox_plan: &'a [u32],
+    outbox_fused: &'a mut [u64],
+    outbox_count: &'a mut [u32],
+    errors: &'a mut [u32],
+    semantic_flags: &'a mut [u32],
+    audit: &'a mut [u64],
+}
+
+fn execute_cpu_shard_round(state: &mut CpuWorkloadShard<'_>, boundary: u64) -> u64 {
+    for local_lane in 0..state.next_time.len() {
+        let lane = state.base_lane + local_lane;
+        state.outbox_count[local_lane] = 0;
+        state.semantic_flags[local_lane] = 0;
+        let transitions = state.transitions[local_lane];
         if transitions > MAX_TRANSITIONS_PER_LP {
-            state.errors[lane] = ERROR_TRANSITION_OVERFLOW;
+            state.errors[local_lane] = ERROR_TRANSITION_OVERFLOW;
             continue;
         }
-        let continuation_count = state.continuations[lane];
+        let continuation_count = state.continuations[local_lane];
         let fel_pop_count = transitions - continuation_count;
-        let local_push_count = state.local_push_plan[lane];
-        let occupancy_count = state.occupancy_plan[lane];
-        let outbox_count = state.outbox_plan[lane];
-        if outbox_count > 1 && state.errors[lane] == ERROR_NONE {
-            state.errors[lane] = ERROR_OUTBOX_OVERFLOW;
+        let local_push_count = state.local_push_plan[local_lane];
+        let occupancy_count = state.occupancy_plan[local_lane];
+        let outbox_count = state.outbox_plan[local_lane];
+        if outbox_count > 1 && state.errors[local_lane] == ERROR_NONE {
+            state.errors[local_lane] = ERROR_OUTBOX_OVERFLOW;
         }
 
         let mut step = 0_u32;
-        let initial = fused_fel_offset(0, lane);
-        let mut continuation_slot = initial;
+        let mut continuation_is_right = false;
         let mut continuation_slot_valid = false;
-        let mut last_event = [0_u64; FUSED_EVENT_PACKET_WORDS];
-        last_event.copy_from_slice(&state.fel_fused[initial..initial + FUSED_EVENT_PACKET_WORDS]);
+        let mut last_event = read_shard_fel(state, local_lane, false);
         while step < transitions {
             let direct_continuation = step >= fel_pop_count;
             let produces_direct_continuation = continuation_count > 0 && step + 1 == fel_pop_count;
@@ -530,21 +719,13 @@ fn execute_cpu_round(state: &mut WorkloadState, reduction_scratch: &mut [u64]) {
             let performs_occupancy =
                 step >= transitions.saturating_sub(occupancy_count.min(transitions));
             let performs_outbox = step >= transitions.saturating_sub(outbox_count.min(transitions));
-            let mut selected = continuation_slot;
+            let mut selected_is_right = continuation_is_right;
             let mut parent = last_event;
             if !direct_continuation {
-                let left = fused_fel_offset(0, lane);
-                let right = fused_fel_offset(1, lane);
-                selected = if fused_event_less(&state.fel_fused, left, right) {
-                    left
-                } else {
-                    right
-                };
-                parent.copy_from_slice(
-                    &state.fel_fused[selected..selected + FUSED_EVENT_PACKET_WORDS],
-                );
+                selected_is_right = !shard_left_event_less(state, local_lane);
+                parent = read_shard_fel(state, local_lane, selected_is_right);
                 if produces_direct_continuation {
-                    continuation_slot = selected;
+                    continuation_is_right = selected_is_right;
                     continuation_slot_valid = true;
                 }
             }
@@ -569,97 +750,263 @@ fn execute_cpu_round(state: &mut WorkloadState, reduction_scratch: &mut [u64]) {
             child[PACKET_SIZE] = child[PACKET_SIZE].wrapping_add(u64::from(step & 1));
             child[PACKET_KIND] = child[PACKET_KIND].wrapping_add(u64::from(step & 1)) & 1;
             if produces_direct_continuation && child[EVENT_TIME] == parent[EVENT_TIME] {
-                state.semantic_flags[lane] |= 1;
+                state.semantic_flags[local_lane] |= 1;
             }
             if direct_continuation && performs_occupancy {
-                state.semantic_flags[lane] |= 1 << 1;
+                state.semantic_flags[local_lane] |= 1 << 1;
             }
             if direct_continuation && performs_outbox {
-                state.semantic_flags[lane] |= 1 << 2;
+                state.semantic_flags[local_lane] |= 1 << 2;
             }
             if direct_continuation && performs_local_push {
-                state.semantic_flags[lane] |= 1 << 3;
+                state.semantic_flags[local_lane] |= 1 << 3;
             }
-            if direct_continuation && continuation_slot_valid && selected == continuation_slot {
-                state.semantic_flags[lane] |= 1 << 4;
+            if direct_continuation
+                && continuation_slot_valid
+                && selected_is_right == continuation_is_right
+            {
+                state.semantic_flags[local_lane] |= 1 << 4;
             }
 
             if performs_local_push {
-                state.fel_fused[selected..selected + FUSED_EVENT_PACKET_WORDS]
-                    .copy_from_slice(&child);
+                write_shard_fel(state, local_lane, selected_is_right, &child);
             } else if !direct_continuation && !produces_direct_continuation {
-                state.fel_fused[selected + EVENT_TIME] = child[EVENT_TIME];
-                state.fel_fused[selected + EVENT_PHASE] = child[EVENT_PHASE];
-                state.fel_fused[selected + EVENT_ORIGIN] = child[EVENT_ORIGIN];
-                state.fel_fused[selected + EVENT_SEQUENCE] = child[EVENT_SEQUENCE];
+                write_shard_fel_key(state, local_lane, selected_is_right, &child);
             }
             if step + 1 == transitions && local_push_count > transitions {
-                let extra = if selected == fused_fel_offset(0, lane) {
-                    fused_fel_offset(1, lane)
-                } else {
-                    fused_fel_offset(0, lane)
-                };
                 let mut second_child = child;
                 second_child[EVENT_SEQUENCE] = second_child[EVENT_SEQUENCE].wrapping_add(1);
-                state.fel_fused[extra..extra + FUSED_EVENT_PACKET_WORDS]
-                    .copy_from_slice(&second_child);
+                write_shard_fel(state, local_lane, !selected_is_right, &second_child);
             }
 
             if performs_occupancy {
-                let depth = state.queue_depth[lane];
+                let depth = state.queue_depth[local_lane];
                 if depth == 0 {
-                    if state.errors[lane] == ERROR_NONE {
-                        state.errors[lane] = ERROR_ZERO_OCCUPANCY;
+                    if state.errors[local_lane] == ERROR_NONE {
+                        state.errors[local_lane] = ERROR_ZERO_OCCUPANCY;
                     }
                 } else {
-                    state.queue_head[lane] = (state.queue_head[lane] + 1) % depth;
+                    state.queue_head[local_lane] = (state.queue_head[local_lane] + 1) % depth;
                 }
             }
 
             if performs_outbox && outbox_count <= 1 {
-                let outbox = lane * FUSED_EVENT_PACKET_WORDS;
+                let outbox = local_lane * FUSED_EVENT_PACKET_WORDS;
                 state.outbox_fused[outbox..outbox + FUSED_EVENT_PACKET_WORDS]
                     .copy_from_slice(&child);
-                state.outbox_count[lane] = 1;
+                state.outbox_count[local_lane] = 1;
             }
 
             let operation_tags = 1_u64
                 .wrapping_add((!direct_continuation as u64) << 8)
                 .wrapping_add((performs_occupancy as u64) << 16)
                 .wrapping_add((performs_outbox as u64) << 24);
-            state.audit[lane] = state.audit[lane].wrapping_add(operation_tags).wrapping_add(
-                parent
-                    .iter()
-                    .fold(0_u64, |sum, word| sum.wrapping_add(*word)),
-            );
+            state.audit[local_lane] = state.audit[local_lane]
+                .wrapping_add(operation_tags)
+                .wrapping_add(
+                    parent
+                        .iter()
+                        .fold(0_u64, |sum, word| sum.wrapping_add(*word)),
+                );
             last_event = child;
             step += 1;
         }
-        let left = fused_fel_offset(0, lane);
-        let right = fused_fel_offset(1, lane);
-        state.next_time[lane] = if fused_event_less(&state.fel_fused, left, right) {
-            state.fel_fused[left + EVENT_TIME]
+        state.next_time[local_lane] = if shard_left_event_less(state, local_lane) {
+            read_shard_fel_word(state, local_lane, false, EVENT_TIME)
         } else {
-            state.fel_fused[right + EVENT_TIME]
+            read_shard_fel_word(state, local_lane, true, EVENT_TIME)
         };
     }
-    state.next_time[ACTIVE_PORT_LPS..].fill(u64::MAX);
-
-    reduction_scratch.copy_from_slice(&state.next_time);
-    let mut stride = REDUCTION_LANES / 2;
-    while stride > 0 {
-        for lane in 0..stride {
-            reduction_scratch[lane] = reduction_scratch[lane].min(reduction_scratch[lane + stride]);
-        }
-        stride /= 2;
-    }
-    state.horizon[0] = reduction_scratch[0].wrapping_add(LOOKAHEAD_NS);
+    state.next_time.iter().copied().min().unwrap_or(u64::MAX)
 }
 
-fn run_cpu_rounds(state: &mut WorkloadState, rounds: usize, reduction_scratch: &mut [u64]) {
-    for _ in 0..rounds {
-        execute_cpu_round(state, reduction_scratch);
+fn read_shard_fel(
+    state: &CpuWorkloadShard<'_>,
+    local_lane: usize,
+    right: bool,
+) -> [u64; FUSED_EVENT_PACKET_WORDS] {
+    let offset = local_lane * FUSED_EVENT_PACKET_WORDS;
+    let source = if right {
+        &state.fel_right[offset..offset + FUSED_EVENT_PACKET_WORDS]
+    } else {
+        &state.fel_left[offset..offset + FUSED_EVENT_PACKET_WORDS]
+    };
+    let mut event = [0; FUSED_EVENT_PACKET_WORDS];
+    event.copy_from_slice(source);
+    event
+}
+
+fn read_shard_fel_word(
+    state: &CpuWorkloadShard<'_>,
+    local_lane: usize,
+    right: bool,
+    word: usize,
+) -> u64 {
+    let offset = local_lane * FUSED_EVENT_PACKET_WORDS + word;
+    if right {
+        state.fel_right[offset]
+    } else {
+        state.fel_left[offset]
     }
+}
+
+fn write_shard_fel(
+    state: &mut CpuWorkloadShard<'_>,
+    local_lane: usize,
+    right: bool,
+    event: &[u64; FUSED_EVENT_PACKET_WORDS],
+) {
+    let offset = local_lane * FUSED_EVENT_PACKET_WORDS;
+    let target = if right {
+        &mut state.fel_right[offset..offset + FUSED_EVENT_PACKET_WORDS]
+    } else {
+        &mut state.fel_left[offset..offset + FUSED_EVENT_PACKET_WORDS]
+    };
+    target.copy_from_slice(event);
+}
+
+fn write_shard_fel_key(
+    state: &mut CpuWorkloadShard<'_>,
+    local_lane: usize,
+    right: bool,
+    event: &[u64; FUSED_EVENT_PACKET_WORDS],
+) {
+    let offset = local_lane * FUSED_EVENT_PACKET_WORDS;
+    let target = if right {
+        &mut state.fel_right[offset..offset + FUSED_EVENT_PACKET_WORDS]
+    } else {
+        &mut state.fel_left[offset..offset + FUSED_EVENT_PACKET_WORDS]
+    };
+    target[EVENT_TIME..=EVENT_SEQUENCE].copy_from_slice(&event[EVENT_TIME..=EVENT_SEQUENCE]);
+}
+
+fn shard_left_event_less(state: &CpuWorkloadShard<'_>, local_lane: usize) -> bool {
+    let offset = local_lane * FUSED_EVENT_PACKET_WORDS;
+    (
+        state.fel_left[offset + EVENT_TIME],
+        state.fel_left[offset + EVENT_PHASE],
+        state.fel_left[offset + EVENT_ORIGIN],
+        state.fel_left[offset + EVENT_SEQUENCE],
+    ) < (
+        state.fel_right[offset + EVENT_TIME],
+        state.fel_right[offset + EVENT_PHASE],
+        state.fel_right[offset + EVENT_ORIGIN],
+        state.fel_right[offset + EVENT_SEQUENCE],
+    )
+}
+
+fn measure_cpu_rounds(state: &mut WorkloadState, rounds: usize, workers: usize) -> u64 {
+    let boundary = AtomicU64::new(state.horizon[0]);
+    let worker_minima = (0..workers)
+        .map(|_| AtomicU64::new(u64::MAX))
+        .collect::<Vec<_>>();
+    let ready_barrier = Barrier::new(workers + 1);
+    let start_barrier = Barrier::new(workers + 1);
+    let finish_barrier = Barrier::new(workers + 1);
+    let round_barrier = Barrier::new(workers);
+    let shards = cpu_workload_shards(state, workers);
+
+    let elapsed = std::thread::scope(|scope| {
+        for (worker, mut shard) in shards.into_iter().enumerate() {
+            let boundary = &boundary;
+            let worker_minima = &worker_minima;
+            let ready_barrier = &ready_barrier;
+            let start_barrier = &start_barrier;
+            let finish_barrier = &finish_barrier;
+            let round_barrier = &round_barrier;
+            scope.spawn(move || {
+                ready_barrier.wait();
+                start_barrier.wait();
+                for _ in 0..rounds {
+                    let minimum =
+                        execute_cpu_shard_round(&mut shard, boundary.load(Ordering::Relaxed));
+                    worker_minima[worker].store(minimum, Ordering::Relaxed);
+                    round_barrier.wait();
+                    if worker == 0 {
+                        let minimum = worker_minima
+                            .iter()
+                            .map(|value| value.load(Ordering::Relaxed))
+                            .min()
+                            .unwrap_or(u64::MAX);
+                        boundary.store(minimum.wrapping_add(LOOKAHEAD_NS), Ordering::Relaxed);
+                    }
+                    round_barrier.wait();
+                }
+                finish_barrier.wait();
+            });
+        }
+
+        ready_barrier.wait();
+        let started = Instant::now();
+        start_barrier.wait();
+        finish_barrier.wait();
+        started.elapsed()
+    });
+    state.horizon[0] = boundary.load(Ordering::Relaxed);
+    duration_ns(elapsed)
+}
+
+fn cpu_workload_shards(state: &mut WorkloadState, workers: usize) -> Vec<CpuWorkloadShard<'_>> {
+    let active_lps = state.active_lps;
+    let padded_words = state.padded_lanes * FUSED_EVENT_PACKET_WORDS;
+    let (fel_left, fel_right) = state.fel_fused.split_at_mut(padded_words);
+
+    let mut next_time = &mut state.next_time[..active_lps];
+    let mut fel_left = &mut fel_left[..active_lps * FUSED_EVENT_PACKET_WORDS];
+    let mut fel_right = &mut fel_right[..active_lps * FUSED_EVENT_PACKET_WORDS];
+    let mut queue_depth = &state.queue_depth[..active_lps];
+    let mut queue_head = &mut state.queue_head[..active_lps];
+    let mut transitions = &state.transitions[..active_lps];
+    let mut continuations = &state.continuations[..active_lps];
+    let mut local_push_plan = &state.local_push_plan[..active_lps];
+    let mut occupancy_plan = &state.occupancy_plan[..active_lps];
+    let mut outbox_plan = &state.outbox_plan[..active_lps];
+    let mut outbox_fused = &mut state.outbox_fused[..active_lps * FUSED_EVENT_PACKET_WORDS];
+    let mut outbox_count = &mut state.outbox_count[..active_lps];
+    let mut errors = &mut state.errors[..active_lps];
+    let mut semantic_flags = &mut state.semantic_flags[..active_lps];
+    let mut audit = &mut state.audit[..active_lps];
+
+    let mut shards = Vec::with_capacity(workers);
+    let mut base_lane = 0;
+    for worker in 0..workers {
+        let next_end = active_lps * (worker + 1) / workers;
+        let lanes = next_end - base_lane;
+        let words = lanes * FUSED_EVENT_PACKET_WORDS;
+        shards.push(CpuWorkloadShard {
+            base_lane,
+            next_time: take_mut_prefix(&mut next_time, lanes),
+            fel_left: take_mut_prefix(&mut fel_left, words),
+            fel_right: take_mut_prefix(&mut fel_right, words),
+            queue_depth: take_prefix(&mut queue_depth, lanes),
+            queue_head: take_mut_prefix(&mut queue_head, lanes),
+            transitions: take_prefix(&mut transitions, lanes),
+            continuations: take_prefix(&mut continuations, lanes),
+            local_push_plan: take_prefix(&mut local_push_plan, lanes),
+            occupancy_plan: take_prefix(&mut occupancy_plan, lanes),
+            outbox_plan: take_prefix(&mut outbox_plan, lanes),
+            outbox_fused: take_mut_prefix(&mut outbox_fused, words),
+            outbox_count: take_mut_prefix(&mut outbox_count, lanes),
+            errors: take_mut_prefix(&mut errors, lanes),
+            semantic_flags: take_mut_prefix(&mut semantic_flags, lanes),
+            audit: take_mut_prefix(&mut audit, lanes),
+        });
+        base_lane = next_end;
+    }
+    shards
+}
+
+fn take_prefix<'a, T>(remainder: &mut &'a [T], len: usize) -> &'a [T] {
+    let (prefix, tail) = remainder.split_at(len);
+    *remainder = tail;
+    prefix
+}
+
+fn take_mut_prefix<'a, T>(remainder: &mut &'a mut [T], len: usize) -> &'a mut [T] {
+    let current = std::mem::take(remainder);
+    let (prefix, tail) = current.split_at_mut(len);
+    *remainder = tail;
+    prefix
 }
 
 #[cube]
@@ -951,15 +1298,39 @@ fn matched_round_kernel(
 }
 
 #[cube(launch_unchecked)]
+fn block_reduction_kernel(next_time: &[u64], block_minima: &mut [u64], #[comptime] width: u32) {
+    let lane = UNIT_POS as usize;
+    let mut minima = Shared::<[u64]>::new_slice(width as usize);
+    minima[lane] = next_time[ABSOLUTE_POS];
+    sync_cube();
+
+    let stride = RuntimeCell::<u32>::new(width / 2u32);
+    while stride.read() > 0u32 {
+        let current_stride = stride.read();
+        if UNIT_POS < current_stride {
+            let right = lane + current_stride as usize;
+            if minima[right] < minima[lane] {
+                minima[lane] = minima[right];
+            }
+        }
+        sync_cube();
+        stride.store(current_stride / 2u32);
+    }
+    if UNIT_POS == 0u32 {
+        block_minima[CUBE_POS_X as usize] = minima[0usize];
+    }
+}
+
+#[cube(launch_unchecked)]
 fn horizon_reduction_kernel(
-    next_time: &[u64],
+    minima_input: &[u64],
     horizon: &mut [u64],
     #[comptime] width: u32,
     #[comptime] lookahead_ns: u64,
 ) {
     let lane = UNIT_POS as usize;
     let mut minima = Shared::<[u64]>::new_slice(width as usize);
-    minima[lane] = next_time[lane];
+    minima[lane] = minima_input[lane];
     sync_cube();
 
     let stride = RuntimeCell::<u32>::new(width / 2u32);
@@ -1002,7 +1373,10 @@ fn compile_kernel<K: CubeKernel>(kernel: K) -> Result<GeneratedKernel, MetalSpik
     })
 }
 
-fn generated_kernels() -> Result<(GeneratedKernel, GeneratedKernel), MetalSpikeError> {
+fn generated_kernels(
+    active_lps: usize,
+    padded_lanes: usize,
+) -> Result<(GeneratedKernel, GeneratedKernel, GeneratedKernel), MetalSpikeError> {
     let client = MetalRuntime::client(&MetalDevice::DefaultDevice);
     let buffer = BufferCompilationArg { inplace: None };
     let round = matched_round_kernel::MatchedRoundKernel::<MetalRuntime>::new(
@@ -1025,10 +1399,19 @@ fn generated_kernels() -> Result<(GeneratedKernel, GeneratedKernel), MetalSpikeE
         buffer.clone(),
         buffer.clone(),
         buffer.clone(),
-        ACTIVE_PORT_LPS as u32,
-        (REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS) as u32,
+        active_lps as u32,
+        (padded_lanes * FUSED_EVENT_PACKET_WORDS) as u32,
         LOOKAHEAD_NS,
         MAX_TRANSITIONS_PER_LP,
+    );
+    let block_reduction = block_reduction_kernel::BlockReductionKernel::<MetalRuntime>::new(
+        KernelSettings::default()
+            .cube_dim(CubeDim::new_1d(REDUCTION_LANES as u32))
+            .kernel_name("block_reduction_kernel"),
+        client.clone(),
+        buffer.clone(),
+        buffer.clone(),
+        REDUCTION_LANES as u32,
     );
     let reduction = horizon_reduction_kernel::HorizonReductionKernel::<MetalRuntime>::new(
         KernelSettings::default()
@@ -1040,7 +1423,11 @@ fn generated_kernels() -> Result<(GeneratedKernel, GeneratedKernel), MetalSpikeE
         REDUCTION_LANES as u32,
         LOOKAHEAD_NS,
     );
-    Ok((compile_kernel(round)?, compile_kernel(reduction)?))
+    Ok((
+        compile_kernel(round)?,
+        compile_kernel(block_reduction)?,
+        compile_kernel(reduction)?,
+    ))
 }
 
 struct UntypedMetalBuffer {
@@ -1083,6 +1470,9 @@ impl UntypedMetalBuffer {
 
 struct MetalBuffers {
     planes: Vec<UntypedMetalBuffer>,
+    block_minima: UntypedMetalBuffer,
+    active_lps: usize,
+    padded_lanes: usize,
 }
 
 impl MetalBuffers {
@@ -1095,7 +1485,14 @@ impl MetalBuffers {
             .into_iter()
             .map(|plane| UntypedMetalBuffer::new(device, plane))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { planes })
+        let block_minima =
+            UntypedMetalBuffer::new(device, bytes(&vec![u64::MAX; REDUCTION_LANES]))?;
+        Ok(Self {
+            planes,
+            block_minima,
+            active_lps: state.active_lps,
+            padded_lanes: state.padded_lanes,
+        })
     }
 
     fn write(&self, state: &WorkloadState) {
@@ -1117,21 +1514,23 @@ impl MetalBuffers {
     fn read_state(&self) -> WorkloadState {
         assert_eq!(self.planes.len(), 15);
         WorkloadState {
-            next_time: self.read_plane(0, REDUCTION_LANES),
+            active_lps: self.active_lps,
+            padded_lanes: self.padded_lanes,
+            next_time: self.read_plane(0, self.padded_lanes),
             horizon: self.read_plane(1, 1),
-            fel_fused: self.read_plane(2, 2 * REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS),
-            queue_depth: self.read_plane(3, REDUCTION_LANES),
-            queue_head: self.read_plane(4, REDUCTION_LANES),
-            transitions: self.read_plane(5, REDUCTION_LANES),
-            continuations: self.read_plane(6, REDUCTION_LANES),
-            local_push_plan: self.read_plane(7, REDUCTION_LANES),
-            occupancy_plan: self.read_plane(8, REDUCTION_LANES),
-            outbox_plan: self.read_plane(9, REDUCTION_LANES),
-            outbox_fused: self.read_plane(10, REDUCTION_LANES * FUSED_EVENT_PACKET_WORDS),
-            outbox_count: self.read_plane(11, REDUCTION_LANES),
-            errors: self.read_plane(12, REDUCTION_LANES),
-            semantic_flags: self.read_plane(13, REDUCTION_LANES),
-            audit: self.read_plane(14, REDUCTION_LANES),
+            fel_fused: self.read_plane(2, 2 * self.padded_lanes * FUSED_EVENT_PACKET_WORDS),
+            queue_depth: self.read_plane(3, self.padded_lanes),
+            queue_head: self.read_plane(4, self.padded_lanes),
+            transitions: self.read_plane(5, self.padded_lanes),
+            continuations: self.read_plane(6, self.padded_lanes),
+            local_push_plan: self.read_plane(7, self.padded_lanes),
+            occupancy_plan: self.read_plane(8, self.padded_lanes),
+            outbox_plan: self.read_plane(9, self.padded_lanes),
+            outbox_fused: self.read_plane(10, self.padded_lanes * FUSED_EVENT_PACKET_WORDS),
+            outbox_count: self.read_plane(11, self.padded_lanes),
+            errors: self.read_plane(12, self.padded_lanes),
+            semantic_flags: self.read_plane(13, self.padded_lanes),
+            audit: self.read_plane(14, self.padded_lanes),
         }
     }
 
@@ -1155,26 +1554,37 @@ struct DirectMetalSpike {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     round_pipeline: MetalPipeline,
+    block_reduction_pipeline: MetalPipeline,
     reduction_pipeline: MetalPipeline,
+    geometry: SweepGeometry,
     pipeline_setup_ns: u64,
 }
 
 impl DirectMetalSpike {
-    fn new() -> Result<Self, MetalSpikeError> {
+    fn new(active_lps: usize) -> Result<Self, MetalSpikeError> {
         let setup_started = Instant::now();
+        let geometry = sweep_geometry(active_lps)?;
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
             MetalSpikeError::Metal("Metal system default device is unavailable".into())
         })?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| MetalSpikeError::Metal("Metal command queue creation failed".into()))?;
-        let (round_source, reduction_source) = generated_kernels()?;
+        let (round_source, block_reduction_source, reduction_source) =
+            generated_kernels(active_lps, geometry.padded_lanes)?;
         let round_pipeline = create_pipeline(&device, round_source)?;
+        let block_reduction_pipeline = create_pipeline(&device, block_reduction_source)?;
         let reduction_pipeline = create_pipeline(&device, reduction_source)?;
         if round_pipeline.maxTotalThreadsPerThreadgroup() < REDUCTION_LANES {
             return Err(MetalSpikeError::Metal(format!(
                 "round pipeline supports only {} threads per threadgroup",
                 round_pipeline.maxTotalThreadsPerThreadgroup()
+            )));
+        }
+        if block_reduction_pipeline.maxTotalThreadsPerThreadgroup() < REDUCTION_LANES {
+            return Err(MetalSpikeError::Metal(format!(
+                "block reduction pipeline supports only {} threads per threadgroup",
+                block_reduction_pipeline.maxTotalThreadsPerThreadgroup()
             )));
         }
         if reduction_pipeline.maxTotalThreadsPerThreadgroup() < REDUCTION_LANES {
@@ -1193,7 +1603,9 @@ impl DirectMetalSpike {
             device,
             queue,
             round_pipeline,
+            block_reduction_pipeline,
             reduction_pipeline,
+            geometry,
             pipeline_setup_ns: duration_ns(setup_started.elapsed()),
         })
     }
@@ -1210,7 +1622,12 @@ impl DirectMetalSpike {
                 "round scale needs more than 64 outstanding Metal command buffers",
             ));
         }
-        let group_count = MTLSize {
+        let body_group_count = MTLSize {
+            width: self.geometry.body_threadgroups,
+            height: 1,
+            depth: 1,
+        };
+        let final_group_count = MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -1234,11 +1651,29 @@ impl DirectMetalSpike {
                     MetalSpikeError::Metal("serial compute encoder creation failed".into())
                 })?;
             buffers.bind(&encoder);
-            for _ in 0..encoded_rounds {
+            for round in 0..encoded_rounds {
+                if self.geometry.body_threadgroups > 1 && round > 0 {
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.planes[0].raw), 0, 0);
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.planes[1].raw), 0, 1);
+                    }
+                }
                 encoder.setComputePipelineState(&self.round_pipeline);
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(group_count, threadgroup);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(body_group_count, threadgroup);
+                if self.geometry.body_threadgroups > 1 {
+                    encoder.setComputePipelineState(&self.block_reduction_pipeline);
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.block_minima.raw), 0, 1);
+                    }
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(body_group_count, threadgroup);
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.block_minima.raw), 0, 0);
+                        encoder.setBuffer_offset_atIndex(Some(&buffers.planes[1].raw), 0, 1);
+                    }
+                }
                 encoder.setComputePipelineState(&self.reduction_pipeline);
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(group_count, threadgroup);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(final_group_count, threadgroup);
             }
             encoder.endEncoding();
             command_buffers.push(command_buffer);
@@ -1315,10 +1750,9 @@ fn create_pipeline(
 /// Revalidates direct-buffer ABI, serial write visibility, reduction geometry, fused outboxes, and
 /// explicit errors. T13's substrate-independent primitive proofs remain carried evidence.
 pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpikeError> {
-    let direct = DirectMetalSpike::new()?;
-    let initial = WorkloadState::initial();
+    let direct = DirectMetalSpike::new(ACTIVE_PORT_LPS)?;
+    let initial = WorkloadState::initial(ACTIVE_PORT_LPS)?;
     let buffers = MetalBuffers::new(&direct.device, &initial)?;
-    let mut reduction_scratch = vec![0; REDUCTION_LANES];
 
     let continuation_slot_association = initial
         .continuations
@@ -1326,8 +1760,8 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
         .zip(&initial.transitions)
         .position(|(continuations, transitions)| *continuations == 1 && *transitions == 2)
         .map(|lane| {
-            let left = fused_fel_offset(0, lane);
-            let right = fused_fel_offset(1, lane);
+            let left = fused_fel_offset(0, lane, initial.padded_lanes);
+            let right = fused_fel_offset(1, lane, initial.padded_lanes);
             let mut slot_fixture = initial.clone();
             // Force the predecessor to pop the right slot. This is the case a hardcoded-left
             // direct continuation corrupts, so CPU/GPU agreement alone cannot mask the bug.
@@ -1347,7 +1781,7 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
                 &slot_fixture.fel_fused[unselected..unselected + FUSED_EVENT_PACKET_WORDS];
 
             let mut slot_cpu = slot_fixture.clone();
-            run_cpu_rounds(&mut slot_cpu, 1, &mut reduction_scratch);
+            measure_cpu_rounds(&mut slot_cpu, 1, 1);
             buffers.write(&slot_fixture);
             direct.run(&buffers, 1, 1)?;
             let slot_gpu = buffers.read_state();
@@ -1366,7 +1800,7 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
         .unwrap_or(false);
 
     let mut cpu = initial.clone();
-    run_cpu_rounds(&mut cpu, 32, &mut reduction_scratch);
+    measure_cpu_rounds(&mut cpu, 32, 1);
     buffers.write(&initial);
     direct.run(&buffers, 32, 32)?;
     let gpu = buffers.read_state();
@@ -1375,7 +1809,7 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
             "direct Metal and matched CPU states differ",
         ));
     }
-    let semantic_same_time_continuation = cpu.continuations[..ACTIVE_PORT_LPS]
+    let semantic_same_time_continuation = cpu.continuations[..cpu.active_lps]
         .iter()
         .zip(&cpu.semantic_flags)
         .filter(|(continuations, _)| **continuations > 0)
@@ -1387,7 +1821,7 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
     invalid.outbox_plan[1] = 2;
     invalid.transitions[2] = MAX_TRANSITIONS_PER_LP + 1;
     let mut invalid_cpu = invalid.clone();
-    run_cpu_rounds(&mut invalid_cpu, 1, &mut reduction_scratch);
+    measure_cpu_rounds(&mut invalid_cpu, 1, 1);
     buffers.write(&invalid);
     direct.run(&buffers, 1, 1)?;
     let invalid_gpu = buffers.read_state();
@@ -1422,52 +1856,44 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
     })
 }
 
-/// Runs the fair T13b gate: same state, same round body, same fixed-tree reduction, paired on one
-/// machine with one warmup and median-of-three samples.
+/// Runs the fair T13c sweep: same state and LP body, paired on one machine with a genuine
+/// persistent CPU worker configuration, one warmup per width, and median-of-three samples.
 pub fn benchmark_metal(
     config: MetalSpikeBenchmarkConfig,
 ) -> Result<MetalSpikeBenchmarkReport, MetalSpikeError> {
     validate_benchmark_config(&config)?;
-    let direct = DirectMetalSpike::new()?;
-    let initial = WorkloadState::initial();
-    let buffers = MetalBuffers::new(&direct.device, &initial)?;
+    let mut scales = Vec::with_capacity(config.sweep_points.len());
+    let mut pipeline_setup_ns = 0_u64;
+    for point in config.sweep_points.iter().copied() {
+        let geometry = sweep_geometry(point.active_lps)?;
+        let workload = scaled_workload_profile(point.active_lps)?;
+        let direct = DirectMetalSpike::new(point.active_lps)?;
+        pipeline_setup_ns = pipeline_setup_ns.saturating_add(direct.pipeline_setup_ns);
+        let initial = WorkloadState::initial(point.active_lps)?;
+        let buffers = MetalBuffers::new(&direct.device, &initial)?;
 
-    let mut cpu_warmup = initial.clone();
-    let mut warmup_reduction_scratch = vec![0; REDUCTION_LANES];
-    run_cpu_rounds(
-        &mut cpu_warmup,
-        config.warmup_rounds,
-        &mut warmup_reduction_scratch,
-    );
-    buffers.write(&initial);
-    direct.run(&buffers, config.warmup_rounds, config.rounds_per_encoding)?;
-    let gpu_warmup = buffers.read_state();
-    if cpu_warmup != gpu_warmup {
-        return Err(MetalSpikeError::PrimitiveMismatch(
-            "CPU and GPU warmup states differ",
-        ));
-    }
+        let mut cpu_warmup = initial.clone();
+        measure_cpu_rounds(&mut cpu_warmup, point.warmup_rounds, config.cpu_workers);
+        buffers.write(&initial);
+        direct.run(&buffers, point.warmup_rounds, config.rounds_per_encoding)?;
+        let gpu_warmup = buffers.read_state();
+        ensure_states_match(point.active_lps, None, "warmup", &cpu_warmup, &gpu_warmup)?;
 
-    let mut scales = Vec::with_capacity(config.round_counts.len());
-    for rounds in config.round_counts.iter().copied() {
         let mut host_encode_submit_ns = Vec::with_capacity(config.samples);
         let mut device_ns = Vec::with_capacity(config.samples);
         let mut gpu_wall_ns = Vec::with_capacity(config.samples);
         let mut matched_cpu_ns = Vec::with_capacity(config.samples);
-        let mut checksums = Vec::with_capacity(config.samples);
-        let mut matched = true;
+        let mut cpu_checksums = Vec::with_capacity(config.samples);
+        let mut gpu_checksums = Vec::with_capacity(config.samples);
 
         for sample in 0..config.samples {
             let mut cpu_state = initial.clone();
-            let mut reduction_scratch = vec![0; REDUCTION_LANES];
-            let mut run_cpu = |state: &mut WorkloadState| {
-                let started = Instant::now();
-                run_cpu_rounds(state, rounds, &mut reduction_scratch);
-                duration_ns(started.elapsed())
+            let run_cpu = |state: &mut WorkloadState| {
+                measure_cpu_rounds(state, point.rounds, config.cpu_workers)
             };
             let run_gpu = || -> Result<(GpuSample, WorkloadState), MetalSpikeError> {
                 buffers.write(&initial);
-                let measurement = direct.run(&buffers, rounds, config.rounds_per_encoding)?;
+                let measurement = direct.run(&buffers, point.rounds, config.rounds_per_encoding)?;
                 Ok((measurement, buffers.read_state()))
             };
 
@@ -1480,38 +1906,54 @@ pub fn benchmark_metal(
                 let cpu_ns = run_cpu(&mut cpu_state);
                 (cpu_ns, gpu, state)
             };
-            matched &= cpu_state == gpu_state;
             let cpu_checksum = checksum(&cpu_state);
             let gpu_checksum = checksum(&gpu_state);
-            matched &= cpu_checksum == gpu_checksum;
-            checksums.push(cpu_checksum);
+            ensure_states_match(
+                point.active_lps,
+                Some(sample),
+                "measured sample",
+                &cpu_state,
+                &gpu_state,
+            )?;
+            if cpu_checksum != gpu_checksum {
+                return Err(MetalSpikeError::StateMismatch(format!(
+                    "checksum divergence at width {} sample {}: CPU {} != GPU {}",
+                    point.active_lps, sample, cpu_checksum, gpu_checksum
+                )));
+            }
+            cpu_checksums.push(cpu_checksum);
+            gpu_checksums.push(gpu_checksum);
             matched_cpu_ns.push(cpu_ns);
             host_encode_submit_ns.push(gpu_measurement.host_encode_submit_ns);
             device_ns.push(gpu_measurement.device_ns);
             gpu_wall_ns.push(gpu_measurement.wall_ns);
         }
-        if !matched {
-            return Err(MetalSpikeError::PrimitiveMismatch(
-                "measured direct Metal state does not match the CPU state",
-            ));
-        }
         scales.push(GateScaleMeasurement {
-            rounds,
-            encodings: rounds.div_ceil(config.rounds_per_encoding),
-            dispatches_per_round: 2,
+            active_lps: point.active_lps,
+            padded_lanes: geometry.padded_lanes,
+            body_threadgroups: geometry.body_threadgroups,
+            reduction_dispatches_per_round: geometry.reduction_dispatches_per_round,
+            rounds: point.rounds,
+            warmup_rounds: point.warmup_rounds,
+            encodings: point.rounds.div_ceil(config.rounds_per_encoding),
+            dispatches_per_round: geometry.dispatches_per_round,
+            workload,
+            pipeline_setup_ns: direct.pipeline_setup_ns,
             host_encode_submit_ns,
             device_ns,
             gpu_wall_ns,
             matched_cpu_ns,
-            checksums,
-            matched_checksums: matched,
+            cpu_checksums,
+            gpu_checksums,
+            matched_checksums: true,
             no_host_sync_between_rounds: true,
         });
     }
     Ok(MetalSpikeBenchmarkReport {
         substrate: SUBSTRATE_VERSION,
-        pipeline_setup_ns: direct.pipeline_setup_ns,
+        pipeline_setup_ns,
         rounds_per_encoding: config.rounds_per_encoding,
+        cpu_workers: config.cpu_workers,
         workload: matched_workload_profile(),
         scales,
     })
@@ -1523,9 +1965,14 @@ fn validate_benchmark_config(config: &MetalSpikeBenchmarkConfig) -> Result<(), M
             "the fair gate requires exactly three measured samples",
         ));
     }
-    if config.round_counts.is_empty() || config.round_counts.contains(&0) {
+    if config.sweep_points.is_empty() {
         return Err(MetalSpikeError::InvalidBenchmarkConfig(
-            "round counts must be nonempty and nonzero",
+            "the sweep must contain at least one width",
+        ));
+    }
+    if config.cpu_workers == 0 {
+        return Err(MetalSpikeError::InvalidBenchmarkConfig(
+            "the matched CPU worker count must be nonzero",
         ));
     }
     if config.rounds_per_encoding < 1_024 {
@@ -1533,22 +1980,48 @@ fn validate_benchmark_config(config: &MetalSpikeBenchmarkConfig) -> Result<(), M
             "long residency requires at least 1,024 rounds per encoding",
         ));
     }
-    if config.warmup_rounds == 0 {
-        return Err(MetalSpikeError::InvalidBenchmarkConfig(
-            "the fair gate requires a warmup",
-        ));
-    }
-    if config
-        .round_counts
-        .iter()
-        .chain(std::iter::once(&config.warmup_rounds))
-        .any(|rounds| rounds.div_ceil(config.rounds_per_encoding) > MAX_OUTSTANDING_COMMAND_BUFFERS)
-    {
-        return Err(MetalSpikeError::InvalidBenchmarkConfig(
-            "one sample may use at most 64 outstanding Metal command buffers",
-        ));
+    for point in &config.sweep_points {
+        scaled_workload_profile(point.active_lps)?;
+        if point.rounds == 0 || point.warmup_rounds == 0 {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "every sweep width requires nonzero warmup and measured rounds",
+            ));
+        }
+        if config.cpu_workers > point.active_lps {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "CPU workers cannot exceed the active-LP width",
+            ));
+        }
+        if [point.rounds, point.warmup_rounds]
+            .into_iter()
+            .any(|rounds| {
+                rounds.div_ceil(config.rounds_per_encoding) > MAX_OUTSTANDING_COMMAND_BUFFERS
+            })
+        {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "one sample may use at most 64 outstanding Metal command buffers",
+            ));
+        }
     }
     Ok(())
+}
+
+fn ensure_states_match(
+    active_lps: usize,
+    sample: Option<usize>,
+    phase: &str,
+    cpu: &WorkloadState,
+    gpu: &WorkloadState,
+) -> Result<(), MetalSpikeError> {
+    if cpu == gpu {
+        return Ok(());
+    }
+    let sample = sample
+        .map(|sample| format!(" sample {sample}"))
+        .unwrap_or_default();
+    Err(MetalSpikeError::StateMismatch(format!(
+        "full-state divergence at width {active_lps}{sample} during {phase}"
+    )))
 }
 
 fn checksum(state: &WorkloadState) -> u64 {
@@ -1579,6 +2052,22 @@ fn seconds_ns(seconds: f64) -> u64 {
     } else {
         nanoseconds.round() as u64
     }
+}
+
+fn coverage_ppm(numerator: usize, denominator: usize) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    let ppm = numerator
+        .saturating_mul(1_000_000)
+        .checked_div(denominator)
+        .unwrap_or(0)
+        .min(1_000_000);
+    ppm as u32
+}
+
+fn events_per_second(events_per_round: u64, nanoseconds_per_round: f64) -> f64 {
+    events_per_round as f64 * 1_000_000_000.0 / nanoseconds_per_round
 }
 
 fn median(values: &[u64]) -> u64 {
