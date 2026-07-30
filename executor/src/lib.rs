@@ -4,6 +4,8 @@
 //! later CPU and GPU executors. The scalar backend defines their executable reference behavior.
 
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod event;
 pub mod image;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -23,6 +25,11 @@ pub use cpu::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use cpu::{WindowedCpuRun, run_cpu_with_metrics_window};
+#[cfg(feature = "cuda")]
+pub use cuda::{
+    CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
+    CudaRun, run_cuda, run_cuda_with_observations,
+};
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{
     ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,

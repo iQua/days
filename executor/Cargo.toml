@@ -9,6 +9,7 @@ name = "days_executor"
 
 [features]
 default = []
+cuda = ["dep:cudarc"]
 metal-spike = [
     "dep:cubecl",
     "cubecl/metal-native",
@@ -22,6 +23,13 @@ metal-test-hooks = ["metal-spike"]
 
 [dependencies]
 crossbeam = "0.8.4"
+cudarc = { version = "0.19.8", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "fallback-dynamic-loading",
+    "cuda-13000",
+], optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 cubecl = { version = "=0.11.0-pre.1", default-features = false, optional = true }
