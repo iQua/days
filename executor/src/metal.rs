@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
@@ -68,6 +68,18 @@ const MAX_ENCODED_PAIRS_PER_WAVE: usize = 64;
 const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER;
 const MAX_COMMAND_BUFFERS: usize = 64;
 const PROFILED_ATTEMPTS: usize = 128;
+
+static METAL_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
+
+/// Acquires the supported process-wide Metal execution envelope.
+///
+/// The guard schedules device access rather than protecting Rust state, so a panic must not
+/// prevent later callers from executing.
+pub(crate) fn metal_device_execution_guard() -> MutexGuard<'static, ()> {
+    METAL_DEVICE_EXECUTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptPhase {
@@ -628,6 +640,10 @@ pub struct MetalPhaseProfile {
 }
 
 /// Runs the production Metal executor through the inclusive scenario stop.
+///
+/// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
+/// callers queue until execution and readback complete. Executor construction may proceed
+/// concurrently.
 pub fn run_metal(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
@@ -642,6 +658,10 @@ pub fn run_metal(
 }
 
 /// Runs the production Metal executor with explicit observation retention.
+///
+/// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
+/// callers queue until execution and readback complete. Executor construction may proceed
+/// concurrently.
 pub fn run_metal_with_observations(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
@@ -659,7 +679,9 @@ pub fn run_metal_with_observations(
 /// Reusable production Metal pipelines and command queue.
 ///
 /// Each run allocates fresh state buffers, so an explicit device fault cannot contaminate a
-/// subsequent run through the same executor.
+/// subsequent run through the same executor. Metal execution is serialized process-wide: one
+/// executor executes at a time, and concurrent callers queue until execution and readback
+/// complete. Executor construction may proceed concurrently.
 pub struct MetalExecutor {
     direct: DirectMetal,
 }
@@ -674,12 +696,17 @@ pub struct MetalInitializationTimings {
 }
 
 impl MetalExecutor {
+    /// Constructs an executor without acquiring the process-wide execution guard.
+    ///
+    /// Multiple executors may be constructed concurrently. Their runs are serialized
+    /// process-wide.
     pub fn new() -> Result<Self, MetalError> {
         Ok(Self {
             direct: DirectMetal::new()?,
         })
     }
 
+    /// Runs with summary observations under the process-wide Metal execution envelope.
     pub fn run(
         &self,
         image: &SimulationImage,
@@ -703,7 +730,8 @@ impl MetalExecutor {
     ///
     /// This mode is intended for tests and benchmark evidence. It preserves simulation semantics
     /// but splits the first 128 round attempts into separate compute passes, so its wall and device
-    /// totals are not production performance measurements.
+    /// totals are not production performance measurements. Concurrent Metal callers queue behind
+    /// the process-wide execution guard.
     pub fn run_profiled(
         &self,
         image: &SimulationImage,
@@ -721,7 +749,8 @@ impl MetalExecutor {
     /// Runs the matched counting-only control for [`Self::run_fel_probe_profiled`].
     ///
     /// The retained diagnostic kernel measures the legacy heap mechanism and therefore requires
-    /// `config.streams_enabled == false`.
+    /// `config.streams_enabled == false`. Concurrent Metal callers queue behind the process-wide
+    /// execution guard.
     pub fn run_fel_control_profiled(
         &self,
         image: &SimulationImage,
@@ -748,7 +777,8 @@ impl MetalExecutor {
     /// [`MetalFelProbeRun::decompose_against`]. Reinserting the just-popped minimum exercises a
     /// near-worst-case heap push, so the scaled result is an upper-biased heuristic, not a
     /// representative average or sufficient evidence by itself to indict the FEL. This legacy
-    /// heap diagnostic requires `config.streams_enabled == false`.
+    /// heap diagnostic requires `config.streams_enabled == false`. Concurrent Metal callers queue
+    /// behind the process-wide execution guard.
     pub fn run_fel_probe_profiled(
         &self,
         image: &SimulationImage,
@@ -770,7 +800,8 @@ impl MetalExecutor {
     /// The read-only pre-scan changes target-merge timing, so callers should use a matching
     /// [`Self::run_profiled`] result for production merge time and this result only for exact fan-in
     /// counts and outcome parity. This legacy exchange diagnostic requires
-    /// `config.streams_enabled == false`.
+    /// `config.streams_enabled == false`. Concurrent Metal callers queue behind the process-wide
+    /// execution guard.
     pub fn run_merge_fan_in_profiled(
         &self,
         image: &SimulationImage,
@@ -797,6 +828,7 @@ impl MetalExecutor {
             Some(pipelines.merge_pipeline),
             false,
         )?;
+        let _execution_guard = metal_device_execution_guard();
         let timing = self
             .direct
             .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
@@ -836,6 +868,7 @@ impl MetalExecutor {
             None,
             inject_round_trip,
         )?;
+        let _execution_guard = metal_device_execution_guard();
         let timing = self
             .direct
             .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
@@ -849,6 +882,7 @@ impl MetalExecutor {
         ))
     }
 
+    /// Runs with explicit observation retention under the process-wide Metal execution envelope.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -866,6 +900,8 @@ impl MetalExecutor {
     }
 
     /// Full-observation counterpart of [`Self::run_profiled`].
+    ///
+    /// Concurrent Metal callers queue behind the process-wide execution guard.
     pub fn run_with_observations_profiled(
         &self,
         image: &SimulationImage,
@@ -890,6 +926,7 @@ impl MetalExecutor {
 
         let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
         let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+        let _execution_guard = metal_device_execution_guard();
         let timing = self.direct.run(&buffers, config, profile)?;
         buffers.finish(image, observation_mode, timing)
     }

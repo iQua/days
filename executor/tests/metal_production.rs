@@ -1,7 +1,8 @@
 #![cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use days_executor::{
     ArrivalDisposition, Backend, ConstantGenerator, Event, EventKey, EventKind, FlowDescriptor,
@@ -19,16 +20,6 @@ const GENERATOR_FORWARD: LinkId = LinkId(0);
 const GENERATOR_REVERSE: LinkId = LinkId(1);
 const GENERATOR_FLOW: FlowId = FlowId(0);
 const GENERATOR_FIRST_PACKET: PayloadId = PayloadId(0);
-
-// Every test in this binary reaches the same process-local default Metal device/runtime. Keep
-// command execution isolated while preserving the default harness's parallelism elsewhere.
-static METAL_TEST_EXECUTION: Mutex<()> = Mutex::new(());
-
-fn metal_test_guard() -> MutexGuard<'static, ()> {
-    METAL_TEST_EXECUTION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 fn generator_image(termination: GeneratorTermination) -> SimulationImage {
     let first_packet = PacketDescriptor {
@@ -1040,21 +1031,18 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
 
 #[test]
 fn metal_constant_generator_bytes_matches_full_scalar_result() {
-    let _metal_test_guard = metal_test_guard();
     let image = generator_image(GeneratorTermination::Bytes(5));
     assert_full_parity(&image, None);
 }
 
 #[test]
 fn metal_constant_generator_duration_matches_full_scalar_result() {
-    let _metal_test_guard = metal_test_guard();
     let image = generator_image(GeneratorTermination::DurationNs(5));
     assert_full_parity(&image, None);
 }
 
 #[test]
 fn metal_equal_rate_paced_source_queue_bound_is_tight() {
-    let _metal_test_guard = metal_test_guard();
     // The fixture emits 64 two-byte packets every 2 ns onto a link whose exact serialization is
     // also 2 ns. PacketArrival precedes the tied TxComplete, so every tie reaches the worst-case
     // queued occupancy of exactly one before TxReady drains it.
@@ -1104,7 +1092,6 @@ fn metal_equal_rate_paced_source_queue_bound_is_tight() {
 
 #[test]
 fn metal_fifo_taildrop_and_single_selection_match_full_scalar_result() {
-    let _metal_test_guard = metal_test_guard();
     let image = fifo_taildrop_image();
     let scalar = run_scalar_with_observations(&image, Some(27), ObservationMode::Full)
         .expect("scalar oracle must run");
@@ -1132,7 +1119,6 @@ fn metal_fifo_taildrop_and_single_selection_match_full_scalar_result() {
 
 #[test]
 fn metal_run_to_run_is_exactly_deterministic() {
-    let _metal_test_guard = metal_test_guard();
     let image = fifo_taildrop_image();
     for streams_enabled in [true, false] {
         let config = MetalConfig {
@@ -1149,8 +1135,44 @@ fn metal_run_to_run_is_exactly_deterministic() {
 }
 
 #[test]
+fn concurrent_public_api_runs_match_the_scalar_result() {
+    const EXECUTORS: usize = 8;
+
+    let image = Arc::new(fifo_taildrop_image());
+    let expected = run_scalar_with_observations(&image, Some(27), ObservationMode::Full)
+        .expect("scalar oracle must run");
+    let executors = (0..EXECUTORS)
+        .map(|_| MetalExecutor::new().expect("Metal executor must initialize"))
+        .collect::<Vec<_>>();
+    let start = Arc::new(Barrier::new(EXECUTORS));
+    let threads = executors
+        .into_iter()
+        .map(|executor| {
+            let image = Arc::clone(&image);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                executor.run_with_observations(
+                    &image,
+                    Some(27),
+                    MetalConfig::default(),
+                    ObservationMode::Full,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        let actual = thread
+            .join()
+            .expect("concurrent Metal worker must not panic")
+            .expect("concurrent Metal run must succeed");
+        assert_eq!(actual.result, expected);
+    }
+}
+
+#[test]
 fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
-    let _metal_test_guard = metal_test_guard();
     let image = fifo_taildrop_image();
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     for streams_enabled in [true, false] {
@@ -1193,7 +1215,6 @@ fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
 
 #[test]
 fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
-    let _metal_test_guard = metal_test_guard();
     let image = fifo_taildrop_image();
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     let expected_diagnostic_error =
@@ -1291,7 +1312,6 @@ fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
 
 #[test]
 fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
-    let _metal_test_guard = metal_test_guard();
     let mut image = uneven_multi_lp_backlog_image();
     for state in image.host_states.iter_mut().step_by(2) {
         state.queue.truncate(1);
@@ -1342,7 +1362,6 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
 
 #[test]
 fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
-    let _metal_test_guard = metal_test_guard();
     let image = generator_image(GeneratorTermination::Bytes(4));
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar recovery oracle must run");
@@ -1460,7 +1479,6 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
 
 #[test]
 fn metal_device_queue_capacity_fault_is_explicit() {
-    let _metal_test_guard = metal_test_guard();
     let image = generator_image(GeneratorTermination::Bytes(2));
     let error = run_metal(
         &image,
@@ -1484,13 +1502,11 @@ fn metal_device_queue_capacity_fault_is_explicit() {
 
 #[test]
 fn metal_feedback_arrival_matches_full_scalar_result() {
-    let _metal_test_guard = metal_test_guard();
     assert_full_parity(&feedback_image(), None);
 }
 
 #[test]
 fn metal_preserves_accepted_orphan_packet_snapshots() {
-    let _metal_test_guard = metal_test_guard();
     let mut image = generator_image(GeneratorTermination::Bytes(2));
     image.host_states[0].generators.clear();
     image.host_states[0].next_origin_seq = 0;
@@ -1502,13 +1518,11 @@ fn metal_preserves_accepted_orphan_packet_snapshots() {
 
 #[test]
 fn metal_converging_generators_keep_canonical_source_order() {
-    let _metal_test_guard = metal_test_guard();
     assert_full_parity(&converging_generators_image(), None);
 }
 
 #[test]
 fn metal_source_queue_order_is_independent_of_same_time_event_key_order() {
-    let _metal_test_guard = metal_test_guard();
     let mut image = converging_generators_image();
     image.initial_events[0].key.origin_seq = 1;
     image.initial_events[1].key.origin_seq = 0;
@@ -1519,13 +1533,11 @@ fn metal_source_queue_order_is_independent_of_same_time_event_key_order() {
 
 #[test]
 fn metal_reverse_route_switch_capacity_is_sized_for_feedback() {
-    let _metal_test_guard = metal_test_guard();
     assert_full_parity(&reverse_switch_feedback_image(), None);
 }
 
 #[test]
 fn metal_default_capacity_handles_a_service_rate_backlog_drain() {
-    let _metal_test_guard = metal_test_guard();
     let image = backlog_drain_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar backlog oracle must run");
@@ -1554,7 +1566,6 @@ fn metal_default_capacity_handles_a_service_rate_backlog_drain() {
 
 #[test]
 fn metal_default_fel_capacity_covers_packets_resident_on_a_long_link() {
-    let _metal_test_guard = metal_test_guard();
     let image = long_flight_backlog_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar long-flight backlog oracle must run");
@@ -1570,7 +1581,6 @@ fn metal_default_fel_capacity_covers_packets_resident_on_a_long_link() {
 
 #[test]
 fn metal_tiny_physical_transition_chunks_relaunch_to_exact_parity() {
-    let _metal_test_guard = metal_test_guard();
     let image = backlog_drain_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar backlog oracle must run");
@@ -1619,7 +1629,6 @@ fn metal_tiny_physical_transition_chunks_relaunch_to_exact_parity() {
 
 #[test]
 fn metal_continuations_advance_across_uneven_active_lps() {
-    let _metal_test_guard = metal_test_guard();
     let image = uneven_multi_lp_backlog_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar multi-LP backlog oracle must run");
@@ -1667,7 +1676,6 @@ fn metal_continuations_advance_across_uneven_active_lps() {
 
 #[test]
 fn metal_continuations_cross_a_bounded_encoding_wave_exactly() {
-    let _metal_test_guard = metal_test_guard();
     let image = uneven_multi_lp_backlog_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar wave-boundary oracle must run");
@@ -1714,7 +1722,6 @@ fn metal_continuations_cross_a_bounded_encoding_wave_exactly() {
 
 #[test]
 fn metal_full_path_matches_scalar_from_a_rich_mid_state() {
-    let _metal_test_guard = metal_test_guard();
     let image = rich_mid_state_image();
     assert!(
         image
@@ -1759,7 +1766,6 @@ fn metal_full_path_matches_scalar_from_a_rich_mid_state() {
 
 #[test]
 fn metal_full_domain_stop_uses_the_one_past_u64_sentinel() {
-    let _metal_test_guard = metal_test_guard();
     let mut image = generator_image(GeneratorTermination::Bytes(2));
     image.stop_time_ns = u64::MAX;
     image.host_states[0].generators.clear();
@@ -1800,7 +1806,6 @@ fn terminal_arrival_at_max(stop_time_ns: u64) -> SimulationImage {
 
 #[test]
 fn metal_executes_a_real_event_at_u64_max_through_the_inclusive_stop() {
-    let _metal_test_guard = metal_test_guard();
     let image = terminal_arrival_at_max(u64::MAX);
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar must execute the endpoint event");
@@ -1824,7 +1829,6 @@ fn metal_executes_a_real_event_at_u64_max_through_the_inclusive_stop() {
 
 #[test]
 fn metal_keeps_a_u64_max_event_pending_above_an_earlier_stop() {
-    let _metal_test_guard = metal_test_guard();
     let image = terminal_arrival_at_max(u64::MAX - 1);
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar must stop before the endpoint event");
@@ -1847,7 +1851,6 @@ fn metal_keeps_a_u64_max_event_pending_above_an_earlier_stop() {
 
 #[test]
 fn metal_serialization_uses_the_full_u128_numerator() {
-    let _metal_test_guard = metal_test_guard();
     let packet_size = 3_000_000_000;
     let mut image = generator_image(GeneratorTermination::Bytes(packet_size));
     image.stop_time_ns = packet_size + 1;
@@ -1864,7 +1867,6 @@ fn metal_serialization_uses_the_full_u128_numerator() {
 
 #[test]
 fn metal_final_bytes_emission_does_not_compute_an_unused_overflowing_successor() {
-    let _metal_test_guard = metal_test_guard();
     let departure = u64::MAX - 4;
     let mut image = generator_image(GeneratorTermination::Bytes(2));
     image.stop_time_ns = u64::MAX;

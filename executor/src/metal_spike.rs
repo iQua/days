@@ -21,6 +21,7 @@ use objc2_metal::{
     MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
+use crate::metal::metal_device_execution_guard;
 use crate::{EventKind, NodeId};
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -3508,10 +3509,14 @@ fn create_pipeline(
 
 /// Revalidates direct-buffer ABI, serial write visibility, reduction geometry, fused outboxes, and
 /// explicit errors. T13's substrate-independent primitive proofs remain carried evidence.
+///
+/// Direct Metal execution shares the production process-wide guard; concurrent callers queue
+/// until execution and readback complete.
 pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpikeError> {
     let direct = DirectMetalSpike::new(ACTIVE_PORT_LPS)?;
     let initial = WorkloadState::initial(ACTIVE_PORT_LPS)?;
     let buffers = MetalBuffers::new(&direct.device, &initial)?;
+    let _execution_guard = metal_device_execution_guard();
 
     let continuation_slot_association = initial
         .continuations
@@ -3617,6 +3622,9 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
 
 /// Runs the fair T13c sweep: same state and LP body, paired on one machine with a genuine
 /// persistent CPU worker configuration, one warmup per width, and three alternating-order samples.
+///
+/// Direct Metal execution shares the production process-wide guard; concurrent callers queue
+/// until execution and readback complete.
 pub fn benchmark_metal(
     config: MetalSpikeBenchmarkConfig,
 ) -> Result<MetalSpikeBenchmarkReport, MetalSpikeError> {
@@ -3630,6 +3638,7 @@ pub fn benchmark_metal(
         pipeline_setup_ns = pipeline_setup_ns.saturating_add(direct.pipeline_setup_ns);
         let initial = WorkloadState::initial(point.active_lps)?;
         let buffers = MetalBuffers::new(&direct.device, &initial)?;
+        let _execution_guard = metal_device_execution_guard();
 
         let mut cpu_warmup = initial.clone();
         measure_cpu_rounds(&mut cpu_warmup, point.warmup_rounds, config.cpu_workers);
@@ -3724,6 +3733,9 @@ pub fn benchmark_metal(
 /// deterministic simulated 88-byte records, and all mutated state remains spike-local rather than
 /// production simulator state. Metal dispatches the fixed maximum geometry but gates every body on
 /// that real round's active width.
+///
+/// Direct Metal execution shares the production process-wide guard; concurrent callers queue
+/// until execution and readback complete.
 pub fn benchmark_real_replay(
     warmup_trace: &RealReplayTrace,
     measured_trace: &RealReplayTrace,
@@ -3745,6 +3757,7 @@ pub fn benchmark_real_replay(
     );
     let warmup_buffers =
         RealReplayMetalBuffers::new(&direct.device, &warmup_plan, &warmup_initial)?;
+    let _execution_guard = metal_device_execution_guard();
     let mut cpu_warmup = warmup_initial.clone();
     measure_real_cpu_replay(&mut cpu_warmup, &warmup_plan, config.cpu_worker_counts[0]);
     direct.run(&warmup_plan, &warmup_buffers, config.rounds_per_encoding)?;
