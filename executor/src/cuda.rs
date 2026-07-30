@@ -465,7 +465,8 @@ pub struct CudaRun {
     pub continuation_relaunches: u64,
     /// Replays of the pre-recorded graph DAG.
     pub graph_replays: u64,
-    /// Explicit device-to-host control synchronizations, one per graph replay.
+    /// Explicit stream synchronizations completing device-to-host control readback,
+    /// one per graph replay.
     pub wave_boundary_syncs: u64,
     pub mid_round_wave_boundary_syncs: u64,
     /// One-time graph capture and instantiation for this run.
@@ -2169,16 +2170,26 @@ impl CudaBuffers {
         observation_mode: ObservationMode,
         timing: CudaTiming,
     ) -> Result<CudaRun, CudaError> {
-        let planes = self
-            .planes
-            .iter()
-            .enumerate()
-            .map(|(index, plane)| {
-                stream
-                    .clone_dtoh(plane)
-                    .map_err(|error| driver_error(format!("result plane {index} readback"), error))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut planes = Vec::with_capacity(self.planes.len());
+        let mut readback_error = None;
+        for (index, plane) in self.planes.iter().enumerate() {
+            match stream.clone_dtoh(plane) {
+                Ok(words) => planes.push(words),
+                Err(error) => {
+                    readback_error = Some(driver_error(
+                        format!("result plane {index} readback"),
+                        error,
+                    ));
+                    break;
+                }
+            }
+        }
+        stream
+            .synchronize()
+            .map_err(|error| driver_error("result-plane readback synchronization", error))?;
+        if let Some(error) = readback_error {
+            return Err(error);
+        }
         let control = &planes[0];
         if control[CONTROL_ERROR] != 0 {
             return Err(decode_device_error(control));
@@ -2569,6 +2580,10 @@ impl DirectCuda {
                 .stream
                 .clone_dtoh(&buffers.planes[0])
                 .map_err(|error| driver_error("graph-wave control readback", error))?;
+            // This is the explicit boundary synchronization counted below.
+            self.stream.synchronize().map_err(|error| {
+                driver_error("graph-wave control readback synchronization", error)
+            })?;
             let elapsed_ms = start
                 .elapsed_ms(&end)
                 .map_err(|error| driver_error("graph-wave elapsed time", error))?;

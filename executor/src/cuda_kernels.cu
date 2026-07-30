@@ -2562,6 +2562,8 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
     if (values[0] != NONE) {
         return;
     }
+    // Complete the reduction-result read before reusing the shared scratch planes.
+    __syncthreads();
     if (params[P_FULL_OBSERVATIONS] == 0) {
         if (lane == 0) {
             control[C_CONTINUATION] = 0;

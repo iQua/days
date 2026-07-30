@@ -2929,6 +2929,8 @@ kernel void days_round_finalize(
     if (values[0] != NONE) {
         return;
     }
+    // Complete the reduction-result read before reusing the threadgroup scratch planes.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (params[P_FULL_OBSERVATIONS] == 0) {
         if (lane == 0) {
             control[C_CONTINUATION] = 0;
