@@ -430,6 +430,15 @@ pub struct MetalExecutor {
     direct: DirectMetal,
 }
 
+/// One-time costs paid while constructing a reusable [`MetalExecutor`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetalInitializationTimings {
+    /// Device, queue, capability validation, and other non-pipeline initialization.
+    pub device_queue_setup_ns: u64,
+    /// Runtime MSL library compilation and compute-pipeline creation for all production phases.
+    pub pipeline_creation_ns: u64,
+}
+
 impl MetalExecutor {
     pub fn new() -> Result<Self, MetalError> {
         Ok(Self {
@@ -449,6 +458,11 @@ impl MetalExecutor {
             config,
             ObservationMode::Summary,
         )
+    }
+
+    /// Returns the one-time initialization split measured when this reusable executor was built.
+    pub const fn initialization_timings(&self) -> MetalInitializationTimings {
+        self.direct.initialization_timings
     }
 
     /// Runs the production backend with diagnostic stage-boundary phase timestamps enabled.
@@ -639,7 +653,8 @@ impl MetalPlan {
             let feedback_count = flow_feedback_counts[flow_index];
             let data_count = packet_count.saturating_sub(feedback_count);
             let source_slot = flow.source.0 as usize;
-            queue_caps[source_slot] = queue_caps[source_slot].saturating_add(data_count);
+            queue_caps[source_slot] = queue_caps[source_slot]
+                .saturating_add(source_queue_packet_bound(image, flow_index, data_count));
             fel_caps[source_slot] = fel_caps[source_slot].saturating_add(4);
 
             add_flow_route_capacities(
@@ -975,6 +990,100 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, MetalError>
     Ok(counts)
 }
 
+fn paced_single_source_queue_bound(
+    packet_count: usize,
+    emission_interval_ns: u64,
+    serialization_ns: u64,
+) -> usize {
+    if emission_interval_ns >= serialization_ns {
+        packet_count.min(1)
+    } else {
+        packet_count
+    }
+}
+
+fn source_queue_packet_bound(
+    image: &SimulationImage,
+    flow_index: usize,
+    packet_count: usize,
+) -> usize {
+    if packet_count == 0 {
+        return 0;
+    }
+    let flow = &image.flows[flow_index];
+    if image
+        .flows
+        .iter()
+        .filter(|candidate| candidate.source == flow.source)
+        .count()
+        != 1
+    {
+        return packet_count;
+    }
+    let source = &image.nodes[flow.source.0 as usize];
+    if source.kind != NodeKind::Host {
+        return packet_count;
+    }
+    let state = &image.host_states[source.state_slot as usize];
+    let [generator] = state.generators.as_slice() else {
+        return packet_count;
+    };
+    if generator.flow.0 as usize != flow_index
+        || generator.next_emission.status != GeneratorStatus::Scheduled
+        || generator.packets_emitted != 0
+        || generator.bytes_emitted != 0
+        || !state.queue.is_empty()
+        || state.in_service.is_some()
+        || state.tx_ready_pending
+    {
+        return packet_count;
+    }
+    let mut initial_data_packets = image
+        .initial_packets
+        .iter()
+        .filter(|packet| packet.flow.0 as usize == flow_index && packet.kind == PacketKind::Data);
+    let Some(initial_packet) = initial_data_packets.next() else {
+        return packet_count;
+    };
+    if initial_data_packets.next().is_some() || initial_packet.id != generator.next_emission.payload
+    {
+        return packet_count;
+    }
+    let scheduled_arrivals = image
+        .initial_events
+        .iter()
+        .filter(|event| {
+            event.target == flow.source
+                && event.kind == EventKind::PacketArrival
+                && event.payload == generator.next_emission.payload
+                && event.key.time_ns == generator.next_emission.departure_time_ns
+        })
+        .count();
+    if scheduled_arrivals != 1 {
+        return packet_count;
+    }
+    let Some(first_link) = flow.route.first().copied() else {
+        return packet_count;
+    };
+    if first_link != state.egress_link {
+        return packet_count;
+    }
+    let FlowGeneratorKind::Constant(constant) = generator.kind;
+    if initial_packet.size_bytes != constant.packet_size_bytes {
+        return packet_count;
+    }
+    let link = image.links[first_link.0 as usize];
+    let serialization =
+        crate::time::serialization_time_ns(constant.packet_size_bytes, link.rate_bps)
+            .expect("Metal validation established a positive finite serialization interval");
+    let paced = paced_single_source_queue_bound(packet_count, constant.interval_ns, serialization);
+    if paced == packet_count {
+        packet_count
+    } else {
+        state.queue.len().saturating_add(paced).min(packet_count)
+    }
+}
+
 fn generator_round_burst(
     image: &SimulationImage,
     flow_index: usize,
@@ -1090,7 +1199,13 @@ fn flow_link_round_bound(
     let (current_queue, queue_capacity) = match source.kind {
         NodeKind::Host => {
             let state = &image.host_states[source.state_slot as usize];
-            (state.queue.len(), packet_count)
+            let capacity =
+                if packet_kind == PacketKind::Data && source.id == image.flows[flow_index].source {
+                    source_queue_packet_bound(image, flow_index, packet_count)
+                } else {
+                    packet_count
+                };
+            (state.queue.len(), capacity)
         }
         NodeKind::Switch => {
             let queue = image.switch_states[source.state_slot as usize]
@@ -2047,6 +2162,7 @@ fn decode_summary_rows(words: &[u64], node_count: usize) -> RunSummary {
 struct DirectMetal {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    initialization_timings: MetalInitializationTimings,
     horizon_pipeline: MetalPipeline,
     prepare_pipeline: MetalPipeline,
     round_pipeline: MetalPipeline,
@@ -2059,6 +2175,7 @@ struct DirectMetal {
 
 impl DirectMetal {
     fn new() -> Result<Self, MetalError> {
+        let initialization_started = Instant::now();
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
             MetalError::Unavailable("system default device is unavailable".into())
         })?;
@@ -2066,6 +2183,7 @@ impl DirectMetal {
             .newCommandQueue()
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
         let source = include_str!("metal_kernels.metal");
+        let pipeline_started = Instant::now();
         let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
         let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
         let round_pipeline = create_pipeline(&device, source, "days_round")?;
@@ -2074,6 +2192,7 @@ impl DirectMetal {
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
         let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
         let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
+        let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         for (name, pipeline) in [
             ("horizon", &horizon_pipeline),
             ("round-prepare", &prepare_pipeline),
@@ -2094,9 +2213,14 @@ impl DirectMetal {
                 device.maxThreadgroupMemoryLength()
             )));
         }
+        let initialization_ns = duration_ns(initialization_started.elapsed());
         Ok(Self {
             device,
             queue,
+            initialization_timings: MetalInitializationTimings {
+                device_queue_setup_ns: initialization_ns.saturating_sub(pipeline_creation_ns),
+                pipeline_creation_ns,
+            },
             horizon_pipeline,
             prepare_pipeline,
             round_pipeline,
@@ -2662,7 +2786,7 @@ mod tests {
         ATTEMPT_PHASES, AttemptPhase, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalPhaseTimings,
         PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS, accumulate_profile_interval,
-        build_phase_profile, encoding_limits,
+        build_phase_profile, encoding_limits, paced_single_source_queue_bound,
     };
 
     #[test]
@@ -2763,6 +2887,17 @@ mod tests {
         assert_eq!(timing.continuation_control_ns, 4);
         assert_eq!(timing.exchange_prefix_ns, 5);
         assert_eq!(timing.final_control_ns, 8);
+    }
+
+    #[test]
+    fn paced_single_source_queue_bound_stays_constant_when_service_keeps_up() {
+        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
+    }
+
+    #[test]
+    fn paced_single_source_queue_bound_retains_full_backlog_when_service_is_slower() {
+        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
     }
 
     #[test]
