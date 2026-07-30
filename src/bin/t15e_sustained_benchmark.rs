@@ -15,6 +15,114 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
 }
 
 #[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComparisonOutcome {
+    Beats,
+    Parity,
+    Trails,
+}
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+impl ComparisonOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Beats => "beats",
+            Self::Parity => "parity",
+            Self::Trails => "trails",
+        }
+    }
+}
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetainedSampleComparison {
+    candidate_median_ns: u128,
+    reference_median_ns: u128,
+    candidate_range_ns: u128,
+    reference_range_ns: u128,
+    parity_bound_range_ns: u128,
+    outcome: ComparisonOutcome,
+    candidate_wins: usize,
+    paired_comparisons: usize,
+}
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+fn retained_range(values: &[u128]) -> u128 {
+    let minimum = values
+        .iter()
+        .min()
+        .expect("retained comparison samples must not be empty");
+    let maximum = values
+        .iter()
+        .max()
+        .expect("retained comparison samples must not be empty");
+    maximum - minimum
+}
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+fn compare_retained_samples(
+    candidate_samples: &[u128],
+    reference_samples: &[u128],
+) -> RetainedSampleComparison {
+    assert!(
+        !candidate_samples.is_empty(),
+        "retained comparison samples must not be empty"
+    );
+    assert_eq!(
+        candidate_samples.len(),
+        reference_samples.len(),
+        "paired retained comparisons must have equal sample counts"
+    );
+
+    let candidate_median_ns = median(candidate_samples.iter().copied());
+    let reference_median_ns = median(reference_samples.iter().copied());
+    let candidate_range_ns = retained_range(candidate_samples);
+    let reference_range_ns = retained_range(reference_samples);
+    let parity_bound_range_ns = candidate_range_ns.max(reference_range_ns);
+    let median_difference_ns = candidate_median_ns.abs_diff(reference_median_ns);
+    let outcome = if median_difference_ns == 0
+        || median_difference_ns.saturating_mul(2) < parity_bound_range_ns
+    {
+        ComparisonOutcome::Parity
+    } else if candidate_median_ns < reference_median_ns {
+        ComparisonOutcome::Beats
+    } else {
+        ComparisonOutcome::Trails
+    };
+    let candidate_wins = candidate_samples
+        .iter()
+        .zip(reference_samples)
+        .filter(|(candidate, reference)| candidate < reference)
+        .count();
+
+    RetainedSampleComparison {
+        candidate_median_ns,
+        reference_median_ns,
+        candidate_range_ns,
+        reference_range_ns,
+        parity_bound_range_ns,
+        outcome,
+        candidate_wins,
+        paired_comparisons: candidate_samples.len(),
+    }
+}
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+fn crossover_summary(w4: ComparisonOutcome, w18: ComparisonOutcome) -> &'static str {
+    match (w4, w18) {
+        (ComparisonOutcome::Beats, ComparisonOutcome::Beats) => "metal_beats_w4_and_w18",
+        (ComparisonOutcome::Beats, ComparisonOutcome::Parity) => "metal_beats_w4_parity_w18",
+        (ComparisonOutcome::Beats, ComparisonOutcome::Trails) => "metal_beats_w4_trails_w18",
+        (ComparisonOutcome::Parity, ComparisonOutcome::Beats) => "metal_parity_w4_beats_w18",
+        (ComparisonOutcome::Parity, ComparisonOutcome::Parity) => "metal_parity_w4_and_w18",
+        (ComparisonOutcome::Parity, ComparisonOutcome::Trails) => "metal_parity_w4_trails_w18",
+        (ComparisonOutcome::Trails, ComparisonOutcome::Beats) => "metal_trails_w4_beats_w18",
+        (ComparisonOutcome::Trails, ComparisonOutcome::Parity) => "metal_trails_w4_parity_w18",
+        (ComparisonOutcome::Trails, ComparisonOutcome::Trails) => "metal_trails_w4_and_w18",
+    }
+}
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
 fn split_fixed(total_ns: u128, marginal_ns: u128) -> (u128, u128) {
     let fixed_ns = total_ns
         .checked_sub(marginal_ns)
@@ -582,6 +690,10 @@ fn main() {
         "record=t15e_protocol scalar_samples={} scalar_predecessor=none \
          comparison_samples={samples} comparison_predecessor=same_kind_discarded \
          order_schedule=balanced_cpu_first_gpu_first_and_heap_streams \
+         comparison_outcome_values=beats,parity,trails \
+         comparison_dispersion=maximum_retained_sample_range \
+         comparison_parity_rule=equal_medians_or_twice_abs_median_difference_lt_dispersion \
+         paired_comparison_rule=same_sample_index \
          scalar_provenance={} scalar_reuse_days_commit={} \
          scalar_reuse_evidence={}",
         if skip_scalar { 0 } else { SCALAR_SAMPLES },
@@ -755,22 +867,35 @@ fn main() {
         }
     }
 
-    let pooled_marginal = |engine| {
-        median(
-            measurements
-                .iter()
-                .filter(|measurement| measurement.engine == engine)
-                .map(|measurement| measurement.marginal_ns),
-        )
+    let retained_marginals = |engine| {
+        measurements
+            .iter()
+            .filter(|measurement| measurement.engine == engine)
+            .map(|measurement| measurement.marginal_ns)
+            .collect::<Vec<_>>()
     };
     let scalar_samples = measurements
         .iter()
         .filter(|measurement| measurement.engine == "scalar")
         .count();
-    let w4_marginal_ns = pooled_marginal("w4");
-    let w18_marginal_ns = pooled_marginal("w18");
-    let metal_heap_marginal_ns = pooled_marginal("metal_heap");
-    let metal_marginal_ns = pooled_marginal("metal_streams");
+    let w4_samples = retained_marginals("w4");
+    let w18_samples = retained_marginals("w18");
+    let metal_heap_samples = retained_marginals("metal_heap");
+    let metal_samples = retained_marginals("metal_streams");
+    let metal_vs_w4 = compare_retained_samples(&metal_samples, &w4_samples);
+    let metal_vs_w18 = compare_retained_samples(&metal_samples, &w18_samples);
+    assert_eq!(
+        metal_vs_w4.paired_comparisons, samples,
+        "W4 comparison must retain the audited sample count"
+    );
+    assert_eq!(
+        metal_vs_w18.paired_comparisons, samples,
+        "W18 comparison must retain the audited sample count"
+    );
+    let w4_marginal_ns = metal_vs_w4.reference_median_ns;
+    let w18_marginal_ns = metal_vs_w18.reference_median_ns;
+    let metal_heap_marginal_ns = median(metal_heap_samples.iter().copied());
+    let metal_marginal_ns = metal_vs_w4.candidate_median_ns;
     assert!(
         w4_marginal_ns > 0
             && w18_marginal_ns > 0
@@ -783,14 +908,7 @@ fn main() {
     let metal_over_heap = metal_marginal_ns as f64 / metal_heap_marginal_ns as f64;
     let w4_over_metal = w4_marginal_ns as f64 / metal_marginal_ns as f64;
     let w18_over_metal = w18_marginal_ns as f64 / metal_marginal_ns as f64;
-    let metal_beats_w4 = metal_marginal_ns < w4_marginal_ns;
-    let metal_beats_w18 = metal_marginal_ns < w18_marginal_ns;
-    let crossover = match (metal_beats_w4, metal_beats_w18) {
-        (true, true) => "metal_below_w4_and_w18",
-        (true, false) => "metal_below_w4_only",
-        (false, true) => "metal_below_w18_only",
-        (false, false) => "metal_below_neither",
-    };
+    let crossover = crossover_summary(metal_vs_w4.outcome, metal_vs_w18.outcome);
     println!(
         "record=t15e_pooled_summary statistic=median config={relative} \
          scalar_samples={scalar_samples} comparison_samples={samples} \
@@ -803,12 +921,26 @@ fn main() {
          metal_marginal_ns={metal_marginal_ns} metal_over_w4={metal_over_w4:.6} \
          metal_over_w18={metal_over_w18:.6} streams_over_heap={metal_over_heap:.6} \
          w4_over_metal={w4_over_metal:.6} \
-         w18_over_metal={w18_over_metal:.6} metal_beats_w4={} metal_beats_w18={} \
-         crossover={crossover} crossover_basis=marginal",
+         w18_over_metal={w18_over_metal:.6} \
+         metal_retained_range_ns={} w4_retained_range_ns={} w18_retained_range_ns={} \
+         metal_vs_w4_parity_bound_range_ns={} metal_vs_w18_parity_bound_range_ns={} \
+         metal_vs_w4_outcome={} metal_vs_w18_outcome={} \
+         metal_wins_vs_w4={} metal_vs_w4_paired_samples={} \
+         metal_wins_vs_w18={} metal_vs_w18_paired_samples={} \
+         crossover={crossover} crossover_basis=dispersion_qualified_marginal",
         expected.rounds,
         expected.transitions,
-        u8::from(metal_beats_w4),
-        u8::from(metal_beats_w18),
+        metal_vs_w4.candidate_range_ns,
+        metal_vs_w4.reference_range_ns,
+        metal_vs_w18.reference_range_ns,
+        metal_vs_w4.parity_bound_range_ns,
+        metal_vs_w18.parity_bound_range_ns,
+        metal_vs_w4.outcome.as_str(),
+        metal_vs_w18.outcome.as_str(),
+        metal_vs_w4.candidate_wins,
+        metal_vs_w4.paired_comparisons,
+        metal_vs_w18.candidate_wins,
+        metal_vs_w18.paired_comparisons,
     );
 }
 
@@ -821,8 +953,63 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCALAR_SAMPLES, median, order_for_sample, recorded_predecessor_for_engine, split_fixed,
+        ComparisonOutcome, SCALAR_SAMPLES, compare_retained_samples, crossover_summary, median,
+        order_for_sample, recorded_predecessor_for_engine, split_fixed,
     };
+
+    #[test]
+    fn comparison_outcomes_use_the_record_schema_values() {
+        assert_eq!(ComparisonOutcome::Beats.as_str(), "beats");
+        assert_eq!(ComparisonOutcome::Parity.as_str(), "parity");
+        assert_eq!(ComparisonOutcome::Trails.as_str(), "trails");
+        assert_eq!(
+            crossover_summary(ComparisonOutcome::Beats, ComparisonOutcome::Parity),
+            "metal_beats_w4_parity_w18"
+        );
+    }
+
+    #[test]
+    fn retained_sample_comparison_reports_beats_and_paired_wins() {
+        let comparison = compare_retained_samples(&[90, 91, 92, 93], &[100, 101, 102, 103]);
+
+        assert_eq!(comparison.outcome, ComparisonOutcome::Beats);
+        assert_eq!(comparison.candidate_wins, 4);
+        assert_eq!(comparison.paired_comparisons, 4);
+    }
+
+    #[test]
+    fn retained_sample_comparison_reports_parity_inside_half_max_range() {
+        let comparison = compare_retained_samples(&[100, 101, 102, 110], &[103, 104, 105, 106]);
+
+        assert_eq!(comparison.candidate_median_ns, 101);
+        assert_eq!(comparison.reference_median_ns, 104);
+        assert_eq!(comparison.candidate_range_ns, 10);
+        assert_eq!(comparison.reference_range_ns, 3);
+        assert_eq!(comparison.parity_bound_range_ns, 10);
+        assert_eq!(comparison.outcome, ComparisonOutcome::Parity);
+        assert_eq!(comparison.candidate_wins, 3);
+    }
+
+    #[test]
+    fn retained_sample_comparison_reports_parity_for_equal_zero_range_samples() {
+        let comparison = compare_retained_samples(&[100; 4], &[100; 4]);
+
+        assert_eq!(comparison.parity_bound_range_ns, 0);
+        assert_eq!(comparison.outcome, ComparisonOutcome::Parity);
+        assert_eq!(comparison.candidate_wins, 0);
+        assert_eq!(comparison.paired_comparisons, 4);
+    }
+
+    #[test]
+    fn retained_sample_comparison_reports_trails_at_half_max_range_boundary() {
+        let comparison = compare_retained_samples(&[105, 106, 107, 115], &[100, 101, 102, 103]);
+
+        assert_eq!(comparison.candidate_median_ns, 106);
+        assert_eq!(comparison.reference_median_ns, 101);
+        assert_eq!(comparison.parity_bound_range_ns, 10);
+        assert_eq!(comparison.outcome, ComparisonOutcome::Trails);
+        assert_eq!(comparison.candidate_wins, 0);
+    }
 
     #[test]
     fn even_median_averages_middle_pair() {

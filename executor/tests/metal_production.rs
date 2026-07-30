@@ -1327,6 +1327,10 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar recovery oracle must run");
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let heap_config = MetalConfig {
+        streams_enabled: false,
+        ..MetalConfig::default()
+    };
 
     let fel = executor
         .run(
@@ -1334,8 +1338,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             None,
             MetalConfig {
                 max_fel_events_per_lp: Some(1),
-                streams_enabled: false,
-                ..MetalConfig::default()
+                ..heap_config
             },
         )
         .expect_err("the second device-generated local child must exhaust the FEL");
@@ -1349,7 +1352,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     );
     assert_eq!(
         executor
-            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+            .run_with_observations(&image, None, heap_config, ObservationMode::Full)
             .expect("the same executor must recover after the FEL fault")
             .result,
         expected
@@ -1542,41 +1545,47 @@ fn metal_tiny_physical_transition_chunks_relaunch_to_exact_parity() {
     let image = backlog_drain_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar backlog oracle must run");
-    let default =
-        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
-            .expect("default Metal chunks must run");
-    let uncapped = run_metal_with_observations(
-        &image,
-        None,
-        MetalConfig {
-            max_transitions_per_lp_per_round: usize::MAX,
-            ..MetalConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("the explicit uncapped Metal run must run");
-    let tiny = run_metal_with_observations(
-        &image,
-        None,
-        MetalConfig {
-            max_transitions_per_lp_per_round: 1,
-            ..MetalConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("one-transition dispatches must continue the same semantic round");
 
-    assert!(default.transitions > 1);
-    assert_eq!(default.continuation_relaunches, 0);
-    assert_eq!(default.result, scalar);
-    assert_eq!(tiny.result, scalar);
-    assert!(tiny.continuation_relaunches > 10);
-    assert_eq!(tiny.rounds, default.rounds);
-    assert_eq!(tiny.transitions, default.transitions);
-    assert_eq!(uncapped.result, scalar);
-    assert_eq!(uncapped.continuation_relaunches, 0);
-    assert_eq!(uncapped.rounds, default.rounds);
-    assert_eq!(uncapped.transitions, default.transitions);
+    for streams_enabled in [true, false] {
+        let config = MetalConfig {
+            streams_enabled,
+            ..MetalConfig::default()
+        };
+        let default = run_metal_with_observations(&image, None, config, ObservationMode::Full)
+            .expect("default Metal chunks must run");
+        let uncapped = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_transitions_per_lp_per_round: usize::MAX,
+                ..config
+            },
+            ObservationMode::Full,
+        )
+        .expect("the explicit uncapped Metal run must run");
+        let tiny = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_transitions_per_lp_per_round: 1,
+                ..config
+            },
+            ObservationMode::Full,
+        )
+        .expect("one-transition dispatches must continue the same semantic round");
+
+        assert!(default.transitions > 1);
+        assert_eq!(default.continuation_relaunches, 0);
+        assert_eq!(default.result, scalar);
+        assert_eq!(tiny.result, scalar);
+        assert!(tiny.continuation_relaunches > 10);
+        assert_eq!(tiny.rounds, default.rounds);
+        assert_eq!(tiny.transitions, default.transitions);
+        assert_eq!(uncapped.result, scalar);
+        assert_eq!(uncapped.continuation_relaunches, 0);
+        assert_eq!(uncapped.rounds, default.rounds);
+        assert_eq!(uncapped.transitions, default.transitions);
+    }
 }
 
 #[test]
@@ -1631,38 +1640,45 @@ fn metal_continuations_cross_a_bounded_encoding_wave_exactly() {
     let image = uneven_multi_lp_backlog_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar wave-boundary oracle must run");
-    let uncapped = run_metal_with_observations(
-        &image,
-        None,
-        MetalConfig {
-            max_transitions_per_lp_per_round: usize::MAX,
-            ..MetalConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("uncapped wave-boundary Metal run must run");
-    let crossed = run_metal_with_observations(
-        &image,
-        None,
-        MetalConfig {
-            max_transitions_per_lp_per_round: 1,
-            rounds_per_command_buffer: 1,
-            ..MetalConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("one-pair command buffers must continue across a bounded wave");
 
-    assert_eq!(uncapped.result, scalar);
-    assert_eq!(crossed.result, scalar);
-    assert_eq!(crossed.result, uncapped.result);
-    assert!(crossed.continuation_relaunches > 64);
-    assert_eq!(crossed.rounds, uncapped.rounds);
-    assert_eq!(crossed.transitions, uncapped.transitions);
-    assert_eq!(crossed.wave_boundary_syncs, 2);
-    assert_eq!(crossed.mid_round_wave_boundary_syncs, 1);
-    assert_eq!(uncapped.wave_boundary_syncs, 1);
-    assert_eq!(uncapped.mid_round_wave_boundary_syncs, 0);
+    for streams_enabled in [true, false] {
+        let config = MetalConfig {
+            streams_enabled,
+            ..MetalConfig::default()
+        };
+        let uncapped = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_transitions_per_lp_per_round: usize::MAX,
+                ..config
+            },
+            ObservationMode::Full,
+        )
+        .expect("uncapped wave-boundary Metal run must run");
+        let crossed = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_transitions_per_lp_per_round: 1,
+                rounds_per_command_buffer: 1,
+                ..config
+            },
+            ObservationMode::Full,
+        )
+        .expect("one-pair command buffers must continue across a bounded wave");
+
+        assert_eq!(uncapped.result, scalar);
+        assert_eq!(crossed.result, scalar);
+        assert_eq!(crossed.result, uncapped.result);
+        assert!(crossed.continuation_relaunches > 64);
+        assert_eq!(crossed.rounds, uncapped.rounds);
+        assert_eq!(crossed.transitions, uncapped.transitions);
+        assert_eq!(crossed.wave_boundary_syncs, 2);
+        assert_eq!(crossed.mid_round_wave_boundary_syncs, 1);
+        assert_eq!(uncapped.wave_boundary_syncs, 1);
+        assert_eq!(uncapped.mid_round_wave_boundary_syncs, 0);
+    }
 }
 
 #[test]
@@ -1754,13 +1770,22 @@ fn metal_executes_a_real_event_at_u64_max_through_the_inclusive_stop() {
     let image = terminal_arrival_at_max(u64::MAX);
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar must execute the endpoint event");
-    let metal =
-        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
-            .expect("Metal must execute the endpoint event");
 
     assert_eq!(scalar.summary.received_packets, 1);
     assert!(scalar.pending_events.is_empty());
-    assert_eq!(metal.result, scalar);
+    for streams_enabled in [true, false] {
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("Metal must execute the endpoint event");
+        assert_eq!(metal.result, scalar);
+    }
 }
 
 #[test]
@@ -1768,12 +1793,21 @@ fn metal_keeps_a_u64_max_event_pending_above_an_earlier_stop() {
     let image = terminal_arrival_at_max(u64::MAX - 1);
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar must stop before the endpoint event");
-    let metal =
-        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
-            .expect("Metal must stop before the endpoint event");
 
     assert_eq!(scalar.pending_events, image.initial_events);
-    assert_eq!(metal.result, scalar);
+    for streams_enabled in [true, false] {
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("Metal must stop before the endpoint event");
+        assert_eq!(metal.result, scalar);
+    }
 }
 
 #[test]
