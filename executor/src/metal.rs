@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
@@ -293,6 +294,186 @@ pub struct MetalRun {
     pub phase_profile: Option<MetalPhaseProfile>,
 }
 
+/// Opt-in T15e FEL round-trip probe result.
+///
+/// The probe executes the production transition body and geometry unchanged, but reinserts and
+/// removes the event that was just popped before each transition. This adds one real heap
+/// push/pop pair while restoring the same logical FEL. It is a differential diagnostic, not a
+/// production execution mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalFelProbeRun {
+    pub run: MetalRun,
+    /// Local FEL pushes performed by the unchanged transition bodies.
+    pub local_fel_pushes: u64,
+    /// Net-zero heap push/pop pairs counted on-device by the probe.
+    pub injected_fel_round_trips: u64,
+    /// Lazy creation cost for all diagnostic pipelines paid by this call, or zero when the
+    /// executor reused its cache.
+    /// This cost is excluded from run and phase timings.
+    pub diagnostic_pipeline_creation_ns: u64,
+}
+
+/// Matched counting-only control for [`MetalFelProbeRun`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalFelControlRun {
+    pub run: MetalRun,
+    pub local_fel_pushes: u64,
+    /// Lazy creation cost for all diagnostic pipelines paid by this call, or zero when the
+    /// executor reused its cache.
+    pub diagnostic_pipeline_creation_ns: u64,
+}
+
+/// Actual remote-merge fan-in accumulated across eventful target-rounds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetalMergeFanIn {
+    pub eventful_target_rounds: u64,
+    pub active_producer_target_rounds: u64,
+    pub remote_events: u64,
+    pub maximum_active_fan_in: u64,
+}
+
+/// Separate fan-in instrumentation run, kept out of FEL differential samples.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalMergeFanInRun {
+    pub run: MetalRun,
+    pub fan_in: MetalMergeFanIn,
+    /// Lazy creation cost for all diagnostic pipelines paid by this call, or zero when the
+    /// executor reused its cache.
+    pub diagnostic_pipeline_creation_ns: u64,
+}
+
+/// Heuristic drain decomposition derived from a production profile and a matching FEL probe.
+///
+/// A positive probe-minus-control delta measures an added root-key heap round trip at the exact
+/// production transition points. Reinserting the just-popped minimum is a near-worst-case push
+/// compared with future-key production children, so the scaled FEL value is an upper-biased stress
+/// heuristic, not a mathematical bound or representative production cost. The residual still includes
+/// root/horizon checks and fused-loop overhead and is not a pure transition-body measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetalDrainDecomposition {
+    pub baseline_drain_execute_ns: u64,
+    pub matched_control_drain_execute_ns: u64,
+    pub probe_drain_execute_ns: u64,
+    pub fel_round_trip_delta_ns: i128,
+    pub rounds: u64,
+    pub transitions: u64,
+    pub local_fel_pushes: u64,
+    pub production_drain_fel_operations: u64,
+    pub injected_fel_operations: u64,
+    pub stress_scaled_fel_estimate_ns: Option<u64>,
+    pub residual_after_stress_scaled_estimate_ns: Option<u64>,
+}
+
+impl MetalFelProbeRun {
+    /// Builds the differential split when both profiles captured every useful attempt.
+    ///
+    /// A non-positive delta is retained as measurement evidence, but the cost estimates are
+    /// `None`: timestamp noise cannot establish a nonnegative FEL cost from that sample. The
+    /// residual is also `None` when the scaled FEL estimate exceeds the baseline.
+    pub fn decompose_against(
+        &self,
+        baseline: &MetalRun,
+        control: &MetalFelControlRun,
+    ) -> Result<MetalDrainDecomposition, MetalError> {
+        if baseline.result != self.run.result
+            || baseline.rounds != self.run.rounds
+            || baseline.transitions != self.run.transitions
+            || baseline.continuation_relaunches != self.run.continuation_relaunches
+            || control.run.result != self.run.result
+            || control.run.rounds != self.run.rounds
+            || control.run.transitions != self.run.transitions
+            || control.run.continuation_relaunches != self.run.continuation_relaunches
+        {
+            return Err(MetalError::Validation(
+                "FEL probe, matched control, and baseline outcomes must match exactly".into(),
+            ));
+        }
+        if self.run.rounds == 0 {
+            return Err(MetalError::Validation(
+                "FEL decomposition requires at least one completed round".into(),
+            ));
+        }
+        if self.injected_fel_round_trips != self.run.transitions {
+            return Err(MetalError::Validation(
+                "FEL probe must inject exactly one round trip per transition".into(),
+            ));
+        }
+        let baseline_profile = baseline.phase_profile.as_ref().ok_or_else(|| {
+            MetalError::Validation("FEL decomposition baseline must be profiled".into())
+        })?;
+        let probe_profile = self.run.phase_profile.as_ref().ok_or_else(|| {
+            MetalError::Validation("FEL probe run must include phase profiling".into())
+        })?;
+        let control_profile = control.run.phase_profile.as_ref().ok_or_else(|| {
+            MetalError::Validation("FEL matched control must include phase profiling".into())
+        })?;
+        if baseline_profile.captured_attempts < baseline_profile.useful_attempts
+            || probe_profile.captured_attempts < probe_profile.useful_attempts
+            || control_profile.captured_attempts < control_profile.useful_attempts
+        {
+            return Err(MetalError::Validation(
+                "FEL decomposition requires complete useful-attempt profile capture".into(),
+            ));
+        }
+        if baseline_profile.useful_attempts != probe_profile.useful_attempts
+            || control_profile.useful_attempts != probe_profile.useful_attempts
+        {
+            return Err(MetalError::Validation(
+                "FEL probe, matched control, and baseline useful-attempt counts must match".into(),
+            ));
+        }
+        if control.local_fel_pushes != self.local_fel_pushes {
+            return Err(MetalError::Validation(
+                "FEL probe and matched control local-push counts must match".into(),
+            ));
+        }
+
+        let baseline_ns = baseline_profile.useful.drain_execute_ns;
+        let control_ns = control_profile.useful.drain_execute_ns;
+        let probe_ns = probe_profile.useful.drain_execute_ns;
+        let delta_ns = i128::from(probe_ns) - i128::from(control_ns);
+        let production_drain_fel_operations = self
+            .run
+            .transitions
+            .checked_add(self.local_fel_pushes)
+            .ok_or_else(|| {
+                MetalError::Validation("production drain FEL operation count overflows".into())
+            })?;
+        let injected_fel_operations =
+            self.injected_fel_round_trips
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    MetalError::Validation("injected FEL operation count overflows".into())
+                })?;
+        let stress_scaled_fel_estimate_ns = if delta_ns > 0 && injected_fel_operations != 0 {
+            let scaled = (delta_ns as u128)
+                .checked_mul(u128::from(production_drain_fel_operations))
+                .ok_or_else(|| MetalError::Validation("scaled FEL time overflows".into()))?
+                / u128::from(injected_fel_operations);
+            Some(u64::try_from(scaled).map_err(|_| {
+                MetalError::Validation("scaled FEL time does not fit in u64".into())
+            })?)
+        } else {
+            None
+        };
+        let residual_after_stress_scaled_estimate_ns =
+            stress_scaled_fel_estimate_ns.and_then(|fel_ns| baseline_ns.checked_sub(fel_ns));
+        Ok(MetalDrainDecomposition {
+            baseline_drain_execute_ns: baseline_ns,
+            matched_control_drain_execute_ns: control_ns,
+            probe_drain_execute_ns: probe_ns,
+            fel_round_trip_delta_ns: delta_ns,
+            rounds: self.run.rounds,
+            transitions: self.run.transitions,
+            local_fel_pushes: self.local_fel_pushes,
+            production_drain_fel_operations,
+            injected_fel_operations,
+            stress_scaled_fel_estimate_ns,
+            residual_after_stress_scaled_estimate_ns,
+        })
+    }
+}
+
 /// Dispatch-level GPU timestamp totals for one production round attempt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MetalPhaseTimings {
@@ -482,6 +663,130 @@ impl MetalExecutor {
             config,
             ObservationMode::Summary,
         )
+    }
+
+    /// Runs the matched counting-only control for [`Self::run_fel_probe_profiled`].
+    pub fn run_fel_control_profiled(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+    ) -> Result<MetalFelControlRun, MetalError> {
+        let (run, local_fel_pushes, injected_fel_round_trips, diagnostic_pipeline_creation_ns) =
+            self.run_fel_diagnostic_profiled(image, exclusive_horizon_ns, config, false)?;
+        if injected_fel_round_trips != 0 {
+            return Err(MetalError::Validation(
+                "FEL matched control must not inject heap round trips".into(),
+            ));
+        }
+        Ok(MetalFelControlRun {
+            run,
+            local_fel_pushes,
+            diagnostic_pipeline_creation_ns,
+        })
+    }
+
+    /// Runs the opt-in T15e FEL round-trip stress probe with phase profiling enabled.
+    ///
+    /// Compare against both [`Self::run_profiled`] and [`Self::run_fel_control_profiled`] using
+    /// [`MetalFelProbeRun::decompose_against`]. Reinserting the just-popped minimum exercises a
+    /// near-worst-case heap push, so the scaled result is an upper-biased heuristic, not a
+    /// representative average or sufficient evidence by itself to indict the FEL.
+    pub fn run_fel_probe_profiled(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+    ) -> Result<MetalFelProbeRun, MetalError> {
+        let (run, local_fel_pushes, injected_fel_round_trips, diagnostic_pipeline_creation_ns) =
+            self.run_fel_diagnostic_profiled(image, exclusive_horizon_ns, config, true)?;
+        Ok(MetalFelProbeRun {
+            run,
+            local_fel_pushes,
+            injected_fel_round_trips,
+            diagnostic_pipeline_creation_ns,
+        })
+    }
+
+    /// Runs a separate target-merge fan-in counter probe.
+    ///
+    /// The read-only pre-scan changes target-merge timing, so callers should use a matching
+    /// [`Self::run_profiled`] result for production merge time and this result only for exact fan-in
+    /// counts and outcome parity.
+    pub fn run_merge_fan_in_profiled(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+    ) -> Result<MetalMergeFanInRun, MetalError> {
+        validate(image, Backend::Metal)
+            .map_err(|error| MetalError::Validation(error.to_string()))?;
+        validate_config(config)?;
+
+        let (pipelines, diagnostic_pipeline_creation_ns) = self.direct.fel_probe_pipelines()?;
+        let plan = MetalPlan::new(
+            image,
+            exclusive_horizon_ns,
+            config,
+            ObservationMode::Summary,
+        )?;
+        let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+        let probe = FelProbeResources::new(
+            &self.direct.device,
+            image.nodes.len(),
+            None,
+            Some(pipelines.merge_pipeline),
+            false,
+        )?;
+        let timing = self
+            .direct
+            .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
+        let run = buffers.finish(image, ObservationMode::Summary, timing)?;
+        let fan_in = probe.merge_fan_in()?;
+        Ok(MetalMergeFanInRun {
+            run,
+            fan_in,
+            diagnostic_pipeline_creation_ns,
+        })
+    }
+
+    fn run_fel_diagnostic_profiled(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        inject_round_trip: bool,
+    ) -> Result<(MetalRun, u64, u64, u64), MetalError> {
+        validate(image, Backend::Metal)
+            .map_err(|error| MetalError::Validation(error.to_string()))?;
+        validate_config(config)?;
+
+        let (pipelines, diagnostic_pipeline_creation_ns) = self.direct.fel_probe_pipelines()?;
+        let plan = MetalPlan::new(
+            image,
+            exclusive_horizon_ns,
+            config,
+            ObservationMode::Summary,
+        )?;
+        let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+        let probe = FelProbeResources::new(
+            &self.direct.device,
+            image.nodes.len(),
+            Some(pipelines.round_pipeline),
+            None,
+            inject_round_trip,
+        )?;
+        let timing = self
+            .direct
+            .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
+        let run = buffers.finish(image, ObservationMode::Summary, timing)?;
+        let (local_fel_pushes, injected_fel_round_trips) = probe.fel_counts()?;
+        Ok((
+            run,
+            local_fel_pushes,
+            injected_fel_round_trips,
+            diagnostic_pipeline_creation_ns,
+        ))
     }
 
     pub fn run_with_observations(
@@ -1661,6 +1966,101 @@ impl SharedBuffer {
     }
 }
 
+#[derive(Clone)]
+struct FelProbePipelines {
+    round_pipeline: MetalPipeline,
+    merge_pipeline: MetalPipeline,
+}
+
+struct FelProbeResources {
+    round_pipeline: Option<MetalPipeline>,
+    merge_pipeline: Option<MetalPipeline>,
+    node_count: usize,
+    counts: SharedBuffer,
+    merge_fan_in: SharedBuffer,
+}
+
+impl FelProbeResources {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        node_count: usize,
+        round_pipeline: Option<MetalPipeline>,
+        merge_pipeline: Option<MetalPipeline>,
+        inject_round_trip: bool,
+    ) -> Result<Self, MetalError> {
+        let fan_in_words = node_count
+            .checked_mul(4)
+            .ok_or_else(|| MetalError::Validation("merge fan-in counter size overflows".into()))?;
+        let count_words = node_count
+            .checked_mul(2)
+            .and_then(|words| words.checked_add(1))
+            .ok_or_else(|| {
+                MetalError::Validation("FEL diagnostic counter size overflows".into())
+            })?;
+        let mut counts = vec![0; count_words];
+        counts[0] = u64::from(inject_round_trip);
+        Ok(Self {
+            round_pipeline,
+            merge_pipeline,
+            node_count,
+            counts: SharedBuffer::new(device, counts)?,
+            merge_fan_in: SharedBuffer::new(device, vec![0; fan_in_words])?,
+        })
+    }
+
+    fn bind(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&self.counts.raw), 0, 25);
+            encoder.setBuffer_offset_atIndex(Some(&self.merge_fan_in.raw), 0, 26);
+        }
+    }
+
+    fn fel_counts(&self) -> Result<(u64, u64), MetalError> {
+        fn checked_sum(values: &[u64], label: &str) -> Result<u64, MetalError> {
+            values.iter().try_fold(0_u64, |total, value| {
+                total.checked_add(*value).ok_or_else(|| {
+                    MetalError::Validation(format!("FEL diagnostic {label} count overflows"))
+                })
+            })
+        }
+
+        let counts = self.counts.read();
+        let local_end = self.node_count + 1;
+        Ok((
+            checked_sum(&counts[1..local_end], "local-push")?,
+            checked_sum(
+                &counts[local_end..local_end + self.node_count],
+                "injected-round-trip",
+            )?,
+        ))
+    }
+
+    fn merge_fan_in(&self) -> Result<MetalMergeFanIn, MetalError> {
+        self.merge_fan_in.read().chunks_exact(4).try_fold(
+            MetalMergeFanIn::default(),
+            |mut total, row| {
+                total.eventful_target_rounds = total
+                    .eventful_target_rounds
+                    .checked_add(row[0])
+                    .ok_or_else(|| {
+                        MetalError::Validation("merge eventful-target-round count overflows".into())
+                    })?;
+                total.active_producer_target_rounds = total
+                    .active_producer_target_rounds
+                    .checked_add(row[1])
+                    .ok_or_else(|| {
+                        MetalError::Validation("merge active-producer count overflows".into())
+                    })?;
+                total.remote_events = total.remote_events.checked_add(row[2]).ok_or_else(|| {
+                    MetalError::Validation("merge remote-event count overflows".into())
+                })?;
+                total.maximum_active_fan_in = total.maximum_active_fan_in.max(row[3]);
+                Ok(total)
+            },
+        )
+    }
+}
+
 struct MetalBuffers {
     planes: Vec<SharedBuffer>,
     orphan_packets: Vec<PacketDescriptor>,
@@ -2171,6 +2571,7 @@ struct DirectMetal {
     exchange_scatter_pipeline: MetalPipeline,
     exchange_merge_pipeline: MetalPipeline,
     finalize_pipeline: MetalPipeline,
+    fel_probe_pipelines: Mutex<Option<FelProbePipelines>>,
 }
 
 impl DirectMetal {
@@ -2229,7 +2630,34 @@ impl DirectMetal {
             exchange_scatter_pipeline,
             exchange_merge_pipeline,
             finalize_pipeline,
+            fel_probe_pipelines: Mutex::new(None),
         })
+    }
+
+    fn fel_probe_pipelines(&self) -> Result<(FelProbePipelines, u64), MetalError> {
+        let mut cached = self.fel_probe_pipelines.lock().map_err(|_| {
+            MetalError::Unavailable("FEL diagnostic pipeline cache is poisoned".into())
+        })?;
+        if let Some(pipelines) = cached.as_ref() {
+            return Ok((pipelines.clone(), 0));
+        }
+
+        let started = Instant::now();
+        let source = format!(
+            "#define DAYS_T15E_DIAGNOSTICS 1\n{}",
+            include_str!("metal_kernels.metal")
+        );
+        let pipelines = FelProbePipelines {
+            round_pipeline: create_pipeline(&self.device, &source, "days_round_fel_probe")?,
+            merge_pipeline: create_pipeline(
+                &self.device,
+                &source,
+                "days_exchange_merge_fan_in_probe",
+            )?,
+        };
+        let creation_ns = duration_ns(started.elapsed());
+        *cached = Some(pipelines.clone());
+        Ok((pipelines, creation_ns))
     }
 
     fn run(
@@ -2238,8 +2666,24 @@ impl DirectMetal {
         config: MetalConfig,
         profile: bool,
     ) -> Result<MetalTiming, MetalError> {
+        self.run_with_fel_probe(buffers, config, profile, None)
+    }
+
+    fn run_with_fel_probe(
+        &self,
+        buffers: &MetalBuffers,
+        config: MetalConfig,
+        profile: bool,
+        fel_probe: Option<&FelProbeResources>,
+    ) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
-        let execution_width = self.round_pipeline.threadExecutionWidth();
+        let round_pipeline = fel_probe
+            .and_then(|probe| probe.round_pipeline.as_deref())
+            .unwrap_or(&self.round_pipeline);
+        let merge_pipeline = fel_probe
+            .and_then(|probe| probe.merge_pipeline.as_deref())
+            .unwrap_or(&self.exchange_merge_pipeline);
+        let execution_width = round_pipeline.threadExecutionWidth();
         if !round_threads.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the device execution width \
@@ -2247,9 +2691,9 @@ impl DirectMetal {
             )));
         }
         let parallel_pipelines = [
-            &self.round_pipeline,
+            round_pipeline,
             &self.exchange_scatter_pipeline,
-            &self.exchange_merge_pipeline,
+            merge_pipeline,
         ];
         let supported_threads = parallel_pipelines
             .iter()
@@ -2352,6 +2796,9 @@ impl DirectMetal {
                             control_group,
                             parallel_grid,
                             parallel_group,
+                            round_pipeline,
+                            merge_pipeline,
+                            fel_probe,
                         )?;
                     }
                 }
@@ -2362,6 +2809,9 @@ impl DirectMetal {
                             MetalError::Unavailable("serial compute encoder creation failed".into())
                         })?;
                     buffers.bind(&encoder);
+                    if let Some(probe) = fel_probe {
+                        probe.bind(&encoder);
+                    }
                     for _ in captured..encoded {
                         self.encode_attempt(
                             &encoder,
@@ -2369,6 +2819,8 @@ impl DirectMetal {
                             control_group,
                             parallel_grid,
                             parallel_group,
+                            round_pipeline,
+                            merge_pipeline,
                         );
                     }
                     encoder.endEncoding();
@@ -2449,6 +2901,7 @@ impl DirectMetal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_attempt(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2456,13 +2909,15 @@ impl DirectMetal {
         control_group: MTLSize,
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
+        round_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) {
         for (phase, geometry) in ATTEMPT_PHASES {
             let (grid, group) = match geometry {
                 DispatchGeometry::FixedControl => (control_grid, control_group),
                 DispatchGeometry::Parallel => (parallel_grid, parallel_group),
             };
-            encoder.setComputePipelineState(self.pipeline(phase));
+            encoder.setComputePipelineState(self.pipeline(phase, round_pipeline, merge_pipeline));
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         }
     }
@@ -2478,6 +2933,9 @@ impl DirectMetal {
         control_group: MTLSize,
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
+        round_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        fel_probe: Option<&FelProbeResources>,
     ) -> Result<(), MetalError> {
         for (phase_index, (phase, geometry)) in ATTEMPT_PHASES.into_iter().enumerate() {
             let (grid, group) = match geometry {
@@ -2503,22 +2961,30 @@ impl DirectMetal {
                     MetalError::Unavailable("profile compute encoder creation failed".into())
                 })?;
             buffers.bind(&encoder);
-            encoder.setComputePipelineState(self.pipeline(phase));
+            if let Some(probe) = fel_probe {
+                probe.bind(&encoder);
+            }
+            encoder.setComputePipelineState(self.pipeline(phase, round_pipeline, merge_pipeline));
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
             encoder.endEncoding();
         }
         Ok(())
     }
 
-    fn pipeline(&self, phase: AttemptPhase) -> &ProtocolObject<dyn MTLComputePipelineState> {
+    fn pipeline<'a>(
+        &'a self,
+        phase: AttemptPhase,
+        round_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
+        merge_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
+    ) -> &'a ProtocolObject<dyn MTLComputePipelineState> {
         match phase {
             AttemptPhase::Horizon => &self.horizon_pipeline,
             AttemptPhase::Compaction => &self.prepare_pipeline,
-            AttemptPhase::DrainExecute => &self.round_pipeline,
+            AttemptPhase::DrainExecute => round_pipeline,
             AttemptPhase::ContinuationControl => &self.control_pipeline,
             AttemptPhase::ExchangePrefix => &self.exchange_prefix_pipeline,
             AttemptPhase::ExchangeScatter => &self.exchange_scatter_pipeline,
-            AttemptPhase::TargetMerge => &self.exchange_merge_pipeline,
+            AttemptPhase::TargetMerge => merge_pipeline,
             AttemptPhase::FinalControl => &self.finalize_pipeline,
         }
     }

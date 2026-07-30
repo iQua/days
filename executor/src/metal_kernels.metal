@@ -1459,6 +1459,183 @@ kernel void days_round(
 
 }
 
+// T15e diagnostic only. This kernel preserves the production event set and transition body. Its
+// uniform mode word optionally adds one push/pop pair for the just-popped event before each real
+// transition. Probe-minus-control measures the marginal stress cost; a per-LP counter reports
+// real local pushes from the unchanged body.
+#if defined(DAYS_T15E_DIAGNOSTICS)
+inline bool diagnostic_record_fel_counts(
+    ulong node,
+    ulong local_pushes,
+    ulong injected_round_trips,
+    const device ulong *params,
+    device ulong *state,
+    device ulong *diagnostic_counts
+) {
+    ulong local_counter = node + 1;
+    ulong previous_local = diagnostic_counts[local_counter];
+    ulong next_local = previous_local + local_pushes;
+    if (next_local < previous_local) {
+        set_semantic_error(state, 33, node);
+        return false;
+    }
+    ulong injected_counter = params[P_NODE_COUNT] + node + 1;
+    ulong previous_injected = diagnostic_counts[injected_counter];
+    ulong next_injected = previous_injected + injected_round_trips;
+    if (next_injected < previous_injected) {
+        set_semantic_error(state, 37, node);
+        return false;
+    }
+    diagnostic_counts[local_counter] = next_local;
+    diagnostic_counts[injected_counter] = next_injected;
+    return true;
+}
+
+// Control and stress-probe calls use this same compiled PSO. A uniform diagnostic-buffer word
+// selects whether to inject the net-zero heap pair, keeping compiler and register layout matched.
+kernel void days_round_fel_probe(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *node_state [[buffer(2)]],
+    device ulong *generators [[buffer(3)]],
+    const device ulong *flows [[buffer(4)]],
+    const device ulong *routes [[buffer(5)]],
+    const device ulong *links [[buffer(6)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    device ulong *queue_meta [[buffer(9)]],
+    device ulong *queue_records [[buffer(10)]],
+    device ulong *in_service [[buffer(11)]],
+    const device ulong *worklist [[buffer(13)]],
+    device ulong *summary [[buffer(14)]],
+    device ulong *observed [[buffer(15)]],
+    device ulong *departures [[buffer(16)]],
+    device ulong *arrivals [[buffer(17)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *remote_staging [[buffer(20)]],
+    device ulong *observation_meta [[buffer(21)]],
+    device ulong *diagnostic_counts [[buffer(25)]],
+    uint active_index [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1 ||
+        active_index >= control[C_ACTIVE]
+    ) {
+        return;
+    }
+    ulong node = worklist[active_index];
+    device ulong *state = lp_state + node * LP_STATE_WORDS;
+    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
+        return;
+    }
+
+    ulong dispatch_transitions = 0;
+    ulong diagnostic_local_pushes = 0;
+    ulong diagnostic_injected_round_trips = 0;
+    bool inject_round_trip = diagnostic_counts[0] != 0;
+    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
+        ulong time;
+        if (
+            !heap_root_time(node, fel_meta, fel_records, time) ||
+            !before_horizon(time, control)
+        ) {
+            if (!diagnostic_record_fel_counts(
+                node,
+                diagnostic_local_pushes,
+                diagnostic_injected_round_trips,
+                params,
+                state,
+                diagnostic_counts
+            )) {
+                return;
+            }
+            state[L_FINISHED] = 1;
+            return;
+        }
+
+        ulong event[EVENT_WORDS];
+        if (!heap_pop(node, fel_meta, fel_records, event)) {
+            set_semantic_error(state, 29, node);
+            return;
+        }
+        if (inject_round_trip) {
+            if (!heap_push(node, event, state, fel_meta, fel_records)) {
+                return;
+            }
+            if (!heap_pop(node, fel_meta, fel_records, event)) {
+                set_semantic_error(state, 30, node);
+                return;
+            }
+            ulong next_round_trips = diagnostic_injected_round_trips + 1;
+            if (next_round_trips < diagnostic_injected_round_trips) {
+                set_semantic_error(state, 37, node);
+                return;
+            }
+            diagnostic_injected_round_trips = next_round_trips;
+        }
+
+        ulong fel_count_before = fel_meta[node * META_WORDS + 3];
+        if (!dispatch_event(
+            node,
+            event,
+            state,
+            params,
+            node_state,
+            generators,
+            flows,
+            routes,
+            links,
+            fel_meta,
+            fel_records,
+            queue_meta,
+            queue_records,
+            in_service,
+            remote_meta,
+            remote_staging,
+            summary,
+            observation_meta,
+            observed,
+            departures,
+            arrivals
+        )) {
+            return;
+        }
+        ulong fel_count_after = fel_meta[node * META_WORDS + 3];
+        if (fel_count_after < fel_count_before) {
+            set_semantic_error(state, 32, node);
+            return;
+        }
+        ulong local_pushes = fel_count_after - fel_count_before;
+        ulong next_local_pushes = diagnostic_local_pushes + local_pushes;
+        if (next_local_pushes < diagnostic_local_pushes) {
+            set_semantic_error(state, 33, node);
+            return;
+        }
+        diagnostic_local_pushes = next_local_pushes;
+
+        if (state[L_TRANSITIONS] == NONE) {
+            set_semantic_error(state, 27, node);
+            return;
+        }
+        state[L_TRANSITIONS] += 1;
+        dispatch_transitions += 1;
+    }
+    if (!diagnostic_record_fel_counts(
+        node,
+        diagnostic_local_pushes,
+        diagnostic_injected_round_trips,
+        params,
+        state,
+        diagnostic_counts
+    )) {
+        return;
+    }
+}
+#endif
+
 kernel void days_round_control(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -1705,6 +1882,140 @@ kernel void days_exchange_merge(
         merge_cursors[best_edge] += 1;
     }
 }
+
+// T15e diagnostic counterpart of `days_exchange_merge`. The merge itself is unchanged; a
+// read-only pre-scan records actual producer fan-in and remote-event counts per target-round.
+#if defined(DAYS_T15E_DIAGNOSTICS)
+kernel void days_exchange_merge_fan_in_probe(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    const device ulong *outbox [[buffer(12)]],
+    device ulong *lp_state [[buffer(18)]],
+    const device ulong *remote_meta [[buffer(19)]],
+    const device ulong *inbound_meta [[buffer(22)]],
+    const device ulong *inbound_producers [[buffer(23)]],
+    device ulong *merge_cursors [[buffer(24)]],
+    device ulong *diagnostic_fan_in [[buffer(26)]],
+    uint target [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2 ||
+        target >= params[P_NODE_COUNT]
+    ) {
+        return;
+    }
+    ulong inbound_base = ulong(target) * INBOUND_META_WORDS;
+    ulong edge_start = inbound_meta[inbound_base];
+    ulong edge_count = inbound_meta[inbound_base + 1];
+    ulong active_fan_in = 0;
+    ulong target_events = 0;
+    for (ulong edge = edge_start; edge < edge_start + edge_count; ++edge) {
+        merge_cursors[edge] = 0;
+        ulong producer = inbound_producers[edge];
+        ulong producer_base = producer * META_WORDS;
+        ulong count = remote_meta[producer_base + 3];
+        bool active = false;
+        for (ulong cursor = 0; cursor < count; ++cursor) {
+            ulong slot = remote_meta[producer_base + 2] + cursor;
+            if (outbox[slot * EVENT_WORDS + E_TARGET] == target) {
+                active = true;
+                ulong next_target_events = target_events + 1;
+                if (next_target_events < target_events) {
+                    set_semantic_error(
+                        lp_state + ulong(target) * LP_STATE_WORDS,
+                        34,
+                        target
+                    );
+                    return;
+                }
+                target_events = next_target_events;
+            }
+        }
+        if (active) {
+            ulong next_active_fan_in = active_fan_in + 1;
+            if (next_active_fan_in < active_fan_in) {
+                set_semantic_error(
+                    lp_state + ulong(target) * LP_STATE_WORDS,
+                    35,
+                    target
+                );
+                return;
+            }
+            active_fan_in = next_active_fan_in;
+        }
+    }
+    device ulong *error = lp_state + ulong(target) * LP_STATE_WORDS;
+    if (active_fan_in != 0) {
+        ulong diagnostic_base = ulong(target) * 4;
+        ulong previous_rounds = diagnostic_fan_in[diagnostic_base];
+        ulong previous_fan_in = diagnostic_fan_in[diagnostic_base + 1];
+        ulong previous_events = diagnostic_fan_in[diagnostic_base + 2];
+        ulong next_rounds = previous_rounds + 1;
+        ulong next_fan_in = previous_fan_in + active_fan_in;
+        ulong next_events = previous_events + target_events;
+        if (
+            next_rounds < previous_rounds ||
+            next_fan_in < previous_fan_in ||
+            next_events < previous_events
+        ) {
+            set_semantic_error(error, 36, target);
+            return;
+        }
+        diagnostic_fan_in[diagnostic_base] = next_rounds;
+        diagnostic_fan_in[diagnostic_base + 1] = next_fan_in;
+        diagnostic_fan_in[diagnostic_base + 2] = next_events;
+        diagnostic_fan_in[diagnostic_base + 3] =
+            max(diagnostic_fan_in[diagnostic_base + 3], active_fan_in);
+    }
+
+    while (true) {
+        ulong best_edge = NONE;
+        ulong best_slot = 0;
+        for (ulong edge = edge_start; edge < edge_start + edge_count; ++edge) {
+            ulong producer = inbound_producers[edge];
+            ulong producer_base = producer * META_WORDS;
+            ulong count = remote_meta[producer_base + 3];
+            ulong cursor = merge_cursors[edge];
+            while (cursor < count) {
+                ulong slot = remote_meta[producer_base + 2] + cursor;
+                if (outbox[slot * EVENT_WORDS + E_TARGET] == target) {
+                    break;
+                }
+                cursor += 1;
+            }
+            merge_cursors[edge] = cursor;
+            if (cursor == count) {
+                continue;
+            }
+            ulong slot = remote_meta[producer_base + 2] + cursor;
+            if (
+                best_edge == NONE ||
+                stored_key_less(outbox, slot, best_slot)
+            ) {
+                best_edge = edge;
+                best_slot = slot;
+            }
+        }
+        if (best_edge == NONE) {
+            break;
+        }
+        ulong event[EVENT_WORDS];
+        copy_device_to_thread(outbox, best_slot, event);
+        if (before_horizon(event[E_TIME], control)) {
+            set_semantic_error(error, 28, target);
+            return;
+        }
+        if (!heap_push(target, event, error, fel_meta, fel_records)) {
+            return;
+        }
+        merge_cursors[best_edge] += 1;
+    }
+}
+#endif
 
 kernel void days_round_finalize(
     device ulong *control [[buffer(0)]],

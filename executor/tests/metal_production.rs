@@ -1124,6 +1124,75 @@ fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
 }
 
 #[test]
+fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
+    let image = fifo_taildrop_image();
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let baseline = executor
+        .run_profiled(&image, Some(27), MetalConfig::default())
+        .expect("profiled baseline must run");
+    let control = executor
+        .run_fel_control_profiled(&image, Some(27), MetalConfig::default())
+        .expect("profiled FEL matched control must run");
+    let probe = executor
+        .run_fel_probe_profiled(&image, Some(27), MetalConfig::default())
+        .expect("profiled FEL probe must run");
+    let fan_in = executor
+        .run_merge_fan_in_profiled(&image, Some(27), MetalConfig::default())
+        .expect("profiled merge fan-in characterization must run");
+
+    assert_eq!(probe.run.result, baseline.result);
+    assert_eq!(probe.run.rounds, baseline.rounds);
+    assert_eq!(probe.run.transitions, baseline.transitions);
+    assert_eq!(
+        probe.run.continuation_relaunches,
+        baseline.continuation_relaunches
+    );
+    assert_eq!(control.run.result, baseline.result);
+    assert_eq!(control.run.rounds, baseline.rounds);
+    assert_eq!(control.run.transitions, baseline.transitions);
+    assert_eq!(
+        control.run.continuation_relaunches,
+        baseline.continuation_relaunches
+    );
+    assert_eq!(fan_in.run.result, baseline.result);
+    assert_eq!(fan_in.run.rounds, baseline.rounds);
+    assert_eq!(fan_in.run.transitions, baseline.transitions);
+    assert_eq!(probe.injected_fel_round_trips, probe.run.transitions);
+    assert_eq!(probe.local_fel_pushes, 18);
+    assert_eq!(probe.local_fel_pushes, control.local_fel_pushes);
+    assert_eq!(fan_in.fan_in.eventful_target_rounds, 9);
+    assert_eq!(fan_in.fan_in.active_producer_target_rounds, 9);
+    assert_eq!(fan_in.fan_in.remote_events, 9);
+    assert_eq!(fan_in.fan_in.maximum_active_fan_in, 1);
+    assert!(control.diagnostic_pipeline_creation_ns > 0);
+    assert_eq!(probe.diagnostic_pipeline_creation_ns, 0);
+    assert_eq!(fan_in.diagnostic_pipeline_creation_ns, 0);
+
+    let decomposition = probe
+        .decompose_against(&baseline, &control)
+        .expect("complete paired profiles must decompose");
+    assert_eq!(decomposition.rounds, baseline.rounds);
+    assert_eq!(decomposition.transitions, baseline.transitions);
+    assert_eq!(
+        decomposition.injected_fel_operations,
+        baseline
+            .transitions
+            .checked_mul(2)
+            .expect("small test operation count must fit")
+    );
+    assert_eq!(
+        decomposition.production_drain_fel_operations,
+        baseline
+            .transitions
+            .checked_add(probe.local_fel_pushes)
+            .expect("small test operation count must fit")
+    );
+    assert!(decomposition.baseline_drain_execute_ns > 0);
+    assert!(decomposition.matched_control_drain_execute_ns > 0);
+    assert!(decomposition.probe_drain_execute_ns > 0);
+}
+
+#[test]
 fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     let image = generator_image(GeneratorTermination::Bytes(4));
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
