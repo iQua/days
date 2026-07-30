@@ -36,6 +36,18 @@ fn order_for_sample(sample: usize) -> &'static str {
     }
 }
 
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+const SCALAR_SAMPLES: usize = 2;
+
+#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+fn recorded_predecessor_for_engine(engine: &str) -> &'static str {
+    if engine == "scalar" {
+        "none"
+    } else {
+        "same_kind_discarded"
+    }
+}
+
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn main() {
     use std::path::PathBuf;
@@ -60,6 +72,7 @@ fn main() {
     struct Measurement {
         sample: usize,
         order: &'static str,
+        predecessor: &'static str,
         engine: &'static str,
         backend: &'static str,
         workers: usize,
@@ -130,6 +143,7 @@ fn main() {
         Measurement {
             sample: 0,
             order: "warmup",
+            predecessor: "none",
             engine: "scalar",
             backend: "scalar",
             workers: 1,
@@ -190,6 +204,7 @@ fn main() {
         Measurement {
             sample: 0,
             order: "warmup",
+            predecessor: "none",
             engine,
             backend: "cpu",
             workers,
@@ -268,6 +283,7 @@ fn main() {
         Measurement {
             sample: 0,
             order: "warmup",
+            predecessor: "none",
             engine: "metal",
             backend: "metal",
             workers: 0,
@@ -290,15 +306,11 @@ fn main() {
         }
     }
 
-    fn scalar_after_predecessor(image: &SimulationImage) -> Measurement {
-        let calibration_ns = scalar_calibration(image);
-        let _ = scalar(image, 0);
-        scalar(image, calibration_ns)
-    }
-
     fn cpu_after_predecessor(image: &SimulationImage, workers: usize) -> Measurement {
         let _ = cpu(image, workers);
-        cpu(image, workers)
+        let mut measurement = cpu(image, workers);
+        measurement.predecessor = recorded_predecessor_for_engine(measurement.engine);
+        measurement
     }
 
     fn metal_after_predecessor(
@@ -315,18 +327,21 @@ fn main() {
             device_queue_setup_ns,
             pipeline_creation_ns,
         );
-        metal(
+        let mut measurement = metal(
             executor,
             image,
             threadgroup_width,
             device_queue_setup_ns,
             pipeline_creation_ns,
-        )
+        );
+        measurement.predecessor = recorded_predecessor_for_engine(measurement.engine);
+        measurement
     }
 
     fn print_record(kind: &str, fixture: &str, threadgroup_width: usize, measurement: Measurement) {
         println!(
-            "record=t15e_{kind} config={fixture} sample={} order={} engine={} backend={} workers={} \
+            "record=t15e_{kind} config={fixture} sample={} order={} predecessor={} \
+             engine={} backend={} workers={} \
              threadgroup_width={} rounds={} transitions={} fixed_method={} separation_quality={} \
              end_to_end_ns={} \
              cold_end_to_end_ns={} fixed_ns={} warm_fixed_ns={} marginal_ns={} \
@@ -335,6 +350,7 @@ fn main() {
              wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
             measurement.sample,
             measurement.order,
+            measurement.predecessor,
             measurement.engine,
             measurement.backend,
             measurement.workers,
@@ -373,6 +389,7 @@ fn main() {
             selected.iter().all(|measurement| {
                 measurement.engine == first.engine
                     && measurement.outcome == first.outcome
+                    && measurement.predecessor == first.predecessor
                     && measurement.fixed_method == first.fixed_method
                     && measurement.separation_quality == first.separation_quality
             }),
@@ -390,13 +407,14 @@ fn main() {
         println!(
             "record=t15e_{kind} statistic=median \
              aggregation=component_medians_with_derived_fixed_closure config={fixture} \
-             order={order} engine={} \
+             order={order} predecessor={} engine={} \
              backend={} workers={} samples={} threadgroup_width={} rounds={} transitions={} \
              fixed_method={} separation_quality={} end_to_end_ns={} cold_end_to_end_ns={} \
              fixed_ns={} warm_fixed_ns={} marginal_ns={} marginal_ns_per_round={} \
              calibration_ns={} backend_wall_ns={} \
              device_ns={} host_encode_submit_ns={} encoded_attempts={} continuation_relaunches={} \
              wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
+            first.predecessor,
             first.engine,
             first.backend,
             first.workers,
@@ -490,7 +508,10 @@ fn main() {
             extra => panic!("unexpected second fixture path {extra}"),
         }
     }
-    assert!(samples > 0, "--samples must be nonzero");
+    assert!(
+        samples >= 2 && samples.is_multiple_of(2),
+        "--samples must be a positive even count so both orders are represented"
+    );
     assert!(threadgroup_width > 0, "--threadgroup-width must be nonzero");
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative);
@@ -501,6 +522,11 @@ fn main() {
     let device_queue_setup_ns = u128::from(initialization.device_queue_setup_ns);
     let pipeline_creation_ns = u128::from(initialization.pipeline_creation_ns);
     println!(
+        "record=t15e_protocol scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
+         comparison_samples={samples} comparison_predecessor=same_kind_discarded \
+         order_schedule=alternating_cpu_first_gpu_first"
+    );
+    println!(
         "record=t15e_initialization config={relative} engine=metal device_queue_setup_ns={} \
          pipeline_creation_ns={} in_process_reuse=1 archive_saving_status=unmeasured \
          archive_upper_bound_ns={}",
@@ -509,9 +535,7 @@ fn main() {
         initialization.pipeline_creation_ns,
     );
 
-    let scalar_calibration_ns = scalar_calibration(&image);
     let warmups = [
-        scalar(&image, scalar_calibration_ns),
         cpu(&image, 4),
         cpu(&image, 18),
         metal(
@@ -528,12 +552,17 @@ fn main() {
         print_record("warmup", &relative, threadgroup_width, warmup);
     }
 
-    let mut measurements = Vec::with_capacity(samples.saturating_mul(4));
+    let mut measurements =
+        Vec::with_capacity(samples.saturating_mul(3).saturating_add(SCALAR_SAMPLES));
     for sample in 0..samples {
         let order = order_for_sample(sample);
-        let ordered = if order == "cpu_first" {
-            [
-                scalar_after_predecessor(&image),
+        let include_scalar = sample < SCALAR_SAMPLES;
+        let mut ordered = Vec::with_capacity(3 + usize::from(include_scalar));
+        if order == "cpu_first" {
+            if include_scalar {
+                ordered.push(scalar(&image, scalar_calibration(&image)));
+            }
+            ordered.extend([
                 cpu_after_predecessor(&image, 4),
                 cpu_after_predecessor(&image, 18),
                 metal_after_predecessor(
@@ -543,21 +572,23 @@ fn main() {
                     device_queue_setup_ns,
                     pipeline_creation_ns,
                 ),
-            ]
+            ]);
         } else {
-            [
-                metal_after_predecessor(
-                    &executor,
-                    &image,
-                    threadgroup_width,
-                    device_queue_setup_ns,
-                    pipeline_creation_ns,
-                ),
-                scalar_after_predecessor(&image),
+            ordered.push(metal_after_predecessor(
+                &executor,
+                &image,
+                threadgroup_width,
+                device_queue_setup_ns,
+                pipeline_creation_ns,
+            ));
+            if include_scalar {
+                ordered.push(scalar(&image, scalar_calibration(&image)));
+            }
+            ordered.extend([
                 cpu_after_predecessor(&image, 4),
                 cpu_after_predecessor(&image, 18),
-            ]
-        };
+            ]);
+        }
         for mut measurement in ordered {
             measurement.sample = sample;
             measurement.order = order;
@@ -603,6 +634,10 @@ fn main() {
                 .map(|measurement| measurement.marginal_ns),
         )
     };
+    let scalar_samples = measurements
+        .iter()
+        .filter(|measurement| measurement.engine == "scalar")
+        .count();
     let w4_marginal_ns = pooled_marginal("w4");
     let w18_marginal_ns = pooled_marginal("w18");
     let metal_marginal_ns = pooled_marginal("metal");
@@ -623,7 +658,8 @@ fn main() {
         (false, false) => "metal_below_neither",
     };
     println!(
-        "record=t15e_pooled_summary statistic=median config={relative} samples={samples} \
+        "record=t15e_pooled_summary statistic=median config={relative} \
+         scalar_samples={scalar_samples} comparison_samples={samples} \
          threadgroup_width={threadgroup_width} rounds={} transitions={} \
          ratio_definition=metal_marginal_div_cpu_marginal \
          speedup_definition=cpu_marginal_div_metal_marginal \
@@ -647,7 +683,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{median, order_for_sample, split_fixed};
+    use super::{
+        SCALAR_SAMPLES, median, order_for_sample, recorded_predecessor_for_engine, split_fixed,
+    };
 
     #[test]
     fn even_median_averages_middle_pair() {
@@ -673,5 +711,17 @@ mod tests {
             2
         );
         assert_eq!(orders, ["cpu_first", "gpu_first", "cpu_first", "gpu_first"]);
+    }
+
+    #[test]
+    fn scalar_measurement_exemption_uses_two_samples_without_predecessors() {
+        assert_eq!(SCALAR_SAMPLES, 2);
+        assert_eq!(recorded_predecessor_for_engine("scalar"), "none");
+        for engine in ["w4", "w18", "metal"] {
+            assert_eq!(
+                recorded_predecessor_for_engine(engine),
+                "same_kind_discarded"
+            );
+        }
     }
 }

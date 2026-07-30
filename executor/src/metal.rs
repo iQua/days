@@ -1300,6 +1300,14 @@ fn paced_single_source_queue_bound(
     emission_interval_ns: u64,
     serialization_ns: u64,
 ) -> usize {
+    // This is the exact worst-case queued occupancy for the clean single-source state accepted by
+    // `source_queue_packet_bound`. Let arrivals be a_n = a_0 + nI and link service take S. The
+    // source begins idle and empty. If I >= S, packet n completes no later than a_(n+1). At I = S,
+    // canonical phases process the next PacketArrival before TxComplete and TxReady, so the queued
+    // population briefly reaches exactly one and then drains; the in-service packet is stored
+    // separately. Thus q(t) <= 1 across every timestamp and safe-horizon cut, and equality makes
+    // the bound tight. When service is slower, retaining the whole remaining flow is the only
+    // workload-independent bound used here.
     if emission_interval_ns >= serialization_ns {
         packet_count.min(1)
     } else {
@@ -1315,6 +1323,10 @@ fn source_queue_packet_bound(
     if packet_count == 0 {
         return 0;
     }
+    // Apply the service-rate proof only to a pristine source with one flow, one constant
+    // generator, one matching scheduled first packet, and no queued or in-service work. Every
+    // checkpoint, preloaded, multi-flow, or otherwise ambiguous state falls back to the whole
+    // remaining flow below.
     let flow = &image.flows[flow_index];
     if image
         .flows
@@ -1537,8 +1549,10 @@ fn flow_link_round_bound(
             0
         };
 
-    // One horizon can expose a checkpoint queue, one packet already in service, link-rate
-    // completions, and newly generated packets. The whole-flow count remains the absolute cap.
+    // For finite lookahead L and serialization S, one horizon can expose the proven checkpoint
+    // queue bound Q, one separately stored in-service packet, ceil(L/S) service completions, and
+    // floor(L/I)+1 generator emissions. Each component rounds outward, saturating arithmetic
+    // cannot shrink the result, and the whole-flow count remains the absolute cap.
     packet_count.min(
         queue_bound
             .saturating_add(1)

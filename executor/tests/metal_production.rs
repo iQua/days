@@ -1030,6 +1030,55 @@ fn metal_constant_generator_duration_matches_full_scalar_result() {
 }
 
 #[test]
+fn metal_equal_rate_paced_source_queue_bound_is_tight() {
+    // The fixture emits 64 two-byte packets every 2 ns onto a link whose exact serialization is
+    // also 2 ns. PacketArrival precedes the tied TxComplete, so every tie reaches the worst-case
+    // queued occupancy of exactly one before TxReady drains it.
+    let mut image = generator_image(GeneratorTermination::Bytes(128));
+    image.stop_time_ns = 126;
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("equal-rate scalar oracle must run");
+    let derived =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("derived paced-source capacity must cover every equality tie");
+    let exact = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_queue_packets_per_lp: Some(1),
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("one queued packet is the exact equal-rate source bound");
+
+    assert_eq!(scalar.summary.sourced_packets, 64);
+    assert_eq!(scalar.summary.departed_packets, 63);
+    assert!(scalar.host_states[0].queue.is_empty());
+    assert!(scalar.host_states[0].in_service.is_some());
+    assert_eq!(derived.result, scalar);
+    assert_eq!(exact.result, scalar);
+
+    let error = run_metal(
+        &image,
+        None,
+        MetalConfig {
+            max_queue_packets_per_lp: Some(0),
+            ..MetalConfig::default()
+        },
+    )
+    .expect_err("the equality case must reach one queued packet");
+    assert_eq!(
+        error,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::Queue,
+            node: Some(GENERATOR_SOURCE),
+            capacity: 0,
+        }
+    );
+}
+
+#[test]
 fn metal_fifo_taildrop_and_single_selection_match_full_scalar_result() {
     let image = fifo_taildrop_image();
     let scalar = run_scalar_with_observations(&image, Some(27), ObservationMode::Full)

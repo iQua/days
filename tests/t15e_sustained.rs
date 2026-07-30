@@ -7,7 +7,10 @@ use days::topos::build::build_graph;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days::scenario::compile_config;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, run_metal, run_scalar};
+use days_executor::{
+    FlowGeneratorKind, GeneratorStatus, GeneratorTermination, MetalConfig, RunResult, run_metal,
+    run_scalar,
+};
 
 const FIXTURE_DIRECTORY: &str = "configs/benchmarks/width_via_load_full";
 const HOST_COUNT: u64 = 8_192;
@@ -24,6 +27,10 @@ struct SustainedFixture {
     flow_bytes: u64,
     stop_time_ns: u64,
     expected_load_percent: f64,
+    expected_rounds: u64,
+    expected_packets_emitted: u64,
+    expected_unsent_packets: u64,
+    expected_next_departure_ns: u64,
 }
 
 const SUSTAINED_FIXTURES: [SustainedFixture; 2] = [
@@ -34,6 +41,10 @@ const SUSTAINED_FIXTURES: [SustainedFixture; 2] = [
         flow_bytes: 33_554_432,
         stop_time_ns: 1_920_000,
         expected_load_percent: 29.262_041_927_083_33,
+        expected_rounds: 1_879,
+        expected_packets_emitted: 91_429,
+        expected_unsent_packets: 39_643,
+        expected_next_departure_ns: 1_920_009,
     },
     SustainedFixture {
         sustained_name: "fattree_k32_load_90_sustained.toml",
@@ -42,6 +53,10 @@ const SUSTAINED_FIXTURES: [SustainedFixture; 2] = [
         flow_bytes: 16_777_216,
         stop_time_ns: 1_152_000,
         expected_load_percent: 87.775_180_989_583_33,
+        expected_rounds: 1_128,
+        expected_packets_emitted: 54_858,
+        expected_unsent_packets: 10_678,
+        expected_next_departure_ns: 1_152_018,
     },
 ];
 
@@ -59,11 +74,19 @@ fn read_fixture(path: &Path) -> toml::Table {
 }
 
 fn sourced_bytes_through_stop(fixture: SustainedFixture) -> u128 {
-    let configured_packets = fixture.flow_bytes / PACKET_SIZE_BYTES;
-    let packets_through_stop = fixture.stop_time_ns / INTERVAL_NS + 1;
+    let configured_packets = configured_packets(fixture);
+    let packets_through_stop = packets_through_stop(fixture);
     u128::from(
         fixture.flow_count * configured_packets.min(packets_through_stop) * PACKET_SIZE_BYTES,
     )
+}
+
+fn configured_packets(fixture: SustainedFixture) -> u64 {
+    fixture.flow_bytes / PACKET_SIZE_BYTES
+}
+
+fn packets_through_stop(fixture: SustainedFixture) -> u64 {
+    fixture.stop_time_ns / INTERVAL_NS + 1
 }
 
 fn offered_host_load_percent(fixture: SustainedFixture) -> f64 {
@@ -158,6 +181,32 @@ fn sustained_fixtures_hold_the_t15e_design_invariants() {
             fixture.sustained_name
         );
         assert!(
+            fixture.expected_rounds >= 1_000,
+            "{} expected round count must remain sustained",
+            fixture.sustained_name
+        );
+        assert_eq!(
+            packets_through_stop(fixture),
+            fixture.expected_packets_emitted,
+            "{} inclusive source emission count changed",
+            fixture.sustained_name
+        );
+        assert_eq!(
+            configured_packets(fixture) - packets_through_stop(fixture),
+            fixture.expected_unsent_packets,
+            "{} terminal unsent packets per source changed",
+            fixture.sustained_name
+        );
+        assert_eq!(
+            fixture
+                .expected_packets_emitted
+                .checked_mul(INTERVAL_NS)
+                .expect("next source departure must fit"),
+            fixture.expected_next_departure_ns,
+            "{} terminal next-departure candidate changed",
+            fixture.sustained_name
+        );
+        assert!(
             (load - fixture.expected_load_percent).abs() < 1e-12,
             "{} offered load changed: {load:.12}%",
             fixture.sustained_name
@@ -167,6 +216,44 @@ fn sustained_fixtures_hold_the_t15e_design_invariants() {
             endpoint_pairs(fixture.short_name),
             "{} endpoint pairs differ from its short fixture",
             fixture.sustained_name
+        );
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+fn assert_terminal_source_state(fixture: SustainedFixture, result: &RunResult) {
+    let generators = result
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        generators.len(),
+        fixture.flow_count as usize,
+        "{} terminal generator count changed",
+        fixture.sustained_name
+    );
+    for generator in generators {
+        let FlowGeneratorKind::Constant(constant) = generator.kind;
+        let GeneratorTermination::Bytes(termination_bytes) = constant.termination else {
+            panic!(
+                "{} generator must retain byte termination",
+                fixture.sustained_name
+            );
+        };
+        assert_eq!(generator.next_emission.status, GeneratorStatus::Stopped);
+        assert_eq!(
+            generator.next_emission.departure_time_ns,
+            fixture.expected_next_departure_ns
+        );
+        assert_eq!(generator.packets_emitted, fixture.expected_packets_emitted);
+        assert_eq!(
+            generator.bytes_emitted,
+            fixture.expected_packets_emitted * PACKET_SIZE_BYTES
+        );
+        assert_eq!(
+            (termination_bytes - generator.bytes_emitted) / constant.packet_size_bytes,
+            fixture.expected_unsent_packets
         );
     }
 }
@@ -183,10 +270,33 @@ fn sustained_load_30_matches_scalar_complete_result() {
     let metal = run_metal(&image, None, MetalConfig::default())
         .unwrap_or_else(|error| panic!("Metal failed for {}: {error}", path.display()));
 
+    assert_eq!(metal.rounds, SUSTAINED_FIXTURES[0].expected_rounds);
+    assert_terminal_source_state(SUSTAINED_FIXTURES[0], &scalar);
+    assert_terminal_source_state(SUSTAINED_FIXTURES[0], &metal.result);
     assert_eq!(
         metal.result,
         scalar,
         "Metal result differs from scalar for {}",
         path.display()
     );
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+#[ignore = "large k32 fixtures; validates terminal state and default Metal capacity"]
+fn sustained_fixtures_reach_expected_rounds_and_terminal_source_state() {
+    for fixture in SUSTAINED_FIXTURES {
+        let path = fixture_path(fixture.sustained_name);
+        let image = compile_config(&path)
+            .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+        let metal = run_metal(&image, None, MetalConfig::default())
+            .unwrap_or_else(|error| panic!("Metal failed for {}: {error}", path.display()));
+
+        assert_eq!(
+            metal.rounds, fixture.expected_rounds,
+            "{} round count changed",
+            fixture.sustained_name
+        );
+        assert_terminal_source_state(fixture, &metal.result);
+    }
 }
