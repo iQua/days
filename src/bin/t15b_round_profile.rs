@@ -87,6 +87,7 @@ fn main() {
     let mut max_rounds = None;
     let mut max_transitions_per_lp_per_round = None;
     let mut rounds_per_command_buffer = None;
+    let mut streams_enabled = true;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--samples" => {
@@ -123,11 +124,13 @@ fn main() {
                         .expect("--rounds-per-command-buffer must be an integer"),
                 );
             }
+            "--streams-disabled" => streams_enabled = false,
             unknown => panic!("unknown argument {unknown}"),
         }
     }
     assert!(samples > 0, "--samples must be nonzero");
     let run_config = MetalConfig {
+        streams_enabled,
         max_rounds,
         max_transitions_per_lp_per_round: max_transitions_per_lp_per_round
             .unwrap_or(MetalConfig::default().max_transitions_per_lp_per_round),
@@ -135,6 +138,7 @@ fn main() {
             .unwrap_or(MetalConfig::default().rounds_per_command_buffer),
         ..MetalConfig::default()
     };
+    let stream_mode = if streams_enabled { "streams" } else { "heap" };
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative);
     let image = compile_config(&path)
@@ -192,7 +196,7 @@ fn main() {
         direct_continuations = direct_continuations.saturating_add(work.same_time_continuations);
     }
     println!(
-        "record=t15b_divergence config={relative} nodes={} rounds={} transitions={} \
+        "record=t15b_divergence config={relative} stream_mode={stream_mode} nodes={} rounds={} transitions={} \
          configured_max_rounds={} configured_transition_cap={} \
          active_lp_rounds={active_lp_rounds} mean_active_lps={:.6} \
          maximum_active_lps={maximum_active_lps} maximum_lp_work={maximum_lp_work} \
@@ -233,6 +237,29 @@ fn main() {
             .expect("standard profile comparison must run");
         assert_eq!(metal_outcome(&standard), expected);
         assert_eq!(standard.result, expected_result);
+        if sample == 0 {
+            let memory = standard.memory_layout;
+            println!(
+                "record=t15f_memory config={relative} stream_mode={stream_mode} \
+                 legacy_heap_event_slots={} fallback_heap_event_slots={} \
+                 checkpoint_fallback_events={} \
+                 channel_stream_event_slots={} service_stream_event_slots={} \
+                 generator_stream_event_slots={} heap_arena_bytes={} stream_arena_bytes={} \
+                 legacy_heap_arena_bytes={} total_event_arena_bytes={} \
+                 delta_from_legacy_heap_bytes={}",
+                memory.legacy_heap_event_slots,
+                memory.fallback_heap_event_slots,
+                memory.checkpoint_fallback_events,
+                memory.channel_stream_event_slots,
+                memory.service_stream_event_slots,
+                memory.generator_stream_event_slots,
+                memory.heap_arena_bytes,
+                memory.stream_arena_bytes,
+                memory.legacy_heap_arena_bytes,
+                memory.total_event_arena_bytes(),
+                memory.delta_from_legacy_heap_bytes(),
+            );
+        }
         standard_device_ns.push(standard.device_ns);
 
         drop(
@@ -258,7 +285,7 @@ fn main() {
             .saturating_add(profile.termination.total_ns());
         let instrumented_residual_ns = profiled.device_ns.saturating_sub(captured_active_ns);
         println!(
-            "record=t15b_profile_sample config={relative} sample={sample} rounds={} \
+            "record=t15b_profile_sample config={relative} stream_mode={stream_mode} sample={sample} rounds={} \
              transitions={} standard_device_ns={} profiled_device_ns={} frequency_hz={} \
          encoded_attempts={} captured_attempts={} useful_attempts={} idle_sample_attempts={} \
          captured_pass_gap_ns={} captured_pass_overlap_ns={} \
@@ -297,7 +324,7 @@ fn main() {
                 .1;
             let captured_active_ns = useful_ns.saturating_add(termination_ns);
             println!(
-                "record=t15b_phase_sample config={relative} sample={sample} phase={phase} \
+                "record=t15b_phase_sample config={relative} stream_mode={stream_mode} sample={sample} phase={phase} \
                  captured_active_ns={captured_active_ns} useful_ns={useful_ns} \
                  termination_ns={termination_ns} idle_mean_ns={idle_mean_ns} \
                  idle_extrapolated_ns={idle_extrapolated_ns} phase_index={index}"
@@ -328,7 +355,7 @@ fn main() {
         - i128::from(attribution_all_active_ns)
         - attribution_net_pass_gap_ns;
     println!(
-        "record=t15d_attribution_summary config={relative} sample={attribution_sample} \
+        "record=t15d_attribution_summary config={relative} stream_mode={stream_mode} sample={attribution_sample} \
          rounds={} transitions={} captured_all_attempts={} encoded_attempts={} \
          captured_attempts={} useful_attempts={} standard_device_ns={attribution_standard_ns} \
          profiled_device_ns={attribution_profiled_ns} profiling_perturbation_ns={} \
@@ -355,7 +382,7 @@ fn main() {
     let captured_active_ns = useful.total_ns().saturating_add(termination.total_ns());
     let instrumented_residual_ns = median_profiled_device_ns.saturating_sub(captured_active_ns);
     println!(
-        "record=t15b_profile_summary config={relative} samples={samples} \
+        "record=t15b_profile_summary config={relative} stream_mode={stream_mode} samples={samples} \
          aggregation=component_medians rounds={} transitions={} \
          standard_device_ns={} profiled_device_ns={} frequency_hz={} encoded_attempts={} \
          captured_attempts={} useful_attempts={} idle_sample_attempts={} \
@@ -390,7 +417,7 @@ fn main() {
         let termination_ns = phases(termination)[index].1;
         let captured_active_ns = useful_ns.saturating_add(termination_ns);
         println!(
-            "record=t15b_phase_summary config={relative} samples={samples} phase={phase} \
+            "record=t15b_phase_summary config={relative} stream_mode={stream_mode} samples={samples} phase={phase} \
              captured_active_ns={captured_active_ns} useful_ns={useful_ns} \
              termination_ns={termination_ns} idle_mean_ns={} \
              idle_extrapolated_ns={idle_extrapolated_ns}",

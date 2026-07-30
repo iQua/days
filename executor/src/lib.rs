@@ -33,8 +33,8 @@ pub use image::{
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
     MetalArena, MetalConfig, MetalDrainDecomposition, MetalError, MetalExecutor,
-    MetalFelControlRun, MetalFelProbeRun, MetalInitializationTimings, MetalMergeFanIn,
-    MetalMergeFanInRun, MetalPhaseProfile, MetalPhaseTimings, MetalRun, run_metal,
+    MetalFelControlRun, MetalFelProbeRun, MetalInitializationTimings, MetalMemoryLayout,
+    MetalMergeFanIn, MetalMergeFanInRun, MetalPhaseProfile, MetalPhaseTimings, MetalRun, run_metal,
     run_metal_with_observations,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

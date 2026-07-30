@@ -2529,16 +2529,26 @@ fn production_metal_matches_representative_cartesian_images() {
                 .unwrap_or_else(|error| {
                     panic!("seed {seed}, horizon {horizon:?} scalar execution failed: {error}")
                 });
-            let actual = run_metal_with_observations(
-                &image,
-                horizon,
-                MetalConfig::default(),
-                ObservationMode::Full,
-            )
-            .unwrap_or_else(|error| {
-                panic!("seed {seed}, horizon {horizon:?} Metal execution failed: {error}")
-            });
-            assert_eq!(actual.result, expected, "seed {seed}, horizon {horizon:?}");
+            for streams_enabled in [true, false] {
+                let actual = run_metal_with_observations(
+                    &image,
+                    horizon,
+                    MetalConfig {
+                        streams_enabled,
+                        ..MetalConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "seed {seed}, horizon {horizon:?}, streams={streams_enabled} Metal execution failed: {error}"
+                    )
+                });
+                assert_eq!(
+                    actual.result, expected,
+                    "seed {seed}, horizon {horizon:?}, streams={streams_enabled}"
+                );
+            }
         }
     }
 }
@@ -2948,12 +2958,20 @@ fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
     assert!(image.initial_events[0].target.0 >= 1_024);
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("wide scalar oracle must run");
-    let actual =
-        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
-            .expect("wide Metal image must run");
-
     assert_eq!(expected.summary.received_packets, 1);
-    assert_eq!(actual.result, expected);
+    for streams_enabled in [true, false] {
+        let actual = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("wide Metal image must run");
+        assert_eq!(actual.result, expected);
+    }
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -2973,12 +2991,20 @@ fn production_metal_horizon_scans_multiple_active_lps_beyond_1024_lanes() {
     );
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("wide scalar oracle must run");
-    let actual =
-        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
-            .expect("wide Metal image must run");
-
     assert_eq!(expected.summary.received_packets, 2);
-    assert_eq!(actual.result, expected);
+    for streams_enabled in [true, false] {
+        let actual = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("wide Metal image must run");
+        assert_eq!(actual.result, expected);
+    }
 }
 
 #[test]

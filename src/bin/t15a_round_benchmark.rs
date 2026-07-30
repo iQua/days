@@ -5,7 +5,7 @@ fn main() {
 
     use days::scenario::compile_config;
     use days_executor::{
-        CpuConfig, MetalConfig, MetalExecutor, RunSummary, SimulationImage, run_cpu,
+        CpuConfig, MetalConfig, MetalExecutor, RunResult, RunSummary, SimulationImage, run_cpu,
         run_scalar_rounds,
     };
 
@@ -23,6 +23,7 @@ fn main() {
         sample: usize,
         order: &'static str,
         backend: &'static str,
+        stream_mode: &'static str,
         workers: usize,
         elapsed_ns: u128,
         outcome: Outcome,
@@ -35,10 +36,14 @@ fn main() {
         mid_round_wave_boundary_syncs: u64,
     }
 
-    fn scalar(image: &SimulationImage) -> Measurement {
+    fn scalar(image: &SimulationImage, expected_result: &RunResult) -> Measurement {
         let started = Instant::now();
         let run = run_scalar_rounds(image, None).expect("scalar benchmark run must succeed");
         let elapsed_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &run.result, expected_result,
+            "scalar benchmark RunResult must match the oracle"
+        );
         let outcome = Outcome {
             rounds: run.rounds.len() as u64,
             transitions: run.rounds.iter().map(|round| round.events_processed).sum(),
@@ -51,6 +56,7 @@ fn main() {
             sample: 0,
             order: "warmup",
             backend: "scalar",
+            stream_mode: "na",
             workers: 1,
             elapsed_ns,
             outcome,
@@ -64,7 +70,7 @@ fn main() {
         }
     }
 
-    fn cpu(image: &SimulationImage, workers: usize) -> Measurement {
+    fn cpu(image: &SimulationImage, workers: usize, expected_result: &RunResult) -> Measurement {
         let started = Instant::now();
         let run = run_cpu(
             image,
@@ -76,6 +82,10 @@ fn main() {
         )
         .unwrap_or_else(|error| panic!("W{workers} benchmark run failed: {error}"));
         let elapsed_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &run.result, expected_result,
+            "W{workers} benchmark RunResult must match the oracle"
+        );
         let outcome = Outcome {
             rounds: run.rounds.len() as u64,
             transitions: run
@@ -92,6 +102,7 @@ fn main() {
             sample: 0,
             order: "warmup",
             backend: "cpu",
+            stream_mode: "na",
             workers,
             elapsed_ns,
             outcome,
@@ -109,6 +120,8 @@ fn main() {
         executor: &MetalExecutor,
         image: &SimulationImage,
         threadgroup_width: usize,
+        streams_enabled: bool,
+        expected_result: &RunResult,
     ) -> Measurement {
         let started = Instant::now();
         let run = executor
@@ -116,12 +129,17 @@ fn main() {
                 image,
                 None,
                 MetalConfig {
+                    streams_enabled,
                     round_threads_per_threadgroup: threadgroup_width,
                     ..MetalConfig::default()
                 },
             )
             .expect("Metal benchmark run must succeed");
         let elapsed_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &run.result, expected_result,
+            "Metal benchmark RunResult must match the oracle"
+        );
         let outcome = Outcome {
             rounds: run.rounds,
             transitions: run.transitions,
@@ -133,6 +151,7 @@ fn main() {
             sample: 0,
             order: "warmup",
             backend: "metal",
+            stream_mode: if streams_enabled { "streams" } else { "heap" },
             workers: 0,
             elapsed_ns,
             outcome,
@@ -150,13 +169,14 @@ fn main() {
 
     fn print_record(kind: &str, fixture: &str, threadgroup_width: usize, measurement: Measurement) {
         println!(
-            "record=t15a_{kind} config={fixture} sample={} order={} backend={} workers={} \
+            "record=t15a_{kind} config={fixture} sample={} order={} backend={} stream_mode={} workers={} \
              threadgroup_width={} rounds={} transitions={} end_to_end_ns={} backend_wall_ns={} \
              device_ns={} host_encode_submit_ns={} encoded_attempts={} continuation_relaunches={} \
              wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
             measurement.sample,
             measurement.order,
             measurement.backend,
+            measurement.stream_mode,
             measurement.workers,
             threadgroup_width,
             measurement.outcome.rounds,
@@ -193,6 +213,7 @@ fn main() {
     });
     let mut samples = 4_usize;
     let mut threadgroup_width = 256_usize;
+    let mut streams_enabled = true;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--samples" => {
@@ -209,21 +230,34 @@ fn main() {
                     .parse()
                     .expect("--threadgroup-width must be an integer");
             }
+            "--streams-disabled" => streams_enabled = false,
             unknown => panic!("unknown argument {unknown}"),
         }
     }
-    assert!(samples > 0, "--samples must be nonzero");
+    assert_eq!(
+        samples, 4,
+        "the T15a protocol requires exactly four samples, two per order"
+    );
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative);
     let image = compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+    let oracle = run_scalar_rounds(&image, None)
+        .expect("scalar benchmark oracle must succeed")
+        .result;
     let executor = MetalExecutor::new().expect("Metal benchmark executor must initialize");
 
     let warmups = [
-        scalar(&image),
-        cpu(&image, 4),
-        cpu(&image, 18),
-        metal(&executor, &image, threadgroup_width),
+        scalar(&image, &oracle),
+        cpu(&image, 4, &oracle),
+        cpu(&image, 18, &oracle),
+        metal(
+            &executor,
+            &image,
+            threadgroup_width,
+            streams_enabled,
+            &oracle,
+        ),
     ];
     let expected = warmups[0].outcome;
     for warmup in warmups {
@@ -240,17 +274,33 @@ fn main() {
         };
         let ordered = if order == "cpu_first" {
             [
-                after_same_kind_predecessor(|| scalar(&image)),
-                after_same_kind_predecessor(|| cpu(&image, 4)),
-                after_same_kind_predecessor(|| cpu(&image, 18)),
-                after_same_kind_predecessor(|| metal(&executor, &image, threadgroup_width)),
+                after_same_kind_predecessor(|| scalar(&image, &oracle)),
+                after_same_kind_predecessor(|| cpu(&image, 4, &oracle)),
+                after_same_kind_predecessor(|| cpu(&image, 18, &oracle)),
+                after_same_kind_predecessor(|| {
+                    metal(
+                        &executor,
+                        &image,
+                        threadgroup_width,
+                        streams_enabled,
+                        &oracle,
+                    )
+                }),
             ]
         } else {
             [
-                after_same_kind_predecessor(|| metal(&executor, &image, threadgroup_width)),
-                after_same_kind_predecessor(|| scalar(&image)),
-                after_same_kind_predecessor(|| cpu(&image, 4)),
-                after_same_kind_predecessor(|| cpu(&image, 18)),
+                after_same_kind_predecessor(|| {
+                    metal(
+                        &executor,
+                        &image,
+                        threadgroup_width,
+                        streams_enabled,
+                        &oracle,
+                    )
+                }),
+                after_same_kind_predecessor(|| scalar(&image, &oracle)),
+                after_same_kind_predecessor(|| cpu(&image, 4, &oracle)),
+                after_same_kind_predecessor(|| cpu(&image, 18, &oracle)),
             ]
         };
         for mut measurement in ordered {
@@ -283,10 +333,15 @@ fn main() {
         let host_ns =
             median(selected.map(|measurement| u128::from(measurement.host_encode_submit_ns)));
         println!(
-            "record=t15a_summary config={relative} backend={backend} workers={workers} samples={} \
+            "record=t15a_summary config={relative} backend={backend} stream_mode={} workers={workers} samples={} \
              threadgroup_width={threadgroup_width} rounds={} transitions={} \
              median_end_to_end_ns={elapsed_ns} median_backend_wall_ns={backend_wall_ns} \
              median_device_ns={device_ns} median_host_encode_submit_ns={host_ns}",
+            if backend == "metal" {
+                if streams_enabled { "streams" } else { "heap" }
+            } else {
+                "na"
+            },
             measurements
                 .iter()
                 .filter(|measurement| {
@@ -304,9 +359,14 @@ fn main() {
             });
             println!(
                 "record=t15a_order_summary config={relative} order={order} backend={backend} \
-                 workers={workers} samples={} threadgroup_width={threadgroup_width} rounds={} \
+                 stream_mode={} workers={workers} samples={} threadgroup_width={threadgroup_width} rounds={} \
                  transitions={} median_end_to_end_ns={} median_backend_wall_ns={} \
                  median_device_ns={} median_host_encode_submit_ns={}",
+                if backend == "metal" {
+                    if streams_enabled { "streams" } else { "heap" }
+                } else {
+                    "na"
+                },
                 measurements
                     .iter()
                     .filter(|measurement| {

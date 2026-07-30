@@ -1006,15 +1006,25 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
     validate(image, Backend::Metal).expect("production Metal fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
         .expect("scalar oracle must run");
-    let metal = run_metal_with_observations(
-        image,
-        exclusive_horizon_ns,
-        MetalConfig::default(),
-        ObservationMode::Full,
-    )
-    .expect("production Metal backend must run");
+    for streams_enabled in [true, false] {
+        let metal = run_metal_with_observations(
+            image,
+            exclusive_horizon_ns,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| {
+            panic!("production Metal backend with streams={streams_enabled} failed: {error}")
+        });
 
-    assert_eq!(metal.result, scalar);
+        assert_eq!(
+            metal.result, scalar,
+            "Metal result with streams={streams_enabled} differs from scalar"
+        );
+    }
 }
 
 #[test]
@@ -1108,85 +1118,103 @@ fn metal_fifo_taildrop_and_single_selection_match_full_scalar_result() {
 #[test]
 fn metal_run_to_run_is_exactly_deterministic() {
     let image = fifo_taildrop_image();
-    let first = run_metal_with_observations(
-        &image,
-        Some(27),
-        MetalConfig::default(),
-        ObservationMode::Full,
-    )
-    .expect("first production Metal run must succeed");
-    let second = run_metal_with_observations(
-        &image,
-        Some(27),
-        MetalConfig::default(),
-        ObservationMode::Full,
-    )
-    .expect("second production Metal run must succeed");
+    for streams_enabled in [true, false] {
+        let config = MetalConfig {
+            streams_enabled,
+            ..MetalConfig::default()
+        };
+        let first = run_metal_with_observations(&image, Some(27), config, ObservationMode::Full)
+            .expect("first production Metal run must succeed");
+        let second = run_metal_with_observations(&image, Some(27), config, ObservationMode::Full)
+            .expect("second production Metal run must succeed");
 
-    assert_eq!(first.result, second.result);
+        assert_eq!(first.result, second.result);
+    }
 }
 
 #[test]
 fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
     let image = fifo_taildrop_image();
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
-    let ordinary = executor
-        .run_with_observations(
-            &image,
-            Some(27),
-            MetalConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("ordinary production Metal run must succeed");
-    let profiled = executor
-        .run_with_observations_profiled(
-            &image,
-            Some(27),
-            MetalConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("profiled production Metal run must succeed");
+    for streams_enabled in [true, false] {
+        let config = MetalConfig {
+            streams_enabled,
+            ..MetalConfig::default()
+        };
+        let ordinary = executor
+            .run_with_observations(&image, Some(27), config, ObservationMode::Full)
+            .expect("ordinary production Metal run must succeed");
+        let profiled = executor
+            .run_with_observations_profiled(&image, Some(27), config, ObservationMode::Full)
+            .expect("profiled production Metal run must succeed");
 
-    assert_eq!(profiled.result, ordinary.result);
-    assert_eq!(profiled.rounds, ordinary.rounds);
-    assert_eq!(profiled.transitions, ordinary.transitions);
-    assert_eq!(profiled.encoded_attempts, ordinary.encoded_attempts);
-    let required_attempts = ordinary
-        .rounds
-        .saturating_add(ordinary.continuation_relaunches)
-        .saturating_add(1);
-    assert!(ordinary.encoded_attempts >= required_attempts);
-    assert!(ordinary.encoded_attempts - required_attempts <= 63);
-    assert!(ordinary.phase_profile.is_none());
-    let profile = profiled
-        .phase_profile
-        .expect("profiled run must return phase timestamps");
-    assert!(profile.estimate_complete);
-    assert_eq!(
-        profile.useful_attempts,
-        profiled.rounds + profiled.continuation_relaunches
-    );
-    assert!(profile.captured_attempts > profile.useful_attempts);
-    let estimated_ns = profile.estimated_total.total_ns();
-    assert!(estimated_ns > 0);
-    assert!(estimated_ns <= profiled.device_ns.saturating_mul(2));
+        assert_eq!(profiled.result, ordinary.result);
+        assert_eq!(profiled.rounds, ordinary.rounds);
+        assert_eq!(profiled.transitions, ordinary.transitions);
+        assert_eq!(profiled.encoded_attempts, ordinary.encoded_attempts);
+        let required_attempts = ordinary
+            .rounds
+            .saturating_add(ordinary.continuation_relaunches)
+            .saturating_add(1);
+        assert!(ordinary.encoded_attempts >= required_attempts);
+        assert!(ordinary.encoded_attempts - required_attempts <= 63);
+        assert!(ordinary.phase_profile.is_none());
+        let profile = profiled
+            .phase_profile
+            .expect("profiled run must return phase timestamps");
+        assert!(profile.estimate_complete);
+        assert_eq!(
+            profile.useful_attempts,
+            profiled.rounds + profiled.continuation_relaunches
+        );
+        assert!(profile.captured_attempts > profile.useful_attempts);
+        let estimated_ns = profile.estimated_total.total_ns();
+        assert!(estimated_ns > 0);
+        assert!(estimated_ns <= profiled.device_ns.saturating_mul(2));
+    }
 }
 
 #[test]
 fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
     let image = fifo_taildrop_image();
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let expected_diagnostic_error =
+        MetalError::Validation("legacy heap FEL diagnostics require streams_enabled=false".into());
+    assert_eq!(
+        executor
+            .run_fel_control_profiled(&image, Some(27), MetalConfig::default())
+            .expect_err("the heap-only FEL control must reject stream mode"),
+        expected_diagnostic_error
+    );
+    assert_eq!(
+        executor
+            .run_fel_probe_profiled(&image, Some(27), MetalConfig::default())
+            .expect_err("the heap-only FEL probe must reject stream mode"),
+        expected_diagnostic_error
+    );
+    assert_eq!(
+        executor
+            .run_merge_fan_in_profiled(&image, Some(27), MetalConfig::default())
+            .expect_err("the heap-only merge probe must reject stream mode"),
+        MetalError::Validation(
+            "legacy heap exchange diagnostics require streams_enabled=false".into()
+        )
+    );
+    let heap_config = MetalConfig {
+        streams_enabled: false,
+        ..MetalConfig::default()
+    };
     let baseline = executor
-        .run_profiled(&image, Some(27), MetalConfig::default())
+        .run_profiled(&image, Some(27), heap_config)
         .expect("profiled baseline must run");
     let control = executor
-        .run_fel_control_profiled(&image, Some(27), MetalConfig::default())
+        .run_fel_control_profiled(&image, Some(27), heap_config)
         .expect("profiled FEL matched control must run");
     let probe = executor
-        .run_fel_probe_profiled(&image, Some(27), MetalConfig::default())
+        .run_fel_probe_profiled(&image, Some(27), heap_config)
         .expect("profiled FEL probe must run");
     let fan_in = executor
-        .run_merge_fan_in_profiled(&image, Some(27), MetalConfig::default())
+        .run_merge_fan_in_profiled(&image, Some(27), heap_config)
         .expect("profiled merge fan-in characterization must run");
 
     assert_eq!(probe.run.result, baseline.result);
@@ -1213,6 +1241,8 @@ fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
     assert_eq!(fan_in.fan_in.active_producer_target_rounds, 9);
     assert_eq!(fan_in.fan_in.remote_events, 9);
     assert_eq!(fan_in.fan_in.maximum_active_fan_in, 1);
+    assert_eq!(fan_in.fan_in.first_maximum_fan_in_target, Some(FIFO_SWITCH));
+    assert_eq!(fan_in.fan_in.maximum_fan_in_target_count, 2);
     assert!(control.diagnostic_pipeline_creation_ns > 0);
     assert_eq!(probe.diagnostic_pipeline_creation_ns, 0);
     assert_eq!(fan_in.diagnostic_pipeline_creation_ns, 0);
@@ -1242,6 +1272,56 @@ fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
 }
 
 #[test]
+fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
+    let mut image = uneven_multi_lp_backlog_image();
+    for state in image.host_states.iter_mut().step_by(2) {
+        state.queue.truncate(1);
+        state.sourced_packets = 1;
+        state.next_payload_seq = 1;
+    }
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar multi-producer recovery oracle must run");
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+
+    for streams_enabled in [false, true] {
+        let error = executor
+            .run(
+                &image,
+                None,
+                MetalConfig {
+                    streams_enabled,
+                    max_outbox_events: Some(2),
+                    ..MetalConfig::default()
+                },
+            )
+            .expect_err("three producers must exceed the two-record global outbox");
+        assert_eq!(
+            error,
+            MetalError::CapacityExceeded {
+                arena: MetalArena::Outbox,
+                node: None,
+                capacity: 2,
+            }
+        );
+        assert_eq!(
+            executor
+                .run_with_observations(
+                    &image,
+                    None,
+                    MetalConfig {
+                        streams_enabled,
+                        ..MetalConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .expect("the same executor must recover after the global outbox fault")
+                .result,
+            expected
+        );
+    }
+}
+
+#[test]
 fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     let image = generator_image(GeneratorTermination::Bytes(4));
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
@@ -1254,6 +1334,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             None,
             MetalConfig {
                 max_fel_events_per_lp: Some(1),
+                streams_enabled: false,
                 ..MetalConfig::default()
             },
         )
@@ -1270,6 +1351,32 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         executor
             .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
             .expect("the same executor must recover after the FEL fault")
+            .result,
+        expected
+    );
+
+    let channel_stream = executor
+        .run(
+            &image,
+            None,
+            MetalConfig {
+                max_channel_events_per_stream: Some(0),
+                ..MetalConfig::default()
+            },
+        )
+        .expect_err("the first remote child must exhaust its channel inbox stream");
+    assert_eq!(
+        channel_stream,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::ChannelInbox,
+            node: Some(GENERATOR_SINK),
+            capacity: 0,
+        }
+    );
+    assert_eq!(
+        executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+            .expect("the same executor must recover after the channel-stream fault")
             .result,
         expected
     );
@@ -1593,6 +1700,12 @@ fn metal_full_path_matches_scalar_from_a_rich_mid_state() {
         })
     }));
 
+    let checkpoint = run_metal(&image, None, MetalConfig::default())
+        .expect("streams-enabled checkpoint classification must run");
+    assert_eq!(
+        checkpoint.memory_layout.checkpoint_fallback_events,
+        image.initial_events.len()
+    );
     assert_full_parity(&image, None);
 }
 

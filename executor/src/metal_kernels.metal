@@ -10,6 +10,11 @@ constant uint META_WORDS = 4;
 constant uint LP_STATE_WORDS = 6;
 constant uint OBSERVATION_META_WORDS = 12;
 constant uint INBOUND_META_WORDS = 2;
+constant uint LP_STREAM_META_WORDS = 4;
+constant uint OUTBOUND_META_WORDS = 2;
+constant uint OUTBOUND_ENTRY_WORDS = 2;
+constant uint CHANNEL_BATCH_WORDS = 4;
+constant uint ACTIVE_STREAM_ENTRY_WORDS = 5;
 constant ulong NONE = 0xfffffffffffffffful;
 
 constant uint C_ERROR = 0;
@@ -46,6 +51,20 @@ constant uint P_TRANSITION_CAPACITY = 10;
 constant uint P_STOP_TIME = 11;
 constant uint P_HAS_LOOKAHEAD = 12;
 constant uint P_ROUND_CAPACITY = 13;
+constant uint P_STREAMS_ENABLED = 14;
+constant uint P_STREAM_COUNT = 15;
+constant uint P_CHANNEL_COUNT = 16;
+constant uint P_SERVICE_STREAM_BASE = 17;
+constant uint P_GENERATOR_STREAM_BASE = 18;
+constant uint P_LP_STREAM_META_OFFSET = 19;
+constant uint P_LP_STREAM_IDS_OFFSET = 20;
+constant uint P_LP_ACTIVE_IDS_OFFSET = 21;
+constant uint P_OUTBOUND_META_OFFSET = 22;
+constant uint P_OUTBOUND_ENTRIES_OFFSET = 23;
+constant uint P_CHANNEL_BATCH_OFFSET = 24;
+constant uint P_STAGING_CHANNEL_OFFSET = 25;
+constant uint P_CHANNEL_TARGET_OFFSET = 26;
+constant uint P_STREAM_ORDER_CHECKS = 27;
 
 constant uint N_KIND = 0;
 constant uint N_EGRESS = 1;
@@ -89,6 +108,9 @@ constant ulong ARENA_WORKLIST = 4;
 constant ulong ARENA_OBSERVED = 5;
 constant ulong ARENA_DEPARTURES = 6;
 constant ulong ARENA_ARRIVALS = 7;
+constant ulong ARENA_CHANNEL_INBOX = 8;
+constant ulong ARENA_SERVICE_STREAM = 9;
+constant ulong ARENA_GENERATOR_STREAM = 10;
 
 constant uint L_FINISHED = 0;
 constant uint L_TRANSITIONS = 1;
@@ -127,6 +149,44 @@ inline bool stored_key_less(
         return records[left + E_ORIGIN] < records[right + E_ORIGIN];
     }
     return records[left + E_SEQUENCE] < records[right + E_SEQUENCE];
+}
+
+inline bool stored_cross_key_less(
+    const device ulong *left_records,
+    ulong left_slot,
+    const device ulong *right_records,
+    ulong right_slot
+) {
+    ulong left = left_slot * EVENT_WORDS;
+    ulong right = right_slot * EVENT_WORDS;
+    if (left_records[left + E_TIME] != right_records[right + E_TIME]) {
+        return left_records[left + E_TIME] < right_records[right + E_TIME];
+    }
+    if (left_records[left + E_PHASE] != right_records[right + E_PHASE]) {
+        return left_records[left + E_PHASE] < right_records[right + E_PHASE];
+    }
+    if (left_records[left + E_ORIGIN] != right_records[right + E_ORIGIN]) {
+        return left_records[left + E_ORIGIN] < right_records[right + E_ORIGIN];
+    }
+    return left_records[left + E_SEQUENCE] < right_records[right + E_SEQUENCE];
+}
+
+inline bool stored_thread_key_less(
+    const device ulong *left_records,
+    ulong left_slot,
+    const thread ulong *right
+) {
+    ulong left = left_slot * EVENT_WORDS;
+    if (left_records[left + E_TIME] != right[E_TIME]) {
+        return left_records[left + E_TIME] < right[E_TIME];
+    }
+    if (left_records[left + E_PHASE] != right[E_PHASE]) {
+        return left_records[left + E_PHASE] < right[E_PHASE];
+    }
+    if (left_records[left + E_ORIGIN] != right[E_ORIGIN]) {
+        return left_records[left + E_ORIGIN] < right[E_ORIGIN];
+    }
+    return left_records[left + E_SEQUENCE] < right[E_SEQUENCE];
 }
 
 inline void copy_thread_to_device(
@@ -275,6 +335,436 @@ inline bool heap_root_time(
     }
     time = records[meta[base] * EVENT_WORDS + E_TIME];
     return true;
+}
+
+inline ulong stream_arena(ulong stream, const device ulong *params) {
+    if (stream < params[P_CHANNEL_COUNT]) {
+        return ARENA_CHANNEL_INBOX;
+    }
+    if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        return ARENA_SERVICE_STREAM;
+    }
+    return ARENA_GENERATOR_STREAM;
+}
+
+inline bool active_add(
+    ulong node,
+    ulong stream,
+    const thread ulong *record,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *stream_state
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    ulong capacity = stream_state[meta + 1] + 1;
+    if (count >= capacity) {
+        set_semantic_error(error, 38, node);
+        return false;
+    }
+    ulong entry = offset + count * ACTIVE_STREAM_ENTRY_WORDS;
+    stream_state[entry] = stream;
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = record[word];
+    }
+    stream_state[meta + 3] = count + 1;
+    return true;
+}
+
+inline void active_update_key(
+    ulong node,
+    ulong active_index,
+    const device ulong *params,
+    device ulong *stream_state,
+    const device ulong *records,
+    ulong slot
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong entry =
+        stream_state[meta + 2] +
+        active_index * ACTIVE_STREAM_ENTRY_WORDS;
+    ulong record = slot * EVENT_WORDS;
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = records[record + word];
+    }
+}
+
+inline bool active_refresh_source(
+    ulong node,
+    ulong stream,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *stream_state,
+    const device ulong *records,
+    ulong slot
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    for (ulong index = 0; index < count; ++index) {
+        ulong entry = offset + index * ACTIVE_STREAM_ENTRY_WORDS;
+        if (stream_state[entry] == stream) {
+            active_update_key(
+                node,
+                index,
+                params,
+                stream_state,
+                records,
+                slot
+            );
+            return true;
+        }
+    }
+    set_semantic_error(error, 43, node);
+    return false;
+}
+
+inline void active_remove(
+    ulong node,
+    ulong active_index,
+    const device ulong *params,
+    device ulong *stream_state
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    if (active_index + 1 < count) {
+        ulong target = offset + active_index * ACTIVE_STREAM_ENTRY_WORDS;
+        ulong source = offset + (count - 1) * ACTIVE_STREAM_ENTRY_WORDS;
+        for (uint word = 0; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+            stream_state[target + word] = stream_state[source + word];
+        }
+    }
+    stream_state[meta + 3] = count - 1;
+}
+
+inline bool stream_push(
+    ulong node,
+    ulong stream,
+    const thread ulong *record,
+    bool activate,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *stream_state,
+    device ulong *stream_records
+) {
+    ulong base = stream * META_WORDS;
+    ulong offset = stream_state[base];
+    ulong capacity = stream_state[base + 1];
+    ulong head = stream_state[base + 2];
+    ulong count = stream_state[base + 3];
+    if (count >= capacity) {
+        set_capacity_error(
+            error,
+            stream_arena(stream, params),
+            node,
+            capacity
+        );
+        return false;
+    }
+    if (params[P_STREAM_ORDER_CHECKS] != 0 && count != 0) {
+        ulong tail = (head + count - 1) % max(capacity, 1ul);
+        if (!stored_thread_key_less(stream_records, offset + tail, record)) {
+            set_semantic_error(error, 39, node);
+            return false;
+        }
+    }
+    ulong physical = (head + count) % max(capacity, 1ul);
+    copy_thread_to_device(record, stream_records, offset + physical);
+    stream_state[base + 3] = count + 1;
+    return count != 0 || !activate ||
+        active_add(node, stream, record, params, error, stream_state);
+}
+
+inline bool fallback_push(
+    ulong node,
+    const thread ulong *record,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state
+) {
+    bool was_empty = fel_meta[node * META_WORDS + 3] == 0;
+    if (!heap_push(node, record, error, fel_meta, fel_records)) {
+        return false;
+    }
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return true;
+    }
+    if (was_empty) {
+        return active_add(
+            node,
+            NONE,
+            record,
+            params,
+            error,
+            stream_state
+        );
+    }
+    return active_refresh_source(
+        node,
+        NONE,
+        params,
+        error,
+        stream_state,
+        fel_records,
+        fel_meta[node * META_WORDS]
+    );
+}
+
+inline bool classified_push(
+    ulong node,
+    const thread ulong *record,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *stream_records
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return heap_push(node, record, error, fel_meta, fel_records);
+    }
+    ulong kind = record[E_KIND];
+    if (kind == PACKET_ARRIVAL && record[PK_FLOW] < params[P_FLOW_COUNT]) {
+        return stream_push(
+            node,
+            params[P_GENERATOR_STREAM_BASE] + record[PK_FLOW],
+            record,
+            true,
+            params,
+            error,
+            stream_state,
+            stream_records
+        );
+    }
+    if (kind == TX_READY || kind == TX_COMPLETE) {
+        return stream_push(
+            node,
+            params[P_SERVICE_STREAM_BASE] + node,
+            record,
+            true,
+            params,
+            error,
+            stream_state,
+            stream_records
+        );
+    }
+    return fallback_push(
+        node,
+        record,
+        params,
+        error,
+        fel_meta,
+        fel_records,
+        stream_state
+    );
+}
+
+inline bool active_key_less(
+    const device ulong *stream_state,
+    ulong left,
+    ulong right
+) {
+    for (uint word = 1; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+        if (stream_state[left + word] != stream_state[right + word]) {
+            return stream_state[left + word] < stream_state[right + word];
+        }
+    }
+    return false;
+}
+
+inline bool fel_peek(
+    ulong node,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    const device ulong *stream_state,
+    const device ulong *stream_records,
+    thread ulong *record,
+    thread ulong &selected_active,
+    thread ulong &selected_stream
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        ulong base = node * META_WORDS;
+        if (fel_meta[base + 3] == 0) {
+            return false;
+        }
+        copy_device_to_thread(fel_records, fel_meta[base], record);
+        selected_active = NONE;
+        selected_stream = NONE;
+        return true;
+    }
+    ulong lp_meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong active_offset = stream_state[lp_meta + 2];
+    ulong active_count = stream_state[lp_meta + 3];
+    if (active_count == 0) {
+        return false;
+    }
+    ulong selected_entry = active_offset;
+    selected_active = 0;
+    for (ulong index = 1; index < active_count; ++index) {
+        ulong candidate =
+            active_offset + index * ACTIVE_STREAM_ENTRY_WORDS;
+        if (active_key_less(stream_state, candidate, selected_entry)) {
+            selected_entry = candidate;
+            selected_active = index;
+        }
+    }
+    selected_stream = stream_state[selected_entry];
+    if (selected_stream == NONE) {
+        ulong heap_base = node * META_WORDS;
+        if (fel_meta[heap_base + 3] == 0) {
+            return false;
+        }
+        copy_device_to_thread(fel_records, fel_meta[heap_base], record);
+    } else {
+        ulong base = selected_stream * META_WORDS;
+        if (stream_state[base + 3] == 0) {
+            return false;
+        }
+        ulong capacity = stream_state[base + 1];
+        ulong physical = stream_state[base + 2] % max(capacity, 1ul);
+        copy_device_to_thread(
+            stream_records,
+            stream_state[base] + physical,
+            record
+        );
+    }
+    return true;
+}
+
+inline bool fel_root_time(
+    ulong node,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    const device ulong *stream_state,
+    const device ulong *stream_records,
+    thread ulong &time
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return heap_root_time(node, fel_meta, fel_records, time);
+    }
+    ulong record[EVENT_WORDS];
+    ulong selected_active;
+    ulong selected_stream;
+    if (!fel_peek(
+        node,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        record,
+        selected_active,
+        selected_stream
+    )) {
+        return false;
+    }
+    time = record[E_TIME];
+    return true;
+}
+
+inline bool fel_pop_selected(
+    ulong node,
+    ulong selected_active,
+    ulong selected_stream,
+    const device ulong *params,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    thread ulong *record
+) {
+    if (params[P_STREAMS_ENABLED] == 0 || selected_active == NONE) {
+        return heap_pop(node, fel_meta, fel_records, record);
+    }
+    if (selected_stream == NONE) {
+        if (!heap_pop(node, fel_meta, fel_records, record)) {
+            return false;
+        }
+        if (fel_meta[node * META_WORDS + 3] == 0) {
+            active_remove(node, selected_active, params, stream_state);
+        } else {
+            active_update_key(
+                node,
+                selected_active,
+                params,
+                stream_state,
+                fel_records,
+                fel_meta[node * META_WORDS]
+            );
+        }
+        return true;
+    }
+    ulong base = selected_stream * META_WORDS;
+    ulong capacity = stream_state[base + 1];
+    ulong head = stream_state[base + 2];
+    ulong count = stream_state[base + 3] - 1;
+    stream_state[base + 2] = (head + 1) % max(capacity, 1ul);
+    stream_state[base + 3] = count;
+    if (count == 0) {
+        active_remove(node, selected_active, params, stream_state);
+    } else {
+        ulong physical = stream_state[base + 2] % max(capacity, 1ul);
+        active_update_key(
+            node,
+            selected_active,
+            params,
+            stream_state,
+            stream_records,
+            stream_state[base] + physical
+        );
+    }
+    return true;
+}
+
+inline bool fel_pop(
+    ulong node,
+    const device ulong *params,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    thread ulong *record
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return heap_pop(node, fel_meta, fel_records, record);
+    }
+    ulong selected_active;
+    ulong selected_stream;
+    if (!fel_peek(
+        node,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        record,
+        selected_active,
+        selected_stream
+    )) {
+        return false;
+    }
+    return fel_pop_selected(
+        node,
+        selected_active,
+        selected_stream,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        record
+    );
 }
 
 inline bool before_horizon(ulong time, const device ulong *control) {
@@ -572,7 +1062,8 @@ inline bool append_remote(
     device ulong *error,
     const device ulong *params,
     device ulong *remote_meta,
-    device ulong *remote_staging
+    device ulong *remote_staging,
+    device ulong *stream_state
 ) {
     ulong base = node * META_WORDS;
     ulong offset = remote_meta[base];
@@ -584,6 +1075,66 @@ inline bool append_remote(
     }
     copy_thread_to_device(record, remote_staging, offset + index);
     remote_meta[base + 3] = index + 1;
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong outbound_meta =
+            params[P_OUTBOUND_META_OFFSET] + node * OUTBOUND_META_WORDS;
+        ulong entry = stream_state[outbound_meta];
+        ulong entry_count = stream_state[outbound_meta + 1];
+        ulong channel = NONE;
+        if (entry_count == 1) {
+            if (
+                params[P_STREAM_ORDER_CHECKS] == 0 ||
+                stream_state[entry] == record[E_TARGET]
+            ) {
+                channel = stream_state[entry + 1];
+            }
+        } else {
+            ulong low = 0;
+            ulong high = entry_count;
+            while (low < high) {
+                ulong middle = low + (high - low) / 2;
+                ulong current = entry + middle * OUTBOUND_ENTRY_WORDS;
+                ulong target = stream_state[current];
+                if (target < record[E_TARGET]) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            if (low < entry_count) {
+                ulong current = entry + low * OUTBOUND_ENTRY_WORDS;
+                if (stream_state[current] == record[E_TARGET]) {
+                    channel = stream_state[current + 1];
+                }
+            }
+        }
+        if (channel == NONE) {
+            set_semantic_error(error, 40, node);
+            return false;
+        }
+        ulong batch =
+            params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
+        ulong batch_count = stream_state[batch];
+        if (params[P_STREAM_ORDER_CHECKS] != 0 && batch_count != 0) {
+            ulong previous_slot = stream_state[batch + 2];
+            if (!stored_cross_key_less(
+                remote_staging,
+                previous_slot,
+                remote_staging,
+                offset + index
+            )) {
+                set_semantic_error(error, 41, node);
+                return false;
+            }
+        } else {
+            stream_state[batch + 1] = offset + index;
+        }
+        stream_state[batch] = batch_count + 1;
+        stream_state[batch + 2] = offset + index;
+        stream_state[params[P_STAGING_CHANNEL_OFFSET] + offset + index] =
+            channel;
+        return true;
+    }
     ulong insertion = index;
     while (
         insertion != 0 &&
@@ -616,7 +1167,9 @@ inline bool emit_child(
     device ulong *fel_meta,
     device ulong *fel_records,
     device ulong *remote_meta,
-    device ulong *remote_staging
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
@@ -642,7 +1195,16 @@ inline bool emit_child(
         return false;
     }
     if (target == node) {
-        return heap_push(node, child, error, fel_meta, fel_records);
+        return classified_push(
+            node,
+            child,
+            params,
+            error,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records
+        );
     }
     return append_remote(
         node,
@@ -650,7 +1212,8 @@ inline bool emit_child(
         error,
         params,
         remote_meta,
-        remote_staging
+        remote_staging,
+        stream_state
     );
 }
 
@@ -789,6 +1352,8 @@ inline bool dispatch_event(
     device ulong *in_service,
     device ulong *remote_meta,
     device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
     device ulong *summary,
     device ulong *observation_meta,
     device ulong *observed,
@@ -896,7 +1461,9 @@ inline bool dispatch_event(
                     fel_meta,
                     fel_records,
                     remote_meta,
-                    remote_staging
+                    remote_staging,
+                    stream_state,
+                    stream_records
                 )) {
                     return false;
                 }
@@ -955,7 +1522,9 @@ inline bool dispatch_event(
                 fel_meta,
                 fel_records,
                 remote_meta,
-                remote_staging
+                remote_staging,
+                stream_state,
+                stream_records
             )) {
                 return false;
             }
@@ -1017,7 +1586,9 @@ inline bool dispatch_event(
             fel_meta,
             fel_records,
             remote_meta,
-            remote_staging
+            remote_staging,
+            stream_state,
+            stream_records
         )) {
             return false;
         }
@@ -1034,7 +1605,9 @@ inline bool dispatch_event(
             fel_meta,
             fel_records,
             remote_meta,
-            remote_staging
+            remote_staging,
+            stream_state,
+            stream_records
         );
     }
 
@@ -1088,7 +1661,9 @@ inline bool dispatch_event(
                 fel_meta,
                 fel_records,
                 remote_meta,
-                remote_staging
+                remote_staging,
+                stream_state,
+                stream_records
             );
         }
         return true;
@@ -1164,7 +1739,9 @@ inline bool dispatch_event(
                 fel_meta,
                 fel_records,
                 remote_meta,
-                remote_staging
+                remote_staging,
+                stream_state,
+                stream_records
             );
         }
         return true;
@@ -1221,6 +1798,8 @@ kernel void days_horizon(
     const device ulong *params [[buffer(1)]],
     const device ulong *fel_meta [[buffer(7)]],
     const device ulong *fel_records [[buffer(8)]],
+    const device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong minima[1024];
@@ -1238,7 +1817,15 @@ kernel void days_horizon(
     for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
         ulong candidate;
         if (
-            heap_root_time(node, fel_meta, fel_records, candidate) &&
+            fel_root_time(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                candidate
+            ) &&
             (!valid || candidate < minimum)
         ) {
             minimum = candidate;
@@ -1300,6 +1887,8 @@ kernel void days_round_prepare(
     device ulong *worklist [[buffer(13)]],
     device ulong *lp_state [[buffer(18)]],
     device ulong *remote_meta [[buffer(19)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong counts[1024];
@@ -1318,6 +1907,21 @@ kernel void days_round_prepare(
     ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
     ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
     ulong local_count = 0;
+    if (params[P_STREAMS_ENABLED] != 0) {
+        for (
+            ulong channel = lane;
+            channel < params[P_CHANNEL_COUNT];
+            channel += 1024
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[batch] = 0;
+            stream_state[batch + 1] = NONE;
+            stream_state[batch + 2] = NONE;
+            stream_state[batch + 3] = 0;
+        }
+    }
     for (ulong node = start; node < end; ++node) {
         ulong state = node * LP_STATE_WORDS;
         lp_state[state + L_ERROR] = 0;
@@ -1327,7 +1931,15 @@ kernel void days_round_prepare(
         remote_meta[node * META_WORDS + 3] = 0;
         ulong time;
         if (
-            heap_root_time(node, fel_meta, fel_records, time) &&
+            fel_root_time(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                time
+            ) &&
             before_horizon(time, control)
         ) {
             local_count += 1;
@@ -1347,7 +1959,15 @@ kernel void days_round_prepare(
     for (ulong node = start; node < end; ++node) {
         ulong time;
         if (
-            heap_root_time(node, fel_meta, fel_records, time) &&
+            fel_root_time(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                time
+            ) &&
             before_horizon(time, control)
         ) {
             if (write >= params[P_WORKLIST_CAPACITY]) {
@@ -1393,6 +2013,8 @@ kernel void days_round(
     device ulong *remote_meta [[buffer(19)]],
     device ulong *remote_staging [[buffer(20)]],
     device ulong *observation_meta [[buffer(21)]],
+    device ulong *stream_state [[buffer(25)]],
+    device ulong *stream_records [[buffer(26)]],
     uint active_index [[thread_position_in_grid]]
 ) {
     if (
@@ -1411,16 +2033,34 @@ kernel void days_round(
 
     ulong dispatch_transitions = 0;
     while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
-        ulong time;
-        if (
-            !heap_root_time(node, fel_meta, fel_records, time) ||
-            !before_horizon(time, control)
-        ) {
+        ulong event[EVENT_WORDS];
+        ulong selected_active;
+        ulong selected_stream;
+        if (!fel_peek(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            event,
+            selected_active,
+            selected_stream
+        ) || !before_horizon(event[E_TIME], control)) {
             state[L_FINISHED] = 1;
             return;
         }
-        ulong event[EVENT_WORDS];
-        if (!heap_pop(node, fel_meta, fel_records, event)) {
+        if (!fel_pop_selected(
+            node,
+            selected_active,
+            selected_stream,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            event
+        )) {
             set_semantic_error(state, 26, node);
             return;
         }
@@ -1441,6 +2081,8 @@ kernel void days_round(
             in_service,
             remote_meta,
             remote_staging,
+            stream_state,
+            stream_records,
             summary,
             observation_meta,
             observed,
@@ -1515,7 +2157,9 @@ kernel void days_round_fel_probe(
     device ulong *remote_meta [[buffer(19)]],
     device ulong *remote_staging [[buffer(20)]],
     device ulong *observation_meta [[buffer(21)]],
-    device ulong *diagnostic_counts [[buffer(25)]],
+    device ulong *stream_state [[buffer(25)]],
+    device ulong *stream_records [[buffer(26)]],
+    device ulong *diagnostic_counts [[buffer(27)]],
     uint active_index [[thread_position_in_grid]]
 ) {
     if (
@@ -1595,6 +2239,8 @@ kernel void days_round_fel_probe(
             in_service,
             remote_meta,
             remote_staging,
+            stream_state,
+            stream_records,
             summary,
             observation_meta,
             observed,
@@ -1699,15 +2345,129 @@ kernel void days_exchange_prefix(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
     device ulong *remote_meta [[buffer(19)]],
+    const device ulong *remote_staging [[buffer(20)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong sums[1024];
     threadgroup uint exceeded[1024];
+    threadgroup ulong failures[1024];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 2
     ) {
+        return;
+    }
+
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong capacity = params[P_OUTBOX_CAPACITY];
+        ulong local_sum = 0;
+        uint local_exceeded = 0;
+        ulong local_failure = NONE;
+        for (
+            ulong channel = lane;
+            channel < params[P_CHANNEL_COUNT];
+            channel += 1024
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            ulong batch_count = stream_state[batch];
+            if (
+                local_exceeded == 0 &&
+                (local_sum > capacity || batch_count > capacity - local_sum)
+            ) {
+                local_sum = capacity;
+                local_exceeded = 1;
+            } else if (local_exceeded == 0) {
+                local_sum += batch_count;
+            }
+            stream_state[batch + 3] = 0;
+            ulong stream_base = channel * META_WORDS;
+            ulong capacity = stream_state[stream_base + 1];
+            ulong count = stream_state[stream_base + 3];
+            bool invalid_capacity =
+                count > capacity || batch_count > capacity - min(count, capacity);
+            bool invalid_order = false;
+            if (
+                params[P_STREAM_ORDER_CHECKS] != 0 &&
+                !invalid_capacity &&
+                batch_count != 0
+            ) {
+                ulong first_slot = stream_state[batch + 1];
+                invalid_order = before_horizon(
+                    remote_staging[first_slot * EVENT_WORDS + E_TIME],
+                    control
+                );
+                if (!invalid_order && count != 0) {
+                    ulong head = stream_state[stream_base + 2];
+                    ulong tail = (head + count - 1) % max(capacity, 1ul);
+                    invalid_order = !stored_cross_key_less(
+                        stream_records,
+                        stream_state[stream_base] + tail,
+                        remote_staging,
+                        first_slot
+                    );
+                }
+            }
+            if ((invalid_capacity || invalid_order) && channel < local_failure) {
+                local_failure = channel;
+            }
+        }
+        sums[lane] = local_sum;
+        exceeded[lane] = local_exceeded;
+        failures[lane] = local_failure;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong right_sum = sums[lane + stride];
+                uint combined_exceeded =
+                    exceeded[lane] | exceeded[lane + stride];
+                if (
+                    combined_exceeded == 0 &&
+                    (sums[lane] > capacity || right_sum > capacity - sums[lane])
+                ) {
+                    combined_exceeded = 1;
+                }
+                sums[lane] =
+                    combined_exceeded != 0 ? capacity : sums[lane] + right_sum;
+                exceeded[lane] = combined_exceeded;
+                failures[lane] = min(failures[lane], failures[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            control[C_OUTBOX] = sums[0];
+            ulong failure = failures[0];
+            if (exceeded[0] != 0) {
+                control[C_ERROR] = ERROR_CAPACITY;
+                control[C_ERROR_ARENA] = ARENA_OUTBOX;
+                control[C_ERROR_NODE] = NONE;
+                control[C_ERROR_CAPACITY] = capacity;
+            } else if (failure != NONE) {
+                ulong batch =
+                    params[P_CHANNEL_BATCH_OFFSET] +
+                    failure * CHANNEL_BATCH_WORDS;
+                ulong stream_base = failure * META_WORDS;
+                ulong capacity = stream_state[stream_base + 1];
+                ulong count = stream_state[stream_base + 3];
+                ulong batch_count = stream_state[batch];
+                control[C_ERROR_NODE] =
+                    stream_state[params[P_CHANNEL_TARGET_OFFSET] + failure];
+                if (
+                    count > capacity ||
+                    batch_count > capacity - min(count, capacity)
+                ) {
+                    control[C_ERROR] = ERROR_CAPACITY;
+                    control[C_ERROR_ARENA] = ARENA_CHANNEL_INBOX;
+                    control[C_ERROR_CAPACITY] = capacity;
+                } else {
+                    control[C_ERROR] = ERROR_SEMANTIC + 42;
+                }
+            }
+        }
         return;
     }
 
@@ -1786,6 +2546,8 @@ kernel void days_exchange_scatter(
     device ulong *outbox [[buffer(12)]],
     const device ulong *remote_meta [[buffer(19)]],
     const device ulong *remote_staging [[buffer(20)]],
+    device ulong *stream_state [[buffer(25)]],
+    device ulong *stream_records [[buffer(26)]],
     uint producer [[thread_position_in_grid]]
 ) {
     if (
@@ -1800,6 +2562,45 @@ kernel void days_exchange_scatter(
     ulong staging = remote_meta[base];
     ulong compact = remote_meta[base + 2];
     ulong count = remote_meta[base + 3];
+    if (params[P_STREAMS_ENABLED] != 0) {
+        for (ulong index = 0; index < count; ++index) {
+            ulong staging_slot = staging + index;
+            ulong channel =
+                stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            ulong cursor = stream_state[batch + 3];
+            ulong stream_base = channel * META_WORDS;
+            ulong capacity = stream_state[stream_base + 1];
+            ulong physical = (
+                stream_state[stream_base + 2] +
+                stream_state[stream_base + 3] +
+                cursor
+            ) % max(capacity, 1ul);
+            copy_device_record(
+                remote_staging,
+                staging_slot,
+                stream_records,
+                stream_state[stream_base] + physical
+            );
+            stream_state[batch + 3] = cursor + 1;
+        }
+        ulong outbound_meta =
+            params[P_OUTBOUND_META_OFFSET] +
+            ulong(producer) * OUTBOUND_META_WORDS;
+        ulong entry = stream_state[outbound_meta];
+        ulong entry_count = stream_state[outbound_meta + 1];
+        for (ulong index = 0; index < entry_count; ++index) {
+            ulong channel =
+                stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[channel * META_WORDS + 3] += stream_state[batch];
+        }
+        return;
+    }
     for (ulong index = 0; index < count; ++index) {
         copy_device_record(
             remote_staging,
@@ -1821,6 +2622,8 @@ kernel void days_exchange_merge(
     const device ulong *inbound_meta [[buffer(22)]],
     const device ulong *inbound_producers [[buffer(23)]],
     device ulong *merge_cursors [[buffer(24)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
     uint target [[thread_position_in_grid]]
 ) {
     if (
@@ -1829,6 +2632,46 @@ kernel void days_exchange_merge(
         control[C_CONTINUATION] != 2 ||
         target >= params[P_NODE_COUNT]
     ) {
+        return;
+    }
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong meta =
+            params[P_LP_STREAM_META_OFFSET] +
+            ulong(target) * LP_STREAM_META_WORDS;
+        ulong declared = stream_state[meta];
+        ulong declared_count = stream_state[meta + 1];
+        ulong active = stream_state[meta + 2];
+        ulong active_count = 0;
+        if (fel_meta[ulong(target) * META_WORDS + 3] != 0) {
+            ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
+            active_count += 1;
+            stream_state[entry] = NONE;
+            ulong record =
+                fel_meta[ulong(target) * META_WORDS] * EVENT_WORDS;
+            for (uint word = 0; word < 4; ++word) {
+                stream_state[entry + 1 + word] = fel_records[record + word];
+            }
+        }
+        for (ulong index = 0; index < declared_count; ++index) {
+            ulong stream = stream_state[declared + index];
+            if (stream_state[stream * META_WORDS + 3] != 0) {
+                ulong entry =
+                    active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
+                active_count += 1;
+                stream_state[entry] = stream;
+                ulong stream_base = stream * META_WORDS;
+                ulong capacity = stream_state[stream_base + 1];
+                ulong physical =
+                    stream_state[stream_base + 2] % max(capacity, 1ul);
+                ulong record =
+                    (stream_state[stream_base] + physical) * EVENT_WORDS;
+                for (uint word = 0; word < 4; ++word) {
+                    stream_state[entry + 1 + word] =
+                        stream_records[record + word];
+                }
+            }
+        }
+        stream_state[meta + 3] = active_count;
         return;
     }
     ulong inbound_base = ulong(target) * INBOUND_META_WORDS;
@@ -1897,7 +2740,7 @@ kernel void days_exchange_merge_fan_in_probe(
     const device ulong *inbound_meta [[buffer(22)]],
     const device ulong *inbound_producers [[buffer(23)]],
     device ulong *merge_cursors [[buffer(24)]],
-    device ulong *diagnostic_fan_in [[buffer(26)]],
+    device ulong *diagnostic_fan_in [[buffer(28)]],
     uint target [[thread_position_in_grid]]
 ) {
     if (

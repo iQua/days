@@ -196,7 +196,7 @@ fn main() {
             })
         });
         println!(
-            "record=t15e_drain_sample config={fixture} sample={} order={} rounds={} \
+            "record=t15e_drain_sample config={fixture} stream_mode=heap sample={} order={} rounds={} \
              transitions={} production_drain_execute_ns={} matched_control_drain_execute_ns={} \
              stress_probe_drain_execute_ns={} fel_round_trip_delta_ns={} \
              production_drain_execute_ms_per_round={:.6} \
@@ -274,6 +274,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     let config = MetalConfig {
+        streams_enabled: false,
         round_threads_per_threadgroup: threadgroup_width,
         ..MetalConfig::default()
     };
@@ -286,7 +287,7 @@ fn main() {
             .decompose_against(&warm_baseline, &warm_control)
             .expect("warm FEL probe, control, and baseline must match");
         println!(
-            "record=t15e_drain_initialization config={relative} \
+            "record=t15e_drain_initialization config={relative} stream_mode=heap \
              all_diagnostic_pipelines_creation_ns={} cached_probe_pipeline_creation_ns={} \
              matched_round_pso=1 warm_rounds={} warm_transitions={} \
              warm_fel_round_trip_delta_ns={}",
@@ -418,7 +419,7 @@ fn main() {
         (Some(_), _) => "mechanism_selection_unavailable_stress_probe_nonrepresentative",
     };
     println!(
-        "record=t15e_drain_summary statistic=median_all_samples config={relative} samples={} \
+        "record=t15e_drain_summary statistic=median_all_samples config={relative} stream_mode=heap samples={} \
          samples_per_order={} threadgroup_width={threadgroup_width} rounds={rounds} \
          transitions={transitions} production_drain_execute_ns={baseline_drain_ns} \
          matched_control_drain_execute_ns={control_drain_ns} \
@@ -480,9 +481,10 @@ fn main() {
         )
     };
     println!(
-        "record=t15e_merge_fan_in_characterization config={relative} \
+        "record=t15e_merge_fan_in_characterization config={relative} stream_mode=heap \
          rounds={} transitions={} eventful_target_rounds={} \
          active_producer_target_rounds={} remote_events={} maximum_active_fan_in={} \
+         first_maximum_fan_in_target={} maximum_fan_in_target_count={} \
          average_active_fan_in={} average_events_per_target_round={} \
          production_target_merge_ns={} instrumented_target_merge_ns={} \
          diagnostic_pipeline_creation_ns={} \
@@ -493,6 +495,10 @@ fn main() {
         fan_in_counts.active_producer_target_rounds,
         fan_in_counts.remote_events,
         fan_in_counts.maximum_active_fan_in,
+        fan_in_counts
+            .first_maximum_fan_in_target
+            .map_or_else(|| "unavailable".to_owned(), |node| node.0.to_string()),
+        fan_in_counts.maximum_fan_in_target_count,
         average_active_fan_in,
         average_events_per_target_round,
         median_production_target_merge_ns,

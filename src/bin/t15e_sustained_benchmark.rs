@@ -55,7 +55,7 @@ fn main() {
 
     use days::scenario::compile_config;
     use days_executor::{
-        CpuConfig, MetalConfig, MetalExecutor, RunSummary, SimulationImage, run_cpu,
+        CpuConfig, MetalConfig, MetalExecutor, RunResult, RunSummary, SimulationImage, run_cpu,
         run_scalar_rounds,
     };
 
@@ -75,6 +75,8 @@ fn main() {
         predecessor: &'static str,
         engine: &'static str,
         backend: &'static str,
+        stream_mode: &'static str,
+        metal_mode_order: &'static str,
         workers: usize,
         fixed_method: &'static str,
         separation_quality: &'static str,
@@ -118,10 +120,18 @@ fn main() {
         calibration_ns
     }
 
-    fn scalar(image: &SimulationImage, calibration_ns: u128) -> Measurement {
+    fn scalar(
+        image: &SimulationImage,
+        calibration_ns: u128,
+        expected_result: &RunResult,
+    ) -> Measurement {
         let started = Instant::now();
         let run = run_scalar_rounds(image, None).expect("scalar benchmark run must succeed");
         let end_to_end_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &run.result, expected_result,
+            "scalar benchmark RunResult must match the oracle"
+        );
         let rounds = u64::try_from(run.rounds.len()).expect("scalar round count must fit in u64");
         assert!(rounds > 0, "scalar benchmark run produced zero rounds");
         let transitions = run.rounds.iter().fold(0_u64, |total, round| {
@@ -146,6 +156,8 @@ fn main() {
             predecessor: "none",
             engine: "scalar",
             backend: "scalar",
+            stream_mode: "na",
+            metal_mode_order: "na",
             workers: 1,
             fixed_method: "zero_round_calibration",
             separation_quality: "calibrated_estimate",
@@ -166,7 +178,7 @@ fn main() {
         }
     }
 
-    fn cpu(image: &SimulationImage, workers: usize) -> Measurement {
+    fn cpu(image: &SimulationImage, workers: usize, expected_result: &RunResult) -> Measurement {
         let started = Instant::now();
         let run = run_cpu(
             image,
@@ -178,6 +190,10 @@ fn main() {
         )
         .unwrap_or_else(|error| panic!("W{workers} benchmark run failed: {error}"));
         let end_to_end_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &run.result, expected_result,
+            "W{workers} benchmark RunResult must match the oracle"
+        );
         let rounds = u64::try_from(run.rounds.len()).expect("CPU round count must fit in u64");
         assert!(rounds > 0, "W{workers} benchmark run produced zero rounds");
         let transitions = run.rounds.iter().fold(0_u64, |total, round| {
@@ -207,6 +223,8 @@ fn main() {
             predecessor: "none",
             engine,
             backend: "cpu",
+            stream_mode: "na",
+            metal_mode_order: "na",
             workers,
             fixed_method: "round_wall_sum",
             separation_quality: "exact_boundary",
@@ -233,6 +251,8 @@ fn main() {
         threadgroup_width: usize,
         device_queue_setup_ns: u128,
         pipeline_creation_ns: u128,
+        streams_enabled: bool,
+        expected_result: &RunResult,
     ) -> Measurement {
         let started = Instant::now();
         let run = executor
@@ -240,12 +260,17 @@ fn main() {
                 image,
                 None,
                 MetalConfig {
+                    streams_enabled,
                     round_threads_per_threadgroup: threadgroup_width,
                     ..MetalConfig::default()
                 },
             )
             .expect("Metal benchmark run must succeed");
         let end_to_end_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &run.result, expected_result,
+            "Metal benchmark RunResult must match the oracle"
+        );
         assert!(run.rounds > 0, "Metal benchmark run produced zero rounds");
         let outcome = Outcome {
             rounds: run.rounds,
@@ -284,8 +309,14 @@ fn main() {
             sample: 0,
             order: "warmup",
             predecessor: "none",
-            engine: "metal",
+            engine: if streams_enabled {
+                "metal_streams"
+            } else {
+                "metal_heap"
+            },
             backend: "metal",
+            stream_mode: if streams_enabled { "streams" } else { "heap" },
+            metal_mode_order: "warmup",
             workers: 0,
             fixed_method: "backend_wall_with_cold_initialization",
             separation_quality: "exact_boundary",
@@ -306,9 +337,13 @@ fn main() {
         }
     }
 
-    fn cpu_after_predecessor(image: &SimulationImage, workers: usize) -> Measurement {
-        let _ = cpu(image, workers);
-        let mut measurement = cpu(image, workers);
+    fn cpu_after_predecessor(
+        image: &SimulationImage,
+        workers: usize,
+        expected_result: &RunResult,
+    ) -> Measurement {
+        let _ = cpu(image, workers, expected_result);
+        let mut measurement = cpu(image, workers, expected_result);
         measurement.predecessor = recorded_predecessor_for_engine(measurement.engine);
         measurement
     }
@@ -319,6 +354,8 @@ fn main() {
         threadgroup_width: usize,
         device_queue_setup_ns: u128,
         pipeline_creation_ns: u128,
+        streams_enabled: bool,
+        expected_result: &RunResult,
     ) -> Measurement {
         let _ = metal(
             executor,
@@ -326,6 +363,8 @@ fn main() {
             threadgroup_width,
             device_queue_setup_ns,
             pipeline_creation_ns,
+            streams_enabled,
+            expected_result,
         );
         let mut measurement = metal(
             executor,
@@ -333,6 +372,8 @@ fn main() {
             threadgroup_width,
             device_queue_setup_ns,
             pipeline_creation_ns,
+            streams_enabled,
+            expected_result,
         );
         measurement.predecessor = recorded_predecessor_for_engine(measurement.engine);
         measurement
@@ -341,7 +382,7 @@ fn main() {
     fn print_record(kind: &str, fixture: &str, threadgroup_width: usize, measurement: Measurement) {
         println!(
             "record=t15e_{kind} config={fixture} sample={} order={} predecessor={} \
-             engine={} backend={} workers={} \
+             engine={} backend={} stream_mode={} metal_mode_order={} workers={} \
              threadgroup_width={} rounds={} transitions={} fixed_method={} separation_quality={} \
              end_to_end_ns={} \
              cold_end_to_end_ns={} fixed_ns={} warm_fixed_ns={} marginal_ns={} \
@@ -353,6 +394,8 @@ fn main() {
             measurement.predecessor,
             measurement.engine,
             measurement.backend,
+            measurement.stream_mode,
+            measurement.metal_mode_order,
             measurement.workers,
             threadgroup_width,
             measurement.outcome.rounds,
@@ -388,6 +431,7 @@ fn main() {
         assert!(
             selected.iter().all(|measurement| {
                 measurement.engine == first.engine
+                    && measurement.stream_mode == first.stream_mode
                     && measurement.outcome == first.outcome
                     && measurement.predecessor == first.predecessor
                     && measurement.fixed_method == first.fixed_method
@@ -408,7 +452,7 @@ fn main() {
             "record=t15e_{kind} statistic=median \
              aggregation=component_medians_with_derived_fixed_closure config={fixture} \
              order={order} predecessor={} engine={} \
-             backend={} workers={} samples={} threadgroup_width={} rounds={} transitions={} \
+             backend={} stream_mode={} workers={} samples={} threadgroup_width={} rounds={} transitions={} \
              fixed_method={} separation_quality={} end_to_end_ns={} cold_end_to_end_ns={} \
              fixed_ns={} warm_fixed_ns={} marginal_ns={} marginal_ns_per_round={} \
              calibration_ns={} backend_wall_ns={} \
@@ -417,6 +461,7 @@ fn main() {
             first.predecessor,
             first.engine,
             first.backend,
+            first.stream_mode,
             first.workers,
             selected.len(),
             threadgroup_width,
@@ -483,6 +528,7 @@ fn main() {
     let mut relative_was_set = false;
     let mut samples = 4_usize;
     let mut threadgroup_width = 256_usize;
+    let mut skip_scalar = false;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -500,6 +546,7 @@ fn main() {
                     .parse()
                     .expect("--threadgroup-width must be an integer");
             }
+            "--skip-scalar" => skip_scalar = true,
             unknown if unknown.starts_with("--") => panic!("unknown argument {unknown}"),
             path if !relative_was_set => {
                 relative = path.to_owned();
@@ -508,23 +555,51 @@ fn main() {
             extra => panic!("unexpected second fixture path {extra}"),
         }
     }
-    assert!(
-        samples >= 2 && samples.is_multiple_of(2),
-        "--samples must be a positive even count so both orders are represented"
+    assert_eq!(
+        samples, 4,
+        "the T15e protocol requires exactly four samples, two per order"
     );
     assert!(threadgroup_width > 0, "--threadgroup-width must be nonzero");
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative);
     let image = compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+    let oracle = run_cpu(
+        &image,
+        None,
+        CpuConfig {
+            workers: 4,
+            ..CpuConfig::default()
+        },
+    )
+    .expect("W4 benchmark oracle must succeed")
+    .result;
     let executor = MetalExecutor::new().expect("Metal benchmark executor must initialize");
     let initialization = executor.initialization_timings();
     let device_queue_setup_ns = u128::from(initialization.device_queue_setup_ns);
     let pipeline_creation_ns = u128::from(initialization.pipeline_creation_ns);
     println!(
-        "record=t15e_protocol scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
+        "record=t15e_protocol scalar_samples={} scalar_predecessor=none \
          comparison_samples={samples} comparison_predecessor=same_kind_discarded \
-         order_schedule=alternating_cpu_first_gpu_first"
+         order_schedule=balanced_cpu_first_gpu_first_and_heap_streams \
+         scalar_provenance={} scalar_reuse_days_commit={} \
+         scalar_reuse_evidence={}",
+        if skip_scalar { 0 } else { SCALAR_SAMPLES },
+        if skip_scalar {
+            "reused_audited_t15e"
+        } else {
+            "measured"
+        },
+        if skip_scalar {
+            "0fb8f9b881cc5fd542d89f4bd4aa705e4ab7cf1a"
+        } else {
+            "na"
+        },
+        if skip_scalar {
+            "evidence/P08/t15e-sustained-load30-raw.txt,evidence/P08/t15e-sustained-load90-raw.txt"
+        } else {
+            "na"
+        },
     );
     println!(
         "record=t15e_initialization config={relative} engine=metal device_queue_setup_ns={} \
@@ -536,14 +611,25 @@ fn main() {
     );
 
     let warmups = [
-        cpu(&image, 4),
-        cpu(&image, 18),
+        cpu(&image, 4, &oracle),
+        cpu(&image, 18, &oracle),
         metal(
             &executor,
             &image,
             threadgroup_width,
             device_queue_setup_ns,
             pipeline_creation_ns,
+            false,
+            &oracle,
+        ),
+        metal(
+            &executor,
+            &image,
+            threadgroup_width,
+            device_queue_setup_ns,
+            pipeline_creation_ns,
+            true,
+            &oracle,
         ),
     ];
     let expected = warmups[0].outcome;
@@ -553,45 +639,85 @@ fn main() {
     }
 
     let mut measurements =
-        Vec::with_capacity(samples.saturating_mul(3).saturating_add(SCALAR_SAMPLES));
+        Vec::with_capacity(samples.saturating_mul(4).saturating_add(SCALAR_SAMPLES));
     for sample in 0..samples {
         let order = order_for_sample(sample);
-        let include_scalar = sample < SCALAR_SAMPLES;
-        let mut ordered = Vec::with_capacity(3 + usize::from(include_scalar));
-        if order == "cpu_first" {
-            if include_scalar {
-                ordered.push(scalar(&image, scalar_calibration(&image)));
-            }
-            ordered.extend([
-                cpu_after_predecessor(&image, 4),
-                cpu_after_predecessor(&image, 18),
+        let include_scalar = !skip_scalar && sample < SCALAR_SAMPLES;
+        let heap_first = sample % 4 == 0 || sample % 4 == 3;
+        let metal_mode_order = if heap_first {
+            "heap_then_streams"
+        } else {
+            "streams_then_heap"
+        };
+        let mut metal_pair = if heap_first {
+            vec![
                 metal_after_predecessor(
                     &executor,
                     &image,
                     threadgroup_width,
                     device_queue_setup_ns,
                     pipeline_creation_ns,
+                    false,
+                    &oracle,
                 ),
-            ]);
+                metal_after_predecessor(
+                    &executor,
+                    &image,
+                    threadgroup_width,
+                    device_queue_setup_ns,
+                    pipeline_creation_ns,
+                    true,
+                    &oracle,
+                ),
+            ]
         } else {
-            ordered.push(metal_after_predecessor(
-                &executor,
-                &image,
-                threadgroup_width,
-                device_queue_setup_ns,
-                pipeline_creation_ns,
-            ));
+            vec![
+                metal_after_predecessor(
+                    &executor,
+                    &image,
+                    threadgroup_width,
+                    device_queue_setup_ns,
+                    pipeline_creation_ns,
+                    true,
+                    &oracle,
+                ),
+                metal_after_predecessor(
+                    &executor,
+                    &image,
+                    threadgroup_width,
+                    device_queue_setup_ns,
+                    pipeline_creation_ns,
+                    false,
+                    &oracle,
+                ),
+            ]
+        };
+        let mut ordered = Vec::with_capacity(4 + usize::from(include_scalar));
+        if order == "cpu_first" {
             if include_scalar {
-                ordered.push(scalar(&image, scalar_calibration(&image)));
+                ordered.push(scalar(&image, scalar_calibration(&image), &oracle));
             }
             ordered.extend([
-                cpu_after_predecessor(&image, 4),
-                cpu_after_predecessor(&image, 18),
+                cpu_after_predecessor(&image, 4, &oracle),
+                cpu_after_predecessor(&image, 18, &oracle),
+            ]);
+            ordered.append(&mut metal_pair);
+        } else {
+            ordered.append(&mut metal_pair);
+            if include_scalar {
+                ordered.push(scalar(&image, scalar_calibration(&image), &oracle));
+            }
+            ordered.extend([
+                cpu_after_predecessor(&image, 4, &oracle),
+                cpu_after_predecessor(&image, 18, &oracle),
             ]);
         }
         for mut measurement in ordered {
             measurement.sample = sample;
             measurement.order = order;
+            if measurement.backend == "metal" {
+                measurement.metal_mode_order = metal_mode_order;
+            }
             assert_eq!(
                 measurement.outcome, expected,
                 "timed sample backends must agree"
@@ -601,12 +727,15 @@ fn main() {
         }
     }
 
-    for engine in ["scalar", "w4", "w18", "metal"] {
+    for engine in ["scalar", "w4", "w18", "metal_heap", "metal_streams"] {
         let pooled = measurements
             .iter()
             .filter(|measurement| measurement.engine == engine)
             .copied()
             .collect::<Vec<_>>();
+        if pooled.is_empty() {
+            continue;
+        }
         print_summary("summary", &relative, "pooled", threadgroup_width, &pooled);
         for order in ["cpu_first", "gpu_first"] {
             let ordered = pooled
@@ -640,13 +769,18 @@ fn main() {
         .count();
     let w4_marginal_ns = pooled_marginal("w4");
     let w18_marginal_ns = pooled_marginal("w18");
-    let metal_marginal_ns = pooled_marginal("metal");
+    let metal_heap_marginal_ns = pooled_marginal("metal_heap");
+    let metal_marginal_ns = pooled_marginal("metal_streams");
     assert!(
-        w4_marginal_ns > 0 && w18_marginal_ns > 0 && metal_marginal_ns > 0,
+        w4_marginal_ns > 0
+            && w18_marginal_ns > 0
+            && metal_heap_marginal_ns > 0
+            && metal_marginal_ns > 0,
         "marginal-ratio inputs must be nonzero"
     );
     let metal_over_w4 = metal_marginal_ns as f64 / w4_marginal_ns as f64;
     let metal_over_w18 = metal_marginal_ns as f64 / w18_marginal_ns as f64;
+    let metal_over_heap = metal_marginal_ns as f64 / metal_heap_marginal_ns as f64;
     let w4_over_metal = w4_marginal_ns as f64 / metal_marginal_ns as f64;
     let w18_over_metal = w18_marginal_ns as f64 / metal_marginal_ns as f64;
     let metal_beats_w4 = metal_marginal_ns < w4_marginal_ns;
@@ -662,10 +796,13 @@ fn main() {
          scalar_samples={scalar_samples} comparison_samples={samples} \
          threadgroup_width={threadgroup_width} rounds={} transitions={} \
          ratio_definition=metal_marginal_div_cpu_marginal \
+         ablation_ratio_definition=metal_streams_marginal_div_metal_heap_marginal \
          speedup_definition=cpu_marginal_div_metal_marginal \
          w4_marginal_ns={w4_marginal_ns} w18_marginal_ns={w18_marginal_ns} \
+         metal_heap_marginal_ns={metal_heap_marginal_ns} \
          metal_marginal_ns={metal_marginal_ns} metal_over_w4={metal_over_w4:.6} \
-         metal_over_w18={metal_over_w18:.6} w4_over_metal={w4_over_metal:.6} \
+         metal_over_w18={metal_over_w18:.6} streams_over_heap={metal_over_heap:.6} \
+         w4_over_metal={w4_over_metal:.6} \
          w18_over_metal={w18_over_metal:.6} metal_beats_w4={} metal_beats_w18={} \
          crossover={crossover} crossover_basis=marginal",
         expected.rounds,
@@ -717,7 +854,7 @@ mod tests {
     fn scalar_measurement_exemption_uses_two_samples_without_predecessors() {
         assert_eq!(SCALAR_SAMPLES, 2);
         assert_eq!(recorded_predecessor_for_engine("scalar"), "none");
-        for engine in ["w4", "w18", "metal"] {
+        for engine in ["w4", "w18", "metal_heap", "metal_streams"] {
             assert_eq!(
                 recorded_predecessor_for_engine(engine),
                 "same_kind_discarded"

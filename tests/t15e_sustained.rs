@@ -267,18 +267,32 @@ fn sustained_load_30_matches_scalar_complete_result() {
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
     let scalar = run_scalar(&image, None)
         .unwrap_or_else(|error| panic!("scalar failed for {}: {error}", path.display()));
-    let metal = run_metal(&image, None, MetalConfig::default())
-        .unwrap_or_else(|error| panic!("Metal failed for {}: {error}", path.display()));
-
-    assert_eq!(metal.rounds, SUSTAINED_FIXTURES[0].expected_rounds);
     assert_terminal_source_state(SUSTAINED_FIXTURES[0], &scalar);
-    assert_terminal_source_state(SUSTAINED_FIXTURES[0], &metal.result);
-    assert_eq!(
-        metal.result,
-        scalar,
-        "Metal result differs from scalar for {}",
-        path.display()
-    );
+    for streams_enabled in [true, false] {
+        let metal = run_metal(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "Metal streams={streams_enabled} failed for {}: {error}",
+                path.display()
+            )
+        });
+
+        assert_eq!(metal.rounds, SUSTAINED_FIXTURES[0].expected_rounds);
+        assert_terminal_source_state(SUSTAINED_FIXTURES[0], &metal.result);
+        assert_eq!(
+            metal.result,
+            scalar,
+            "Metal streams={streams_enabled} differs from scalar for {}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

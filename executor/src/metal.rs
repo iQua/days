@@ -47,6 +47,11 @@ const ARRIVAL_WORDS: usize = 10;
 const LP_STATE_WORDS: usize = 6;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
+const LP_STREAM_META_WORDS: usize = 4;
+const OUTBOUND_META_WORDS: usize = 2;
+const OUTBOUND_ENTRY_WORDS: usize = 2;
+const CHANNEL_BATCH_WORDS: usize = 4;
+const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
 // The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
 // LP drains single-launch while putting a finite ceiling on pathological device work per lane.
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
@@ -132,6 +137,9 @@ type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetalArena {
     Fel,
+    ChannelInbox,
+    ServiceStream,
+    GeneratorStream,
     Queue,
     Outbox,
     Worklist,
@@ -144,6 +152,9 @@ impl fmt::Display for MetalArena {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Fel => "FEL",
+            Self::ChannelInbox => "channel inbox stream",
+            Self::ServiceStream => "service stream",
+            Self::GeneratorStream => "generator stream",
             Self::Queue => "queue",
             Self::Outbox => "remote outbox",
             Self::Worklist => "active worklist",
@@ -228,9 +239,15 @@ impl Error for MetalError {}
 /// Physical capacity and bounded-wave encoding policy for one Metal run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetalConfig {
+    /// Enables the stream-decomposed FEL. When false, every event uses the retained exact heap and
+    /// the original target-owned exchange merge, providing an identical-binary ablation.
+    pub streams_enabled: bool,
     /// Optional exact per-LP FEL capacity override. Raising the derived default consumes more
     /// device memory; lowering it retains an explicit device capacity fault on overflow.
     pub max_fel_events_per_lp: Option<usize>,
+    /// Optional exact capacity applied independently to every incoming-channel stream. Lowering
+    /// it retains an explicit device capacity fault; it has no effect when streams are disabled.
+    pub max_channel_events_per_stream: Option<usize>,
     /// Optional exact per-LP packet-queue capacity override, with the same memory/fault tradeoff.
     pub max_queue_packets_per_lp: Option<usize>,
     /// Optional bound for all remote children produced in one round.
@@ -255,7 +272,9 @@ pub struct MetalConfig {
 impl Default for MetalConfig {
     fn default() -> Self {
         Self {
+            streams_enabled: true,
             max_fel_events_per_lp: None,
+            max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
             max_outbox_events: None,
             max_observations: None,
@@ -264,6 +283,33 @@ impl Default for MetalConfig {
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
         }
+    }
+}
+
+/// Exact planned Metal event-arena footprint for one run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetalMemoryLayout {
+    pub streams_enabled: bool,
+    pub legacy_heap_event_slots: usize,
+    pub fallback_heap_event_slots: usize,
+    /// Every unproven initial/checkpoint pending is loaded into the fallback heap.
+    pub checkpoint_fallback_events: usize,
+    pub channel_stream_event_slots: usize,
+    pub service_stream_event_slots: usize,
+    pub generator_stream_event_slots: usize,
+    pub heap_arena_bytes: usize,
+    pub stream_arena_bytes: usize,
+    pub legacy_heap_arena_bytes: usize,
+}
+
+impl MetalMemoryLayout {
+    pub fn total_event_arena_bytes(self) -> usize {
+        self.heap_arena_bytes
+            .saturating_add(self.stream_arena_bytes)
+    }
+
+    pub fn delta_from_legacy_heap_bytes(self) -> i128 {
+        self.total_event_arena_bytes() as i128 - self.legacy_heap_arena_bytes as i128
     }
 }
 
@@ -292,6 +338,8 @@ pub struct MetalRun {
     pub wall_ns: u64,
     /// Opt-in diagnostic timings. Normal production runs leave this `None`.
     pub phase_profile: Option<MetalPhaseProfile>,
+    /// Exact record and metadata bytes planned for the fallback heap and monotone streams.
+    pub memory_layout: MetalMemoryLayout,
 }
 
 /// Opt-in T15e FEL round-trip probe result.
@@ -330,6 +378,8 @@ pub struct MetalMergeFanIn {
     pub active_producer_target_rounds: u64,
     pub remote_events: u64,
     pub maximum_active_fan_in: u64,
+    pub first_maximum_fan_in_target: Option<NodeId>,
+    pub maximum_fan_in_target_count: u64,
 }
 
 /// Separate fan-in instrumentation run, kept out of FEL differential samples.
@@ -483,6 +533,9 @@ pub struct MetalPhaseTimings {
     pub continuation_control_ns: u64,
     pub exchange_prefix_ns: u64,
     pub exchange_scatter_ns: u64,
+    /// Target-owned k-way heap merge when streams are disabled; target active-head refresh when
+    /// stream decomposition is enabled. Keeping one aligned slot makes same-binary phase ablation
+    /// tables directly comparable.
     pub target_merge_ns: u64,
     pub final_control_ns: u64,
 }
@@ -666,6 +719,9 @@ impl MetalExecutor {
     }
 
     /// Runs the matched counting-only control for [`Self::run_fel_probe_profiled`].
+    ///
+    /// The retained diagnostic kernel measures the legacy heap mechanism and therefore requires
+    /// `config.streams_enabled == false`.
     pub fn run_fel_control_profiled(
         &self,
         image: &SimulationImage,
@@ -691,7 +747,8 @@ impl MetalExecutor {
     /// Compare against both [`Self::run_profiled`] and [`Self::run_fel_control_profiled`] using
     /// [`MetalFelProbeRun::decompose_against`]. Reinserting the just-popped minimum exercises a
     /// near-worst-case heap push, so the scaled result is an upper-biased heuristic, not a
-    /// representative average or sufficient evidence by itself to indict the FEL.
+    /// representative average or sufficient evidence by itself to indict the FEL. This legacy
+    /// heap diagnostic requires `config.streams_enabled == false`.
     pub fn run_fel_probe_profiled(
         &self,
         image: &SimulationImage,
@@ -712,7 +769,8 @@ impl MetalExecutor {
     ///
     /// The read-only pre-scan changes target-merge timing, so callers should use a matching
     /// [`Self::run_profiled`] result for production merge time and this result only for exact fan-in
-    /// counts and outcome parity.
+    /// counts and outcome parity. This legacy exchange diagnostic requires
+    /// `config.streams_enabled == false`.
     pub fn run_merge_fan_in_profiled(
         &self,
         image: &SimulationImage,
@@ -722,6 +780,7 @@ impl MetalExecutor {
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
+        require_heap_diagnostic(config, "exchange")?;
 
         let (pipelines, diagnostic_pipeline_creation_ns) = self.direct.fel_probe_pipelines()?;
         let plan = MetalPlan::new(
@@ -760,6 +819,7 @@ impl MetalExecutor {
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
+        require_heap_diagnostic(config, "FEL")?;
 
         let (pipelines, diagnostic_pipeline_creation_ns) = self.direct.fel_probe_pipelines()?;
         let plan = MetalPlan::new(
@@ -854,6 +914,15 @@ fn validate_config(config: MetalConfig) -> Result<(), MetalError> {
     Ok(())
 }
 
+fn require_heap_diagnostic(config: MetalConfig, mechanism: &str) -> Result<(), MetalError> {
+    if config.streams_enabled {
+        return Err(MetalError::Validation(format!(
+            "legacy heap {mechanism} diagnostics require streams_enabled=false"
+        )));
+    }
+    Ok(())
+}
+
 fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
     let pairs_per_command_buffer =
         rounds_per_command_buffer.min(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER);
@@ -889,9 +958,36 @@ struct MetalPlan {
     inbound_meta: Vec<u64>,
     inbound_producers: Vec<u64>,
     merge_cursors: Vec<u64>,
+    stream_state: Vec<u64>,
+    stream_records: Vec<u64>,
+    stream_layout: StreamLayout,
+    memory_layout: MetalMemoryLayout,
     orphan_packets: Vec<PacketDescriptor>,
     round_capacity: usize,
     dispatch_capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamLayout {
+    stream_count: usize,
+    channel_count: usize,
+    service_stream_base: usize,
+    generator_stream_base: usize,
+    lp_stream_meta_offset: usize,
+    lp_stream_ids_offset: usize,
+    lp_active_ids_offset: usize,
+    outbound_meta_offset: usize,
+    outbound_entries_offset: usize,
+    channel_batch_offset: usize,
+    staging_channel_offset: usize,
+    channel_target_offset: usize,
+}
+
+struct PreparedStreams {
+    state: Vec<u64>,
+    records: Vec<u64>,
+    layout: StreamLayout,
+    memory_layout: MetalMemoryLayout,
 }
 
 impl MetalPlan {
@@ -949,9 +1045,10 @@ impl MetalPlan {
             .collect();
 
         let mut queue_caps = vec![1_usize; node_count];
-        let mut fel_caps = vec![8_usize; node_count];
+        let mut legacy_fel_caps = vec![8_usize; node_count];
         for event in &image.initial_events {
-            fel_caps[event.target.0 as usize] = fel_caps[event.target.0 as usize].saturating_add(1);
+            legacy_fel_caps[event.target.0 as usize] =
+                legacy_fel_caps[event.target.0 as usize].saturating_add(1);
         }
         for (flow_index, flow) in image.flows.iter().enumerate() {
             let packet_count = flow_packet_counts[flow_index];
@@ -960,7 +1057,7 @@ impl MetalPlan {
             let source_slot = flow.source.0 as usize;
             queue_caps[source_slot] = queue_caps[source_slot]
                 .saturating_add(source_queue_packet_bound(image, flow_index, data_count));
-            fel_caps[source_slot] = fel_caps[source_slot].saturating_add(4);
+            legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
 
             add_flow_route_capacities(
                 image,
@@ -968,7 +1065,7 @@ impl MetalPlan {
                 data_count,
                 PacketKind::Data,
                 minimum_lookahead_ns,
-                &mut fel_caps,
+                &mut legacy_fel_caps,
                 &mut queue_caps,
             );
             add_flow_route_capacities(
@@ -977,7 +1074,7 @@ impl MetalPlan {
                 feedback_count,
                 PacketKind::Feedback,
                 minimum_lookahead_ns,
-                &mut fel_caps,
+                &mut legacy_fel_caps,
                 &mut queue_caps,
             );
         }
@@ -1003,12 +1100,26 @@ impl MetalPlan {
                     }
                 }
             }
-            if let Some(limit) = config.max_fel_events_per_lp {
-                fel_caps[slot] = limit;
-            }
             if let Some(limit) = config.max_queue_packets_per_lp {
                 queue_caps[slot] = limit;
             }
+        }
+
+        if let Some(limit) = config.max_fel_events_per_lp {
+            legacy_fel_caps.fill(limit);
+        }
+        let mut fel_caps = if config.streams_enabled {
+            let mut capacities = vec![1_usize; node_count];
+            for event in &image.initial_events {
+                let target = event.target.0 as usize;
+                capacities[target] = capacities[target].saturating_add(1);
+            }
+            capacities
+        } else {
+            legacy_fel_caps.clone()
+        };
+        if let Some(limit) = config.max_fel_events_per_lp {
+            fel_caps.fill(limit);
         }
 
         let mut fel_meta = vec![0_u64; node_count * ARENA_META_WORDS];
@@ -1165,6 +1276,18 @@ impl MetalPlan {
         }
         let mut remote_meta = vec![0_u64; node_count * ARENA_META_WORDS];
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
+        let streams = prepare_streams(
+            image,
+            &flow_packet_counts,
+            &flow_feedback_counts,
+            minimum_lookahead_ns,
+            config,
+            &legacy_fel_caps,
+            &fel_caps,
+            &fel_meta,
+            &fel_records,
+            remote_staging_slots,
+        )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts);
         let observation_capacity = if observation_mode == ObservationMode::Full {
             config.max_observations.unwrap_or(event_bound.max(1))
@@ -1211,6 +1334,20 @@ impl MetalPlan {
             image.stop_time_ns,
             u64::from(minimum_lookahead_ns.is_some()),
             round_capacity as u64,
+            u64::from(config.streams_enabled),
+            streams.layout.stream_count as u64,
+            streams.layout.channel_count as u64,
+            streams.layout.service_stream_base as u64,
+            streams.layout.generator_stream_base as u64,
+            streams.layout.lp_stream_meta_offset as u64,
+            streams.layout.lp_stream_ids_offset as u64,
+            streams.layout.lp_active_ids_offset as u64,
+            streams.layout.outbound_meta_offset as u64,
+            streams.layout.outbound_entries_offset as u64,
+            streams.layout.channel_batch_offset as u64,
+            streams.layout.staging_channel_offset as u64,
+            streams.layout.channel_target_offset as u64,
+            u64::from(cfg!(debug_assertions)),
         ];
 
         Ok(Self {
@@ -1239,6 +1376,10 @@ impl MetalPlan {
             inbound_meta,
             merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
             inbound_producers,
+            stream_state: streams.state,
+            stream_records: streams.records,
+            stream_layout: streams.layout,
+            memory_layout: streams.memory_layout,
             orphan_packets,
             round_capacity,
             dispatch_capacity,
@@ -1664,6 +1805,348 @@ fn derived_remote_capacities(
     capacities
 }
 
+/// Classifies every v1 runtime event source at prepare time.
+///
+/// Each declared `RemoteChannel` owns one inbox ring, each LP owns one alternating
+/// `TxReady`/`TxComplete` service ring, and each `FlowId` with a generator owns one generator
+/// ring. The closed v1 transition set emits no other runtime source; future or otherwise
+/// unclassified kinds fall through to the exact heap in `classified_push`. Initial events are
+/// deliberately never classified because an image may be a partial-history checkpoint.
+#[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all arena sizing inputs.
+fn prepare_streams(
+    image: &SimulationImage,
+    counts: &[usize],
+    feedback_counts: &[usize],
+    lookahead: Option<u64>,
+    config: MetalConfig,
+    legacy_fel_caps: &[usize],
+    fallback_fel_caps: &[usize],
+    fel_meta: &[u64],
+    fel_records: &[u64],
+    remote_staging_slots: usize,
+) -> Result<PreparedStreams, MetalError> {
+    let legacy_heap_event_slots = checked_sum_usize(legacy_fel_caps, "legacy FEL slots")?;
+    let fallback_heap_event_slots = checked_sum_usize(fallback_fel_caps, "fallback FEL slots")?;
+    let heap_arena_bytes = event_arena_bytes(
+        fallback_heap_event_slots,
+        image.nodes.len() * ARENA_META_WORDS,
+    )?;
+    let legacy_heap_arena_bytes = event_arena_bytes(
+        legacy_heap_event_slots,
+        image.nodes.len() * ARENA_META_WORDS,
+    )?;
+    if !config.streams_enabled {
+        return Ok(PreparedStreams {
+            state: vec![0],
+            records: vec![0],
+            layout: StreamLayout::default(),
+            memory_layout: MetalMemoryLayout {
+                streams_enabled: false,
+                legacy_heap_event_slots,
+                fallback_heap_event_slots,
+                checkpoint_fallback_events: image.initial_events.len(),
+                heap_arena_bytes,
+                legacy_heap_arena_bytes,
+                ..MetalMemoryLayout::default()
+            },
+        });
+    }
+
+    let node_count = image.nodes.len();
+    let channel_count = image.channels.len();
+    let service_stream_base = channel_count;
+    let generator_stream_base = service_stream_base
+        .checked_add(node_count)
+        .ok_or_else(|| MetalError::Validation("service stream count overflows usize".into()))?;
+    let stream_count = generator_stream_base
+        .checked_add(image.flows.len())
+        .ok_or_else(|| MetalError::Validation("generator stream count overflows usize".into()))?;
+    let mut channel_caps =
+        derived_channel_stream_capacities(image, counts, feedback_counts, lookahead)?;
+    if let Some(capacity) = config.max_channel_events_per_stream {
+        channel_caps.fill(capacity);
+    }
+    let service_caps = vec![2_usize; node_count];
+    let generator_caps = vec![2_usize; image.flows.len()];
+    let mut stream_caps = Vec::with_capacity(stream_count);
+    stream_caps.extend_from_slice(&channel_caps);
+    stream_caps.extend_from_slice(&service_caps);
+    stream_caps.extend_from_slice(&generator_caps);
+
+    let mut stream_meta = vec![0_u64; stream_count * ARENA_META_WORDS];
+    let stream_record_slots = assign_arena_offsets(&mut stream_meta, &stream_caps)?;
+    let mut lp_streams = vec![Vec::<u64>::new(); node_count];
+    for (channel, descriptor) in image.channels.iter().enumerate() {
+        lp_streams[descriptor.target.0 as usize].push(channel as u64);
+    }
+    for (node, streams) in lp_streams.iter_mut().enumerate() {
+        streams.push((service_stream_base + node) as u64);
+    }
+    for state in &image.host_states {
+        for generator in &state.generators {
+            let stream = generator_stream_base
+                .checked_add(generator.flow.0 as usize)
+                .ok_or_else(|| {
+                    MetalError::Validation("generator stream identifier overflows usize".into())
+                })?;
+            lp_streams[image.flows[generator.flow.0 as usize].source.0 as usize]
+                .push(stream as u64);
+        }
+    }
+    for streams in &mut lp_streams {
+        streams.sort_unstable();
+        streams.dedup();
+    }
+
+    let mut outbound = vec![Vec::<(u64, u64)>::new(); node_count];
+    for (channel, descriptor) in image.channels.iter().enumerate() {
+        outbound[descriptor.source.0 as usize].push((descriptor.target.0, channel as u64));
+    }
+    for entries in &mut outbound {
+        entries.sort_unstable();
+        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(MetalError::Validation(
+                "stream classification requires one channel per source-target LP pair".into(),
+            ));
+        }
+    }
+
+    let lp_stream_id_words = lp_streams
+        .iter()
+        .try_fold(0_usize, |total, streams| total.checked_add(streams.len()))
+        .ok_or_else(|| MetalError::Validation("LP stream-list size overflows usize".into()))?;
+    let lp_active_id_words = lp_streams
+        .iter()
+        .try_fold(0_usize, |total, streams| {
+            total.checked_add(
+                streams
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(ACTIVE_STREAM_ENTRY_WORDS),
+            )
+        })
+        .ok_or_else(|| MetalError::Validation("active stream-list size overflows usize".into()))?;
+    let outbound_entry_count = outbound
+        .iter()
+        .try_fold(0_usize, |total, entries| total.checked_add(entries.len()))
+        .ok_or_else(|| {
+            MetalError::Validation("outbound channel-list size overflows usize".into())
+        })?;
+
+    let mut next = stream_meta.len();
+    let lp_stream_meta_offset = take_words(&mut next, node_count, LP_STREAM_META_WORDS)?;
+    let lp_stream_ids_offset = take_words(&mut next, lp_stream_id_words, 1)?;
+    let lp_active_ids_offset = take_words(&mut next, lp_active_id_words, 1)?;
+    let outbound_meta_offset = take_words(&mut next, node_count, OUTBOUND_META_WORDS)?;
+    let outbound_entries_offset =
+        take_words(&mut next, outbound_entry_count, OUTBOUND_ENTRY_WORDS)?;
+    let channel_batch_offset = take_words(&mut next, channel_count, CHANNEL_BATCH_WORDS)?;
+    let staging_channel_offset = take_words(&mut next, remote_staging_slots, 1)?;
+    let channel_target_offset = take_words(&mut next, channel_count, 1)?;
+
+    let mut state = stream_meta;
+    state.resize(next.max(1), 0);
+    let mut declared_cursor = lp_stream_ids_offset;
+    let mut active_cursor = lp_active_ids_offset;
+    for (node, streams) in lp_streams.iter().enumerate() {
+        let meta = lp_stream_meta_offset + node * LP_STREAM_META_WORDS;
+        state[meta] = declared_cursor as u64;
+        state[meta + 1] = streams.len() as u64;
+        state[meta + 2] = active_cursor as u64;
+        state[declared_cursor..declared_cursor + streams.len()].copy_from_slice(streams);
+        declared_cursor += streams.len();
+        let fel_count = fel_meta[node * ARENA_META_WORDS + 3];
+        if fel_count != 0 {
+            state[active_cursor] = NONE;
+            let root = fel_meta[node * ARENA_META_WORDS] as usize * EVENT_WORDS;
+            state[active_cursor + 1..active_cursor + ACTIVE_STREAM_ENTRY_WORDS]
+                .copy_from_slice(&fel_records[root..root + 4]);
+            state[meta + 3] = 1;
+        }
+        active_cursor += (streams.len() + 1) * ACTIVE_STREAM_ENTRY_WORDS;
+    }
+
+    let mut outbound_cursor = outbound_entries_offset;
+    for (node, entries) in outbound.iter().enumerate() {
+        let meta = outbound_meta_offset + node * OUTBOUND_META_WORDS;
+        state[meta] = outbound_cursor as u64;
+        state[meta + 1] = entries.len() as u64;
+        for &(target, channel) in entries {
+            state[outbound_cursor] = target;
+            state[outbound_cursor + 1] = channel;
+            outbound_cursor += OUTBOUND_ENTRY_WORDS;
+        }
+    }
+    for channel in 0..channel_count {
+        let batch = channel_batch_offset + channel * CHANNEL_BATCH_WORDS;
+        state[batch + 1] = NONE;
+        state[batch + 2] = NONE;
+        state[channel_target_offset + channel] = image.channels[channel].target.0;
+    }
+    state[staging_channel_offset..staging_channel_offset + remote_staging_slots].fill(NONE);
+
+    let channel_stream_event_slots = checked_sum_usize(&channel_caps, "channel stream slots")?;
+    let service_stream_event_slots = checked_sum_usize(&service_caps, "service stream slots")?;
+    let generator_stream_event_slots =
+        checked_sum_usize(&generator_caps, "generator stream slots")?;
+    let stream_arena_bytes = stream_record_slots
+        .checked_mul(EVENT_WORDS)
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+        .and_then(|bytes| {
+            state
+                .len()
+                .checked_mul(std::mem::size_of::<u64>())
+                .and_then(|meta| bytes.checked_add(meta))
+        })
+        .ok_or_else(|| MetalError::Validation("stream arena byte size overflows usize".into()))?;
+
+    Ok(PreparedStreams {
+        state,
+        records: zero_words(stream_record_slots, EVENT_WORDS)?,
+        layout: StreamLayout {
+            stream_count,
+            channel_count,
+            service_stream_base,
+            generator_stream_base,
+            lp_stream_meta_offset,
+            lp_stream_ids_offset,
+            lp_active_ids_offset,
+            outbound_meta_offset,
+            outbound_entries_offset,
+            channel_batch_offset,
+            staging_channel_offset,
+            channel_target_offset,
+        },
+        memory_layout: MetalMemoryLayout {
+            streams_enabled: true,
+            legacy_heap_event_slots,
+            fallback_heap_event_slots,
+            checkpoint_fallback_events: image.initial_events.len(),
+            channel_stream_event_slots,
+            service_stream_event_slots,
+            generator_stream_event_slots,
+            heap_arena_bytes,
+            stream_arena_bytes,
+            legacy_heap_arena_bytes,
+        },
+    })
+}
+
+fn derived_channel_stream_capacities(
+    image: &SimulationImage,
+    counts: &[usize],
+    feedback_counts: &[usize],
+    lookahead: Option<u64>,
+) -> Result<Vec<usize>, MetalError> {
+    // A serial non-preemptive producer can emit at most ceil(horizon/serialization)+1 events per
+    // horizon. Constant propagation can retain at most ceil(propagation/serialization) older
+    // events, and two additional records provide outward-rounded slack. The channel's finite
+    // whole-run packet count remains an absolute cap on semantic events, before slack.
+    let channels = image
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| ((channel.link, channel.target), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut packet_counts = vec![0_usize; image.channels.len()];
+    let mut minimum_serialization = vec![None::<u64>; image.channels.len()];
+    for (flow_index, flow) in image.flows.iter().enumerate() {
+        let feedback_count = feedback_counts[flow_index];
+        let data_count = counts[flow_index].saturating_sub(feedback_count);
+        for (route, terminal, packet_count, packet_kind) in [
+            (
+                flow.route.as_slice(),
+                flow.target,
+                data_count,
+                PacketKind::Data,
+            ),
+            (
+                flow.reverse_route.as_slice(),
+                flow.source,
+                feedback_count,
+                PacketKind::Feedback,
+            ),
+        ] {
+            if packet_count == 0 {
+                continue;
+            }
+            for (step, link_id) in route.iter().enumerate() {
+                let target = route
+                    .get(step + 1)
+                    .map_or(terminal, |next| image.links[next.0 as usize].source);
+                let channel = channels.get(&(*link_id, target)).copied().ok_or_else(|| {
+                    MetalError::Validation(format!(
+                        "no stream classification for link {link_id:?} to node {target:?}"
+                    ))
+                })?;
+                packet_counts[channel] = packet_counts[channel].saturating_add(packet_count);
+                let serialization = flow_link_serialization_ns(
+                    image,
+                    flow_index,
+                    packet_kind,
+                    image.links[link_id.0 as usize],
+                );
+                minimum_serialization[channel] = Some(
+                    minimum_serialization[channel]
+                        .map_or(serialization, |current| current.min(serialization)),
+                );
+            }
+        }
+    }
+    Ok(image
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(channel, descriptor)| {
+            let packet_count = packet_counts[channel];
+            let Some(serialization) = minimum_serialization[channel] else {
+                return 2;
+            };
+            let horizon_emissions = lookahead.map_or(packet_count, |horizon| {
+                usize::try_from(horizon.div_ceil(serialization))
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1)
+            });
+            let propagation_residency = usize::try_from(
+                image.links[descriptor.link.0 as usize]
+                    .propagation_ns
+                    .div_ceil(serialization),
+            )
+            .unwrap_or(usize::MAX);
+            packet_count
+                .min(horizon_emissions.saturating_add(propagation_residency))
+                .saturating_add(2)
+        })
+        .collect())
+}
+
+fn checked_sum_usize(values: &[usize], label: &str) -> Result<usize, MetalError> {
+    values.iter().try_fold(0_usize, |total, value| {
+        total
+            .checked_add(*value)
+            .ok_or_else(|| MetalError::Validation(format!("{label} overflow usize")))
+    })
+}
+
+fn event_arena_bytes(record_slots: usize, meta_words: usize) -> Result<usize, MetalError> {
+    record_slots
+        .checked_mul(EVENT_WORDS)
+        .and_then(|words| words.checked_add(meta_words))
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or_else(|| MetalError::Validation("event arena byte size overflows usize".into()))
+}
+
+fn take_words(next: &mut usize, records: usize, words: usize) -> Result<usize, MetalError> {
+    let start = *next;
+    *next =
+        (*next)
+            .checked_add(records.checked_mul(words).ok_or_else(|| {
+                MetalError::Validation("stream state size overflows usize".into())
+            })?)
+            .ok_or_else(|| MetalError::Validation("stream state size overflows usize".into()))?;
+    Ok(start)
+}
+
 fn derived_observation_capacities(
     image: &SimulationImage,
     counts: &[usize],
@@ -2024,8 +2507,8 @@ impl FelProbeResources {
 
     fn bind(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&self.counts.raw), 0, 25);
-            encoder.setBuffer_offset_atIndex(Some(&self.merge_fan_in.raw), 0, 26);
+            encoder.setBuffer_offset_atIndex(Some(&self.counts.raw), 0, 27);
+            encoder.setBuffer_offset_atIndex(Some(&self.merge_fan_in.raw), 0, 28);
         }
     }
 
@@ -2050,9 +2533,11 @@ impl FelProbeResources {
     }
 
     fn merge_fan_in(&self) -> Result<MetalMergeFanIn, MetalError> {
-        self.merge_fan_in.read().chunks_exact(4).try_fold(
-            MetalMergeFanIn::default(),
-            |mut total, row| {
+        self.merge_fan_in
+            .read()
+            .chunks_exact(4)
+            .enumerate()
+            .try_fold(MetalMergeFanIn::default(), |mut total, (target, row)| {
                 total.eventful_target_rounds = total
                     .eventful_target_rounds
                     .checked_add(row[0])
@@ -2068,10 +2553,22 @@ impl FelProbeResources {
                 total.remote_events = total.remote_events.checked_add(row[2]).ok_or_else(|| {
                     MetalError::Validation("merge remote-event count overflows".into())
                 })?;
-                total.maximum_active_fan_in = total.maximum_active_fan_in.max(row[3]);
+                if row[3] > total.maximum_active_fan_in {
+                    total.maximum_active_fan_in = row[3];
+                    total.first_maximum_fan_in_target = Some(NodeId(target as u64));
+                    total.maximum_fan_in_target_count = 1;
+                } else if row[3] != 0 && row[3] == total.maximum_active_fan_in {
+                    total.maximum_fan_in_target_count = total
+                        .maximum_fan_in_target_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            MetalError::Validation(
+                                "merge maximum-fan-in target count overflows".into(),
+                            )
+                        })?;
+                }
                 Ok(total)
-            },
-        )
+            })
     }
 }
 
@@ -2079,6 +2576,8 @@ struct MetalBuffers {
     planes: Vec<SharedBuffer>,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
+    stream_layout: StreamLayout,
+    memory_layout: MetalMemoryLayout,
     round_capacity: usize,
     dispatch_capacity: usize,
 }
@@ -2088,6 +2587,8 @@ impl MetalBuffers {
         let round_capacity = plan.round_capacity;
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
+        let stream_layout = plan.stream_layout;
+        let memory_layout = plan.memory_layout;
         let node_count = plan.params[0] as usize;
         let planes = vec![
             plan.control,
@@ -2115,6 +2616,8 @@ impl MetalBuffers {
             plan.inbound_meta,
             plan.inbound_producers,
             plan.merge_cursors,
+            plan.stream_state,
+            plan.stream_records,
         ]
         .into_iter()
         .map(|words| SharedBuffer::new(device, words))
@@ -2123,6 +2626,8 @@ impl MetalBuffers {
             planes,
             orphan_packets,
             node_count,
+            stream_layout,
+            memory_layout,
             round_capacity,
             dispatch_capacity,
         })
@@ -2170,6 +2675,8 @@ impl MetalBuffers {
         let arrival_words = &planes[17];
         let lp_state = &planes[18];
         let observation_meta = &planes[21];
+        let stream_state = &planes[25];
+        let stream_records = &planes[26];
 
         let mut host_states = image.host_states.clone();
         let mut switch_states = image.switch_states.clone();
@@ -2237,6 +2744,20 @@ impl MetalBuffers {
             let count = fel_meta[base + 3] as usize;
             for index in 0..count {
                 let record = read_record(fel_records, offset + index);
+                let (event, packet) = decode_event(record)?;
+                resident.insert(packet.id, packet);
+                pending_events.push(event);
+            }
+        }
+        for stream in 0..self.stream_layout.stream_count {
+            let base = stream * ARENA_META_WORDS;
+            let offset = stream_state[base] as usize;
+            let capacity = stream_state[base + 1] as usize;
+            let head = stream_state[base + 2] as usize;
+            let count = stream_state[base + 3] as usize;
+            for index in 0..count {
+                let physical = (head + index) % capacity.max(1);
+                let record = read_record(stream_records, offset + physical);
                 let (event, packet) = decode_event(record)?;
                 resident.insert(packet.id, packet);
                 pending_events.push(event);
@@ -2359,6 +2880,7 @@ impl MetalBuffers {
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
             phase_profile,
+            memory_layout: self.memory_layout,
         })
     }
 }
@@ -2389,6 +2911,9 @@ fn decode_arena(value: u64) -> MetalArena {
         5 => MetalArena::ObservedPackets,
         6 => MetalArena::Departures,
         7 => MetalArena::Arrivals,
+        8 => MetalArena::ChannelInbox,
+        9 => MetalArena::ServiceStream,
+        10 => MetalArena::GeneratorStream,
         _ => MetalArena::Fel,
     }
 }
@@ -3264,10 +3789,19 @@ fn seconds_ns(seconds: f64) -> u64 {
 mod tests {
     use super::{
         ATTEMPT_PHASES, AttemptPhase, DispatchGeometry, LANES,
-        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalPhaseTimings,
-        PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS, accumulate_profile_interval,
-        build_phase_profile, encoding_limits, paced_single_source_queue_bound,
+        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
+        MetalPhaseTimings, PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS,
+        accumulate_profile_interval, build_phase_profile, encoding_limits,
+        paced_single_source_queue_bound,
     };
+
+    #[test]
+    fn stream_decomposition_is_enabled_by_default() {
+        let config = MetalConfig::default();
+
+        assert!(config.streams_enabled);
+        assert_eq!(config.max_channel_events_per_stream, None);
+    }
 
     #[test]
     fn production_attempt_uses_fixed_parallel_control_geometry() {

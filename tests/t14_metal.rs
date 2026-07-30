@@ -24,16 +24,41 @@ fn assert_metal_matches_scalar(relative: &str) -> MetalRun {
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
     let scalar = run_scalar(&image, None)
         .unwrap_or_else(|error| panic!("scalar failed for {}: {error}", path.display()));
-    let metal = run_metal(&image, None, MetalConfig::default())
-        .unwrap_or_else(|error| panic!("Metal failed for {}: {error}", path.display()));
+    let run = |streams_enabled| {
+        run_metal(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                ..MetalConfig::default()
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "Metal streams={streams_enabled} failed for {}: {error}",
+                path.display()
+            )
+        })
+    };
+    let streams = run(true);
+    let heap = run(false);
 
     assert_eq!(
-        metal.result,
+        streams.result,
         scalar,
-        "Metal result differs from scalar for {}",
+        "Metal streams=true differs from scalar for {}",
         path.display()
     );
-    metal
+    assert_eq!(
+        heap.result,
+        scalar,
+        "Metal streams=false differs from scalar for {}",
+        path.display()
+    );
+    assert_eq!(streams.result, heap.result);
+    assert_eq!(streams.rounds, heap.rounds);
+    assert_eq!(streams.transitions, heap.transitions);
+    streams
 }
 
 #[test]
@@ -48,12 +73,13 @@ fn fattree_k8_result_is_independent_of_round_threadgroup_geometry() {
     let path = fixture_path(BASELINE_FIXTURES[1]);
     let image = compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
-    let run = |round_threads_per_threadgroup| {
+    let run = |round_threads_per_threadgroup, streams_enabled| {
         run_metal_with_observations(
             &image,
             None,
             MetalConfig {
                 round_threads_per_threadgroup,
+                streams_enabled,
                 ..MetalConfig::default()
             },
             ObservationMode::Full,
@@ -66,10 +92,12 @@ fn fattree_k8_result_is_independent_of_round_threadgroup_geometry() {
         })
     };
 
-    let narrow = run(32);
-    let wide = run(256);
+    for streams_enabled in [true, false] {
+        let narrow = run(32, streams_enabled);
+        let wide = run(256, streams_enabled);
 
-    assert_eq!(narrow.result, wide.result);
+        assert_eq!(narrow.result, wide.result);
+    }
 }
 
 #[test]
