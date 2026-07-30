@@ -5,12 +5,12 @@ use std::collections::VecDeque;
 use std::thread;
 
 use days_executor::{
-    Backend, ConstantGenerator, CudaConfig, Event, EventKey, EventKind, FlowDescriptor,
-    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
-    GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
-    ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission,
-    SimulationImage, event_phase, run_cuda, run_cuda_with_observations,
-    run_scalar_with_observations, validate,
+    ArrivalDisposition, Backend, ConstantGenerator, CudaConfig, Event, EventKey, EventKind,
+    FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
+    GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor,
+    NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel,
+    ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    run_cuda, run_cuda_with_observations, run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda-test-hooks")]
 use days_executor::{CudaArena, CudaError, CudaExecutor};
@@ -360,6 +360,179 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
     }
 }
 
+fn fan_in_tail_drop_contention_image() -> SimulationImage {
+    let source_zero_link = LinkDescriptor {
+        id: LinkId(0),
+        source: NodeId(0),
+        target: NodeId(2),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 9,
+    };
+    let source_one_link = LinkDescriptor {
+        id: LinkId(1),
+        source: NodeId(1),
+        target: NodeId(2),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 10,
+    };
+    let switch_link = LinkDescriptor {
+        id: LinkId(2),
+        source: NodeId(2),
+        target: NodeId(3),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let sink_egress = LinkDescriptor {
+        id: LinkId(3),
+        source: NodeId(3),
+        target: NodeId(0),
+        rate_bps: 8_000_000_000,
+        propagation_ns: 0,
+    };
+    let packet_zero = PacketDescriptor {
+        id: PayloadId(0),
+        flow: FlowId(0),
+        size_bytes: 1,
+        kind: PacketKind::Data,
+    };
+    let packet_one = PacketDescriptor {
+        id: PayloadId(1),
+        flow: FlowId(1),
+        size_bytes: 1,
+        kind: PacketKind::Data,
+    };
+
+    SimulationImage {
+        stop_time_ns: 100,
+        nodes: vec![
+            NodeDescriptor {
+                id: NodeId(0),
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(1),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(2),
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(3),
+                kind: NodeKind::Host,
+                state_slot: 2,
+            },
+        ],
+        host_states: vec![
+            HostState {
+                egress_link: source_zero_link.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 1,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: source_one_link.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 1,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: sink_egress.id,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ],
+        switch_states: vec![SwitchState {
+            physical_switch: 0,
+            queues: vec![SwitchQueueState {
+                egress_link: Some(switch_link.id),
+                scheduler: SchedulerKind::Fifo,
+                queue_capacity_packets: 1,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+            }],
+            next_origin_seq: 0,
+            arrived_packets: 0,
+            dropped_packets: 0,
+            departed_packets: 0,
+        }],
+        flows: vec![
+            FlowDescriptor {
+                id: packet_zero.flow,
+                source: NodeId(0),
+                target: NodeId(3),
+                route: vec![source_zero_link.id, switch_link.id],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: packet_one.flow,
+                source: NodeId(1),
+                target: NodeId(3),
+                route: vec![source_one_link.id, switch_link.id],
+                reverse_route: vec![],
+            },
+        ],
+        initial_packets: vec![packet_zero, packet_one],
+        links: vec![source_zero_link, source_one_link, switch_link, sink_egress],
+        channels: vec![
+            RemoteChannel::for_packet_link(source_zero_link, packet_zero.size_bytes)
+                .expect("source-zero channel delay must fit"),
+            RemoteChannel::for_packet_link(source_one_link, packet_one.size_bytes)
+                .expect("source-one channel delay must fit"),
+            RemoteChannel::for_packet_link(switch_link, packet_zero.size_bytes)
+                .expect("switch channel delay must fit"),
+        ],
+        initial_events: vec![
+            Event {
+                key: EventKey {
+                    time_ns: 0,
+                    phase: event_phase(EventKind::PacketArrival),
+                    origin_node: NodeId(1),
+                    origin_seq: 0,
+                },
+                target: NodeId(1),
+                kind: EventKind::PacketArrival,
+                payload: packet_one.id,
+            },
+            Event {
+                key: EventKey {
+                    time_ns: 1,
+                    phase: event_phase(EventKind::PacketArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: 0,
+                },
+                target: NodeId(0),
+                kind: EventKind::PacketArrival,
+                payload: packet_zero.id,
+            },
+        ],
+        seed: 37,
+    }
+}
+
 fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>) {
     validate(image, Backend::Cuda).expect("production CUDA fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
@@ -433,19 +606,52 @@ fn cuda_block_boundaries_and_geometry_match_full_scalar_result() {
 }
 
 #[test]
-fn cuda_fallback_heap_multi_producer_fan_in_keeps_canonical_tie_order() {
-    let image = multi_producer_target_image(4);
+fn cuda_fallback_heap_fan_in_tie_order_decides_tail_drop_winner() {
+    let image = fan_in_tail_drop_contention_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("fan-in scalar oracle must run");
     assert_eq!(
         scalar
             .arrivals
             .iter()
-            .map(|arrival| arrival.payload)
+            .filter(|arrival| arrival.time_ns == 11)
+            .map(|arrival| (arrival.payload, arrival.disposition))
             .collect::<Vec<_>>(),
-        vec![PayloadId(0), PayloadId(1), PayloadId(2), PayloadId(3)]
+        vec![
+            (PayloadId(0), ArrivalDisposition::Admitted),
+            (PayloadId(1), ArrivalDisposition::Dropped),
+        ]
     );
-    assert_full_parity(&image, None);
+    assert_eq!(scalar.summary.admitted_packets, 1);
+    assert_eq!(scalar.summary.dropped_packets, 1);
+    assert_eq!(scalar.summary.received_packets, 1);
+
+    for streams_enabled in [false, true] {
+        let cuda = run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig {
+                streams_enabled,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| {
+            panic!("fan-in CUDA backend with streams={streams_enabled} failed: {error}")
+        });
+
+        // Heap mode routes both runtime arrivals through the per-LP fallback heap. Streams mode
+        // instead checks that the k-way merge of the two per-channel inboxes chooses the same
+        // canonical winner; it is not evidence about the fallback heap.
+        assert_eq!(cuda.memory_layout.streams_enabled, streams_enabled);
+        if streams_enabled {
+            assert!(cuda.memory_layout.channel_stream_event_slots >= 2);
+        } else {
+            assert_eq!(cuda.memory_layout.channel_stream_event_slots, 0);
+            assert!(cuda.memory_layout.fallback_heap_event_slots >= 2);
+        }
+        assert_eq!(cuda.result, scalar);
+    }
 }
 
 #[test]
