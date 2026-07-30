@@ -18,6 +18,7 @@ metal-spike = [
     "dep:objc2-foundation",
     "dep:objc2-metal",
 ]
+metal-test-hooks = ["metal-spike"]
 
 [dependencies]
 crossbeam = "0.8.4"

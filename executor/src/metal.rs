@@ -71,6 +71,12 @@ const PROFILED_ATTEMPTS: usize = 128;
 
 static METAL_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "metal-test-hooks")]
+std::thread_local! {
+    static PANIC_AFTER_NEXT_EXECUTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Acquires the supported process-wide Metal execution envelope.
 ///
 /// The guard schedules device access rather than protecting Rust state, so a panic must not
@@ -79,6 +85,22 @@ pub(crate) fn metal_device_execution_guard() -> MutexGuard<'static, ()> {
     METAL_DEVICE_EXECUTION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Arms a one-shot panic after this thread's next successful Metal execution.
+///
+/// This test-only hook fires before readback while the process-wide execution guard remains held.
+#[cfg(feature = "metal-test-hooks")]
+#[doc(hidden)]
+pub fn panic_after_next_execution_for_testing() {
+    PANIC_AFTER_NEXT_EXECUTION.with(|armed| armed.set(true));
+}
+
+#[cfg(feature = "metal-test-hooks")]
+fn panic_after_execution_if_requested() {
+    if PANIC_AFTER_NEXT_EXECUTION.with(std::cell::Cell::take) {
+        panic!("injected panic after Metal execution");
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -928,6 +950,8 @@ impl MetalExecutor {
         let buffers = MetalBuffers::new(&self.direct.device, plan)?;
         let _execution_guard = metal_device_execution_guard();
         let timing = self.direct.run(&buffers, config, profile)?;
+        #[cfg(feature = "metal-test-hooks")]
+        panic_after_execution_if_requested();
         buffers.finish(image, observation_mode, timing)
     }
 }

@@ -1171,6 +1171,38 @@ fn concurrent_public_api_runs_match_the_scalar_result() {
     }
 }
 
+#[cfg(feature = "metal-test-hooks")]
+#[test]
+fn process_wide_guard_recovers_after_a_mid_execution_panic() {
+    let image = generator_image(GeneratorTermination::Bytes(2));
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar recovery oracle must run");
+    let panic_image = image.clone();
+
+    let panic = thread::spawn(move || {
+        days_executor::metal::panic_after_next_execution_for_testing();
+        run_metal_with_observations(
+            &panic_image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("the injected Metal execution must reach the panic boundary");
+    })
+    .join()
+    .expect_err("the guarded Metal execution must panic");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>(),
+        Some(&"injected panic after Metal execution"),
+        "the worker must panic at the guarded post-execution boundary"
+    );
+
+    let recovered =
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("Metal execution must recover after the guarded panic");
+    assert_eq!(recovered.result, expected);
+}
+
 #[test]
 fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
     let image = fifo_taildrop_image();
