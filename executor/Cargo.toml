@@ -10,6 +10,7 @@ name = "days_executor"
 [features]
 default = []
 cuda = ["dep:cudarc"]
+cuda-test-hooks = ["cuda"]
 metal-spike = [
     "dep:cubecl",
     "cubecl/metal-native",

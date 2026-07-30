@@ -1994,7 +1994,7 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     }
 }
 
-extern "C" __global__ void days_round(DAYS_BUFFERS) {
+extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
     uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (
         control[C_ERROR] != 0 ||

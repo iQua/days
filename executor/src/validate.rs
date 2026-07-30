@@ -1281,7 +1281,7 @@ fn validate_global_time_capacity(
     backend: Backend,
 ) -> Result<(), ValidationError> {
     let mut service_bound = 0_u64;
-    let service_payloads = if backend == Backend::Metal {
+    let service_payloads = if matches!(backend, Backend::Metal | Backend::Cuda) {
         let mut payloads = image
             .host_states
             .iter()

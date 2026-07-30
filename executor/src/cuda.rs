@@ -8,6 +8,8 @@
 //! plane at graph-wave boundaries, then explicitly transfers every result plane for normalization.
 //! No unified or host-mapped device memory and no result-affecting atomics are used.
 
+#[cfg(feature = "cuda-test-hooks")]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -66,6 +68,11 @@ const CONTROL_WORDS: usize = 19;
 static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
 static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
 
+#[cfg(feature = "cuda-test-hooks")]
+std::thread_local! {
+    static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Acquires the supported process-wide CUDA execution envelope.
 ///
 /// The guard schedules device access rather than protecting Rust state, so a panic must not
@@ -74,6 +81,22 @@ pub(crate) fn cuda_device_execution_guard() -> MutexGuard<'static, ()> {
     CUDA_DEVICE_EXECUTION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Arms a one-shot panic after this thread's next successful CUDA graph execution.
+///
+/// This test hook fires while the process-wide execution guard is still held.
+#[doc(hidden)]
+#[cfg(feature = "cuda-test-hooks")]
+pub fn panic_after_next_execution_for_testing() {
+    PANIC_AFTER_NEXT_EXECUTION.set(true);
+}
+
+#[cfg(feature = "cuda-test-hooks")]
+fn panic_after_execution_if_requested() {
+    if PANIC_AFTER_NEXT_EXECUTION.replace(false) {
+        panic!("injected panic after CUDA execution");
+    }
 }
 
 /// Bounded device arena reported by a production CUDA capacity fault.
@@ -409,6 +432,10 @@ pub struct CudaConfig {
     pub attempts_per_graph_wave: usize,
     /// Optional hard cap overriding the conservative semantic round bound.
     pub max_rounds: Option<usize>,
+    /// Test-only zero-capacity injection for device arenas without a public sizing override.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub fault_injection: Option<CudaArena>,
 }
 
 impl Default for CudaConfig {
@@ -424,6 +451,8 @@ impl Default for CudaConfig {
             round_threads_per_block: DEFAULT_ROUND_THREADS_PER_BLOCK,
             attempts_per_graph_wave: DEFAULT_ATTEMPTS_PER_GRAPH_WAVE,
             max_rounds: None,
+            #[cfg(feature = "cuda-test-hooks")]
+            fault_injection: None,
         }
     }
 }
@@ -580,6 +609,8 @@ impl CudaExecutor {
         let _execution_guard = cuda_device_execution_guard();
         let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
         let timing = self.direct.run(&buffers, config)?;
+        #[cfg(feature = "cuda-test-hooks")]
+        panic_after_execution_if_requested();
         buffers.finish(&self.direct.stream, image, observation_mode, timing)
     }
 }
@@ -606,8 +637,33 @@ fn validate_config(config: CudaConfig) -> Result<(), CudaError> {
             "round_threads_per_block must be nonzero".into(),
         ));
     }
+    #[cfg(feature = "cuda-test-hooks")]
+    if config.fault_injection.is_some_and(|arena| {
+        !matches!(
+            arena,
+            CudaArena::ServiceStream
+                | CudaArena::GeneratorStream
+                | CudaArena::Departures
+                | CudaArena::Arrivals
+        )
+    }) {
+        return Err(CudaError::Validation(
+            "fault_injection supports only service/generator streams and departure/arrival logs"
+                .into(),
+        ));
+    }
     Ok(())
 }
+
+fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> usize {
+    #[cfg(feature = "cuda-test-hooks")]
+    if config.fault_injection == Some(arena) {
+        return 0;
+    }
+    let _ = (config, arena);
+    default
+}
+
 struct CudaPlan {
     control: Vec<u64>,
     params: Vec<u64>,
@@ -970,6 +1026,9 @@ impl CudaPlan {
         } else {
             0
         };
+        let departure_capacity =
+            injected_capacity(config, CudaArena::Departures, observation_capacity);
+        let arrival_capacity = injected_capacity(config, CudaArena::Arrivals, observation_capacity);
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
             derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
         } else {
@@ -981,6 +1040,18 @@ impl CudaPlan {
         let mut observation_meta = vec![0_u64; node_count * OBSERVATION_META_WORDS];
         let observation_slots =
             assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
+        if departure_capacity != observation_capacity {
+            for node in 0..node_count {
+                observation_meta[node * OBSERVATION_META_WORDS + ARENA_META_WORDS + 1] =
+                    departure_capacity as u64;
+            }
+        }
+        if arrival_capacity != observation_capacity {
+            for node in 0..node_count {
+                observation_meta[node * OBSERVATION_META_WORDS + 2 * ARENA_META_WORDS + 1] =
+                    arrival_capacity as u64;
+            }
+        }
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1002,8 +1073,8 @@ impl CudaPlan {
             outbox_capacity as u64,
             node_count as u64,
             observation_capacity as u64,
-            observation_capacity as u64,
-            observation_capacity as u64,
+            departure_capacity as u64,
+            arrival_capacity as u64,
             u64::from(observation_mode == ObservationMode::Full),
             minimum_lookahead_ns.unwrap_or(0),
             config.max_transitions_per_lp_per_round as u64,
@@ -1542,8 +1613,9 @@ fn prepare_streams(
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity);
     }
-    let service_caps = vec![2_usize; node_count];
-    let generator_caps = vec![2_usize; image.flows.len()];
+    let service_caps = vec![injected_capacity(config, CudaArena::ServiceStream, 2); node_count];
+    let generator_caps =
+        vec![injected_capacity(config, CudaArena::GeneratorStream, 2); image.flows.len()];
     let mut stream_caps = Vec::with_capacity(stream_count);
     stream_caps.extend_from_slice(&channel_caps);
     stream_caps.extend_from_slice(&service_caps);
