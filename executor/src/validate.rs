@@ -88,6 +88,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_flows(image)?;
     validate_generators(image)?;
     let derived_delays = validate_packets_and_derive_delays(image)?;
+    validate_tcp_segment_ledger(image)?;
     validate_owned_service_state(image, backend)?;
     validate_channels(image, backend, &derived_delays)?;
     validate_events(image)?;
@@ -630,10 +631,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                         )));
                     }
                     GeneratorStatus::Blocked => {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} TCP generator cannot start Blocked because initial retransmission timers are unsupported",
-                            flow.id
-                        )));
+                        validate_blocked_tcp_timer(image, owner.id, flow.id, tcp)?;
                     }
                     GeneratorStatus::Scheduled | GeneratorStatus::Finished => {}
                 }
@@ -939,6 +937,127 @@ fn validate_preloaded_arrival_capacity(image: &SimulationImage) -> Result<(), Va
                 packet.flow
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_tcp_segment_ledger(image: &SimulationImage) -> Result<(), ValidationError> {
+    let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
+        ValidationError::new(format!(
+            "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
+            conflict.flow,
+            conflict.sequence,
+            conflict.original_size_bytes,
+            conflict.replacement_size_bytes
+        ))
+    })?;
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+            continue;
+        };
+        for packet in image
+            .initial_packets
+            .iter()
+            .filter(|packet| packet.flow == generator.flow)
+        {
+            let PacketKind::TcpData(header) = packet.kind else {
+                continue;
+            };
+            if header.sequence < tcp.next_sequence
+                || generator.next_emission.status == GeneratorStatus::Scheduled
+                    && packet.id == generator.next_emission.payload
+                    && header.sequence == tcp.next_sequence
+            {
+                continue;
+            }
+            return Err(ValidationError::new(format!(
+                "flow {:?} TCP segment ledger has unexpected initial segment at sequence {} at or beyond next sequence {}",
+                generator.flow, header.sequence, tcp.next_sequence
+            )));
+        }
+        let mut expected_sequence = tcp.highest_ack;
+        if let Some(segments) = ledger.get(&generator.flow) {
+            for (&sequence, packet) in segments.range(tcp.highest_ack..tcp.next_sequence) {
+                if sequence != expected_sequence {
+                    return Err(incomplete_tcp_segment_ledger(
+                        generator.flow,
+                        tcp.highest_ack,
+                        tcp.next_sequence,
+                        expected_sequence,
+                    ));
+                }
+                expected_sequence = sequence.checked_add(packet.size_bytes).ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} TCP segment at sequence {sequence} overflows the byte sequence domain",
+                        generator.flow
+                    ))
+                })?;
+                if expected_sequence > tcp.next_sequence {
+                    return Err(incomplete_tcp_segment_ledger(
+                        generator.flow,
+                        tcp.highest_ack,
+                        tcp.next_sequence,
+                        sequence,
+                    ));
+                }
+            }
+        }
+        if expected_sequence != tcp.next_sequence {
+            return Err(incomplete_tcp_segment_ledger(
+                generator.flow,
+                tcp.highest_ack,
+                tcp.next_sequence,
+                expected_sequence,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn incomplete_tcp_segment_ledger(
+    flow: crate::FlowId,
+    highest_ack: u64,
+    next_sequence: u64,
+    expected_sequence: u64,
+) -> ValidationError {
+    ValidationError::new(format!(
+        "flow {flow:?} TCP segment ledger does not cover unacknowledged byte range {highest_ack}..{next_sequence}; expected segment at sequence {expected_sequence}"
+    ))
+}
+
+fn validate_blocked_tcp_timer(
+    image: &SimulationImage,
+    owner: NodeId,
+    flow: crate::FlowId,
+    tcp: crate::TcpGenerator,
+) -> Result<(), ValidationError> {
+    let timer = tcp.active_timer.ok_or_else(|| {
+        ValidationError::new(format!(
+            "flow {flow:?} TCP generator is Blocked without an active retransmission timer"
+        ))
+    })?;
+    if timer.sequence != tcp.highest_ack
+        || timer.generation != tcp.timer_generation
+        || timer.attempt != tcp.last_attempt
+    {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} TCP active retransmission timer is inconsistent with sender state"
+        )));
+    }
+    let matching_events = image
+        .initial_events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::RetransmissionTimeout
+                && event.target == owner
+                && event.payload == timer.attempt
+                && event.key.time_ns == timer.deadline_ns
+        })
+        .count();
+    if matching_events != 1 {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} TCP active retransmission timer has {matching_events} matching events; expected 1"
+        )));
     }
     Ok(())
 }
@@ -1723,6 +1842,15 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                 target.kind, target.id, event.kind
             )));
         }
+        if event.kind == EventKind::RetransmissionTimeout {
+            if origin.id != target.id || target.kind != NodeKind::Host {
+                return Err(ValidationError::new(format!(
+                    "RetransmissionTimeout event {index} must be owned by one host node"
+                )));
+            }
+            continue;
+        }
+
         let packet = packet(image, event.payload).ok_or_else(|| {
             ValidationError::new(format!(
                 "initial event {index} references unknown packet {:?}",
@@ -1807,11 +1935,7 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                     index,
                 )?;
             }
-            EventKind::RetransmissionTimeout => {
-                return Err(ValidationError::new(
-                    "initial retransmission timers are not accepted; TCP schedules them from a send transition",
-                ));
-            }
+            EventKind::RetransmissionTimeout => unreachable!("handled before packet lookup"),
         }
     }
     Ok(())
@@ -1867,6 +1991,7 @@ fn validate_global_time_capacity(
     backend: Backend,
 ) -> Result<(), ValidationError> {
     let mut service_bound = 0_u64;
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
     let service_payloads = if matches!(backend, Backend::Metal | Backend::Cuda) {
         let mut payloads = image
             .host_states
@@ -1901,6 +2026,7 @@ fn validate_global_time_capacity(
         .collect::<BTreeSet<_>>();
     for packet in &image.initial_packets {
         if scheduled_payloads.contains(&packet.id)
+            || matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id)
             || service_payloads
                 .as_ref()
                 .is_some_and(|payloads| !payloads.contains(&packet.id))
@@ -2301,8 +2427,11 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
         .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
         .map(|generator| generator.next_emission.payload)
         .collect::<BTreeSet<_>>();
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
     for packet in &image.initial_packets {
-        if scheduled_payloads.contains(&packet.id) {
+        if scheduled_payloads.contains(&packet.id)
+            || matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id)
+        {
             continue;
         }
         let counts = if packet.kind.is_data() {

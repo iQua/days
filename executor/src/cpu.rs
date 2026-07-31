@@ -3265,6 +3265,9 @@ fn build_lps<'image>(
         if futures[lp_slot].insert(event.key, event).is_some() {
             return Err(ExecutionError::DuplicateEventKey(event.key));
         }
+        if event.kind == crate::EventKind::RetransmissionTimeout {
+            continue;
+        }
         let descriptor = descriptors
             .get(&event.payload)
             .copied()
@@ -3328,6 +3331,13 @@ fn build_lps<'image>(
             let source_slot =
                 node_slot(image, flow.source).ok_or(ExecutionError::UnknownNode(flow.source))?;
             tcp_segment_seeds[source_slot].push(descriptor);
+        }
+        let ledger_only = matches!(descriptor.kind, crate::PacketKind::TcpData(_))
+            && !meaningful_event_payloads.contains(&descriptor.id)
+            && !queued_payloads.contains(&descriptor.id)
+            && !in_service_payloads.contains(&descriptor.id);
+        if ledger_only {
+            continue;
         }
         let needs_orphan_retention = !meaningful_event_payloads.contains(&descriptor.id)
             && !queued_payloads.contains(&descriptor.id)
@@ -3575,6 +3585,7 @@ fn assemble_result(
         .collect::<Vec<_>>();
     let mut summary = RunSummary::default();
     let mut resident_packets = BTreeMap::new();
+    let mut tcp_segment_ledger = BTreeMap::new();
     let mut observed_packets = BTreeMap::new();
     let mut departures = Vec::new();
     let mut arrivals = Vec::new();
@@ -3599,11 +3610,15 @@ fn assemble_result(
             &mut switch_states,
             &mut summary,
             &mut resident_packets,
+            &mut tcp_segment_ledger,
             &mut observed_packets,
             &mut departures,
             &mut arrivals,
             &mut tcp_transitions,
         )?;
+    }
+    for packet in tcp_segment_ledger.into_values() {
+        resident_packets.entry(packet.id).or_insert(packet);
     }
     pending_events.sort_unstable_by_key(|event| event.key);
     departures.sort_unstable_by_key(|(key, _)| *key);
@@ -3654,6 +3669,7 @@ fn install_local_result(
     switch_states: &mut [Option<crate::SwitchState>],
     summary: &mut RunSummary,
     resident_packets: &mut BTreeMap<PayloadId, PacketDescriptor>,
+    tcp_segment_ledger: &mut BTreeMap<PayloadId, PacketDescriptor>,
     observed_packets: &mut BTreeMap<PayloadId, PacketDescriptor>,
     departures: &mut Vec<(EventKey, PacketDeparture)>,
     arrivals: &mut Vec<(EventKey, PacketArrivalObservation)>,
@@ -3696,6 +3712,13 @@ fn install_local_result(
         .filter(|packet| referenced.contains(&packet.id))
     {
         if let Some(existing) = resident_packets.insert(packet.id, packet) {
+            if existing != packet {
+                return Err(ExecutionError::DuplicatePayload(packet.id));
+            }
+        }
+    }
+    for packet in local.tcp_segment_ledger {
+        if let Some(existing) = tcp_segment_ledger.insert(packet.id, packet) {
             if existing != packet {
                 return Err(ExecutionError::DuplicatePayload(packet.id));
             }

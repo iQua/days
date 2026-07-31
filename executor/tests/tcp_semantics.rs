@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use days_executor::{
     Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, ConstantGenerator, CpuConfig, Event,
@@ -473,6 +473,70 @@ fn scheduled_tcp_checkpoint_image(in_flight_segments: u64, total_segments: u64) 
     image
 }
 
+fn checkpoint_image(
+    source: &SimulationImage,
+    result: &days_executor::RunResult,
+) -> SimulationImage {
+    let mut checkpoint = source.clone();
+    checkpoint.host_states = result.host_states.clone();
+    checkpoint.switch_states = result.switch_states.clone();
+    checkpoint.initial_packets = result.resident_packets.clone();
+    checkpoint.initial_events = result.pending_events.clone();
+    checkpoint
+}
+
+fn stitch_checkpoint_run(
+    prefix: &days_executor::RunResult,
+    suffix: &days_executor::RunResult,
+) -> days_executor::RunResult {
+    let mut summary = prefix.summary;
+    macro_rules! add_summary {
+        ($field:ident) => {
+            summary.$field += suffix.summary.$field;
+        };
+    }
+    add_summary!(sourced_packets);
+    add_summary!(sourced_bytes);
+    add_summary!(departed_packets);
+    add_summary!(departed_bytes);
+    add_summary!(admitted_packets);
+    add_summary!(admitted_bytes);
+    add_summary!(received_packets);
+    add_summary!(received_bytes);
+    add_summary!(dropped_packets);
+    add_summary!(dropped_bytes);
+    add_summary!(feedback_packets);
+    add_summary!(feedback_bytes);
+
+    let mut observed_packets = prefix
+        .observed_packets
+        .iter()
+        .chain(&suffix.observed_packets)
+        .map(|packet| (packet.id, *packet))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
+    observed_packets.sort_by_key(|packet| packet.id);
+    let mut departures = prefix.departures.clone();
+    departures.extend_from_slice(&suffix.departures);
+    let mut arrivals = prefix.arrivals.clone();
+    arrivals.extend_from_slice(&suffix.arrivals);
+    let mut tcp_transitions = prefix.tcp_transitions.clone();
+    tcp_transitions.extend_from_slice(&suffix.tcp_transitions);
+
+    days_executor::RunResult {
+        host_states: suffix.host_states.clone(),
+        switch_states: suffix.switch_states.clone(),
+        summary,
+        resident_packets: suffix.resident_packets.clone(),
+        observed_packets,
+        departures,
+        arrivals,
+        tcp_transitions,
+        pending_events: suffix.pending_events.clone(),
+    }
+}
+
 #[test]
 fn reno_slow_start_doubles_exactly_over_one_window_of_acks() {
     let mut reno = TcpCongestionControl::reno(MSS);
@@ -901,7 +965,7 @@ fn validator_rejects_nonprogressing_tcp_blocked_fresh_flow_without_an_event() {
             .expect_err("a fresh blocked TCP flow without live work must be rejected");
         assert_eq!(
             error.to_string(),
-            "flow FlowId(0) TCP generator cannot start Blocked because initial retransmission timers are unsupported"
+            "flow FlowId(0) TCP generator is Blocked without an active retransmission timer"
         );
     }
 }
@@ -936,7 +1000,7 @@ fn validator_rejects_blocked_tcp_with_only_unscheduled_timer_state() {
             .expect_err("timer state without a live timer event cannot make progress");
         assert_eq!(
             error.to_string(),
-            "flow FlowId(0) TCP generator cannot start Blocked because initial retransmission timers are unsupported"
+            "flow FlowId(0) TCP active retransmission timer has 0 matching events; expected 1"
         );
     }
 }
@@ -1308,6 +1372,342 @@ fn cpu_checkpoint_retransmission_uses_source_owned_segment_ledger() {
             PacketKind::TcpData(header) if header.retransmission && header.sequence == 0
         )
     }));
+}
+
+#[test]
+fn ack_normalized_checkpoint_reconstructs_partial_segment_for_both_backends() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    let generator = &mut image.host_states[0].generators[0];
+    generator.feedback.outstanding_bytes = MSS - 1;
+    generator.feedback.unacknowledged_bytes = MSS - 1;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.highest_ack = 1;
+    tcp.bytes_in_flight = MSS - 1;
+
+    let node_count = image.nodes.len() as u64;
+    for origin_seq in 0..3 {
+        let payload = PayloadId(SINK.0 + node_count * origin_seq);
+        image.initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow: FLOW,
+            size_bytes: ACK_BYTES,
+            kind: PacketKind::TcpAck(TcpAckHeader {
+                acknowledgment: 1,
+                acknowledged_bytes: 1,
+                echoed_sent_time_ns: 0,
+            }),
+        });
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SINK,
+                origin_seq,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+    image.host_states[1].next_origin_seq = 3;
+    image.host_states[1].next_payload_seq = 3;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+    image.initial_events.sort_by_key(|event| event.key);
+
+    validate(&image, Backend::Scalar).expect("partial checkpoint Scalar validation");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("partial checkpoint CPU validation");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("Scalar must reconstruct and retransmit the normalized remainder");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU must reconstruct and retransmit the normalized remainder");
+
+    assert_eq!(cpu.result, scalar, "partial checkpoint Scalar/CPU identity");
+    assert!(scalar.observed_packets.iter().any(|packet| {
+        packet.size_bytes == MSS - 1
+            && matches!(
+                packet.kind,
+                PacketKind::TcpData(TcpDataHeader {
+                    sequence: 1,
+                    retransmission: true,
+                    ..
+                })
+            )
+    }));
+}
+
+#[test]
+fn inconsistent_initial_tcp_segment_sizes_are_rejected_by_both_validators() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    image.initial_packets.push(PacketDescriptor {
+        id: PayloadId(4),
+        flow: FLOW,
+        size_bytes: MSS - 1,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: 0,
+            sent_time_ns: 0,
+            retransmission: true,
+        }),
+    });
+    image.host_states[0].next_payload_seq = 3;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+
+    let expected = "TCP flow FlowId(0) sequence 0 changed segment size from 512 to 511 bytes";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("same-sequence TCP segments with distinct sizes must reject");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn ack_normalization_conflicts_are_rejected_by_both_validators() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    let generator = &mut image.host_states[0].generators[0];
+    generator.feedback.outstanding_bytes = MSS - 1;
+    generator.feedback.unacknowledged_bytes = MSS - 1;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.highest_ack = 1;
+    tcp.bytes_in_flight = MSS - 1;
+    image.initial_packets.push(PacketDescriptor {
+        id: PayloadId(4),
+        flow: FLOW,
+        size_bytes: MSS - 2,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: 1,
+            sent_time_ns: 0,
+            retransmission: true,
+        }),
+    });
+    image.host_states[0].next_payload_seq = 3;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+
+    let expected = "TCP flow FlowId(0) sequence 1 changed segment size from 510 to 511 bytes";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("ACK-boundary segment conflicts must reject before construction");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn incomplete_initial_tcp_segment_ledger_is_rejected_by_both_validators() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    image.initial_packets.retain(|packet| {
+        !matches!(
+            packet.kind,
+            PacketKind::TcpData(TcpDataHeader { sequence: 0, .. })
+        )
+    });
+    image
+        .initial_events
+        .retain(|event| event.payload != PayloadId(0));
+
+    let expected = "flow FlowId(0) TCP segment ledger does not cover unacknowledged byte range 0..512; expected segment at sequence 0";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("an in-flight TCP range requires an exact segment ledger");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn future_initial_tcp_segment_is_rejected_before_fresh_send_collision() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    image.initial_packets.push(PacketDescriptor {
+        id: PayloadId(2),
+        flow: FLOW,
+        size_bytes: MSS - 1,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: MSS,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+    });
+    image.host_states[0].next_payload_seq = 2;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+
+    let expected = "flow FlowId(0) TCP segment ledger has unexpected initial segment at sequence 512 at or beyond next sequence 0";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("future TCP ledger entries must reject before construction");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn live_raw_segment_precedes_normalized_ledger_seed_at_partial_horizon() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    let generator = &mut image.host_states[0].generators[0];
+    generator.feedback.outstanding_bytes = MSS - 1;
+    generator.feedback.unacknowledged_bytes = MSS - 1;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.highest_ack = 1;
+    tcp.bytes_in_flight = MSS - 1;
+
+    validate(&image, Backend::Scalar).expect("live/ledger overlap Scalar validation");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("live/ledger overlap CPU validation");
+    let scalar = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
+        .expect("Scalar partial horizon with live raw descriptor");
+    let cpu = run_cpu_with_observations(
+        &image,
+        Some(0),
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU partial horizon with live raw descriptor");
+
+    assert_eq!(cpu.result, scalar);
+    assert!(scalar.resident_packets.iter().any(|packet| {
+        packet.id == PayloadId(0)
+            && packet.size_bytes == MSS
+            && matches!(
+                packet.kind,
+                PacketKind::TcpData(TcpDataHeader { sequence: 0, .. })
+            )
+    }));
+}
+
+#[test]
+fn ledger_only_tcp_seeds_do_not_consume_live_counter_capacity() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    image
+        .initial_events
+        .retain(|event| event.payload != PayloadId(0));
+    let generator = &mut image.host_states[0].generators[0];
+    generator.feedback.outstanding_bytes = MSS - 1;
+    generator.feedback.unacknowledged_bytes = MSS - 1;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.highest_ack = 1;
+    tcp.bytes_in_flight = MSS - 1;
+    image.host_states[1].received_packets = u64::MAX - 3;
+
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        validate(&image, backend)
+            .expect("ledger-only TCP seeds must not consume live packet counter capacity");
+    }
+}
+
+#[test]
+fn partial_ack_and_retransmit_checkpoints_round_trip_byte_identically() {
+    let mut image = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), 2 * MSS, &[1; 4]);
+    image.stop_time_ns = 1_000_000_001;
+    image.links[1].propagation_ns = 10_000;
+    for (offset, event) in image
+        .initial_events
+        .iter_mut()
+        .filter(|event| event.key.origin_node == SINK)
+        .enumerate()
+    {
+        event.key.time_ns = 100 + offset as u64;
+    }
+    image.initial_events.sort_by_key(|event| event.key);
+
+    let uninterrupted = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("uninterrupted partial-ACK campaign");
+    let partial_prefix = run_scalar_with_observations(&image, Some(103), ObservationMode::Full)
+        .expect("checkpoint after partial ACK and two duplicate ACKs");
+    assert!(partial_prefix.resident_packets.iter().any(|packet| {
+        packet.size_bytes == MSS - 1
+            && matches!(
+                packet.kind,
+                PacketKind::TcpData(TcpDataHeader { sequence: 1, .. })
+            )
+    }));
+    let after_partial_ack = checkpoint_image(&image, &partial_prefix);
+    validate(&after_partial_ack, Backend::Scalar)
+        .expect("partial-ACK checkpoint Scalar validation");
+    validate(&after_partial_ack, Backend::Cpu { workers: 2 })
+        .expect("partial-ACK checkpoint CPU validation");
+
+    let scalar_after_partial =
+        run_scalar_with_observations(&after_partial_ack, None, ObservationMode::Full)
+            .expect("Scalar continuation after partial ACK");
+    let cpu_after_partial = run_cpu_with_observations(
+        &after_partial_ack,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU continuation after partial ACK");
+    assert_eq!(cpu_after_partial.result, scalar_after_partial);
+    assert_eq!(
+        stitch_checkpoint_run(&partial_prefix, &scalar_after_partial),
+        uninterrupted,
+        "partial-ACK checkpoint must reproduce the entire uninterrupted result"
+    );
+    assert!(scalar_after_partial.observed_packets.iter().any(|packet| {
+        packet.size_bytes == MSS - 1
+            && matches!(
+                packet.kind,
+                PacketKind::TcpData(TcpDataHeader {
+                    sequence: 1,
+                    retransmission: true,
+                    ..
+                })
+            )
+    }));
+
+    let retransmit_prefix =
+        run_scalar_with_observations(&after_partial_ack, Some(200), ObservationMode::Full)
+            .expect("checkpoint after retransmitted remainder crosses the forward path");
+    assert!(retransmit_prefix.resident_packets.iter().any(|packet| {
+        packet.size_bytes == MSS - 1
+            && matches!(
+                packet.kind,
+                PacketKind::TcpData(TcpDataHeader {
+                    sequence: 1,
+                    retransmission: true,
+                    ..
+                })
+            )
+    }));
+    let after_retransmit = checkpoint_image(&after_partial_ack, &retransmit_prefix);
+    validate(&after_retransmit, Backend::Scalar)
+        .expect("post-retransmit checkpoint Scalar validation");
+    validate(&after_retransmit, Backend::Cpu { workers: 2 })
+        .expect("post-retransmit checkpoint CPU validation");
+    let scalar_after_retransmit =
+        run_scalar_with_observations(&after_retransmit, None, ObservationMode::Full)
+            .expect("Scalar continuation after retransmit");
+    let cpu_after_retransmit = run_cpu_with_observations(
+        &after_retransmit,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU continuation after retransmit");
+    assert_eq!(cpu_after_retransmit.result, scalar_after_retransmit);
+    let through_retransmit = stitch_checkpoint_run(&partial_prefix, &retransmit_prefix);
+    assert_eq!(
+        stitch_checkpoint_run(&through_retransmit, &scalar_after_retransmit),
+        uninterrupted,
+        "post-retransmit checkpoint must reproduce the entire uninterrupted result"
+    );
 }
 
 #[test]

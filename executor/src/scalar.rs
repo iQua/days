@@ -101,7 +101,12 @@ pub struct RunResult {
     pub host_states: Vec<HostState>,
     pub switch_states: Vec<SwitchState>,
     pub summary: RunSummary,
-    /// Nonterminal packet data referenced by queues, service slots, or pending events.
+    /// Packet data required to resume execution.
+    ///
+    /// In addition to descriptors referenced by live packet positions, this includes canonical
+    /// TCP segment-ledger seeds. On reload, constructors seed `(flow, sequence, size_bytes)` and
+    /// apply each sender's `highest_ack` with the same partial-segment split used for live ACKs.
+    /// Unreferenced TCP data descriptors are ledger-only and are not installed as resident packets.
     pub resident_packets: Vec<PacketDescriptor>,
     /// Complete packet descriptors referenced by full-mode observations.
     pub observed_packets: Vec<PacketDescriptor>,
@@ -456,7 +461,7 @@ pub(crate) struct TransitionState<'image> {
     departures: Vec<(EventKey, PacketDeparture)>,
     arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: Vec<TcpTransitionRecord>,
-    tcp_sent_segments: BTreeMap<FlowId, BTreeMap<u64, u64>>,
+    tcp_sent_segments: crate::tcp_ledger::TcpSegmentLedger,
 }
 
 #[derive(Clone, Copy)]
@@ -477,6 +482,7 @@ pub(crate) struct LocalTransitionResult {
     pub state: LocalNodeState,
     pub summary: RunSummary,
     pub resident_packets: Vec<PacketDescriptor>,
+    pub tcp_segment_ledger: Vec<PacketDescriptor>,
     pub observed_packets: Vec<PacketDescriptor>,
     pub departures: Vec<(EventKey, PacketDeparture)>,
     pub arrivals: Vec<(EventKey, PacketArrivalObservation)>,
@@ -502,9 +508,15 @@ impl<'image> TransitionState<'image> {
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
         let mut packets = BTreeMap::new();
-        let mut tcp_sent_segments = BTreeMap::new();
+        let tcp_sent_segments =
+            crate::tcp_ledger::seed_image(image).map_err(tcp_segment_conflict_error)?;
+        let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
         for descriptor in image.initial_packets.iter().copied() {
-            seed_tcp_segment(&mut tcp_sent_segments, descriptor)?;
+            if matches!(descriptor.kind, PacketKind::TcpData(_))
+                && !live_payloads.contains(&descriptor.id)
+            {
+                continue;
+            }
             if packets
                 .insert(
                     descriptor.id,
@@ -592,9 +604,7 @@ impl<'image> TransitionState<'image> {
         };
 
         let mut resident = BTreeMap::new();
-        let mut tcp_sent_segments = BTreeMap::new();
         for descriptor in packets {
-            seed_tcp_segment(&mut tcp_sent_segments, descriptor)?;
             if resident
                 .insert(
                     descriptor.id,
@@ -610,9 +620,8 @@ impl<'image> TransitionState<'image> {
                 return Err(ExecutionError::DuplicatePayload(descriptor.id));
             }
         }
-        for descriptor in tcp_segment_seeds {
-            seed_tcp_segment(&mut tcp_sent_segments, descriptor)?;
-        }
+        let tcp_sent_segments = crate::tcp_ledger::seed_packets(image, tcp_segment_seeds)
+            .map_err(tcp_segment_conflict_error)?;
         let in_service = match node.kind {
             NodeKind::Host => host_states[0].in_service.into_iter().collect::<Vec<_>>(),
             NodeKind::Switch => switch_states[0]
@@ -679,11 +688,7 @@ impl<'image> TransitionState<'image> {
 
     pub(crate) fn finish(mut self, pending_events: Vec<Event>) -> RunResult {
         debug_assert!(self.local_node.is_none());
-        let resident_packets = self
-            .packets
-            .into_values()
-            .map(|packet| packet.descriptor)
-            .collect();
+        let resident_packets = resumable_packets(self.packets, &self.tcp_sent_segments);
         let observed_packets = self.observed_packets.into_values().collect();
         self.departures.sort_unstable_by_key(|(key, _)| *key);
         self.arrivals.sort_unstable_by_key(|(key, _)| *key);
@@ -738,6 +743,11 @@ impl<'image> TransitionState<'image> {
                 .packets
                 .into_values()
                 .map(|packet| packet.descriptor)
+                .collect(),
+            tcp_segment_ledger: self
+                .tcp_sent_segments
+                .into_values()
+                .flat_map(BTreeMap::into_values)
                 .collect(),
             observed_packets: self.observed_packets.into_values().collect(),
             departures: self.departures,
@@ -2144,8 +2154,7 @@ impl<'image> TransitionState<'image> {
                 self.tcp_sent_segments
                     .get(&flow)
                     .and_then(|segments| segments.get(&sequence))
-                    .copied()
-                    .map(|size_bytes| (sequence, size_bytes))
+                    .map(|packet| (sequence, packet.size_bytes))
                     .ok_or(ExecutionError::MissingTcpSegment { flow, sequence })
             })
             .transpose()?;
@@ -2470,58 +2479,42 @@ impl<'image> TransitionState<'image> {
 }
 
 fn seed_tcp_segment(
-    segments: &mut BTreeMap<FlowId, BTreeMap<u64, u64>>,
+    segments: &mut crate::tcp_ledger::TcpSegmentLedger,
     packet: PacketDescriptor,
 ) -> Result<(), ExecutionError> {
-    let PacketKind::TcpData(header) = packet.kind else {
-        return Ok(());
-    };
-    let flow_segments = segments.entry(packet.flow).or_default();
-    if let Some(original_size_bytes) = flow_segments.insert(header.sequence, packet.size_bytes) {
-        if original_size_bytes != packet.size_bytes {
-            return Err(ExecutionError::InconsistentTcpSegment {
-                flow: packet.flow,
-                sequence: header.sequence,
-                original_size_bytes,
-                replacement_size_bytes: packet.size_bytes,
-            });
-        }
-    }
-    Ok(())
+    crate::tcp_ledger::seed_segment(segments, packet).map_err(tcp_segment_conflict_error)
 }
 
 fn acknowledge_tcp_segments(
-    segments: &mut BTreeMap<FlowId, BTreeMap<u64, u64>>,
+    segments: &mut crate::tcp_ledger::TcpSegmentLedger,
     flow: FlowId,
     acknowledgment: u64,
 ) -> Result<(), ExecutionError> {
-    let Some(flow_segments) = segments.get_mut(&flow) else {
-        return Ok(());
-    };
-    let mut unacknowledged = flow_segments.split_off(&acknowledgment);
-    if let Some((sequence, size_bytes)) = flow_segments.pop_last() {
-        let acknowledged_bytes = acknowledgment - sequence;
-        if acknowledged_bytes < size_bytes {
-            let remainder_bytes = size_bytes - acknowledged_bytes;
-            if let Some(original_size_bytes) =
-                unacknowledged.insert(acknowledgment, remainder_bytes)
-            {
-                if original_size_bytes != remainder_bytes {
-                    return Err(ExecutionError::InconsistentTcpSegment {
-                        flow,
-                        sequence: acknowledgment,
-                        original_size_bytes,
-                        replacement_size_bytes: remainder_bytes,
-                    });
-                }
-            }
-        }
+    crate::tcp_ledger::acknowledge_segments(segments, flow, acknowledgment)
+        .map_err(tcp_segment_conflict_error)
+}
+
+fn tcp_segment_conflict_error(conflict: crate::tcp_ledger::TcpSegmentConflict) -> ExecutionError {
+    ExecutionError::InconsistentTcpSegment {
+        flow: conflict.flow,
+        sequence: conflict.sequence,
+        original_size_bytes: conflict.original_size_bytes,
+        replacement_size_bytes: conflict.replacement_size_bytes,
     }
-    *flow_segments = unacknowledged;
-    if flow_segments.is_empty() {
-        segments.remove(&flow);
+}
+
+fn resumable_packets(
+    packets: BTreeMap<PayloadId, ResidentPacket>,
+    tcp_sent_segments: &crate::tcp_ledger::TcpSegmentLedger,
+) -> Vec<PacketDescriptor> {
+    let mut descriptors = packets
+        .into_iter()
+        .map(|(payload, packet)| (payload, packet.descriptor))
+        .collect::<BTreeMap<_, _>>();
+    for packet in tcp_sent_segments.values().flat_map(BTreeMap::values) {
+        descriptors.entry(packet.id).or_insert(*packet);
     }
-    Ok(())
+    descriptors.into_values().collect()
 }
 
 fn scheduler_class(flow: FlowId, class_count: usize) -> Option<usize> {
