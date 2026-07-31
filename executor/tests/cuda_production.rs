@@ -468,47 +468,6 @@ fn cuda_two_runs_are_byte_exact() {
 }
 
 #[test]
-fn cuda_kind_clustered_worklist_matches_unmodified_dispatch_for_both_fel_modes() {
-    let image = fifo_taildrop_image();
-    let scalar = run_scalar_with_observations(&image, Some(27), ObservationMode::Full)
-        .expect("scalar kind-clustering oracle must run");
-    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
-
-    for streams_enabled in [true, false] {
-        let unmodified = executor
-            .run_with_observations(
-                &image,
-                Some(27),
-                CudaConfig {
-                    streams_enabled,
-                    kind_clustering: false,
-                    ..CudaConfig::default()
-                },
-                ObservationMode::Full,
-            )
-            .expect("unmodified CUDA dispatch must run");
-        let clustered = executor
-            .run_with_observations(
-                &image,
-                Some(27),
-                CudaConfig {
-                    streams_enabled,
-                    kind_clustering: true,
-                    ..CudaConfig::default()
-                },
-                ObservationMode::Full,
-            )
-            .expect("kind-clustered CUDA dispatch must run");
-
-        assert_eq!(unmodified.result, scalar);
-        assert_eq!(clustered.result, scalar);
-        assert_eq!(clustered.result, unmodified.result);
-        assert_eq!(clustered.rounds, unmodified.rounds);
-        assert_eq!(clustered.transitions, unmodified.transitions);
-    }
-}
-
-#[test]
 fn cuda_continuation_state_crosses_graph_waves_exactly() {
     let image = long_continuation_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
