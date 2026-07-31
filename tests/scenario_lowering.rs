@@ -59,6 +59,12 @@ fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
         .to_owned()
 }
 
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
     let mut delays = BTreeMap::<LinkId, u64>::new();
     for packet in &image.initial_packets {
@@ -963,6 +969,32 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
             .iter()
             .any(|state| state.received_packets > 0),
         "at least one packet must reach a sink host"
+    );
+}
+
+#[test]
+fn representative_lowered_image_bytes_match_frozen_preoptimization_hashes() {
+    let fixtures = [
+        "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
+        "configs/benchmarks/baseline/fattree_k8_f64_st.toml",
+        "configs/benchmarks/width_via_load_full/fattree_k32_load_10.toml",
+    ];
+    let actual = fixtures.map(|fixture| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
+        let image = compile_config(path).unwrap_or_else(|error| {
+            panic!("representative fixture {fixture} should lower: {error}")
+        });
+        fnv1a64(format!("{image:#?}").as_bytes())
+    });
+
+    assert_eq!(
+        actual,
+        [
+            8_913_124_020_181_194_792,
+            7_690_158_362_243_519_310,
+            18_404_967_740_969_582_445,
+        ],
+        "route-construction changes must preserve every ordered image byte"
     );
 }
 

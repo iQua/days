@@ -1,0 +1,27 @@
+# T17b canonical-host k64 lowering gate: 327,680 LPs and 32,768 lazy flows.
+seed = 1000
+threading = "single"
+log_path = "logs/fattree"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 64
+hosts_per_edge = 16
+
+[switch]
+port_rate = 320000
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 32768
+[flow_set.traffic]
+initial_delay = 1.0
+duration = 1500
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }

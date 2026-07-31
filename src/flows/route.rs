@@ -16,6 +16,11 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 
+#[cfg(test)]
+std::thread_local! {
+    static FAT_TREE_LAYOUT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Copy, Clone, Debug)]
 struct MinScoredNode {
     score: (usize, usize, usize),
@@ -157,6 +162,9 @@ impl ShortestPath {
     }
 
     fn fat_tree_params(graph: &UnGraph<usize, ()>) -> Option<(usize, usize, usize)> {
+        #[cfg(test)]
+        FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(checks.get() + 1));
+
         let total_nodes = graph.node_count();
         if total_nodes == 0 || !total_nodes.is_multiple_of(5) {
             return None;
@@ -177,12 +185,12 @@ impl ShortestPath {
         Some((num_layer_switches, switches_per_pod, k))
     }
 
-    fn compute_fat_tree_route_in(
+    fn compute_fat_tree_route_with_params(
         graph: &UnGraph<usize, ()>,
         start: NodeIndex,
         end: NodeIndex,
+        (num_layer_switches, switches_per_pod, num_pods): (usize, usize, usize),
     ) -> Option<Vec<NodeIndex>> {
-        let (num_layer_switches, switches_per_pod, num_pods) = Self::fat_tree_params(graph)?;
         let core_start = 2 * num_layer_switches;
 
         let start_idx = start.index();
@@ -291,10 +299,22 @@ impl ShortestPath {
         start: NodeIndex,
         end: NodeIndex,
     ) -> Option<Vec<NodeIndex>> {
-        if let Some(path) = Self::compute_fat_tree_route_in(graph, start, end) {
-            return Some(path);
-        }
+        let fat_tree_params = Self::fat_tree_params(graph);
+        Self::try_compute_route_in_classified_canonical_graph(graph, start, end, fat_tree_params)
+    }
 
+    fn try_compute_route_in_classified_canonical_graph(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+        fat_tree_params: Option<(usize, usize, usize)>,
+    ) -> Option<Vec<NodeIndex>> {
+        if let Some(params) = fat_tree_params {
+            if let Some(path) = Self::compute_fat_tree_route_with_params(graph, start, end, params)
+            {
+                return Some(path);
+            }
+        }
         astar(
             graph,
             start,
@@ -364,14 +384,18 @@ where
     K: Ord,
 {
     let graph = canonical_routing_graph(graph);
+    let fat_tree_params = ShortestPath::fat_tree_params(&graph);
     let mut routes = BTreeMap::new();
     for (key, source, target) in flows {
         if routes.contains_key(&key) {
             return Err(RouteTableError::DuplicateKey(key));
         }
-        let Some(route) =
-            ShortestPath::try_compute_route_in_canonical_graph(&graph, source, target)
-        else {
+        let Some(route) = ShortestPath::try_compute_route_in_classified_canonical_graph(
+            &graph,
+            source,
+            target,
+            fat_tree_params,
+        ) else {
             return Err(RouteTableError::Unreachable(key));
         };
         routes.insert(key, route);
@@ -563,6 +587,92 @@ impl RoutingProtocol for ECMP {
 mod tests {
     use super::*;
     use petgraph::graph::UnGraph;
+
+    fn canonical_k4_fat_tree() -> UnGraph<usize, ()> {
+        let mut graph = UnGraph::with_capacity(20, 32);
+        for node in 0..20 {
+            graph.add_node(node);
+        }
+        for pod in 0..4 {
+            let edge_base = pod * 2;
+            let aggregation_base = 8 + pod * 2;
+            for edge_offset in 0..2 {
+                for aggregation_offset in 0..2 {
+                    graph.add_edge(
+                        NodeIndex::new(edge_base + edge_offset),
+                        NodeIndex::new(aggregation_base + aggregation_offset),
+                        (),
+                    );
+                }
+            }
+        }
+        for aggregation in 8..16 {
+            let group = (aggregation - 8) % 2;
+            for core_offset in 0..2 {
+                graph.add_edge(
+                    NodeIndex::new(aggregation),
+                    NodeIndex::new(16 + group * 2 + core_offset),
+                    (),
+                );
+            }
+        }
+        graph
+    }
+
+    #[test]
+    fn route_table_checks_fat_tree_layout_once_for_all_flows() {
+        let graph = canonical_k4_fat_tree();
+        FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(0));
+
+        let routes = compute_shortest_path_route_table(
+            &graph,
+            [
+                (0, NodeIndex::new(0), NodeIndex::new(1)),
+                (1, NodeIndex::new(0), NodeIndex::new(2)),
+                (2, NodeIndex::new(3), NodeIndex::new(7)),
+            ],
+        )
+        .expect("canonical fat-tree routes should exist");
+
+        assert_eq!(routes.len(), 3);
+        FAT_TREE_LAYOUT_CHECKS.with(|checks| {
+            assert_eq!(
+                checks.get(),
+                1,
+                "route-table lowering must classify the immutable topology once"
+            );
+        });
+    }
+
+    #[test]
+    fn classified_fat_tree_route_table_preserves_one_off_route_selection() {
+        let graph = canonical_k4_fat_tree();
+        let flows = (0..8)
+            .flat_map(|source| {
+                (0..8)
+                    .filter(move |target| *target != source)
+                    .map(move |target| {
+                        (
+                            (source, target),
+                            NodeIndex::new(source),
+                            NodeIndex::new(target),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let routes = compute_shortest_path_route_table(&graph, flows.iter().copied())
+            .expect("canonical fat-tree routes should exist");
+        for ((source, target), source_node, target_node) in flows {
+            let one_off = ShortestPath::try_compute_route_in(&graph, source_node, target_node)
+                .expect("one-off canonical fat-tree route should exist");
+            assert_eq!(
+                routes[&(source, target)],
+                one_off,
+                "cached classification must not change equal-cost path selection"
+            );
+        }
+    }
 
     #[test]
     fn test_ecmp_routing() {
