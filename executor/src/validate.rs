@@ -490,7 +490,8 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
             .entry((event.target, event.payload, event.key.time_ns))
             .or_default() += 1;
     }
-    let mut owners = BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64)>::new();
+    let mut owners =
+        BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64, bool)>::new();
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     for owner in image
         .nodes
@@ -562,6 +563,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                     generator.next_emission.status,
                     generator.next_emission.payload,
                     generator.next_emission.departure_time_ns,
+                    matches!(generator.kind, FlowGeneratorKind::Tcp(_)),
                 ),
             ) {
                 return Err(ValidationError::new(format!(
@@ -862,9 +864,29 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
         }
     }
     for (receiver_flow, receiver_owner) in receiver_owners {
-        if !owners.contains_key(&receiver_flow) {
+        match owners.get(&receiver_flow) {
+            None => {
+                return Err(ValidationError::new(format!(
+                    "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow has no generator"
+                )));
+            }
+            Some((.., false)) => {
+                return Err(ValidationError::new(format!(
+                    "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow generator is not TCP"
+                )));
+            }
+            Some((.., true)) => {}
+        }
+    }
+    for packet in image
+        .initial_packets
+        .iter()
+        .filter(|packet| matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)))
+    {
+        if !owners.get(&packet.flow).is_some_and(|(.., is_tcp)| *is_tcp) {
             return Err(ValidationError::new(format!(
-                "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow has no generator"
+                "TCP packet {:?} for flow {:?} requires a TCP generator",
+                packet.id, packet.flow
             )));
         }
     }
@@ -876,7 +898,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
         let Some(packet) = packet(image, event.payload) else {
             continue;
         };
-        if let Some((owner, status, payload, time_ns)) = owners.get(&packet.flow) {
+        if let Some((owner, status, payload, time_ns, _)) = owners.get(&packet.flow) {
             let expected = *status == GeneratorStatus::Scheduled
                 && *owner == event.target
                 && *payload == event.payload
@@ -2300,8 +2322,13 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
                 executable_generator_packets(generator)?,
             )?,
             FlowGeneratorKind::Tcp(_) => {
+                let preloaded_data = data_by_flow[generator.flow.0 as usize];
                 let attempts = tcp_attempt_upper_bound(image, generator)?;
                 add_packet_count(&mut data_by_flow[generator.flow.0 as usize], attempts)?;
+                add_packet_count(
+                    &mut feedback_by_flow[generator.flow.0 as usize],
+                    preloaded_data,
+                )?;
                 add_packet_count(&mut feedback_by_flow[generator.flow.0 as usize], attempts)?;
             }
         }
@@ -2324,6 +2351,10 @@ fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationEr
         .zip(work.data_by_flow.iter().zip(work.feedback_by_flow.iter()))
     {
         add_packet_count(&mut sourced_by_node[flow.source.0 as usize], *data_count)?;
+        add_packet_count(
+            &mut sourced_by_node[flow.target.0 as usize],
+            *feedback_count,
+        )?;
         add_packet_count(&mut received_by_node[flow.target.0 as usize], *data_count)?;
         add_packet_count(
             &mut received_by_node[flow.source.0 as usize],
@@ -2496,9 +2527,11 @@ fn executable_generator_packets(
 
 /// Conservative finite-run bound used only to reserve counters and node-strided PayloadIds.
 ///
-/// Every new segment is counted once. Each additional retransmission requires at least one
-/// simulator timestamp in the finite run, so `stop_time_ns + 1` is a deliberately loose bound
-/// covering fast retransmits and timer retries without embedding congestion behavior in validation.
+/// Nominal fresh segments are counted once. Every send-plan trigger can add at most one additional
+/// congestion-window-limited fragment and one retransmission. Runtime ACKs for a flow are
+/// serialized over its positive-delay reverse route, and a phase-0 ACK cancels the flow's single
+/// active phase-1 timer, so there is at most one runtime trigger per timestamp. Preloaded ACK
+/// events bypass that serialization and are therefore counted individually.
 fn tcp_attempt_upper_bound(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
@@ -2515,9 +2548,38 @@ fn tcp_attempt_upper_bound(
     if tcp.highest_ack >= tcp.total_bytes {
         return Ok(0);
     }
+    let preloaded_ack_events = u64::try_from(
+        image
+            .initial_events
+            .iter()
+            .filter(|event| {
+                packet(image, event.payload).is_some_and(|packet| {
+                    packet.flow == generator.flow && matches!(packet.kind, PacketKind::TcpAck(_))
+                })
+            })
+            .count(),
+    )
+    .map_err(|_| {
+        ValidationError::new(format!(
+            "flow {:?} TCP finite-run attempt bound exceeds u64",
+            generator.flow
+        ))
+    })?;
+    let triggers = image
+        .stop_time_ns
+        .checked_add(1)
+        .and_then(|timestamps| timestamps.checked_add(preloaded_ack_events));
     remaining_generator_packets(generator)?
-        .checked_add(image.stop_time_ns)
-        .and_then(|count| count.checked_add(1))
+        .checked_add(
+            triggers
+                .and_then(|count| count.checked_mul(2))
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} TCP finite-run attempt bound exceeds u64",
+                        generator.flow
+                    ))
+                })?,
+        )
         .ok_or_else(|| {
             ValidationError::new(format!(
                 "flow {:?} TCP finite-run attempt bound exceeds u64",
@@ -2581,10 +2643,16 @@ fn validate_origin_sequences(
     {
         let state = &image.host_states[owner.state_slot as usize];
         for generator in &state.generators {
-            let remaining = executable_generator_packets(generator)?;
-            let scheduled = u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
-            emissions_by_node[owner.id.0 as usize] +=
-                u128::from(remaining.saturating_sub(scheduled));
+            let emissions = match generator.kind {
+                FlowGeneratorKind::Constant(_) => {
+                    let remaining = executable_generator_packets(generator)?;
+                    let scheduled =
+                        u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+                    remaining.saturating_sub(scheduled)
+                }
+                FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
+            };
+            emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
         }
     }
     for node in &image.nodes {
@@ -2629,7 +2697,7 @@ fn validate_origin_sequences(
 
 fn validate_payload_sequences(
     image: &SimulationImage,
-    _work: &FutureWork,
+    work: &FutureWork,
 ) -> Result<(), ValidationError> {
     let node_count = u64::try_from(image.nodes.len()).unwrap_or(u64::MAX);
     let mut payload_sequences_by_owner = vec![Vec::<(u64, PayloadId)>::new(); image.nodes.len()];
@@ -2693,16 +2761,8 @@ fn validate_payload_sequences(
             })?;
         }
         for receiver in &state.tcp_receivers {
-            let source = flow(image, receiver.flow)
-                .and_then(|receiver_flow| node(image, receiver_flow.source))
-                .expect("receiver validation established its source host");
-            let generator = image.host_states[source.state_slot as usize]
-                .generators
-                .iter()
-                .find(|generator| generator.flow == receiver.flow)
-                .expect("receiver validation established its generator");
             allocations = allocations
-                .checked_add(tcp_attempt_upper_bound(image, generator)?)
+                .checked_add(work.data_by_flow[receiver.flow.0 as usize])
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} generated TCP ACK count exceeds u64",

@@ -3233,6 +3233,9 @@ fn build_lps<'image>(
     let mut pinned_packets = (0..image.nodes.len())
         .map(|_| BTreeSet::new())
         .collect::<Vec<_>>();
+    let mut tcp_segment_seeds = (0..image.nodes.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<PacketDescriptor>>>();
     let meaningful_event_payloads = image
         .initial_events
         .iter()
@@ -3316,6 +3319,16 @@ fn build_lps<'image>(
         }
     }
     for descriptor in image.initial_packets.iter().copied() {
+        if matches!(descriptor.kind, crate::PacketKind::TcpData(_)) {
+            let flow = image
+                .flows
+                .get(descriptor.flow.0 as usize)
+                .filter(|flow| flow.id == descriptor.flow)
+                .ok_or(ExecutionError::UnknownFlow(descriptor.flow))?;
+            let source_slot =
+                node_slot(image, flow.source).ok_or(ExecutionError::UnknownNode(flow.source))?;
+            tcp_segment_seeds[source_slot].push(descriptor);
+        }
         let needs_orphan_retention = !meaningful_event_payloads.contains(&descriptor.id)
             && !queued_payloads.contains(&descriptor.id)
             && (!in_service_payloads.contains(&descriptor.id)
@@ -3365,6 +3378,7 @@ fn build_lps<'image>(
                     image,
                     node,
                     std::mem::take(&mut packets[lp_slot]).into_values(),
+                    std::mem::take(&mut tcp_segment_seeds[lp_slot]),
                     observation_mode,
                 )?,
                 futures: std::mem::take(&mut futures[lp_slot]),

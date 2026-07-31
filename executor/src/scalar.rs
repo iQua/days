@@ -456,7 +456,7 @@ pub(crate) struct TransitionState<'image> {
     departures: Vec<(EventKey, PacketDeparture)>,
     arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: Vec<TcpTransitionRecord>,
-    tcp_sent_segments: BTreeMap<(FlowId, u64), u64>,
+    tcp_sent_segments: BTreeMap<FlowId, BTreeMap<u64, u64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -561,6 +561,7 @@ impl<'image> TransitionState<'image> {
         image: &'image SimulationImage,
         node: NodeDescriptor,
         packets: impl IntoIterator<Item = PacketDescriptor>,
+        tcp_segment_seeds: impl IntoIterator<Item = PacketDescriptor>,
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
         let (host_states, switch_states) = match node.kind {
@@ -608,6 +609,9 @@ impl<'image> TransitionState<'image> {
             {
                 return Err(ExecutionError::DuplicatePayload(descriptor.id));
             }
+        }
+        for descriptor in tcp_segment_seeds {
+            seed_tcp_segment(&mut tcp_sent_segments, descriptor)?;
         }
         let in_service = match node.kind {
             NodeKind::Host => host_states[0].in_service.into_iter().collect::<Vec<_>>(),
@@ -1522,10 +1526,7 @@ impl<'image> TransitionState<'image> {
             (retransmit, fill, acknowledged_through, transition)
         };
         if let Some(acknowledgment) = acknowledged_through {
-            self.tcp_sent_segments
-                .retain(|(segment_flow, sequence), _| {
-                    *segment_flow != packet.flow || *sequence >= acknowledgment
-                });
+            acknowledge_tcp_segments(&mut self.tcp_sent_segments, packet.flow, acknowledgment)?;
         }
         if self.observation_mode == ObservationMode::Full {
             self.tcp_transitions.extend(transition);
@@ -2141,7 +2142,8 @@ impl<'image> TransitionState<'image> {
         let retransmit_segment = retransmit_sequence
             .map(|sequence| {
                 self.tcp_sent_segments
-                    .get(&(flow, sequence))
+                    .get(&flow)
+                    .and_then(|segments| segments.get(&sequence))
                     .copied()
                     .map(|size_bytes| (sequence, size_bytes))
                     .ok_or(ExecutionError::MissingTcpSegment { flow, sequence })
@@ -2468,15 +2470,14 @@ impl<'image> TransitionState<'image> {
 }
 
 fn seed_tcp_segment(
-    segments: &mut BTreeMap<(FlowId, u64), u64>,
+    segments: &mut BTreeMap<FlowId, BTreeMap<u64, u64>>,
     packet: PacketDescriptor,
 ) -> Result<(), ExecutionError> {
     let PacketKind::TcpData(header) = packet.kind else {
         return Ok(());
     };
-    if let Some(original_size_bytes) =
-        segments.insert((packet.flow, header.sequence), packet.size_bytes)
-    {
+    let flow_segments = segments.entry(packet.flow).or_default();
+    if let Some(original_size_bytes) = flow_segments.insert(header.sequence, packet.size_bytes) {
         if original_size_bytes != packet.size_bytes {
             return Err(ExecutionError::InconsistentTcpSegment {
                 flow: packet.flow,
@@ -2485,6 +2486,40 @@ fn seed_tcp_segment(
                 replacement_size_bytes: packet.size_bytes,
             });
         }
+    }
+    Ok(())
+}
+
+fn acknowledge_tcp_segments(
+    segments: &mut BTreeMap<FlowId, BTreeMap<u64, u64>>,
+    flow: FlowId,
+    acknowledgment: u64,
+) -> Result<(), ExecutionError> {
+    let Some(flow_segments) = segments.get_mut(&flow) else {
+        return Ok(());
+    };
+    let mut unacknowledged = flow_segments.split_off(&acknowledgment);
+    if let Some((sequence, size_bytes)) = flow_segments.pop_last() {
+        let acknowledged_bytes = acknowledgment - sequence;
+        if acknowledged_bytes < size_bytes {
+            let remainder_bytes = size_bytes - acknowledged_bytes;
+            if let Some(original_size_bytes) =
+                unacknowledged.insert(acknowledgment, remainder_bytes)
+            {
+                if original_size_bytes != remainder_bytes {
+                    return Err(ExecutionError::InconsistentTcpSegment {
+                        flow,
+                        sequence: acknowledgment,
+                        original_size_bytes,
+                        replacement_size_bytes: remainder_bytes,
+                    });
+                }
+            }
+        }
+    }
+    *flow_segments = unacknowledged;
+    if flow_segments.is_empty() {
+        segments.remove(&flow);
     }
     Ok(())
 }

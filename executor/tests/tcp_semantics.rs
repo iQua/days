@@ -1,15 +1,15 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, CpuConfig, Event, EventFelClass, EventKey,
-    EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
-    GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId, NodeDescriptor,
-    NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel,
-    ScheduledEmission, SchedulerKind, SimulationImage, StaticPartitionPolicy, SwitchQueueState,
-    SwitchState, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpPhase,
-    TcpReceiverState, TcpTimerState, TcpTransitionInput, event_fel_class, event_phase,
-    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
-    size_default_device_plan, validate,
+    Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, ConstantGenerator, CpuConfig, Event,
+    EventFelClass, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
+    FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState,
+    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
+    PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
+    StaticPartitionPolicy, SwitchQueueState, SwitchState, TcpAckHeader, TcpCongestionControl,
+    TcpDataHeader, TcpGenerator, TcpPhase, TcpReceiverState, TcpTimerState, TcpTransitionInput,
+    event_fel_class, event_phase, run_cpu_with_observations, run_scalar_rounds_with_observations,
+    run_scalar_with_observations, size_default_device_plan, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -354,6 +354,121 @@ fn recovery_campaign_image(control: TcpCongestionControl) -> SimulationImage {
     }
     image.host_states[1].next_payload_seq = acknowledgments.len() as u64;
     image.switch_states[1].next_origin_seq = acknowledgments.len() as u64;
+    image.initial_events.sort_by_key(|event| event.key);
+    image
+}
+
+fn tcp_ack_burst_image(
+    control: TcpCongestionControl,
+    total_bytes: u64,
+    acknowledgments: &[u64],
+) -> SimulationImage {
+    let mut image = tcp_image(control, total_bytes);
+    image.stop_time_ns = 0;
+    let node_count = image.nodes.len() as u64;
+    for (origin_seq, acknowledgment) in acknowledgments.iter().copied().enumerate() {
+        let origin_seq = origin_seq as u64;
+        let payload = PayloadId(SINK.0 + node_count * origin_seq);
+        image.initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow: FLOW,
+            size_bytes: ACK_BYTES,
+            kind: PacketKind::TcpAck(TcpAckHeader {
+                acknowledgment,
+                acknowledged_bytes: acknowledgment,
+                echoed_sent_time_ns: 0,
+            }),
+        });
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SINK,
+                origin_seq,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+    image.host_states[1].next_origin_seq = acknowledgments.len() as u64;
+    image.host_states[1].next_payload_seq = acknowledgments.len() as u64;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+    image.initial_events.sort_by_key(|event| event.key);
+    image
+}
+
+fn scheduled_tcp_checkpoint_image(in_flight_segments: u64, total_segments: u64) -> SimulationImage {
+    assert!(0 < in_flight_segments && in_flight_segments < total_segments);
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), total_segments * MSS);
+    image.stop_time_ns = 0;
+    image.initial_packets.clear();
+    image.initial_events.clear();
+
+    let node_count = image.nodes.len() as u64;
+    for sequence in 0..in_flight_segments {
+        let payload = PayloadId(SOURCE.0 + node_count * sequence);
+        image.initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow: FLOW,
+            size_bytes: MSS,
+            kind: PacketKind::TcpData(TcpDataHeader {
+                sequence: sequence * MSS,
+                sent_time_ns: 0,
+                retransmission: false,
+            }),
+        });
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SOURCE,
+                origin_seq: sequence + 1,
+            },
+            target: SINK,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+
+    let scheduled_payload = PayloadId(SOURCE.0 + node_count * in_flight_segments);
+    image.initial_packets.push(PacketDescriptor {
+        id: scheduled_payload,
+        flow: FLOW,
+        size_bytes: MSS,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: in_flight_segments * MSS,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+    });
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::PacketArrival),
+            origin_node: SOURCE,
+            origin_seq: 0,
+        },
+        target: SOURCE,
+        kind: EventKind::PacketArrival,
+        payload: scheduled_payload,
+    });
+
+    let generator = &mut image.host_states[0].generators[0];
+    generator.packets_emitted = in_flight_segments;
+    generator.bytes_emitted = in_flight_segments * MSS;
+    generator.next_emission.payload = scheduled_payload;
+    generator.feedback.outstanding_bytes = in_flight_segments * MSS;
+    generator.feedback.unacknowledged_bytes = in_flight_segments * MSS;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.next_sequence = in_flight_segments * MSS;
+    tcp.bytes_in_flight = in_flight_segments * MSS;
+    tcp.last_attempt = PayloadId(SOURCE.0 + node_count * (in_flight_segments - 1));
+    image.host_states[0].next_origin_seq = in_flight_segments + 1;
+    image.host_states[0].next_payload_seq = in_flight_segments + 1;
+    image.initial_packets.sort_by_key(|packet| packet.id);
     image.initial_events.sort_by_key(|event| event.key);
     image
 }
@@ -1033,4 +1148,281 @@ fn retransmission_preserves_cwnd_limited_segment_length() {
             "CPU byte identity with {workers} workers"
         );
     }
+}
+
+#[test]
+fn partial_cumulative_ack_retransmits_only_unacknowledged_remainder() {
+    let image = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), 4 * MSS, &[1; 7]);
+    validate(&image, Backend::Scalar).expect("partial-ACK scalar image should validate");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("partial-ACK CPU image should validate");
+
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full);
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    );
+    assert!(
+        scalar.is_ok() && cpu.is_ok(),
+        "partial ACK outcomes: Scalar={:?}, Cpu={:?}",
+        scalar.as_ref().err(),
+        cpu.as_ref().err()
+    );
+    let scalar = scalar.expect("checked scalar success");
+    let cpu = cpu.expect("checked CPU success");
+    assert_eq!(cpu.result, scalar, "partial-ACK Scalar/CPU byte identity");
+
+    let retransmission = scalar
+        .observed_packets
+        .iter()
+        .find(|packet| {
+            matches!(
+                packet.kind,
+                PacketKind::TcpData(header)
+                    if header.retransmission && header.sequence == 1
+            )
+        })
+        .expect("the fourth ACK should retransmit the remainder beginning at sequence 1");
+    assert_eq!(retransmission.size_bytes, MSS - 1);
+}
+
+#[test]
+fn same_timestamp_ack_burst_cannot_escape_tcp_payload_reservation() {
+    const ACK_COUNT: u64 = 18;
+    let mut control = TcpCongestionControl::reno(MSS);
+    let TcpCongestionControl::Reno(ref mut reno) = control else {
+        unreachable!()
+    };
+    reno.cwnd_bytes = ACK_COUNT * MSS;
+    let acknowledgments = std::iter::repeat_n(0, 3)
+        .chain((1..=ACK_COUNT - 3).map(|segments| segments * MSS))
+        .collect::<Vec<_>>();
+    assert_eq!(acknowledgments.len(), ACK_COUNT as usize);
+
+    let mut image = tcp_ack_burst_image(control, ACK_COUNT * MSS, &acknowledgments);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.rto_ns = 1;
+    let maximum_sequence = u64::MAX / image.nodes.len() as u64;
+    image.host_states[0].next_payload_seq = maximum_sequence - (ACK_COUNT - 1);
+    let expected = format!(
+        "node NodeId(0) payload identity sequence {} overflows while reserving 55 generated packets",
+        image.host_states[0].next_payload_seq
+    );
+
+    let outcomes = [
+        ("Scalar", Backend::Scalar),
+        ("Cpu", Backend::Cpu { workers: 2 }),
+    ]
+    .map(|(label, backend)| match validate(&image, backend) {
+        Err(error) => format!("{label}: rejected: {error}"),
+        Ok(()) => {
+            let execution = match backend {
+                Backend::Scalar => {
+                    run_scalar_with_observations(&image, None, ObservationMode::Full).map(|_| ())
+                }
+                Backend::Cpu { workers } => run_cpu_with_observations(
+                    &image,
+                    None,
+                    CpuConfig {
+                        workers,
+                        ..CpuConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .map(|_| ()),
+                Backend::Metal | Backend::Cuda => unreachable!(),
+            };
+            match execution {
+                Ok(()) => format!("{label}: validated and completed"),
+                Err(error) => format!("{label}: validated then faulted: {error}"),
+            }
+        }
+    });
+
+    assert_eq!(
+        outcomes,
+        [
+            format!("Scalar: rejected: {expected}"),
+            format!("Cpu: rejected: {expected}"),
+        ]
+    );
+}
+
+#[test]
+fn cpu_checkpoint_retransmission_uses_source_owned_segment_ledger() {
+    let mut image = scheduled_tcp_checkpoint_image(2, 4);
+    let node_count = image.nodes.len() as u64;
+    for origin_seq in 0..3 {
+        let payload = PayloadId(SINK.0 + node_count * origin_seq);
+        image.initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow: FLOW,
+            size_bytes: ACK_BYTES,
+            kind: PacketKind::TcpAck(TcpAckHeader {
+                acknowledgment: 0,
+                acknowledged_bytes: 0,
+                echoed_sent_time_ns: 0,
+            }),
+        });
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SINK,
+                origin_seq,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+    image.host_states[1].next_origin_seq = 3;
+    image.host_states[1].next_payload_seq = 3;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+    image.initial_events.sort_by_key(|event| event.key);
+
+    validate(&image, Backend::Scalar).expect("checkpoint scalar image should validate");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("checkpoint CPU image should validate");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("checkpoint scalar execution should retransmit sequence zero");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("checkpoint CPU execution should retransmit sequence zero");
+    assert_eq!(cpu.result, scalar, "checkpoint Scalar/CPU byte identity");
+    assert!(scalar.observed_packets.iter().any(|packet| {
+        matches!(
+            packet.kind,
+            PacketKind::TcpData(header) if header.retransmission && header.sequence == 0
+        )
+    }));
+}
+
+#[test]
+fn receiver_reserves_ack_payloads_for_preloaded_in_flight_data() {
+    let mut constant_receiver = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    constant_receiver.initial_packets[0].kind = PacketKind::Data;
+    constant_receiver.host_states[0].generators[0].kind =
+        FlowGeneratorKind::Constant(ConstantGenerator {
+            first_departure_ns: 0,
+            interval_ns: 1,
+            packet_size_bytes: MSS,
+            termination: GeneratorTermination::Bytes(MSS),
+        });
+    let error = validate(&constant_receiver, Backend::Scalar)
+        .expect_err("TCP receiver state must require a TCP generator");
+    assert_eq!(
+        error.to_string(),
+        "host node NodeId(1) owns TCP receiver state for flow FlowId(0), but the flow generator is not TCP"
+    );
+
+    let mut constant_tcp_packet = constant_receiver;
+    constant_tcp_packet.host_states[1].tcp_receivers.clear();
+    constant_tcp_packet.initial_packets.push(PacketDescriptor {
+        id: PayloadId(2),
+        flow: FLOW,
+        size_bytes: MSS,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: 0,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+    });
+    constant_tcp_packet.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::RemoteArrival),
+            origin_node: SOURCE,
+            origin_seq: 1,
+        },
+        target: SINK,
+        kind: EventKind::RemoteArrival,
+        payload: PayloadId(2),
+    });
+    constant_tcp_packet.host_states[0].next_origin_seq = 2;
+    constant_tcp_packet.host_states[0].next_payload_seq = 2;
+    constant_tcp_packet
+        .initial_packets
+        .sort_by_key(|packet| packet.id);
+    constant_tcp_packet
+        .initial_events
+        .sort_by_key(|event| event.key);
+    let error = validate(&constant_tcp_packet, Backend::Scalar)
+        .expect_err("TCP packets must require a TCP generator");
+    assert_eq!(
+        error.to_string(),
+        "TCP packet PayloadId(2) for flow FlowId(0) requires a TCP generator"
+    );
+
+    let image = scheduled_tcp_checkpoint_image(4, 5);
+
+    let mut counter_image = image.clone();
+    counter_image.host_states[1].sourced_packets = u64::MAX - 3;
+    let counter_expected = format!(
+        "node NodeId(1) counter sourced_packets value {} overflows with remaining upper bound 7",
+        counter_image.host_states[1].sourced_packets
+    );
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&counter_image, backend)
+            .expect_err("preloaded data ACKs must be included in receiver counter bounds");
+        assert_eq!(error.to_string(), counter_expected);
+    }
+
+    let mut image = image;
+    let maximum_sequence = u64::MAX / image.nodes.len() as u64;
+    image.host_states[1].next_payload_seq = maximum_sequence - 2;
+    let expected = format!(
+        "node NodeId(1) payload identity sequence {} overflows while reserving 7 generated packets",
+        image.host_states[1].next_payload_seq
+    );
+
+    let outcomes = [
+        ("Scalar", Backend::Scalar),
+        ("Cpu", Backend::Cpu { workers: 2 }),
+    ]
+    .map(|(label, backend)| match validate(&image, backend) {
+        Err(error) => format!("{label}: rejected: {error}"),
+        Ok(()) => {
+            let execution = match backend {
+                Backend::Scalar => {
+                    run_scalar_with_observations(&image, None, ObservationMode::Full).map(|_| ())
+                }
+                Backend::Cpu { workers } => run_cpu_with_observations(
+                    &image,
+                    None,
+                    CpuConfig {
+                        workers,
+                        ..CpuConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .map(|_| ()),
+                Backend::Metal | Backend::Cuda => unreachable!(),
+            };
+            match execution {
+                Ok(()) => format!("{label}: validated and completed"),
+                Err(error) => format!("{label}: validated then faulted: {error}"),
+            }
+        }
+    });
+
+    assert_eq!(
+        outcomes,
+        [
+            format!("Scalar: rejected: {expected}"),
+            format!("Cpu: rejected: {expected}"),
+        ]
+    );
 }
