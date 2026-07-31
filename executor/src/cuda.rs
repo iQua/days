@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, sys,
+    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, LaunchConfig,
+    PushKernelArg, sys,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -509,6 +510,59 @@ pub struct CudaRun {
     pub memory_layout: CudaMemoryLayout,
 }
 
+/// Device-timestamp totals for the eight phases in every encoded CUDA graph attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaPhaseProfile {
+    pub recorded_attempts: u64,
+    pub horizon_ns: u64,
+    pub prepare_ns: u64,
+    pub drain_ns: u64,
+    pub control_ns: u64,
+    pub exchange_prefix_ns: u64,
+    pub exchange_scatter_ns: u64,
+    pub exchange_merge_ns: u64,
+    pub finalize_ns: u64,
+}
+
+impl CudaPhaseProfile {
+    pub fn total_kernel_ns(self) -> u64 {
+        [
+            self.horizon_ns,
+            self.prepare_ns,
+            self.drain_ns,
+            self.control_ns,
+            self.exchange_prefix_ns,
+            self.exchange_scatter_ns,
+            self.exchange_merge_ns,
+            self.finalize_ns,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add)
+    }
+
+    fn observe(&mut self, phase: usize, elapsed_ns: u64) {
+        let total = match phase {
+            0 => &mut self.horizon_ns,
+            1 => &mut self.prepare_ns,
+            2 => &mut self.drain_ns,
+            3 => &mut self.control_ns,
+            4 => &mut self.exchange_prefix_ns,
+            5 => &mut self.exchange_scatter_ns,
+            6 => &mut self.exchange_merge_ns,
+            7 => &mut self.finalize_ns,
+            _ => unreachable!("CUDA graph has exactly eight profiled phases"),
+        };
+        *total = total.saturating_add(elapsed_ns);
+    }
+}
+
+/// Complete CUDA result paired with opt-in phase timestamps.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaProfiledRun {
+    pub run: CudaRun,
+    pub profile: CudaPhaseProfile,
+}
+
 /// One-time CUDA context, stream, module, and kernel initialization costs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaInitializationTimings {
@@ -612,6 +666,27 @@ impl CudaExecutor {
         #[cfg(feature = "cuda-test-hooks")]
         panic_after_execution_if_requested();
         buffers.finish(&self.direct.stream, image, observation_mode, timing)
+    }
+
+    /// Executes with device events bracketing every captured graph phase.
+    pub fn run_profiled_with_observations(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+    ) -> Result<CudaProfiledRun, CudaError> {
+        validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+        validate_config(config)?;
+
+        let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
+        let _execution_guard = cuda_device_execution_guard();
+        let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
+        let (timing, profile) = self.direct.run_profiled(&buffers, config)?;
+        #[cfg(feature = "cuda-test-hooks")]
+        panic_after_execution_if_requested();
+        let run = buffers.finish(&self.direct.stream, image, observation_mode, timing)?;
+        Ok(CudaProfiledRun { run, profile })
     }
 }
 
@@ -2685,6 +2760,178 @@ impl DirectCuda {
             device_ns,
             wall_ns: duration_ns(wall_started.elapsed()),
         })
+    }
+
+    fn run_profiled(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+    ) -> Result<(CudaTiming, CudaPhaseProfile), CudaError> {
+        let parallel_threads = config.round_threads_per_block;
+        let supported_parallel_threads = PARALLEL_KERNELS
+            .iter()
+            .map(|index| {
+                self.functions[*index]
+                    .max_threads_per_block()
+                    .map(|value| value as usize)
+                    .map_err(|error| {
+                        driver_error(
+                            format!("kernel `{}` thread limit query", KERNEL_NAMES[*index]),
+                            error,
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min()
+            .unwrap_or(0);
+        if parallel_threads > supported_parallel_threads {
+            return Err(CudaError::Validation(format!(
+                "round_threads_per_block {parallel_threads} exceeds the supported maximum \
+                 {supported_parallel_threads}"
+            )));
+        }
+
+        let parallel_blocks = buffers.node_count.div_ceil(parallel_threads).max(1);
+        let parallel_blocks = u32::try_from(parallel_blocks).map_err(|_| {
+            CudaError::Validation("parallel CUDA grid does not fit in u32 blocks".into())
+        })?;
+        let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
+            CudaError::Validation("round_threads_per_block does not fit in u32".into())
+        })?;
+        let control = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (LANES as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let parallel = LaunchConfig {
+            grid_dim: (parallel_blocks, 1, 1),
+            block_dim: (parallel_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let configs = [
+            control, control, parallel, control, control, parallel, parallel, control,
+        ];
+
+        let wall_started = Instant::now();
+        let maximum_waves = buffers
+            .dispatch_capacity
+            .div_ceil(config.attempts_per_graph_wave)
+            .max(1);
+        let mut wave_boundary_syncs = 0_u64;
+        let mut mid_round_wave_boundary_syncs = 0_u64;
+        let mut host_submit_ns = 0_u64;
+        let mut device_ns = 0_u64;
+        let mut encoded_attempts = 0_u64;
+        let mut profile = CudaPhaseProfile::default();
+
+        for _ in 0..maximum_waves {
+            let phase_events = self.create_phase_events(config.attempts_per_graph_wave)?;
+            let start = self
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| driver_error("profile wave start event", error))?;
+            let submitted = Instant::now();
+            for boundaries in &phase_events {
+                boundaries[0]
+                    .record(&self.stream)
+                    .map_err(|error| driver_error("profile attempt start event", error))?;
+                for (phase, ((function, launch_config), name)) in self
+                    .functions
+                    .iter()
+                    .zip(configs)
+                    .zip(KERNEL_NAMES)
+                    .enumerate()
+                {
+                    launch_uniform(&self.stream, function, buffers, launch_config)
+                        .map_err(|error| driver_error(format!("profile `{name}` launch"), error))?;
+                    boundaries[phase + 1]
+                        .record(&self.stream)
+                        .map_err(|error| {
+                            driver_error(format!("profile `{name}` end event"), error)
+                        })?;
+                }
+            }
+            host_submit_ns = host_submit_ns.saturating_add(duration_ns(submitted.elapsed()));
+            let end = self
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| driver_error("profile wave end event", error))?;
+            let control = self
+                .stream
+                .clone_dtoh(&buffers.planes[0])
+                .map_err(|error| driver_error("profile wave control readback", error))?;
+            self.stream
+                .synchronize()
+                .map_err(|error| driver_error("profile wave synchronization", error))?;
+            let elapsed_ms = start
+                .elapsed_ms(&end)
+                .map_err(|error| driver_error("profile wave elapsed time", error))?;
+            device_ns = device_ns.saturating_add((f64::from(elapsed_ms) * 1_000_000.0) as u64);
+            wave_boundary_syncs = wave_boundary_syncs.saturating_add(1);
+            encoded_attempts =
+                encoded_attempts.saturating_add(config.attempts_per_graph_wave as u64);
+
+            for boundaries in &phase_events {
+                for phase in 0..KERNEL_NAMES.len() {
+                    let elapsed_ms = boundaries[phase]
+                        .elapsed_ms(&boundaries[phase + 1])
+                        .map_err(|error| {
+                            driver_error(
+                                format!(
+                                    "profile `{}` device-event elapsed time",
+                                    KERNEL_NAMES[phase]
+                                ),
+                                error,
+                            )
+                        })?;
+                    profile.observe(phase, (f64::from(elapsed_ms) * 1_000_000.0) as u64);
+                }
+            }
+            profile.recorded_attempts = profile
+                .recorded_attempts
+                .saturating_add(phase_events.len() as u64);
+
+            let done = control[CONTROL_DONE] != 0;
+            let error = control[CONTROL_ERROR] != 0;
+            if !done && !error && control[CONTROL_CONTINUATION] != 0 {
+                mid_round_wave_boundary_syncs = mid_round_wave_boundary_syncs.saturating_add(1);
+            }
+            if done || error {
+                break;
+            }
+        }
+
+        Ok((
+            CudaTiming {
+                encoded_attempts,
+                graph_replays: 0,
+                wave_boundary_syncs,
+                mid_round_wave_boundary_syncs,
+                graph_capture_ns: 0,
+                host_submit_ns,
+                device_ns,
+                wall_ns: duration_ns(wall_started.elapsed()),
+            },
+            profile,
+        ))
+    }
+
+    fn create_phase_events(&self, attempts: usize) -> Result<Vec<Vec<CudaEvent>>, CudaError> {
+        let mut phase_events = Vec::with_capacity(attempts);
+        for _ in 0..attempts {
+            let mut boundaries = Vec::with_capacity(KERNEL_NAMES.len() + 1);
+            for _ in 0..=KERNEL_NAMES.len() {
+                boundaries.push(
+                    self.stream
+                        .context()
+                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(|error| driver_error("phase profile event creation", error))?,
+                );
+            }
+            phase_events.push(boundaries);
+        }
+        Ok(phase_events)
     }
 
     fn capture_graph(
