@@ -83,9 +83,10 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_flow_ids(image)?;
     validate_packet_ids(image)?;
     validate_state_ownership(image)?;
+    validate_device_tcp_support(image, backend)?;
     validate_links(image)?;
     validate_flows(image)?;
-    validate_generators(image, backend)?;
+    validate_generators(image)?;
     let derived_delays = validate_packets_and_derive_delays(image)?;
     validate_owned_service_state(image, backend)?;
     validate_channels(image, backend, &derived_delays)?;
@@ -98,6 +99,75 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_preloaded_arrival_capacity(image)?;
     validate_initial_payload_positions(image)?;
     Ok(())
+}
+
+fn validate_device_tcp_support(
+    image: &SimulationImage,
+    backend: Backend,
+) -> Result<(), ValidationError> {
+    if !matches!(backend, Backend::Metal | Backend::Cuda) {
+        return Ok(());
+    }
+
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        for generator in &state.generators {
+            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+                return Err(ValidationError::new(format!(
+                    "TCP {} generator for flow {:?} requires Scalar or Cpu; {backend} support is T24",
+                    tcp.control.label(),
+                    generator.flow
+                )));
+            }
+        }
+    }
+
+    for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)) {
+            return Err(ValidationError::new(format!(
+                "TCP packet {:?} for flow {:?} requires Scalar or Cpu; {backend} support is T24",
+                packet.id, packet.flow
+            )));
+        }
+    }
+
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        if let Some(receiver) = state.tcp_receivers.first() {
+            return Err(ValidationError::new(format!(
+                "TCP receiver state for flow {:?} at node {:?} requires Scalar or Cpu; {backend} support is T24",
+                receiver.flow, owner.id
+            )));
+        }
+    }
+
+    if let Some(event) = image
+        .initial_events
+        .iter()
+        .find(|event| event.kind == EventKind::RetransmissionTimeout)
+    {
+        return Err(ValidationError::new(format!(
+            "TCP retransmission timer event at key {:?} requires Scalar or Cpu; {backend} support is T24",
+            event.key
+        )));
+    }
+
+    Ok(())
+}
+
+const fn congestion_control_mss_bytes(control: crate::TcpCongestionControl) -> u64 {
+    match control {
+        crate::TcpCongestionControl::Reno(state) => state.mss_bytes,
+        crate::TcpCongestionControl::Cubic(state) => state.mss_bytes,
+    }
 }
 
 fn validate_node_ids(image: &SimulationImage) -> Result<(), ValidationError> {
@@ -409,7 +479,7 @@ fn route_target(
         .or_else(|| (index + 1 == route.len()).then_some(terminal))
 }
 
-fn validate_generators(image: &SimulationImage, backend: Backend) -> Result<(), ValidationError> {
+fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut arrival_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
     for event in image
         .initial_events
@@ -501,17 +571,26 @@ fn validate_generators(image: &SimulationImage, backend: Backend) -> Result<(), 
             }
 
             if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-                if matches!(backend, Backend::Metal | Backend::Cuda) {
-                    return Err(ValidationError::new(format!(
-                        "TCP {} generator for flow {:?} requires Scalar or Cpu; {backend} support is T24",
-                        tcp.control.label(),
-                        flow.id
-                    )));
-                }
                 if tcp.total_bytes == 0 || tcp.mss_bytes == 0 || tcp.ack_size_bytes == 0 {
                     return Err(ValidationError::new(format!(
                         "flow {:?} TCP total_bytes, mss_bytes, and ack_size_bytes must be positive",
                         flow.id
+                    )));
+                }
+                if tcp.rto_ns == 0 || tcp.active_timer.is_some_and(|timer| timer.rto_ns == 0) {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP retransmission timeout must be positive",
+                        flow.id
+                    )));
+                }
+                let control_mss_bytes = congestion_control_mss_bytes(tcp.control);
+                if tcp.mss_bytes != control_mss_bytes {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP generator MSS {} does not match {} controller MSS {}",
+                        flow.id,
+                        tcp.mss_bytes,
+                        tcp.control.label(),
+                        control_mss_bytes
                     )));
                 }
                 let remaining = remaining_generator_packets(generator)?;
@@ -548,9 +627,13 @@ fn validate_generators(image: &SimulationImage, backend: Backend) -> Result<(), 
                             flow.id
                         )));
                     }
-                    GeneratorStatus::Scheduled
-                    | GeneratorStatus::Blocked
-                    | GeneratorStatus::Finished => {}
+                    GeneratorStatus::Blocked => {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} TCP generator cannot start Blocked because initial retransmission timers are unsupported",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Scheduled | GeneratorStatus::Finished => {}
                 }
                 if flow.reverse_route.is_empty() {
                     return Err(ValidationError::new(format!(
@@ -964,7 +1047,10 @@ fn validate_packets_and_derive_delays(
                             .and_modify(|minimum| *minimum = (*minimum).min(delay))
                             .or_insert(delay);
                     }
-                    (tcp.mss_bytes, flow.route.as_slice(), flow.target)
+                    // TCP may emit a short final or congestion-window-limited segment.  A
+                    // single byte is therefore the conservative lower bound for every future
+                    // forward transmission on this route.
+                    (1, flow.route.as_slice(), flow.target)
                 }
             };
             for (index, link_id) in route.iter().enumerate() {

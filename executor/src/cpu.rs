@@ -748,7 +748,7 @@ impl CpuLp<'_> {
         let mut outbox = Vec::new();
         let mut events_processed = 0_u64;
         let mut same_time_continuations = 0_u64;
-        let mut fallback_heap_pushes = 0_u64;
+        let mut fallback_classified_pushes = 0_u64;
         let mut continuation = None;
         while continuation.is_some()
             || self
@@ -808,7 +808,7 @@ impl CpuLp<'_> {
                     } else if self.futures.insert(child.key, child).is_some() {
                         return Err(ExecutionError::DuplicateEventKey(child.key));
                     } else if event_fel_class(child.kind) == EventFelClass::FallbackHeap {
-                        fallback_heap_pushes = fallback_heap_pushes
+                        fallback_classified_pushes = fallback_classified_pushes
                             .checked_add(1)
                             .ok_or(ExecutionError::CounterOverflow(self.node.id))?;
                     }
@@ -843,7 +843,7 @@ impl CpuLp<'_> {
                 node: self.node.id,
                 events_processed,
                 same_time_continuations,
-                fallback_heap_pushes,
+                fallback_classified_pushes,
             },
             outbox,
         ))
@@ -4321,7 +4321,7 @@ fn one_lp_outbox_is_event_key_ordered_not_target_major() {
             node: NodeId(0),
             events_processed: 9,
             same_time_continuations: 2,
-            fallback_heap_pushes: 0,
+            fallback_classified_pushes: 0,
         }
     );
     assert_eq!(

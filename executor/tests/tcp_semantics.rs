@@ -6,9 +6,10 @@ use days_executor::{
     GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId, NodeDescriptor,
     NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel,
     ScheduledEmission, SchedulerKind, SimulationImage, StaticPartitionPolicy, SwitchQueueState,
-    SwitchState, TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpPhase, TcpReceiverState,
-    TcpTransitionInput, event_fel_class, event_phase, run_cpu_with_observations,
-    run_scalar_rounds_with_observations, run_scalar_with_observations, validate,
+    SwitchState, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpPhase,
+    TcpReceiverState, TcpTimerState, TcpTransitionInput, event_fel_class, event_phase,
+    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
+    size_default_device_plan, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -120,7 +121,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
         initial_packets: vec![first],
         links: vec![forward, reverse],
         channels: vec![
-            RemoteChannel::for_packet_link(forward, first_size).unwrap(),
+            RemoteChannel::for_packet_link(forward, 1).unwrap(),
             RemoteChannel::for_packet_link(reverse, ACK_BYTES).unwrap(),
         ],
         initial_events: vec![Event {
@@ -302,8 +303,8 @@ fn switched_tcp_image(
         initial_packets: vec![first],
         links: links.to_vec(),
         channels: vec![
-            RemoteChannel::for_packet_link(links[0], MSS).unwrap(),
-            RemoteChannel::for_packet_link(links[1], MSS).unwrap(),
+            RemoteChannel::for_packet_link(links[0], 1).unwrap(),
+            RemoteChannel::for_packet_link(links[1], 1).unwrap(),
             RemoteChannel::for_packet_link(links[2], ACK_BYTES).unwrap(),
             RemoteChannel::for_packet_link(links[3], ACK_BYTES).unwrap(),
         ],
@@ -320,6 +321,41 @@ fn switched_tcp_image(
         }],
         seed: 11,
     }
+}
+
+fn recovery_campaign_image(control: TcpCongestionControl) -> SimulationImage {
+    let mut image = switched_tcp_image(control, SchedulerKind::Fifo, 1);
+    let acknowledgments = [MSS, MSS, MSS, MSS, MSS, 2 * MSS, 4 * MSS];
+    let node_count = image.nodes.len() as u64;
+    let target = image.flows[0].target;
+    for (sequence, acknowledgment) in acknowledgments.into_iter().enumerate() {
+        let payload = PayloadId(target.0 + node_count * sequence as u64);
+        image.initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow: FLOW,
+            size_bytes: ACK_BYTES,
+            kind: PacketKind::TcpAck(TcpAckHeader {
+                acknowledgment,
+                acknowledged_bytes: 0,
+                echoed_sent_time_ns: 0,
+            }),
+        });
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: sequence as u64 + 1,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: NodeId(3),
+                origin_seq: sequence as u64,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+    image.host_states[1].next_payload_seq = acknowledgments.len() as u64;
+    image.switch_states[1].next_origin_seq = acknowledgments.len() as u64;
+    image.initial_events.sort_by_key(|event| event.key);
+    image
 }
 
 #[test]
@@ -393,7 +429,7 @@ fn cubic_window_uses_the_documented_integer_lattice() {
 }
 
 #[test]
-fn retransmission_timeout_is_a_phase_one_fallback_heap_event() {
+fn retransmission_timeout_is_a_phase_one_fallback_classified_event() {
     assert_eq!(event_phase(EventKind::RetransmissionTimeout), 1);
     assert_eq!(
         event_fel_class(EventKind::RetransmissionTimeout),
@@ -408,8 +444,8 @@ fn retransmission_timeout_is_a_phase_one_fallback_heap_event() {
             .rounds
             .iter()
             .flat_map(|round| &round.lp_work)
-            .any(|work| work.fallback_heap_pushes > 0),
-        "the scalar stream FEL must route TCP timers through its fallback heap"
+            .any(|work| work.fallback_classified_pushes > 0),
+        "scalar must classify generic-FEL TCP timer insertions as fallback events"
     );
 
     let cpu = run_cpu_with_observations(
@@ -423,8 +459,8 @@ fn retransmission_timeout_is_a_phase_one_fallback_heap_event() {
         cpu.rounds
             .iter()
             .flat_map(|round| &round.semantic.lp_work)
-            .any(|work| work.fallback_heap_pushes > 0),
-        "the CPU stream FEL must route TCP timers through its fallback heap"
+            .any(|work| work.fallback_classified_pushes > 0),
+        "CPU must classify generic-FEL TCP timer insertions as fallback events"
     );
 }
 
@@ -548,14 +584,48 @@ fn tcp_cartesian_matrix_is_byte_identical_across_queue_and_cpu_axes() {
 }
 
 #[test]
-fn forty_byte_acks_reduce_the_measured_horizon_from_41ns_to_4ns() {
+fn tcp_lookahead_admits_one_byte_data_segments_and_forty_byte_acks() {
     let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
-    assert_eq!(image.channels[0].min_delay_ns, 41);
+    assert_eq!(image.channels[0].min_delay_ns, 1);
     assert_eq!(image.channels[1].min_delay_ns, 4);
 
     let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full)
         .expect("round execution should run");
-    assert_eq!(run.rounds[0].horizon_advance_ns, 4);
+    assert_eq!(run.rounds[0].horizon_advance_ns, 1);
+}
+
+#[test]
+fn sub_mss_final_segment_respects_safe_horizon_and_cpu_byte_identity() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), MSS + 1);
+    validate(&image, Backend::Scalar).expect("TCP scalar image should validate");
+
+    let serial = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("serial execution should deliver the one-byte final segment");
+    let scalar = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full)
+        .expect("safe-horizon scalar execution must admit the one-byte final segment");
+    assert_eq!(scalar.result, serial);
+
+    for workers in [1, 2, 4] {
+        validate(&image, Backend::Cpu { workers }).expect("TCP CPU image should validate");
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| {
+            panic!("safe-horizon CPU execution with {workers} workers failed: {error}")
+        });
+        assert_eq!(
+            cpu.result, serial,
+            "CPU byte identity with {workers} workers"
+        );
+    }
+
+    assert_eq!(serial.summary.received_bytes, u128::from(MSS + 1));
 }
 
 #[test]
@@ -568,6 +638,108 @@ fn tcp_images_reject_devices_with_the_t24_capability_diagnostic() {
             format!(
                 "TCP Reno generator for flow FlowId(0) requires Scalar or Cpu; {backend} support is T24"
             )
+        );
+    }
+}
+
+#[test]
+fn devices_reject_tcp_packets_without_a_tcp_generator_before_packing() {
+    let packet_kinds = [
+        PacketKind::TcpData(TcpDataHeader {
+            sequence: 0,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+        PacketKind::TcpAck(TcpAckHeader {
+            acknowledgment: 0,
+            acknowledged_bytes: 0,
+            echoed_sent_time_ns: 0,
+        }),
+    ];
+    for packet_kind in packet_kinds {
+        let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+        image.host_states[0].generators.clear();
+        image.host_states[1].tcp_receivers.clear();
+        image.initial_packets[0].kind = packet_kind;
+
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let error = validate(&image, backend)
+                .expect_err("device packet encoding cannot represent TCP packet metadata");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "TCP packet PayloadId(0) for flow FlowId(0) requires Scalar or Cpu; {backend} support is T24"
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn devices_reject_tcp_receiver_state_on_an_ordinary_data_image_before_packing() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    image.host_states[0].generators.clear();
+    image.initial_packets[0].kind = PacketKind::Data;
+
+    for backend in [Backend::Metal, Backend::Cuda] {
+        let error = validate(&image, backend)
+            .expect_err("device state encoding cannot represent TCP receiver state");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "TCP receiver state for flow FlowId(0) at node NodeId(1) requires Scalar or Cpu; {backend} support is T24"
+            )
+        );
+    }
+}
+
+#[test]
+fn devices_reject_tcp_timer_events_before_packing() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    image.host_states[0].generators.clear();
+    image.host_states[1].tcp_receivers.clear();
+    image.initial_packets[0].kind = PacketKind::Data;
+    image.initial_events[0].kind = EventKind::RetransmissionTimeout;
+    image.initial_events[0].key.phase = event_phase(EventKind::RetransmissionTimeout);
+
+    for backend in [Backend::Metal, Backend::Cuda] {
+        let error = validate(&image, backend)
+            .expect_err("device event encoding cannot represent TCP timers");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "TCP retransmission timer event at key {:?} requires Scalar or Cpu; {backend} support is T24",
+                image.initial_events[0].key
+            )
+        );
+    }
+}
+
+#[test]
+fn device_sizing_rejects_tcp_before_deriving_any_plan() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    let error = size_default_device_plan(&image)
+        .expect_err("generic GPU sizing must reject TCP instead of reaching packing assumptions");
+    assert_eq!(
+        error.to_string(),
+        "TCP Reno generator for flow FlowId(0) requires a non-device backend; device sizing support is T24"
+    );
+}
+
+#[test]
+fn validator_rejects_tcp_generator_and_controller_mss_disagreement() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.control = TcpCongestionControl::cubic(1460);
+
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("transport and congestion control must share one MSS");
+        assert_eq!(
+            error.to_string(),
+            "flow FlowId(0) TCP generator MSS 512 does not match CUBIC controller MSS 1460"
         );
     }
 }
@@ -604,18 +776,87 @@ fn validator_rejects_duplicate_tcp_receiver_ownership() {
 }
 
 #[test]
+fn validator_rejects_nonprogressing_tcp_blocked_fresh_flow_without_an_event() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    image.host_states[0].generators[0].next_emission.status = GeneratorStatus::Blocked;
+    image.initial_events.clear();
+
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("a fresh blocked TCP flow without live work must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "flow FlowId(0) TCP generator cannot start Blocked because initial retransmission timers are unsupported"
+        );
+    }
+}
+
+#[test]
+fn validator_rejects_blocked_tcp_with_only_unscheduled_timer_state() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    image.initial_events.clear();
+    let generator = &mut image.host_states[0].generators[0];
+    generator.next_emission.status = GeneratorStatus::Blocked;
+    generator.packets_emitted = 1;
+    generator.bytes_emitted = MSS;
+    generator.feedback.outstanding_bytes = MSS;
+    generator.feedback.unacknowledged_bytes = MSS;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.next_sequence = MSS;
+    tcp.bytes_in_flight = MSS;
+    tcp.last_attempt = FIRST;
+    tcp.timer_generation = 1;
+    tcp.active_timer = Some(TcpTimerState {
+        attempt: FIRST,
+        sequence: 0,
+        deadline_ns: TcpGenerator::INITIAL_RTO_NS,
+        generation: 1,
+        rto_ns: TcpGenerator::INITIAL_RTO_NS,
+    });
+
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("timer state without a live timer event cannot make progress");
+        assert_eq!(
+            error.to_string(),
+            "flow FlowId(0) TCP generator cannot start Blocked because initial retransmission timers are unsupported"
+        );
+    }
+}
+
+#[test]
+fn validator_rejects_nonprogressing_tcp_zero_rto_before_execution() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    image.stop_time_ns = 0;
+    image.host_states[0].next_payload_seq = u64::MAX / 2 - 4;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.rto_ns = 0;
+
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("a zero-time retransmission cycle must be rejected before execution");
+        assert_eq!(
+            error.to_string(),
+            "flow FlowId(0) TCP retransmission timeout must be positive"
+        );
+    }
+}
+
+#[test]
 fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
-    let mut records = Vec::new();
-    for (index, control) in [
+    let mut traces = Vec::new();
+    for control in [
         TcpCongestionControl::reno(MSS),
         TcpCongestionControl::cubic(MSS),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let image = switched_tcp_image(control, SchedulerKind::Fifo, 1);
-        let run = run_scalar_with_observations(&image, None, ObservationMode::Full)
-            .expect("adversarial TailDrop trace should run");
+    ] {
+        let image = recovery_campaign_image(control);
+        validate(&image, Backend::Scalar).expect("recovery campaign image should validate");
+        let run = run_scalar_with_observations(&image, Some(8), ObservationMode::Full)
+            .expect("adversarial recovery TailDrop trace should run");
         let retransmissions = run
             .observed_packets
             .iter()
@@ -635,30 +876,161 @@ fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
                     )
             }));
         }
-        records.extend(run.tcp_transitions.into_iter().map(|mut record| {
-            record.flow = FlowId(index as u64);
-            record
+        let records = run.tcp_transitions;
+        assert!(records.iter().any(|record| {
+            matches!(record.input, TcpTransitionInput::DuplicateAck { .. })
+                && record.before.duplicate_acks() == 2
+                && record.after.phase() == TcpPhase::FastRecovery
         }));
+        assert!(records.iter().any(|record| {
+            matches!(record.input, TcpTransitionInput::DuplicateAck { .. })
+                && record.before.phase() == TcpPhase::FastRecovery
+                && record.before.duplicate_acks() >= 3
+                && record.after.cwnd_scaled() > record.before.cwnd_scaled()
+        }));
+        assert!(records.iter().any(|record| {
+            matches!(
+                record.input,
+                TcpTransitionInput::NewAck { acknowledgment, .. }
+                    if record.before.phase() == TcpPhase::FastRecovery
+                        && acknowledgment < record.before.recovery_high_sequence()
+            )
+        }));
+        assert!(records.iter().any(|record| {
+            matches!(
+                record.input,
+                TcpTransitionInput::NewAck { acknowledgment, .. }
+                    if record.before.phase() == TcpPhase::FastRecovery
+                        && acknowledgment >= record.before.recovery_high_sequence()
+            )
+        }));
+        if control.label() == "CUBIC" {
+            assert!(records.iter().any(|record| record.after.cubic_k_ns() > 0));
+        }
+        traces.push((format!("{}-recovery", control.label()), records));
+
+        let timeout_run = run_scalar_with_observations(
+            &switched_tcp_image(control, SchedulerKind::Fifo, 1),
+            None,
+            ObservationMode::Full,
+        )
+        .expect("adversarial timeout TailDrop trace should run");
+        assert!(
+            timeout_run
+                .tcp_transitions
+                .iter()
+                .any(|record| matches!(record.input, TcpTransitionInput::Timeout { .. }))
+        );
+        traces.push((
+            format!("{}-timeout", control.label()),
+            timeout_run.tcp_transitions,
+        ));
     }
 
-    assert!(
+    assert!(traces.iter().all(|(_, records)| {
         records
             .iter()
             .any(|record| matches!(record.input, TcpTransitionInput::NewAck { .. }))
-    );
-    assert!(
+    }));
+    assert!(traces.iter().all(|(_, records)| {
         records
             .iter()
             .any(|record| matches!(record.input, TcpTransitionInput::DuplicateAck { .. }))
-    );
-    assert!(
+    }));
+    assert!(traces.iter().any(|(_, records)| {
         records
             .iter()
             .any(|record| matches!(record.input, TcpTransitionInput::Timeout { .. }))
-    );
-    let csv = days_executor::tcp_transitions_csv(&records);
-    assert_eq!(csv.lines().count(), records.len() + 1);
-    if let Some(path) = std::env::var_os("DAYS_TCP_TRACE_OUT") {
-        std::fs::write(path, csv).expect("write requested TCP LeanGuard trace");
+    }));
+    let before = TcpCongestionControl::reno(u64::MAX);
+    let mut after = before;
+    after.on_new_ack(1, 8, 1, u64::MAX, 1);
+    traces.push((
+        "reno-saturation".to_string(),
+        vec![days_executor::TcpTransitionRecord {
+            key: EventKey {
+                time_ns: 8,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: NodeId(3),
+                origin_seq: 99,
+            },
+            node: SOURCE,
+            flow: FlowId(99),
+            mss_bytes: u64::MAX,
+            input: TcpTransitionInput::NewAck {
+                acknowledged_bytes: 1,
+                rtt_sample_ns: 1,
+                flight_size_bytes: u64::MAX,
+                acknowledgment: 1,
+            },
+            before,
+            after,
+        }],
+    ));
+    let output_dir = std::env::var_os("DAYS_TCP_TRACE_DIR").map(std::path::PathBuf::from);
+    for (algorithm, records) in traces {
+        let csv = days_executor::tcp_transitions_csv(&records)
+            .expect("one scalar run must have unique canonical event keys");
+        assert_eq!(csv.lines().count(), records.len() + 1);
+        if let Some(directory) = &output_dir {
+            std::fs::create_dir_all(directory).expect("create requested TCP trace directory");
+            let name = format!("{}-tcp-events.csv", algorithm.to_ascii_lowercase());
+            std::fs::write(directory.join(name), csv).expect("write requested TCP LeanGuard trace");
+        }
+    }
+}
+
+#[test]
+fn retransmission_preserves_cwnd_limited_segment_length() {
+    let mut control = TcpCongestionControl::reno(MSS);
+    let TcpCongestionControl::Reno(ref mut reno) = control else {
+        unreachable!()
+    };
+    reno.cwnd_bytes = 3 * MSS - 1;
+
+    let image = switched_tcp_image(control, SchedulerKind::Fifo, 1);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the cwnd-limited TailDrop trace should run");
+    let original = scalar
+        .observed_packets
+        .iter()
+        .find(|packet| {
+            matches!(
+                packet.kind,
+                PacketKind::TcpData(header)
+                    if !header.retransmission && header.sequence == 2 * MSS
+            )
+        })
+        .expect("sequence 1024 should be emitted before its retransmission");
+    let retransmission = scalar
+        .observed_packets
+        .iter()
+        .find(|packet| {
+            matches!(
+                packet.kind,
+                PacketKind::TcpData(header)
+                    if header.retransmission && header.sequence == 2 * MSS
+            )
+        })
+        .expect("TailDrop should force sequence 1024 to be retransmitted");
+
+    assert_eq!(original.size_bytes, MSS - 1);
+    assert_eq!(retransmission.size_bytes, original.size_bytes);
+
+    for workers in [1, 2, 4] {
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("CPU execution with {workers} workers failed: {error}"));
+        assert_eq!(
+            cpu.result, scalar,
+            "CPU byte identity with {workers} workers"
+        );
     }
 }

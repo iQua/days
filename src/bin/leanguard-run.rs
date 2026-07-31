@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -465,8 +465,18 @@ fn run_checker(
 }
 
 fn read_coverage_points(path: &Path) -> Option<Vec<String>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CoverageFile {
+        Points(Vec<String>),
+        Report { cover: Vec<String> },
+    }
+
     let content = fs::read_to_string(path).ok()?;
-    if let Ok(mut points) = serde_json::from_str::<Vec<String>>(&content) {
+    if let Ok(parsed) = serde_json::from_str::<CoverageFile>(&content) {
+        let mut points = match parsed {
+            CoverageFile::Points(points) | CoverageFile::Report { cover: points } => points,
+        };
         points.sort();
         points.dedup();
         return Some(points);
@@ -483,6 +493,27 @@ fn read_coverage_points(path: &Path) -> Option<Vec<String>> {
     points.sort();
     points.dedup();
     Some(points)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_coverage_points;
+
+    #[test]
+    fn coverage_report_object_extracts_sorted_unique_coverpoints() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("coverage.json");
+        std::fs::write(
+            &path,
+            r#"{"checker":"tcp_check","accept":true,"cover":["reno_timeout","reno_new_ack","reno_timeout"],"stats":{"rows":3,"processed_rows":3}}"#,
+        )
+        .expect("write coverage report");
+
+        assert_eq!(
+            read_coverage_points(&path),
+            Some(vec!["reno_new_ack".to_string(), "reno_timeout".to_string()])
+        );
+    }
 }
 
 fn aggregate_coverage(results: &[CheckerResult]) -> Option<CoverageSummary> {

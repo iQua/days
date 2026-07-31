@@ -116,6 +116,7 @@ impl std::error::Error for DeviceSizingError {}
 pub fn size_default_device_plan(
     image: &SimulationImage,
 ) -> Result<DeviceSizingReport, DeviceSizingError> {
+    reject_tcp_device_sizing(image)?;
     let node_count = image.nodes.len();
     let flow_count = image.flows.len();
     let link_count = image.links.len();
@@ -300,6 +301,47 @@ pub fn size_default_device_plan(
             legacy_heap_arena_bytes,
         },
     })
+}
+
+fn reject_tcp_device_sizing(image: &SimulationImage) -> Result<(), DeviceSizingError> {
+    for state in &image.host_states {
+        for generator in &state.generators {
+            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+                return Err(sizing_error(format!(
+                    "TCP {} generator for flow {:?} requires a non-device backend; device sizing support is T24",
+                    tcp.control.label(),
+                    generator.flow
+                )));
+            }
+        }
+    }
+    for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)) {
+            return Err(sizing_error(format!(
+                "TCP packet {:?} for flow {:?} requires a non-device backend; device sizing support is T24",
+                packet.id, packet.flow
+            )));
+        }
+    }
+    for (slot, state) in image.host_states.iter().enumerate() {
+        if let Some(receiver) = state.tcp_receivers.first() {
+            return Err(sizing_error(format!(
+                "TCP receiver state for flow {:?} in host state {slot} requires a non-device backend; device sizing support is T24",
+                receiver.flow
+            )));
+        }
+    }
+    if let Some(event) = image
+        .initial_events
+        .iter()
+        .find(|event| event.kind == EventKind::RetransmissionTimeout)
+    {
+        return Err(sizing_error(format!(
+            "TCP retransmission timer event at key {:?} requires a non-device backend; device sizing support is T24",
+            event.key
+        )));
+    }
+    Ok(())
 }
 
 struct CapacityContext {

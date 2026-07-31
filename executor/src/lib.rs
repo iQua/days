@@ -79,6 +79,6 @@ pub use scalar::{
     run_scalar_with_observations,
 };
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
-pub use tcp_trace::tcp_transitions_csv;
+pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
 pub use validate::{Backend, ValidationError, validate};

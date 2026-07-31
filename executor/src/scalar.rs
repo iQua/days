@@ -149,6 +149,16 @@ pub enum ExecutionError {
         flow: FlowId,
         payload: PayloadId,
     },
+    MissingTcpSegment {
+        flow: FlowId,
+        sequence: u64,
+    },
+    InconsistentTcpSegment {
+        flow: FlowId,
+        sequence: u64,
+        original_size_bytes: u64,
+        replacement_size_bytes: u64,
+    },
     PayloadSequenceOverflow(NodeId),
     GeneratorTimeOverflow(FlowId),
     FlowRouteMiss {
@@ -258,6 +268,20 @@ impl fmt::Display for ExecutionError {
             } => write!(
                 formatter,
                 "host node {node:?} generator for flow {flow:?} did not schedule payload {payload:?}"
+            ),
+            Self::MissingTcpSegment { flow, sequence } => write!(
+                formatter,
+                "TCP flow {flow:?} has no recorded original segment at sequence {sequence}"
+            ),
+            Self::InconsistentTcpSegment {
+                flow,
+                sequence,
+                original_size_bytes,
+                replacement_size_bytes,
+            } => write!(
+                formatter,
+                "TCP flow {flow:?} sequence {sequence} changed segment size from \
+                 {original_size_bytes} to {replacement_size_bytes} bytes"
             ),
             Self::PayloadSequenceOverflow(node) => {
                 write!(
@@ -432,6 +456,7 @@ pub(crate) struct TransitionState<'image> {
     departures: Vec<(EventKey, PacketDeparture)>,
     arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: Vec<TcpTransitionRecord>,
+    tcp_sent_segments: BTreeMap<(FlowId, u64), u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -477,7 +502,9 @@ impl<'image> TransitionState<'image> {
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
         let mut packets = BTreeMap::new();
+        let mut tcp_sent_segments = BTreeMap::new();
         for descriptor in image.initial_packets.iter().copied() {
+            seed_tcp_segment(&mut tcp_sent_segments, descriptor)?;
             if packets
                 .insert(
                     descriptor.id,
@@ -526,6 +553,7 @@ impl<'image> TransitionState<'image> {
             departures: Vec::new(),
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
+            tcp_sent_segments,
         })
     }
 
@@ -563,7 +591,9 @@ impl<'image> TransitionState<'image> {
         };
 
         let mut resident = BTreeMap::new();
+        let mut tcp_sent_segments = BTreeMap::new();
         for descriptor in packets {
+            seed_tcp_segment(&mut tcp_sent_segments, descriptor)?;
             if resident
                 .insert(
                     descriptor.id,
@@ -609,6 +639,7 @@ impl<'image> TransitionState<'image> {
             departures: Vec::new(),
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
+            tcp_sent_segments,
         })
     }
 
@@ -984,6 +1015,7 @@ impl<'image> TransitionState<'image> {
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
+        seed_tcp_segment(&mut self.tcp_sent_segments, packet)?;
         self.enqueue_source_packet(node, packet.id)?;
         self.record_sourced(node.id, packet)?;
         let plan = self.prepare_tcp_attempts(node, packet.flow, event.key.time_ns, None, true)?;
@@ -1399,7 +1431,7 @@ impl<'image> TransitionState<'image> {
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
         self.mark_terminal(packet.id)?;
 
-        let (retransmit_sequence, fill_window, transition) = {
+        let (retransmit_sequence, fill_window, acknowledged_through, transition) = {
             let state = self.host_state_mut(node)?;
             let generator = state
                 .generators
@@ -1421,6 +1453,7 @@ impl<'image> TransitionState<'image> {
             let mut input = None;
             let mut retransmit = None;
             let mut fill = false;
+            let mut acknowledged_through = None;
             if acknowledgment > tcp.highest_ack {
                 let acknowledged_bytes = acknowledgment - tcp.highest_ack;
                 let flight_before = tcp.bytes_in_flight;
@@ -1446,6 +1479,7 @@ impl<'image> TransitionState<'image> {
                 });
                 tcp.bytes_in_flight = tcp.bytes_in_flight.saturating_sub(acknowledged_bytes);
                 tcp.highest_ack = acknowledgment;
+                acknowledged_through = Some(acknowledgment);
                 tcp.duplicate_acks = 0;
                 tcp.active_timer = None;
                 if tcp.control.phase() == crate::TcpPhase::FastRecovery
@@ -1485,8 +1519,14 @@ impl<'image> TransitionState<'image> {
                 before,
                 after: tcp.control,
             });
-            (retransmit, fill, transition)
+            (retransmit, fill, acknowledged_through, transition)
         };
+        if let Some(acknowledgment) = acknowledged_through {
+            self.tcp_sent_segments
+                .retain(|(segment_flow, sequence), _| {
+                    *segment_flow != packet.flow || *sequence >= acknowledgment
+                });
+        }
         if self.observation_mode == ObservationMode::Full {
             self.tcp_transitions.extend(transition);
         }
@@ -2098,6 +2138,15 @@ impl<'image> TransitionState<'image> {
         fill_window: bool,
     ) -> Result<TcpSendPlan, ExecutionError> {
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let retransmit_segment = retransmit_sequence
+            .map(|sequence| {
+                self.tcp_sent_segments
+                    .get(&(flow, sequence))
+                    .copied()
+                    .map(|size_bytes| (sequence, size_bytes))
+                    .ok_or(ExecutionError::MissingTcpSegment { flow, sequence })
+            })
+            .transpose()?;
         let state = self.host_state_mut(node)?;
         let generator_index = state
             .generators
@@ -2115,8 +2164,9 @@ impl<'image> TransitionState<'image> {
         };
         let mut packets = Vec::new();
 
-        if let Some(sequence) = retransmit_sequence.filter(|sequence| *sequence < tcp.total_bytes) {
-            let size_bytes = tcp.mss_bytes.min(tcp.total_bytes - sequence);
+        if let Some((sequence, size_bytes)) =
+            retransmit_segment.filter(|(sequence, _)| *sequence < tcp.total_bytes)
+        {
             let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
             state.next_payload_seq = state
@@ -2222,6 +2272,9 @@ impl<'image> TransitionState<'image> {
             .sourced_packets
             .checked_add(u64::try_from(packets.len()).unwrap_or(u64::MAX))
             .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        for packet in packets.iter().copied() {
+            seed_tcp_segment(&mut self.tcp_sent_segments, packet)?;
+        }
         Ok(TcpSendPlan { packets, timer })
     }
 
@@ -2412,6 +2465,28 @@ impl<'image> TransitionState<'image> {
         }
         Ok(())
     }
+}
+
+fn seed_tcp_segment(
+    segments: &mut BTreeMap<(FlowId, u64), u64>,
+    packet: PacketDescriptor,
+) -> Result<(), ExecutionError> {
+    let PacketKind::TcpData(header) = packet.kind else {
+        return Ok(());
+    };
+    if let Some(original_size_bytes) =
+        segments.insert((packet.flow, header.sequence), packet.size_bytes)
+    {
+        if original_size_bytes != packet.size_bytes {
+            return Err(ExecutionError::InconsistentTcpSegment {
+                flow: packet.flow,
+                sequence: header.sequence,
+                original_size_bytes,
+                replacement_size_bytes: packet.size_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn scheduler_class(flow: FlowId, class_count: usize) -> Option<usize> {

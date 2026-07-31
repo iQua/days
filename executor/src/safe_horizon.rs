@@ -25,8 +25,12 @@ pub struct LpRoundWork {
     pub events_processed: u64,
     /// Local `TxComplete` → same-time `TxReady` pairs executed without an LP queue insert/pop.
     pub same_time_continuations: u64,
-    /// Local events inserted into the generic ordered FEL rather than a specialized stream.
-    pub fallback_heap_pushes: u64,
+    /// Local generic-FEL insertions whose event kind is classified as `FallbackHeap`.
+    ///
+    /// This is a classification counter, not evidence of a physically separate heap: scalar and
+    /// CPU round execution currently store every non-continuation local event in the same ordered
+    /// `BTreeMap`.
+    pub fallback_classified_pushes: u64,
 }
 
 /// Cheap, deterministic instrumentation retained for one safe-horizon round.
@@ -672,7 +676,7 @@ impl<'image> RoundExecutor<'image> {
         let node = self.image.nodes[lp_slot].id;
         let mut events_processed = 0_u64;
         let mut same_time_continuations = 0_u64;
-        let mut fallback_heap_pushes = 0_u64;
+        let mut fallback_classified_pushes = 0_u64;
         let mut outbox = Vec::new();
         let mut continuation = None;
         #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -746,7 +750,7 @@ impl<'image> RoundExecutor<'image> {
                         return Err(ExecutionError::DuplicateEventKey(child.key));
                     } else {
                         if event_fel_class(child.kind) == EventFelClass::FallbackHeap {
-                            fallback_heap_pushes = fallback_heap_pushes
+                            fallback_classified_pushes = fallback_classified_pushes
                                 .checked_add(1)
                                 .ok_or(ExecutionError::CounterOverflow(node))?;
                         }
@@ -788,7 +792,7 @@ impl<'image> RoundExecutor<'image> {
                 node,
                 events_processed,
                 same_time_continuations,
-                fallback_heap_pushes,
+                fallback_classified_pushes,
             },
             outbox,
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
