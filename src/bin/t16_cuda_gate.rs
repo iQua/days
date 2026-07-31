@@ -225,6 +225,7 @@ mod tests {
             observed_packets: Vec::new(),
             departures: Vec::new(),
             arrivals: Vec::new(),
+            tcp_transitions: Vec::new(),
             pending_events: Vec::new(),
         }
     }

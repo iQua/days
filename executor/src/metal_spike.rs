@@ -91,6 +91,11 @@ impl ReplayStep {
         remote_outbox_writes: u8,
         queue_occupancy: Option<u16>,
     ) -> Result<Self, MetalSpikeError> {
+        if kind == EventKind::RetransmissionTimeout {
+            return Err(MetalSpikeError::InvalidBenchmarkConfig(
+                "the T13 replay format does not encode TCP timeout events",
+            ));
+        }
         if local_fel_pushes > REPLAY_CHILD_COUNT_MASK as u8
             || remote_outbox_writes > REPLAY_CHILD_COUNT_MASK as u8
         {
@@ -1735,7 +1740,7 @@ fn simulated_replay_parent(
 const fn replay_event_phase(kind: EventKind) -> u64 {
     match kind {
         EventKind::PacketArrival | EventKind::RemoteArrival => 0,
-        EventKind::TxComplete => 1,
+        EventKind::TxComplete | EventKind::RetransmissionTimeout => 1,
         EventKind::TxReady => 2,
     }
 }
@@ -3598,7 +3603,9 @@ pub fn run_metal_correctness_suite() -> Result<MetalCorrectnessReport, MetalSpik
         fixed_width_u64: std::mem::size_of::<u64>() == 8
             && std::mem::size_of::<crate::EventKey>() == 32
             && std::mem::size_of::<crate::Event>() == 56
-            && std::mem::size_of::<crate::PacketDescriptor>() == 32
+            // TCP packet metadata expands the fixed-width descriptor while preserving the
+            // pointer-free, u64-aligned image contract.
+            && std::mem::size_of::<crate::PacketDescriptor>() == 56
             && std::mem::size_of::<crate::NodeDescriptor>() == 16,
         event_key_total_order: true,
         exclusive_lp_ownership: true,

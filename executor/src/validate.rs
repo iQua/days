@@ -85,7 +85,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_state_ownership(image)?;
     validate_links(image)?;
     validate_flows(image)?;
-    validate_generators(image)?;
+    validate_generators(image, backend)?;
     let derived_delays = validate_packets_and_derive_delays(image)?;
     validate_owned_service_state(image, backend)?;
     validate_channels(image, backend, &derived_delays)?;
@@ -409,7 +409,7 @@ fn route_target(
         .or_else(|| (index + 1 == route.len()).then_some(terminal))
 }
 
-fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_generators(image: &SimulationImage, backend: Backend) -> Result<(), ValidationError> {
     let mut arrival_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
     for event in image
         .initial_events
@@ -421,12 +421,47 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
             .or_default() += 1;
     }
     let mut owners = BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64)>::new();
+    let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     for owner in image
         .nodes
         .iter()
         .filter(|node| node.kind == NodeKind::Host)
     {
         let state = &image.host_states[owner.state_slot as usize];
+        let mut previous_receiver = None;
+        for receiver in &state.tcp_receivers {
+            if previous_receiver.is_some_and(|flow| flow >= receiver.flow) {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} has duplicate receiver state or non-increasing TCP receiver flow {:?}",
+                    owner.id, receiver.flow
+                )));
+            }
+            previous_receiver = Some(receiver.flow);
+            let receiver_flow = flow(image, receiver.flow).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "host node {:?} TCP receiver references unknown flow {:?}",
+                    owner.id, receiver.flow
+                ))
+            })?;
+            if receiver_flow.target != owner.id {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} owns TCP receiver for flow {:?}, but the flow target is {:?}",
+                    owner.id, receiver.flow, receiver_flow.target
+                )));
+            }
+            if receiver.ack_size_bytes == 0 {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} TCP receiver ACK size must be positive",
+                    receiver.flow
+                )));
+            }
+            if receiver_owners.insert(receiver.flow, owner.id).is_some() {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} has duplicate receiver state",
+                    receiver.flow
+                )));
+            }
+        }
         let mut previous = None;
         for (index, generator) in state.generators.iter().enumerate() {
             if previous.is_some_and(|flow| flow >= generator.flow) {
@@ -465,7 +500,139 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                 )));
             }
 
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+                if matches!(backend, Backend::Metal | Backend::Cuda) {
+                    return Err(ValidationError::new(format!(
+                        "TCP {} generator for flow {:?} requires Scalar or Cpu; {backend} support is T24",
+                        tcp.control.label(),
+                        flow.id
+                    )));
+                }
+                if tcp.total_bytes == 0 || tcp.mss_bytes == 0 || tcp.ack_size_bytes == 0 {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP total_bytes, mss_bytes, and ack_size_bytes must be positive",
+                        flow.id
+                    )));
+                }
+                let remaining = remaining_generator_packets(generator)?;
+                if tcp.highest_ack > tcp.next_sequence
+                    || tcp.bytes_in_flight != tcp.next_sequence - tcp.highest_ack
+                    || generator.feedback.outstanding_bytes != tcp.bytes_in_flight
+                    || generator.feedback.unacknowledged_bytes != tcp.bytes_in_flight
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP acknowledgment, flight, and feedback byte state is inconsistent",
+                        flow.id
+                    )));
+                }
+                match generator.next_emission.status {
+                    GeneratorStatus::Scheduled if remaining == 0 => {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} has a scheduled emission after its TCP generator finished",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Finished
+                        if remaining != 0
+                            || tcp.highest_ack != tcp.total_bytes
+                            || tcp.bytes_in_flight != 0 =>
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} TCP generator is Finished before all bytes are acknowledged",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Stopped => {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} TCP generator cannot use the open-loop Stopped state",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Scheduled
+                    | GeneratorStatus::Blocked
+                    | GeneratorStatus::Finished => {}
+                }
+                if flow.reverse_route.is_empty() {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP generator requires a reverse ACK route",
+                        flow.id
+                    )));
+                }
+                let target = node(image, flow.target).expect("flow validation established target");
+                let receiver = image.host_states[target.state_slot as usize]
+                    .tcp_receivers
+                    .iter()
+                    .find(|receiver| receiver.flow == flow.id)
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} TCP generator has no receiver state at target node {:?}",
+                            flow.id, flow.target
+                        ))
+                    })?;
+                if receiver.ack_size_bytes != tcp.ack_size_bytes {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP receiver ACK size {} does not match generator ACK size {}",
+                        flow.id, receiver.ack_size_bytes, tcp.ack_size_bytes
+                    )));
+                }
+                if generator.next_emission.status == GeneratorStatus::Scheduled {
+                    let packet =
+                        packet(image, generator.next_emission.payload).ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} scheduled emission references unknown packet {:?}",
+                                flow.id, generator.next_emission.payload
+                            ))
+                        })?;
+                    let PacketKind::TcpData(header) = packet.kind else {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} scheduled packet {:?} is {:?}, expected TcpData",
+                            flow.id, packet.id, packet.kind
+                        )));
+                    };
+                    if header.sequence != tcp.next_sequence
+                        || header.sent_time_ns != generator.next_emission.departure_time_ns
+                        || header.retransmission
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} scheduled TCP packet {:?} metadata does not match generator state",
+                            flow.id, packet.id
+                        )));
+                    }
+                    if packet.size_bytes != tcp.mss_bytes.min(tcp.total_bytes - tcp.next_sequence) {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} scheduled TCP packet {:?} has invalid segment size {}",
+                            flow.id, packet.id, packet.size_bytes
+                        )));
+                    }
+                    let matching_events = arrival_counts
+                        .get(&(
+                            owner.id,
+                            packet.id,
+                            generator.next_emission.departure_time_ns,
+                        ))
+                        .copied()
+                        .unwrap_or(0);
+                    if matching_events != 1 {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} scheduled emission has {matching_events} matching PacketArrival events; expected 1",
+                            flow.id
+                        )));
+                    }
+                    validate_scheduled_payload_sequence(
+                        image,
+                        owner,
+                        state,
+                        packet.id,
+                        flow.id,
+                        generator.packets_emitted,
+                    )?;
+                }
+                continue;
+            }
+
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                unreachable!("TCP generators continue above")
+            };
             if constant.interval_ns == 0 {
                 return Err(ValidationError::new(format!(
                     "flow {:?} constant generator interval must be positive",
@@ -611,6 +778,13 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
             }
         }
     }
+    for (receiver_flow, receiver_owner) in receiver_owners {
+        if !owners.contains_key(&receiver_flow) {
+            return Err(ValidationError::new(format!(
+                "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow has no generator"
+            )));
+        }
+    }
     for event in image
         .initial_events
         .iter()
@@ -717,7 +891,7 @@ fn validate_packets_and_derive_delays(
                 packet.id, packet.flow
             ))
         })?;
-        if packet.kind == PacketKind::Feedback {
+        if packet.kind.is_feedback() {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let state = &image.host_states[source.state_slot as usize];
@@ -765,11 +939,38 @@ fn validate_packets_and_derive_delays(
                 continue;
             }
             let flow = flow(image, generator.flow).expect("generator validation established flow");
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
-            for (index, link_id) in flow.route.iter().enumerate() {
+            let (packet_size_bytes, route, terminal) = match generator.kind {
+                FlowGeneratorKind::Constant(constant) => (
+                    constant.packet_size_bytes,
+                    flow.route.as_slice(),
+                    flow.target,
+                ),
+                FlowGeneratorKind::Tcp(tcp) => {
+                    for (index, link_id) in flow.reverse_route.iter().enumerate() {
+                        let link = link(image, *link_id)
+                            .expect("validated reverse route names an existing link");
+                        let delay = link.delay_ns(tcp.ack_size_bytes).map_err(|error| {
+                            ValidationError::new(format!(
+                                "link {:?} delay overflows for flow {:?} TCP ACK: {error}",
+                                link.id, flow.id
+                            ))
+                        })?;
+                        derived
+                            .entry((
+                                link.id,
+                                route_target(image, &flow.reverse_route, index, flow.source)
+                                    .expect("validated reverse route has a direct target"),
+                            ))
+                            .and_modify(|minimum| *minimum = (*minimum).min(delay))
+                            .or_insert(delay);
+                    }
+                    (tcp.mss_bytes, flow.route.as_slice(), flow.target)
+                }
+            };
+            for (index, link_id) in route.iter().enumerate() {
                 let link =
                     link(image, *link_id).expect("validated flow route names an existing link");
-                let delay = link.delay_ns(constant.packet_size_bytes).map_err(|error| {
+                let delay = link.delay_ns(packet_size_bytes).map_err(|error| {
                     ValidationError::new(format!(
                         "link {:?} delay overflows for flow {:?} generator: {error}",
                         link.id, flow.id
@@ -778,7 +979,7 @@ fn validate_packets_and_derive_delays(
                 derived
                     .entry((
                         link.id,
-                        route_target(image, &flow.route, index, flow.target)
+                        route_target(image, route, index, terminal)
                             .expect("validated route has a direct target"),
                     ))
                     .and_modify(|minimum| *minimum = (*minimum).min(delay))
@@ -1430,7 +1631,7 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
 
         match event.kind {
             EventKind::PacketArrival => {
-                if packet.kind != PacketKind::Data || event.target != flow.source {
+                if !packet.kind.is_data() || event.target != flow.source {
                     return Err(ValidationError::new(format!(
                         "PacketArrival event {index} for payload {:?} targets node {:?}, but flow {:?} is sourced by node {:?}",
                         event.payload, event.target, flow.id, flow.source
@@ -1498,6 +1699,11 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                     index,
                 )?;
             }
+            EventKind::RetransmissionTimeout => {
+                return Err(ValidationError::new(
+                    "initial retransmission timers are not accepted; TCP schedules them from a send transition",
+                ));
+            }
         }
     }
     Ok(())
@@ -1511,10 +1717,7 @@ fn validate_remaining_route_time(
     start_node: NodeId,
     event_index: usize,
 ) -> Result<(), ValidationError> {
-    let terminal = match packet.kind {
-        PacketKind::Data => flow.target,
-        PacketKind::Feedback => flow.source,
-    };
+    let terminal = packet_terminal(flow, packet.kind);
     if start_node == terminal {
         return Ok(());
     }
@@ -1572,10 +1775,7 @@ fn validate_global_time_capacity(
             let packet =
                 packet(image, event.payload).expect("event validation established the packet");
             let flow = flow(image, packet.flow).expect("packet validation established the flow");
-            let terminal = match packet.kind {
-                PacketKind::Data => flow.target,
-                PacketKind::Feedback => flow.source,
-            };
+            let terminal = packet_terminal(flow, packet.kind);
             if event.kind != EventKind::RemoteArrival || event.target != terminal {
                 payloads.insert(event.payload);
             }
@@ -1615,12 +1815,15 @@ fn validate_global_time_capacity(
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
-        let FlowGeneratorKind::Constant(constant) = generator.kind;
+        let packet_size_bytes = match generator.kind {
+            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
+            FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
+        };
         let remaining = executable_generator_packets(generator)?;
         for link_id in &flow.route {
             let link = link(image, *link_id).expect("flow validation established the route link");
             let delay = link
-                .delay_ns(constant.packet_size_bytes)
+                .delay_ns(packet_size_bytes)
                 .expect("generator/link delay validation already succeeded");
             let flow_delay = delay.checked_mul(remaining).ok_or_else(|| {
                 ValidationError::new(format!(
@@ -1647,25 +1850,27 @@ fn validate_global_time_capacity(
         .iter()
         .flat_map(|state| &state.generators)
         .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
-        .map(|generator| {
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
-            let remaining = executable_generator_packets(generator)?;
-            let intervals = remaining.saturating_sub(1);
-            constant
-                .interval_ns
-                .checked_mul(intervals)
-                .and_then(|offset| {
-                    generator
-                        .next_emission
-                        .departure_time_ns
-                        .checked_add(offset)
-                })
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} latest generated departure time exceeds u64",
-                        generator.flow
-                    ))
-                })
+        .map(|generator| match generator.kind {
+            FlowGeneratorKind::Constant(constant) => {
+                let remaining = executable_generator_packets(generator)?;
+                let intervals = remaining.saturating_sub(1);
+                constant
+                    .interval_ns
+                    .checked_mul(intervals)
+                    .and_then(|offset| {
+                        generator
+                            .next_emission
+                            .departure_time_ns
+                            .checked_add(offset)
+                    })
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} latest generated departure time exceeds u64",
+                            generator.flow
+                        ))
+                    })
+            }
+            FlowGeneratorKind::Tcp(_) => Ok(image.stop_time_ns),
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -1704,7 +1909,9 @@ fn validate_service_event_consistency(image: &SimulationImage) -> Result<(), Val
         match event.kind {
             EventKind::TxReady => events.ready_count += 1,
             EventKind::TxComplete => events.completions.push(event.payload),
-            EventKind::PacketArrival | EventKind::RemoteArrival => unreachable!(),
+            EventKind::PacketArrival
+            | EventKind::RemoteArrival
+            | EventKind::RetransmissionTimeout => unreachable!(),
         }
     }
 
@@ -1932,6 +2139,12 @@ fn describe_initial_position(image: &SimulationImage, index: usize, event: crate
                 event.key.origin_node, event.target
             )
         }
+        EventKind::RetransmissionTimeout => {
+            format!(
+                "RetransmissionTimeout event {index} at node {:?}",
+                event.target
+            )
+        }
     }
 }
 
@@ -1984,9 +2197,10 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
         if scheduled_payloads.contains(&packet.id) {
             continue;
         }
-        let counts = match packet.kind {
-            PacketKind::Data => &mut data_by_flow,
-            PacketKind::Feedback => &mut feedback_by_flow,
+        let counts = if packet.kind.is_data() {
+            &mut data_by_flow
+        } else {
+            &mut feedback_by_flow
         };
         let count = &mut counts[packet.flow.0 as usize];
         *count = count
@@ -1994,10 +2208,17 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
             .ok_or_else(|| ValidationError::new("packet count exceeds the u64 counter domain"))?;
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        add_packet_count(
-            &mut data_by_flow[generator.flow.0 as usize],
-            executable_generator_packets(generator)?,
-        )?;
+        match generator.kind {
+            FlowGeneratorKind::Constant(_) => add_packet_count(
+                &mut data_by_flow[generator.flow.0 as usize],
+                executable_generator_packets(generator)?,
+            )?,
+            FlowGeneratorKind::Tcp(_) => {
+                let attempts = tcp_attempt_upper_bound(image, generator)?;
+                add_packet_count(&mut data_by_flow[generator.flow.0 as usize], attempts)?;
+                add_packet_count(&mut feedback_by_flow[generator.flow.0 as usize], attempts)?;
+            }
+        }
     }
     Ok(FutureWork {
         data_by_flow,
@@ -2105,7 +2326,29 @@ fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationEr
 fn remaining_generator_packets(
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
-    let FlowGeneratorKind::Constant(constant) = generator.kind;
+    let FlowGeneratorKind::Constant(constant) = generator.kind else {
+        let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+            unreachable!()
+        };
+        if generator.bytes_emitted > tcp.total_bytes || tcp.next_sequence > tcp.total_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} TCP emitted byte state exceeds total bytes {}",
+                generator.flow, tcp.total_bytes
+            )));
+        }
+        if generator.bytes_emitted != tcp.next_sequence {
+            return Err(ValidationError::new(format!(
+                "flow {:?} TCP emitted bytes {} do not match next sequence {}",
+                generator.flow, generator.bytes_emitted, tcp.next_sequence
+            )));
+        }
+        let remaining = tcp.total_bytes - tcp.next_sequence;
+        return Ok(if remaining == 0 {
+            0
+        } else {
+            1 + (remaining - 1) / tcp.mss_bytes
+        });
+    };
     let total = match constant.termination {
         GeneratorTermination::Bytes(bytes) => {
             if bytes == 0 {
@@ -2158,8 +2401,43 @@ fn executable_generator_packets(
 ) -> Result<u64, ValidationError> {
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
+        GeneratorStatus::Blocked if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) => {
+            remaining_generator_packets(generator)
+        }
         GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
     }
+}
+
+/// Conservative finite-run bound used only to reserve counters and node-strided PayloadIds.
+///
+/// Every new segment is counted once. Each additional retransmission requires at least one
+/// simulator timestamp in the finite run, so `stop_time_ns + 1` is a deliberately loose bound
+/// covering fast retransmits and timer retries without embedding congestion behavior in validation.
+fn tcp_attempt_upper_bound(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    if matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Finished | GeneratorStatus::Stopped
+    ) {
+        return Ok(0);
+    }
+    let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+        return executable_generator_packets(generator);
+    };
+    if tcp.highest_ack >= tcp.total_bytes {
+        return Ok(0);
+    }
+    remaining_generator_packets(generator)?
+        .checked_add(image.stop_time_ns)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} TCP finite-run attempt bound exceeds u64",
+                generator.flow
+            ))
+        })
 }
 
 fn add_packet_count(total: &mut u64, count: u64) -> Result<(), ValidationError> {
@@ -2274,10 +2552,16 @@ fn validate_payload_sequences(
             let owner = packet.id.0 % node_count;
             let sequence = packet.id.0 / node_count;
             let flow = flow(image, packet.flow).expect("packet validation established the flow");
-            if packet.kind == PacketKind::Data && owner != flow.source.0 {
+            if packet.kind.is_data() && owner != flow.source.0 {
                 return Err(ValidationError::new(format!(
                     "data packet {:?} for flow {:?} is not allocated by source node {:?}",
                     packet.id, flow.id, flow.source
+                )));
+            }
+            if packet.kind.is_feedback() && owner != flow.target.0 {
+                return Err(ValidationError::new(format!(
+                    "feedback packet {:?} for flow {:?} is not allocated by target node {:?}",
+                    packet.id, flow.id, flow.target
                 )));
             }
             if let Some(payloads) = payload_sequences_by_owner.get_mut(owner as usize) {
@@ -2294,7 +2578,10 @@ fn validate_payload_sequences(
         let mut allocations = 0_u64;
         let mut consumed_sequences = 0_u64;
         for generator in &state.generators {
-            let remaining = executable_generator_packets(generator)?;
+            let remaining = match generator.kind {
+                FlowGeneratorKind::Constant(_) => executable_generator_packets(generator)?,
+                FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
+            };
             let already_scheduled =
                 u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
             consumed_sequences = consumed_sequences
@@ -2318,6 +2605,24 @@ fn validate_payload_sequences(
                     owner.id
                 ))
             })?;
+        }
+        for receiver in &state.tcp_receivers {
+            let source = flow(image, receiver.flow)
+                .and_then(|receiver_flow| node(image, receiver_flow.source))
+                .expect("receiver validation established its source host");
+            let generator = image.host_states[source.state_slot as usize]
+                .generators
+                .iter()
+                .find(|generator| generator.flow == receiver.flow)
+                .expect("receiver validation established its generator");
+            allocations = allocations
+                .checked_add(tcp_attempt_upper_bound(image, generator)?)
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "node {:?} generated TCP ACK count exceeds u64",
+                        owner.id
+                    ))
+                })?;
         }
         if state.next_payload_seq < consumed_sequences {
             return Err(ValidationError::new(format!(
@@ -2440,15 +2745,15 @@ fn packet_remote_target_after_link(
 
 fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
     match packet_kind {
-        PacketKind::Data => &flow.route,
-        PacketKind::Feedback => &flow.reverse_route,
+        PacketKind::Data | PacketKind::TcpData(_) => &flow.route,
+        PacketKind::Feedback | PacketKind::TcpAck(_) => &flow.reverse_route,
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
-        PacketKind::Data => flow.target,
-        PacketKind::Feedback => flow.source,
+        PacketKind::Data | PacketKind::TcpData(_) => flow.target,
+        PacketKind::Feedback | PacketKind::TcpAck(_) => flow.source,
     }
 }
 

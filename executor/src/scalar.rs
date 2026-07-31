@@ -11,7 +11,8 @@ use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
     GeneratorStatus, GeneratorTermination, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
     PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage, SwitchState,
-    TimeError, TransitionHandler, WfqSchedulerState, event_phase, resolve_transition,
+    TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpReceiveRange, TcpTimerState, TimeError,
+    TransitionHandler, WfqSchedulerState, event_phase, resolve_transition,
 };
 
 /// Outcome of one remote packet arrival at a switch queue or sink host.
@@ -37,6 +38,36 @@ pub struct PacketArrivalObservation {
     pub payload: PayloadId,
     pub time_ns: u64,
     pub disposition: ArrivalDisposition,
+}
+
+/// Congestion-control input retained for exact LeanGuard transition replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcpTransitionInput {
+    NewAck {
+        acknowledged_bytes: u64,
+        rtt_sample_ns: u64,
+        flight_size_bytes: u64,
+        acknowledgment: u64,
+    },
+    DuplicateAck {
+        flight_size_bytes: u64,
+        recovery_high_sequence: u64,
+    },
+    Timeout {
+        flight_size_bytes: u64,
+    },
+}
+
+/// One scalar congestion-state transition, keyed by the event that caused it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpTransitionRecord {
+    pub key: EventKey,
+    pub node: NodeId,
+    pub flow: FlowId,
+    pub mss_bytes: u64,
+    pub input: TcpTransitionInput,
+    pub before: TcpCongestionControl,
+    pub after: TcpCongestionControl,
 }
 
 /// Whether the scalar oracle retains complete per-packet observations.
@@ -76,6 +107,8 @@ pub struct RunResult {
     pub observed_packets: Vec<PacketDescriptor>,
     pub departures: Vec<PacketDeparture>,
     pub arrivals: Vec<PacketArrivalObservation>,
+    /// Exact TCP control transitions retained in full observation mode.
+    pub tcp_transitions: Vec<TcpTransitionRecord>,
     /// Unprocessed events in canonical `EventKey` order.
     pub pending_events: Vec<Event>,
 }
@@ -398,6 +431,7 @@ pub(crate) struct TransitionState<'image> {
     observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
     departures: Vec<(EventKey, PacketDeparture)>,
     arrivals: Vec<(EventKey, PacketArrivalObservation)>,
+    tcp_transitions: Vec<TcpTransitionRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -421,6 +455,7 @@ pub(crate) struct LocalTransitionResult {
     pub observed_packets: Vec<PacketDescriptor>,
     pub departures: Vec<(EventKey, PacketDeparture)>,
     pub arrivals: Vec<(EventKey, PacketArrivalObservation)>,
+    pub tcp_transitions: Vec<TcpTransitionRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +464,11 @@ struct ChildEmission {
     kind: EventKind,
     payload: PayloadId,
     time_ns: u64,
+}
+
+struct TcpSendPlan {
+    packets: Vec<PacketDescriptor>,
+    timer: Option<TcpTimerState>,
 }
 
 impl<'image> TransitionState<'image> {
@@ -485,6 +525,7 @@ impl<'image> TransitionState<'image> {
             observed_packets: BTreeMap::new(),
             departures: Vec::new(),
             arrivals: Vec::new(),
+            tcp_transitions: Vec::new(),
         })
     }
 
@@ -567,6 +608,7 @@ impl<'image> TransitionState<'image> {
             observed_packets: BTreeMap::new(),
             departures: Vec::new(),
             arrivals: Vec::new(),
+            tcp_transitions: Vec::new(),
         })
     }
 
@@ -610,6 +652,8 @@ impl<'image> TransitionState<'image> {
         let observed_packets = self.observed_packets.into_values().collect();
         self.departures.sort_unstable_by_key(|(key, _)| *key);
         self.arrivals.sort_unstable_by_key(|(key, _)| *key);
+        self.tcp_transitions
+            .sort_unstable_by_key(|record| record.key);
         RunResult {
             host_states: self.host_states,
             switch_states: self.switch_states,
@@ -626,6 +670,7 @@ impl<'image> TransitionState<'image> {
                 .into_iter()
                 .map(|(_, arrival)| arrival)
                 .collect(),
+            tcp_transitions: self.tcp_transitions,
             pending_events,
         }
     }
@@ -636,6 +681,8 @@ impl<'image> TransitionState<'image> {
             .expect("finish_local requires node-local transition state");
         self.departures.sort_unstable_by_key(|(key, _)| *key);
         self.arrivals.sort_unstable_by_key(|(key, _)| *key);
+        self.tcp_transitions
+            .sort_unstable_by_key(|record| record.key);
         let state = match node.kind {
             NodeKind::Host => LocalNodeState::Host(
                 self.host_states
@@ -660,6 +707,7 @@ impl<'image> TransitionState<'image> {
             observed_packets: self.observed_packets.into_values().collect(),
             departures: self.departures,
             arrivals: self.arrivals,
+            tcp_transitions: self.tcp_transitions,
         }
     }
 
@@ -701,6 +749,9 @@ impl<'image> TransitionState<'image> {
             TransitionHandler::SwitchRemoteArrival => {
                 self.switch_remote_arrival(node, event, children)
             }
+            TransitionHandler::HostRetransmissionTimeout => {
+                self.host_retransmission_timeout(node, event, children)
+            }
         }
     }
 
@@ -718,6 +769,9 @@ impl<'image> TransitionState<'image> {
             .any(|generator| generator.flow == packet.flow);
         if !owns_generator {
             return self.host_preloaded_packet_arrival(node, event, children);
+        }
+        if let PacketKind::TcpData(header) = packet.kind {
+            return self.host_tcp_initial_send(node, event, packet, header, children);
         }
         self.set_source_time(event.payload, event.key.time_ns)?;
         let (next_packet, next_departure_ns, schedule_ready) = {
@@ -754,7 +808,9 @@ impl<'image> TransitionState<'image> {
                     .checked_add(packet.size_bytes)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
 
-                let FlowGeneratorKind::Constant(constant) = generator.kind;
+                let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                    unreachable!("TCP emissions use the closed-loop transition")
+                };
                 let next_departure_ns = match constant.termination {
                     GeneratorTermination::Bytes(bytes) if generator.bytes_emitted < bytes => Some(
                         event
@@ -861,6 +917,77 @@ impl<'image> TransitionState<'image> {
         }
 
         Ok(())
+    }
+
+    fn host_tcp_initial_send(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        header: TcpDataHeader,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        self.set_source_time(event.payload, event.key.time_ns)?;
+        {
+            let state = self.host_state_mut(node)?;
+            let generator = state
+                .generators
+                .iter_mut()
+                .find(|generator| generator.flow == packet.flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow: packet.flow,
+                })?;
+            let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow: packet.flow,
+                    payload: packet.id,
+                });
+            };
+            if generator.next_emission.status != GeneratorStatus::Scheduled
+                || generator.next_emission.payload != packet.id
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+                || header.sequence != tcp.next_sequence
+                || header.sent_time_ns != event.key.time_ns
+                || header.retransmission
+            {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow: packet.flow,
+                    payload: packet.id,
+                });
+            }
+            generator.packets_emitted = generator
+                .packets_emitted
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            generator.bytes_emitted = generator
+                .bytes_emitted
+                .checked_add(packet.size_bytes)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            tcp.next_sequence = tcp
+                .next_sequence
+                .checked_add(packet.size_bytes)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            tcp.bytes_in_flight = tcp
+                .bytes_in_flight
+                .checked_add(packet.size_bytes)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            tcp.last_attempt = packet.id;
+            generator.feedback.outstanding_bytes = tcp.bytes_in_flight;
+            generator.feedback.unacknowledged_bytes = tcp.bytes_in_flight;
+            generator.next_emission.status = GeneratorStatus::Blocked;
+            generator.kind = FlowGeneratorKind::Tcp(tcp);
+            state.sourced_packets = state
+                .sourced_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        }
+        self.enqueue_source_packet(node, packet.id)?;
+        self.record_sourced(node.id, packet)?;
+        let plan = self.prepare_tcp_attempts(node, packet.flow, event.key.time_ns, None, true)?;
+        self.install_tcp_attempts(node, event, plan, children)
     }
 
     fn host_preloaded_packet_arrival(
@@ -1113,13 +1240,22 @@ impl<'image> TransitionState<'image> {
             let flow = self.flow(packet.flow)?;
             (flow.id, flow.source, flow.target)
         };
-        let expected_target = match packet.kind {
-            PacketKind::Data => flow_target,
-            PacketKind::Feedback => flow_source,
+        if let PacketKind::TcpData(header) = packet.kind {
+            return self.host_tcp_data_arrival(node, event, packet, header, children);
+        }
+        if let PacketKind::TcpAck(header) = packet.kind {
+            return self.host_tcp_ack_arrival(node, event, packet, header, children);
+        }
+        let expected_target = if packet.kind.is_data() {
+            flow_target
+        } else {
+            flow_source
         };
         let (disposition, feedback_action) = {
             let state = self.host_state_mut(node)?;
-            let feedback_generator = (packet.kind == PacketKind::Feedback)
+            let feedback_generator = packet
+                .kind
+                .is_feedback()
                 .then(|| {
                     state
                         .generators
@@ -1152,6 +1288,270 @@ impl<'image> TransitionState<'image> {
             self.emit_feedback_driven_packet(node, event, flow, size_bytes, children)?;
         }
         Ok(())
+    }
+
+    fn host_tcp_data_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        header: TcpDataHeader,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let flow = self.flow(packet.flow)?;
+        if flow.target != node.id {
+            return Err(ExecutionError::FlowRouteMiss {
+                flow: flow.id,
+                node: node.id,
+            });
+        }
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let (ack_payload, acknowledgment, ack_size_bytes) = {
+            let state = self.host_state_mut(node)?;
+            let receiver = state
+                .tcp_receivers
+                .iter_mut()
+                .find(|receiver| receiver.flow == packet.flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow: packet.flow,
+                })?;
+            let end = header
+                .sequence
+                .checked_add(packet.size_bytes)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            tcp_receive_range(receiver, header.sequence, end);
+            let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+            state.next_payload_seq = state
+                .next_payload_seq
+                .checked_add(1)
+                .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+            state.received_packets = state
+                .received_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            state.sourced_packets = state
+                .sourced_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            (
+                payload,
+                receiver.next_expected_sequence,
+                receiver.ack_size_bytes,
+            )
+        };
+        self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
+        self.mark_terminal(packet.id)?;
+        let ack = PacketDescriptor {
+            id: ack_payload,
+            flow: packet.flow,
+            size_bytes: ack_size_bytes,
+            kind: PacketKind::TcpAck(TcpAckHeader {
+                acknowledgment,
+                acknowledged_bytes: packet.size_bytes,
+                echoed_sent_time_ns: header.sent_time_ns,
+            }),
+        };
+        self.insert_packet(ack, Some(event.key.time_ns))?;
+        self.enqueue_source_packet(node, ack.id)?;
+        self.record_sourced(node.id, ack)?;
+        let ready = {
+            let state = self.host_state_mut(node)?;
+            if state.in_service.is_none() && !state.tx_ready_pending {
+                state.tx_ready_pending = true;
+                true
+            } else {
+                false
+            }
+        };
+        if ready {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload: ack.id,
+                    time_ns: event.key.time_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn host_tcp_ack_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        header: TcpAckHeader,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let flow = self.flow(packet.flow)?;
+        if flow.source != node.id {
+            return Err(ExecutionError::FlowRouteMiss {
+                flow: flow.id,
+                node: node.id,
+            });
+        }
+        self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
+        self.mark_terminal(packet.id)?;
+
+        let (retransmit_sequence, fill_window, transition) = {
+            let state = self.host_state_mut(node)?;
+            let generator = state
+                .generators
+                .iter_mut()
+                .find(|generator| generator.flow == packet.flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow: packet.flow,
+                })?;
+            let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
+                return Err(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow: packet.flow,
+                });
+            };
+            apply_generator_feedback(generator, node.id)?;
+            let acknowledgment = header.acknowledgment.min(tcp.next_sequence);
+            let before = tcp.control;
+            let mut input = None;
+            let mut retransmit = None;
+            let mut fill = false;
+            if acknowledgment > tcp.highest_ack {
+                let acknowledged_bytes = acknowledgment - tcp.highest_ack;
+                let flight_before = tcp.bytes_in_flight;
+                let rtt_sample = event
+                    .key
+                    .time_ns
+                    .saturating_sub(header.echoed_sent_time_ns)
+                    .max(1);
+                tcp.rto_ns =
+                    crate::tcp::update_rto_ns(&mut tcp.srtt_ns, &mut tcp.rtt_var_ns, rtt_sample);
+                tcp.control.on_new_ack(
+                    acknowledged_bytes,
+                    event.key.time_ns,
+                    rtt_sample,
+                    flight_before,
+                    acknowledgment,
+                );
+                input = Some(TcpTransitionInput::NewAck {
+                    acknowledged_bytes,
+                    rtt_sample_ns: rtt_sample,
+                    flight_size_bytes: flight_before,
+                    acknowledgment,
+                });
+                tcp.bytes_in_flight = tcp.bytes_in_flight.saturating_sub(acknowledged_bytes);
+                tcp.highest_ack = acknowledgment;
+                tcp.duplicate_acks = 0;
+                tcp.active_timer = None;
+                if tcp.control.phase() == crate::TcpPhase::FastRecovery
+                    && acknowledgment < tcp.recovery_high_sequence
+                {
+                    retransmit = Some(acknowledgment);
+                }
+                fill = acknowledgment < tcp.total_bytes;
+            } else if acknowledgment == tcp.highest_ack && tcp.highest_ack < tcp.total_bytes {
+                input = Some(TcpTransitionInput::DuplicateAck {
+                    flight_size_bytes: tcp.bytes_in_flight,
+                    recovery_high_sequence: tcp.next_sequence,
+                });
+                let fast_retransmit = tcp
+                    .control
+                    .on_duplicate_ack(tcp.bytes_in_flight, event.key.time_ns);
+                tcp.duplicate_acks = tcp.control.duplicate_acks();
+                if fast_retransmit {
+                    tcp.recovery_high_sequence = tcp.next_sequence;
+                    tcp.control
+                        .set_recovery_high_sequence(tcp.recovery_high_sequence);
+                    tcp.active_timer = None;
+                    retransmit = Some(tcp.highest_ack);
+                } else if tcp.duplicate_acks > 3 {
+                    fill = true;
+                }
+            }
+            generator.feedback.outstanding_bytes = tcp.bytes_in_flight;
+            generator.feedback.unacknowledged_bytes = tcp.bytes_in_flight;
+            generator.kind = FlowGeneratorKind::Tcp(tcp);
+            let transition = input.map(|input| TcpTransitionRecord {
+                key: event.key,
+                node: node.id,
+                flow: packet.flow,
+                mss_bytes: tcp.mss_bytes,
+                input,
+                before,
+                after: tcp.control,
+            });
+            (retransmit, fill, transition)
+        };
+        if self.observation_mode == ObservationMode::Full {
+            self.tcp_transitions.extend(transition);
+        }
+        let plan = self.prepare_tcp_attempts(
+            node,
+            packet.flow,
+            event.key.time_ns,
+            retransmit_sequence,
+            fill_window,
+        )?;
+        self.install_tcp_attempts(node, event, plan, children)
+    }
+
+    fn host_retransmission_timeout(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut timed_out = None;
+        {
+            let state = self.host_state_mut(node)?;
+            for generator in &mut state.generators {
+                let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
+                    continue;
+                };
+                let Some(timer) = tcp.active_timer else {
+                    continue;
+                };
+                if timer.attempt != event.payload || timer.deadline_ns != event.key.time_ns {
+                    continue;
+                }
+                tcp.active_timer = None;
+                let before = tcp.control;
+                let flight_size_bytes = tcp.bytes_in_flight;
+                tcp.control
+                    .on_timeout(tcp.bytes_in_flight, event.key.time_ns);
+                tcp.rto_ns = timer.rto_ns.saturating_mul(2).min(60_000_000_000);
+                let sequence = tcp.highest_ack;
+                generator.kind = FlowGeneratorKind::Tcp(tcp);
+                timed_out = Some((
+                    generator.flow,
+                    sequence,
+                    TcpTransitionRecord {
+                        key: event.key,
+                        node: node.id,
+                        flow: generator.flow,
+                        mss_bytes: tcp.mss_bytes,
+                        input: TcpTransitionInput::Timeout { flight_size_bytes },
+                        before,
+                        after: tcp.control,
+                    },
+                ));
+                break;
+            }
+        }
+        let Some((flow, sequence, transition)) = timed_out else {
+            return Ok(());
+        };
+        if self.observation_mode == ObservationMode::Full {
+            self.tcp_transitions.push(transition);
+        }
+        let plan =
+            self.prepare_tcp_attempts(node, flow, event.key.time_ns, Some(sequence), false)?;
+        self.install_tcp_attempts(node, event, plan, children)
     }
 
     fn switch_tx_ready(
@@ -1513,9 +1913,10 @@ impl<'image> TransitionState<'image> {
         let packet = self.packet(payload)?;
         let flow = self.flow(packet.flow)?;
 
-        let route = match packet.kind {
-            PacketKind::Data => &flow.route,
-            PacketKind::Feedback => &flow.reverse_route,
+        let route = if packet.kind.is_data() {
+            &flow.route
+        } else {
+            &flow.reverse_route
         };
         for link_id in route {
             let link = self.link(*link_id)?;
@@ -1523,9 +1924,10 @@ impl<'image> TransitionState<'image> {
                 return Ok(Some(link.id));
             }
         }
-        let terminal = match packet.kind {
-            PacketKind::Data => flow.target,
-            PacketKind::Feedback => flow.source,
+        let terminal = if packet.kind.is_data() {
+            flow.target
+        } else {
+            flow.source
         };
         if terminal == node {
             return Ok(None);
@@ -1543,9 +1945,10 @@ impl<'image> TransitionState<'image> {
     ) -> Result<NodeId, ExecutionError> {
         let packet = self.packet(payload)?;
         let flow = self.flow(packet.flow)?;
-        let route = match packet.kind {
-            PacketKind::Data => &flow.route,
-            PacketKind::Feedback => &flow.reverse_route,
+        let route = if packet.kind.is_data() {
+            &flow.route
+        } else {
+            &flow.reverse_route
         };
         let Some(index) = route.iter().position(|link| *link == egress) else {
             return Err(ExecutionError::FlowRouteMiss {
@@ -1556,9 +1959,10 @@ impl<'image> TransitionState<'image> {
         if let Some(next) = route.get(index + 1) {
             return Ok(self.link(*next)?.source);
         }
-        Ok(match packet.kind {
-            PacketKind::Data => flow.target,
-            PacketKind::Feedback => flow.source,
+        Ok(if packet.kind.is_data() {
+            flow.target
+        } else {
+            flow.source
         })
     }
 
@@ -1670,6 +2074,195 @@ impl<'image> TransitionState<'image> {
         self.enqueue_source_packet(node, payload)?;
         self.record_sourced(node.id, packet)?;
         if schedule_ready {
+            self.emit_from_host(
+                node,
+                parent,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
+                    time_ns: parent.key.time_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn prepare_tcp_attempts(
+        &mut self,
+        node: NodeDescriptor,
+        flow: FlowId,
+        now_ns: u64,
+        retransmit_sequence: Option<u64>,
+        fill_window: bool,
+    ) -> Result<TcpSendPlan, ExecutionError> {
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let state = self.host_state_mut(node)?;
+        let generator_index = state
+            .generators
+            .iter()
+            .position(|generator| generator.flow == flow)
+            .ok_or(ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow,
+            })?;
+        let FlowGeneratorKind::Tcp(mut tcp) = state.generators[generator_index].kind else {
+            return Err(ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow,
+            });
+        };
+        let mut packets = Vec::new();
+
+        if let Some(sequence) = retransmit_sequence.filter(|sequence| *sequence < tcp.total_bytes) {
+            let size_bytes = tcp.mss_bytes.min(tcp.total_bytes - sequence);
+            let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+            state.next_payload_seq = state
+                .next_payload_seq
+                .checked_add(1)
+                .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+            tcp.last_attempt = payload;
+            packets.push(PacketDescriptor {
+                id: payload,
+                flow,
+                size_bytes,
+                kind: PacketKind::TcpData(TcpDataHeader {
+                    sequence,
+                    sent_time_ns: now_ns,
+                    retransmission: true,
+                }),
+            });
+        }
+
+        if fill_window {
+            loop {
+                let cwnd = tcp.control.cwnd_bytes(tcp.mss_bytes);
+                let allowance = cwnd.saturating_sub(tcp.bytes_in_flight);
+                if allowance == 0 || tcp.next_sequence >= tcp.total_bytes {
+                    break;
+                }
+                let size_bytes = tcp
+                    .mss_bytes
+                    .min(tcp.total_bytes - tcp.next_sequence)
+                    .min(allowance);
+                if size_bytes == 0 {
+                    break;
+                }
+                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                state.next_payload_seq = state
+                    .next_payload_seq
+                    .checked_add(1)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                let sequence = tcp.next_sequence;
+                tcp.next_sequence = tcp
+                    .next_sequence
+                    .checked_add(size_bytes)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                tcp.bytes_in_flight = tcp
+                    .bytes_in_flight
+                    .checked_add(size_bytes)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                tcp.last_attempt = payload;
+                state.generators[generator_index].packets_emitted = state.generators
+                    [generator_index]
+                    .packets_emitted
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                state.generators[generator_index].bytes_emitted = state.generators[generator_index]
+                    .bytes_emitted
+                    .checked_add(size_bytes)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                packets.push(PacketDescriptor {
+                    id: payload,
+                    flow,
+                    size_bytes,
+                    kind: PacketKind::TcpData(TcpDataHeader {
+                        sequence,
+                        sent_time_ns: now_ns,
+                        retransmission: false,
+                    }),
+                });
+            }
+        }
+
+        let timer = if tcp.active_timer.is_none() && tcp.bytes_in_flight != 0 {
+            tcp.timer_generation = tcp
+                .timer_generation
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let deadline_ns = now_ns
+                .checked_add(tcp.rto_ns)
+                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+            let timer = TcpTimerState {
+                attempt: tcp.last_attempt,
+                sequence: tcp.highest_ack,
+                deadline_ns,
+                generation: tcp.timer_generation,
+                rto_ns: tcp.rto_ns,
+            };
+            tcp.active_timer = Some(timer);
+            Some(timer)
+        } else {
+            None
+        };
+
+        let generator = &mut state.generators[generator_index];
+        generator.feedback.outstanding_bytes = tcp.bytes_in_flight;
+        generator.feedback.unacknowledged_bytes = tcp.bytes_in_flight;
+        generator.next_emission.status = if tcp.highest_ack >= tcp.total_bytes {
+            GeneratorStatus::Finished
+        } else {
+            GeneratorStatus::Blocked
+        };
+        generator.kind = FlowGeneratorKind::Tcp(tcp);
+        state.sourced_packets = state
+            .sourced_packets
+            .checked_add(u64::try_from(packets.len()).unwrap_or(u64::MAX))
+            .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        Ok(TcpSendPlan { packets, timer })
+    }
+
+    fn install_tcp_attempts(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        plan: TcpSendPlan,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        for packet in plan.packets {
+            self.insert_packet(packet, Some(parent.key.time_ns))?;
+            self.enqueue_source_packet(node, packet.id)?;
+            self.record_sourced(node.id, packet)?;
+        }
+        let ready_payload = {
+            let state = self.host_state_mut(node)?;
+            if state.in_service.is_none() && !state.tx_ready_pending {
+                let ready = state.queue.front().copied();
+                if ready.is_some() {
+                    state.tx_ready_pending = true;
+                }
+                ready
+            } else {
+                None
+            }
+        };
+        if let Some(timer) = plan.timer {
+            self.emit_from_host(
+                node,
+                parent,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::RetransmissionTimeout,
+                    payload: timer.attempt,
+                    time_ns: timer.deadline_ns,
+                },
+                children,
+            )?;
+        }
+        if let Some(payload) = ready_payload {
             self.emit_from_host(
                 node,
                 parent,
@@ -1975,6 +2568,37 @@ fn wfq_complete(
     Ok(())
 }
 
+fn tcp_receive_range(receiver: &mut crate::TcpReceiverState, start: u64, end: u64) {
+    if end <= start || end <= receiver.next_expected_sequence {
+        return;
+    }
+    receiver.out_of_order.push(TcpReceiveRange { start, end });
+    receiver
+        .out_of_order
+        .sort_unstable_by_key(|range| (range.start, range.end));
+    let mut merged = Vec::<TcpReceiveRange>::with_capacity(receiver.out_of_order.len());
+    for range in receiver.out_of_order.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    let mut next = receiver.next_expected_sequence;
+    let mut keep = Vec::with_capacity(merged.len());
+    for range in merged {
+        if range.start <= next {
+            next = next.max(range.end);
+        } else {
+            keep.push(range);
+        }
+    }
+    receiver.next_expected_sequence = next;
+    receiver.out_of_order = keep;
+}
+
 fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> Option<&T> {
     let indexed = usize::try_from(id)
         .ok()
@@ -2009,11 +2633,11 @@ fn add_summary(total: &mut u128, value: u64, node: NodeId) -> Result<(), Executi
     Ok(())
 }
 
-/// Routes an ordinary arriving packet into the closed source-generator transition.
+/// Routes an arriving feedback packet through the source-generator contract hook.
 ///
-/// The constant generator records feedback bookkeeping but never emits because of feedback. A
-/// future closed-loop variant extends this closed transition and uses the caller's host-owned
-/// emission path without adding an event kind.
+/// Constant generators only record the arrival. TCP ACK processing calls this hook before its
+/// structured cumulative-ACK transition, then uses the caller's host-owned emission path to
+/// refill the congestion window without introducing a backend-specific event kind.
 fn apply_generator_feedback(
     generator: &mut crate::FlowGeneratorState,
     node: NodeId,
@@ -2025,5 +2649,6 @@ fn apply_generator_feedback(
         .ok_or(ExecutionError::CounterOverflow(node))?;
     match generator.kind {
         FlowGeneratorKind::Constant(_) => Ok(GeneratorFeedbackAction::None),
+        FlowGeneratorKind::Tcp(_) => Ok(GeneratorFeedbackAction::None),
     }
 }

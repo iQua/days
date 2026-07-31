@@ -73,6 +73,30 @@ pub enum EventKind {
     TxComplete = 2,
     /// A transmitted packet reaches the route-selected target logical process.
     RemoteArrival = 3,
+    /// A source-owned TCP retransmission timer fires.
+    ///
+    /// This kind is deliberately not assigned to a monotone producer stream. It is the first
+    /// runtime client of the exact stream-FEL fallback heap retained by T15f.
+    RetransmissionTimeout = 4,
+}
+
+/// Physical FEL class used by the stream decomposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventFelClass {
+    Channel,
+    Service,
+    Generator,
+    FallbackHeap,
+}
+
+/// Classifies persistent events without backend-specific assumptions.
+pub const fn event_fel_class(kind: EventKind) -> EventFelClass {
+    match kind {
+        EventKind::RemoteArrival => EventFelClass::Channel,
+        EventKind::TxReady | EventKind::TxComplete => EventFelClass::Service,
+        EventKind::PacketArrival => EventFelClass::Generator,
+        EventKind::RetransmissionTimeout => EventFelClass::FallbackHeap,
+    }
 }
 
 /// Returns the canonical equal-time phase for a closed v1 event kind.
@@ -82,7 +106,7 @@ pub enum EventKind {
 pub const fn event_phase(kind: EventKind) -> u16 {
     match kind {
         EventKind::PacketArrival | EventKind::RemoteArrival => 0,
-        EventKind::TxComplete => 1,
+        EventKind::TxComplete | EventKind::RetransmissionTimeout => 1,
         EventKind::TxReady => 2,
     }
 }

@@ -326,7 +326,9 @@ impl CapacityContext {
         for state in &image.host_states {
             for generator in &state.generators {
                 let index = generator.flow.0 as usize;
-                let FlowGeneratorKind::Constant(constant) = generator.kind;
+                let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                    unreachable!("device validation rejects TCP before sizing")
+                };
                 minimum_data_sizes[index] =
                     minimum_data_sizes[index].min(constant.packet_size_bytes);
                 if generator.next_emission.status == GeneratorStatus::Scheduled {
@@ -336,8 +338,12 @@ impl CapacityContext {
         }
         for packet in &image.initial_packets {
             let minimum = match packet.kind {
-                PacketKind::Data => &mut minimum_data_sizes[packet.flow.0 as usize],
-                PacketKind::Feedback => &mut minimum_feedback_sizes[packet.flow.0 as usize],
+                PacketKind::Data | PacketKind::TcpData(_) => {
+                    &mut minimum_data_sizes[packet.flow.0 as usize]
+                }
+                PacketKind::Feedback | PacketKind::TcpAck(_) => {
+                    &mut minimum_feedback_sizes[packet.flow.0 as usize]
+                }
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -373,7 +379,9 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
             if generator.next_emission.status != GeneratorStatus::Scheduled {
                 continue;
             }
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                unreachable!("device validation rejects TCP before sizing")
+            };
             let termination_count = match constant.termination {
                 crate::GeneratorTermination::Bytes(bytes) => {
                     if generator.bytes_emitted >= bytes {
@@ -502,7 +510,9 @@ fn source_queue_bounds(
             if first_link != state.egress_link {
                 return Ok(packet_count);
             }
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                unreachable!("device validation rejects TCP before sizing")
+            };
             if initial_data_size[flow_index] != constant.packet_size_bytes {
                 return Ok(packet_count);
             }
@@ -537,8 +547,10 @@ fn add_flow_route_capacities(
     }
     let flow = &image.flows[flow_index];
     let (route, terminal) = match packet_kind {
-        PacketKind::Data => (flow.route.as_slice(), flow.target),
-        PacketKind::Feedback => (flow.reverse_route.as_slice(), flow.source),
+        PacketKind::Data | PacketKind::TcpData(_) => (flow.route.as_slice(), flow.target),
+        PacketKind::Feedback | PacketKind::TcpAck(_) => {
+            (flow.reverse_route.as_slice(), flow.source)
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -570,8 +582,8 @@ fn flow_link_serialization_ns(
     link_id: LinkId,
 ) -> u64 {
     let minimum_size = match packet_kind {
-        PacketKind::Data => context.minimum_data_sizes[flow_index],
-        PacketKind::Feedback => context.minimum_feedback_sizes[flow_index],
+        PacketKind::Data | PacketKind::TcpData(_) => context.minimum_data_sizes[flow_index],
+        PacketKind::Feedback | PacketKind::TcpAck(_) => context.minimum_feedback_sizes[flow_index],
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")

@@ -79,6 +79,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                         termination,
                     }),
                 }],
+                tcp_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 1,
                 sourced_packets: 0,
@@ -91,6 +92,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -188,7 +190,9 @@ fn blocked_reverse_route_image() -> SimulationImage {
 
 fn rich_mid_state_image() -> SimulationImage {
     let mut image = generator_image(GeneratorTermination::Bytes(12));
-    let FlowGeneratorKind::Constant(mut generator) = image.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut generator) = image.host_states[0].generators[0].kind else {
+        panic!("fixture uses a constant generator")
+    };
     generator.interval_ns = 1;
     image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(generator);
 
@@ -289,6 +293,7 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
             in_service: None,
             tx_ready_pending: false,
             generators: vec![],
+            tcp_receivers: vec![],
             next_origin_seq: 1,
             next_payload_seq: 0,
             sourced_packets: 0,
@@ -332,6 +337,7 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
         in_service: None,
         tx_ready_pending: false,
         generators: vec![],
+        tcp_receivers: vec![],
         next_origin_seq: 0,
         next_payload_seq: 0,
         sourced_packets: 0,
@@ -433,6 +439,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -445,6 +452,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -457,6 +465,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -777,7 +786,9 @@ fn cuda_serialization_uses_the_full_u128_numerator() {
     let mut image = generator_image(GeneratorTermination::Bytes(packet_size));
     image.stop_time_ns = packet_size + 1;
     image.initial_packets[0].size_bytes = packet_size;
-    let FlowGeneratorKind::Constant(mut constant) = image.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut constant) = image.host_states[0].generators[0].kind else {
+        panic!("fixture uses a constant generator")
+    };
     constant.packet_size_bytes = packet_size;
     constant.termination = GeneratorTermination::Bytes(packet_size);
     image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(constant);
@@ -795,7 +806,9 @@ fn cuda_final_bytes_emission_does_not_compute_an_unused_overflowing_successor() 
     image.initial_events[0].key.time_ns = departure;
     let generator = &mut image.host_states[0].generators[0];
     generator.next_emission.departure_time_ns = departure;
-    let FlowGeneratorKind::Constant(mut constant) = generator.kind;
+    let FlowGeneratorKind::Constant(mut constant) = generator.kind else {
+        panic!("fixture uses a constant generator")
+    };
     constant.first_departure_ns = departure;
     constant.interval_ns = 10;
     generator.kind = FlowGeneratorKind::Constant(constant);

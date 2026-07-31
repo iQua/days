@@ -1008,12 +1008,12 @@ fn representative_lowered_image_bytes_match_frozen_preoptimization_hashes() {
     assert_eq!(
         actual,
         [
-            8_913_124_020_181_194_792,
-            7_690_158_362_243_519_310,
-            18_404_967_740_969_582_445,
-            6_163_052_821_661_902_962,
+            8_218_538_847_115_646_020,
+            8_308_880_521_678_431_806,
+            18_053_182_671_785_655_793,
+            787_825_773_756_164_116,
         ],
-        "route-construction changes must preserve every ordered image byte"
+        "route-construction changes must preserve every ordered post-T23 image byte"
     );
 }
 
@@ -1060,8 +1060,8 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
     let image = compile_config(&path).expect("custom A* fallback scenario should lower");
     assert_eq!(
         debug_fnv1a64(&image),
-        2_329_417_208_480_234_693,
-        "the post-optimization fallback image must match its frozen pre-optimization bytes"
+        11_025_326_788_893_610_349,
+        "the post-optimization fallback image must match its frozen post-T23 schema bytes"
     );
 }
 

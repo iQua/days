@@ -234,7 +234,9 @@ fn assert_terminal_source_state(fixture: SustainedFixture, result: &RunResult) {
         fixture.sustained_name
     );
     for generator in generators {
-        let FlowGeneratorKind::Constant(constant) = generator.kind;
+        let FlowGeneratorKind::Constant(constant) = generator.kind else {
+            panic!("{} must use constant generators", fixture.sustained_name)
+        };
         let GeneratorTermination::Bytes(termination_bytes) = constant.termination else {
             panic!(
                 "{} generator must retain byte termination",

@@ -920,6 +920,7 @@ fn lower(
                 in_service: None,
                 tx_ready_pending: false,
                 generators: generators_by_source.remove(&node_key).unwrap_or_default(),
+                tcp_receivers: vec![],
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,

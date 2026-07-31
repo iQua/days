@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 
 use crate::{
-    Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind, TimeError,
-    link_arrival_time_ns,
+    Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind,
+    TcpCongestionControl, TimeError, link_arrival_time_ns,
 };
 
 /// The plan's default constant propagation delay for a directed link.
@@ -31,6 +31,8 @@ pub struct HostState {
     pub tx_ready_pending: bool,
     /// Source-owned flow generators in canonical `FlowId` order.
     pub generators: Vec<FlowGeneratorState>,
+    /// Target-owned TCP cumulative-ACK state in canonical `FlowId` order.
+    pub tcp_receivers: Vec<TcpReceiverState>,
     pub next_origin_seq: u64,
     /// Per-node packet identity cursor. Every generated packet consumes one sequence value.
     pub next_payload_seq: u64,
@@ -132,9 +134,12 @@ pub struct ConstantGenerator {
 
 /// Closed generator transition set. New traffic families require an explicit image variant.
 #[repr(C, u8)]
+// Image state is deliberately pointer-free and Copy across every backend boundary.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlowGeneratorKind {
     Constant(ConstantGenerator),
+    Tcp(TcpGenerator),
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.
@@ -159,6 +164,95 @@ pub struct FlowGeneratorState {
     pub kind: FlowGeneratorKind,
 }
 
+/// One active source-owned retransmission timer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpTimerState {
+    pub attempt: PayloadId,
+    pub sequence: u64,
+    pub deadline_ns: u64,
+    pub generation: u64,
+    pub rto_ns: u64,
+}
+
+/// Fixed-width source-owned TCP transport and congestion state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpGenerator {
+    pub total_bytes: u64,
+    pub mss_bytes: u64,
+    pub ack_size_bytes: u64,
+    pub next_sequence: u64,
+    pub highest_ack: u64,
+    pub bytes_in_flight: u64,
+    pub duplicate_acks: u64,
+    pub recovery_high_sequence: u64,
+    pub last_attempt: PayloadId,
+    pub timer_generation: u64,
+    pub active_timer: Option<TcpTimerState>,
+    pub srtt_ns: u64,
+    pub rtt_var_ns: u64,
+    pub rto_ns: u64,
+    pub control: TcpCongestionControl,
+}
+
+impl TcpGenerator {
+    pub const INITIAL_RTO_NS: u64 = 1_000_000_000;
+
+    pub const fn new(
+        total_bytes: u64,
+        mss_bytes: u64,
+        ack_size_bytes: u64,
+        control: TcpCongestionControl,
+    ) -> Self {
+        Self {
+            total_bytes,
+            mss_bytes,
+            ack_size_bytes,
+            next_sequence: 0,
+            highest_ack: 0,
+            bytes_in_flight: 0,
+            duplicate_acks: 0,
+            recovery_high_sequence: 0,
+            last_attempt: PayloadId(0),
+            timer_generation: 0,
+            active_timer: None,
+            srtt_ns: 0,
+            rtt_var_ns: 0,
+            rto_ns: Self::INITIAL_RTO_NS,
+            control,
+        }
+    }
+}
+
+/// One target-side received byte range, represented half-open as `[start, end)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpReceiveRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Target-owned cumulative ACK state for one TCP flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TcpReceiverState {
+    pub flow: FlowId,
+    pub ack_size_bytes: u64,
+    pub next_expected_sequence: u64,
+    pub out_of_order: Vec<TcpReceiveRange>,
+}
+
+impl TcpReceiverState {
+    pub const fn new(flow: FlowId, ack_size_bytes: u64) -> Self {
+        Self {
+            flow,
+            ack_size_bytes,
+            next_expected_sequence: 0,
+            out_of_order: Vec::new(),
+        }
+    }
+}
+
 /// Immutable per-packet data referenced by a persistent event payload.
 ///
 /// Lowered images retain only the first scheduled packet for each active flow. Later records are
@@ -172,12 +266,51 @@ pub struct PacketDescriptor {
     pub kind: PacketKind,
 }
 
+/// TCP data metadata independent of the transmission-attempt `PayloadId`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpDataHeader {
+    pub sequence: u64,
+    pub sent_time_ns: u64,
+    pub retransmission: bool,
+}
+
+/// TCP cumulative-ACK metadata carried by a feedback packet.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpAckHeader {
+    pub acknowledgment: u64,
+    pub acknowledged_bytes: u64,
+    pub echoed_sent_time_ns: u64,
+}
+
 /// Closed packet direction used to route ordinary data and feedback packets.
-#[repr(u8)]
+#[repr(C, u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketKind {
     Data = 0,
     Feedback = 1,
+    TcpData(TcpDataHeader) = 2,
+    TcpAck(TcpAckHeader) = 3,
+}
+
+impl PacketKind {
+    pub const fn is_data(self) -> bool {
+        matches!(self, Self::Data | Self::TcpData(_))
+    }
+
+    pub const fn is_feedback(self) -> bool {
+        matches!(self, Self::Feedback | Self::TcpAck(_))
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::Feedback => 1,
+            Self::TcpData(_) => 2,
+            Self::TcpAck(_) => 3,
+        }
+    }
 }
 
 /// Immutable configuration of one constant-rate, directed, non-preemptive link.

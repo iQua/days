@@ -104,6 +104,7 @@ pub enum TransitionHandler {
     SwitchTxReady = 4,
     SwitchTxComplete = 5,
     SwitchRemoteArrival = 6,
+    HostRetransmissionTimeout = 7,
 }
 
 /// Resolves a role/event pair to its supported v1 transition handler.
@@ -119,11 +120,15 @@ pub const fn resolve_transition(
         (NodeKind::Host, EventKind::TxReady) => Some(TransitionHandler::HostTxReady),
         (NodeKind::Host, EventKind::TxComplete) => Some(TransitionHandler::HostTxComplete),
         (NodeKind::Host, EventKind::RemoteArrival) => Some(TransitionHandler::HostRemoteArrival),
+        (NodeKind::Host, EventKind::RetransmissionTimeout) => {
+            Some(TransitionHandler::HostRetransmissionTimeout)
+        }
         (NodeKind::Switch, EventKind::PacketArrival) => None,
         (NodeKind::Switch, EventKind::TxReady) => Some(TransitionHandler::SwitchTxReady),
         (NodeKind::Switch, EventKind::TxComplete) => Some(TransitionHandler::SwitchTxComplete),
         (NodeKind::Switch, EventKind::RemoteArrival) => {
             Some(TransitionHandler::SwitchRemoteArrival)
         }
+        (NodeKind::Switch, EventKind::RetransmissionTimeout) => None,
     }
 }

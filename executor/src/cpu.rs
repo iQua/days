@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, bounded, unbounded};
 
-use crate::event::is_same_time_tx_ready_continuation;
+use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continuation};
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use crate::safe_horizon::{RoundMetricsWindow, WindowedRunTotals};
@@ -748,6 +748,7 @@ impl CpuLp<'_> {
         let mut outbox = Vec::new();
         let mut events_processed = 0_u64;
         let mut same_time_continuations = 0_u64;
+        let mut fallback_heap_pushes = 0_u64;
         let mut continuation = None;
         while continuation.is_some()
             || self
@@ -806,6 +807,10 @@ impl CpuLp<'_> {
                         same_time_continuations = same_time_continuations.saturating_add(1);
                     } else if self.futures.insert(child.key, child).is_some() {
                         return Err(ExecutionError::DuplicateEventKey(child.key));
+                    } else if event_fel_class(child.kind) == EventFelClass::FallbackHeap {
+                        fallback_heap_pushes = fallback_heap_pushes
+                            .checked_add(1)
+                            .ok_or(ExecutionError::CounterOverflow(self.node.id))?;
                     }
                 } else {
                     if outbox_capacity.is_some_and(|capacity| outbox.len() >= capacity) {
@@ -838,6 +843,7 @@ impl CpuLp<'_> {
                 node: self.node.id,
                 events_processed,
                 same_time_continuations,
+                fallback_heap_pushes,
             },
             outbox,
         ))
@@ -3463,7 +3469,13 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
 
     let mut flow_rates = vec![0_u128; image.flows.len()];
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        let FlowGeneratorKind::Constant(constant) = generator.kind;
+        let interval_ns = match generator.kind {
+            FlowGeneratorKind::Constant(constant) => constant.interval_ns,
+            FlowGeneratorKind::Tcp(tcp) => {
+                let packets = tcp.total_bytes.div_ceil(tcp.mss_bytes).max(1);
+                image.stop_time_ns.max(1).div_ceil(packets)
+            }
+        };
         let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
             continue;
         };
@@ -3474,11 +3486,11 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
             .flows
             .get(flow_slot)
             .is_none_or(|flow| flow.id != generator.flow)
-            || constant.interval_ns == 0
+            || interval_ns == 0
         {
             continue;
         }
-        *rate = rate.saturating_add(RATE_SCALE.div_ceil(u128::from(constant.interval_ns)));
+        *rate = rate.saturating_add(RATE_SCALE.div_ceil(u128::from(interval_ns)));
     }
 
     let mut offered_load = vec![0_u128; image.nodes.len()];
@@ -3552,6 +3564,7 @@ fn assemble_result(
     let mut observed_packets = BTreeMap::new();
     let mut departures = Vec::new();
     let mut arrivals = Vec::new();
+    let mut tcp_transitions = Vec::new();
     let mut pending_events = Vec::new();
 
     for lp in lps {
@@ -3575,11 +3588,13 @@ fn assemble_result(
             &mut observed_packets,
             &mut departures,
             &mut arrivals,
+            &mut tcp_transitions,
         )?;
     }
     pending_events.sort_unstable_by_key(|event| event.key);
     departures.sort_unstable_by_key(|(key, _)| *key);
     arrivals.sort_unstable_by_key(|(key, _)| *key);
+    tcp_transitions.sort_unstable_by_key(|record| record.key);
     Ok(RunResult {
         host_states: host_states
             .into_iter()
@@ -3597,6 +3612,7 @@ fn assemble_result(
             .map(|(_, departure)| departure)
             .collect(),
         arrivals: arrivals.into_iter().map(|(_, arrival)| arrival).collect(),
+        tcp_transitions,
         pending_events,
     })
 }
@@ -3627,6 +3643,7 @@ fn install_local_result(
     observed_packets: &mut BTreeMap<PayloadId, PacketDescriptor>,
     departures: &mut Vec<(EventKey, PacketDeparture)>,
     arrivals: &mut Vec<(EventKey, PacketArrivalObservation)>,
+    tcp_transitions: &mut Vec<crate::TcpTransitionRecord>,
 ) -> Result<(), ExecutionError> {
     match local.state {
         LocalNodeState::Host(state) => {
@@ -3679,6 +3696,7 @@ fn install_local_result(
     }
     departures.extend(local.departures);
     arrivals.extend(local.arrivals);
+    tcp_transitions.extend(local.tcp_transitions);
     Ok(())
 }
 
@@ -4161,6 +4179,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 3,
                 next_payload_seq: 3,
                 sourced_packets: 0,
@@ -4173,6 +4192,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4185,6 +4205,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4300,6 +4321,7 @@ fn one_lp_outbox_is_event_key_ordered_not_target_major() {
             node: NodeId(0),
             events_processed: 9,
             same_time_continuations: 2,
+            fallback_heap_pushes: 0,
         }
     );
     assert_eq!(

@@ -72,6 +72,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
                         termination: GeneratorTermination::Bytes(bytes),
                     }),
                 }],
+                tcp_receivers: vec![],
                 next_origin_seq: u64::from(scheduled),
                 next_payload_seq,
                 sourced_packets: 0,
@@ -84,6 +85,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -193,7 +195,9 @@ fn constant_generator_allocates_unique_node_local_payloads() {
 fn constant_generator_preserves_bytes_overshoot_and_duration_half_open_end() {
     let mut bytes = image(GeneratorStatus::Scheduled, 5, 1);
     bytes.initial_packets[0].size_bytes = 2;
-    let FlowGeneratorKind::Constant(mut constant) = bytes.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut constant) = bytes.host_states[0].generators[0].kind else {
+        panic!("fixture must remain constant")
+    };
     constant.packet_size_bytes = 2;
     bytes.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(constant);
     bytes.channels[0] = RemoteChannel::for_packet_link(bytes.links[0], 2).expect("delay must fit");
@@ -202,7 +206,10 @@ fn constant_generator_preserves_bytes_overshoot_and_duration_half_open_end() {
     assert_eq!(bytes_result.summary.sourced_bytes, 6);
 
     let mut duration = image(GeneratorStatus::Scheduled, 0, 1);
-    let FlowGeneratorKind::Constant(mut constant) = duration.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut constant) = duration.host_states[0].generators[0].kind
+    else {
+        panic!("fixture must remain constant")
+    };
     constant.termination = GeneratorTermination::DurationNs(5);
     duration.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(constant);
     let duration_result = run_scalar(&duration, None).expect("duration-terminated flow should run");

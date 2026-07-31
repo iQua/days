@@ -78,6 +78,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                         termination,
                     }),
                 }],
+                tcp_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 1,
                 sourced_packets: 0,
@@ -90,6 +91,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -184,7 +186,10 @@ fn converging_generators_image() -> SimulationImage {
     });
     image.initial_packets[0].size_bytes = 1;
     image.initial_packets.push(second_packet);
-    let FlowGeneratorKind::Constant(mut first_constant) = image.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut first_constant) = image.host_states[0].generators[0].kind
+    else {
+        panic!("fixture uses a constant generator")
+    };
     first_constant.packet_size_bytes = 1;
     image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(first_constant);
     image.host_states[0].generators.push(FlowGeneratorState {
@@ -320,6 +325,7 @@ fn reverse_switch_feedback_image() -> SimulationImage {
                         termination: GeneratorTermination::Bytes(1),
                     }),
                 }],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -332,6 +338,7 @@ fn reverse_switch_feedback_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 2,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -460,6 +467,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 5,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -472,6 +480,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -631,6 +640,7 @@ fn backlog_drain_image() -> SimulationImage {
                         termination: GeneratorTermination::Bytes(0),
                     }),
                 }],
+                tcp_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: PACKET_COUNT,
                 sourced_packets: PACKET_COUNT,
@@ -643,6 +653,7 @@ fn backlog_drain_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -757,6 +768,7 @@ fn uneven_multi_lp_backlog_image() -> SimulationImage {
                         termination: GeneratorTermination::Bytes(0),
                     }),
                 }],
+                tcp_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: packet_count,
                 sourced_packets: packet_count,
@@ -769,6 +781,7 @@ fn uneven_multi_lp_backlog_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -878,6 +891,7 @@ fn long_flight_backlog_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: PACKET_COUNT,
                 next_payload_seq: PACKET_COUNT,
                 sourced_packets: PACKET_COUNT,
@@ -890,6 +904,7 @@ fn long_flight_backlog_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                tcp_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -957,7 +972,9 @@ fn long_flight_backlog_image() -> SimulationImage {
 
 fn rich_mid_state_image() -> SimulationImage {
     let mut image = generator_image(GeneratorTermination::Bytes(12));
-    let FlowGeneratorKind::Constant(mut generator) = image.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut generator) = image.host_states[0].generators[0].kind else {
+        panic!("fixture uses a constant generator")
+    };
     generator.interval_ns = 1;
     image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(generator);
 
@@ -1887,7 +1904,9 @@ fn metal_serialization_uses_the_full_u128_numerator() {
     let mut image = generator_image(GeneratorTermination::Bytes(packet_size));
     image.stop_time_ns = packet_size + 1;
     image.initial_packets[0].size_bytes = packet_size;
-    let FlowGeneratorKind::Constant(mut constant) = image.host_states[0].generators[0].kind;
+    let FlowGeneratorKind::Constant(mut constant) = image.host_states[0].generators[0].kind else {
+        panic!("fixture uses a constant generator")
+    };
     constant.packet_size_bytes = packet_size;
     constant.termination = GeneratorTermination::Bytes(packet_size);
     image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(constant);
@@ -1905,7 +1924,9 @@ fn metal_final_bytes_emission_does_not_compute_an_unused_overflowing_successor()
     image.initial_events[0].key.time_ns = departure;
     let generator = &mut image.host_states[0].generators[0];
     generator.next_emission.departure_time_ns = departure;
-    let FlowGeneratorKind::Constant(mut constant) = generator.kind;
+    let FlowGeneratorKind::Constant(mut constant) = generator.kind else {
+        panic!("fixture uses a constant generator")
+    };
     constant.first_departure_ns = departure;
     constant.interval_ns = 10;
     generator.kind = FlowGeneratorKind::Constant(constant);

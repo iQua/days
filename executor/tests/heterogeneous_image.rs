@@ -31,6 +31,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
             in_service: None,
             tx_ready_pending: false,
             generators: vec![],
+            tcp_receivers: vec![],
             next_payload_seq: 0,
             next_origin_seq: 0,
             sourced_packets: 0,

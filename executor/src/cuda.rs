@@ -994,7 +994,9 @@ impl CudaPlan {
                         generators[offset + 8] = generator.feedback.arrivals;
                         generators[offset + 9] = generator.feedback.outstanding_bytes;
                         generators[offset + 10] = generator.feedback.unacknowledged_bytes;
-                        let FlowGeneratorKind::Constant(constant) = generator.kind;
+                        let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                            unreachable!("TCP generators are rejected before CUDA encoding")
+                        };
                         generators[offset + 11] = constant.first_departure_ns;
                         generators[offset + 12] = constant.interval_ns;
                         generators[offset + 13] = constant.packet_size_bytes;
@@ -1236,7 +1238,9 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, CudaError> 
             if generator.next_emission.status != GeneratorStatus::Scheduled {
                 continue;
             }
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                unreachable!("TCP generators are rejected before CUDA sizing")
+            };
             let termination_count = match constant.termination {
                 GeneratorTermination::Bytes(bytes) => {
                     if generator.bytes_emitted >= bytes {
@@ -1364,7 +1368,9 @@ fn source_queue_packet_bound(
     if first_link != state.egress_link {
         return packet_count;
     }
-    let FlowGeneratorKind::Constant(constant) = generator.kind;
+    let FlowGeneratorKind::Constant(constant) = generator.kind else {
+        unreachable!("TCP generators are rejected before CUDA sizing")
+    };
     if initial_packet.size_bytes != constant.packet_size_bytes {
         return packet_count;
     }
@@ -1395,7 +1401,9 @@ fn generator_round_burst(
                 && generator.next_emission.status == GeneratorStatus::Scheduled
         })
         .map(|generator| {
-            let FlowGeneratorKind::Constant(constant) = generator.kind;
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                unreachable!("TCP generators are rejected before CUDA sizing")
+            };
             match lookahead {
                 Some(lookahead) => packet_count.min(
                     usize::try_from(lookahead / constant.interval_ns)
@@ -1422,8 +1430,10 @@ fn add_flow_route_capacities(
     }
     let flow = &image.flows[flow_index];
     let (route, terminal) = match packet_kind {
-        PacketKind::Data => (flow.route.as_slice(), flow.target),
-        PacketKind::Feedback => (flow.reverse_route.as_slice(), flow.source),
+        PacketKind::Data | PacketKind::TcpData(_) => (flow.route.as_slice(), flow.target),
+        PacketKind::Feedback | PacketKind::TcpAck(_) => {
+            (flow.reverse_route.as_slice(), flow.source)
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -1466,7 +1476,9 @@ fn flow_link_serialization_ns(
                         .flat_map(|state| &state.generators)
                         .filter(move |generator| generator.flow.0 as usize == flow_index)
                         .map(|generator| {
-                            let FlowGeneratorKind::Constant(constant) = generator.kind;
+                            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                                unreachable!("TCP generators are rejected before CUDA sizing")
+                            };
                             constant.packet_size_bytes
                         })
                 })
@@ -2168,7 +2180,7 @@ fn packet_record(packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
     record[7] = packet.id.0;
     record[8] = packet.flow.0;
     record[9] = packet.size_bytes;
-    record[10] = packet.kind as u64;
+    record[10] = u64::from(packet.kind.code());
     record
 }
 
@@ -2184,7 +2196,7 @@ fn event_record(event: Event, packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
         packet.id.0,
         packet.flow.0,
         packet.size_bytes,
-        packet.kind as u64,
+        u64::from(packet.kind.code()),
     ]
 }
 
@@ -2558,6 +2570,7 @@ impl CudaBuffers {
                 observed_packets: observed_packets.into_values().collect(),
                 departures,
                 arrivals,
+                tcp_transitions: Vec::new(),
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],

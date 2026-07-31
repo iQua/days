@@ -17,6 +17,8 @@ pub mod metal_spike;
 pub mod model;
 pub mod safe_horizon;
 pub mod scalar;
+pub mod tcp;
+pub mod tcp_trace;
 pub mod time;
 pub mod validate;
 
@@ -36,12 +38,16 @@ pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     size_default_device_plan,
 };
-pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
+pub use event::{
+    Event, EventFelClass, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_fel_class,
+    event_phase,
+};
 pub use image::{
     ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
     GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, RemoteChannel,
-    ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, default_propagation_ns,
+    ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader,
+    TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
@@ -69,7 +75,10 @@ pub use safe_horizon::{
 };
 pub use scalar::{
     ArrivalDisposition, ExecutionError, ObservationMode, PacketArrivalObservation, PacketDeparture,
-    RunResult, RunSummary, run_scalar, run_scalar_with_observations,
+    RunResult, RunSummary, TcpTransitionInput, TcpTransitionRecord, run_scalar,
+    run_scalar_with_observations,
 };
+pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
+pub use tcp_trace::tcp_transitions_csv;
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
 pub use validate::{Backend, ValidationError, validate};
