@@ -1,5 +1,6 @@
 #![cfg(feature = "test")]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,15 @@ use days::flows::packet::Packet;
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::drr::DRRServer;
 use days::schedulers::port::Port;
+use days::schedulers::sp::SPServer;
+use days::schedulers::wfq::WFQServer;
 use days::schedulers::wrr::WRRServer;
+use days_executor::{
+    Backend, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId,
+    NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId,
+    RemoteChannel, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    run_scalar_with_observations, validate,
+};
 
 struct ScriptedPacketSource {
     packets: Vec<Packet>,
@@ -278,4 +287,253 @@ fn wrr_does_not_free_future_service_capacity_early() {
 
     sim.step_until(t0 + Duration::from_secs(6)).unwrap();
     assert_only_capacity_valid_packets_departed(reader);
+}
+
+fn executor_scheduler_image(scheduler: SchedulerKind) -> SimulationImage {
+    let source_link = LinkDescriptor {
+        id: LinkId(0),
+        source: NodeId(0),
+        target: NodeId(1),
+        rate_bps: 8,
+        propagation_ns: 0,
+    };
+    let switch_link = LinkDescriptor {
+        id: LinkId(1),
+        source: NodeId(1),
+        target: NodeId(2),
+        rate_bps: 8,
+        propagation_ns: 0,
+    };
+    SimulationImage {
+        stop_time_ns: 4_000_000_000,
+        nodes: vec![
+            NodeDescriptor {
+                id: NodeId(0),
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(1),
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(2),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+        ],
+        host_states: vec![
+            HostState {
+                egress_link: LinkId(0),
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 3,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+            HostState {
+                egress_link: LinkId(2),
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+                generators: vec![],
+                next_origin_seq: 0,
+                next_payload_seq: 0,
+                sourced_packets: 0,
+                departed_packets: 0,
+                received_packets: 0,
+            },
+        ],
+        switch_states: vec![SwitchState {
+            physical_switch: 0,
+            queues: vec![SwitchQueueState {
+                egress_link: Some(LinkId(1)),
+                scheduler,
+                queue_capacity_packets: 8,
+                queue: VecDeque::new(),
+                in_service: None,
+                tx_ready_pending: false,
+            }],
+            next_origin_seq: 0,
+            arrived_packets: 0,
+            dropped_packets: 0,
+            departed_packets: 0,
+        }],
+        flows: vec![
+            FlowDescriptor {
+                id: FlowId(0),
+                source: NodeId(0),
+                target: NodeId(2),
+                route: vec![LinkId(0), LinkId(1)],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: FlowId(1),
+                source: NodeId(0),
+                target: NodeId(2),
+                route: vec![LinkId(0), LinkId(1)],
+                reverse_route: vec![],
+            },
+        ],
+        initial_packets: vec![
+            PacketDescriptor {
+                id: PayloadId(0),
+                flow: FlowId(0),
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            },
+            PacketDescriptor {
+                id: PayloadId(3),
+                flow: FlowId(0),
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            },
+            PacketDescriptor {
+                id: PayloadId(6),
+                flow: FlowId(1),
+                size_bytes: 1,
+                kind: PacketKind::Data,
+            },
+        ],
+        links: vec![
+            source_link,
+            switch_link,
+            LinkDescriptor {
+                id: LinkId(2),
+                source: NodeId(2),
+                target: NodeId(1),
+                rate_bps: 8,
+                propagation_ns: 0,
+            },
+        ],
+        channels: vec![
+            RemoteChannel::for_packet_link(source_link, 1).unwrap(),
+            RemoteChannel::for_packet_link(switch_link, 1).unwrap(),
+        ],
+        initial_events: [0_u64, 100_000_000, 200_000_000]
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, time_ns)| Event {
+                key: EventKey {
+                    time_ns,
+                    phase: event_phase(EventKind::RemoteArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: sequence as u64,
+                },
+                target: NodeId(1),
+                kind: EventKind::RemoteArrival,
+                payload: PayloadId(sequence as u64 * 3),
+            })
+            .collect(),
+        seed: 18,
+    }
+}
+
+fn executor_trajectory(scheduler: SchedulerKind) -> Vec<(usize, u128)> {
+    let image = executor_scheduler_image(scheduler);
+    validate(&image, Backend::Scalar).expect("trajectory image must validate");
+    run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("trajectory image must run")
+        .departures
+        .into_iter()
+        .map(|departure| {
+            (
+                (departure.payload.0 / 3) as usize,
+                u128::from(departure.time_ns),
+            )
+        })
+        .collect()
+}
+
+fn scripted_trajectory_packets() -> Vec<Packet> {
+    vec![
+        Packet::new(1, 0, 0, 0.0),
+        Packet::new(1, 1, 0, 0.1),
+        Packet::new(1, 2, 1, 0.2),
+    ]
+}
+
+#[test]
+fn sp_scalar_matches_legacy_on_a_nontied_integer_time_trajectory() {
+    let mut source = ScriptedPacketSource::new(scripted_trajectory_packets());
+    let mut scheduler = SPServer::new(
+        8.0,
+        8,
+        CapacityUnit::Packets,
+        Arc::new(|flow_id| flow_id),
+        DropStrategy::TailDrop,
+        0.0,
+        vec![1, 9],
+    );
+    let source_mbox = Mailbox::new();
+    let scheduler_mbox = Mailbox::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
+    source
+        .output
+        .connect(SPServer::packet_received, &scheduler_mbox);
+    scheduler.output.connect_sink(writer);
+    let t0 = MonotonicTime::EPOCH;
+    let mut sim = SimInit::with_num_threads(1)
+        .add_model(source, source_mbox, "Source")
+        .add_model(scheduler, scheduler_mbox, "SP")
+        .init(t0)
+        .unwrap();
+    sim.step_until(t0 + Duration::from_secs(4)).unwrap();
+    let mut legacy = Vec::new();
+    while let Some(packet) = reader.try_read() {
+        legacy.push((
+            packet.packet_id,
+            Duration::from_secs_f64(packet.time).as_nanos(),
+        ));
+    }
+
+    assert_eq!(
+        executor_trajectory(SchedulerKind::static_priority(vec![1, 9])),
+        legacy
+    );
+}
+
+#[test]
+fn wfq_scalar_matches_legacy_on_a_nontied_integer_time_trajectory() {
+    let mut source = ScriptedPacketSource::new(scripted_trajectory_packets());
+    let mut scheduler = WFQServer::new(
+        8.0,
+        8,
+        CapacityUnit::Packets,
+        Arc::new(|flow_id| flow_id),
+        DropStrategy::TailDrop,
+        0.0,
+        vec![1, 4],
+    );
+    let source_mbox = Mailbox::new();
+    let scheduler_mbox = Mailbox::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
+    source
+        .output
+        .connect(WFQServer::packet_received, &scheduler_mbox);
+    scheduler.output.connect_sink(writer);
+    let t0 = MonotonicTime::EPOCH;
+    let mut sim = SimInit::with_num_threads(1)
+        .add_model(source, source_mbox, "Source")
+        .add_model(scheduler, scheduler_mbox, "WFQ")
+        .init(t0)
+        .unwrap();
+    sim.step_until(t0 + Duration::from_secs(4)).unwrap();
+    let mut legacy = Vec::new();
+    while let Some(packet) = reader.try_read() {
+        legacy.push((
+            packet.packet_id,
+            Duration::from_secs_f64(packet.time).as_nanos(),
+        ));
+    }
+
+    assert_eq!(
+        executor_trajectory(SchedulerKind::weighted_fair_queue(vec![1, 4])),
+        legacy
+    );
 }

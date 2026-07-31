@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use num_bigint::BigUint;
+
 use crate::{
     EventKind, FlowDescriptor, FlowGeneratorKind, GeneratorStatus, GeneratorTermination,
     LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketKind, PayloadId, SchedulerKind,
@@ -788,6 +790,11 @@ fn validate_owned_service_state(
     image: &SimulationImage,
     backend: Backend,
 ) -> Result<(), ValidationError> {
+    let pending_event_frontier = image
+        .initial_events
+        .iter()
+        .map(|event| event.key.time_ns)
+        .min();
     for owner in image
         .nodes
         .iter()
@@ -858,14 +865,14 @@ fn validate_owned_service_state(
         }
         let mut egresses = BTreeSet::new();
         for (queue_index, queue) in state.queues.iter().enumerate() {
-            match queue.scheduler {
-                SchedulerKind::Fifo => {}
-                unsupported => {
-                    return Err(ValidationError::new(format!(
-                        "switch node {:?} queue {queue_index} uses unsupported {unsupported:?} service on backend {backend}",
-                        owner.id
-                    )));
-                }
+            if matches!(backend, Backend::Metal | Backend::Cuda)
+                && !matches!(&queue.scheduler, SchedulerKind::Fifo)
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {:?} queue {queue_index} uses {} service, which backend {backend} does not support; SP/WFQ require Scalar or Cpu until T19",
+                    owner.id,
+                    queue.scheduler.label()
+                )));
             }
             if let Some(limit) = backend.capacity_limit() {
                 if queue.queue_capacity_packets > limit {
@@ -931,6 +938,7 @@ fn validate_owned_service_state(
                     [payload],
                 )?;
             }
+            validate_scheduler_state(image, owner.id, queue_index, queue, pending_event_frontier)?;
             if queue.in_service.is_some() && queue.tx_ready_pending {
                 return Err(ValidationError::new(format!(
                     "switch node {:?} queue {queue_index} cannot be in service and have TxReady pending",
@@ -981,6 +989,171 @@ fn validate_owned_service_state(
         }
     }
     Ok(())
+}
+
+fn validate_scheduler_state(
+    image: &SimulationImage,
+    owner: NodeId,
+    queue_index: usize,
+    queue: &crate::SwitchQueueState,
+    pending_event_frontier: Option<u64>,
+) -> Result<(), ValidationError> {
+    match &queue.scheduler {
+        SchedulerKind::Fifo => Ok(()),
+        SchedulerKind::StaticPriority { priorities } => {
+            if priorities.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} SP priorities must contain at least one class"
+                )));
+            }
+            let mut previous = None;
+            for payload in &queue.queue {
+                let priority = scheduler_class_value(image, *payload, priorities)
+                    .expect("packet and flow validation precede scheduler-state validation");
+                if previous.is_some_and(|previous| previous < priority) {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} SP waiting queue is not ordered by descending priority at packet {payload:?}"
+                    )));
+                }
+                previous = Some(priority);
+            }
+            Ok(())
+        }
+        SchedulerKind::WeightedFairQueue(state) => {
+            if state.weights.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ weights must contain at least one class"
+                )));
+            }
+            if let Some(class) = state.weights.iter().position(|weight| *weight == 0) {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ weight for class {class} must be positive"
+                )));
+            }
+            if state.finish_times.len() != state.weights.len()
+                || state.active_packets.len() != state.weights.len()
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ class-state lengths must equal its {} weights",
+                    state.weights.len()
+                )));
+            }
+            if state.virtual_time.denom() == &BigUint::from(0_u8) {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ virtual time has a zero denominator"
+                )));
+            }
+            for (class, finish) in state.finish_times.iter().enumerate() {
+                if finish.denom() == &BigUint::from(0_u8) {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ finish state for class {class} has a zero denominator"
+                    )));
+                }
+            }
+            for (payload, finish) in &state.packet_finish_times {
+                if finish.denom() == &BigUint::from(0_u8) {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ finish tag for packet {payload:?} has a zero denominator"
+                    )));
+                }
+            }
+            if let Some(frontier) =
+                pending_event_frontier.filter(|frontier| state.last_updated_ns > *frontier)
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ last update time {} exceeds pending event frontier {frontier}",
+                    state.last_updated_ns
+                )));
+            }
+
+            let queued = queue.queue.iter().copied().collect::<BTreeSet<_>>();
+            let tagged = state
+                .packet_finish_times
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if queued != tagged {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ finish tags must name exactly the waiting packets"
+                )));
+            }
+
+            let mut expected_active = vec![0_u64; state.weights.len()];
+            for payload in queue.queue.iter().copied().chain(queue.in_service) {
+                let class = scheduler_class(image, payload, state.weights.len())
+                    .expect("packet and flow validation precede scheduler-state validation");
+                expected_active[class] = expected_active[class].checked_add(1).ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ active count overflows for class {class}"
+                    ))
+                })?;
+            }
+            if state.active_packets != expected_active {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WFQ active counts {:?} do not match queued plus in-service counts {expected_active:?}",
+                    state.active_packets
+                )));
+            }
+            if state.active_packets.iter().all(|active| *active == 0)
+                && state.virtual_time.numer() != &BigUint::from(0_u8)
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} idle WFQ virtual time must be zero"
+                )));
+            }
+
+            let mut previous = None;
+            let mut maximum_waiting_finish = vec![None; state.weights.len()];
+            for payload in &queue.queue {
+                let finish = &state.packet_finish_times[payload];
+                let class = scheduler_class(image, *payload, state.weights.len())
+                    .expect("packet and flow validation precede scheduler-state validation");
+                if finish.numer() == &BigUint::from(0_u8) {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ finish tag for waiting packet {payload:?} must be positive"
+                    )));
+                }
+                if finish > &state.finish_times[class] {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ packet {payload:?} finish tag exceeds class {class} finish state"
+                    )));
+                }
+                if previous.is_some_and(|previous: &crate::ExactRational| previous > finish) {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ waiting queue is not ordered by nondecreasing exact finish tag at packet {payload:?}"
+                    )));
+                }
+                maximum_waiting_finish[class] = Some(finish);
+                previous = Some(finish);
+            }
+            for (class, maximum) in maximum_waiting_finish.into_iter().enumerate() {
+                if maximum.is_some_and(|maximum| maximum != &state.finish_times[class]) {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} WFQ finish state for class {class} does not equal its maximum waiting tag"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn scheduler_class(
+    image: &SimulationImage,
+    payload: PayloadId,
+    class_count: usize,
+) -> Option<usize> {
+    let packet = packet(image, payload)?;
+    let class_count = u64::try_from(class_count).ok()?;
+    usize::try_from(packet.flow.0 % class_count).ok()
+}
+
+fn scheduler_class_value(
+    image: &SimulationImage,
+    payload: PayloadId,
+    values: &[u64],
+) -> Option<u64> {
+    scheduler_class(image, payload, values.len()).map(|class| values[class])
 }
 
 fn validate_payload_egress(

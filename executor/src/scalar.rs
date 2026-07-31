@@ -4,11 +4,14 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use num_bigint::BigUint;
+use num_rational::Ratio;
+
 use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
     GeneratorStatus, GeneratorTermination, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
-    PacketDescriptor, PacketKind, PayloadId, SimulationImage, SwitchState, TimeError,
-    TransitionHandler, event_phase, resolve_transition,
+    PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage, SwitchState,
+    TimeError, TransitionHandler, WfqSchedulerState, event_phase, resolve_transition,
 };
 
 /// Outcome of one remote packet arrival at a switch queue or sink host.
@@ -123,6 +126,16 @@ pub enum ExecutionError {
         node: NodeId,
         egress_link: Option<LinkId>,
     },
+    InvalidSchedulerState(NodeId),
+    MissingWfqFinishTag {
+        node: NodeId,
+        payload: PayloadId,
+    },
+    NonMonotoneWfqTime {
+        node: NodeId,
+        previous_ns: u64,
+        current_ns: u64,
+    },
     HostAlreadyTransmitting(NodeId),
     SwitchAlreadyTransmitting {
         node: NodeId,
@@ -231,6 +244,21 @@ impl fmt::Display for ExecutionError {
             Self::MissingSwitchQueue { node, egress_link } => write!(
                 formatter,
                 "switch {node:?} has no queue for egress link {egress_link:?}"
+            ),
+            Self::InvalidSchedulerState(node) => {
+                write!(formatter, "switch {node:?} has invalid scheduler state")
+            }
+            Self::MissingWfqFinishTag { node, payload } => write!(
+                formatter,
+                "switch {node:?} WFQ queue has no finish tag for waiting packet {payload:?}"
+            ),
+            Self::NonMonotoneWfqTime {
+                node,
+                previous_ns,
+                current_ns,
+            } => write!(
+                formatter,
+                "switch {node:?} WFQ time moved backward from {previous_ns} ns to {current_ns} ns"
             ),
             Self::HostAlreadyTransmitting(node) => {
                 write!(
@@ -994,6 +1022,10 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
+        let rate_bps = egress_link
+            .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
+            .transpose()?;
+        let sp_position = self.switch_sp_insertion_position(node, egress_link, packet.flow)?;
 
         let (disposition, schedule_ready) = {
             let state = self.switch_state_mut(node)?;
@@ -1018,7 +1050,27 @@ impl<'image> TransitionState<'image> {
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 (ArrivalDisposition::Dropped, false)
             } else {
-                queue.queue.push_back(event.payload);
+                match &mut queue.scheduler {
+                    SchedulerKind::Fifo => queue.queue.push_back(event.payload),
+                    SchedulerKind::StaticPriority { .. } => {
+                        queue.queue.insert(
+                            sp_position.ok_or(ExecutionError::InvalidSchedulerState(node.id))?,
+                            event.payload,
+                        );
+                    }
+                    SchedulerKind::WeightedFairQueue(wfq) => {
+                        let rate_bps =
+                            rate_bps.ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+                        wfq_enqueue(
+                            wfq,
+                            &mut queue.queue,
+                            packet,
+                            event.key.time_ns,
+                            rate_bps,
+                            node.id,
+                        )?;
+                    }
+                }
                 let schedule_ready = queue.egress_link.is_some()
                     && queue.in_service.is_none()
                     && !queue.tx_ready_pending;
@@ -1137,6 +1189,14 @@ impl<'image> TransitionState<'image> {
             let Some(payload) = queue.queue.pop_front() else {
                 return Ok(());
             };
+            if let SchedulerKind::WeightedFairQueue(wfq) = &mut queue.scheduler {
+                wfq.packet_finish_times.remove(&payload).ok_or(
+                    ExecutionError::MissingWfqFinishTag {
+                        node: node.id,
+                        payload,
+                    },
+                )?;
+            }
             queue.in_service = Some(payload);
             payload
         };
@@ -1193,6 +1253,8 @@ impl<'image> TransitionState<'image> {
                 egress_link: None,
             });
         };
+        let rate_bps = self.link(egress_link)?.rate_bps;
+        let packet = self.packet(event.payload)?;
 
         let next_payload = {
             let state = self.switch_state_mut(node)?;
@@ -1211,6 +1273,9 @@ impl<'image> TransitionState<'image> {
                     actual: event.payload,
                 });
             }
+            if let SchedulerKind::WeightedFairQueue(wfq) = &mut queue.scheduler {
+                wfq_complete(wfq, packet, event.key.time_ns, rate_bps, node.id)?;
+            }
             queue.in_service = None;
 
             let next_payload = queue.queue.front().copied();
@@ -1227,7 +1292,6 @@ impl<'image> TransitionState<'image> {
             schedule_payload
         };
 
-        let packet = self.packet(event.payload)?;
         self.record_departure(node.id, packet, event.key)?;
         self.finish_transmission(node.id, event.payload)?;
 
@@ -1368,7 +1432,6 @@ impl<'image> TransitionState<'image> {
             })
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     fn switch_state(&self, node: NodeDescriptor) -> Result<&SwitchState, ExecutionError> {
         let state_slot = self.local_state_slot(node)?;
         self.switch_states
@@ -1378,6 +1441,38 @@ impl<'image> TransitionState<'image> {
                 kind: node.kind,
                 state_slot: node.state_slot,
             })
+    }
+
+    fn switch_sp_insertion_position(
+        &self,
+        node: NodeDescriptor,
+        egress_link: Option<LinkId>,
+        incoming_flow: FlowId,
+    ) -> Result<Option<usize>, ExecutionError> {
+        let queue = self
+            .switch_state(node)?
+            .queues
+            .iter()
+            .find(|queue| queue.egress_link == egress_link)
+            .ok_or(ExecutionError::MissingSwitchQueue {
+                node: node.id,
+                egress_link,
+            })?;
+        let SchedulerKind::StaticPriority { priorities } = &queue.scheduler else {
+            return Ok(None);
+        };
+        let incoming_class = scheduler_class(incoming_flow, priorities.len())
+            .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+        let incoming_priority = priorities[incoming_class];
+        for (position, payload) in queue.queue.iter().enumerate() {
+            let queued = self.packet(*payload)?;
+            let queued_class = scheduler_class(queued.flow, priorities.len())
+                .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+            if priorities[queued_class] < incoming_priority {
+                return Ok(Some(position));
+            }
+        }
+        Ok(Some(queue.queue.len()))
     }
 
     fn local_state_slot(&self, node: NodeDescriptor) -> Result<usize, ExecutionError> {
@@ -1724,6 +1819,153 @@ impl<'image> TransitionState<'image> {
         }
         Ok(())
     }
+}
+
+fn scheduler_class(flow: FlowId, class_count: usize) -> Option<usize> {
+    let class_count = u64::try_from(class_count).ok()?;
+    if class_count == 0 {
+        return None;
+    }
+    usize::try_from(flow.0 % class_count).ok()
+}
+
+fn zero_rational() -> Ratio<BigUint> {
+    Ratio::from_integer(BigUint::from(0_u8))
+}
+
+fn wfq_active_weight_sum(state: &WfqSchedulerState) -> BigUint {
+    state
+        .weights
+        .iter()
+        .zip(&state.active_packets)
+        .filter(|(_, active)| **active != 0)
+        .fold(BigUint::from(0_u8), |sum, (weight, _)| {
+            sum + BigUint::from(*weight)
+        })
+}
+
+fn wfq_advance_virtual_time(
+    state: &mut WfqSchedulerState,
+    time_ns: u64,
+    rate_bps: u64,
+    node: NodeId,
+) -> Result<(), ExecutionError> {
+    let elapsed_ns =
+        time_ns
+            .checked_sub(state.last_updated_ns)
+            .ok_or(ExecutionError::NonMonotoneWfqTime {
+                node,
+                previous_ns: state.last_updated_ns,
+                current_ns: time_ns,
+            })?;
+    let weight_sum = wfq_active_weight_sum(state);
+    if weight_sum == BigUint::from(0_u8) {
+        return Err(ExecutionError::InvalidSchedulerState(node));
+    }
+    if elapsed_ns != 0 {
+        let numerator = BigUint::from(elapsed_ns) * BigUint::from(rate_bps);
+        let denominator = BigUint::from(1_000_000_000_u64) * weight_sum;
+        state.virtual_time = state.virtual_time.clone() + Ratio::new(numerator, denominator);
+    }
+    Ok(())
+}
+
+fn wfq_enqueue(
+    state: &mut WfqSchedulerState,
+    queue: &mut std::collections::VecDeque<PayloadId>,
+    packet: PacketDescriptor,
+    arrival_time_ns: u64,
+    rate_bps: u64,
+    node: NodeId,
+) -> Result<(), ExecutionError> {
+    let class = scheduler_class(packet.flow, state.weights.len())
+        .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+    if state.weights[class] == 0
+        || state.finish_times.len() != state.weights.len()
+        || state.active_packets.len() != state.weights.len()
+    {
+        return Err(ExecutionError::InvalidSchedulerState(node));
+    }
+    if arrival_time_ns < state.last_updated_ns {
+        return Err(ExecutionError::NonMonotoneWfqTime {
+            node,
+            previous_ns: state.last_updated_ns,
+            current_ns: arrival_time_ns,
+        });
+    }
+
+    if state.active_packets.iter().all(|active| *active == 0) {
+        state.virtual_time = zero_rational();
+        state.finish_times.fill(zero_rational());
+    } else {
+        wfq_advance_virtual_time(state, arrival_time_ns, rate_bps, node)?;
+    }
+
+    let virtual_start = state
+        .virtual_time
+        .clone()
+        .max(state.finish_times[class].clone());
+    let service = Ratio::new(
+        BigUint::from(packet.size_bytes) * BigUint::from(8_u8),
+        BigUint::from(state.weights[class]),
+    );
+    let finish = virtual_start + service;
+    state.finish_times[class] = finish.clone();
+
+    let mut position = queue.len();
+    for (index, queued) in queue.iter().enumerate() {
+        let queued_finish =
+            state
+                .packet_finish_times
+                .get(queued)
+                .ok_or(ExecutionError::MissingWfqFinishTag {
+                    node,
+                    payload: *queued,
+                })?;
+        if queued_finish > &finish {
+            position = index;
+            break;
+        }
+    }
+    if state
+        .packet_finish_times
+        .insert(packet.id, finish)
+        .is_some()
+    {
+        return Err(ExecutionError::InvalidSchedulerState(node));
+    }
+    queue.insert(position, packet.id);
+    state.active_packets[class] = state.active_packets[class]
+        .checked_add(1)
+        .ok_or(ExecutionError::CounterOverflow(node))?;
+    state.last_updated_ns = arrival_time_ns;
+    Ok(())
+}
+
+fn wfq_complete(
+    state: &mut WfqSchedulerState,
+    packet: PacketDescriptor,
+    departure_time_ns: u64,
+    rate_bps: u64,
+    node: NodeId,
+) -> Result<(), ExecutionError> {
+    let class = scheduler_class(packet.flow, state.weights.len())
+        .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+    if state.weights[class] == 0
+        || state.finish_times.len() != state.weights.len()
+        || state.active_packets.len() != state.weights.len()
+        || state.active_packets[class] == 0
+    {
+        return Err(ExecutionError::InvalidSchedulerState(node));
+    }
+    wfq_advance_virtual_time(state, departure_time_ns, rate_bps, node)?;
+    state.active_packets[class] -= 1;
+    if state.active_packets.iter().all(|active| *active == 0) {
+        state.virtual_time = zero_rational();
+        state.finish_times[class] = zero_rational();
+    }
+    state.last_updated_ns = departure_time_ns;
+    Ok(())
 }
 
 fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> Option<&T> {

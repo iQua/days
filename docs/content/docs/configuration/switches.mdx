@@ -80,17 +80,18 @@ Class weights.
 
 - Type: `Vec<usize>`
 - Required when `discipline` is `DRR`, `WRR`, or `WFQ`
+- WFQ requires at least one class and rejects zero weights in the exact executor.
 
 Class assignment:
 
 - Days uses a simple mapping `class_id = flow_id % weights.len()`.
 
-## `switch.priorities` (required for SP)
+## `switch.priorities` (optional for SP)
 
 Maps class IDs to strict priority levels.
 
 - Type: `Vec<usize>`
-- Required when `discipline = "SP"`
+- Default: `[1]` when the field is missing or empty
 - Interpretation: **larger numbers are served first** (the scheduler iterates priorities in descending order).
 
 Class assignment:

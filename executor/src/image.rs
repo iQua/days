@@ -39,7 +39,7 @@ pub struct HostState {
     pub received_packets: u64,
 }
 
-/// One switch-port-owned FIFO/TailDrop egress queue.
+/// One switch-port-owned TailDrop egress queue with discipline-owned service state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwitchQueueState {
     /// `None` is used only by terminal hand-built fixtures whose flow ends at the switch.

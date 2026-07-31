@@ -18,15 +18,45 @@ The first complete vertical slice supports:
 
 - static topologies with one LP per host and one LP per switch egress port;
 - integer nanosecond logical time without timestamp quantization;
-- FIFO scheduling with TailDrop;
+- FIFO, Static Priority (SP), and Weighted Fair Queueing (WFQ) with TailDrop;
 - constant-rate, non-preemptive links;
 - a constant propagation delay for each directed link;
 - open-loop UDP traffic generated from deterministic, precomputed inputs;
 - one CPU process and one GPU device; and
 - a known, positive lookahead on every channel that crosses LP boundaries.
 
-This deliberately closed model gives the scalar, multicore CPU, Metal, and CUDA
-backends one common execution contract.
+The scalar and multicore CPU backends execute all three disciplines. Metal and
+CUDA reject SP and WFQ images during load-time validation until the device work
+lands in T19.
+
+### SP and WFQ service semantics
+
+SP maps `flow_id % priorities.len()` to a class. Larger numeric priorities win,
+and packets with the same priority retain canonical arrival order. An SP arrival
+cannot preempt an in-service packet.
+
+WFQ maps `flow_id % weights.len()` to a class and requires a positive weight for
+each class. The executor assigns a finish tag when it admits a packet, keeps the
+waiting queue in tag order, and commits the first packet only when `TxReady`
+starts service. Arrivals processed before that `TxReady`, including phase-zero
+arrivals at the same timestamp, participate in the decision.
+
+The WFQ state uses exact rational arithmetic over arbitrary-precision integers.
+Let `V` and `F` denote legacy virtual time and finish time multiplied by the link
+rate. For elapsed integer time `delta_ns`, the executor applies:
+
+```text
+V += delta_ns * rate_bps / (1_000_000_000 * active_weight_sum)
+F[class] = max(V, F[class]) + 8 * size_bytes / weight[class]
+```
+
+This recurrence preserves the mathematical order behind the legacy `f64`
+calculation without float rounding. Exact tag ties use canonical arrival order.
+Legacy WFQ compares only the `f64` tag in an unstable binary heap, so its order
+for equal tags is unspecified. Near float-rounding boundaries and equal-time
+legacy LIFO arrivals can also change a cross-version trajectory. Compare
+nontied integer-time fixtures packet by packet; use per-timestamp multisets and
+per-flow sequences at those version boundaries.
 
 ## Migration comparison policy
 
@@ -88,8 +118,7 @@ cannot be implemented.
 
 ## Follow-on model work
 
-Strict Priority (SP) and Weighted Fair Queueing (WFQ) follow FIFO. Deficit Round
-Robin (DRR), Weighted Round Robin (WRR), TCP, CUBIC, RED-family active queue
+Deficit Round Robin (DRR), Weighted Round Robin (WRR), TCP, CUBIC, RED-family active queue
 management, PFC, and DCQCN are not required for the first result. A later
 project may qualify these models against the same exact execution contract.
 

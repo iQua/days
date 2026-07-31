@@ -1078,10 +1078,10 @@ hosts = [0, 1]
 [switch]
 port_rate = 8_000
 capacity = 1
-discipline = "SP"
+discipline = "DRR"
 drop = "TailDrop"
 "#,
-            "unsupported scheduler `SP`; Days executor v1 supports only FIFO",
+            "unsupported scheduler `DRR`; Days executor supports FIFO, SP, and WFQ",
         ),
         (
             "drop",
@@ -1219,6 +1219,167 @@ run_batch_size = 2
         let path = write_config(&directory, &format!("{name}.toml"), config);
         let error = compile_config(&path).expect_err("unsupported scenario should reject");
         assert_eq!(error.to_string(), expected, "case {name}");
+    }
+}
+
+#[test]
+fn sp_and_wfq_config_surfaces_lower_with_validated_class_parameters() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let header = r#"
+seed = 1
+duration = 0.000000010
+edges = [[0, 1]]
+hosts = [0, 1]
+"#;
+    let flow = r#"
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+size = 2
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+"#;
+    let sp_path = write_config(
+        &directory,
+        "sp.toml",
+        &format!(
+            r#"{header}
+[switch]
+port_rate = 8_000_000_000
+capacity = 8
+discipline = "SP"
+drop = "TailDrop"
+priorities = [1, 7, 3]
+{flow}
+"#
+        ),
+    );
+    let wfq_path = write_config(
+        &directory,
+        "wfq.toml",
+        &format!(
+            r#"{header}
+[switch]
+port_rate = 8_000_000_000
+capacity = 8
+discipline = "WFQ"
+drop = "TailDrop"
+weights = [1, 4, 2]
+{flow}
+"#
+        ),
+    );
+
+    let sp = compile_config(sp_path).expect("SP scenario should lower");
+    let wfq = compile_config(wfq_path).expect("WFQ scenario should lower");
+    assert!(
+        sp.switch_states
+            .iter()
+            .all(|state| state.queues.iter().all(|queue| matches!(
+                &queue.scheduler,
+                SchedulerKind::StaticPriority { priorities } if priorities == &[1, 7, 3]
+            )))
+    );
+    assert!(
+        wfq.switch_states
+            .iter()
+            .all(|state| state.queues.iter().all(|queue| matches!(
+                &queue.scheduler,
+                SchedulerKind::WeightedFairQueue(state) if state.weights == [1, 4, 2]
+            )))
+    );
+    validate(&sp, Backend::Cpu { workers: 2 }).expect("CPU should accept lowered SP");
+    validate(&wfq, Backend::Cpu { workers: 2 }).expect("CPU should accept lowered WFQ");
+}
+
+#[test]
+fn sp_missing_and_empty_priorities_default_to_one_class() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    for (name, priorities) in [("missing", ""), ("empty", "priorities = []")] {
+        let path = write_config(
+            &directory,
+            &format!("sp-{name}.toml"),
+            &format!(
+                r#"
+seed = 1
+duration = 0.000000010
+edges = [[0, 1]]
+hosts = [0, 1]
+[switch]
+port_rate = 8_000_000_000
+capacity = 8
+discipline = "SP"
+drop = "TailDrop"
+{priorities}
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+size = 2
+arr_dist = {{ type = "Uniform", low = 0.000000001, high = 0.000000001 }}
+pkt_size_dist = {{ type = "Uniform", low = 1, high = 1 }}
+"#
+            ),
+        );
+
+        let image = compile_config(path).expect("SP defaults should lower");
+        assert!(image.switch_states.iter().all(|state| {
+            state.queues.iter().all(|queue| {
+                matches!(
+                    &queue.scheduler,
+                    SchedulerKind::StaticPriority { priorities } if priorities == &[1]
+                )
+            })
+        }));
+    }
+}
+
+#[test]
+fn wfq_config_rejects_missing_empty_and_zero_weights() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    for (name, weights, expected) in [
+        (
+            "missing",
+            "",
+            "invalid scenario: `switch.weights` must be provided for WFQ scheduling",
+        ),
+        (
+            "empty",
+            "weights = []",
+            "invalid scenario: `switch.weights` must contain at least one class for WFQ scheduling",
+        ),
+        (
+            "zero",
+            "weights = [1, 0]",
+            "invalid scenario: `switch.weights[1]` must be positive for WFQ scheduling",
+        ),
+    ] {
+        let path = write_config(
+            &directory,
+            &format!("wfq-{name}.toml"),
+            &format!(
+                r#"
+seed = 1
+edges = [[0, 1]]
+hosts = [0, 1]
+[switch]
+port_rate = 8_000_000_000
+capacity = 8
+discipline = "WFQ"
+drop = "TailDrop"
+{weights}
+"#
+            ),
+        );
+        assert_eq!(
+            compile_config(path)
+                .expect_err("malformed WFQ weights must be rejected")
+                .to_string(),
+            expected
+        );
     }
 }
 

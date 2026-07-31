@@ -61,7 +61,7 @@ pub struct EventKey {
     pub origin_seq: u64,
 }
 
-/// Closed set of event transitions in the v1 FIFO model.
+/// Closed set of event transitions shared by the FIFO, SP, and WFQ models.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EventKind {

@@ -1516,6 +1516,26 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
     image
 }
 
+fn scheduler_corpus() -> [SchedulerKind; 3] {
+    [
+        SchedulerKind::Fifo,
+        SchedulerKind::static_priority(vec![1, 7, 3]),
+        SchedulerKind::weighted_fair_queue(vec![1, 7, 3]),
+    ]
+}
+
+fn heterogeneous_scheduler_image(seed: u64, scheduler: SchedulerKind) -> SimulationImage {
+    let mut image = heterogeneous_image(seed);
+    for queue in image
+        .switch_states
+        .iter_mut()
+        .flat_map(|state| &mut state.queues)
+    {
+        queue.scheduler = scheduler.clone();
+    }
+    image
+}
+
 fn pre_split_heterogeneous_image(seed: u64) -> SimulationImage {
     let mut image = heterogeneous_image(seed);
     let post_node_count = image.nodes.len() as u64;
@@ -1733,7 +1753,7 @@ fn normalized_physical_result(
             state.queues.iter().map(|queue| NormalizedQueue {
                 physical_switch: state.physical_switch,
                 egress_link: queue.egress_link,
-                scheduler: queue.scheduler as u8,
+                scheduler: queue.scheduler.code(),
                 queue_capacity_packets: queue.queue_capacity_packets,
                 queue: queue.queue.iter().copied().map(semantic_packet).collect(),
                 in_service: queue.in_service.map(semantic_packet),
@@ -2502,16 +2522,25 @@ fn port_decomposition_preserves_pre_split_physical_outcomes() {
 
 #[test]
 fn randomized_small_heterogeneous_images_match_complete_global_state() {
+    let mut comparisons = 0;
     for seed in 0..128 {
-        let image = heterogeneous_image(seed);
-        validate(&image, Backend::Scalar)
-            .unwrap_or_else(|error| panic!("seed {seed} scalar validation failed: {error}"));
-        validate(&image, Backend::Cpu { workers: 1 })
-            .unwrap_or_else(|error| panic!("seed {seed} CPU validation failed: {error}"));
-        assert_equivalent(&image, None);
-        let cut = 1 + (seed * 17) % image.stop_time_ns;
-        assert_equivalent(&image, Some(cut));
+        for scheduler in scheduler_corpus() {
+            let label = scheduler.label();
+            let image = heterogeneous_scheduler_image(seed, scheduler);
+            validate(&image, Backend::Scalar).unwrap_or_else(|error| {
+                panic!("seed {seed}, scheduler {label} scalar validation failed: {error}")
+            });
+            validate(&image, Backend::Cpu { workers: 1 }).unwrap_or_else(|error| {
+                panic!("seed {seed}, scheduler {label} CPU validation failed: {error}")
+            });
+            assert_equivalent(&image, None);
+            comparisons += 1;
+            let cut = 1 + (seed * 17) % image.stop_time_ns;
+            assert_equivalent(&image, Some(cut));
+            comparisons += 1;
+        }
     }
+    assert_eq!(comparisons, 128 * 3 * 2);
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -2555,69 +2584,84 @@ fn production_metal_matches_representative_cartesian_images() {
 
 #[test]
 fn cpu_configuration_matrix_preserves_complete_state_at_full_and_partial_horizons() {
+    let mut comparisons = 0;
     for seed in 0..128 {
-        let image = heterogeneous_image(seed);
-        let full_expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
-            .unwrap_or_else(|error| panic!("seed {seed} scalar execution failed: {error}"));
-        let cut = 1 + (seed * 17) % image.stop_time_ns;
-        let partial_expected =
-            run_scalar_with_observations(&image, Some(cut), ObservationMode::Full).unwrap_or_else(
-                |error| panic!("seed {seed}, horizon {cut} scalar execution failed: {error}"),
-            );
-        let horizons = [(None, &full_expected), (Some(cut), &partial_expected)];
+        for scheduler in scheduler_corpus() {
+            let label = scheduler.label();
+            let image = heterogeneous_scheduler_image(seed, scheduler);
+            let full_expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+                .unwrap_or_else(|error| {
+                    panic!("seed {seed}, scheduler {label} scalar execution failed: {error}")
+                });
+            let cut = 1 + (seed * 17) % image.stop_time_ns;
+            let partial_expected = run_scalar_with_observations(
+                &image,
+                Some(cut),
+                ObservationMode::Full,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "seed {seed}, scheduler {label}, horizon {cut} scalar execution failed: {error}"
+                )
+            });
+            let horizons = [(None, &full_expected), (Some(cut), &partial_expected)];
 
-        for static_partition in [
-            StaticPartitionPolicy::Modulo,
-            StaticPartitionPolicy::RouteLoad,
-        ] {
-            for workers in 1..=4 {
-                for granularity in [
-                    ChunkGranularity::Static,
-                    ChunkGranularity::Fixed(1),
-                    ChunkGranularity::Fixed(3),
-                ] {
-                    for straggler_threshold_events in [None, Some(0), Some(3)] {
-                        for (horizon, expected) in horizons {
-                            let config = CpuConfig {
-                                workers,
-                                granularity,
-                                static_partition,
-                                straggler_threshold_events,
-                                ..CpuConfig::default()
-                            };
-                            let actual = run_cpu_with_observations(
-                                &image,
-                                horizon,
-                                config,
-                                ObservationMode::Full,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "seed {seed}, horizon {horizon:?}, partition \
-                                    {static_partition:?}, workers {workers}, granularity \
-                                    {granularity:?}, threshold {straggler_threshold_events:?} \
-                                    failed: {error}"
+            for static_partition in [
+                StaticPartitionPolicy::Modulo,
+                StaticPartitionPolicy::RouteLoad,
+            ] {
+                for workers in 1..=4 {
+                    for granularity in [
+                        ChunkGranularity::Static,
+                        ChunkGranularity::Fixed(1),
+                        ChunkGranularity::Fixed(3),
+                    ] {
+                        for straggler_threshold_events in [None, Some(0), Some(3)] {
+                            for (horizon, expected) in horizons {
+                                let config = CpuConfig {
+                                    workers,
+                                    granularity,
+                                    static_partition,
+                                    straggler_threshold_events,
+                                    ..CpuConfig::default()
+                                };
+                                let actual = run_cpu_with_observations(
+                                    &image,
+                                    horizon,
+                                    config,
+                                    ObservationMode::Full,
                                 )
-                            });
-                            let maximum_owner_batches = u64::try_from(workers * workers)
-                                .expect("worker bound must fit u64");
-                            assert!(actual.rounds.iter().all(|round| {
-                                round.owner_batch_messages <= maximum_owner_batches
-                                    && round.owner_batch_messages
-                                        <= round.semantic.messages_exchanged
-                            }));
-                            assert_eq!(
-                                &actual.result, expected,
-                                "seed {seed}, horizon {horizon:?}, partition \
-                                 {static_partition:?}, workers {workers}, granularity \
-                                 {granularity:?}, threshold {straggler_threshold_events:?}"
-                            );
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "seed {seed}, scheduler {label}, horizon {horizon:?}, \
+                                        partition {static_partition:?}, workers {workers}, \
+                                        granularity {granularity:?}, threshold \
+                                        {straggler_threshold_events:?} failed: {error}"
+                                    )
+                                });
+                                let maximum_owner_batches = u64::try_from(workers * workers)
+                                    .expect("worker bound must fit u64");
+                                assert!(actual.rounds.iter().all(|round| {
+                                    round.owner_batch_messages <= maximum_owner_batches
+                                        && round.owner_batch_messages
+                                            <= round.semantic.messages_exchanged
+                                }));
+                                assert_eq!(
+                                    &actual.result, expected,
+                                    "seed {seed}, scheduler {label}, horizon {horizon:?}, \
+                                     partition {static_partition:?}, workers {workers}, \
+                                     granularity {granularity:?}, threshold \
+                                     {straggler_threshold_events:?}"
+                                );
+                                comparisons += 1;
+                            }
                         }
                     }
                 }
             }
         }
     }
+    assert_eq!(comparisons, 128 * 3 * 2 * 2 * 4 * 3 * 3);
 }
 
 fn incast_image(sender_count: usize) -> SimulationImage {

@@ -3,8 +3,10 @@ use std::collections::VecDeque;
 use days_executor::{
     Backend, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId,
     NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, event_phase, validate,
+    SimulationImage, SwitchQueueState, SwitchState, WfqSchedulerState, event_phase, validate,
 };
+use num_bigint::BigUint;
+use num_rational::Ratio;
 
 const SOURCE: NodeId = NodeId(0);
 const SWITCH: NodeId = NodeId(1);
@@ -149,6 +151,34 @@ fn rejection(image: &SimulationImage, backend: Backend) -> String {
         .to_string();
     println!("{diagnostic}");
     diagnostic
+}
+
+fn wfq_waiting_image() -> SimulationImage {
+    let mut image = valid_image();
+    let queue = &mut image.switch_states[0].queues[0];
+    queue.queue.push_back(PACKET);
+    queue.tx_ready_pending = true;
+    let mut state = WfqSchedulerState::new(vec![1]);
+    state.finish_times[0] = Ratio::from_integer(BigUint::from(16_u8));
+    state.active_packets[0] = 1;
+    state
+        .packet_finish_times
+        .insert(PACKET, Ratio::from_integer(BigUint::from(16_u8)));
+    queue.scheduler = SchedulerKind::WeightedFairQueue(state);
+    image.switch_states[0].arrived_packets = 1;
+    image.switch_states[0].next_origin_seq = 1;
+    image.initial_events[0] = Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::TxReady),
+            origin_node: SWITCH,
+            origin_seq: 0,
+        },
+        target: SWITCH,
+        kind: EventKind::TxReady,
+        payload: PACKET,
+    };
+    image
 }
 
 #[test]
@@ -554,11 +584,42 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
         "node NodeId(0) next origin sequence 0 does not advance existing sequence 0"
     );
 
-    let mut scheduler = valid_image();
-    scheduler.switch_states[0].queues[0].scheduler = SchedulerKind::StaticPriority;
+    for scheduler in [
+        SchedulerKind::static_priority(vec![1, 2]),
+        SchedulerKind::weighted_fair_queue(vec![1, 2]),
+    ] {
+        let mut image = valid_image();
+        image.switch_states[0].queues[0].scheduler = scheduler;
+        validate(&image, Backend::Scalar).expect("scalar must support SP/WFQ");
+        validate(&image, Backend::Cpu { workers: 2 }).expect("CPU must support SP/WFQ");
+        let label = image.switch_states[0].queues[0].scheduler.label();
+        assert_eq!(
+            rejection(&image, Backend::Metal),
+            format!(
+                "switch node NodeId(1) queue 0 uses {label} service, which backend Metal does not support; SP/WFQ require Scalar or Cpu until T19"
+            )
+        );
+        assert_eq!(
+            rejection(&image, Backend::Cuda),
+            format!(
+                "switch node NodeId(1) queue 0 uses {label} service, which backend Cuda does not support; SP/WFQ require Scalar or Cpu until T19"
+            )
+        );
+    }
+
+    let mut empty_priorities = valid_image();
+    empty_priorities.switch_states[0].queues[0].scheduler = SchedulerKind::static_priority(vec![]);
     assert_eq!(
-        rejection(&scheduler, Backend::Scalar),
-        "switch node NodeId(1) queue 0 uses unsupported StaticPriority service on backend Scalar"
+        rejection(&empty_priorities, Backend::Scalar),
+        "switch node NodeId(1) queue 0 SP priorities must contain at least one class"
+    );
+
+    let mut zero_weight = valid_image();
+    zero_weight.switch_states[0].queues[0].scheduler =
+        SchedulerKind::weighted_fair_queue(vec![1, 0]);
+    assert_eq!(
+        rejection(&zero_weight, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ weight for class 1 must be positive"
     );
 
     let mut capacity = valid_image();
@@ -646,6 +707,93 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
     assert_eq!(
         rejection(&counter, Backend::Scalar),
         "node NodeId(0) counter sourced_packets value 18446744073709551615 overflows with remaining upper bound 1"
+    );
+}
+
+#[test]
+fn wfq_checkpoint_rationals_require_nonzero_denominators() {
+    let zero_denominator = || Ratio::new_raw(BigUint::from(0_u8), BigUint::from(0_u8));
+
+    let mut virtual_time = valid_image();
+    let mut state = WfqSchedulerState::new(vec![1]);
+    state.virtual_time = zero_denominator();
+    virtual_time.switch_states[0].queues[0].scheduler = SchedulerKind::WeightedFairQueue(state);
+    assert_eq!(
+        rejection(&virtual_time, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ virtual time has a zero denominator"
+    );
+
+    let mut class_finish = valid_image();
+    let mut state = WfqSchedulerState::new(vec![1]);
+    state.finish_times[0] = zero_denominator();
+    class_finish.switch_states[0].queues[0].scheduler = SchedulerKind::WeightedFairQueue(state);
+    assert_eq!(
+        rejection(&class_finish, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ finish state for class 0 has a zero denominator"
+    );
+
+    let mut packet_finish = wfq_waiting_image();
+    let SchedulerKind::WeightedFairQueue(state) =
+        &mut packet_finish.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.packet_finish_times.insert(PACKET, zero_denominator());
+    assert_eq!(
+        rejection(&packet_finish, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ finish tag for packet PayloadId(0) has a zero denominator"
+    );
+}
+
+#[test]
+fn wfq_checkpoint_time_cannot_lead_the_pending_event_frontier() {
+    let mut idle = valid_image();
+    let mut state = WfqSchedulerState::new(vec![1]);
+    state.last_updated_ns = 1;
+    idle.switch_states[0].queues[0].scheduler = SchedulerKind::WeightedFairQueue(state);
+    assert_eq!(
+        rejection(&idle, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ last update time 1 exceeds pending event frontier 0"
+    );
+
+    let mut active = wfq_waiting_image();
+    let SchedulerKind::WeightedFairQueue(state) = &mut active.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.last_updated_ns = 1;
+    assert_eq!(
+        rejection(&active, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ last update time 1 exceeds pending event frontier 0"
+    );
+}
+
+#[test]
+fn wfq_checkpoint_waiting_tags_are_positive_and_close_class_history() {
+    let mut zero = wfq_waiting_image();
+    let SchedulerKind::WeightedFairQueue(state) = &mut zero.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.finish_times[0] = Ratio::from_integer(BigUint::from(0_u8));
+    state
+        .packet_finish_times
+        .insert(PACKET, Ratio::from_integer(BigUint::from(0_u8)));
+    assert_eq!(
+        rejection(&zero, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ finish tag for waiting packet PayloadId(0) must be positive"
+    );
+
+    let mut inflated = wfq_waiting_image();
+    let SchedulerKind::WeightedFairQueue(state) =
+        &mut inflated.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.finish_times[0] = Ratio::from_integer(BigUint::from(17_u8));
+    assert_eq!(
+        rejection(&inflated, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ finish state for class 0 does not equal its maximum waiting tag"
     );
 }
 

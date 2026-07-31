@@ -51,7 +51,10 @@ pub use metal::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};
-pub use model::{NodeKind, SchedulerKind, TransitionHandler, resolve_transition};
+pub use model::{
+    ExactRational, NodeKind, SchedulerKind, TransitionHandler, WfqSchedulerState,
+    resolve_transition,
+};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{

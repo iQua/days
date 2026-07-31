@@ -503,12 +503,13 @@ def InitialEventsRoleCorrect
       event.target = node.id ∧ roleSupports node.kind event.kind
 
 /--
-Conservative queue-conflict class for the accepted FIFO/TailDrop handlers.
+Conservative queue-conflict class for all accepted queueing handlers.
 
-Rust's arrival, readiness, and completion handlers all mutate the same finite-capacity queue
-(`executor/src/scalar.rs:975-1016,1091-1233`), so formal "same-type" ordering must mean a shared
-queue-conflict class rather than literal equality of `EventKind`. This intentionally restricts
-same-node reordering while still permitting same-stage batching across LPs.
+Rust's FIFO, SP, and WFQ arrival, readiness, and completion handlers mutate one discipline-owned
+queue (`executor/src/scalar.rs`), so formal "same-type" ordering must mean a shared queue-conflict
+class rather than literal equality of `EventKind`. This intentionally restricts same-node
+reordering while still permitting same-stage batching across LPs. The SP/WFQ coverage obligations
+are discharged explicitly in `DaysExecutor.SchedulerInstances`.
 -/
 def fifoQueueConflictClass (_kind : EventKind) : Nat :=
   0

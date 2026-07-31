@@ -67,6 +67,8 @@ struct SourceSwitch {
     capacity: u64,
     discipline: Option<String>,
     drop: Option<String>,
+    weights: Option<Vec<u64>>,
+    priorities: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -192,6 +194,7 @@ struct SupportedModel {
     stop_time_ns: u64,
     rate_bps: u64,
     queue_capacity_packets: u64,
+    scheduler: SchedulerKind,
     propagation_ns: u64,
     explicit_flows: Vec<ExplicitFlowKey>,
     flow_sets: Vec<FlowSetKey>,
@@ -210,14 +213,45 @@ impl SupportedModel {
             .discipline
             .as_deref()
             .ok_or_else(|| CompileError::Unsupported(
-                "unsupported scheduler: `switch.discipline` is missing; Days executor v1 supports only FIFO"
+                "unsupported scheduler: `switch.discipline` is missing; Days executor supports FIFO, SP, and WFQ"
                     .to_owned(),
             ))?;
-        if discipline != "FIFO" {
-            return Err(CompileError::Unsupported(format!(
-                "unsupported scheduler `{discipline}`; Days executor v1 supports only FIFO"
-            )));
-        }
+        let scheduler = match discipline {
+            "FIFO" => SchedulerKind::Fifo,
+            "SP" => {
+                let priorities = source
+                    .switch
+                    .priorities
+                    .clone()
+                    .filter(|priorities| !priorities.is_empty())
+                    .unwrap_or_else(|| vec![1]);
+                SchedulerKind::static_priority(priorities)
+            }
+            "WFQ" => {
+                let weights = source.switch.weights.clone().ok_or_else(|| {
+                    CompileError::Invalid(
+                        "`switch.weights` must be provided for WFQ scheduling".to_owned(),
+                    )
+                })?;
+                if weights.is_empty() {
+                    return Err(CompileError::Invalid(
+                        "`switch.weights` must contain at least one class for WFQ scheduling"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(class) = weights.iter().position(|weight| *weight == 0) {
+                    return Err(CompileError::Invalid(format!(
+                        "`switch.weights[{class}]` must be positive for WFQ scheduling"
+                    )));
+                }
+                SchedulerKind::weighted_fair_queue(weights)
+            }
+            unsupported => {
+                return Err(CompileError::Unsupported(format!(
+                    "unsupported scheduler `{unsupported}`; Days executor supports FIFO, SP, and WFQ"
+                )));
+            }
+        };
 
         let drop = source.switch.drop.as_deref().ok_or_else(|| {
             CompileError::Unsupported(
@@ -284,6 +318,7 @@ impl SupportedModel {
             stop_time_ns,
             rate_bps,
             queue_capacity_packets: source.switch.capacity,
+            scheduler,
             propagation_ns: link.propagation_ns.unwrap_or(0),
             explicit_flows,
             flow_sets,
@@ -903,7 +938,7 @@ fn lower(
                 physical_switch: switch,
                 queues: vec![SwitchQueueState {
                     egress_link: Some(ids.link(egress)),
-                    scheduler: SchedulerKind::Fifo,
+                    scheduler: model.scheduler.clone(),
                     queue_capacity_packets: model.queue_capacity_packets,
                     queue: VecDeque::new(),
                     in_service: None,
