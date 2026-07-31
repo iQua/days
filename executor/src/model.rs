@@ -73,7 +73,7 @@ impl SchedulerKind {
         Self::WeightedFairQueue(WfqSchedulerState::new(weights))
     }
 
-    /// Stable device-facing tag. T18 rejects non-FIFO images before device packing.
+    /// Stable device-facing tag shared by the Metal and CUDA scheduler planes.
     pub const fn code(&self) -> u8 {
         match self {
             Self::Fifo => 0,

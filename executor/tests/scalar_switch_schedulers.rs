@@ -6,6 +6,20 @@ use days_executor::{
     PacketKind, PayloadId, RemoteChannel, SchedulerKind, SimulationImage, SwitchQueueState,
     SwitchState, event_phase, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use num_bigint::BigUint;
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use num_rational::Ratio;
 
 const SOURCE: NodeId = NodeId(0);
 const SWITCH: NodeId = NodeId(1);
@@ -316,5 +330,278 @@ fn cpu_is_byte_identical_to_scalar_for_sp_and_wfq() {
         )
         .expect("CPU executor must run");
         assert_eq!(cpu.result, scalar);
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn adversarial_scheduler_images() -> [SimulationImage; 3] {
+    [
+        image(
+            SchedulerKind::static_priority(vec![1, 9]),
+            &[(0, 0, 1, 0), (1, 1, 1, 0)],
+            4,
+        ),
+        image(
+            SchedulerKind::weighted_fair_queue(vec![1, 8]),
+            &[(0, 0, 8, 0), (1, 1, 1, 0)],
+            16,
+        ),
+        image(
+            SchedulerKind::weighted_fair_queue(vec![1, 2]),
+            &[(0, 0, 1, 0), (1, 1, 2, 0)],
+            8,
+        ),
+    ]
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn wfq_multilimb_checkpoint() -> (SimulationImage, Ratio<BigUint>) {
+    let mut checkpoint = image(
+        SchedulerKind::weighted_fair_queue(vec![1_000_000_000, 2_000_000_000]),
+        &[(0, 1, 1, 0), (1, 0, 1, 0), (2, 0, 1, 1)],
+        32,
+    );
+    let prefix = run_scalar_with_observations(&checkpoint, Some(1), ObservationMode::Full)
+        .expect("WFQ multi-limb checkpoint prefix must run");
+    checkpoint.host_states = prefix.host_states;
+    checkpoint.switch_states = prefix.switch_states;
+    checkpoint.initial_packets = prefix.resident_packets;
+    checkpoint.initial_events = prefix.pending_events;
+
+    let denominator = BigUint::from(125_000_000_u64) << 288_usize;
+    let numerator = &denominator * BigUint::from(15_u8) + BigUint::from(1_u8);
+    let high_finish = Ratio::new(numerator, denominator);
+    let expected_finish =
+        high_finish.clone() + Ratio::new(BigUint::from(8_u8), BigUint::from(1_000_000_000_u64));
+    let queue = &mut checkpoint.switch_states[0].queues[0];
+    let waiting = *queue
+        .queue
+        .front()
+        .expect("prefix must retain the high-weight waiting packet");
+    let SchedulerKind::WeightedFairQueue(state) = &mut queue.scheduler else {
+        unreachable!()
+    };
+    state.finish_times[0] = high_finish.clone();
+    state.packet_finish_times.insert(waiting, high_finish);
+    (checkpoint, expected_finish)
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn wfq_overflow_checkpoint() -> SimulationImage {
+    let mut checkpoint = image(
+        SchedulerKind::weighted_fair_queue(vec![1]),
+        &[(0, 0, 1, 0)],
+        4,
+    );
+    let prefix = run_scalar_with_observations(&checkpoint, Some(1), ObservationMode::Full)
+        .expect("WFQ overflow checkpoint prefix must run");
+    checkpoint.host_states = prefix.host_states;
+    checkpoint.switch_states = prefix.switch_states;
+    checkpoint.initial_packets = prefix.resident_packets;
+    checkpoint.initial_events = prefix.pending_events;
+
+    let payload = checkpoint.switch_states[0].queues[0]
+        .in_service
+        .expect("prefix must retain one in-service packet");
+    let SchedulerKind::WeightedFairQueue(state) =
+        &mut checkpoint.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    let maximum = Ratio::from_integer((BigUint::from(1_u8) << 320_usize) - 1_u8);
+    state.virtual_time = maximum.clone();
+    state.finish_times[0] = maximum.clone();
+    state.packet_finish_times.insert(payload, maximum);
+    checkpoint
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
+    for image in adversarial_scheduler_images() {
+        for horizon in [Some(1), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            for streams_enabled in [true, false] {
+                for round_threads_per_threadgroup in [32, 256] {
+                    let actual = run_metal_with_observations(
+                        &image,
+                        horizon,
+                        MetalConfig {
+                            streams_enabled,
+                            round_threads_per_threadgroup,
+                            ..MetalConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_threadgroup}: {error}",
+                            image.switch_states[0].queues[0].scheduler.label()
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_wfq_overflow_faults_instead_of_wrapping() {
+    let image = wfq_overflow_checkpoint();
+    validate(&image, Backend::Metal).expect("320-bit checkpoint must pass Metal pre-screening");
+    for streams_enabled in [true, false] {
+        assert_eq!(
+            run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig {
+                    streams_enabled,
+                    ..MetalConfig::default()
+                },
+                ObservationMode::Full,
+            )
+            .expect_err("the exact reduced virtual time needs 321 bits"),
+            MetalError::WfqArithmeticOverflow { node: SWITCH }
+        );
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_wfq_multilimb_cross_cancel_and_comparison_match_scalar() {
+    let (image, expected_finish) = wfq_multilimb_checkpoint();
+    validate(&image, Backend::Metal).expect("320-bit multi-limb checkpoint must validate");
+    let scalar_prefix =
+        run_scalar_with_observations(&image, Some(2), ObservationMode::Full).unwrap();
+    let SchedulerKind::WeightedFairQueue(state) =
+        &scalar_prefix.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    assert_eq!(state.finish_times[0], expected_finish);
+    assert!(state.finish_times[0].numer().bits() >= 319);
+    assert!(state.finish_times[0].denom().bits() >= 315);
+    for horizon in [Some(2), None] {
+        let expected =
+            run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+        for streams_enabled in [true, false] {
+            for round_threads_per_threadgroup in [32, 256] {
+                let actual = run_metal_with_observations(
+                    &image,
+                    horizon,
+                    MetalConfig {
+                        streams_enabled,
+                        round_threads_per_threadgroup,
+                        ..MetalConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .unwrap();
+                assert_eq!(actual.result, expected);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
+    for image in adversarial_scheduler_images() {
+        for horizon in [Some(1), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            for streams_enabled in [true, false] {
+                for round_threads_per_block in [32, 256] {
+                    let actual = run_cuda_with_observations(
+                        &image,
+                        horizon,
+                        CudaConfig {
+                            streams_enabled,
+                            round_threads_per_block,
+                            ..CudaConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_block}: {error}",
+                            image.switch_states[0].queues[0].scheduler.label()
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_wfq_overflow_faults_instead_of_wrapping() {
+    let image = wfq_overflow_checkpoint();
+    validate(&image, Backend::Cuda).expect("320-bit checkpoint must pass CUDA pre-screening");
+    for streams_enabled in [true, false] {
+        assert_eq!(
+            run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig {
+                    streams_enabled,
+                    ..CudaConfig::default()
+                },
+                ObservationMode::Full,
+            )
+            .expect_err("the exact reduced virtual time needs 321 bits"),
+            CudaError::WfqArithmeticOverflow { node: SWITCH }
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_wfq_multilimb_cross_cancel_and_comparison_match_scalar() {
+    let (image, expected_finish) = wfq_multilimb_checkpoint();
+    validate(&image, Backend::Cuda).expect("320-bit multi-limb checkpoint must validate");
+    let scalar_prefix =
+        run_scalar_with_observations(&image, Some(2), ObservationMode::Full).unwrap();
+    let SchedulerKind::WeightedFairQueue(state) =
+        &scalar_prefix.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    assert_eq!(state.finish_times[0], expected_finish);
+    assert!(state.finish_times[0].numer().bits() >= 319);
+    assert!(state.finish_times[0].denom().bits() >= 315);
+    for horizon in [Some(2), None] {
+        let expected =
+            run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+        for streams_enabled in [true, false] {
+            for round_threads_per_block in [32, 256] {
+                let actual = run_cuda_with_observations(
+                    &image,
+                    horizon,
+                    CudaConfig {
+                        streams_enabled,
+                        round_threads_per_block,
+                        ..CudaConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .unwrap();
+                assert_eq!(actual.result, expected);
+            }
+        }
     }
 }

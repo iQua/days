@@ -12,6 +12,9 @@ use crate::{
     SimulationImage, event_phase, resolve_transition,
 };
 
+const DEVICE_WFQ_BITS: u64 = 320;
+const DEVICE_WFQ_MAX_TOTAL_WEIGHT: u64 = u64::MAX / 1_000_000_000;
+
 /// Execution target whose representational limits are checked before running.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
@@ -865,15 +868,6 @@ fn validate_owned_service_state(
         }
         let mut egresses = BTreeSet::new();
         for (queue_index, queue) in state.queues.iter().enumerate() {
-            if matches!(backend, Backend::Metal | Backend::Cuda)
-                && !matches!(&queue.scheduler, SchedulerKind::Fifo)
-            {
-                return Err(ValidationError::new(format!(
-                    "switch node {:?} queue {queue_index} uses {} service, which backend {backend} does not support; SP/WFQ require Scalar or Cpu until T19",
-                    owner.id,
-                    queue.scheduler.label()
-                )));
-            }
             if let Some(limit) = backend.capacity_limit() {
                 if queue.queue_capacity_packets > limit {
                     return Err(ValidationError::new(format!(
@@ -939,6 +933,7 @@ fn validate_owned_service_state(
                 )?;
             }
             validate_scheduler_state(image, owner.id, queue_index, queue, pending_event_frontier)?;
+            validate_device_scheduler_capability(owner.id, queue_index, queue, backend)?;
             if queue.in_service.is_some() && queue.tx_ready_pending {
                 return Err(ValidationError::new(format!(
                     "switch node {:?} queue {queue_index} cannot be in service and have TxReady pending",
@@ -987,6 +982,84 @@ fn validate_owned_service_state(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_device_scheduler_capability(
+    owner: NodeId,
+    queue_index: usize,
+    queue: &crate::SwitchQueueState,
+    backend: Backend,
+) -> Result<(), ValidationError> {
+    if !matches!(backend, Backend::Metal | Backend::Cuda) {
+        return Ok(());
+    }
+    let SchedulerKind::WeightedFairQueue(state) = &queue.scheduler else {
+        return Ok(());
+    };
+
+    let total_weight = state
+        .weights
+        .iter()
+        .fold(BigUint::from(0_u8), |sum, weight| {
+            sum + BigUint::from(*weight)
+        });
+    if total_weight > BigUint::from(DEVICE_WFQ_MAX_TOTAL_WEIGHT) {
+        return Err(ValidationError::new(format!(
+            "switch node {owner:?} queue {queue_index} WFQ total weight {total_weight} makes the 1_000_000_000 * active-weight denominator exceed u64; backend {backend} requires a total weight at most {DEVICE_WFQ_MAX_TOTAL_WEIGHT} (Scalar and Cpu are unbounded)"
+        )));
+    }
+
+    validate_device_rational(
+        owner,
+        queue_index,
+        backend,
+        "virtual time",
+        &state.virtual_time,
+    )?;
+    for (class, finish) in state.finish_times.iter().enumerate() {
+        validate_device_rational(
+            owner,
+            queue_index,
+            backend,
+            &format!("finish state for class {class}"),
+            finish,
+        )?;
+    }
+    for (payload, finish) in &state.packet_finish_times {
+        validate_device_rational(
+            owner,
+            queue_index,
+            backend,
+            &format!("finish tag for packet {payload:?}"),
+            finish,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_device_rational(
+    owner: NodeId,
+    queue_index: usize,
+    backend: Backend,
+    field: &str,
+    value: &crate::ExactRational,
+) -> Result<(), ValidationError> {
+    for (component, integer) in [("numerator", value.numer()), ("denominator", value.denom())] {
+        let bits = integer.bits();
+        if bits > DEVICE_WFQ_BITS {
+            return Err(ValidationError::new(format!(
+                "switch node {owner:?} queue {queue_index} WFQ {field} {component} requires {bits} bits; backend {backend} exact-rational limit is {DEVICE_WFQ_BITS} bits (Scalar and Cpu are unbounded)"
+            )));
+        }
+    }
+
+    let canonical = crate::ExactRational::new(value.numer().clone(), value.denom().clone());
+    if canonical.numer() != value.numer() || canonical.denom() != value.denom() {
+        return Err(ValidationError::new(format!(
+            "switch node {owner:?} queue {queue_index} WFQ {field} is not a reduced canonical rational; backend {backend} requires canonical checkpoint rationals (Scalar and Cpu are unbounded)"
+        )));
     }
     Ok(())
 }

@@ -26,6 +26,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
+use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
 use crate::{
     ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
@@ -216,6 +217,9 @@ pub enum MetalError {
     RoundLimitExceeded {
         capacity: usize,
     },
+    WfqArithmeticOverflow {
+        node: NodeId,
+    },
     DeviceExecution {
         code: u64,
         node: Option<NodeId>,
@@ -253,6 +257,10 @@ impl fmt::Display for MetalError {
                 formatter,
                 "Metal bounded-wave encoding exhausted its capacity of {capacity} rounds before \
                  termination"
+            ),
+            Self::WfqArithmeticOverflow { node } => write!(
+                formatter,
+                "Metal WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
             Self::DeviceExecution { code, node } => {
                 write!(
@@ -1021,6 +1029,7 @@ struct MetalPlan {
     merge_cursors: Vec<u64>,
     stream_state: Vec<u64>,
     stream_records: Vec<u64>,
+    scheduler_state: Vec<u64>,
     stream_layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
     orphan_packets: Vec<PacketDescriptor>,
@@ -1283,6 +1292,9 @@ impl MetalPlan {
             }
         }
 
+        let scheduler_state =
+            prepare_device_schedulers(image, &queue_meta).map_err(MetalError::Validation)?;
+
         for event in &image.initial_events {
             let packet = packet_for(&initial_by_payload, event.payload)?;
             let record = event_record(*event, packet);
@@ -1439,6 +1451,7 @@ impl MetalPlan {
             inbound_producers,
             stream_state: streams.state,
             stream_records: streams.records,
+            scheduler_state,
             stream_layout: streams.layout,
             memory_layout: streams.memory_layout,
             orphan_packets,
@@ -2568,8 +2581,8 @@ impl FelProbeResources {
 
     fn bind(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&self.counts.raw), 0, 27);
-            encoder.setBuffer_offset_atIndex(Some(&self.merge_fan_in.raw), 0, 28);
+            encoder.setBuffer_offset_atIndex(Some(&self.counts.raw), 0, 28);
+            encoder.setBuffer_offset_atIndex(Some(&self.merge_fan_in.raw), 0, 29);
         }
     }
 
@@ -2679,6 +2692,7 @@ impl MetalBuffers {
             plan.merge_cursors,
             plan.stream_state,
             plan.stream_records,
+            plan.scheduler_state,
         ]
         .into_iter()
         .map(|words| SharedBuffer::new(device, words))
@@ -2738,6 +2752,7 @@ impl MetalBuffers {
         let observation_meta = &planes[21];
         let stream_state = &planes[25];
         let stream_records = &planes[26];
+        let scheduler_state = &planes[27];
 
         let mut host_states = image.host_states.clone();
         let mut switch_states = image.switch_states.clone();
@@ -2789,6 +2804,8 @@ impl MetalBuffers {
                         switch_queue.queue = queue.iter().map(|packet| packet.id).collect();
                         switch_queue.in_service = service.map(|packet| packet.id);
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
+                        restore_device_scheduler(lp, queue_meta, scheduler_state, switch_queue)
+                            .map_err(MetalError::Validation)?;
                     }
                     state.next_origin_seq = node_state[base + 5];
                     state.arrived_packets = node_state[base + 7];
@@ -2958,6 +2975,9 @@ fn decode_device_error(control: &[u64]) -> MetalError {
         2 => MetalError::TransitionLimitExceeded {
             node: node.unwrap_or(NodeId(0)),
             capacity,
+        },
+        100 => MetalError::WfqArithmeticOverflow {
+            node: node.unwrap_or(NodeId(0)),
         },
         code => MetalError::DeviceExecution { code, node },
     }

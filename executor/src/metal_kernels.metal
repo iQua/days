@@ -15,6 +15,12 @@ constant uint OUTBOUND_META_WORDS = 2;
 constant uint OUTBOUND_ENTRY_WORDS = 2;
 constant uint CHANNEL_BATCH_WORDS = 4;
 constant uint ACTIVE_STREAM_ENTRY_WORDS = 5;
+constant uint RATIONAL_WORDS = 10;
+constant uint BIG_LIMBS = 10;
+constant uint WIDE_LIMBS = 16;
+constant uint PRODUCT_LIMBS = 20;
+constant uint SCHEDULER_NODE_WORDS = 25;
+constant uint SCHEDULER_CLASS_WORDS = 12;
 constant ulong NONE = 0xfffffffffffffffful;
 
 constant uint C_ERROR = 0;
@@ -77,6 +83,18 @@ constant uint N_COUNTER_0 = 7;
 constant uint N_COUNTER_1 = 8;
 constant uint N_COUNTER_2 = 9;
 
+constant uint S_KIND = 0;
+constant uint S_CLASS_COUNT = 1;
+constant uint S_CLASS_OFFSET = 2;
+constant uint S_QUEUE_TAG_OFFSET = 3;
+constant uint S_LAST_UPDATED = 4;
+constant uint S_VIRTUAL_TIME = 5;
+constant uint S_IN_SERVICE_TAG = 15;
+
+constant uint SC_VALUE = 0;
+constant uint SC_ACTIVE = 1;
+constant uint SC_FINISH = 2;
+
 constant uint E_TIME = 0;
 constant uint E_PHASE = 1;
 constant uint E_ORIGIN = 2;
@@ -97,10 +115,14 @@ constant ulong TX_COMPLETE = 2;
 constant ulong REMOTE_ARRIVAL = 3;
 constant ulong DATA_PACKET = 0;
 constant ulong FEEDBACK_PACKET = 1;
+constant ulong SCHED_FIFO = 0;
+constant ulong SCHED_SP = 1;
+constant ulong SCHED_WFQ = 2;
 
 constant ulong ERROR_CAPACITY = 1;
 constant ulong ERROR_TRANSITION_CAPACITY = 2;
 constant ulong ERROR_SEMANTIC = 3;
+constant ulong ERROR_WFQ_ARITHMETIC = 100;
 constant ulong ARENA_FEL = 1;
 constant ulong ARENA_QUEUE = 2;
 constant ulong ARENA_OUTBOX = 3;
@@ -251,6 +273,13 @@ inline void set_capacity_error(
 inline void set_semantic_error(device ulong *error, ulong code, ulong node) {
     if (error[L_ERROR] == 0) {
         error[L_ERROR] = ERROR_SEMANTIC + code;
+        error[L_ERROR_NODE] = node;
+    }
+}
+
+inline void set_wfq_arithmetic_error(device ulong *error, ulong node) {
+    if (error[L_ERROR] == 0) {
+        error[L_ERROR] = ERROR_WFQ_ARITHMETIC;
         error[L_ERROR_NODE] = node;
     }
 }
@@ -851,7 +880,8 @@ inline bool queue_pop(
     ulong node,
     device ulong *meta,
     const device ulong *records,
-    thread ulong *record
+    thread ulong *record,
+    thread ulong &physical
 ) {
     ulong base = node * META_WORDS;
     ulong offset = meta[base];
@@ -861,7 +891,8 @@ inline bool queue_pop(
     if (count == 0) {
         return false;
     }
-    copy_device_to_thread(records, offset + head, record);
+    physical = head;
+    copy_device_to_thread(records, offset + physical, record);
     meta[base + 2] = (head + 1) % max(capacity, 1ul);
     meta[base + 3] = count - 1;
     return true;
@@ -1222,6 +1253,329 @@ inline bool checked_add(ulong left, ulong right, thread ulong &result) {
     return result >= left;
 }
 
+inline void big_clear(thread uint *value, uint limbs) {
+    for (uint limb = 0; limb < limbs; ++limb) {
+        value[limb] = 0;
+    }
+}
+
+inline bool big_is_zero(const thread uint *value, uint limbs) {
+    for (uint limb = 0; limb < limbs; ++limb) {
+        if (value[limb] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline void big_copy(
+    const thread uint *source,
+    thread uint *target,
+    uint limbs
+) {
+    for (uint limb = 0; limb < limbs; ++limb) {
+        target[limb] = source[limb];
+    }
+}
+
+inline void big_load(
+    const device ulong *source,
+    ulong offset,
+    thread uint *target
+) {
+    for (uint word = 0; word < 5; ++word) {
+        ulong packed = source[offset + word];
+        target[word * 2] = uint(packed);
+        target[word * 2 + 1] = uint(packed >> 32);
+    }
+}
+
+inline void big_store(
+    const thread uint *source,
+    device ulong *target,
+    ulong offset
+) {
+    for (uint word = 0; word < 5; ++word) {
+        target[offset + word] =
+            ulong(source[word * 2]) | (ulong(source[word * 2 + 1]) << 32);
+    }
+}
+
+inline int big_compare(
+    const thread uint *left,
+    const thread uint *right,
+    uint limbs
+) {
+    for (int limb = int(limbs) - 1; limb >= 0; --limb) {
+        if (left[limb] != right[limb]) {
+            return left[limb] < right[limb] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+inline ulong big_remainder_u64(
+    const thread uint *value,
+    uint limbs,
+    ulong divisor
+) {
+    ulong remainder = 0;
+    for (int bit = int(limbs * 32) - 1; bit >= 0; --bit) {
+        bool carry = (remainder >> 63) != 0;
+        ulong shifted =
+            (remainder << 1) |
+            ulong((value[uint(bit) / 32] >> (uint(bit) % 32)) & 1u);
+        if (carry || shifted >= divisor) {
+            shifted -= divisor;
+        }
+        remainder = shifted;
+    }
+    return remainder;
+}
+
+inline ulong big_div_u64(
+    const thread uint *value,
+    uint limbs,
+    ulong divisor,
+    thread uint *quotient
+) {
+    big_clear(quotient, limbs);
+    ulong remainder = 0;
+    for (int bit = int(limbs * 32) - 1; bit >= 0; --bit) {
+        bool carry = (remainder >> 63) != 0;
+        ulong shifted =
+            (remainder << 1) |
+            ulong((value[uint(bit) / 32] >> (uint(bit) % 32)) & 1u);
+        if (carry || shifted >= divisor) {
+            shifted -= divisor;
+            quotient[uint(bit) / 32] |= 1u << (uint(bit) % 32);
+        }
+        remainder = shifted;
+    }
+    return remainder;
+}
+
+inline ulong gcd_u64(ulong left, ulong right) {
+    while (right != 0) {
+        ulong remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    return left;
+}
+
+inline void big_multiply(
+    const thread uint *left,
+    uint left_limbs,
+    const thread uint *right,
+    uint right_limbs,
+    thread uint *product,
+    uint product_limbs
+) {
+    big_clear(product, product_limbs);
+    for (uint left_limb = 0; left_limb < left_limbs; ++left_limb) {
+        ulong carry = 0;
+        for (uint right_limb = 0; right_limb < right_limbs; ++right_limb) {
+            uint output = left_limb + right_limb;
+            ulong current =
+                ulong(left[left_limb]) * ulong(right[right_limb]) +
+                ulong(product[output]) + carry;
+            product[output] = uint(current);
+            carry = current >> 32;
+        }
+        product[left_limb + right_limbs] = uint(carry);
+    }
+}
+
+inline bool big_add(
+    thread uint *target,
+    const thread uint *addend,
+    uint limbs
+) {
+    ulong carry = 0;
+    for (uint limb = 0; limb < limbs; ++limb) {
+        ulong sum = ulong(target[limb]) + ulong(addend[limb]) + carry;
+        target[limb] = uint(sum);
+        carry = sum >> 32;
+    }
+    return carry == 0;
+}
+
+inline void u64_limbs(ulong value, thread uint *limbs) {
+    limbs[0] = uint(value);
+    limbs[1] = uint(value >> 32);
+}
+
+inline void multiply_u64(ulong left, ulong right, thread uint *product) {
+    uint left_limbs[2];
+    uint right_limbs[2];
+    u64_limbs(left, left_limbs);
+    u64_limbs(right, right_limbs);
+    big_multiply(left_limbs, 2, right_limbs, 2, product, 4);
+}
+
+inline bool rational_compare(
+    const thread uint *left_num,
+    const thread uint *left_den,
+    const thread uint *right_num,
+    const thread uint *right_den,
+    thread int &ordering
+) {
+    if (big_is_zero(left_den, BIG_LIMBS) || big_is_zero(right_den, BIG_LIMBS)) {
+        return false;
+    }
+    uint left_product[PRODUCT_LIMBS];
+    uint right_product[PRODUCT_LIMBS];
+    big_multiply(
+        left_num,
+        BIG_LIMBS,
+        right_den,
+        BIG_LIMBS,
+        left_product,
+        PRODUCT_LIMBS
+    );
+    big_multiply(
+        right_num,
+        BIG_LIMBS,
+        left_den,
+        BIG_LIMBS,
+        right_product,
+        PRODUCT_LIMBS
+    );
+    ordering = big_compare(left_product, right_product, PRODUCT_LIMBS);
+    return true;
+}
+
+inline void rational_load(
+    const device ulong *state,
+    ulong offset,
+    thread uint *numerator,
+    thread uint *denominator
+) {
+    big_load(state, offset, numerator);
+    big_load(state, offset + 5, denominator);
+}
+
+inline void rational_store(
+    const thread uint *numerator,
+    const thread uint *denominator,
+    device ulong *state,
+    ulong offset
+) {
+    big_store(numerator, state, offset);
+    big_store(denominator, state, offset + 5);
+}
+
+inline void rational_zero(device ulong *state, ulong offset) {
+    for (uint word = 0; word < RATIONAL_WORDS; ++word) {
+        state[offset + word] = 0;
+    }
+    state[offset + 5] = 1;
+}
+
+inline void rational_copy(
+    device ulong *state,
+    ulong source,
+    ulong target
+) {
+    for (uint word = 0; word < RATIONAL_WORDS; ++word) {
+        state[target + word] = state[source + word];
+    }
+}
+
+inline bool rational_add_small(
+    const thread uint *input_num,
+    const thread uint *input_den,
+    const thread uint *small_num_input,
+    ulong small_den_input,
+    thread uint *output_num,
+    thread uint *output_den
+) {
+    if (small_den_input == 0 || big_is_zero(input_den, BIG_LIMBS)) {
+        return false;
+    }
+    uint small_num[4];
+    big_copy(small_num_input, small_num, 4);
+    ulong small_den = small_den_input;
+    ulong small_gcd = gcd_u64(big_remainder_u64(small_num, 4, small_den), small_den);
+    if (small_gcd > 1) {
+        uint reduced[4];
+        if (big_div_u64(small_num, 4, small_gcd, reduced) != 0) {
+            return false;
+        }
+        big_copy(reduced, small_num, 4);
+        small_den /= small_gcd;
+    }
+
+    ulong denominator_gcd =
+        gcd_u64(big_remainder_u64(input_den, BIG_LIMBS, small_den), small_den);
+    uint denominator_base[BIG_LIMBS];
+    if (
+        big_div_u64(
+            input_den,
+            BIG_LIMBS,
+            denominator_gcd,
+            denominator_base
+        ) != 0
+    ) {
+        return false;
+    }
+    ulong left_scale = small_den / denominator_gcd;
+    uint left_scale_limbs[2];
+    u64_limbs(left_scale, left_scale_limbs);
+    uint numerator[WIDE_LIMBS];
+    big_multiply(
+        input_num,
+        BIG_LIMBS,
+        left_scale_limbs,
+        2,
+        numerator,
+        WIDE_LIMBS
+    );
+    uint right[WIDE_LIMBS];
+    big_multiply(
+        denominator_base,
+        BIG_LIMBS,
+        small_num,
+        4,
+        right,
+        WIDE_LIMBS
+    );
+    if (!big_add(numerator, right, WIDE_LIMBS)) {
+        return false;
+    }
+
+    ulong result_gcd =
+        gcd_u64(big_remainder_u64(numerator, WIDE_LIMBS, denominator_gcd), denominator_gcd);
+    uint reduced_num[WIDE_LIMBS];
+    if (big_div_u64(numerator, WIDE_LIMBS, result_gcd, reduced_num) != 0) {
+        return false;
+    }
+    ulong right_scale = small_den / result_gcd;
+    uint right_scale_limbs[2];
+    u64_limbs(right_scale, right_scale_limbs);
+    uint reduced_den[WIDE_LIMBS];
+    big_multiply(
+        denominator_base,
+        BIG_LIMBS,
+        right_scale_limbs,
+        2,
+        reduced_den,
+        WIDE_LIMBS
+    );
+    for (uint limb = BIG_LIMBS; limb < WIDE_LIMBS; ++limb) {
+        if (reduced_num[limb] != 0 || reduced_den[limb] != 0) {
+            return false;
+        }
+    }
+    if (big_is_zero(reduced_den, BIG_LIMBS)) {
+        return false;
+    }
+    big_copy(reduced_num, output_num, BIG_LIMBS);
+    big_copy(reduced_den, output_den, BIG_LIMBS);
+    return true;
+}
+
 inline bool serialization_ns(
     ulong bytes,
     ulong rate,
@@ -1260,6 +1614,410 @@ inline bool serialization_ns(
         quotient += 1;
     }
     result = quotient;
+    return true;
+}
+
+inline bool scheduler_active_weight_sum(
+    ulong node_base,
+    const device ulong *scheduler_state,
+    thread ulong &weight_sum
+) {
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    weight_sum = 0;
+    for (ulong class_index = 0; class_index < class_count; ++class_index) {
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        if (scheduler_state[class_base + SC_ACTIVE] == 0) {
+            continue;
+        }
+        ulong weight = scheduler_state[class_base + SC_VALUE];
+        if (weight_sum > NONE - weight) {
+            return false;
+        }
+        weight_sum += weight;
+    }
+    return true;
+}
+
+inline void local_rational_zero(thread uint *numerator, thread uint *denominator) {
+    big_clear(numerator, BIG_LIMBS);
+    big_clear(denominator, BIG_LIMBS);
+    denominator[0] = 1;
+}
+
+inline bool wfq_advanced_virtual_time(
+    ulong node,
+    ulong time,
+    ulong rate,
+    device ulong *error,
+    device ulong *scheduler_state,
+    thread uint *numerator,
+    thread uint *denominator
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong last_updated = scheduler_state[node_base + S_LAST_UPDATED];
+    if (time < last_updated) {
+        set_semantic_error(error, 26, node);
+        return false;
+    }
+    rational_load(
+        scheduler_state,
+        node_base + S_VIRTUAL_TIME,
+        numerator,
+        denominator
+    );
+    ulong elapsed = time - last_updated;
+    if (elapsed == 0) {
+        return true;
+    }
+    ulong weight_sum;
+    if (
+        !scheduler_active_weight_sum(node_base, scheduler_state, weight_sum) ||
+        weight_sum == 0 ||
+        weight_sum > NONE / 1000000000ul
+    ) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    uint increment[4];
+    multiply_u64(elapsed, rate, increment);
+    uint result_num[BIG_LIMBS];
+    uint result_den[BIG_LIMBS];
+    if (
+        !rational_add_small(
+            numerator,
+            denominator,
+            increment,
+            weight_sum * 1000000000ul,
+            result_num,
+            result_den
+        )
+    ) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    big_copy(result_num, numerator, BIG_LIMBS);
+    big_copy(result_den, denominator, BIG_LIMBS);
+    return true;
+}
+
+inline bool sp_queue_insert(
+    ulong node,
+    const thread ulong *record,
+    device ulong *error,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    const device ulong *scheduler_state
+) {
+    ulong meta_base = node * META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_QUEUE, node, capacity);
+        return false;
+    }
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    if (class_count == 0) {
+        set_semantic_error(error, 27, node);
+        return false;
+    }
+    ulong incoming_class = record[PK_FLOW] % class_count;
+    ulong incoming_priority =
+        scheduler_state[
+            class_offset + incoming_class * SCHEDULER_CLASS_WORDS + SC_VALUE
+        ];
+    ulong insertion = count;
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong physical = (head + logical) % max(capacity, 1ul);
+        ulong record_base = (offset + physical) * EVENT_WORDS;
+        ulong queued_class = queue_records[record_base + PK_FLOW] % class_count;
+        ulong queued_priority =
+            scheduler_state[
+                class_offset + queued_class * SCHEDULER_CLASS_WORDS + SC_VALUE
+            ];
+        if (queued_priority < incoming_priority) {
+            insertion = logical;
+            break;
+        }
+    }
+    for (ulong logical = count; logical > insertion; --logical) {
+        ulong source = offset + (head + logical - 1) % max(capacity, 1ul);
+        ulong target = offset + (head + logical) % max(capacity, 1ul);
+        copy_device_record(queue_records, source, queue_records, target);
+    }
+    copy_thread_to_device(
+        record,
+        queue_records,
+        offset + (head + insertion) % max(capacity, 1ul)
+    );
+    queue_meta[meta_base + 3] = count + 1;
+    return true;
+}
+
+inline bool wfq_queue_insert(
+    ulong node,
+    const thread ulong *record,
+    const thread uint *finish_num,
+    const thread uint *finish_den,
+    device ulong *error,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *scheduler_state
+) {
+    ulong meta_base = node * META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_QUEUE, node, capacity);
+        return false;
+    }
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong tag_offset = scheduler_state[node_base + S_QUEUE_TAG_OFFSET];
+    ulong insertion = count;
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong physical = (head + logical) % max(capacity, 1ul);
+        uint queued_num[BIG_LIMBS];
+        uint queued_den[BIG_LIMBS];
+        rational_load(
+            scheduler_state,
+            tag_offset + physical * RATIONAL_WORDS,
+            queued_num,
+            queued_den
+        );
+        int ordering;
+        if (!rational_compare(queued_num, queued_den, finish_num, finish_den, ordering)) {
+            set_wfq_arithmetic_error(error, node);
+            return false;
+        }
+        if (ordering > 0) {
+            insertion = logical;
+            break;
+        }
+    }
+    for (ulong logical = count; logical > insertion; --logical) {
+        ulong source_physical = (head + logical - 1) % max(capacity, 1ul);
+        ulong target_physical = (head + logical) % max(capacity, 1ul);
+        copy_device_record(
+            queue_records,
+            offset + source_physical,
+            queue_records,
+            offset + target_physical
+        );
+        rational_copy(
+            scheduler_state,
+            tag_offset + source_physical * RATIONAL_WORDS,
+            tag_offset + target_physical * RATIONAL_WORDS
+        );
+    }
+    ulong destination = (head + insertion) % max(capacity, 1ul);
+    copy_thread_to_device(record, queue_records, offset + destination);
+    rational_store(
+        finish_num,
+        finish_den,
+        scheduler_state,
+        tag_offset + destination * RATIONAL_WORDS
+    );
+    queue_meta[meta_base + 3] = count + 1;
+    return true;
+}
+
+inline bool wfq_enqueue(
+    ulong node,
+    const thread ulong *record,
+    ulong rate,
+    device ulong *error,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *scheduler_state
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    if (class_count == 0 || record[E_TIME] < scheduler_state[node_base + S_LAST_UPDATED]) {
+        set_semantic_error(error, 28, node);
+        return false;
+    }
+    ulong class_index = record[PK_FLOW] % class_count;
+    ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+    ulong weight = scheduler_state[class_base + SC_VALUE];
+    ulong active = scheduler_state[class_base + SC_ACTIVE];
+    if (weight == 0 || active == NONE) {
+        set_semantic_error(error, 29, node);
+        return false;
+    }
+
+    ulong active_weight_sum;
+    if (!scheduler_active_weight_sum(node_base, scheduler_state, active_weight_sum)) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    bool idle = active_weight_sum == 0;
+    uint virtual_num[BIG_LIMBS];
+    uint virtual_den[BIG_LIMBS];
+    if (idle) {
+        local_rational_zero(virtual_num, virtual_den);
+    } else if (
+        !wfq_advanced_virtual_time(
+            node,
+            record[E_TIME],
+            rate,
+            error,
+            scheduler_state,
+            virtual_num,
+            virtual_den
+        )
+    ) {
+        return false;
+    }
+
+    uint start_num[BIG_LIMBS];
+    uint start_den[BIG_LIMBS];
+    if (idle) {
+        local_rational_zero(start_num, start_den);
+    } else {
+        uint class_num[BIG_LIMBS];
+        uint class_den[BIG_LIMBS];
+        rational_load(
+            scheduler_state,
+            class_base + SC_FINISH,
+            class_num,
+            class_den
+        );
+        int ordering;
+        if (!rational_compare(virtual_num, virtual_den, class_num, class_den, ordering)) {
+            set_wfq_arithmetic_error(error, node);
+            return false;
+        }
+        if (ordering >= 0) {
+            big_copy(virtual_num, start_num, BIG_LIMBS);
+            big_copy(virtual_den, start_den, BIG_LIMBS);
+        } else {
+            big_copy(class_num, start_num, BIG_LIMBS);
+            big_copy(class_den, start_den, BIG_LIMBS);
+        }
+    }
+
+    uint service[4];
+    multiply_u64(record[PK_SIZE], 8, service);
+    uint finish_num[BIG_LIMBS];
+    uint finish_den[BIG_LIMBS];
+    if (
+        !rational_add_small(
+            start_num,
+            start_den,
+            service,
+            weight,
+            finish_num,
+            finish_den
+        )
+    ) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    if (
+        !wfq_queue_insert(
+            node,
+            record,
+            finish_num,
+            finish_den,
+            error,
+            queue_meta,
+            queue_records,
+            scheduler_state
+        )
+    ) {
+        return false;
+    }
+
+    if (idle) {
+        rational_zero(scheduler_state, node_base + S_VIRTUAL_TIME);
+        for (ulong reset_class = 0; reset_class < class_count; ++reset_class) {
+            rational_zero(
+                scheduler_state,
+                class_offset + reset_class * SCHEDULER_CLASS_WORDS + SC_FINISH
+            );
+        }
+    } else {
+        rational_store(
+            virtual_num,
+            virtual_den,
+            scheduler_state,
+            node_base + S_VIRTUAL_TIME
+        );
+    }
+    rational_store(
+        finish_num,
+        finish_den,
+        scheduler_state,
+        class_base + SC_FINISH
+    );
+    scheduler_state[class_base + SC_ACTIVE] = active + 1;
+    scheduler_state[node_base + S_LAST_UPDATED] = record[E_TIME];
+    return true;
+}
+
+inline bool wfq_complete(
+    ulong node,
+    const thread ulong *record,
+    ulong rate,
+    device ulong *error,
+    device ulong *scheduler_state
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    if (class_count == 0) {
+        set_semantic_error(error, 30, node);
+        return false;
+    }
+    ulong class_index = record[PK_FLOW] % class_count;
+    ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+    ulong active = scheduler_state[class_base + SC_ACTIVE];
+    if (active == 0) {
+        set_semantic_error(error, 31, node);
+        return false;
+    }
+    uint virtual_num[BIG_LIMBS];
+    uint virtual_den[BIG_LIMBS];
+    if (
+        !wfq_advanced_virtual_time(
+            node,
+            record[E_TIME],
+            rate,
+            error,
+            scheduler_state,
+            virtual_num,
+            virtual_den
+        )
+    ) {
+        return false;
+    }
+
+    scheduler_state[class_base + SC_ACTIVE] = active - 1;
+    bool any_active = false;
+    for (ulong other = 0; other < class_count; ++other) {
+        ulong other_base = class_offset + other * SCHEDULER_CLASS_WORDS;
+        any_active = any_active || scheduler_state[other_base + SC_ACTIVE] != 0;
+    }
+    rational_zero(scheduler_state, node_base + S_IN_SERVICE_TAG);
+    if (any_active) {
+        rational_store(
+            virtual_num,
+            virtual_den,
+            scheduler_state,
+            node_base + S_VIRTUAL_TIME
+        );
+    } else {
+        rational_zero(scheduler_state, node_base + S_VIRTUAL_TIME);
+        rational_zero(scheduler_state, class_base + SC_FINISH);
+    }
+    scheduler_state[node_base + S_LAST_UPDATED] = record[E_TIME];
     return true;
 }
 
@@ -1350,6 +2108,7 @@ inline bool dispatch_event(
     device ulong *queue_meta,
     device ulong *queue_records,
     device ulong *in_service,
+    device ulong *scheduler_state,
     device ulong *remote_meta,
     device ulong *remote_staging,
     device ulong *stream_state,
@@ -1539,8 +2298,22 @@ inline bool dispatch_event(
             return false;
         }
         ulong selected[EVENT_WORDS];
-        if (!queue_pop(node, queue_meta, queue_records, selected)) {
+        ulong selected_physical;
+        if (!queue_pop(node, queue_meta, queue_records, selected, selected_physical)) {
             return true;
+        }
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        if (role == SWITCH && scheduler_state[scheduler_base + S_KIND] == SCHED_WFQ) {
+            ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
+            rational_copy(
+                scheduler_state,
+                tag_offset + selected_physical * RATIONAL_WORDS,
+                scheduler_base + S_IN_SERVICE_TAG
+            );
+            rational_zero(
+                scheduler_state,
+                tag_offset + selected_physical * RATIONAL_WORDS
+            );
         }
         node_state[node_base + N_SERVICE_VALID] = 1;
         copy_thread_to_device(selected, in_service, node);
@@ -1618,6 +2391,23 @@ inline bool dispatch_event(
         ) {
             set_semantic_error(error, 15, node);
             return false;
+        }
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        if (role == SWITCH && scheduler_state[scheduler_base + S_KIND] == SCHED_WFQ) {
+            ulong egress = node_state[node_base + N_EGRESS];
+            if (
+                egress == NONE ||
+                egress >= params[P_LINK_COUNT] ||
+                !wfq_complete(
+                    node,
+                    event,
+                    links[egress * LINK_WORDS + 2],
+                    error,
+                    scheduler_state
+                )
+            ) {
+                return false;
+            }
         }
         node_state[node_base + N_SERVICE_VALID] = 0;
         uint departure_counter = role == HOST ? N_COUNTER_1 : N_COUNTER_2;
@@ -1704,7 +2494,35 @@ inline bool dispatch_event(
                 arrivals
             );
         }
-        if (!queue_push(node, event, error, queue_meta, queue_records)) {
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];
+        bool inserted;
+        if (scheduler_kind == SCHED_FIFO) {
+            inserted = queue_push(node, event, error, queue_meta, queue_records);
+        } else if (scheduler_kind == SCHED_SP) {
+            inserted = sp_queue_insert(
+                node,
+                event,
+                error,
+                queue_meta,
+                queue_records,
+                scheduler_state
+            );
+        } else if (scheduler_kind == SCHED_WFQ) {
+            inserted = wfq_enqueue(
+                node,
+                event,
+                links[egress * LINK_WORDS + 2],
+                error,
+                queue_meta,
+                queue_records,
+                scheduler_state
+            );
+        } else {
+            set_semantic_error(error, 32, node);
+            return false;
+        }
+        if (!inserted) {
             return false;
         }
         if (!record_arrival(
@@ -2015,6 +2833,7 @@ kernel void days_round(
     device ulong *observation_meta [[buffer(21)]],
     device ulong *stream_state [[buffer(25)]],
     device ulong *stream_records [[buffer(26)]],
+    device ulong *scheduler_state [[buffer(27)]],
     uint active_index [[thread_position_in_grid]]
 ) {
     if (
@@ -2079,6 +2898,7 @@ kernel void days_round(
             queue_meta,
             queue_records,
             in_service,
+            scheduler_state,
             remote_meta,
             remote_staging,
             stream_state,
@@ -2159,7 +2979,8 @@ kernel void days_round_fel_probe(
     device ulong *observation_meta [[buffer(21)]],
     device ulong *stream_state [[buffer(25)]],
     device ulong *stream_records [[buffer(26)]],
-    device ulong *diagnostic_counts [[buffer(27)]],
+    device ulong *scheduler_state [[buffer(27)]],
+    device ulong *diagnostic_counts [[buffer(28)]],
     uint active_index [[thread_position_in_grid]]
 ) {
     if (
@@ -2237,6 +3058,7 @@ kernel void days_round_fel_probe(
             queue_meta,
             queue_records,
             in_service,
+            scheduler_state,
             remote_meta,
             remote_staging,
             stream_state,
@@ -2740,7 +3562,7 @@ kernel void days_exchange_merge_fan_in_probe(
     const device ulong *inbound_meta [[buffer(22)]],
     const device ulong *inbound_producers [[buffer(23)]],
     device ulong *merge_cursors [[buffer(24)]],
-    device ulong *diagnostic_fan_in [[buffer(28)]],
+    device ulong *diagnostic_fan_in [[buffer(29)]],
     uint target [[thread_position_in_grid]]
 ) {
     if (

@@ -10,6 +10,8 @@ use days_executor::{
     run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
     validate,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaConfig, run_cuda_with_observations};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{
     MetalConfig, RoundMetricsWindow, run_cpu_with_metrics_window, run_metal_with_observations,
@@ -2549,34 +2551,80 @@ fn production_metal_matches_representative_cartesian_images() {
     // Metal has no CPU worker/partition axes. Sixteen stable seeds at full and partial horizons
     // retain the image/queue/rate/propagation/capacity axes while keeping the feature suite quick.
     for seed in 0..16 {
-        let image = heterogeneous_image(seed);
-        validate(&image, Backend::Metal)
-            .unwrap_or_else(|error| panic!("seed {seed} Metal validation failed: {error}"));
-        let cut = 1 + (seed * 17) % image.stop_time_ns;
-        for horizon in [None, Some(cut)] {
-            let expected = run_scalar_with_observations(&image, horizon, ObservationMode::Full)
-                .unwrap_or_else(|error| {
-                    panic!("seed {seed}, horizon {horizon:?} scalar execution failed: {error}")
-                });
-            for streams_enabled in [true, false] {
-                let actual = run_metal_with_observations(
+        for scheduler in scheduler_corpus() {
+            let label = scheduler.label();
+            let image = heterogeneous_scheduler_image(seed, scheduler);
+            validate(&image, Backend::Metal).unwrap_or_else(|error| {
+                panic!("seed {seed}, scheduler {label} Metal validation failed: {error}")
+            });
+            let cut = 1 + (seed * 17) % image.stop_time_ns;
+            for horizon in [None, Some(cut)] {
+                let expected = run_scalar_with_observations(
                     &image,
                     horizon,
-                    MetalConfig {
-                        streams_enabled,
-                        ..MetalConfig::default()
-                    },
                     ObservationMode::Full,
                 )
                 .unwrap_or_else(|error| {
                     panic!(
-                        "seed {seed}, horizon {horizon:?}, streams={streams_enabled} Metal execution failed: {error}"
+                        "seed {seed}, scheduler {label}, horizon {horizon:?} scalar execution failed: {error}"
                     )
                 });
-                assert_eq!(
-                    actual.result, expected,
-                    "seed {seed}, horizon {horizon:?}, streams={streams_enabled}"
-                );
+                for streams_enabled in [true, false] {
+                    let actual = run_metal_with_observations(
+                        &image,
+                        horizon,
+                        MetalConfig {
+                            streams_enabled,
+                            ..MetalConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled} Metal execution failed: {error}"
+                        )
+                    });
+                    assert_eq!(
+                        actual.result, expected,
+                        "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn production_cuda_matches_representative_scheduler_cartesian_images() {
+    for seed in 0..16 {
+        for scheduler in scheduler_corpus() {
+            let label = scheduler.label();
+            let image = heterogeneous_scheduler_image(seed, scheduler);
+            validate(&image, Backend::Cuda).unwrap_or_else(|error| {
+                panic!("seed {seed}, scheduler {label} CUDA validation failed: {error}")
+            });
+            let cut = 1 + (seed * 17) % image.stop_time_ns;
+            for horizon in [None, Some(cut)] {
+                let expected =
+                    run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+                for streams_enabled in [true, false] {
+                    let actual = run_cuda_with_observations(
+                        &image,
+                        horizon,
+                        CudaConfig {
+                            streams_enabled,
+                            ..CudaConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled} CUDA execution failed: {error}"
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
             }
         }
     }

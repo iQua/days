@@ -294,14 +294,14 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
     let stdout = String::from_utf8(output.stdout).expect("sizing report must be UTF-8");
     assert!(stdout.contains(
         "record=t17c_wide_sizing_protocol \
-         mode=host_arithmetic_only allocates_device=false executes_simulation=false plane_count=27"
+         mode=host_arithmetic_only allocates_device=false executes_simulation=false plane_count=28"
     ));
     assert_eq!(
         stdout
             .lines()
             .filter(|line| line.starts_with("record=t17c_wide_sizing_plane "))
             .count(),
-        27
+        28
     );
     let plane_names = stdout
         .lines()
@@ -342,6 +342,7 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
             "merge_cursors",
             "stream_state",
             "stream_records",
+            "scheduler_state",
         ]
     );
     assert!(stdout.contains(
@@ -352,7 +353,7 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
          stream_arena_bytes=504865800 total_event_arena_bytes=523047160 \
          legacy_heap_arena_bytes=2888942352"
     ));
-    assert!(stdout.contains("record=t17c_wide_sizing_total plane_count=27 total_device_bytes="));
+    assert!(stdout.contains("record=t17c_wide_sizing_total plane_count=28 total_device_bytes="));
 }
 
 #[test]

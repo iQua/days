@@ -22,6 +22,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
+use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
 use crate::{
     ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
@@ -143,6 +144,9 @@ fn decode_device_error(control: &[u64]) -> CudaError {
         2 => CudaError::TransitionLimitExceeded {
             node: node.unwrap_or(NodeId(0)),
             capacity,
+        },
+        100 => CudaError::WfqArithmeticOverflow {
+            node: node.unwrap_or(NodeId(0)),
         },
         code => CudaError::DeviceExecution { code, node },
     }
@@ -361,6 +365,9 @@ pub enum CudaError {
     RoundLimitExceeded {
         capacity: usize,
     },
+    WfqArithmeticOverflow {
+        node: NodeId,
+    },
     DeviceExecution {
         code: u64,
         node: Option<NodeId>,
@@ -398,6 +405,10 @@ impl fmt::Display for CudaError {
                 formatter,
                 "CUDA bounded graph waves exhausted their capacity of {capacity} rounds before \
                  termination"
+            ),
+            Self::WfqArithmeticOverflow { node } => write!(
+                formatter,
+                "CUDA WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
             Self::DeviceExecution { code, node } => {
                 write!(
@@ -767,6 +778,7 @@ struct CudaPlan {
     merge_cursors: Vec<u64>,
     stream_state: Vec<u64>,
     stream_records: Vec<u64>,
+    scheduler_state: Vec<u64>,
     stream_layout: StreamLayout,
     memory_layout: CudaMemoryLayout,
     orphan_packets: Vec<PacketDescriptor>,
@@ -1029,6 +1041,9 @@ impl CudaPlan {
             }
         }
 
+        let scheduler_state =
+            prepare_device_schedulers(image, &queue_meta).map_err(CudaError::Validation)?;
+
         for event in &image.initial_events {
             let packet = packet_for(&initial_by_payload, event.payload)?;
             let record = event_record(*event, packet);
@@ -1200,6 +1215,7 @@ impl CudaPlan {
             inbound_producers,
             stream_state: streams.state,
             stream_records: streams.records,
+            scheduler_state,
             stream_layout: streams.layout,
             memory_layout: streams.memory_layout,
             orphan_packets,
@@ -2289,6 +2305,7 @@ impl CudaBuffers {
             plan.merge_cursors,
             plan.stream_state,
             plan.stream_records,
+            plan.scheduler_state,
         ]
         .into_iter()
         .enumerate()
@@ -2362,6 +2379,7 @@ impl CudaBuffers {
         let observation_meta = &planes[21];
         let stream_state = &planes[25];
         let stream_records = &planes[26];
+        let scheduler_state = &planes[27];
 
         let mut host_states = image.host_states.clone();
         let mut switch_states = image.switch_states.clone();
@@ -2413,6 +2431,8 @@ impl CudaBuffers {
                         switch_queue.queue = queue.iter().map(|packet| packet.id).collect();
                         switch_queue.in_service = service.map(|packet| packet.id);
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
+                        restore_device_scheduler(lp, queue_meta, scheduler_state, switch_queue)
+                            .map_err(CudaError::Validation)?;
                     }
                     state.next_origin_seq = node_state[base + 5];
                     state.arrived_packets = node_state[base + 7];
@@ -2981,7 +3001,7 @@ fn launch_uniform(
     buffers: &CudaBuffers,
     config: LaunchConfig,
 ) -> Result<(), cudarc::driver::DriverError> {
-    debug_assert_eq!(buffers.planes.len(), 27);
+    debug_assert_eq!(buffers.planes.len(), 28);
     let mut arguments = stream.launch_builder(function);
     for plane in &buffers.planes {
         arguments.arg(plane);

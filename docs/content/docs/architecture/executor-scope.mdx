@@ -25,9 +25,11 @@ The first complete vertical slice supports:
 - one CPU process and one GPU device; and
 - a known, positive lookahead on every channel that crosses LP boundaries.
 
-The scalar and multicore CPU backends execute all three disciplines. Metal and
-CUDA reject SP and WFQ images during load-time validation until the device work
-lands in T19.
+All four backends execute all three disciplines. Scalar and multicore CPU retain
+unbounded `BigUint` arithmetic. Metal and CUDA use checked 320-bit rational
+components and reject checkpoints or static weight bounds outside that device
+capability; every accepted execution either remains exact or faults explicitly
+before an overflowing result can be committed.
 
 ### SP and WFQ service semantics
 
@@ -52,6 +54,13 @@ F[class] = max(V, F[class]) + 8 * size_bytes / weight[class]
 
 This recurrence preserves the mathematical order behind the legacy `f64`
 calculation without float rounding. Exact tag ties use canonical arrival order.
+The device representation stores five 64-bit limbs for each numerator and
+denominator, compares with complete 640-bit cross-products, and uses complete
+512-bit scratch for the recurrence's bounded-denominator additions. Device
+validation requires canonical checkpoint rationals no wider than 320 bits and
+requires `1_000_000_000 * sum(weights)` to fit `u64`. Scalar and CPU do not have
+those width limits. Metal and CUDA report a capability fault instead of
+wrapping if a reduced runtime result outgrows 320 bits.
 Legacy WFQ compares only the `f64` tag in an unstable binary heap, so its order
 for equal tags is unspecified. Near float-rounding boundaries and equal-time
 legacy LIFO arrivals can also change a cross-version trajectory. Compare

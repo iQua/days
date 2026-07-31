@@ -6,6 +6,7 @@
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+mod device_scheduler;
 pub mod device_sizing;
 pub mod event;
 pub mod image;

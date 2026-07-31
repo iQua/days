@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::device_scheduler::device_scheduler_word_count;
 use crate::{
     EventKind, FlowGeneratorKind, GeneratorStatus, LinkId, NodeKind, PacketKind, SimulationImage,
     serialization_time_ns,
@@ -31,7 +32,7 @@ const CONTROL_WORDS: usize = 19;
 const PARAM_WORDS: usize = 28;
 const WORD_BYTES: usize = std::mem::size_of::<u64>();
 
-const PLANE_NAMES: [&str; 27] = [
+const PLANE_NAMES: [&str; 28] = [
     "control",
     "params",
     "node_state",
@@ -59,6 +60,7 @@ const PLANE_NAMES: [&str; 27] = [
     "merge_cursors",
     "stream_state",
     "stream_records",
+    "scheduler_state",
 ];
 
 /// Exact size of one `u64` device plane in the default production GPU plan.
@@ -90,7 +92,7 @@ impl DeviceEventArenaSizing {
     }
 }
 
-/// Complete host-only sizing report for the 27 default production GPU device planes.
+/// Complete host-only sizing report for the 28 default production GPU device planes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -252,6 +254,7 @@ pub fn size_default_device_plan(
         inbound_producer_words.max(1),
         stream_state_words,
         checked_product(stream_record_slots, EVENT_WORDS, "stream record plane")?.max(1),
+        device_scheduler_word_count(image, &queue_capacities).map_err(DeviceSizingError)?,
     ];
 
     let planes = PLANE_NAMES

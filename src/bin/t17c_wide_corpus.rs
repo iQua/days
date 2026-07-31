@@ -93,7 +93,7 @@ fn run_sizing_dry_run_if_requested() -> bool {
 
     println!(
         "record=t17c_wide_sizing_protocol mode=host_arithmetic_only allocates_device=false \
-         executes_simulation=false plane_count=27 fixture={fixture}"
+         executes_simulation=false plane_count=28 fixture={fixture}"
     );
     for plane in &report.planes {
         println!(
@@ -119,7 +119,7 @@ fn run_sizing_dry_run_if_requested() -> bool {
         arenas.legacy_heap_arena_bytes,
     );
     println!(
-        "record=t17c_wide_sizing_total plane_count=27 total_device_bytes={} \
+        "record=t17c_wide_sizing_total plane_count=28 total_device_bytes={} \
          total_device_mib={:.6} total_device_gib={:.9} fixture={fixture}",
         report.total_device_bytes,
         report.total_device_bytes as f64 / 1_048_576.0,

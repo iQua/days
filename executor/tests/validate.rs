@@ -605,17 +605,57 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
         image.switch_states[0].queues[0].scheduler = scheduler;
         validate(&image, Backend::Scalar).expect("scalar must support SP/WFQ");
         validate(&image, Backend::Cpu { workers: 2 }).expect("CPU must support SP/WFQ");
-        let label = image.switch_states[0].queues[0].scheduler.label();
+        validate(&image, Backend::Metal).expect("Metal must support bounded SP/WFQ");
+        validate(&image, Backend::Cuda).expect("CUDA must support bounded SP/WFQ");
+    }
+
+    let mut wide_checkpoint = valid_image();
+    let mut state = WfqSchedulerState::new(vec![1]);
+    state.finish_times[0] = Ratio::from_integer(BigUint::from(1_u8) << 320_usize);
+    wide_checkpoint.switch_states[0].queues[0].scheduler = SchedulerKind::WeightedFairQueue(state);
+    validate(&wide_checkpoint, Backend::Scalar)
+        .expect("Scalar keeps unbounded exact WFQ checkpoint arithmetic");
+    validate(&wide_checkpoint, Backend::Cpu { workers: 2 })
+        .expect("CPU keeps unbounded exact WFQ checkpoint arithmetic");
+    for backend in [Backend::Metal, Backend::Cuda] {
         assert_eq!(
-            rejection(&image, Backend::Metal),
+            rejection(&wide_checkpoint, backend),
             format!(
-                "switch node NodeId(1) queue 0 uses {label} service, which backend Metal does not support; SP/WFQ require Scalar or Cpu until T19"
+                "switch node NodeId(1) queue 0 WFQ finish state for class 0 numerator requires 321 bits; backend {backend} exact-rational limit is 320 bits (Scalar and Cpu are unbounded)"
             )
         );
+    }
+
+    let mut noncanonical_checkpoint = valid_image();
+    let mut state = WfqSchedulerState::new(vec![1]);
+    state.finish_times[0] = Ratio::new_raw(BigUint::from(2_u8), BigUint::from(2_u8));
+    noncanonical_checkpoint.switch_states[0].queues[0].scheduler =
+        SchedulerKind::WeightedFairQueue(state);
+    validate(&noncanonical_checkpoint, Backend::Scalar)
+        .expect("Scalar accepts unbounded raw rational checkpoints");
+    validate(&noncanonical_checkpoint, Backend::Cpu { workers: 2 })
+        .expect("CPU accepts unbounded raw rational checkpoints");
+    for backend in [Backend::Metal, Backend::Cuda] {
         assert_eq!(
-            rejection(&image, Backend::Cuda),
+            rejection(&noncanonical_checkpoint, backend),
             format!(
-                "switch node NodeId(1) queue 0 uses {label} service, which backend Cuda does not support; SP/WFQ require Scalar or Cpu until T19"
+                "switch node NodeId(1) queue 0 WFQ finish state for class 0 is not a reduced canonical rational; backend {backend} requires canonical checkpoint rationals (Scalar and Cpu are unbounded)"
+            )
+        );
+    }
+
+    let mut wide_weight_sum = valid_image();
+    wide_weight_sum.switch_states[0].queues[0].scheduler =
+        SchedulerKind::weighted_fair_queue(vec![18_446_744_074]);
+    validate(&wide_weight_sum, Backend::Scalar)
+        .expect("Scalar keeps unbounded active-weight denominator arithmetic");
+    validate(&wide_weight_sum, Backend::Cpu { workers: 2 })
+        .expect("CPU keeps unbounded active-weight denominator arithmetic");
+    for backend in [Backend::Metal, Backend::Cuda] {
+        assert_eq!(
+            rejection(&wide_weight_sum, backend),
+            format!(
+                "switch node NodeId(1) queue 0 WFQ total weight 18446744074 makes the 1_000_000_000 * active-weight denominator exceed u64; backend {backend} requires a total weight at most 18446744073 (Scalar and Cpu are unbounded)"
             )
         );
     }
