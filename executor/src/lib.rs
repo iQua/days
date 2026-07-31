@@ -6,6 +6,7 @@
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod device_sizing;
 pub mod event;
 pub mod image;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -29,6 +30,10 @@ pub use cpu::{WindowedCpuRun, run_cpu_with_metrics_window};
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
     CudaRun, run_cuda, run_cuda_with_observations,
+};
+pub use device_sizing::{
+    DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
+    size_default_device_plan,
 };
 pub use event::{Event, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_phase};
 pub use image::{

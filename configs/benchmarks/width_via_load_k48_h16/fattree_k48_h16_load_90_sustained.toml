@@ -1,13 +1,14 @@
-# T17c k48/h16 wide-corpus ~30% point.
+# T17c k48/h16 wide-corpus ~90% point.
+# Status: excluded-from-execution (annotation-only sizing evidence; exceeds Boston VRAM).
 # 18,432 hosts + 129,024 switch-port LPs = 147,456 topology LPs.
 # Inclusive source budget: floor(1,024,000 ns / 21 ns) + 1 = 48,762 packets/flow.
-# 5,530 flows source 269,653,860 packets = 69,031,388,160 bytes, or
-# 29.25931640625% of aggregate host capacity through the stop.
-# Estimated semantic work: 1.37B–1.70B transitions.
+# 16,589 flows source 808,912,818 packets = 207,081,681,408 bytes, or
+# 87.772658203125% of aggregate host capacity through the stop.
+# Estimated semantic work: 4.10B–4.98B transitions.
 seed = 17048
 duration = 0.001024
 threading = "single"
-log_path = "logs/width_via_load_k48_h16/fattree_k48_h16_load_30_sustained"
+log_path = "logs/width_via_load_k48_h16/fattree_k48_h16_load_90_sustained"
 
 [topology]
 category = "FatTree"
@@ -28,5 +29,5 @@ propagation_ns = 1000
 
 [[flow_set]]
 flow_type = "PacketDistribution"
-flow_count = 5530
+flow_count = 16589
 traffic = { initial_delay = 0.0, size = 16_777_216, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }

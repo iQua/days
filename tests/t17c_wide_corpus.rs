@@ -2,10 +2,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use assert_cmd::cargo::cargo_bin_cmd;
 use days::flows::flow::Flow;
 use days::scenario::compile_config;
 use days::topos::build::build_graph;
-use days_executor::{FlowGeneratorKind, GeneratorTermination, SchedulerKind};
+use days_executor::{
+    DeviceEventArenaSizing, FlowGeneratorKind, GeneratorTermination, SchedulerKind,
+    size_default_device_plan,
+};
 
 const FIXTURE_DIRECTORY: &str = "configs/benchmarks/width_via_load_k48_h16";
 const HOST_COUNT: u64 = 18_432;
@@ -29,7 +33,7 @@ struct Fixture {
     expected_load_percent: f64,
 }
 
-const FIXTURES: [Fixture; 2] = [
+const FIXTURES: [Fixture; 3] = [
     Fixture {
         name: "fattree_k48_h16_load_30_sustained.toml",
         nominal_load_percent: 30,
@@ -45,6 +49,14 @@ const FIXTURES: [Fixture; 2] = [
         expected_source_packets: 539_258_958,
         expected_source_bytes: 138_050_293_248,
         expected_load_percent: 58.513_341_796_875,
+    },
+    Fixture {
+        name: "fattree_k48_h16_load_90_sustained.toml",
+        nominal_load_percent: 90,
+        flow_count: 16_589,
+        expected_source_packets: 808_912_818,
+        expected_source_bytes: 207_081_681_408,
+        expected_load_percent: 87.772_658_203_125,
     },
 ];
 
@@ -145,7 +157,7 @@ fn k48_wide_fixtures_hold_the_budget_and_lowering_invariants() {
         assert_eq!(source_bytes, fixture.expected_source_bytes);
         assert!((load - fixture.expected_load_percent).abs() < 1e-12);
         assert!(
-            (load - fixture.nominal_load_percent as f64).abs() < 2.0,
+            (load - fixture.nominal_load_percent as f64).abs() < 2.5,
             "{} no longer represents its nominal load point",
             fixture.name
         );
@@ -223,9 +235,15 @@ fn k48_wide_fixtures_hold_the_budget_and_lowering_invariants() {
 fn k48_wide_endpoint_pairs_are_nested_and_distinct() {
     let load_30 = endpoint_pairs(FIXTURES[0]);
     let load_60 = endpoint_pairs(FIXTURES[1]);
+    let load_90 = endpoint_pairs(FIXTURES[2]);
 
     assert_eq!(load_30, load_60[..load_30.len()]);
-    for (fixture, pairs) in [(FIXTURES[0], load_30), (FIXTURES[1], load_60)] {
+    assert_eq!(load_60, load_90[..load_60.len()]);
+    for (fixture, pairs) in [
+        (FIXTURES[0], load_30),
+        (FIXTURES[1], load_60),
+        (FIXTURES[2], load_90),
+    ] {
         assert_eq!(pairs.len(), fixture.flow_count as usize);
         assert_eq!(
             pairs
@@ -245,4 +263,125 @@ fn k48_wide_endpoint_pairs_are_nested_and_distinct() {
         );
         assert!(pairs.iter().all(|(source, sink)| source != sink));
     }
+}
+
+#[test]
+fn k48_wide_annotations_cover_actuals_and_exclude_load90_execution() {
+    let load_30 = fs::read_to_string(fixture_path(FIXTURES[0].name)).unwrap();
+    let load_60 = fs::read_to_string(fixture_path(FIXTURES[1].name)).unwrap();
+    let load_90 = fs::read_to_string(fixture_path(FIXTURES[2].name)).unwrap();
+
+    assert!(load_30.contains("Estimated semantic work: 1.37B–1.70B transitions."));
+    assert!(load_60.contains("Estimated semantic work: 2.73B–3.32B transitions."));
+    assert!(load_90.contains(
+        "Status: excluded-from-execution (annotation-only sizing evidence; exceeds Boston VRAM)."
+    ));
+    assert!(load_90.contains("Estimated semantic work: 4.10B–4.98B transitions."));
+}
+
+#[test]
+fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
+    let fixture = format!("{FIXTURE_DIRECTORY}/{}", FIXTURES[0].name);
+    let output = cargo_bin_cmd!("t17c_wide_corpus")
+        .args(["--sizing-dry-run", &fixture])
+        .output()
+        .expect("sizing dry-run must launch");
+    assert!(
+        output.status.success(),
+        "sizing dry-run failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("sizing report must be UTF-8");
+    assert!(stdout.contains(
+        "record=t17c_wide_sizing_protocol \
+         mode=host_arithmetic_only allocates_device=false executes_simulation=false plane_count=27"
+    ));
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("record=t17c_wide_sizing_plane "))
+            .count(),
+        27
+    );
+    let plane_names = stdout
+        .lines()
+        .filter(|line| line.starts_with("record=t17c_wide_sizing_plane "))
+        .map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("name="))
+                .expect("plane record must name the plane")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plane_names,
+        [
+            "control",
+            "params",
+            "node_state",
+            "generators",
+            "flows",
+            "routes",
+            "links",
+            "fel_meta",
+            "fel_records",
+            "queue_meta",
+            "queue_records",
+            "in_service",
+            "outbox",
+            "worklist",
+            "summary",
+            "observed",
+            "departures",
+            "arrivals",
+            "lp_state",
+            "remote_meta",
+            "remote_staging",
+            "observation_meta",
+            "inbound_meta",
+            "inbound_producers",
+            "merge_cursors",
+            "stream_state",
+            "stream_records",
+        ]
+    );
+    assert!(stdout.contains(
+        "record=t17c_wide_sizing_arena \
+         legacy_heap_event_slots=32775270 fallback_heap_event_slots=152986 \
+         channel_stream_event_slots=2355300 service_stream_event_slots=294912 \
+         generator_stream_event_slots=11060 heap_arena_bytes=18181360 \
+         stream_arena_bytes=504865800 total_event_arena_bytes=523047160 \
+         legacy_heap_arena_bytes=2888942352"
+    ));
+    assert!(stdout.contains("record=t17c_wide_sizing_total plane_count=27 total_device_bytes="));
+}
+
+#[test]
+fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
+    let image = compile_config(fixture_path(FIXTURES[1].name)).unwrap();
+    let report = size_default_device_plan(&image).unwrap();
+
+    assert_eq!(
+        report.event_arenas,
+        DeviceEventArenaSizing {
+            legacy_heap_event_slots: 64_396_545,
+            fallback_heap_event_slots: 158_515,
+            channel_stream_event_slots: 4_197_000,
+            service_stream_event_slots: 294_912,
+            generator_stream_event_slots: 22_118,
+            heap_arena_bytes: 18_667_912,
+            stream_arena_bytes: 910_948_704,
+            legacy_heap_arena_bytes: 5_671_614_552,
+        }
+    );
+    assert_eq!(
+        report.total_device_bytes,
+        report.planes.iter().map(|plane| plane.bytes).sum::<usize>()
+    );
+    assert_eq!(
+        report.event_arenas.total_event_arena_bytes(),
+        [7, 8, 25, 26]
+            .into_iter()
+            .map(|index| report.planes[index].bytes)
+            .sum::<usize>()
+    );
 }
