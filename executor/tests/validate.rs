@@ -2,8 +2,9 @@ use std::collections::VecDeque;
 
 use days_executor::{
     Backend, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId,
-    NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PayloadId, RemoteChannel, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, WfqSchedulerState, event_phase, validate,
+    NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PayloadId, RemoteChannel,
+    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, WfqSchedulerState, event_phase,
+    run_scalar_with_observations, validate,
 };
 use num_bigint::BigUint;
 use num_rational::Ratio;
@@ -179,6 +180,18 @@ fn wfq_waiting_image() -> SimulationImage {
         payload: PACKET,
     };
     image
+}
+
+fn wfq_in_service_image() -> SimulationImage {
+    let source = wfq_waiting_image();
+    let prefix = run_scalar_with_observations(&source, Some(1), ObservationMode::Full)
+        .expect("TxReady prefix must run");
+    let mut checkpoint = source;
+    checkpoint.host_states = prefix.host_states;
+    checkpoint.switch_states = prefix.switch_states;
+    checkpoint.initial_packets = prefix.resident_packets;
+    checkpoint.initial_events = prefix.pending_events;
+    checkpoint
 }
 
 #[test]
@@ -794,6 +807,25 @@ fn wfq_checkpoint_waiting_tags_are_positive_and_close_class_history() {
     assert_eq!(
         rejection(&inflated, Backend::Scalar),
         "switch node NodeId(1) queue 0 WFQ finish state for class 0 does not equal its maximum waiting tag"
+    );
+}
+
+#[test]
+fn wfq_checkpoint_in_service_tag_closes_class_history() {
+    validate(&wfq_in_service_image(), Backend::Scalar)
+        .expect("the valid in-service checkpoint must validate");
+
+    let mut malformed = wfq_in_service_image();
+    let SchedulerKind::WeightedFairQueue(state) =
+        &mut malformed.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.finish_times[0] = Ratio::from_integer(BigUint::from(17_u8));
+
+    assert_eq!(
+        rejection(&malformed, Backend::Scalar),
+        "switch node NodeId(1) queue 0 WFQ finish state for class 0 does not equal its in-service packet PayloadId(0) tag"
     );
 }
 

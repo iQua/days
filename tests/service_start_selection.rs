@@ -1,6 +1,7 @@
 #![cfg(feature = "test")]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,9 @@ use nexosim::ports::{EventSinkReader, Output, SinkState, event_queue};
 use nexosim::simulation::{Mailbox, SimInit};
 use nexosim::time::MonotonicTime;
 
+use days::flows::flow::Flow;
 use days::flows::packet::Packet;
+use days::scenario::compile_config;
 use days::schedulers::drop::{CapacityUnit, DropStrategy};
 use days::schedulers::drr::DRRServer;
 use days::schedulers::port::Port;
@@ -24,6 +27,7 @@ use days_executor::{
     RemoteChannel, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
     run_scalar_with_observations, validate,
 };
+use tempfile::TempDir;
 
 struct ScriptedPacketSource {
     packets: Vec<Packet>,
@@ -456,6 +460,119 @@ fn scripted_trajectory_packets() -> Vec<Packet> {
         Packet::new(1, 1, 0, 0.1),
         Packet::new(1, 2, 1, 0.2),
     ]
+}
+
+fn legacy_wfq_trajectory(flow_ids_by_source: &BTreeMap<usize, usize>) -> Vec<usize> {
+    let source_zero = flow_ids_by_source[&0];
+    let source_one = flow_ids_by_source[&1];
+    let mut source = ScriptedPacketSource::new(vec![
+        Packet::new(1, 10, source_zero, 0.0),
+        Packet::new(1, 11, source_zero, 0.1),
+        Packet::new(1, 20, source_one, 0.2),
+    ]);
+    let mut scheduler = WFQServer::new(
+        8.0,
+        8,
+        CapacityUnit::Packets,
+        Arc::new(|flow_id| flow_id % 2),
+        DropStrategy::TailDrop,
+        0.0,
+        vec![1, 4],
+    );
+    let source_mbox = Mailbox::new();
+    let scheduler_mbox = Mailbox::new();
+    let (writer, mut reader) = event_queue(SinkState::Enabled);
+    source
+        .output
+        .connect(WFQServer::packet_received, &scheduler_mbox);
+    scheduler.output.connect_sink(writer);
+    let t0 = MonotonicTime::EPOCH;
+    let mut sim = SimInit::with_num_threads(1)
+        .add_model(source, source_mbox, "Source")
+        .add_model(scheduler, scheduler_mbox, "WFQ")
+        .init(t0)
+        .unwrap();
+    sim.step_until(t0 + Duration::from_secs(4)).unwrap();
+
+    let mut trajectory = Vec::new();
+    while let Some(packet) = reader.try_read() {
+        trajectory.push(packet.packet_id);
+    }
+    trajectory
+}
+
+#[test]
+fn reordered_toml_keeps_days_image_identity_but_changes_legacy_wfq_classes() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let common = r#"
+seed = 18
+duration = 4.0
+threading = "single"
+edges = [[0, 2], [1, 2]]
+hosts = [0, 1, 2]
+
+[switch]
+port_rate = 8
+capacity = 8
+discipline = "WFQ"
+drop = "TailDrop"
+weights = [1, 4]
+"#;
+    let flow_zero = r#"
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 2]]
+[flow.traffic]
+initial_delay = 0.0
+size = 2
+arr_dist = { type = "Uniform", low = 0.1, high = 0.1 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+"#;
+    let flow_one = r#"
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[1, 2]]
+[flow.traffic]
+initial_delay = 0.2
+size = 1
+arr_dist = { type = "Uniform", low = 0.1, high = 0.1 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
+"#;
+    let first_path = directory.path().join("first.toml");
+    let second_path = directory.path().join("second.toml");
+    fs::write(&first_path, format!("{common}{flow_zero}{flow_one}"))
+        .expect("first config should be writable");
+    fs::write(&second_path, format!("{common}{flow_one}{flow_zero}"))
+        .expect("second config should be writable");
+
+    let first_image = compile_config(&first_path).expect("first config should lower");
+    let second_image = compile_config(&second_path).expect("reordered config should lower");
+    assert_eq!(first_image, second_image);
+    assert_eq!(
+        format!("{first_image:#?}").into_bytes(),
+        format!("{second_image:#?}").into_bytes(),
+        "canonical Days images must be byte-identical"
+    );
+
+    let legacy_flow_ids = |path: &std::path::Path| {
+        Flow::flows_from_config(
+            path.to_str().expect("fixture path should be valid UTF-8"),
+            &[0, 1, 2],
+        )
+        .into_iter()
+        .map(|flow| (flow.source_host, flow.id))
+        .collect::<BTreeMap<_, _>>()
+    };
+    let first_ids = legacy_flow_ids(&first_path);
+    let second_ids = legacy_flow_ids(&second_path);
+    assert_ne!(first_ids[&0] % 2, second_ids[&0] % 2);
+    assert_ne!(first_ids[&1] % 2, second_ids[&1] % 2);
+
+    let first_trajectory = legacy_wfq_trajectory(&first_ids);
+    let second_trajectory = legacy_wfq_trajectory(&second_ids);
+    assert_eq!(first_trajectory, vec![10, 20, 11]);
+    assert_eq!(second_trajectory, vec![10, 11, 20]);
+    assert_ne!(first_trajectory, second_trajectory);
 }
 
 #[test]

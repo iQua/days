@@ -1190,7 +1190,7 @@ impl<'image> TransitionState<'image> {
                 return Ok(());
             };
             if let SchedulerKind::WeightedFairQueue(wfq) = &mut queue.scheduler {
-                wfq.packet_finish_times.remove(&payload).ok_or(
+                wfq.packet_finish_times.get(&payload).ok_or(
                     ExecutionError::MissingWfqFinishTag {
                         node: node.id,
                         payload,
@@ -1959,6 +1959,13 @@ fn wfq_complete(
         return Err(ExecutionError::InvalidSchedulerState(node));
     }
     wfq_advance_virtual_time(state, departure_time_ns, rate_bps, node)?;
+    state
+        .packet_finish_times
+        .remove(&packet.id)
+        .ok_or(ExecutionError::MissingWfqFinishTag {
+            node,
+            payload: packet.id,
+        })?;
     state.active_packets[class] -= 1;
     if state.active_packets.iter().all(|active| *active == 0) {
         state.virtual_time = zero_rational();

@@ -1066,15 +1066,20 @@ fn validate_scheduler_state(
                 )));
             }
 
-            let queued = queue.queue.iter().copied().collect::<BTreeSet<_>>();
+            let active = queue
+                .queue
+                .iter()
+                .copied()
+                .chain(queue.in_service)
+                .collect::<BTreeSet<_>>();
             let tagged = state
                 .packet_finish_times
                 .keys()
                 .copied()
                 .collect::<BTreeSet<_>>();
-            if queued != tagged {
+            if active != tagged {
                 return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} WFQ finish tags must name exactly the waiting packets"
+                    "switch node {owner:?} queue {queue_index} WFQ finish tags must name exactly the waiting plus in-service packets"
                 )));
             }
 
@@ -1126,11 +1131,35 @@ fn validate_scheduler_state(
                 maximum_waiting_finish[class] = Some(finish);
                 previous = Some(finish);
             }
-            for (class, maximum) in maximum_waiting_finish.into_iter().enumerate() {
-                if maximum.is_some_and(|maximum| maximum != &state.finish_times[class]) {
+            if let Some(payload) = queue.in_service {
+                let in_service_finish = &state.packet_finish_times[&payload];
+                if in_service_finish.numer() == &BigUint::from(0_u8) {
                     return Err(ValidationError::new(format!(
-                        "switch node {owner:?} queue {queue_index} WFQ finish state for class {class} does not equal its maximum waiting tag"
+                        "switch node {owner:?} queue {queue_index} WFQ finish tag for in-service packet {payload:?} must be positive"
                     )));
+                }
+            }
+            for (class, maximum) in maximum_waiting_finish.into_iter().enumerate() {
+                if let Some(maximum) = maximum {
+                    if maximum != &state.finish_times[class] {
+                        return Err(ValidationError::new(format!(
+                            "switch node {owner:?} queue {queue_index} WFQ finish state for class {class} does not equal its maximum waiting tag"
+                        )));
+                    }
+                    continue;
+                }
+
+                if let Some(payload) = queue.in_service {
+                    let in_service_class = scheduler_class(image, payload, state.weights.len())
+                        .expect("packet and flow validation precede scheduler-state validation");
+                    if class == in_service_class {
+                        let in_service_finish = &state.packet_finish_times[&payload];
+                        if in_service_finish != &state.finish_times[class] {
+                            return Err(ValidationError::new(format!(
+                                "switch node {owner:?} queue {queue_index} WFQ finish state for class {class} does not equal its in-service packet {payload:?} tag"
+                            )));
+                        }
+                    }
                 }
             }
             Ok(())

@@ -35,8 +35,8 @@ pub struct WfqSchedulerState {
     pub finish_times: Vec<ExactRational>,
     /// Queued plus in-service packets by class, matching legacy active-set accounting.
     pub active_packets: Vec<u64>,
-    /// Finish tags for waiting packets. The in-service packet has already been selected and is
-    /// therefore absent, while its class remains active until completion.
+    /// Finish tags for waiting plus in-service packets. Selection retains the chosen packet's tag
+    /// until completion so checkpoint validation can close its class finish history exactly.
     pub packet_finish_times: BTreeMap<PayloadId, ExactRational>,
 }
 

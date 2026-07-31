@@ -248,7 +248,9 @@ fn exact_equal_wfq_tags_use_canonical_arrival_order() {
         ["8", "8"]
     );
     assert_eq!(wfq.active_packets, [1, 1]);
+    assert_eq!(wfq.packet_finish_times[&PayloadId(0)].to_string(), "8");
     assert_eq!(wfq.packet_finish_times[&PayloadId(3)].to_string(), "8");
+    assert_eq!(wfq.packet_finish_times.len(), 2);
 
     assert_eq!(switch_departures(&image), vec![PayloadId(0), PayloadId(3)]);
 }
