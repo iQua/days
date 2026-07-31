@@ -333,10 +333,6 @@ fn cpu_is_byte_identical_to_scalar_for_sp_and_wfq() {
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
 fn adversarial_scheduler_images() -> [SimulationImage; 3] {
     [
         image(
@@ -355,6 +351,34 @@ fn adversarial_scheduler_images() -> [SimulationImage; 3] {
             8,
         ),
     ]
+}
+
+#[test]
+fn cpu_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
+    for image in adversarial_scheduler_images() {
+        for horizon in [Some(1), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            for workers in [1, 2, 4] {
+                let actual = run_cpu_with_observations(
+                    &image,
+                    horizon,
+                    CpuConfig {
+                        workers,
+                        ..CpuConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} horizon={horizon:?} workers={workers}: {error}",
+                        image.switch_states[0].queues[0].scheduler.label()
+                    )
+                });
+                assert_eq!(actual.result, expected);
+            }
+        }
+    }
 }
 
 #[cfg(any(
