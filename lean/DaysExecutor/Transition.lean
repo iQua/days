@@ -152,7 +152,7 @@ Closed role/event support table mirroring `executor/src/model.rs:41-60`
 -/
 def roleSupports : NodeKind → EventKind → Prop
   | .host, _ => True
-  | .switch, .packetArrival => False
+  | .switch, .packetArrival | .switch, .retransmissionTimeout => False
   | .switch, .txReady | .switch, .txComplete | .switch, .remoteArrival => True
 
 /--

@@ -89,6 +89,12 @@ private theorem privatePayload_decisionTrace :
       simp at hlength
     · rintro ⟨decision, hdecision, _⟩
       simpa [hkind, tinyQueueDecisions] using hdecision
+  · constructor
+    · intro hselection
+      have hlength := congrArg List.length hselection
+      simp at hlength
+    · rintro ⟨decision, hdecision, _⟩
+      simpa [hkind, tinyQueueDecisions] using hdecision
 
 private theorem erasure_decisionTrace :
     ServiceDecisionTraceComplete tinyQueueErasurePreemptingTransition := by
@@ -124,6 +130,12 @@ private theorem erasure_decisionTrace :
       simp at hlength
     · rintro ⟨decision, hdecision, _⟩
       simpa [hkind, tinyQueueDecisions] using hdecision
+  · constructor
+    · intro hselection
+      have hlength := congrArg List.length hselection
+      simp at hlength
+    · rintro ⟨decision, hdecision, _⟩
+      simpa [hkind, tinyQueueDecisions] using hdecision
 
 private theorem privatePayload_nonPreemptive :
     CommittedServiceNonPreemptive tinyQueuePrivatePayloadTransition := by
@@ -146,6 +158,7 @@ private theorem privatePayload_nonPreemptive :
         simp [hkind, hcommitted, tinyQueueSelectedPacket,
           tinyQueueReadyState, tinyQueueDecisions]
   · exact ⟨fun hnodup => hnodup.erase _, hcompletion hkind, rfl⟩
+  · simp [hkind, tinyQueueDecisions]
   · simp [hkind, tinyQueueDecisions]
 
 private def privatePayloadWitnessNode : NodeDescriptor :=

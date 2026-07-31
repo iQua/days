@@ -217,7 +217,7 @@ def orderedQueueTransitionResult
     | .txComplete =>
         { state with
           committedService := state.committedService.erase event.payload }
-    | .packetArrival => state
+    | .packetArrival | .retransmissionTimeout => state
   { nextState
     children := orderedQueueServiceChildren node event selected
     packetReferenceIncrements :=
@@ -606,6 +606,9 @@ private theorem orderedQueue_decision_trace (before) :
       simp [SelectionIntroduced, orderedQueueTransitionResult, hkind,
         orderedQueueDecisions,
         ordered_erase_ne_append_singleton_of_mem _ _ _ hpresent]
+  | retransmissionTimeout =>
+      simp [SelectionIntroduced, orderedQueueTransitionResult, hkind,
+        orderedQueueDecisions]
 
 private theorem orderedQueue_committed_nonpreemptive (before) :
     CommittedServiceNonPreemptive (orderedQueueTransition before) := by
@@ -640,6 +643,8 @@ private theorem orderedQueue_committed_nonpreemptive (before) :
       simp only [orderedQueueTransitionResult, hkind, orderedQueueDecisions,
         ↓reduceIte, hpresent, true_and]
       exact ⟨fun hnodup => hnodup.erase _, trivial⟩
+  | retransmissionTimeout =>
+      simp [orderedQueueTransitionResult, hkind, orderedQueueDecisions]
 
 private theorem orderedQueue_private_irrelevant (before) :
     TxReadySelectionPrivateIrrelevant (orderedQueueTransition before) := by

@@ -966,7 +966,7 @@ def tinyQueueTransitionResult
     | .txComplete =>
         { state with
           committedService := state.committedService.erase event.payload }
-    | .packetArrival => state
+    | .packetArrival | .retransmissionTimeout => state
   { nextState
     children := tinyQueueServiceChildren node event selected
     packetReferenceIncrements :=

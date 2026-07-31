@@ -195,6 +195,7 @@ inductive EventKind where
   | txReady
   | txComplete
   | remoteArrival
+  | retransmissionTimeout
   deriving DecidableEq, Repr, Ord
 
 /--
@@ -202,7 +203,7 @@ Canonical equal-time phase dispatch mirroring `executor/src/event.rs:78-88` (`ev
 -/
 def eventPhase : EventKind → Nat
   | .packetArrival | .remoteArrival => 0
-  | .txComplete => 1
+  | .txComplete | .retransmissionTimeout => 1
   | .txReady => 2
 
 /--

@@ -305,6 +305,7 @@ fn scan_for_traces(log_path: &Path) -> Vec<String> {
         "wfq_events.csv",
         "drr_events.csv",
         "cubic_events.csv",
+        "tcp_events.csv",
     ];
 
     let mut traces = Vec::new();
@@ -375,6 +376,12 @@ fn select_checkers(log_path: &Path, traces: &[String]) -> Vec<CheckerInvocation>
         invocations.push(CheckerInvocation::One {
             exe: "cubic_check",
             args: vec![log_path.join("cubic_events.csv")],
+        });
+    }
+    if has("tcp_events.csv") {
+        invocations.push(CheckerInvocation::One {
+            exe: "tcp_check",
+            args: vec![log_path.join("tcp_events.csv")],
         });
     }
 
