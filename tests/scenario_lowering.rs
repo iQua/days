@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -59,10 +60,26 @@ fn write_config(directory: &TempDir, name: &str, contents: &str) -> String {
         .to_owned()
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
+fn debug_fnv1a64(value: &impl fmt::Debug) -> u64 {
+    struct Fnv1a64(u64);
+
+    impl fmt::Write for Fnv1a64 {
+        fn write_str(&mut self, value: &str) -> fmt::Result {
+            self.0 = fnv1a64_with_seed(self.0, value.as_bytes());
+            Ok(())
+        }
+    }
+
+    fn fnv1a64_with_seed(seed: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(seed, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    let mut hash = Fnv1a64(0xcbf29ce484222325);
+    fmt::write(&mut hash, format_args!("{value:#?}"))
+        .expect("formatting into the image hasher should succeed");
+    hash.0
 }
 
 fn certified_delays(image: &SimulationImage) -> BTreeMap<LinkId, u64> {
@@ -978,13 +995,14 @@ fn representative_lowered_image_bytes_match_frozen_preoptimization_hashes() {
         "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
         "configs/benchmarks/baseline/fattree_k8_f64_st.toml",
         "configs/benchmarks/width_via_load_full/fattree_k32_load_10.toml",
+        "configs/benchmarks/real_image_gate/fattree_k64_h16_f32768_st.toml",
     ];
     let actual = fixtures.map(|fixture| {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
         let image = compile_config(path).unwrap_or_else(|error| {
             panic!("representative fixture {fixture} should lower: {error}")
         });
-        fnv1a64(format!("{image:#?}").as_bytes())
+        debug_fnv1a64(&image)
     });
 
     assert_eq!(
@@ -993,8 +1011,57 @@ fn representative_lowered_image_bytes_match_frozen_preoptimization_hashes() {
             8_913_124_020_181_194_792,
             7_690_158_362_243_519_310,
             18_404_967_740_969_582_445,
+            6_163_052_821_661_902_962,
         ],
         "route-construction changes must preserve every ordered image byte"
+    );
+}
+
+#[test]
+fn custom_graph_astar_fallback_matches_frozen_preoptimization_image_hash() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "custom-graph-astar-fallback.toml",
+        r#"
+seed = 17
+duration = 0.000001
+edges = [[0, 2], [0, 3], [1, 2], [1, 3], [0, 4], [3, 4]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 8_000_000_000
+capacity = 8
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 17
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+[flow.traffic]
+initial_delay = 0.0
+size = 16
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
+"#,
+    );
+
+    let (graph, _) = build_graph(&path).expect("custom topology should build");
+    assert_eq!(graph.node_count(), 5);
+    assert_eq!(
+        graph.edge_count(),
+        6,
+        "a canonical k=2 fat tree has four edges, so this graph must take the A* fallback"
+    );
+
+    let image = compile_config(&path).expect("custom A* fallback scenario should lower");
+    assert_eq!(
+        debug_fnv1a64(&image),
+        2_329_417_208_480_234_693,
+        "the post-optimization fallback image must match its frozen pre-optimization bytes"
     );
 }
 

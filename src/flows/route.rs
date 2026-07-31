@@ -789,6 +789,12 @@ mod tests {
     fn test_shortest_path_custom_five_node_graph_falls_back_from_fat_tree_fast_path() {
         let edges = [(0_u32, 2_u32), (0, 3), (1, 2), (1, 3), (0, 4), (3, 4)];
         let graph = UnGraph::<usize, ()>::from_edges(edges);
+        let canonical_graph = canonical_routing_graph(&graph);
+        assert_eq!(
+            ShortestPath::fat_tree_params(&canonical_graph),
+            None,
+            "the six-edge custom graph must reject the four-edge canonical k=2 layout"
+        );
 
         let path = ShortestPath::compute_route_in(&graph, NodeIndex::new(0), NodeIndex::new(1));
 
