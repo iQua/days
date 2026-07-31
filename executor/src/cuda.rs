@@ -419,6 +419,8 @@ impl Error for CudaError {}
 pub struct CudaConfig {
     /// Enables the stream-decomposed FEL. `false` retains the exact fallback heap path.
     pub streams_enabled: bool,
+    /// Orders active LPs by head-event kind before the round drain.
+    pub kind_clustering: bool,
     pub max_fel_events_per_lp: Option<usize>,
     pub max_channel_events_per_stream: Option<usize>,
     pub max_queue_packets_per_lp: Option<usize>,
@@ -442,6 +444,7 @@ impl Default for CudaConfig {
     fn default() -> Self {
         Self {
             streams_enabled: true,
+            kind_clustering: true,
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -2485,9 +2488,10 @@ impl CudaBuffers {
     }
 }
 
-const KERNEL_NAMES: [&str; 8] = [
+const KERNEL_NAMES: [&str; 9] = [
     "days_horizon",
     "days_round_prepare",
+    "days_round_prepare_kind_clustered",
     "days_round",
     "days_round_control",
     "days_exchange_prefix",
@@ -2495,8 +2499,10 @@ const KERNEL_NAMES: [&str; 8] = [
     "days_exchange_merge",
     "days_round_finalize",
 ];
-const CONTROL_KERNELS: [usize; 5] = [0, 1, 3, 4, 7];
-const PARALLEL_KERNELS: [usize; 3] = [2, 5, 6];
+const UNMODIFIED_KERNELS: [usize; 8] = [0, 1, 3, 4, 5, 6, 7, 8];
+const KIND_CLUSTERED_KERNELS: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+const CONTROL_KERNELS: [usize; 6] = [0, 1, 2, 4, 5, 8];
+const PARALLEL_KERNELS: [usize; 3] = [3, 6, 7];
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
@@ -2620,7 +2626,17 @@ impl DirectCuda {
 
         let wall_started = Instant::now();
         let capture_started = Instant::now();
-        let graph = self.capture_graph(buffers, &configs, config.attempts_per_graph_wave)?;
+        let kernel_indices = if config.kind_clustering {
+            &KIND_CLUSTERED_KERNELS
+        } else {
+            &UNMODIFIED_KERNELS
+        };
+        let graph = self.capture_graph(
+            buffers,
+            &configs,
+            kernel_indices,
+            config.attempts_per_graph_wave,
+        )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
 
         let maximum_replays = buffers
@@ -2691,6 +2707,7 @@ impl DirectCuda {
         &self,
         buffers: &CudaBuffers,
         configs: &[LaunchConfig; 8],
+        kernel_indices: &[usize; 8],
         attempts: usize,
     ) -> Result<CudaGraph, CudaError> {
         self.stream
@@ -2699,9 +2716,9 @@ impl DirectCuda {
 
         let captured = (|| {
             for _ in 0..attempts {
-                for ((function, config), name) in
-                    self.functions.iter().zip(configs).zip(KERNEL_NAMES)
-                {
+                for (kernel_index, config) in kernel_indices.iter().copied().zip(configs) {
+                    let function = &self.functions[kernel_index];
+                    let name = KERNEL_NAMES[kernel_index];
                     launch_uniform(&self.stream, function, buffers, *config)
                         .map_err(|error| driver_error(format!("capture `{name}` launch"), error))?;
                 }

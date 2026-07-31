@@ -693,6 +693,37 @@ __device__ __forceinline__ bool fel_root_time(
     return true;
 }
 
+__device__ __forceinline__ bool fel_root_time_kind(
+    ulong node,
+    const ulong *params,
+    const ulong *fel_meta,
+    const ulong *fel_records,
+    const ulong *stream_state,
+    const ulong *stream_records,
+    ulong &time,
+    ulong &kind
+) {
+    ulong record[EVENT_WORDS];
+    ulong selected_active;
+    ulong selected_stream;
+    if (!fel_peek(
+        node,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        record,
+        selected_active,
+        selected_stream
+    )) {
+        return false;
+    }
+    time = record[E_TIME];
+    kind = record[E_KIND];
+    return true;
+}
+
 __device__ __forceinline__ bool fel_pop_selected(
     ulong node,
     ulong selected_active,
@@ -1989,6 +2020,127 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     __syncthreads();
     if (lane == 0) {
         control[C_ACTIVE] = counts[1023];
+        control[C_OUTBOX] = 0;
+        control[C_CONTINUATION] = 1;
+    }
+}
+
+extern "C" __global__ void days_round_prepare_kind_clustered(DAYS_BUFFERS) {
+    constexpr uint EVENT_KINDS = 4;
+    uint lane = threadIdx.x;
+    __shared__ ulong counts[EVENT_KINDS][1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+
+    ulong nodes = params[P_NODE_COUNT];
+    ulong chunk = nodes / 1024;
+    ulong remainder = nodes % 1024;
+    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
+    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong local_counts[EVENT_KINDS] = {0, 0, 0, 0};
+    if (params[P_STREAMS_ENABLED] != 0) {
+        for (
+            ulong channel = lane;
+            channel < params[P_CHANNEL_COUNT];
+            channel += 1024
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[batch] = 0;
+            stream_state[batch + 1] = NONE;
+            stream_state[batch + 2] = NONE;
+            stream_state[batch + 3] = 0;
+        }
+    }
+    for (ulong node = start; node < end; ++node) {
+        ulong state = node * LP_STATE_WORDS;
+        lp_state[state + L_ERROR] = 0;
+        lp_state[state + L_ERROR_ARENA] = 0;
+        lp_state[state + L_ERROR_NODE] = NONE;
+        lp_state[state + L_ERROR_CAPACITY] = 0;
+        remote_meta[node * META_WORDS + 3] = 0;
+        ulong time;
+        ulong kind;
+        if (
+            fel_root_time_kind(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                time,
+                kind
+            ) &&
+            before_horizon(time, control)
+        ) {
+            local_counts[min(kind, ulong(EVENT_KINDS - 1))] += 1;
+        }
+    }
+
+    for (uint kind = 0; kind < EVENT_KINDS; ++kind) {
+        counts[kind][lane] = local_counts[kind];
+    }
+    __syncthreads();
+    for (uint offset = 1; offset < 1024; offset <<= 1) {
+        ulong addends[EVENT_KINDS];
+        for (uint kind = 0; kind < EVENT_KINDS; ++kind) {
+            addends[kind] = lane >= offset ? counts[kind][lane - offset] : 0;
+        }
+        __syncthreads();
+        for (uint kind = 0; kind < EVENT_KINDS; ++kind) {
+            counts[kind][lane] += addends[kind];
+        }
+        __syncthreads();
+    }
+
+    ulong writes[EVENT_KINDS];
+    ulong kind_offset = 0;
+    for (uint kind = 0; kind < EVENT_KINDS; ++kind) {
+        writes[kind] = kind_offset + counts[kind][lane] - local_counts[kind];
+        kind_offset += counts[kind][1023];
+    }
+    for (ulong node = start; node < end; ++node) {
+        ulong time;
+        ulong kind;
+        if (
+            fel_root_time_kind(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                time,
+                kind
+            ) &&
+            before_horizon(time, control)
+        ) {
+            uint bucket = uint(min(kind, ulong(EVENT_KINDS - 1)));
+            ulong write = writes[bucket]++;
+            if (write >= params[P_WORKLIST_CAPACITY]) {
+                if (lane == 0) {
+                    control[C_ERROR] = ERROR_CAPACITY;
+                    control[C_ERROR_ARENA] = ARENA_WORKLIST;
+                    control[C_ERROR_NODE] = NONE;
+                    control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+                }
+                return;
+            }
+            worklist[write] = node;
+            lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+        }
+    }
+    __syncthreads();
+    if (lane == 0) {
+        control[C_ACTIVE] = kind_offset;
         control[C_OUTBOX] = 0;
         control[C_CONTINUATION] = 1;
     }
