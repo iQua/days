@@ -1,7 +1,8 @@
 //! Correctness-first production CUDA executor.
 //!
 //! The backend keeps the safe-horizon round loop resident in explicit CUDA device buffers. One
-//! fixed eight-kernel attempt DAG is captured as a CUDA Graph and replayed in bounded waves.
+//! unified eight-kernel or role-split nine-kernel attempt DAG is captured as a CUDA Graph and
+//! replayed in bounded waves.
 //! Deterministic 1,024-lane reductions publish each exact exclusive horizon and compact active
 //! LPs; one CUDA lane owns each active LP transition drain; boundary exchange remains
 //! producer-local followed by deterministic per-channel scatter. The host reads only the control
@@ -63,7 +64,7 @@ const CONTROL_RUN_END_HI: usize = 8;
 const CONTROL_ROUNDS: usize = 9;
 const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
-const CONTROL_WORDS: usize = 19;
+const CONTROL_WORDS: usize = 21;
 
 static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
 static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
@@ -419,6 +420,8 @@ impl Error for CudaError {}
 pub struct CudaConfig {
     /// Enables the stream-decomposed FEL. `false` retains the exact fallback heap path.
     pub streams_enabled: bool,
+    /// Dispatches host and switch-port LPs through separate role-specialized kernels.
+    pub role_split: bool,
     pub max_fel_events_per_lp: Option<usize>,
     pub max_channel_events_per_stream: Option<usize>,
     pub max_queue_packets_per_lp: Option<usize>,
@@ -428,7 +431,7 @@ pub struct CudaConfig {
     pub max_transitions_per_lp_per_round: usize,
     /// CUDA threads in each parallel transition/exchange block.
     pub round_threads_per_block: usize,
-    /// Complete eight-kernel attempts captured in the reusable graph.
+    /// Complete attempt DAGs captured in the reusable graph.
     pub attempts_per_graph_wave: usize,
     /// Optional hard cap overriding the conservative semantic round bound.
     pub max_rounds: Option<usize>,
@@ -442,6 +445,7 @@ impl Default for CudaConfig {
     fn default() -> Self {
         Self {
             streams_enabled: true,
+            role_split: true,
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -695,6 +699,8 @@ struct CudaPlan {
     stream_layout: StreamLayout,
     memory_layout: CudaMemoryLayout,
     orphan_packets: Vec<PacketDescriptor>,
+    host_node_count: usize,
+    switch_node_count: usize,
     round_capacity: usize,
     dispatch_capacity: usize,
 }
@@ -730,6 +736,12 @@ impl CudaPlan {
         observation_mode: ObservationMode,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
+        let host_node_count = image
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Host)
+            .count();
+        let switch_node_count = node_count.saturating_sub(host_node_count);
         let flow_packet_counts = flow_packet_counts(image)?;
         let flow_feedback_counts = image.initial_packets.iter().fold(
             vec![0_usize; image.flows.len()],
@@ -1128,6 +1140,8 @@ impl CudaPlan {
             stream_layout: streams.layout,
             memory_layout: streams.memory_layout,
             orphan_packets,
+            host_node_count,
+            switch_node_count,
             round_capacity,
             dispatch_capacity,
         })
@@ -2172,6 +2186,8 @@ struct CudaBuffers {
     planes: Vec<CudaSlice<u64>>,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
+    host_node_count: usize,
+    switch_node_count: usize,
     stream_layout: StreamLayout,
     memory_layout: CudaMemoryLayout,
     round_capacity: usize,
@@ -2186,6 +2202,8 @@ impl CudaBuffers {
         let stream_layout = plan.stream_layout;
         let memory_layout = plan.memory_layout;
         let node_count = plan.params[0] as usize;
+        let host_node_count = plan.host_node_count;
+        let switch_node_count = plan.switch_node_count;
         let planes = vec![
             plan.control,
             plan.params,
@@ -2228,6 +2246,8 @@ impl CudaBuffers {
             planes,
             orphan_packets,
             node_count,
+            host_node_count,
+            switch_node_count,
             stream_layout,
             memory_layout,
             round_capacity,
@@ -2485,18 +2505,23 @@ impl CudaBuffers {
     }
 }
 
-const KERNEL_NAMES: [&str; 8] = [
+const KERNEL_NAMES: [&str; 11] = [
     "days_horizon",
     "days_round_prepare",
+    "days_round_prepare_role",
     "days_round",
+    "days_round_host",
+    "days_round_switch",
     "days_round_control",
     "days_exchange_prefix",
     "days_exchange_scatter",
     "days_exchange_merge",
     "days_round_finalize",
 ];
-const CONTROL_KERNELS: [usize; 5] = [0, 1, 3, 4, 7];
-const PARALLEL_KERNELS: [usize; 3] = [2, 5, 6];
+const CONTROL_KERNELS: [usize; 6] = [0, 1, 2, 6, 7, 10];
+const PARALLEL_KERNELS: [usize; 5] = [3, 4, 5, 8, 9];
+const UNIFIED_ATTEMPT_KERNELS: [usize; 8] = [0, 1, 3, 6, 7, 8, 9, 10];
+const ROLE_SPLIT_ATTEMPT_KERNELS: [usize; 9] = [0, 2, 4, 5, 6, 7, 8, 9, 10];
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
@@ -2601,6 +2626,14 @@ impl DirectCuda {
         let parallel_blocks = u32::try_from(parallel_blocks).map_err(|_| {
             CudaError::Validation("parallel CUDA grid does not fit in u32 blocks".into())
         })?;
+        let host_blocks = buffers.host_node_count.div_ceil(parallel_threads).max(1);
+        let host_blocks = u32::try_from(host_blocks).map_err(|_| {
+            CudaError::Validation("host CUDA grid does not fit in u32 blocks".into())
+        })?;
+        let switch_blocks = buffers.switch_node_count.div_ceil(parallel_threads).max(1);
+        let switch_blocks = u32::try_from(switch_blocks).map_err(|_| {
+            CudaError::Validation("switch CUDA grid does not fit in u32 blocks".into())
+        })?;
         let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
             CudaError::Validation("round_threads_per_block does not fit in u32".into())
         })?;
@@ -2614,13 +2647,34 @@ impl DirectCuda {
             block_dim: (parallel_threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        let host = LaunchConfig {
+            grid_dim: (host_blocks, 1, 1),
+            block_dim: (parallel_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let switch = LaunchConfig {
+            grid_dim: (switch_blocks, 1, 1),
+            block_dim: (parallel_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let configs = [
-            control, control, parallel, control, control, parallel, parallel, control,
+            control, control, control, parallel, host, switch, control, control, parallel,
+            parallel, control,
         ];
+        let attempt_kernels = if config.role_split {
+            ROLE_SPLIT_ATTEMPT_KERNELS.as_slice()
+        } else {
+            UNIFIED_ATTEMPT_KERNELS.as_slice()
+        };
 
         let wall_started = Instant::now();
         let capture_started = Instant::now();
-        let graph = self.capture_graph(buffers, &configs, config.attempts_per_graph_wave)?;
+        let graph = self.capture_graph(
+            buffers,
+            &configs,
+            attempt_kernels,
+            config.attempts_per_graph_wave,
+        )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
 
         let maximum_replays = buffers
@@ -2690,7 +2744,8 @@ impl DirectCuda {
     fn capture_graph(
         &self,
         buffers: &CudaBuffers,
-        configs: &[LaunchConfig; 8],
+        configs: &[LaunchConfig; 11],
+        attempt_kernels: &[usize],
         attempts: usize,
     ) -> Result<CudaGraph, CudaError> {
         self.stream
@@ -2699,11 +2754,16 @@ impl DirectCuda {
 
         let captured = (|| {
             for _ in 0..attempts {
-                for ((function, config), name) in
-                    self.functions.iter().zip(configs).zip(KERNEL_NAMES)
-                {
-                    launch_uniform(&self.stream, function, buffers, *config)
-                        .map_err(|error| driver_error(format!("capture `{name}` launch"), error))?;
+                for &index in attempt_kernels {
+                    launch_uniform(
+                        &self.stream,
+                        &self.functions[index],
+                        buffers,
+                        configs[index],
+                    )
+                    .map_err(|error| {
+                        driver_error(format!("capture `{}` launch", KERNEL_NAMES[index]), error)
+                    })?;
                 }
             }
             Ok(())
