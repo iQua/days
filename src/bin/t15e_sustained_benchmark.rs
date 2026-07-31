@@ -1,4 +1,8 @@
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn median(values: impl Iterator<Item = u128>) -> u128 {
     let mut values = values.collect::<Vec<_>>();
     values.sort_unstable();
@@ -14,7 +18,11 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
     }
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComparisonOutcome {
     Beats,
@@ -22,7 +30,11 @@ enum ComparisonOutcome {
     Trails,
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 impl ComparisonOutcome {
     fn as_str(self) -> &'static str {
         match self {
@@ -33,7 +45,11 @@ impl ComparisonOutcome {
     }
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetainedSampleComparison {
     candidate_median_ns: u128,
@@ -46,7 +62,11 @@ struct RetainedSampleComparison {
     paired_comparisons: usize,
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn retained_range(values: &[u128]) -> u128 {
     let minimum = values
         .iter()
@@ -59,7 +79,11 @@ fn retained_range(values: &[u128]) -> u128 {
     maximum - minimum
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn compare_retained_samples(
     candidate_samples: &[u128],
     reference_samples: &[u128],
@@ -122,7 +146,80 @@ fn crossover_summary(w4: ComparisonOutcome, w18: ComparisonOutcome) -> &'static 
     }
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    all(
+        feature = "cuda",
+        not(all(feature = "metal-spike", target_vendor = "apple"))
+    )
+))]
+fn cuda_crossover_summary(w4: ComparisonOutcome, wbest: ComparisonOutcome) -> &'static str {
+    match (w4, wbest) {
+        (ComparisonOutcome::Beats, ComparisonOutcome::Beats) => "cuda_beats_w4_and_wbest",
+        (ComparisonOutcome::Beats, ComparisonOutcome::Parity) => "cuda_beats_w4_parity_wbest",
+        (ComparisonOutcome::Beats, ComparisonOutcome::Trails) => "cuda_beats_w4_trails_wbest",
+        (ComparisonOutcome::Parity, ComparisonOutcome::Beats) => "cuda_parity_w4_beats_wbest",
+        (ComparisonOutcome::Parity, ComparisonOutcome::Parity) => "cuda_parity_w4_and_wbest",
+        (ComparisonOutcome::Parity, ComparisonOutcome::Trails) => "cuda_parity_w4_trails_wbest",
+        (ComparisonOutcome::Trails, ComparisonOutcome::Beats) => "cuda_trails_w4_beats_wbest",
+        (ComparisonOutcome::Trails, ComparisonOutcome::Parity) => "cuda_trails_w4_parity_wbest",
+        (ComparisonOutcome::Trails, ComparisonOutcome::Trails) => "cuda_trails_w4_and_wbest",
+    }
+}
+
+#[cfg(any(
+    test,
+    all(
+        feature = "cuda",
+        not(all(feature = "metal-spike", target_vendor = "apple"))
+    )
+))]
+fn cpu_engine_name(workers: usize, best_workers: usize) -> &'static str {
+    if workers == 4 {
+        "w4"
+    } else if workers == best_workers {
+        "wbest"
+    } else {
+        "cpu"
+    }
+}
+
+#[cfg(any(
+    test,
+    all(
+        feature = "cuda",
+        not(all(feature = "metal-spike", target_vendor = "apple"))
+    )
+))]
+fn parse_worker_sweep(value: &str) -> Result<Vec<usize>, String> {
+    let workers = value
+        .split(',')
+        .map(|worker| {
+            worker
+                .parse::<usize>()
+                .map_err(|_| "worker sweep counts must be integers".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if workers.is_empty() {
+        return Err("worker sweep must include at least one count".to_owned());
+    }
+    if workers.contains(&0) {
+        return Err("worker sweep counts must be nonzero".to_owned());
+    }
+    let mut unique = workers.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != workers.len() {
+        return Err("worker sweep counts must be unique".to_owned());
+    }
+    Ok(workers)
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn split_fixed(total_ns: u128, marginal_ns: u128) -> (u128, u128) {
     let fixed_ns = total_ns
         .checked_sub(marginal_ns)
@@ -135,7 +232,11 @@ fn split_fixed(total_ns: u128, marginal_ns: u128) -> (u128, u128) {
     (fixed_ns, marginal_ns)
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn order_for_sample(sample: usize) -> &'static str {
     if sample.is_multiple_of(2) {
         "cpu_first"
@@ -144,10 +245,18 @@ fn order_for_sample(sample: usize) -> &'static str {
     }
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 const SCALAR_SAMPLES: usize = 2;
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn recorded_predecessor_for_engine(engine: &str) -> &'static str {
     if engine == "scalar" {
         "none"
@@ -944,17 +1053,38 @@ fn main() {
     );
 }
 
-#[cfg(not(all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(all(
+    feature = "cuda",
+    not(all(feature = "metal-spike", target_vendor = "apple"))
+))]
+#[path = "t15e_sustained_benchmark/cuda_app.rs"]
+mod cuda_app;
+
+#[cfg(all(
+    feature = "cuda",
+    not(all(feature = "metal-spike", target_vendor = "apple"))
+))]
 fn main() {
-    eprintln!("t15e_sustained_benchmark requires --features metal-spike on an Apple target");
+    cuda_app::main();
+}
+
+#[cfg(not(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+)))]
+fn main() {
+    eprintln!(
+        "t15e_sustained_benchmark requires --features metal-spike on Apple or --features cuda"
+    );
     std::process::exit(2);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ComparisonOutcome, SCALAR_SAMPLES, compare_retained_samples, crossover_summary, median,
-        order_for_sample, recorded_predecessor_for_engine, split_fixed,
+        ComparisonOutcome, SCALAR_SAMPLES, compare_retained_samples, cpu_engine_name,
+        crossover_summary, cuda_crossover_summary, median, order_for_sample, parse_worker_sweep,
+        recorded_predecessor_for_engine, split_fixed,
     };
 
     #[test]
@@ -965,6 +1095,24 @@ mod tests {
         assert_eq!(
             crossover_summary(ComparisonOutcome::Beats, ComparisonOutcome::Parity),
             "metal_beats_w4_parity_w18"
+        );
+    }
+
+    #[test]
+    fn cuda_crossover_summary_names_w4_and_selected_best_worker_baselines() {
+        assert_eq!(
+            cuda_crossover_summary(ComparisonOutcome::Beats, ComparisonOutcome::Parity),
+            "cuda_beats_w4_parity_wbest"
+        );
+        assert_eq!(
+            cpu_engine_name(4, 19),
+            "w4",
+            "the fixed W4 baseline keeps its stable engine name"
+        );
+        assert_eq!(
+            cpu_engine_name(19, 19),
+            "wbest",
+            "the selected Grace worker count uses the W-best engine name"
         );
     }
 
@@ -1041,11 +1189,27 @@ mod tests {
     fn scalar_measurement_exemption_uses_two_samples_without_predecessors() {
         assert_eq!(SCALAR_SAMPLES, 2);
         assert_eq!(recorded_predecessor_for_engine("scalar"), "none");
-        for engine in ["w4", "w18", "metal_heap", "metal_streams"] {
+        for engine in ["w4", "w18", "wbest", "cuda", "metal_heap", "metal_streams"] {
             assert_eq!(
                 recorded_predecessor_for_engine(engine),
                 "same_kind_discarded"
             );
         }
+    }
+
+    #[test]
+    fn worker_sweep_parses_the_audited_grace_counts() {
+        assert_eq!(
+            parse_worker_sweep("4,8,12,16,19").unwrap(),
+            [4, 8, 12, 16, 19]
+        );
+        assert_eq!(
+            parse_worker_sweep("4,4").unwrap_err(),
+            "worker sweep counts must be unique"
+        );
+        assert_eq!(
+            parse_worker_sweep("4,0").unwrap_err(),
+            "worker sweep counts must be nonzero"
+        );
     }
 }
