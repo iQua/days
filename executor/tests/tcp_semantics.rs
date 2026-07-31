@@ -1826,3 +1826,649 @@ fn receiver_reserves_ack_payloads_for_preloaded_in_flight_data() {
         ]
     );
 }
+
+#[test]
+fn fully_sent_unacknowledged_tcp_requires_its_reverse_ack_channel() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    image.stop_time_ns = 3_000_000_000;
+    image.links[0].propagation_ns = 1_500_000_000;
+    image.channels = vec![
+        RemoteChannel::for_packet_link(image.links[0], 1).unwrap(),
+        RemoteChannel::for_packet_link(image.links[1], ACK_BYTES).unwrap(),
+    ];
+
+    let uninterrupted = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("uninterrupted final-window timer campaign");
+    let prefix = run_scalar_with_observations(
+        &image,
+        Some(TcpGenerator::INITIAL_RTO_NS),
+        ObservationMode::Full,
+    )
+    .expect("reachable final-window timer boundary");
+    let FlowGeneratorKind::Tcp(tcp) = prefix.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(tcp.next_sequence, tcp.total_bytes);
+    assert!(tcp.highest_ack < tcp.next_sequence);
+
+    let checkpoint = checkpoint_image(&image, &prefix);
+    validate(&checkpoint, Backend::Scalar)
+        .expect("the reachable reverse ACK channel must validate for Scalar");
+    validate(&checkpoint, Backend::Cpu { workers: 2 })
+        .expect("the reachable reverse ACK channel must validate for CPU");
+    let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+        .expect("Scalar continuation with the reverse channel");
+    let cpu = run_cpu_with_observations(
+        &checkpoint,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU continuation with the reverse channel");
+    assert_eq!(cpu.result, scalar);
+    assert_eq!(stitch_checkpoint_run(&prefix, &scalar), uninterrupted);
+
+    let completed_checkpoint = checkpoint_image(&image, &uninterrupted);
+    validate(&completed_checkpoint, Backend::Scalar)
+        .expect("a completed runtime checkpoint must remain valid for Scalar");
+    validate(&completed_checkpoint, Backend::Cpu { workers: 2 })
+        .expect("a completed runtime checkpoint must remain valid for CPU");
+    let mut quiescent_without_channels = completed_checkpoint;
+    quiescent_without_channels.channels.clear();
+    validate(&quiescent_without_channels, Backend::Scalar)
+        .expect("quiescent completed TCP does not require dormant channels for Scalar");
+    validate(&quiescent_without_channels, Backend::Cpu { workers: 2 })
+        .expect("quiescent completed TCP does not require dormant channels for CPU");
+
+    let mut missing_reverse = checkpoint;
+    missing_reverse
+        .channels
+        .retain(|channel| channel.link != REVERSE);
+    let expected = "link LinkId(1) can emit RemoteArrival from node NodeId(1) to node NodeId(0), but no channel is declared";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&missing_reverse, backend)
+            .expect_err("an in-flight TCP segment requires its reverse ACK channel");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn scheduled_active_timer_preserves_validate_execute_checkpoint_closure() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    image.stop_time_ns = 0;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.last_attempt = PayloadId(2);
+    tcp.timer_generation = 1;
+    tcp.active_timer = Some(TcpTimerState {
+        attempt: PayloadId(2),
+        sequence: 0,
+        deadline_ns: 0,
+        generation: 1,
+        rto_ns: TcpGenerator::INITIAL_RTO_NS,
+    });
+
+    let outcomes = [Backend::Scalar, Backend::Cpu { workers: 2 }].map(|backend| {
+        if let Err(error) = validate(&image, backend) {
+            return format!("{backend}: rejected input: {error}");
+        }
+        let result = match backend {
+            Backend::Scalar => run_scalar_with_observations(&image, None, ObservationMode::Full)
+                .expect("accepted Scalar image must execute"),
+            Backend::Cpu { workers } => {
+                run_cpu_with_observations(
+                    &image,
+                    None,
+                    CpuConfig {
+                        workers,
+                        ..CpuConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .expect("accepted CPU image must execute")
+                .result
+            }
+            Backend::Metal | Backend::Cuda => unreachable!(),
+        };
+        let checkpoint = checkpoint_image(&image, &result);
+        match validate(&checkpoint, backend) {
+            Ok(()) => format!("{backend}: accepted input and continuation"),
+            Err(error) => format!("{backend}: accepted input but rejected continuation: {error}"),
+        }
+    });
+
+    let expected = "flow FlowId(0) TCP generator is Scheduled with an active retransmission timer";
+    assert_eq!(
+        outcomes,
+        [
+            format!("Scalar: rejected input: {expected}"),
+            format!("Cpu: rejected input: {expected}"),
+        ]
+    );
+}
+
+#[test]
+fn reachable_recovery_timer_may_precede_the_latest_attempt() {
+    for control in [
+        TcpCongestionControl::reno(MSS),
+        TcpCongestionControl::cubic(MSS),
+    ] {
+        let image = recovery_campaign_image(control);
+        let prefix = run_scalar_with_observations(&image, Some(6), ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("{} recovery prefix: {error}", control.label()));
+        let FlowGeneratorKind::Tcp(tcp) = prefix.host_states[0].generators[0].kind else {
+            unreachable!()
+        };
+        let timer = tcp.active_timer.expect("recovery keeps the oldest timer");
+        assert_eq!(tcp.control.phase(), TcpPhase::FastRecovery);
+        assert_ne!(timer.attempt, tcp.last_attempt);
+
+        let checkpoint = checkpoint_image(&image, &prefix);
+        validate(&checkpoint, Backend::Scalar)
+            .unwrap_or_else(|error| panic!("{} Scalar checkpoint: {error}", control.label()));
+        validate(&checkpoint, Backend::Cpu { workers: 2 })
+            .unwrap_or_else(|error| panic!("{} CPU checkpoint: {error}", control.label()));
+        let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("{} Scalar continuation: {error}", control.label()));
+        let cpu = run_cpu_with_observations(
+            &checkpoint,
+            None,
+            CpuConfig {
+                workers: 2,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("{} CPU continuation: {error}", control.label()));
+        assert_eq!(cpu.result, scalar, "{} continuation", control.label());
+    }
+}
+
+#[test]
+fn retransmission_timer_requires_unacknowledged_ledger_coverage() {
+    for status in [GeneratorStatus::Finished, GeneratorStatus::Blocked] {
+        let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+        image.stop_time_ns = 0;
+        image.initial_events.clear();
+        let generator = &mut image.host_states[0].generators[0];
+        generator.packets_emitted = 1;
+        generator.bytes_emitted = MSS;
+        generator.next_emission.status = status;
+        generator.feedback.outstanding_bytes = 0;
+        generator.feedback.unacknowledged_bytes = 0;
+        let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+            unreachable!()
+        };
+        tcp.next_sequence = MSS;
+        tcp.highest_ack = MSS;
+        tcp.last_attempt = FIRST;
+        tcp.timer_generation = 1;
+        tcp.active_timer = Some(TcpTimerState {
+            attempt: FIRST,
+            sequence: MSS,
+            deadline_ns: 0,
+            generation: 1,
+            rto_ns: TcpGenerator::INITIAL_RTO_NS,
+        });
+        image.host_states[0].sourced_packets = 1;
+        image.host_states[0].departed_packets = 1;
+        image.host_states[1].sourced_packets = 1;
+        image.host_states[1].departed_packets = 1;
+        image.host_states[1].received_packets = 1;
+        image.host_states[1].tcp_receivers[0].next_expected_sequence = MSS;
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RetransmissionTimeout),
+                origin_node: SOURCE,
+                origin_seq: 0,
+            },
+            target: SOURCE,
+            kind: EventKind::RetransmissionTimeout,
+            payload: FIRST,
+        });
+
+        let expected = match status {
+            GeneratorStatus::Finished => {
+                "flow FlowId(0) TCP generator is Finished with an active retransmission timer"
+            }
+            GeneratorStatus::Blocked => {
+                "flow FlowId(0) TCP generator is Blocked without unacknowledged data"
+            }
+            GeneratorStatus::Scheduled | GeneratorStatus::Stopped => unreachable!(),
+        };
+        for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+            let error = validate(&image, backend)
+                .expect_err("a timer cannot target the empty acknowledged ledger range");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+}
+
+#[test]
+fn active_timer_attempt_must_be_source_allocated() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let prefix = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
+        .expect("initial TCP send should produce a blocked checkpoint");
+    let mut checkpoint = checkpoint_image(&image, &prefix);
+    let next_payload_seq = checkpoint.host_states[0].next_payload_seq;
+    let unallocated =
+        PayloadId::from_node_sequence(SOURCE, checkpoint.nodes.len() as u64, next_payload_seq)
+            .expect("small fixture payload identity");
+    let FlowGeneratorKind::Tcp(ref mut tcp) = checkpoint.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    let timer = tcp
+        .active_timer
+        .as_mut()
+        .expect("blocked sender has an active timer");
+    let old_attempt = timer.attempt;
+    timer.attempt = unallocated;
+    checkpoint
+        .initial_events
+        .iter_mut()
+        .find(|event| {
+            event.kind == EventKind::RetransmissionTimeout && event.payload == old_attempt
+        })
+        .expect("checkpoint contains the timer event")
+        .payload = unallocated;
+
+    let expected = format!(
+        "flow FlowId(0) TCP active retransmission timer attempt {unallocated:?} was not allocated by source node NodeId(0)"
+    );
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&checkpoint, backend)
+            .expect_err("timer identity must name an already allocated source attempt");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn fast_recovery_cannot_retransmit_beyond_the_sent_ledger() {
+    for control in [
+        TcpCongestionControl::reno(MSS),
+        TcpCongestionControl::cubic(MSS),
+    ] {
+        let image = recovery_campaign_image(control);
+        let prefix = run_scalar_with_observations(&image, Some(6), ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("{} recovery prefix: {error}", control.label()));
+        for corrupt_generator_bound in [false, true] {
+            let mut checkpoint = checkpoint_image(&image, &prefix);
+            let FlowGeneratorKind::Tcp(ref mut tcp) = checkpoint.host_states[0].generators[0].kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(tcp.control.phase(), TcpPhase::FastRecovery);
+            let unsent_sequence = tcp.next_sequence + 1;
+            if corrupt_generator_bound {
+                tcp.recovery_high_sequence = unsent_sequence;
+            } else {
+                match &mut tcp.control {
+                    TcpCongestionControl::Reno(state) => {
+                        state.recovery_high_sequence = unsent_sequence;
+                    }
+                    TcpCongestionControl::Cubic(state) => {
+                        state.recovery_high_sequence = unsent_sequence;
+                    }
+                }
+            }
+
+            let expected = format!(
+                "flow FlowId(0) TCP recovery can retransmit beyond next sequence {}",
+                tcp.next_sequence
+            );
+            for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+                let error = validate(&checkpoint, backend).expect_err(
+                    "every recovery retransmission target must stay inside the sent ledger",
+                );
+                assert_eq!(error.to_string(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn one_timeout_event_cannot_drive_two_blocked_tcp_flows() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    image.stop_time_ns = TcpGenerator::INITIAL_RTO_NS;
+    image.initial_events.clear();
+    image.initial_packets[0].size_bytes = MSS;
+    let generator = &mut image.host_states[0].generators[0];
+    generator.packets_emitted = 1;
+    generator.bytes_emitted = MSS;
+    generator.next_emission.status = GeneratorStatus::Blocked;
+    generator.feedback.outstanding_bytes = MSS;
+    generator.feedback.unacknowledged_bytes = MSS;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.next_sequence = MSS;
+    tcp.bytes_in_flight = MSS;
+    tcp.last_attempt = FIRST;
+    tcp.timer_generation = 1;
+    tcp.active_timer = Some(TcpTimerState {
+        attempt: FIRST,
+        sequence: 0,
+        deadline_ns: TcpGenerator::INITIAL_RTO_NS,
+        generation: 1,
+        rto_ns: TcpGenerator::INITIAL_RTO_NS,
+    });
+    image.host_states[0].sourced_packets = 1;
+    image.host_states[0].departed_packets = 1;
+
+    let mut second_flow = image.flows[0].clone();
+    second_flow.id = FlowId(1);
+    image.flows.push(second_flow);
+    let mut second_generator = image.host_states[0].generators[0];
+    second_generator.flow = FlowId(1);
+    second_generator.next_emission.payload = PayloadId(2);
+    let FlowGeneratorKind::Tcp(ref mut second_tcp) = second_generator.kind else {
+        unreachable!()
+    };
+    second_tcp.last_attempt = PayloadId(2);
+    image.host_states[0].generators.push(second_generator);
+    image.host_states[0].next_payload_seq = 2;
+    image.host_states[0].sourced_packets = 2;
+    image.host_states[0].departed_packets = 2;
+    let mut second_receiver = image.host_states[1].tcp_receivers[0].clone();
+    second_receiver.flow = FlowId(1);
+    image.host_states[1].tcp_receivers.push(second_receiver);
+    image.initial_packets.push(PacketDescriptor {
+        id: PayloadId(2),
+        flow: FlowId(1),
+        size_bytes: MSS,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: 0,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+    });
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: TcpGenerator::INITIAL_RTO_NS,
+            phase: event_phase(EventKind::RetransmissionTimeout),
+            origin_node: SOURCE,
+            origin_seq: 0,
+        },
+        target: SOURCE,
+        kind: EventKind::RetransmissionTimeout,
+        payload: FIRST,
+    });
+
+    let expected = "flows FlowId(0) and FlowId(1) TCP active retransmission timers share event identity at node NodeId(0), payload PayloadId(0), deadline 1000000000";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("one timeout event cannot be claimed by two blocked generators");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn zero_flight_duplicate_acks_do_not_preempt_a_scheduled_send() {
+    let mut image = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), MSS, &[0, 0, 0]);
+    image.stop_time_ns = 100;
+    image.host_states[0].generators[0]
+        .next_emission
+        .departure_time_ns = 100;
+    let PacketKind::TcpData(ref mut header) = image.initial_packets[0].kind else {
+        unreachable!()
+    };
+    header.sent_time_ns = 100;
+    image
+        .initial_events
+        .iter_mut()
+        .find(|event| event.kind == EventKind::PacketArrival)
+        .expect("scheduled source event")
+        .key
+        .time_ns = 100;
+    image.initial_events.sort_by_key(|event| event.key);
+
+    validate(&image, Backend::Scalar).expect("stale zero-flight ACKs are safe for Scalar");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("stale zero-flight ACKs are safe for CPU");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("zero-flight ACKs must not invalidate the scheduled send");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU zero-flight ACK handling")
+    .result;
+    assert_eq!(cpu, scalar);
+    assert_eq!(
+        scalar.host_states[0].generators[0].packets_emitted, 1,
+        "the original scheduled segment must be emitted exactly once"
+    );
+}
+
+#[test]
+fn advancing_ack_does_not_preempt_a_scheduled_send() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    image.stop_time_ns = 200;
+    let scheduled_payload = image.host_states[0].generators[0].next_emission.payload;
+    image.host_states[0].generators[0]
+        .next_emission
+        .departure_time_ns = 100;
+    let scheduled_event = image
+        .initial_events
+        .iter_mut()
+        .find(|event| event.kind == EventKind::PacketArrival)
+        .expect("scheduled source event");
+    scheduled_event.key.time_ns = 100;
+    let scheduled_packet = image
+        .initial_packets
+        .iter_mut()
+        .find(|packet| packet.id == scheduled_payload)
+        .expect("scheduled source descriptor");
+    let PacketKind::TcpData(ref mut header) = scheduled_packet.kind else {
+        unreachable!()
+    };
+    header.sent_time_ns = 100;
+    image.initial_events.sort_by_key(|event| event.key);
+
+    validate(&image, Backend::Scalar).expect("advancing-ACK image is valid for Scalar");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("advancing-ACK image is valid for CPU");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the advancing ACK must preserve the reserved scheduled send");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU advancing-ACK handling")
+    .result;
+
+    assert_eq!(cpu, scalar);
+    let prefix = run_scalar_with_observations(&image, Some(100), ObservationMode::Full)
+        .expect("Scalar prefix after ACK and before the scheduled send");
+    let cpu_prefix = run_cpu_with_observations(
+        &image,
+        Some(100),
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU prefix after ACK and before the scheduled send")
+    .result;
+    assert_eq!(cpu_prefix, prefix);
+    let FlowGeneratorKind::Tcp(prefix_tcp) = prefix.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(prefix_tcp.highest_ack, MSS);
+    assert_eq!(
+        prefix.host_states[0].generators[0].next_emission.status,
+        GeneratorStatus::Scheduled
+    );
+    let prefix_checkpoint = checkpoint_image(&image, &prefix);
+    validate(&prefix_checkpoint, Backend::Scalar).expect("Scalar prefix checkpoint must validate");
+    validate(&prefix_checkpoint, Backend::Cpu { workers: 2 })
+        .expect("CPU prefix checkpoint must validate");
+    let scalar_continuation =
+        run_scalar_with_observations(&prefix_checkpoint, None, ObservationMode::Full)
+            .expect("Scalar continuation must preserve the scheduled send");
+    let cpu_continuation = run_cpu_with_observations(
+        &prefix_checkpoint,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU continuation must preserve the scheduled send")
+    .result;
+    assert_eq!(cpu_continuation, scalar_continuation);
+    assert_eq!(stitch_checkpoint_run(&prefix, &scalar_continuation), scalar);
+    assert_eq!(scalar.host_states[0].generators[0].packets_emitted, 2);
+    assert_eq!(
+        scalar
+            .observed_packets
+            .iter()
+            .filter(|packet| packet.id == scheduled_payload)
+            .count(),
+        1,
+        "the reserved scheduled descriptor must be emitted exactly once"
+    );
+    let checkpoint = checkpoint_image(&image, &scalar);
+    validate(&checkpoint, Backend::Scalar).expect("Scalar continuation must validate");
+    validate(&checkpoint, Backend::Cpu { workers: 2 }).expect("CPU continuation must validate");
+}
+
+#[test]
+fn loss_acks_before_a_scheduled_send_still_retransmit() {
+    let mut image = scheduled_tcp_checkpoint_image(1, 2);
+    image.stop_time_ns = 200;
+    let scheduled_payload = image.host_states[0].generators[0].next_emission.payload;
+    image.host_states[0].generators[0]
+        .next_emission
+        .departure_time_ns = 100;
+    image.initial_events.retain(|event| event.payload != FIRST);
+    let scheduled_event = image
+        .initial_events
+        .iter_mut()
+        .find(|event| event.kind == EventKind::PacketArrival)
+        .expect("scheduled source event");
+    scheduled_event.key.time_ns = 100;
+    let scheduled_packet = image
+        .initial_packets
+        .iter_mut()
+        .find(|packet| packet.id == scheduled_payload)
+        .expect("scheduled source descriptor");
+    let PacketKind::TcpData(ref mut header) = scheduled_packet.kind else {
+        unreachable!()
+    };
+    header.sent_time_ns = 100;
+
+    let node_count = image.nodes.len() as u64;
+    for origin_seq in 0..3 {
+        let payload = PayloadId(SINK.0 + node_count * origin_seq);
+        image.initial_packets.push(PacketDescriptor {
+            id: payload,
+            flow: FLOW,
+            size_bytes: ACK_BYTES,
+            kind: PacketKind::TcpAck(TcpAckHeader {
+                acknowledgment: 0,
+                acknowledged_bytes: 0,
+                echoed_sent_time_ns: 0,
+            }),
+        });
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: origin_seq + 1,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SINK,
+                origin_seq,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload,
+        });
+    }
+    image.host_states[1].next_origin_seq = 3;
+    image.host_states[1].next_payload_seq = 3;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+    image.initial_events.sort_by_key(|event| event.key);
+
+    validate(&image, Backend::Scalar).expect("loss-ACK image is valid for Scalar");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("loss-ACK image is valid for CPU");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("Scalar must retain fast retransmit before the scheduled send");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU must retain fast retransmit before the scheduled send")
+    .result;
+
+    assert_eq!(cpu, scalar);
+    let prefix = run_scalar_with_observations(&image, Some(100), ObservationMode::Full)
+        .expect("Scalar loss-recovery prefix before the scheduled send");
+    let cpu_prefix = run_cpu_with_observations(
+        &image,
+        Some(100),
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU loss-recovery prefix before the scheduled send")
+    .result;
+    assert_eq!(cpu_prefix, prefix);
+    assert_eq!(
+        prefix.host_states[0].generators[0].next_emission.status,
+        GeneratorStatus::Scheduled
+    );
+    let prefix_checkpoint = checkpoint_image(&image, &prefix);
+    validate(&prefix_checkpoint, Backend::Scalar).expect("Scalar prefix checkpoint must validate");
+    validate(&prefix_checkpoint, Backend::Cpu { workers: 2 })
+        .expect("CPU prefix checkpoint must validate");
+    let scalar_continuation =
+        run_scalar_with_observations(&prefix_checkpoint, None, ObservationMode::Full)
+            .expect("Scalar loss-recovery continuation");
+    let cpu_continuation = run_cpu_with_observations(
+        &prefix_checkpoint,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU loss-recovery continuation")
+    .result;
+    assert_eq!(cpu_continuation, scalar_continuation);
+    assert_eq!(stitch_checkpoint_run(&prefix, &scalar_continuation), scalar);
+    assert!(scalar.observed_packets.iter().any(|packet| {
+        matches!(
+            packet.kind,
+            PacketKind::TcpData(TcpDataHeader {
+                sequence: 0,
+                retransmission: true,
+                ..
+            })
+        )
+    }));
+    let checkpoint = checkpoint_image(&image, &scalar);
+    validate(&checkpoint, Backend::Scalar).expect("Scalar continuation must validate");
+    validate(&checkpoint, Backend::Cpu { workers: 2 }).expect("CPU continuation must validate");
+}

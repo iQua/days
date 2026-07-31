@@ -1032,7 +1032,8 @@ impl<'image> TransitionState<'image> {
         seed_tcp_segment(&mut self.tcp_sent_segments, packet)?;
         self.enqueue_source_packet(node, packet.id)?;
         self.record_sourced(node.id, packet)?;
-        let plan = self.prepare_tcp_attempts(node, packet.flow, event.key.time_ns, None, true)?;
+        let plan =
+            self.prepare_tcp_attempts(node, packet.flow, event.key.time_ns, None, true, false)?;
         self.install_tcp_attempts(node, event, plan, children)
     }
 
@@ -1445,7 +1446,13 @@ impl<'image> TransitionState<'image> {
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
         self.mark_terminal(packet.id)?;
 
-        let (retransmit_sequence, fill_window, acknowledged_through, transition) = {
+        let (
+            retransmit_sequence,
+            fill_window,
+            acknowledged_through,
+            transition,
+            scheduled_send_pending,
+        ) = {
             let state = self.host_state_mut(node)?;
             let generator = state
                 .generators
@@ -1502,7 +1509,10 @@ impl<'image> TransitionState<'image> {
                     retransmit = Some(acknowledgment);
                 }
                 fill = acknowledgment < tcp.total_bytes;
-            } else if acknowledgment == tcp.highest_ack && tcp.highest_ack < tcp.total_bytes {
+            } else if acknowledgment == tcp.highest_ack
+                && tcp.highest_ack < tcp.total_bytes
+                && tcp.bytes_in_flight != 0
+            {
                 input = Some(TcpTransitionInput::DuplicateAck {
                     flight_size_bytes: tcp.bytes_in_flight,
                     recovery_high_sequence: tcp.next_sequence,
@@ -1524,6 +1534,8 @@ impl<'image> TransitionState<'image> {
             generator.feedback.outstanding_bytes = tcp.bytes_in_flight;
             generator.feedback.unacknowledged_bytes = tcp.bytes_in_flight;
             generator.kind = FlowGeneratorKind::Tcp(tcp);
+            let scheduled_send_pending =
+                generator.next_emission.status == GeneratorStatus::Scheduled;
             let transition = input.map(|input| TcpTransitionRecord {
                 key: event.key,
                 node: node.id,
@@ -1533,20 +1545,37 @@ impl<'image> TransitionState<'image> {
                 before,
                 after: tcp.control,
             });
-            (retransmit, fill, acknowledged_through, transition)
+            (
+                retransmit,
+                fill,
+                acknowledged_through,
+                transition,
+                scheduled_send_pending,
+            )
         };
         if let Some(acknowledgment) = acknowledged_through {
             acknowledge_tcp_segments(&mut self.tcp_sent_segments, packet.flow, acknowledgment)?;
         }
+        let sender_transition = transition.is_some();
         if self.observation_mode == ObservationMode::Full {
             self.tcp_transitions.extend(transition);
+        }
+        if !sender_transition {
+            return Ok(());
+        }
+        // A Scheduled TCP descriptor already reserves next_sequence and owns its pending
+        // PacketArrival. ACKs may update the sender and ledger, and loss recovery may retransmit
+        // an older sequence, but fresh window fill must wait for the reserved event.
+        if scheduled_send_pending && retransmit_sequence.is_none() {
+            return Ok(());
         }
         let plan = self.prepare_tcp_attempts(
             node,
             packet.flow,
             event.key.time_ns,
             retransmit_sequence,
-            fill_window,
+            fill_window && !scheduled_send_pending,
+            scheduled_send_pending,
         )?;
         self.install_tcp_attempts(node, event, plan, children)
     }
@@ -1601,7 +1630,7 @@ impl<'image> TransitionState<'image> {
             self.tcp_transitions.push(transition);
         }
         let plan =
-            self.prepare_tcp_attempts(node, flow, event.key.time_ns, Some(sequence), false)?;
+            self.prepare_tcp_attempts(node, flow, event.key.time_ns, Some(sequence), false, false)?;
         self.install_tcp_attempts(node, event, plan, children)
     }
 
@@ -2147,6 +2176,7 @@ impl<'image> TransitionState<'image> {
         now_ns: u64,
         retransmit_sequence: Option<u64>,
         fill_window: bool,
+        preserve_scheduled_send: bool,
     ) -> Result<TcpSendPlan, ExecutionError> {
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let retransmit_segment = retransmit_sequence
@@ -2249,35 +2279,38 @@ impl<'image> TransitionState<'image> {
             }
         }
 
-        let timer = if tcp.active_timer.is_none() && tcp.bytes_in_flight != 0 {
-            tcp.timer_generation = tcp
-                .timer_generation
-                .checked_add(1)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let deadline_ns = now_ns
-                .checked_add(tcp.rto_ns)
-                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
-            let timer = TcpTimerState {
-                attempt: tcp.last_attempt,
-                sequence: tcp.highest_ack,
-                deadline_ns,
-                generation: tcp.timer_generation,
-                rto_ns: tcp.rto_ns,
+        let timer =
+            if !preserve_scheduled_send && tcp.active_timer.is_none() && tcp.bytes_in_flight != 0 {
+                tcp.timer_generation = tcp
+                    .timer_generation
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                let deadline_ns = now_ns
+                    .checked_add(tcp.rto_ns)
+                    .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+                let timer = TcpTimerState {
+                    attempt: tcp.last_attempt,
+                    sequence: tcp.highest_ack,
+                    deadline_ns,
+                    generation: tcp.timer_generation,
+                    rto_ns: tcp.rto_ns,
+                };
+                tcp.active_timer = Some(timer);
+                Some(timer)
+            } else {
+                None
             };
-            tcp.active_timer = Some(timer);
-            Some(timer)
-        } else {
-            None
-        };
 
         let generator = &mut state.generators[generator_index];
         generator.feedback.outstanding_bytes = tcp.bytes_in_flight;
         generator.feedback.unacknowledged_bytes = tcp.bytes_in_flight;
-        generator.next_emission.status = if tcp.highest_ack >= tcp.total_bytes {
-            GeneratorStatus::Finished
-        } else {
-            GeneratorStatus::Blocked
-        };
+        if !preserve_scheduled_send {
+            generator.next_emission.status = if tcp.highest_ack >= tcp.total_bytes {
+                GeneratorStatus::Finished
+            } else {
+                GeneratorStatus::Blocked
+            };
+        }
         generator.kind = FlowGeneratorKind::Tcp(tcp);
         state.sourced_packets = state
             .sourced_packets

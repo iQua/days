@@ -494,6 +494,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut owners =
         BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64, bool)>::new();
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
+    let mut claimed_tcp_timers = BTreeMap::<(NodeId, PayloadId, u64), crate::FlowId>::new();
     for owner in image
         .nodes
         .iter()
@@ -607,10 +608,28 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                         flow.id
                     )));
                 }
+                // Partial-ACK recovery may request a retransmission at the new cumulative ACK.
+                // Keeping both recovery bounds inside the sent prefix guarantees that the
+                // normalized ledger below contains that sequence whenever it is referenced.
+                if tcp.control.phase() == crate::TcpPhase::FastRecovery
+                    && (tcp.recovery_high_sequence > tcp.next_sequence
+                        || tcp.control.recovery_high_sequence() > tcp.next_sequence)
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} TCP recovery can retransmit beyond next sequence {}",
+                        flow.id, tcp.next_sequence
+                    )));
+                }
                 match generator.next_emission.status {
                     GeneratorStatus::Scheduled if remaining == 0 => {
                         return Err(ValidationError::new(format!(
                             "flow {:?} has a scheduled emission after its TCP generator finished",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Scheduled if tcp.active_timer.is_some() => {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} TCP generator is Scheduled with an active retransmission timer",
                             flow.id
                         )));
                     }
@@ -624,6 +643,12 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                             flow.id
                         )));
                     }
+                    GeneratorStatus::Finished if tcp.active_timer.is_some() => {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} TCP generator is Finished with an active retransmission timer",
+                            flow.id
+                        )));
+                    }
                     GeneratorStatus::Stopped => {
                         return Err(ValidationError::new(format!(
                             "flow {:?} TCP generator cannot use the open-loop Stopped state",
@@ -632,6 +657,17 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                     }
                     GeneratorStatus::Blocked => {
                         validate_blocked_tcp_timer(image, owner.id, flow.id, tcp)?;
+                        let timer = tcp
+                            .active_timer
+                            .expect("blocked timer validation established an active timer");
+                        if let Some(first_flow) = claimed_tcp_timers
+                            .insert((owner.id, timer.attempt, timer.deadline_ns), flow.id)
+                        {
+                            return Err(ValidationError::new(format!(
+                                "flows {first_flow:?} and {:?} TCP active retransmission timers share event identity at node {:?}, payload {:?}, deadline {}",
+                                flow.id, owner.id, timer.attempt, timer.deadline_ns
+                            )));
+                        }
                     }
                     GeneratorStatus::Scheduled | GeneratorStatus::Finished => {}
                 }
@@ -1036,12 +1072,33 @@ fn validate_blocked_tcp_timer(
             "flow {flow:?} TCP generator is Blocked without an active retransmission timer"
         ))
     })?;
-    if timer.sequence != tcp.highest_ack
-        || timer.generation != tcp.timer_generation
-        || timer.attempt != tcp.last_attempt
-    {
+    if tcp.bytes_in_flight == 0 {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} TCP generator is Blocked without unacknowledged data"
+        )));
+    }
+    if timer.sequence != tcp.highest_ack || timer.generation != tcp.timer_generation {
         return Err(ValidationError::new(format!(
             "flow {flow:?} TCP active retransmission timer is inconsistent with sender state"
+        )));
+    }
+    // The timer attempt identifies its pending event. It can legitimately precede last_attempt:
+    // later duplicate ACKs may fill the window without replacing the oldest active timer.
+    let state_slot = node(image, owner)
+        .expect("generator validation established owner")
+        .state_slot as usize;
+    let next_payload_seq = image.host_states[state_slot].next_payload_seq;
+    let node_count = u64::try_from(image.nodes.len()).unwrap_or(u64::MAX);
+    let attempt_sequence = timer
+        .attempt
+        .0
+        .checked_sub(owner.0)
+        .filter(|offset| node_count != 0 && offset % node_count == 0)
+        .map(|offset| offset / node_count);
+    if attempt_sequence.is_none_or(|sequence| sequence >= next_payload_seq) {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} TCP active retransmission timer attempt {:?} was not allocated by source node {owner:?}",
+            timer.attempt
         )));
     }
     let matching_events = image
@@ -1098,10 +1155,36 @@ fn validate_scheduled_payload_sequence(
     Ok(())
 }
 
+struct DerivedChannelDelays {
+    possible: BTreeMap<(LinkId, NodeId), u64>,
+    required: BTreeSet<(LinkId, NodeId)>,
+}
+
+fn insert_derived_delay(
+    delays: &mut BTreeMap<(LinkId, NodeId), u64>,
+    route: (LinkId, NodeId),
+    delay: u64,
+) {
+    delays
+        .entry(route)
+        .and_modify(|minimum| *minimum = (*minimum).min(delay))
+        .or_insert(delay);
+}
+
 fn validate_packets_and_derive_delays(
     image: &SimulationImage,
-) -> Result<BTreeMap<(LinkId, NodeId), u64>, ValidationError> {
-    let mut derived = BTreeMap::<(LinkId, NodeId), u64>::new();
+) -> Result<DerivedChannelDelays, ValidationError> {
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
+    let live_tcp_data_flows = image
+        .initial_packets
+        .iter()
+        .filter(|packet| {
+            live_payloads.contains(&packet.id) && matches!(packet.kind, PacketKind::TcpData(_))
+        })
+        .map(|packet| packet.flow)
+        .collect::<BTreeSet<_>>();
+    let mut possible = BTreeMap::<(LinkId, NodeId), u64>::new();
+    let mut required = BTreeSet::<(LinkId, NodeId)>::new();
     for packet in &image.initial_packets {
         if packet.size_bytes == 0 {
             return Err(ValidationError::new(format!(
@@ -1147,22 +1230,24 @@ fn validate_packets_and_derive_delays(
                     packet.id, link.id
                 ))
             })?;
-            derived
-                .entry((
-                    link.id,
-                    route_target(image, route, index, terminal)
-                        .expect("validated route has a direct target"),
-                ))
-                .and_modify(|minimum| *minimum = (*minimum).min(delay))
-                .or_insert(delay);
+            let route = (
+                link.id,
+                route_target(image, route, index, terminal)
+                    .expect("validated route has a direct target"),
+            );
+            insert_derived_delay(&mut possible, route, delay);
+            if live_payloads.contains(&packet.id) {
+                required.insert(route);
+            }
         }
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if remaining_generator_packets(generator)? == 0 {
-                continue;
-            }
             let flow = flow(image, generator.flow).expect("generator validation established flow");
+            let generator_can_emit = matches!(
+                generator.next_emission.status,
+                GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+            );
             let (packet_size_bytes, route, terminal) = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => (
                     constant.packet_size_bytes,
@@ -1170,6 +1255,8 @@ fn validate_packets_and_derive_delays(
                     flow.target,
                 ),
                 FlowGeneratorKind::Tcp(tcp) => {
+                    let ack_can_be_emitted =
+                        generator_can_emit || live_tcp_data_flows.contains(&flow.id);
                     for (index, link_id) in flow.reverse_route.iter().enumerate() {
                         let link = link(image, *link_id)
                             .expect("validated reverse route names an existing link");
@@ -1179,14 +1266,15 @@ fn validate_packets_and_derive_delays(
                                 link.id, flow.id
                             ))
                         })?;
-                        derived
-                            .entry((
-                                link.id,
-                                route_target(image, &flow.reverse_route, index, flow.source)
-                                    .expect("validated reverse route has a direct target"),
-                            ))
-                            .and_modify(|minimum| *minimum = (*minimum).min(delay))
-                            .or_insert(delay);
+                        let route = (
+                            link.id,
+                            route_target(image, &flow.reverse_route, index, flow.source)
+                                .expect("validated reverse route has a direct target"),
+                        );
+                        insert_derived_delay(&mut possible, route, delay);
+                        if ack_can_be_emitted {
+                            required.insert(route);
+                        }
                     }
                     // TCP may emit a short final or congestion-window-limited segment.  A
                     // single byte is therefore the conservative lower bound for every future
@@ -1203,18 +1291,19 @@ fn validate_packets_and_derive_delays(
                         link.id, flow.id
                     ))
                 })?;
-                derived
-                    .entry((
-                        link.id,
-                        route_target(image, route, index, terminal)
-                            .expect("validated route has a direct target"),
-                    ))
-                    .and_modify(|minimum| *minimum = (*minimum).min(delay))
-                    .or_insert(delay);
+                let route = (
+                    link.id,
+                    route_target(image, route, index, terminal)
+                        .expect("validated route has a direct target"),
+                );
+                insert_derived_delay(&mut possible, route, delay);
+                if generator_can_emit {
+                    required.insert(route);
+                }
             }
         }
     }
-    Ok(derived)
+    Ok(DerivedChannelDelays { possible, required })
 }
 
 fn validate_owned_service_state(
@@ -1713,7 +1802,7 @@ fn validate_payload_egress(
 fn validate_channels(
     image: &SimulationImage,
     backend: Backend,
-    derived_delays: &BTreeMap<(LinkId, NodeId), u64>,
+    derived_delays: &DerivedChannelDelays,
 ) -> Result<(), ValidationError> {
     let mut channels_by_route = BTreeMap::<(LinkId, NodeId), usize>::new();
     for (index, channel) in image.channels.iter().enumerate() {
@@ -1753,7 +1842,11 @@ fn validate_channels(
                 channel.link, channel.target,
             )));
         }
-        let Some(derived) = derived_delays.get(&(channel.link, channel.target)).copied() else {
+        let Some(derived) = derived_delays
+            .possible
+            .get(&(channel.link, channel.target))
+            .copied()
+        else {
             return Err(ValidationError::new(format!(
                 "channel {index} references link {:?} to node {:?}, which has no possible route-selected packet emission",
                 channel.link, channel.target,
@@ -1772,7 +1865,7 @@ fn validate_channels(
         }
     }
 
-    for &(link_id, target) in derived_delays.keys() {
+    for &(link_id, target) in &derived_delays.required {
         if !channels_by_route.contains_key(&(link_id, target)) {
             let link = link(image, link_id).expect("derived delay names a validated link");
             return Err(ValidationError::new(format!(
