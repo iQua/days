@@ -21,12 +21,6 @@ using ulong = uint64_t;
     ulong *observation_meta, ulong *inbound_meta, ulong *inbound_producers, \
     ulong *merge_cursors, ulong *stream_state, ulong *stream_records
 
-#define DAYS_BUFFER_ARGS \
-    control, params, node_state, generators, flows, routes, links, fel_meta, fel_records, \
-    queue_meta, queue_records, in_service, outbox, worklist, summary, observed, departures, \
-    arrivals, lp_state, remote_meta, remote_staging, observation_meta, inbound_meta, \
-    inbound_producers, merge_cursors, stream_state, stream_records
-
 constexpr uint EVENT_WORDS = 11;
 constexpr uint NODE_WORDS = 11;
 constexpr uint GENERATOR_WORDS = 16;
@@ -62,8 +56,6 @@ constexpr uint C_ACTIVE = 15;
 constexpr uint C_FRONTIER = 16;
 constexpr uint C_CONTINUATION = 17;
 constexpr uint C_RELAUNCHES = 18;
-constexpr uint C_ACTIVE_HOSTS = 19;
-constexpr uint C_ACTIVE_SWITCHES = 20;
 
 constexpr uint P_NODE_COUNT = 0;
 constexpr uint P_FLOW_COUNT = 1;
@@ -2002,127 +1994,6 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     }
 }
 
-extern "C" __global__ void days_round_prepare_role(DAYS_BUFFERS) {
-    uint lane = threadIdx.x;
-    __shared__ ulong host_counts[1024];
-    __shared__ ulong switch_counts[1024];
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 0 ||
-        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
-        return;
-    }
-
-    ulong nodes = params[P_NODE_COUNT];
-    ulong chunk = nodes / 1024;
-    ulong remainder = nodes % 1024;
-    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
-    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
-    ulong local_hosts = 0;
-    ulong local_switches = 0;
-    if (params[P_STREAMS_ENABLED] != 0) {
-        for (
-            ulong channel = lane;
-            channel < params[P_CHANNEL_COUNT];
-            channel += 1024
-        ) {
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            stream_state[batch] = 0;
-            stream_state[batch + 1] = NONE;
-            stream_state[batch + 2] = NONE;
-            stream_state[batch + 3] = 0;
-        }
-    }
-    for (ulong node = start; node < end; ++node) {
-        ulong state = node * LP_STATE_WORDS;
-        lp_state[state + L_ERROR] = 0;
-        lp_state[state + L_ERROR_ARENA] = 0;
-        lp_state[state + L_ERROR_NODE] = NONE;
-        lp_state[state + L_ERROR_CAPACITY] = 0;
-        remote_meta[node * META_WORDS + 3] = 0;
-        ulong time;
-        if (
-            fel_root_time(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                time
-            ) &&
-            before_horizon(time, control)
-        ) {
-            if (node_state[node * NODE_WORDS + N_KIND] == HOST) {
-                local_hosts += 1;
-            } else {
-                local_switches += 1;
-            }
-        }
-    }
-
-    host_counts[lane] = local_hosts;
-    switch_counts[lane] = local_switches;
-    __syncthreads();
-    for (uint offset = 1; offset < 1024; offset <<= 1) {
-        ulong host_addend = lane >= offset ? host_counts[lane - offset] : 0;
-        ulong switch_addend = lane >= offset ? switch_counts[lane - offset] : 0;
-        __syncthreads();
-        host_counts[lane] += host_addend;
-        switch_counts[lane] += switch_addend;
-        __syncthreads();
-    }
-
-    ulong host_write = host_counts[lane] - local_hosts;
-    ulong switch_write =
-        host_counts[1023] + switch_counts[lane] - local_switches;
-    for (ulong node = start; node < end; ++node) {
-        ulong time;
-        if (
-            fel_root_time(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                time
-            ) &&
-            before_horizon(time, control)
-        ) {
-            ulong write;
-            if (node_state[node * NODE_WORDS + N_KIND] == HOST) {
-                write = host_write++;
-            } else {
-                write = switch_write++;
-            }
-            if (write >= params[P_WORKLIST_CAPACITY]) {
-                if (lane == 0) {
-                    control[C_ERROR] = ERROR_CAPACITY;
-                    control[C_ERROR_ARENA] = ARENA_WORKLIST;
-                    control[C_ERROR_NODE] = NONE;
-                    control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
-                }
-                return;
-            }
-            worklist[write] = node;
-            lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
-        }
-    }
-    __syncthreads();
-    if (lane == 0) {
-        control[C_ACTIVE_HOSTS] = host_counts[1023];
-        control[C_ACTIVE_SWITCHES] = switch_counts[1023];
-        control[C_ACTIVE] = host_counts[1023] + switch_counts[1023];
-        control[C_OUTBOX] = 0;
-        control[C_CONTINUATION] = 1;
-    }
-}
-
 extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
     uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (
@@ -2207,123 +2078,6 @@ extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
         dispatch_transitions += 1;
     }
 
-}
-
-__device__ __forceinline__ void days_round_role_active(
-    DAYS_BUFFERS,
-    ulong active_index,
-    ulong expected_role
-) {
-    ulong node = worklist[active_index];
-    ulong *state = lp_state + node * LP_STATE_WORDS;
-    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
-        return;
-    }
-    if (
-        expected_role != NONE &&
-        node_state[node * NODE_WORDS + N_KIND] != expected_role
-    ) {
-        set_semantic_error(state, 28, node);
-        return;
-    }
-
-    ulong dispatch_transitions = 0;
-    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
-        ulong event[EVENT_WORDS];
-        ulong selected_active;
-        ulong selected_stream;
-        if (!fel_peek(
-            node,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            event,
-            selected_active,
-            selected_stream
-        ) || !before_horizon(event[E_TIME], control)) {
-            state[L_FINISHED] = 1;
-            return;
-        }
-        if (!fel_pop_selected(
-            node,
-            selected_active,
-            selected_stream,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            event
-        )) {
-            set_semantic_error(state, 26, node);
-            return;
-        }
-        if (!dispatch_event(
-            node,
-            event,
-            state,
-            params,
-            node_state,
-            generators,
-            flows,
-            routes,
-            links,
-            fel_meta,
-            fel_records,
-            queue_meta,
-            queue_records,
-            in_service,
-            remote_meta,
-            remote_staging,
-            stream_state,
-            stream_records,
-            summary,
-            observation_meta,
-            observed,
-            departures,
-            arrivals
-        )) {
-            return;
-        }
-        if (state[L_TRANSITIONS] == NONE) {
-            set_semantic_error(state, 27, node);
-            return;
-        }
-        state[L_TRANSITIONS] += 1;
-        dispatch_transitions += 1;
-    }
-}
-
-extern "C" __global__ __launch_bounds__(1024) void days_round_host(DAYS_BUFFERS) {
-    ulong role_index = ulong(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 1 ||
-        role_index >= control[C_ACTIVE_HOSTS]
-    ) {
-        return;
-    }
-    days_round_role_active(DAYS_BUFFER_ARGS, role_index, HOST);
-}
-
-extern "C" __global__ __launch_bounds__(1024) void days_round_switch(DAYS_BUFFERS) {
-    ulong role_index = ulong(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 1 ||
-        role_index >= control[C_ACTIVE_SWITCHES]
-    ) {
-        return;
-    }
-    days_round_role_active(
-        DAYS_BUFFER_ARGS,
-        control[C_ACTIVE_HOSTS] + role_index,
-        SWITCH
-    );
 }
 
 // T15e diagnostic only. This kernel preserves the production event set and transition body. Its

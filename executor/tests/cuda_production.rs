@@ -468,47 +468,6 @@ fn cuda_two_runs_are_byte_exact() {
 }
 
 #[test]
-fn cuda_role_split_dispatch_matches_unified_dispatch() {
-    let image = fifo_taildrop_image();
-    let scalar = run_scalar_with_observations(&image, Some(27), ObservationMode::Full)
-        .expect("scalar role-split oracle must run");
-    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
-
-    for streams_enabled in [true, false] {
-        let unified = executor
-            .run_with_observations(
-                &image,
-                Some(27),
-                CudaConfig {
-                    streams_enabled,
-                    role_split: false,
-                    ..CudaConfig::default()
-                },
-                ObservationMode::Full,
-            )
-            .expect("unified CUDA dispatch must succeed");
-        let split = executor
-            .run_with_observations(
-                &image,
-                Some(27),
-                CudaConfig {
-                    streams_enabled,
-                    role_split: true,
-                    ..CudaConfig::default()
-                },
-                ObservationMode::Full,
-            )
-            .expect("role-split CUDA dispatch must succeed");
-
-        assert_eq!(unified.result, scalar);
-        assert_eq!(split.result, scalar);
-        assert_eq!(split.result, unified.result);
-        assert_eq!(split.rounds, unified.rounds);
-        assert_eq!(split.transitions, unified.transitions);
-    }
-}
-
-#[test]
 fn cuda_continuation_state_crosses_graph_waves_exactly() {
     let image = long_continuation_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
