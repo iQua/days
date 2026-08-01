@@ -1112,7 +1112,11 @@ fn validate_blocked_tcp_timer(
                 && event.key.time_ns == timer.deadline_ns
         })
         .count();
-    if matching_events != 1 {
+    // Timeout events do not encode a generation. When an ACK replaces a timer with the same
+    // attempt and deadline, the first indistinguishable event consumes the current timer and the
+    // remaining events are stale runtime no-ops. The state-generation check above identifies the
+    // live generation, so validation only needs one event with its executable identity.
+    if matching_events == 0 {
         return Err(ValidationError::new(format!(
             "flow {flow:?} TCP active retransmission timer has {matching_events} matching events; expected 1"
         )));
@@ -2170,6 +2174,7 @@ fn validate_global_time_capacity(
     let maximum_initial_time = image
         .initial_events
         .iter()
+        .filter(|event| event.key.time_ns <= image.stop_time_ns)
         .map(|event| event.key.time_ns)
         .max()
         .unwrap_or(0);
@@ -2748,6 +2753,21 @@ fn executable_generator_packets(
     }
 }
 
+fn is_preloaded_tcp_ack_arrival(
+    image: &SimulationImage,
+    event: &crate::Event,
+    generator_flow: crate::FlowId,
+) -> bool {
+    let Some(flow) = flow(image, generator_flow) else {
+        return false;
+    };
+    event.kind == EventKind::RemoteArrival
+        && event.target == flow.source
+        && packet(image, event.payload).is_some_and(|packet| {
+            packet.flow == generator_flow && matches!(packet.kind, PacketKind::TcpAck(_))
+        })
+}
+
 /// Conservative bound on timer installations reachable during the configured run.
 ///
 /// Runtime TCP feedback is serialized by a positive-delay reverse route. A phase-0 ACK cancels
@@ -2788,10 +2808,7 @@ fn tcp_timer_install_upper_bound(
             .iter()
             .filter(|event| {
                 event.key.time_ns <= image.stop_time_ns
-                    && packet(image, event.payload).is_some_and(|packet| {
-                        packet.flow == generator.flow
-                            && matches!(packet.kind, PacketKind::TcpAck(_))
-                    })
+                    && is_preloaded_tcp_ack_arrival(image, event, generator.flow)
             })
             .count(),
     )
@@ -2866,11 +2883,7 @@ fn tcp_attempt_upper_bound(
         image
             .initial_events
             .iter()
-            .filter(|event| {
-                packet(image, event.payload).is_some_and(|packet| {
-                    packet.flow == generator.flow && matches!(packet.kind, PacketKind::TcpAck(_))
-                })
-            })
+            .filter(|event| is_preloaded_tcp_ack_arrival(image, event, generator.flow))
             .count(),
     )
     .map_err(|_| {

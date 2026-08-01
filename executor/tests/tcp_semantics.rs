@@ -1071,6 +1071,51 @@ fn validator_reserves_tcp_timer_generation_capacity_before_execution() {
 }
 
 #[test]
+fn ack_service_siblings_do_not_double_count_timer_installations() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), 1);
+    image.stop_time_ns = 2;
+    for link in &mut image.links {
+        link.rate_bps = u64::MAX;
+    }
+    image.channels = vec![
+        RemoteChannel::for_packet_link(image.links[0], 1).unwrap(),
+        RemoteChannel::for_packet_link(image.links[1], ACK_BYTES).unwrap(),
+    ];
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.timer_generation = u64::MAX - 3;
+
+    validate(&image, Backend::Scalar).expect("reviewer ACK-sibling probe must validate for Scalar");
+    validate(&image, Backend::Cpu { workers: 2 })
+        .expect("reviewer ACK-sibling probe must validate for CPU");
+    let scalar = run_scalar_with_observations(&image, Some(2), ObservationMode::Full)
+        .expect("reviewer ACK-sibling Scalar prefix must execute");
+    let cpu = run_cpu_with_observations(
+        &image,
+        Some(2),
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("reviewer ACK-sibling CPU prefix must execute")
+    .result;
+    assert_eq!(cpu, scalar, "reviewer ACK-sibling byte identity");
+    let FlowGeneratorKind::Tcp(tcp) = scalar.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(tcp.timer_generation, u64::MAX - 2);
+
+    let checkpoint = checkpoint_image(&image, &scalar);
+    validate(&checkpoint, Backend::Scalar)
+        .expect("reviewer ACK-sibling checkpoint must validate for Scalar");
+    validate(&checkpoint, Backend::Cpu { workers: 2 })
+        .expect("reviewer ACK-sibling checkpoint must validate for CPU");
+}
+
+#[test]
 fn validator_reserves_tcp_rto_deadline_headroom_before_execution() {
     let mut rejected = tcp_image(TcpCongestionControl::reno(MSS), MSS);
     rejected.stop_time_ns = 1;
@@ -1114,6 +1159,65 @@ fn validator_reserves_tcp_rto_deadline_headroom_before_execution() {
     .expect("maximum safe CPU RTO must execute")
     .result;
     assert_eq!(cpu, scalar, "RTO deadline boundary byte identity");
+    let checkpoint = checkpoint_image(&boundary, &scalar);
+    validate(&checkpoint, Backend::Scalar)
+        .expect("maximum safe RTO checkpoint must validate for Scalar");
+    validate(&checkpoint, Backend::Cpu { workers: 2 })
+        .expect("maximum safe RTO checkpoint must validate for CPU");
+}
+
+#[test]
+fn stale_same_attempt_timers_preserve_checkpoint_closure() {
+    let acknowledgments = [0, 0, 0, MSS, 2 * MSS, 2 * MSS, 3 * MSS];
+    let mut image = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), 4 * MSS, &acknowledgments);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.timer_generation = u64::MAX - 8;
+
+    validate(&image, Backend::Scalar).expect("reviewer stale-timer probe must validate for Scalar");
+    validate(&image, Backend::Cpu { workers: 2 })
+        .expect("reviewer stale-timer probe must validate for CPU");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("reviewer stale-timer Scalar run must execute");
+    let cpu = run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("reviewer stale-timer CPU run must execute")
+    .result;
+    assert_eq!(cpu, scalar, "reviewer stale-timer byte identity");
+
+    let checkpoint = checkpoint_image(&image, &scalar);
+    let FlowGeneratorKind::Tcp(tcp) = checkpoint.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    let timer = tcp
+        .active_timer
+        .expect("reviewer checkpoint has a live timer");
+    assert_eq!(
+        checkpoint
+            .initial_events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::RetransmissionTimeout
+                    && event.target == SOURCE
+                    && event.payload == timer.attempt
+                    && event.key.time_ns == timer.deadline_ns
+            })
+            .count(),
+        3,
+        "reviewer checkpoint must retain the live timer and two stale generations"
+    );
+    validate(&checkpoint, Backend::Scalar)
+        .expect("reviewer stale-timer checkpoint must validate for Scalar");
+    validate(&checkpoint, Backend::Cpu { workers: 2 })
+        .expect("reviewer stale-timer checkpoint must validate for CPU");
 }
 
 #[test]
