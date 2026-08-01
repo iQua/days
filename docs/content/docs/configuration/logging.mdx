@@ -8,7 +8,7 @@ This page documents “general” configuration keys that are not specific to fl
 Implementation notes:
 
 - `CsvLogger` reads logging keys from `src/utils/logger.rs`.
-- Runtime/UI/tracing keys are read from small config structs in `src/topos/topo.rs` and `src/utils/`.
+- Runtime/UI/tracing keys are read from shared config structs in `src/topos/config.rs`, the legacy runtime in `legacy/src/topos/topo.rs`, and `src/utils/`.
 
 ## `seed` (required)
 
@@ -151,7 +151,7 @@ When enabled, Days installs a tracing subscriber layer and computes a wall-clock
 
 ## Application-level sources for TCP collectives (optional)
 
-For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with actor-managed byte buffers (`src/flows/app_source.rs`).
+For certain TCP collectives (broadcast, ring allreduce), legacy Days can back TCP flows with actor-managed byte buffers (`legacy/src/flows/app_source.rs`).
 
 - `Broadcast` uses one shared buffer per collective.
 - `RingAllReduce` uses one buffer per collective per directed ring link.

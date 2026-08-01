@@ -7,7 +7,7 @@
 
 # These are files related to logged outputs
 **/*.csv
-logs/**
+**/logs/**
 
 # RepoPrompt
 .repoprompt/**

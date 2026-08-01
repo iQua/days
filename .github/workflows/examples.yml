@@ -36,11 +36,19 @@ jobs:
 
       - name: Build and run examples
         run: |
-          for example in examples/*; do
+          for example in legacy/examples/*; do
             if [ -f "$example" ]; then
               echo "Running example: $example"
-              cargo run --release --example $(basename "$example" .rs)
-              echo "Running tests"
-              cargo test --features test
+              cargo run --release -p days-legacy --example $(basename "$example" .rs)
             fi
           done
+
+          cargo run --release --example scalar_benchmark -- configs/simple.toml
+          cargo run --release --example round_benchmark -- configs/simple.toml --repetitions 1
+
+      - name: Run partitioned default test matrix
+        run: |
+          cargo test -p days-executor -- --show-output
+          cargo test -p days --features test -- --show-output
+          cargo test -p days-legacy --features test -- --show-output
+          cargo test -p days-validation --features test -- --show-output

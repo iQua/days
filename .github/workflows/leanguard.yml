@@ -148,9 +148,11 @@ jobs:
         env:
           SUMMARY_PATH: leanguard-${{ matrix.protocol }}.json
         run: |
+          cargo build -p days-legacy --features "${{ matrix.features }}" --bin days
           set +e
           cargo run --features "${{ matrix.features }}" --bin leanguard-run -- \
             --config "${{ matrix.config }}" \
+            --legacy-runner target/debug/days \
             --checker-dir lean/.lake/build/bin \
             > "$SUMMARY_PATH"
           status=$?

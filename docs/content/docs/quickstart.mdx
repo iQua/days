@@ -8,19 +8,19 @@ description: Run built-in configs, inspect outputs, and debug simulations.
 The repository ships with runnable TOML configs in `configs/`.
 
 ```bash
-RUST_LOG=info cargo run --bin days -- configs/simple.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
 ```
 
 Useful variations:
 
 ```bash
 # TCP example
-RUST_LOG=info cargo run --bin days -- configs/tcp_simple.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/tcp_simple.toml
 
 # Fat-tree topology examples
-RUST_LOG=info cargo run --bin days -- configs/fattree.toml
-RUST_LOG=info cargo run --bin days -- configs/tcp_fattree.toml
-RUST_LOG=info cargo run --bin days -- configs/bbr_fattree.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/fattree.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/tcp_fattree.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/bbr_fattree.toml
 ```
 
 ## Output artifacts
@@ -41,7 +41,7 @@ By default, Days writes periodic reports to CSV files under `log_path` (see [/do
 Increase log verbosity with `RUST_LOG`:
 
 ```bash
-RUST_LOG=debug cargo run --bin days -- configs/simple.toml
+RUST_LOG=debug cargo run -p days-legacy --bin days -- configs/simple.toml
 ```
 
 ## Mental model

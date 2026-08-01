@@ -5,7 +5,7 @@ Days is a discrete-event network simulator written in Rust. It models network co
 ## Quick start
 
 ```bash
-cargo run --release --bin days -- configs/simple.toml
+cargo run --release -p days-legacy --bin days -- configs/simple.toml
 ```
 
 Simulation outputs are written under `log_path` (default: `./output/`) as CSV files.
@@ -24,18 +24,21 @@ Alternatively, one can directly visit the [documentation website](https://days.s
 
 ## Examples
 
-- Config-driven runs: `cargo run --release --bin days -- configs/tcp_simple.toml`
-- Rust examples: `cargo run --release --example basic`
+- Config-driven runs: `cargo run --release -p days-legacy --bin days -- configs/tcp_simple.toml`
+- Rust examples: `cargo run --release -p days-legacy --example basic`
 
 ## Tests
 
 ```bash
-cargo nextest run --all-features
+cargo test -p days-executor -- --show-output
+cargo test -p days --features test -- --show-output
+cargo test -p days-legacy --features test -- --show-output
+cargo test -p days-validation --features test -- --show-output
 ```
 
 ## Feature flags
 
-- `l2` / `l2_pfc`: optional L2/PFC pipeline
+- `l2` / `l2_pfc`: optional legacy L2/PFC pipeline
 - `dcqcn`: DCQCN flow type and models
 - `lean`: additional DCQCN event logging for the Lean checker
 - `test`: extra assertions and test helpers

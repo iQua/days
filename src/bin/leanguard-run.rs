@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_nondeterministic: bool,
 
+    /// Path to the separately built legacy engine used for trace generation.
+    #[arg(long)]
+    legacy_runner: Option<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     coverage: bool,
 
@@ -201,19 +205,33 @@ fn main() {
     let required_features_hint = required_features_hint(&config_toml);
 
     if matches!(cli.mode, Mode::SimulateAndCheck) {
-        let run_result =
-            std::panic::catch_unwind(|| days::run_simulation_from_config(&summary.config_path));
-        match run_result {
-            Ok(Ok(())) => {
+        let legacy_runner = resolve_legacy_runner(cli.legacy_runner.as_deref());
+        match Command::new(&legacy_runner)
+            .arg(&summary.config_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
                 summary.days = DaysStatus::Ok;
             }
-            Ok(Err(e)) => {
-                summary.days = DaysStatus::Error;
-                summary.days_error = Some(e);
-            }
-            Err(_) => {
+            Ok(output) if output.status.code() == Some(101) => {
                 summary.days = DaysStatus::Panic;
                 summary.days_error = Some("Days panicked".to_string());
+            }
+            Ok(output) => {
+                summary.days = DaysStatus::Error;
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                summary.days_error = Some(if stderr.is_empty() {
+                    format!("legacy runner exited with status {}", output.status)
+                } else {
+                    stderr
+                });
+            }
+            Err(error) => {
+                summary.days = DaysStatus::Error;
+                summary.days_error = Some(format!(
+                    "failed to execute legacy runner `{}`: {error}",
+                    legacy_runner.display()
+                ));
             }
         }
     } else {
@@ -266,6 +284,21 @@ fn main() {
 
     let exit_code = if summary.accept { 0 } else { 1 };
     emit_and_exit(summary, exit_code);
+}
+
+fn resolve_legacy_runner(configured: Option<&Path>) -> PathBuf {
+    if let Some(path) = configured {
+        return path.to_owned();
+    }
+    if let Some(path) = std::env::var_os("DAYS_LEGACY_RUNNER") {
+        return PathBuf::from(path);
+    }
+
+    let executable_name = if cfg!(windows) { "days.exe" } else { "days" };
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(executable_name)))
+        .unwrap_or_else(|| PathBuf::from(executable_name))
 }
 
 fn emit_and_exit(summary: RunSummaryV1, exit_code: i32) -> ! {

@@ -3,7 +3,7 @@ title: Switches & Queues
 description: Configure per-edge schedulers, buffering, and drop/ECN behavior.
 ---
 
-Switch configuration is global: it applies to **every scheduler instantiated per directed edge** in the topology graph (see `Topology::connect_neighbours` in `src/topos/topo.rs`).
+Switch configuration is global: it applies to **every scheduler instantiated per directed edge** in the topology graph (see `Topology::connect_neighbours` in `legacy/src/topos/topo.rs`).
 
 ```toml
 [switch]

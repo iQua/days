@@ -13,6 +13,8 @@ Source: `days/src/bin/leanguard-testgen.rs`
 - `--checker-dir <dir>` (default: `lean/.lake/build/bin`)
 - `--leanguard-run <path>` (optional)
   - If omitted, `leanguard-testgen` will try to execute `leanguard-run` (either as a sibling binary or via `$PATH`).
+- `--legacy-runner <path>` (optional)
+  - Forwarded to `leanguard-run`; point it at the separately built `days-legacy` binary for simulate-and-check campaigns.
 - `--allow-nondeterministic` (default: false)
 
 ## Subcommands

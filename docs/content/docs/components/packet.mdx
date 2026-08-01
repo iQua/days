@@ -3,7 +3,7 @@ title: Packet
 description: The core message type, carrying time, size, priority, and control signals.
 ---
 
-The simulator’s primary message is `Packet` (`src/flows/packet.rs`). Packets are plain structs (no payload modeling) that carry:
+The legacy simulator’s primary message is `Packet` (`legacy/src/flows/packet.rs`). Packets are plain structs (no payload modeling) that carry:
 
 - **Timestamp**: `Packet.time` is the current simulation time associated with the packet.
 - **Creation time**: `Packet.creation_time` is the time the source first created the packet.

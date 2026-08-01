@@ -1,0 +1,73 @@
+[package]
+name = "days-legacy"
+version = "0.4.3"
+description = "Nexosim-based legacy engine for Days"
+authors = ["Baochun Li <bli@ece.toronto.edu>"]
+repository = "https://github.com/iqua/days"
+license = "AGPL-3.0-only"
+edition = "2021"
+publish = false
+
+[lib]
+name = "days_legacy"
+
+[[bin]]
+name = "days"
+path = "src/main.rs"
+
+[features]
+test = ["days/test"]
+l2 = []
+l2_pfc = ["l2", "days/l2_pfc"]
+dcqcn = ["days/dcqcn"]
+lean = ["days/lean"]
+perf_stats = ["nexosim/perf_stats"]
+
+[dependencies]
+csv = "1.4"
+days = { path = ".." }
+env_logger = "0.11"
+indicatif = "0.18"
+indicatif-log-bridge = "0.2"
+log = "0.4"
+nexosim = { version = "1.0.0", features = ["tracing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
+parking_lot = "0.12"
+petgraph = "0.8"
+rand_distr = "0.6"
+rand = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+toml = "1"
+tempfile = "3"
+tachyonix = "0.3"
+futures = "0.3"
+futures-executor = { version = "0.3", default-features = false, features = ["thread-pool"] }
+once_cell = "1"
+num_cpus = "1.17"
+
+[dev-dependencies]
+assert_cmd = "2"
+csv = "1.4"
+days-executor = { path = "../executor" }
+predicates = "3"
+
+[[example]]
+name = "basic"
+
+[[example]]
+name = "ecn"
+
+[[example]]
+name = "switch"
+
+[[example]]
+name = "tcp"
+
+[[example]]
+name = "tcp_test"
+
+[[example]]
+name = "wire"

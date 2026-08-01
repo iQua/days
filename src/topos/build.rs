@@ -10,7 +10,7 @@ use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::topos::topo::{Config, FatTreeConfig, TopoCategory, TorusConfig};
+use crate::topos::config::{Config, FatTreeConfig, TopoCategory, TorusConfig};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostAttachment {
@@ -75,7 +75,7 @@ impl HostAttachments {
             .map(|entry| entry.switch_id)
     }
 
-    pub(crate) fn sample_flow_pairs(
+    pub fn sample_flow_pairs(
         &self,
         rng: &mut SmallRng,
         count: usize,

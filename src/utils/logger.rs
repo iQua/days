@@ -12,17 +12,82 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::flows::sink::PacketSinkReport;
-use crate::flows::source::PacketSourceReport;
-#[cfg(feature = "l2_pfc")]
-use crate::l2::pfc::PfcPortReport;
-use crate::schedulers::SchedulerReport;
-
-#[cfg(feature = "lean")]
-use crate::flows::packet::EcnField;
-#[cfg(feature = "lean")]
-use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategyKind};
 use crate::utils::trace_manifest;
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct PacketSourceReport {
+    pub id: usize,
+    pub flow_id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub sent_packets: usize,
+    pub packet_sizes: usize,
+    pub ack_bytes: usize,
+}
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct PacketSinkReport {
+    pub id: usize,
+    pub flow_id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub received_packets: usize,
+    pub received_sizes: usize,
+    pub queueing_delay_mean: f64,
+    pub one_way_delay_mean: f64,
+}
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct SchedulerReport {
+    pub id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub received_packets: usize,
+    pub dropped_packets: usize,
+    pub forwarded_packets: usize,
+    pub queue_length: usize,
+    pub received_sizes: usize,
+    pub forwarded_sizes: usize,
+    pub throughput_mean: f64,
+    pub queueing_delay_mean: f64,
+}
+
+#[cfg(feature = "l2_pfc")]
+#[derive(Clone, Debug, Serialize)]
+pub struct PfcPortReport {
+    pub id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub pause_frames: usize,
+    pub resume_frames: usize,
+    pub dropped_packets: usize,
+    pub max_occupancy: usize,
+    pub current_occupancy: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityUnit {
+    Bytes,
+    Packets,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropAction {
+    Enqueue,
+    Drop,
+    MarkEcn,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropStrategyKind {
+    TailDrop,
+    Red,
+    RedEcn,
+    EcnThreshold,
+}
 
 #[derive(Deserialize)]
 struct LogConfig {
@@ -112,18 +177,6 @@ pub enum DcqcnLoggedEcnField {
 }
 
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
-impl From<EcnField> for DcqcnLoggedEcnField {
-    fn from(field: EcnField) -> Self {
-        match field {
-            EcnField::NotEct => DcqcnLoggedEcnField::NotEct,
-            EcnField::Ect0 => DcqcnLoggedEcnField::Ect0,
-            EcnField::Ect1 => DcqcnLoggedEcnField::Ect1,
-            EcnField::Ce => DcqcnLoggedEcnField::Ce,
-        }
-    }
-}
-
-#[cfg(all(feature = "lean", feature = "dcqcn"))]
 #[derive(Clone, Debug, Serialize)]
 pub struct DcqcnEventRow {
     pub time_ns: u64,
@@ -168,18 +221,6 @@ pub enum AqmLoggedEcnField {
     Ect0,
     Ect1,
     Ce,
-}
-
-#[cfg(feature = "lean")]
-impl From<EcnField> for AqmLoggedEcnField {
-    fn from(field: EcnField) -> Self {
-        match field {
-            EcnField::NotEct => AqmLoggedEcnField::NotEct,
-            EcnField::Ect0 => AqmLoggedEcnField::Ect0,
-            EcnField::Ect1 => AqmLoggedEcnField::Ect1,
-            EcnField::Ce => AqmLoggedEcnField::Ce,
-        }
-    }
 }
 
 #[cfg(feature = "lean")]

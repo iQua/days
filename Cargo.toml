@@ -11,16 +11,14 @@ license = "AGPL-3.0-only"
 edition = "2021"
 
 [workspace]
-members = ["executor"]
+members = ["executor", "legacy", "validation", "xtask"]
 resolver = "2"
 
 [features]
 test = []
-l2 = []
-l2_pfc = ["l2"]
+l2_pfc = []
 dcqcn = []
 lean = []
-perf_stats = ["nexosim/perf_stats"]
 metal-spike = ["days-executor/metal-spike"]
 cuda = ["days-executor/cuda"]
 
@@ -29,26 +27,16 @@ csv = "1.4"
 days-executor = { path = "executor" }
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
-indicatif = "0.18"
-indicatif-log-bridge = "0.2"
 log = "0.4"
-nexosim = { version = "1.0.0", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [ "fmt", "env-filter", "registry" ] }
 parking_lot = "0.12"
 petgraph = "0.8"
-rand_distr = "0.6"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
 toml = "1"
-tempfile = "3"
-tachyonix = "0.3"
-futures = "0.3"
-futures-executor = { version = "0.3", default-features = false, features = ["thread-pool"] }
-once_cell = "1"
-num_cpus = "1.17"
 
 [patch.crates-io]
 nexosim = { path = "crates/nexosim" }
@@ -56,3 +44,4 @@ nexosim = { path = "crates/nexosim" }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+tempfile = "3"

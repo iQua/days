@@ -11,7 +11,7 @@ description: Build Days from source and enable optional protocol features.
 ## Build
 
 ```bash
-cargo build
+cargo build -p days-legacy
 ```
 
 ## Run from source
@@ -19,14 +19,14 @@ cargo build
 The `days` CLI expects exactly one argument: the path to a TOML configuration file.
 
 ```bash
-RUST_LOG=info cargo run --bin days -- configs/simple.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
 ```
 
 ## Feature flags
 
 Days uses Cargo features to keep the default build lean.
 
-- `l2`: enables the layer-2 module boundary (`src/l2/`)
+- `l2`: enables the legacy layer-2 module boundary (`legacy/src/l2/`)
 - `l2_pfc`: enables PFC components (implies `l2`)
 - `dcqcn`: enables the DCQCN flow type and related code
 - `lean`: enables additional per-transition protocol trace logging used by LeanGuard
@@ -36,14 +36,14 @@ Examples:
 
 ```bash
 # Build with PFC support available (still opt-in at runtime via config)
-cargo build --features l2,l2_pfc
+cargo build -p days-legacy --features l2,l2_pfc
 
 # Run a PFC-configured experiment
-RUST_LOG=info cargo run --features l2,l2_pfc --bin days -- configs/pfc.toml
+RUST_LOG=info cargo run -p days-legacy --features l2,l2_pfc --bin days -- configs/pfc.toml
 
 # Run DCQCN (typically paired with PFC in lossless fabrics)
-RUST_LOG=info cargo run --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
+RUST_LOG=info cargo run -p days-legacy --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
 
 # Emit dcqcn_events.csv for LeanGuard (conformance checking)
-RUST_LOG=info cargo run --features dcqcn,lean,l2_pfc --bin days -- configs/dcqcn_simple.toml
+RUST_LOG=info cargo run -p days-legacy --features dcqcn,lean,l2_pfc --bin days -- configs/dcqcn_simple.toml
 ```

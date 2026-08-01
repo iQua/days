@@ -3,22 +3,22 @@ title: days
 description: Run a simulation from a single TOML configuration file.
 ---
 
-The default binary (built from `src/main.rs`) runs a simulation described by a TOML configuration file.
+The legacy binary (built from `legacy/src/main.rs`) runs a simulation described by a TOML configuration file.
 
 ## Usage
 
 ```bash
-RUST_LOG=info cargo run --release --bin days -- <path/to/config.toml>
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- <path/to/config.toml>
 ```
 
 Examples:
 
 ```bash
 # Minimal example
-RUST_LOG=info cargo run --release --bin days -- configs/simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/simple.toml
 
 # TCP example
-RUST_LOG=info cargo run --release --bin days -- configs/tcp_simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/tcp_simple.toml
 ```
 
 ## Arguments

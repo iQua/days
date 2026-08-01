@@ -5,16 +5,29 @@
 //! compute an average concurrency during a simulation run.
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tracing::Subscriber;
 use tracing_subscriber::{Layer, registry::LookupSpan};
 
-use crate::ACTIVE_TASKS;
-use crate::PEAK_ACTIVE_TASKS;
-use crate::topos::topo::TracingConfig;
+use crate::topos::config::TracingConfig;
+
+static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+static PEAK_ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn current_concurrency() -> usize {
+    ACTIVE_TASKS.load(Ordering::Relaxed)
+}
+
+pub fn peak_concurrency() -> usize {
+    PEAK_ACTIVE_TASKS.load(Ordering::Relaxed)
+}
+
+pub fn reset_peak_concurrency() {
+    PEAK_ACTIVE_TASKS.store(0, Ordering::Relaxed);
+}
 
 pub struct ConcurrencyTrackerLayer;
 

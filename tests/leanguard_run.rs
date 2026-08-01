@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 
 #[test]
-fn leanguard_run_check_only_uses_manifest_and_runs_checkers() {
+fn leanguard_run_subprocess_uses_manifest_and_runs_checkers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let log_path = tmp.path().join("logs");
     fs::create_dir_all(&log_path).expect("create log dir");
@@ -49,12 +49,28 @@ fn leanguard_run_check_only_uses_manifest_and_runs_checkers() {
         }
     }
 
+    let legacy_runner = tmp.path().join("days-legacy-stub");
+    let legacy_runner_marker = tmp.path().join("legacy-runner-invoked");
+    fs::write(
+        &legacy_runner,
+        "#!/bin/sh\n: > \"$LEGACY_RUNNER_MARKER\"\nexit 0\n",
+    )
+    .expect("write legacy runner stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&legacy_runner).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&legacy_runner, permissions).unwrap();
+    }
+
     let mut cmd = cargo_bin_cmd!("leanguard-run");
+    cmd.env("LEGACY_RUNNER_MARKER", &legacy_runner_marker);
     cmd.args([
         "--config",
         config_path.to_str().unwrap(),
-        "--mode",
-        "check-only",
+        "--legacy-runner",
+        legacy_runner.to_str().unwrap(),
         "--checker-dir",
         checker_dir.to_str().unwrap(),
     ]);
@@ -66,6 +82,10 @@ fn leanguard_run_check_only_uses_manifest_and_runs_checkers() {
         .stdout(predicate::str::contains("aqm_check"))
         .stdout(predicate::str::contains("dcqcn_check"))
         .stdout(predicate::str::contains("aqm_dcqcn_check"));
+    assert!(
+        legacy_runner_marker.exists(),
+        "legacy runner must be invoked"
+    );
 }
 
 #[test]

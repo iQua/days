@@ -7,9 +7,9 @@ Flows are specified in TOML and expanded into source/sink actors attached to hos
 
 Core types:
 
-- `Flow` and `FlowType` (`src/flows/flow.rs`)
-- `TrafficCharacteristics` (`src/flows/mod.rs`)
-- `PacketSource` / `PacketSink` enums (`src/flows/source.rs`, `src/flows/sink.rs`)
+- `Flow` and `FlowType` (`legacy/src/flows/flow.rs`)
+- `TrafficCharacteristics` (`legacy/src/flows/mod.rs`)
+- `PacketSource` / `PacketSink` enums (`legacy/src/flows/source.rs`, `legacy/src/flows/sink.rs`)
 
 ## Flow types
 
@@ -60,8 +60,8 @@ These are wired by sending `FlowFinishMsg` when a flow completes (either from th
 
 ## Collectives
 
-Collectives (`src/flows/collective.rs`) generate sets of flows from higher-level patterns:
+Collectives (`legacy/src/flows/collective.rs`) generate sets of flows from higher-level patterns:
 
 - `Broadcast`, `Gather`, `AllReduce`, and `RingAllReduce`
 
-They are expanded into concrete flows inside `Topology::process_collectives` (`src/topos/topo.rs`) before routing happens.
+They are expanded into concrete flows inside `Topology::process_collectives` (`legacy/src/topos/topo.rs`) before routing happens.

@@ -3,11 +3,11 @@ title: Collectives
 description: High-level communication patterns expanded into concrete flows.
 ---
 
-Collectives are higher-level communication patterns (common in ML training workloads) that are expanded into concrete flows at simulation start (`Topology::process_collectives` in `src/topos/topo.rs`).
+Collectives are higher-level communication patterns (common in ML training workloads) that are expanded into concrete flows at simulation start (`Topology::process_collectives` in `legacy/src/topos/topo.rs`).
 
 Days does not model payload contents. In particular, `RingAllReduce` exists to reproduce the network traffic pattern of a reduce-scatter plus all-gather schedule; it does not simulate arithmetic reduction over application data.
 
-Parsing is implemented in `src/flows/collective.rs`.
+Legacy parsing is implemented in `legacy/src/flows/collective.rs`.
 
 Supported `collective_type` values:
 
@@ -110,7 +110,7 @@ Flow ID assignment:
 
 ## TCP collectives and application data
 
-For TCP collectives, Days can optionally back flows with application-level byte buffers (`src/flows/app_source.rs`).
+For TCP collectives, legacy Days can optionally back flows with application-level byte buffers (`legacy/src/flows/app_source.rs`).
 
 These buffers are synthetic byte stores used to bound transmitted bytes and pacing. Days does not mutate or interpret payload contents while modeling the collective.
 

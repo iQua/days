@@ -31,7 +31,7 @@ Days is a high-performance discrete-event network simulator written in Rust. It 
 From the repo root:
 
 ```bash
-RUST_LOG=info cargo run --release --bin days -- configs/simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/simple.toml
 ```
 
 Output CSV files are written under the configured `log_path` (default: `./output/`).

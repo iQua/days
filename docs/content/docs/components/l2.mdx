@@ -10,7 +10,7 @@ Layer-2 support is optional and is designed to have **zero overhead when disable
 
 ## Frame model
 
-When L2 is compiled in, internal link pipelines use `LinkFrame` (`src/l2/frame.rs`):
+When L2 is compiled in, internal link pipelines use `LinkFrame` (`legacy/src/l2/frame.rs`):
 
 - `LinkFrame::Data(Packet)`
 - `LinkFrame::Pfc(PfcFrame)` (only with `l2_pfc`)
@@ -19,7 +19,7 @@ Frames carry timestamps and sizes so that links can serialize them at a given ra
 
 ## Link serializer
 
-`Link` (`src/l2/link.rs`) is a small model that:
+`Link` (`legacy/src/l2/link.rs`) is a small model that:
 
 - queues `LinkFrame`s,
 - schedules a delivery event after `size_bits / rate_bps`,
@@ -29,7 +29,7 @@ This lets L2 control frames and data frames share the same serialization logic.
 
 ## PFC (802.1Qbb-style pause)
 
-PFC is implemented by two per-edge actors (`src/l2/pfc.rs`):
+PFC is implemented by two per-edge actors (`legacy/src/l2/pfc.rs`):
 
 - **Ingress** (`PfcIngressPort`): per-priority buffering, XON/XOFF thresholds, generates pause/resume frames upstream.
 - **Egress** (`PfcEgressGate`): per-priority gating of outbound frames based on received pause frames.

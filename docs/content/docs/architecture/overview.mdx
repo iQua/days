@@ -1,6 +1,6 @@
 ---
-title: Architecture Overview
-description: Core concepts and how Days is assembled on top of Nexosim.
+title: Legacy Architecture Overview
+description: Core concepts and how the legacy Days engine is assembled on top of Nexosim.
 ---
 
 Days is built around a small set of concepts:
@@ -9,7 +9,7 @@ Days is built around a small set of concepts:
 - **Actor model**: each simulated component is an actor that owns its state and communicates via message passing.
 - **Packets carry time**: most components avoid querying the global simulation clock by reading the timestamp stored in the message itself.
 
-Days uses the `nexosim` crate as the simulation engine. Each actor implements `nexosim::model::Model` and receives messages through connected `Output<T>` ports and model mailboxes (`Mailbox<M>`).
+The legacy engine under `legacy/` uses the `nexosim` crate. Each actor implements `nexosim::model::Model` and receives messages through connected `Output<T>` ports and model mailboxes (`Mailbox<M>`).
 
 ## Bird's-eye architecture
 
@@ -24,10 +24,10 @@ flowchart LR
   subgraph REPO[Days repository]
     direction TB
     TOP[Topology builder src/topos]
-    FLO[Flows src/flows]
-    SW[Switches src/switches]
-    SCH[Schedulers src/schedulers]
-    L2[Optional L2/PFC src/l2]
+    FLO[Flows legacy/src/flows]
+    SW[Switches legacy/src/switches]
+    SCH[Schedulers legacy/src/schedulers]
+    L2[Optional L2/PFC legacy/src/l2]
     OBS[Observability src/utils]
     SIM[nexosim simulation engine]
   end
@@ -54,12 +54,12 @@ flowchart LR
 
 ## Main components
 
-- **Topology builder** (`src/topos/`): parses the TOML config, builds the network graph, instantiates models, wires ports, and runs the simulation.
-- **Switch** (`src/switches/`): `PacketSwitch` demultiplexes packets using a per-flow forwarding table (FIB).
-- **Schedulers** (`src/schedulers/`): model per-port queueing, drop/ECN policies, and transmission delay.
-- **Flows** (`src/flows/`): model sources/sinks (packet distributions, TCP, DCQCN) and collectives.
-- **Optional L2** (`src/l2/`, feature-gated): link-layer frames and PFC (802.1Qbb-style pause).
-- **Logging/UI** (`src/utils/`): progress UI, concurrency tracing, and CSV report logging.
+- **Topology builder** (`src/topos/`): shared graph and configuration parsing; `legacy/src/topos/topo.rs` instantiates and runs Nexosim models.
+- **Switch** (`legacy/src/switches/`): `PacketSwitch` demultiplexes packets using a per-flow forwarding table (FIB).
+- **Schedulers** (`legacy/src/schedulers/`): model per-port queueing, drop/ECN policies, and transmission delay.
+- **Flows** (`legacy/src/flows/`): model sources/sinks (packet distributions, TCP, DCQCN) and collectives.
+- **Optional L2** (`legacy/src/l2/`, feature-gated): link-layer frames and PFC (802.1Qbb-style pause).
+- **Logging/UI** (`src/utils/`, `legacy/src/utils/ui.rs`): concurrency tracing, CSV report logging, and the legacy progress UI.
 
 ## Message flow (L3/L4-only)
 

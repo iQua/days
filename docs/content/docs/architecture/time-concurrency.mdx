@@ -29,10 +29,10 @@ These checks validate that “time-in-message” is consistent with the simulati
 
 Core models keep a local `time: f64`:
 
-- `PacketSwitch.time` (`src/switches/switch.rs`)
-- `Port.time`, `DRRServer.time`, etc. (`src/schedulers/`)
-- endpoint time in sources/sinks (`src/flows/`)
-- link-layer time in `Link`/PFC components (`src/l2/`)
+- `PacketSwitch.time` (`legacy/src/switches/switch.rs`)
+- `Port.time`, `DRRServer.time`, etc. (`legacy/src/schedulers/`)
+- endpoint time in sources/sinks (`legacy/src/flows/`)
+- link-layer time in `Link`/PFC components (`legacy/src/l2/`)
 
 The local time is updated from the incoming message (or from `cx.time()` only in limited cases).
 

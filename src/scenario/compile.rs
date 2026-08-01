@@ -18,9 +18,9 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
-use crate::flows::DistributionInfo;
-use crate::flows::route::{RouteTableError, compute_shortest_path_route_table};
+use crate::scenario::DistributionInfo;
 use crate::topos::build::{HostAttachments, TopologyError, build_graph};
+use crate::topos::route::{RouteTableError, compute_shortest_path_route_table};
 
 /// Failure while lowering supported Days source configuration.
 #[derive(Debug, Error)]

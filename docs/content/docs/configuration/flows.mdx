@@ -3,7 +3,7 @@ title: Flows
 description: Define end-to-end traffic using [[flow]] and [[flow_set]] plus traffic tables.
 ---
 
-Flow parsing is implemented in `src/flows/flow.rs`. Flows are end-to-end traffic generators that attach to host switches and send packets through the routed network.
+Legacy flow parsing is implemented in `legacy/src/flows/flow.rs`. Flows are end-to-end traffic generators that attach to host switches and send packets through the routed network.
 
 Days supports:
 
@@ -70,7 +70,7 @@ Supported fields:
 
 ## Traffic schema (`[*.traffic]`)
 
-Traffic is parsed via `TomlTrafficCharacteristics` (`src/flows/mod.rs`).
+Traffic is parsed via `TomlTrafficCharacteristics` (`legacy/src/flows/mod.rs`).
 
 Required fields:
 

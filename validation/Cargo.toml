@@ -1,0 +1,21 @@
+[package]
+name = "days-validation"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[features]
+test = ["days/test", "days-legacy/test"]
+metal-spike = ["days/metal-spike", "days-executor/metal-spike"]
+cuda = ["days/cuda", "days-executor/cuda"]
+
+[dev-dependencies]
+assert_cmd = "2"
+days = { path = ".." }
+days-executor = { path = "../executor" }
+days-legacy = { path = "../legacy" }
+nexosim = { version = "1.0.0", features = ["tracing"] }
+petgraph = "0.8"
+tempfile = "3"
+toml = "1"

@@ -20,6 +20,7 @@ pub struct TestGenOptions {
     pub corpus_root: PathBuf,
     pub checker_dir: PathBuf,
     pub leanguard_run: Option<PathBuf>,
+    pub legacy_runner: Option<PathBuf>,
     pub allow_nondeterministic: bool,
 }
 
@@ -446,6 +447,7 @@ pub fn fuzz(
 
         let run = run_leanguard(
             &leanguard_run,
+            opts.legacy_runner.as_deref(),
             &opts.checker_dir,
             &config_path,
             opts.allow_nondeterministic,
@@ -717,6 +719,7 @@ fn campaign_with_options(
 
             let run = run_leanguard(
                 &leanguard_run,
+                opts.legacy_runner.as_deref(),
                 &opts.checker_dir,
                 &config_path,
                 opts.allow_nondeterministic,
@@ -933,6 +936,7 @@ pub fn replay(opts: &TestGenOptions, case_dir: &Path) -> Result<ReplaySummary, S
 
     let output = run_leanguard(
         &leanguard_run,
+        opts.legacy_runner.as_deref(),
         &opts.checker_dir,
         &config_path,
         opts.allow_nondeterministic,
@@ -1008,6 +1012,7 @@ pub fn minimize(
     } else {
         let output = run_leanguard(
             &leanguard_run,
+            opts.legacy_runner.as_deref(),
             &opts.checker_dir,
             &config_path,
             opts.allow_nondeterministic,
@@ -1047,6 +1052,7 @@ pub fn minimize(
 
             let output = run_leanguard(
                 &leanguard_run,
+                opts.legacy_runner.as_deref(),
                 &opts.checker_dir,
                 &candidate_path,
                 opts.allow_nondeterministic,
@@ -2571,6 +2577,7 @@ struct RunOutput {
 
 fn run_leanguard(
     leanguard_run: &Path,
+    legacy_runner: Option<&Path>,
     checker_dir: &Path,
     config_path: &Path,
     allow_nondeterministic: bool,
@@ -2580,6 +2587,9 @@ fn run_leanguard(
         .arg(config_path)
         .arg("--checker-dir")
         .arg(checker_dir);
+    if let Some(path) = legacy_runner {
+        cmd.arg("--legacy-runner").arg(path);
+    }
     if allow_nondeterministic {
         cmd.arg("--allow-nondeterministic");
     }

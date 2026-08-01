@@ -18,9 +18,13 @@ Source: `days/src/bin/leanguard-run.rs`
 # Build the Lean checkers once
 cd lean && lake build && cd ..
 
-# Run simulation + checkers
-cargo run --bin leanguard-run -- \
+# Build the separate legacy trace generator
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days
+
+# Run simulation + checkers through the explicit test-only handoff
+cargo run --features dcqcn,l2_pfc,lean --bin leanguard-run -- \
   --config configs/dcqcn_simple.toml \
+  --legacy-runner target/debug/days \
   --checker-dir lean/.lake/build/bin
 ```
 
@@ -38,6 +42,9 @@ cargo run --bin leanguard-run -- \
 - `--config <path>` (**required**)
 - `--mode <simulate-and-check|check-only>` (default: `simulate-and-check`)
 - `--checker-dir <path>` (default: `lean/.lake/build/bin`)
+- `--legacy-runner <path>` (optional)
+  - Path to the separately built `days-legacy` binary used only by `simulate-and-check`.
+  - If omitted, `leanguard-run` checks `DAYS_LEGACY_RUNNER`, then a sibling executable named `days`.
 - `--allow-nondeterministic` (default: false)
   - Refuses to run when the config contains `threading = "multiple"` unless this flag is set.
 - `--coverage` (default: false)

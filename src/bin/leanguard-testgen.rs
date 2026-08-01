@@ -17,6 +17,10 @@ struct Cli {
     #[arg(long)]
     leanguard_run: Option<PathBuf>,
 
+    /// Path forwarded to leanguard-run for legacy trace generation.
+    #[arg(long)]
+    legacy_runner: Option<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     allow_nondeterministic: bool,
 
@@ -69,6 +73,7 @@ fn main() {
         corpus_root: cli.corpus_root,
         checker_dir: cli.checker_dir,
         leanguard_run: cli.leanguard_run,
+        legacy_runner: cli.legacy_runner,
         allow_nondeterministic: cli.allow_nondeterministic,
     };
 

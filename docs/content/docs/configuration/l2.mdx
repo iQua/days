@@ -3,7 +3,7 @@ title: Link Layer (L2 / PFC)
 description: Enable and configure the optional PFC pipeline per edge.
 ---
 
-Link-layer behavior is configured under `[link]` and implemented in `src/l2/`.
+Legacy link-layer behavior is configured under `[link]` and implemented in `legacy/src/l2/`.
 
 ## `link.mode`
 
@@ -39,7 +39,7 @@ refresh_interval = 0.0002
 drain_interval = 0.000001
 ```
 
-Fields and defaults (from `Topology::build_pfc_config` in `src/topos/topo.rs`):
+Fields and defaults (from `Topology::build_pfc_config` in `legacy/src/topos/topo.rs`):
 
 - `xoff` (bytes, default `64 * 1024` per priority): assert pause when occupancy ≥ XOFF
 - `xon` (bytes, default `48 * 1024` per priority): send resume when occupancy ≤ XON
