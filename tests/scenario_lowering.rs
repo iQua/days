@@ -1233,6 +1233,88 @@ graph = [[0, 1]]
 }
 
 #[test]
+fn inter_flow_start_dependencies_are_rejected_with_a_specific_diagnostic() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let expected = "unsupported inter-flow start dependencies; executor generators must be independently scheduled in the lowered image";
+
+    for (name, dependency) in [
+        ("starts-before", "starts_before = [1]"),
+        ("starts-after", "starts_after = [1]"),
+    ] {
+        let config = format!(
+            r#"
+seed = 24
+duration = 0.001
+edges = [[0, 1]]
+hosts = [0, 1]
+[switch]
+port_rate = 100_000_000_000
+capacity = 16
+discipline = "FIFO"
+drop = "TailDrop"
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+{dependency}
+[flow.traffic]
+size = 512
+arr_dist = {{ type = "Uniform", low = 1.0, high = 1.0 }}
+pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
+"#
+        );
+        let path = write_config(&directory, &format!("{name}.toml"), &config);
+        assert_eq!(
+            compile_config(path)
+                .expect_err("inter-flow start dependency should fail")
+                .to_string(),
+            expected,
+            "case {name}"
+        );
+    }
+}
+
+#[test]
+fn source_routing_and_explicit_paths_are_rejected_with_a_specific_diagnostic() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let expected = "unsupported source routing or explicit path selection; executor scenario lowering derives deterministic topology routes";
+
+    for (name, route) in [
+        ("source-routing", "routing = \"ShortestPath\""),
+        ("explicit-path", "path = [0, 1]"),
+    ] {
+        let config = format!(
+            r#"
+seed = 24
+duration = 0.001
+edges = [[0, 1]]
+hosts = [0, 1]
+[switch]
+port_rate = 100_000_000_000
+capacity = 16
+discipline = "FIFO"
+drop = "TailDrop"
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+{route}
+[flow.traffic]
+size = 512
+arr_dist = {{ type = "Uniform", low = 1.0, high = 1.0 }}
+pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
+"#
+        );
+        let path = write_config(&directory, &format!("{name}.toml"), &config);
+        assert_eq!(
+            compile_config(path)
+                .expect_err("source routing or explicit path should fail")
+                .to_string(),
+            expected,
+            "case {name}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_source_behaviour_is_rejected_with_specific_diagnostics() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let cases = [
