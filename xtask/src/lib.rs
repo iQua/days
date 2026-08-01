@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::Deserialize;
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Expr, Lit, Meta, Token};
 
@@ -99,7 +101,8 @@ pub fn audit_boundary_metadata(
         }
     }
 
-    let legacy_manifest = Path::new(&metadata.workspace_root).join("legacy/Cargo.toml");
+    let legacy_directory = Path::new(&metadata.workspace_root).join("legacy");
+    let legacy_manifest = legacy_directory.join("Cargo.toml");
     let legacy_packages = metadata
         .packages
         .iter()
@@ -121,6 +124,34 @@ pub fn audit_boundary_metadata(
             "boundary package at {} must be named `days-legacy`; found `{}`",
             legacy_manifest.display(),
             legacy.name
+        ));
+    }
+
+    let legacy_owned_packages = metadata
+        .packages
+        .iter()
+        .filter(|package| Path::new(&package.manifest_path).starts_with(&legacy_directory))
+        .collect::<Vec<_>>();
+    let legacy_package_ids = legacy_owned_packages
+        .iter()
+        .map(|package| package.id.clone())
+        .collect::<BTreeSet<_>>();
+    let workspace_legacy_packages = legacy_owned_packages
+        .iter()
+        .copied()
+        .filter(|package| workspace_members.contains(&package.id))
+        .collect::<Vec<_>>();
+    if workspace_legacy_packages.len() != 1 || workspace_legacy_packages[0].id != legacy.id {
+        let found = workspace_legacy_packages
+            .iter()
+            .map(|package| format!("{} ({})", package.name, package.manifest_path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "legacy directory ownership requires workspace members under {} to be exactly days-legacy ({}); found [{}]",
+            legacy_directory.display(),
+            legacy_manifest.display(),
+            found
         ));
     }
 
@@ -206,15 +237,11 @@ pub fn audit_boundary_metadata(
     let mut seen_allowed = BTreeSet::new();
     for member_id in workspace_members
         .iter()
-        .filter(|member_id| member_id.as_str() != legacy.id)
+        .filter(|member_id| !legacy_package_ids.contains(member_id.as_str()))
     {
         let node = nodes_by_id[member_id.as_str()];
         for dependency in &node.deps {
-            let suffix = if dependency.pkg == legacy.id {
-                Some(vec![legacy.id.clone()])
-            } else {
-                resolved_path(&dependency.pkg, &legacy.id, &full_graph)
-            };
+            let suffix = resolved_path_to_any(&dependency.pkg, &legacy_package_ids, &full_graph);
             let Some(suffix) = suffix else {
                 continue;
             };
@@ -253,7 +280,7 @@ pub fn audit_boundary_metadata(
         let key = (source_id.clone(), dependency_id.clone(), kind.clone());
         if !seen_allowed.contains(&key) {
             errors.push(format!(
-                "stale boundary allow-list entry {} -[{}]-> {}: expected an exact resolved entry edge whose full path reaches the real legacy package",
+                "stale boundary allow-list entry {} -[{}]-> {}: expected an exact resolved entry edge whose full path reaches a legacy-owned package",
                 package_label(source_id, &packages_by_id),
                 kind.as_deref().unwrap_or("normal"),
                 package_label(dependency_id, &packages_by_id)
@@ -272,11 +299,15 @@ fn dependency_kind_label(kind: &ResolvedDependencyKind) -> &str {
     kind.kind.as_deref().unwrap_or("normal")
 }
 
-fn resolved_path(
+fn resolved_path_to_any(
     source: &str,
-    target: &str,
+    targets: &BTreeSet<String>,
     graph: &BTreeMap<String, Vec<String>>,
 ) -> Option<Vec<String>> {
+    if targets.contains(source) {
+        return Some(vec![source.to_owned()]);
+    }
+
     let mut queue = VecDeque::from([vec![source.to_owned()]]);
     let mut visited = BTreeSet::from([source.to_owned()]);
     while let Some(path) = queue.pop_front() {
@@ -284,7 +315,7 @@ fn resolved_path(
         for dependency_id in graph.get(package_id).into_iter().flatten() {
             let mut dependency_path = path.clone();
             dependency_path.push(dependency_id.clone());
-            if dependency_id == target {
+            if targets.contains(dependency_id) {
                 return Some(dependency_path);
             }
             if visited.insert(dependency_id.clone()) {
@@ -371,6 +402,7 @@ pub fn observed_feature_gates(
     files.sort();
 
     let mut observed = BTreeMap::new();
+    let mut parse_errors = Vec::new();
     for file in files {
         let source = fs::read_to_string(&file)
             .map_err(|error| format!("failed to read {}: {error}", file.display()))?;
@@ -385,6 +417,18 @@ pub fn observed_feature_gates(
         for predicate in collector.predicates {
             *observed.entry((relative.clone(), predicate)).or_insert(0) += 1;
         }
+        for error in collector.errors {
+            parse_errors.push(format!(
+                "{}:{}: failed to parse recognized {}: {}",
+                relative.display(),
+                error.line,
+                error.form,
+                error.message
+            ));
+        }
+    }
+    if !parse_errors.is_empty() {
+        return Err(parse_errors.join("\n"));
     }
     Ok(observed)
 }
@@ -412,24 +456,38 @@ fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), 
 #[derive(Default)]
 struct FeatureGateCollector {
     predicates: Vec<String>,
+    errors: Vec<FeatureGateParseError>,
+}
+
+struct FeatureGateParseError {
+    line: usize,
+    form: &'static str,
+    message: String,
 }
 
 impl<'ast> Visit<'ast> for FeatureGateCollector {
     fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
-        if attribute.path().is_ident("cfg") {
-            if let Ok(predicate) = attribute.parse_args::<Meta>() {
-                if contains_feature(&predicate) {
-                    self.predicates.push(canonical_meta(&predicate));
-                }
-            }
-        } else if attribute.path().is_ident("cfg_attr") {
-            let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-            if let Ok(arguments) =
-                parser.parse2(attribute.meta.require_list().unwrap().tokens.clone())
+        if path_is_ident(attribute.path(), "cfg") {
+            match attribute
+                .meta
+                .require_list()
+                .and_then(|list| parse_single_meta(list.tokens.clone(), attribute.span()))
             {
-                for argument in arguments.iter().filter(|meta| contains_feature(meta)) {
-                    self.predicates.push(canonical_meta(argument));
-                }
+                Ok(predicate) => self.collect_meta(&predicate, "cfg attribute", attribute.span()),
+                Err(error) => self.record_error("cfg attribute", attribute.span(), error),
+            }
+        } else if path_is_ident(attribute.path(), "cfg_attr") {
+            match attribute
+                .meta
+                .require_list()
+                .and_then(|list| parse_meta_list(list.tokens.clone()))
+            {
+                Ok(arguments) => self.collect_cfg_attr_arguments(
+                    &arguments,
+                    "cfg_attr attribute",
+                    attribute.span(),
+                ),
+                Err(error) => self.record_error("cfg_attr attribute", attribute.span(), error),
             }
         }
         syn::visit::visit_attribute(self, attribute);
@@ -437,18 +495,190 @@ impl<'ast> Visit<'ast> for FeatureGateCollector {
 
     fn visit_macro(&mut self, macro_: &'ast syn::Macro) {
         if is_standard_cfg_macro(&macro_.path) {
-            if let Ok(predicate) = syn::parse2::<Meta>(macro_.tokens.clone()) {
-                if contains_feature(&predicate) {
-                    self.predicates.push(canonical_meta(&predicate));
-                }
+            match parse_single_meta(macro_.tokens.clone(), macro_.span()) {
+                Ok(predicate) => self.collect_meta(&predicate, "cfg macro", macro_.span()),
+                Err(error) => self.record_error("cfg macro", macro_.span(), error),
             }
+        } else {
+            self.collect_nested_cfg_macros(macro_.tokens.clone());
         }
         syn::visit::visit_macro(self, macro_);
     }
 }
 
+impl FeatureGateCollector {
+    fn collect_meta(&mut self, meta: &Meta, form: &'static str, span: Span) {
+        match contains_feature(meta) {
+            Ok(true) => match canonical_meta(meta) {
+                Ok(predicate) => self.predicates.push(predicate),
+                Err(error) => self.record_error(form, span, error),
+            },
+            Ok(false) => {}
+            Err(error) => self.record_error(form, span, error),
+        }
+    }
+
+    fn record_error(&mut self, form: &'static str, span: Span, error: syn::Error) {
+        self.errors.push(FeatureGateParseError {
+            line: span.start().line,
+            form,
+            message: error.to_string(),
+        });
+    }
+
+    fn collect_cfg_attr_arguments(
+        &mut self,
+        arguments: &Punctuated<Meta, Token![,]>,
+        form: &'static str,
+        span: Span,
+    ) {
+        let mut arguments = arguments.iter();
+        let Some(predicate) = arguments.next() else {
+            self.record_error(
+                form,
+                span,
+                syn::Error::new(span, "expected a cfg_attr predicate"),
+            );
+            return;
+        };
+        self.collect_meta(predicate, form, span);
+
+        for attribute in arguments {
+            if path_is_ident(meta_path(attribute), "cfg") {
+                if matches!(attribute, Meta::List(_)) {
+                    self.collect_meta(attribute, "cfg attribute nested in cfg_attr", span);
+                } else {
+                    self.record_error(
+                        "cfg attribute nested in cfg_attr",
+                        span,
+                        syn::Error::new_spanned(attribute, "expected cfg predicate arguments"),
+                    );
+                }
+            } else if path_is_ident(meta_path(attribute), "cfg_attr") {
+                match attribute {
+                    Meta::List(list) => match parse_meta_list(list.tokens.clone()) {
+                        Ok(nested) => self.collect_cfg_attr_arguments(
+                            &nested,
+                            "cfg_attr attribute nested in cfg_attr",
+                            span,
+                        ),
+                        Err(error) => {
+                            self.record_error("cfg_attr attribute nested in cfg_attr", span, error)
+                        }
+                    },
+                    _ => self.record_error(
+                        "cfg_attr attribute nested in cfg_attr",
+                        span,
+                        syn::Error::new_spanned(attribute, "expected cfg_attr arguments"),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn collect_nested_cfg_macros(&mut self, tokens: TokenStream) {
+        let tokens = tokens.into_iter().collect::<Vec<_>>();
+        let mut index = 0;
+        while index < tokens.len() {
+            if let Some((consumed, body, span)) = cfg_macro_at(&tokens, index) {
+                match parse_single_meta(body, span) {
+                    Ok(predicate) => {
+                        self.collect_meta(&predicate, "cfg macro nested in macro tokens", span)
+                    }
+                    Err(error) => {
+                        self.record_error("cfg macro nested in macro tokens", span, error)
+                    }
+                }
+                index += consumed;
+                continue;
+            }
+
+            if let TokenTree::Group(group) = &tokens[index] {
+                self.collect_nested_cfg_macros(group.stream());
+            }
+            index += 1;
+        }
+    }
+}
+
+fn meta_path(meta: &Meta) -> &syn::Path {
+    match meta {
+        Meta::Path(path) => path,
+        Meta::List(list) => &list.path,
+        Meta::NameValue(value) => &value.path,
+    }
+}
+
+fn parse_meta_list(tokens: TokenStream) -> syn::Result<Punctuated<Meta, Token![,]>> {
+    Punctuated::<Meta, Token![,]>::parse_terminated.parse2(tokens)
+}
+
+fn parse_single_meta(tokens: TokenStream, span: Span) -> syn::Result<Meta> {
+    let items = parse_meta_list(tokens)?;
+    if items.len() != 1 {
+        return Err(syn::Error::new(
+            span,
+            format!("expected exactly one cfg predicate, found {}", items.len()),
+        ));
+    }
+    Ok(items.into_iter().next().expect("one cfg predicate exists"))
+}
+
+fn cfg_macro_at(tokens: &[TokenTree], index: usize) -> Option<(usize, TokenStream, Span)> {
+    let mut cursor = index;
+    let has_leading_colon = punct_at(tokens, cursor, ':') && punct_at(tokens, cursor + 1, ':');
+    if has_leading_colon {
+        if index > 0 && matches!(&tokens[index - 1], TokenTree::Ident(_)) {
+            return None;
+        }
+        cursor += 2;
+    } else if index >= 2 && punct_at(tokens, index - 1, ':') && punct_at(tokens, index - 2, ':') {
+        return None;
+    }
+
+    let first = ident_at(tokens, cursor)?;
+    let span = first.span();
+    cursor += 1;
+
+    if ident_is(first, "cfg") {
+        if has_leading_colon {
+            return None;
+        }
+    } else if ident_is(first, "std") || ident_is(first, "core") {
+        if !punct_at(tokens, cursor, ':') || !punct_at(tokens, cursor + 1, ':') {
+            return None;
+        }
+        cursor += 2;
+        if !ident_at(tokens, cursor).is_some_and(|ident| ident_is(ident, "cfg")) {
+            return None;
+        }
+        cursor += 1;
+    } else {
+        return None;
+    }
+
+    if !punct_at(tokens, cursor, '!') {
+        return None;
+    }
+    let TokenTree::Group(body) = tokens.get(cursor + 1)? else {
+        return None;
+    };
+    Some((cursor + 2 - index, body.stream(), span))
+}
+
+fn ident_at(tokens: &[TokenTree], index: usize) -> Option<&syn::Ident> {
+    match tokens.get(index)? {
+        TokenTree::Ident(ident) => Some(ident),
+        _ => None,
+    }
+}
+
+fn punct_at(tokens: &[TokenTree], index: usize, expected: char) -> bool {
+    matches!(tokens.get(index), Some(TokenTree::Punct(punct)) if punct.as_char() == expected)
+}
+
 fn is_standard_cfg_macro(path: &syn::Path) -> bool {
-    if path.is_ident("cfg") {
+    if path.leading_colon.is_none() && path_is_ident(path, "cfg") {
         return true;
     }
     if path.segments.len() != 2 {
@@ -458,64 +688,87 @@ fn is_standard_cfg_macro(path: &syn::Path) -> bool {
     let mut segments = path.segments.iter();
     let root = segments.next().expect("two-segment path has a root");
     let macro_name = segments.next().expect("two-segment path has a macro name");
-    (root.ident == "std" || root.ident == "core") && macro_name.ident == "cfg"
+    (ident_is(&root.ident, "std") || ident_is(&root.ident, "core"))
+        && ident_is(&macro_name.ident, "cfg")
 }
 
-fn contains_feature(meta: &Meta) -> bool {
+fn path_is_ident(path: &syn::Path, expected: &str) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && ident_is(&path.segments[0].ident, expected)
+}
+
+fn ident_is(ident: &syn::Ident, expected: &str) -> bool {
+    normalized_ident(ident) == expected
+}
+
+fn normalized_ident(ident: &syn::Ident) -> String {
+    let ident = ident.to_string();
+    ident.strip_prefix("r#").unwrap_or(&ident).to_owned()
+}
+
+fn contains_feature(meta: &Meta) -> syn::Result<bool> {
     match meta {
-        Meta::Path(_) => false,
-        Meta::NameValue(value) => value.path.is_ident("feature"),
+        Meta::Path(_) => Ok(false),
+        Meta::NameValue(value) => {
+            canonical_expr(&value.value)?;
+            Ok(path_is_ident(&value.path, "feature"))
+        }
         Meta::List(list) => {
-            let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-            parser
-                .parse2(list.tokens.clone())
-                .is_ok_and(|items| items.iter().any(contains_feature))
+            let items = parse_meta_list(list.tokens.clone())?;
+            for item in &items {
+                if contains_feature(item)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
     }
 }
 
-fn canonical_meta(meta: &Meta) -> String {
-    match meta {
+fn canonical_meta(meta: &Meta) -> syn::Result<String> {
+    Ok(match meta {
         Meta::Path(path) => canonical_path(path),
-        Meta::NameValue(value) => {
-            format!(
-                "{} = {}",
-                canonical_path(&value.path),
-                canonical_expr(&value.value)
-            )
-        }
+        Meta::NameValue(value) => format!(
+            "{} = {}",
+            canonical_path(&value.path),
+            canonical_expr(&value.value)?
+        ),
         Meta::List(list) => {
-            let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-            let arguments = parser
-                .parse2(list.tokens.clone())
-                .expect("validated cfg predicate should contain meta arguments");
+            let arguments = parse_meta_list(list.tokens.clone())?;
             let arguments = arguments
                 .iter()
                 .map(canonical_meta)
-                .collect::<Vec<_>>()
+                .collect::<syn::Result<Vec<_>>>()?
                 .join(", ");
             format!("{}({arguments})", canonical_path(&list.path))
         }
-    }
+    })
 }
 
 fn canonical_path(path: &syn::Path) -> String {
     path.segments
         .iter()
-        .map(|segment| segment.ident.to_string())
+        .map(|segment| normalized_ident(&segment.ident))
         .collect::<Vec<_>>()
         .join("::")
 }
 
-fn canonical_expr(expression: &Expr) -> String {
+fn canonical_expr(expression: &Expr) -> syn::Result<String> {
     match expression {
         Expr::Lit(literal) => match &literal.lit {
-            Lit::Str(value) => format!("\"{}\"", value.value()),
-            Lit::Bool(value) => value.value.to_string(),
-            Lit::Int(value) => value.base10_digits().to_owned(),
-            _ => panic!("unsupported cfg literal"),
+            Lit::Str(value) => Ok(format!("\"{}\"", value.value())),
+            Lit::Bool(value) => Ok(value.value.to_string()),
+            Lit::Int(value) => Ok(value.base10_digits().to_owned()),
+            _ => Err(syn::Error::new_spanned(
+                expression,
+                "unsupported cfg predicate literal",
+            )),
         },
-        _ => panic!("unsupported cfg expression"),
+        _ => Err(syn::Error::new_spanned(
+            expression,
+            "unsupported cfg predicate expression",
+        )),
     }
 }
 
@@ -692,6 +945,39 @@ mod tests {
     }
 
     #[test]
+    fn boundary_rejects_shadow_workspace_package_under_legacy_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"legacy\", \"legacy/shadow\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        write_package(
+            &temp.path().join("legacy"),
+            "[package]\nname = \"days-legacy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_package(
+            &temp.path().join("legacy/shadow"),
+            "[package]\nname = \"shadow-legacy-engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+
+        let json = scratch_metadata(temp.path());
+        let error = audit_boundary_metadata(&json, &[])
+            .expect_err("a second workspace package under legacy/ must fail");
+        assert!(error.contains("shadow-legacy-engine"));
+        assert!(error.contains("legacy/shadow/Cargo.toml"));
+    }
+
+    #[test]
+    fn boundary_rejects_path_to_non_workspace_package_under_legacy_directory() {
+        let json = r#"{"workspace_root":"/repo","workspace_members":["app","legacy"],"packages":[{"id":"app","name":"app","manifest_path":"/repo/app/Cargo.toml"},{"id":"legacy","name":"days-legacy","manifest_path":"/repo/legacy/Cargo.toml"},{"id":"shadow","name":"shadow-legacy-engine","manifest_path":"/repo/legacy/shadow/Cargo.toml"}],"resolve":{"nodes":[{"id":"app","deps":[{"pkg":"shadow","dep_kinds":[{"kind":null}]}]},{"id":"legacy","deps":[]},{"id":"shadow","deps":[]}]}}"#;
+        let error = audit_boundary_metadata(json, &[])
+            .expect_err("every package under legacy/ must be a reachability target");
+        assert!(error.contains("resolved production/build path"), "{error}");
+        assert!(error.contains("shadow-legacy-engine"), "{error}");
+    }
+
+    #[test]
     fn semantic_gate_audit_rejects_protocol_features_and_wrong_paths() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
@@ -762,6 +1048,18 @@ mod tests {
     }
 
     #[test]
+    fn semantic_gate_audit_allows_unrelated_cfg_attr_attribute_syntax() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            "#![cfg_attr(unix, doc = concat!(\"hello\", \" world\"))]\n",
+        )
+        .unwrap();
+
+        assert!(audit_semantic_feature_gates(temp.path(), &[]).is_ok());
+    }
+
+    #[test]
     fn semantic_gate_audit_rejects_cfg_macro_feature_checks() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
@@ -810,6 +1108,255 @@ mod tests {
         }];
 
         assert!(audit_semantic_feature_gates(temp.path(), &allow).is_ok());
+    }
+
+    #[test]
+    fn semantic_gate_audit_finds_standard_cfg_macros_nested_in_macro_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            concat!(
+                "pub fn probe() {\n",
+                "    assert!(provider::cfg!(feature = \"protocol\"));\n",
+                "    assert!(provider::std::cfg!(feature = \"protocol\"));\n",
+                "    assert!(provider::core::cfg!(feature = \"protocol\"));\n",
+                "    assert!(cfg!(feature = \"protocol\"));\n",
+                "    assert!(std::cfg!(feature = \"protocol\"));\n",
+                "    assert!(core::cfg!(feature = \"protocol\"));\n",
+                "    assert!(::std::cfg!(feature = \"protocol\"));\n",
+                "    assert!(::core::cfg!(feature = \"protocol\"));\n",
+                "    assert!(r#cfg!(r#feature = \"protocol\"));\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let allow = [AllowedFeatureGate {
+            path: "model.rs",
+            predicate: r#"feature = "protocol""#,
+            count: 6,
+            purpose: "standard cfg paths nested in macro token streams",
+        }];
+
+        assert!(audit_semantic_feature_gates(temp.path(), &allow).is_ok());
+    }
+
+    #[test]
+    fn semantic_gate_audit_finds_nested_cfg_macros_after_field_colons() {
+        let mut bypasses = Vec::new();
+        for invocation in [
+            r#"cfg!(feature = "protocol")"#,
+            r#"std::cfg!(feature = "protocol")"#,
+            r#"core::cfg!(feature = "protocol")"#,
+            r#"::std::cfg!(feature = "protocol")"#,
+            r#"::core::cfg!(feature = "protocol")"#,
+            r#"r#cfg!(r#feature = "protocol")"#,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join("model.rs"),
+                format!(
+                    "struct Probe {{ gate: bool }}\npub fn probe() {{ let _ = vec![Probe {{ gate: {invocation} }}]; }}\n"
+                ),
+            )
+            .unwrap();
+            let allow = [AllowedFeatureGate {
+                path: "model.rs",
+                predicate: r#"feature = "protocol""#,
+                count: 1,
+                purpose: "nested cfg after a struct field colon",
+            }];
+
+            if audit_semantic_feature_gates(temp.path(), &allow).is_err() {
+                bypasses.push(invocation);
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "nested cfg macro spellings after a field colon bypassed inventory: {bypasses:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_trailing_comma_in_every_standard_cfg_macro_path() {
+        let mut bypasses = Vec::new();
+        for invocation in [
+            r#"cfg!(feature = "probe",)"#,
+            r#"std::cfg!(feature = "probe",)"#,
+            r#"core::cfg!(feature = "probe",)"#,
+            r#"::std::cfg!(feature = "probe",)"#,
+            r#"::core::cfg!(feature = "probe",)"#,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join("model.rs"),
+                format!("pub fn probe() -> bool {{ {invocation} }}\n"),
+            )
+            .unwrap();
+
+            match audit_semantic_feature_gates(temp.path(), &[]) {
+                Ok(()) => bypasses.push(invocation),
+                Err(error) => {
+                    assert!(error.contains("unapproved semantic feature gate"));
+                    assert!(error.contains(r#"feature = "probe""#));
+                }
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "standard cfg macro spellings bypassed the inventory: {bypasses:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_trailing_comma_in_cfg_attribute() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            "#[cfg(feature = \"probe\",)]\npub fn probe() {}\n",
+        )
+        .unwrap();
+
+        let error = audit_semantic_feature_gates(temp.path(), &[])
+            .expect_err("a trailing comma in cfg must not bypass the inventory");
+        assert!(error.contains("unapproved semantic feature gate"));
+        assert!(error.contains(r#"feature = "probe""#));
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_raw_identifiers_in_standard_cfg_macro_paths() {
+        let mut bypasses = Vec::new();
+        for invocation in [
+            r#"r#cfg!(feature = "probe")"#,
+            r#"std::r#cfg!(feature = "probe")"#,
+            r#"r#std::cfg!(feature = "probe")"#,
+            r#"core::r#cfg!(feature = "probe")"#,
+            r#"r#core::cfg!(feature = "probe")"#,
+            r#"::std::r#cfg!(feature = "probe")"#,
+            r#"::r#std::cfg!(feature = "probe")"#,
+            r#"::core::r#cfg!(feature = "probe")"#,
+            r#"::r#core::cfg!(feature = "probe")"#,
+            r#"cfg!(r#feature = "probe")"#,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join("model.rs"),
+                format!("pub fn probe() -> bool {{ {invocation} }}\n"),
+            )
+            .unwrap();
+
+            match audit_semantic_feature_gates(temp.path(), &[]) {
+                Ok(()) => bypasses.push(invocation),
+                Err(error) => {
+                    assert!(error.contains("unapproved semantic feature gate"));
+                    assert!(error.contains(r#"feature = "probe""#));
+                    assert!(!error.contains("r#feature"));
+                }
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "raw cfg macro spellings bypassed the inventory: {bypasses:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_raw_identifiers_in_cfg_attributes() {
+        let mut bypasses = Vec::new();
+        for attribute in [
+            r#"#[r#cfg(feature = "probe")]"#,
+            r#"#[cfg(r#feature = "probe")]"#,
+            r#"#[r#cfg(r#feature = "probe")]"#,
+            r#"#[r#cfg_attr(unix, cfg(feature = "probe"))]"#,
+            r#"#[cfg_attr(unix, r#cfg(r#feature = "probe"))]"#,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join("model.rs"),
+                format!("{attribute}\npub fn probe() {{}}\n"),
+            )
+            .unwrap();
+
+            match audit_semantic_feature_gates(temp.path(), &[]) {
+                Ok(()) => bypasses.push(attribute),
+                Err(error) => {
+                    assert!(error.contains("unapproved semantic feature gate"));
+                    assert!(error.contains(r#"feature = "probe""#));
+                    assert!(!error.contains("r#feature"));
+                }
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "raw cfg attribute spellings bypassed the inventory: {bypasses:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_gate_audit_canonicalizes_raw_feature_predicate_identifiers() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            "#[cfg(r#feature = \"probe\")]\npub fn probe() {}\n",
+        )
+        .unwrap();
+        let allow = [AllowedFeatureGate {
+            path: "model.rs",
+            predicate: r#"feature = "probe""#,
+            count: 1,
+            purpose: "raw identifiers have the same cfg identity",
+        }];
+
+        assert!(audit_semantic_feature_gates(temp.path(), &allow).is_ok());
+    }
+
+    #[test]
+    fn semantic_gate_audit_reports_recognized_cfg_parse_failures_with_location() {
+        let mut bypasses = Vec::new();
+        for (form, source) in [
+            (
+                "cfg!",
+                "pub fn probe() -> bool { cfg!(feature = \"probe\";) }\n",
+            ),
+            (
+                "std::cfg!",
+                "pub fn probe() -> bool { std::cfg!(feature = \"probe\";) }\n",
+            ),
+            (
+                "core::cfg!",
+                "pub fn probe() -> bool { core::cfg!(feature = \"probe\";) }\n",
+            ),
+            (
+                "::std::cfg!",
+                "pub fn probe() -> bool { ::std::cfg!(feature = \"probe\";) }\n",
+            ),
+            (
+                "::core::cfg!",
+                "pub fn probe() -> bool { ::core::cfg!(feature = \"probe\";) }\n",
+            ),
+            (
+                "#[cfg]",
+                "#[cfg(feature = \"probe\";)]\npub fn probe() {}\n",
+            ),
+            (
+                "#[cfg_attr]",
+                "#[cfg_attr(unix, cfg(feature = \"probe\";))]\npub fn probe() {}\n",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("model.rs"), source).unwrap();
+
+            match audit_semantic_feature_gates(temp.path(), &[]) {
+                Ok(()) => bypasses.push(form),
+                Err(error) => {
+                    assert!(error.contains("failed to parse recognized"));
+                    assert!(error.contains("model.rs:1"));
+                }
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "recognized cfg parse failures were ignored: {bypasses:?}"
+        );
     }
 
     #[test]
