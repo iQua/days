@@ -1064,8 +1064,7 @@ impl CudaPlan {
         observation_mode: ObservationMode,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
-        let flow_packet_counts = flow_packet_counts(image)?;
-        let flow_feedback_counts = flow_feedback_counts(image, &flow_packet_counts);
+        let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
         let minimum_lookahead_ns = image
             .channels
             .iter()
@@ -1508,35 +1507,46 @@ impl CudaPlan {
     }
 }
 
-fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, CudaError> {
-    let mut counts = vec![0_usize; image.flows.len()];
+fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>), CudaError> {
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
+    let mut data_counts = vec![0_usize; image.flows.len()];
+    let mut feedback_counts = vec![0_usize; image.flows.len()];
     for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
+            continue;
+        }
+        let counts = if packet.kind.is_data() {
+            &mut data_counts
+        } else {
+            &mut feedback_counts
+        };
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
-            if generator.next_emission.status != GeneratorStatus::Scheduled {
-                continue;
-            }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
                 let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                     unreachable!()
                 };
                 let remaining = tcp.total_bytes.saturating_sub(tcp.next_sequence);
-                let fresh =
-                    usize::try_from(remaining.div_ceil(tcp.mss_bytes)).unwrap_or(usize::MAX);
-                // Each delivered attempt creates one ACK. Four attempts per original segment is
-                // the established bounded device arena allowance; explicit capacity overrides
-                // remain available for adversarial checkpoint images.
-                let segments =
-                    usize::try_from(tcp.total_bytes.div_ceil(tcp.mss_bytes)).unwrap_or(usize::MAX);
+                let fresh = remaining.div_ceil(tcp.mss_bytes) as usize;
+                let outstanding = tcp.bytes_in_flight.div_ceil(tcp.mss_bytes) as usize;
+                // Retransmissions replace an existing ledger entry. Four attempts per outstanding
+                // segment plus a small recovery allowance is conservative for the finite T24
+                // corpora while retaining an explicit device-capacity fault for pathological loss.
                 let attempts = fresh
-                    .saturating_add(segments.saturating_mul(4))
+                    .saturating_add(outstanding.saturating_mul(4))
                     .saturating_add(8);
-                counts[index] = counts[index].saturating_add(attempts.saturating_mul(2));
+                let already_scheduled =
+                    usize::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+                data_counts[index] =
+                    data_counts[index].saturating_add(attempts.saturating_sub(already_scheduled));
                 continue;
             };
+            if generator.next_emission.status != GeneratorStatus::Scheduled {
+                continue;
+            }
             let termination_count = match constant.termination {
                 GeneratorTermination::Bytes(bytes) => {
                     if generator.bytes_emitted >= bytes {
@@ -1568,10 +1578,23 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, CudaError> 
                     / constant.interval_ns
             };
             let future = termination_count.min(stop_count) as usize;
-            counts[index] = counts[index].saturating_add(future.saturating_sub(1));
+            data_counts[index] = data_counts[index].saturating_add(future.saturating_sub(1));
         }
     }
-    Ok(counts)
+    for state in &image.host_states {
+        for generator in &state.generators {
+            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+                let flow = generator.flow.0 as usize;
+                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
+            }
+        }
+    }
+    let totals = data_counts
+        .into_iter()
+        .zip(&feedback_counts)
+        .map(|(data, feedback)| data.saturating_add(*feedback))
+        .collect();
+    Ok((totals, feedback_counts))
 }
 
 fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::TcpGenerator> {
@@ -1584,23 +1607,6 @@ fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::Tc
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
             FlowGeneratorKind::Constant(_) => None,
         })
-}
-
-fn flow_feedback_counts(image: &SimulationImage, total_counts: &[usize]) -> Vec<usize> {
-    let mut counts = vec![0_usize; image.flows.len()];
-    for packet in &image.initial_packets {
-        if matches!(packet.kind, PacketKind::Feedback | PacketKind::TcpAck(_)) {
-            counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
-        }
-    }
-    for flow in 0..image.flows.len() {
-        if tcp_generator(image, flow).is_some() {
-            // TCP data and ACK records are paired after the initial checkpoint population. A
-            // one-record outward rounding keeps the direction split conservative when odd.
-            counts[flow] = counts[flow].max(total_counts[flow].div_ceil(2));
-        }
-    }
-    counts
 }
 
 fn paced_single_source_queue_bound(
