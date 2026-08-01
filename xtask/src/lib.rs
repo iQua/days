@@ -132,14 +132,6 @@ pub fn audit_boundary_metadata(
                 entry.package, entry.dependency
             ));
         }
-        if entry.dependency != legacy.name {
-            return Err(format!(
-                "boundary allow-list entry {} -> {} does not name the real legacy package at {}",
-                entry.package,
-                entry.dependency,
-                legacy_manifest.display()
-            ));
-        }
         let source_packages = metadata
             .packages
             .iter()
@@ -154,10 +146,30 @@ pub fn audit_boundary_metadata(
                 source_packages.len()
             ));
         }
-        let key = (source_packages[0].id.clone(), legacy.id.clone());
+        let dependency_packages = if entry.dependency == legacy.name {
+            vec![legacy]
+        } else {
+            metadata
+                .packages
+                .iter()
+                .filter(|package| package.name == entry.dependency)
+                .collect::<Vec<_>>()
+        };
+        if dependency_packages.len() != 1 {
+            return Err(format!(
+                "boundary allow-list target `{}` must resolve to exactly one package; found {}",
+                entry.dependency,
+                dependency_packages.len()
+            ));
+        }
+        let key = (
+            source_packages[0].id.clone(),
+            dependency_packages[0].id.clone(),
+            Some("dev".to_owned()),
+        );
         if allowed.insert(key, entry.purpose).is_some() {
             return Err(format!(
-                "duplicate boundary allow-list entry {} -> {}",
+                "duplicate boundary allow-list entry {} -[dev]-> {}",
                 entry.package, entry.dependency
             ));
         }
@@ -176,55 +188,13 @@ pub fn audit_boundary_metadata(
         }
     }
 
-    let mut seen_allowed = BTreeSet::new();
-    for member_id in &workspace_members {
-        let node = nodes_by_id[member_id.as_str()];
-        for dependency in &node.deps {
-            if dependency.pkg != legacy.id
-                || !dependency
-                    .dep_kinds
-                    .iter()
-                    .any(|kind| kind.kind.as_deref() == Some("dev"))
-            {
-                continue;
-            }
-
-            let key = (member_id.clone(), legacy.id.clone());
-            if allowed.contains_key(&key) {
-                seen_allowed.insert(key);
-            } else {
-                errors.push(format!(
-                    "{} -> {} has a forbidden resolved dev dependency",
-                    package_label(member_id, &packages_by_id),
-                    package_label(&legacy.id, &packages_by_id)
-                ));
-            }
-        }
-    }
-
-    for (source_id, dependency_id) in allowed.keys() {
-        if !seen_allowed.contains(&(source_id.clone(), dependency_id.clone())) {
-            errors.push(format!(
-                "stale boundary allow-list entry {} -> {}: expected an exact resolved dev-dependency",
-                package_label(source_id, &packages_by_id),
-                package_label(dependency_id, &packages_by_id)
-            ));
-        }
-    }
-
-    let production_graph = resolve
+    let full_graph = resolve
         .nodes
         .iter()
         .map(|node| {
             let mut dependencies = node
                 .deps
                 .iter()
-                .filter(|dependency| {
-                    dependency
-                        .dep_kinds
-                        .iter()
-                        .any(|kind| kind.kind.as_deref() != Some("dev"))
-                })
                 .map(|dependency| dependency.pkg.clone())
                 .collect::<Vec<_>>();
             dependencies.sort();
@@ -232,17 +202,61 @@ pub fn audit_boundary_metadata(
             (node.id.clone(), dependencies)
         })
         .collect::<BTreeMap<_, _>>();
+
+    let mut seen_allowed = BTreeSet::new();
     for member_id in workspace_members
         .iter()
         .filter(|member_id| member_id.as_str() != legacy.id)
     {
-        if let Some(path) = resolved_path(member_id, &legacy.id, &production_graph) {
+        let node = nodes_by_id[member_id.as_str()];
+        for dependency in &node.deps {
+            let suffix = if dependency.pkg == legacy.id {
+                Some(vec![legacy.id.clone()])
+            } else {
+                resolved_path(&dependency.pkg, &legacy.id, &full_graph)
+            };
+            let Some(suffix) = suffix else {
+                continue;
+            };
+            let path = std::iter::once(member_id.clone())
+                .chain(suffix)
+                .map(|package_id| package_label(&package_id, &packages_by_id))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+
+            for kind in &dependency.dep_kinds {
+                let key = (member_id.clone(), dependency.pkg.clone(), kind.kind.clone());
+                let entry = format!(
+                    "{} -[{}]-> {}",
+                    package_label(member_id, &packages_by_id),
+                    dependency_kind_label(kind),
+                    package_label(&dependency.pkg, &packages_by_id)
+                );
+                if kind.kind.as_deref() == Some("dev") {
+                    if allowed.contains_key(&key) {
+                        seen_allowed.insert(key);
+                    } else {
+                        errors.push(format!(
+                            "forbidden resolved dev entry edge reaches the legacy boundary: {entry}; path: {path}"
+                        ));
+                    }
+                } else {
+                    errors.push(format!(
+                        "resolved production/build path reaches the legacy boundary via entry edge {entry}: {path}"
+                    ));
+                }
+            }
+        }
+    }
+
+    for (source_id, dependency_id, kind) in allowed.keys() {
+        let key = (source_id.clone(), dependency_id.clone(), kind.clone());
+        if !seen_allowed.contains(&key) {
             errors.push(format!(
-                "resolved production/build path reaches the legacy boundary: {}",
-                path.iter()
-                    .map(|package_id| package_label(package_id, &packages_by_id))
-                    .collect::<Vec<_>>()
-                    .join(" -> ")
+                "stale boundary allow-list entry {} -[{}]-> {}: expected an exact resolved entry edge whose full path reaches the real legacy package",
+                package_label(source_id, &packages_by_id),
+                kind.as_deref().unwrap_or("normal"),
+                package_label(dependency_id, &packages_by_id)
             ));
         }
     }
@@ -252,6 +266,10 @@ pub fn audit_boundary_metadata(
     } else {
         Err(errors.join("\n"))
     }
+}
+
+fn dependency_kind_label(kind: &ResolvedDependencyKind) -> &str {
+    kind.kind.as_deref().unwrap_or("normal")
 }
 
 fn resolved_path(
@@ -418,12 +436,7 @@ impl<'ast> Visit<'ast> for FeatureGateCollector {
     }
 
     fn visit_macro(&mut self, macro_: &'ast syn::Macro) {
-        if macro_
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "cfg")
-        {
+        if is_standard_cfg_macro(&macro_.path) {
             if let Ok(predicate) = syn::parse2::<Meta>(macro_.tokens.clone()) {
                 if contains_feature(&predicate) {
                     self.predicates.push(canonical_meta(&predicate));
@@ -432,6 +445,20 @@ impl<'ast> Visit<'ast> for FeatureGateCollector {
         }
         syn::visit::visit_macro(self, macro_);
     }
+}
+
+fn is_standard_cfg_macro(path: &syn::Path) -> bool {
+    if path.is_ident("cfg") {
+        return true;
+    }
+    if path.segments.len() != 2 {
+        return false;
+    }
+
+    let mut segments = path.segments.iter();
+    let root = segments.next().expect("two-segment path has a root");
+    let macro_name = segments.next().expect("two-segment path has a macro name");
+    (root.ident == "std" || root.ident == "core") && macro_name.ident == "cfg"
 }
 
 fn contains_feature(meta: &Meta) -> bool {
@@ -596,6 +623,42 @@ mod tests {
     }
 
     #[test]
+    fn boundary_rejects_dev_entry_to_normal_legacy_bridge() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"probe\", \"legacy\"]\nexclude = [\"bridge\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        write_package(
+            &temp.path().join("probe"),
+            "[package]\nname = \"days-executor-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dev-dependencies]\nbridge = { path = \"../bridge\" }\n",
+        );
+        write_package(
+            &temp.path().join("bridge"),
+            "[package]\nname = \"bridge\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndays-legacy = { path = \"../legacy\" }\n",
+        );
+        write_package(
+            &temp.path().join("legacy"),
+            "[package]\nname = \"days-legacy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+
+        let json = scratch_metadata(temp.path());
+        let error = audit_boundary_metadata(&json, &[])
+            .expect_err("dev entry to a normal legacy bridge must fail");
+        assert!(error.contains("days-executor-probe"));
+        assert!(error.contains("bridge"));
+        assert!(error.contains("days-legacy"));
+
+        let allow = [AllowedDevDependency {
+            package: "days-executor-probe",
+            dependency: "bridge",
+            purpose: "test-only bridge entry",
+        }];
+        assert!(audit_boundary_metadata(&json, &allow).is_ok());
+    }
+
+    #[test]
     fn boundary_allow_list_rejects_same_named_impostor() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
@@ -722,6 +785,31 @@ mod tests {
         let error = audit_semantic_feature_gates(temp.path(), &[])
             .expect_err("qualified cfg macro must be inventoried");
         assert!(error.contains(r#"feature = "protocol""#));
+    }
+
+    #[test]
+    fn semantic_gate_audit_matches_only_standard_cfg_macro_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            concat!(
+                "provider::cfg!(feature = \"protocol\");\n",
+                "cfg!(feature = \"protocol\");\n",
+                "std::cfg!(feature = \"protocol\");\n",
+                "core::cfg!(feature = \"protocol\");\n",
+                "::std::cfg!(feature = \"protocol\");\n",
+                "::core::cfg!(feature = \"protocol\");\n",
+            ),
+        )
+        .unwrap();
+        let allow = [AllowedFeatureGate {
+            path: "model.rs",
+            predicate: r#"feature = "protocol""#,
+            count: 5,
+            purpose: "the five exact standard cfg macro paths",
+        }];
+
+        assert!(audit_semantic_feature_gates(temp.path(), &allow).is_ok());
     }
 
     #[test]
