@@ -980,6 +980,119 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
     assert_eq!(cuda_comparisons, 2 * 4 * 2 * 2 * 2);
 }
 
+#[test]
+fn tcp_device_semantic_gap_probes_are_byte_identical() {
+    const PROBE_COMPARISONS_PER_BACKEND: usize = 3;
+
+    let partial_ack = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), 4 * MSS, &[1; 7]);
+
+    let mut maximum_timer_generation = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    maximum_timer_generation.stop_time_ns = 0;
+    let FlowGeneratorKind::Tcp(ref mut tcp) =
+        maximum_timer_generation.host_states[0].generators[0].kind
+    else {
+        unreachable!()
+    };
+    tcp.timer_generation = u64::MAX - 1;
+
+    let mut maximum_rto = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    maximum_rto.stop_time_ns = 1;
+    let generator = &mut maximum_rto.host_states[0].generators[0];
+    generator.next_emission.departure_time_ns = 1;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.rto_ns = u64::MAX - maximum_rto.stop_time_ns;
+    let PacketKind::TcpData(ref mut header) = maximum_rto.initial_packets[0].kind else {
+        unreachable!()
+    };
+    header.sent_time_ns = 1;
+    maximum_rto.initial_events[0].key.time_ns = 1;
+
+    let probes = [
+        ("partial cumulative ACK remainder", partial_ack),
+        ("maximum timer generation", maximum_timer_generation),
+        ("maximum accepted RTO", maximum_rto),
+    ];
+    let mut cpu_comparisons = 0;
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    let mut metal_comparisons = 0;
+    #[cfg(feature = "cuda")]
+    let mut cuda_comparisons = 0;
+
+    for (name, image) in probes {
+        validate(&image, Backend::Scalar)
+            .unwrap_or_else(|error| panic!("{name} Scalar validation failed: {error}"));
+        validate(&image, Backend::Cpu { workers: 2 })
+            .unwrap_or_else(|error| panic!("{name} CPU validation failed: {error}"));
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("{name} Scalar execution failed: {error}"));
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers: 2,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("{name} CPU execution failed: {error}"));
+        assert_eq!(cpu.result, scalar, "{name} Scalar/CPU byte identity");
+        cpu_comparisons += 1;
+
+        if name == "partial cumulative ACK remainder" {
+            let retransmission = scalar
+                .observed_packets
+                .iter()
+                .find(|packet| {
+                    matches!(
+                        packet.kind,
+                        PacketKind::TcpData(header)
+                            if header.retransmission && header.sequence == 1
+                    )
+                })
+                .expect("partial cumulative ACK must retransmit the unacknowledged remainder");
+            assert_eq!(retransmission.size_bytes, MSS - 1);
+        }
+
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        {
+            validate(&image, Backend::Metal)
+                .unwrap_or_else(|error| panic!("{name} Metal validation failed: {error}"));
+            let metal = run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .unwrap_or_else(|error| panic!("{name} Metal execution failed: {error}"));
+            assert_eq!(metal.result, scalar, "{name} Scalar/Metal byte identity");
+            metal_comparisons += 1;
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            validate(&image, Backend::Cuda)
+                .unwrap_or_else(|error| panic!("{name} CUDA validation failed: {error}"));
+            let cuda = run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Full,
+            )
+            .unwrap_or_else(|error| panic!("{name} CUDA execution failed: {error}"));
+            assert_eq!(cuda.result, scalar, "{name} Scalar/CUDA byte identity");
+            cuda_comparisons += 1;
+        }
+    }
+
+    assert_eq!(cpu_comparisons, PROBE_COMPARISONS_PER_BACKEND);
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    assert_eq!(metal_comparisons, PROBE_COMPARISONS_PER_BACKEND);
+    #[cfg(feature = "cuda")]
+    assert_eq!(cuda_comparisons, PROBE_COMPARISONS_PER_BACKEND);
+}
+
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
 fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
@@ -1037,6 +1150,94 @@ fn cuda_tcp_timer_checkpoint_is_byte_identical() {
     )
     .expect("CUDA timer checkpoint must resume");
     assert_eq!(cuda.result, scalar);
+}
+
+#[test]
+fn stale_different_timer_checkpoint_is_byte_identical_on_all_available_backends() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 4 * MSS);
+    let prefix = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
+        .expect("scalar TCP prefix must run");
+    let mut checkpoint = checkpoint_image(&image, &prefix);
+    let state = &mut checkpoint.host_states[0];
+    let FlowGeneratorKind::Tcp(ref mut tcp) = state.generators[0].kind else {
+        unreachable!()
+    };
+    let live_timer = tcp
+        .active_timer
+        .expect("blocked sender has an active timer");
+    let stale_attempt = FIRST;
+    assert_ne!(stale_attempt, live_timer.attempt);
+    let stale_deadline = live_timer
+        .deadline_ns
+        .checked_sub(1)
+        .expect("fixture timer deadline follows the stale event");
+
+    let mut stale_event = checkpoint
+        .initial_events
+        .iter()
+        .copied()
+        .find(|event| {
+            event.kind == EventKind::RetransmissionTimeout
+                && event.payload == live_timer.attempt
+                && event.key.time_ns == live_timer.deadline_ns
+        })
+        .expect("checkpoint contains the live timer event");
+    stale_event.key.time_ns = stale_deadline;
+    stale_event.key.origin_seq = state.next_origin_seq;
+    stale_event.payload = stale_attempt;
+    state.next_origin_seq += 1;
+    checkpoint.initial_events.push(stale_event);
+    checkpoint
+        .initial_events
+        .sort_unstable_by_key(|event| event.key);
+
+    for backend in [
+        Backend::Scalar,
+        Backend::Cpu { workers: 2 },
+        Backend::Metal,
+        Backend::Cuda,
+    ] {
+        validate(&checkpoint, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept a stale timer: {error}"));
+    }
+
+    let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+        .expect("scalar stale-timer checkpoint must resume");
+    let cpu = run_cpu_with_observations(
+        &checkpoint,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("CPU stale-timer checkpoint must resume");
+    assert_eq!(cpu.result, scalar, "stale-timer Scalar/CPU identity");
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    {
+        let metal = run_metal_with_observations(
+            &checkpoint,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("Metal stale-timer checkpoint must resume");
+        assert_eq!(metal.result, scalar, "stale-timer Scalar/Metal identity");
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let cuda = run_cuda_with_observations(
+            &checkpoint,
+            None,
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("CUDA stale-timer checkpoint must resume");
+        assert_eq!(cuda.result, scalar, "stale-timer Scalar/CUDA identity");
+    }
 }
 
 #[test]

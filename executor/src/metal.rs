@@ -1330,10 +1330,10 @@ impl MetalPlan {
             };
             let mut record = event_record(*event, packet);
             if event.kind == EventKind::RetransmissionTimeout {
-                let timer_flow = image
-                    .host_states
+                let node = &image.nodes[event.target.0 as usize];
+                let timer_flow = image.host_states[node.state_slot as usize]
+                    .generators
                     .iter()
-                    .flat_map(|state| &state.generators)
                     .find_map(|generator| match generator.kind {
                         FlowGeneratorKind::Tcp(tcp)
                             if tcp.active_timer.is_some_and(|timer| {
@@ -1344,14 +1344,8 @@ impl MetalPlan {
                             Some(generator.flow)
                         }
                         _ => None,
-                    })
-                    .ok_or_else(|| {
-                        MetalError::Validation(format!(
-                            "TCP retransmission timer at key {:?} has no matching active timer",
-                            event.key
-                        ))
-                    })?;
-                record[8] = timer_flow.0;
+                    });
+                record[8] = timer_flow.map_or(NONE, |flow| flow.0);
             }
             heap_push_host(
                 event.target.0 as usize,

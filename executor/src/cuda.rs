@@ -25,11 +25,11 @@ use cudarc::nvrtc::Ptx;
 use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
-    ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus,
-    GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
-    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, TcpTransitionInput, TcpTransitionRecord, validate,
+    ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, FlowId,
+    GeneratorStatus, GeneratorTermination, NodeId, NodeKind, ObservationMode,
+    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult,
+    RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase,
+    TcpReceiveRange, TcpTimerState, TcpTransitionInput, TcpTransitionRecord, validate,
 };
 
 const LANES: usize = 1_024;
@@ -2528,24 +2528,22 @@ fn timer_packet_for(image: &SimulationImage, event: Event) -> Result<PacketDescr
                 })
                 .map(|timer| (generator.flow, timer))
         });
-    let Some((flow, timer)) = matches.next() else {
-        return Err(CudaError::Validation(format!(
-            "TCP timeout {:?} payload {:?} has no owning active timer",
-            event.key, event.payload
-        )));
-    };
+    let owner = matches.next();
     if matches.next().is_some() {
         return Err(CudaError::Validation(format!(
             "TCP timeout {:?} payload {:?} has multiple owning active timers",
             event.key, event.payload
         )));
     }
+    let (flow, sequence) = owner
+        .map(|(flow, timer)| (flow, timer.sequence))
+        .unwrap_or((FlowId(NONE), 0));
     Ok(PacketDescriptor {
         id: event.payload,
         flow,
         size_bytes: 0,
         kind: PacketKind::TcpData(TcpDataHeader {
-            sequence: timer.sequence,
+            sequence,
             sent_time_ns: event.key.time_ns,
             retransmission: true,
         }),
