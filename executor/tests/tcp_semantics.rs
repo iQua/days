@@ -11,6 +11,10 @@ use days_executor::{
     event_fel_class, event_phase, run_cpu_with_observations, run_scalar_rounds_with_observations,
     run_scalar_with_observations, size_default_device_plan, validate,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaConfig, run_cuda_with_observations};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -234,7 +238,7 @@ fn switched_tcp_image(
                         unacknowledged_bytes: 0,
                     },
                     kind: FlowGeneratorKind::Tcp(TcpGenerator::new(
-                        16 * MSS,
+                        160 * MSS,
                         MSS,
                         ACK_BYTES,
                         control,
@@ -395,6 +399,95 @@ fn tcp_ack_burst_image(
     image.host_states[1].next_payload_seq = acknowledgments.len() as u64;
     image.initial_packets.sort_by_key(|packet| packet.id);
     image.initial_events.sort_by_key(|event| event.key);
+    image
+}
+
+fn cubic_wide_magnitude_checkpoint_image() -> SimulationImage {
+    const ACK_TIME_NS: u64 = 82_858;
+    const ECHOED_TIME_NS: u64 = 68_164;
+    const TIMER_DEADLINE_NS: u64 = 1_000_000_000;
+
+    let mut control = TcpCongestionControl::cubic(MSS);
+    let TcpCongestionControl::Cubic(ref mut cubic) = control else {
+        unreachable!()
+    };
+    cubic.cwnd_scaled = 5_600_000_000;
+    cubic.ssthresh_scaled = 5_600_000_000;
+    cubic.phase = TcpPhase::CongestionAvoidance;
+    cubic.w_max_scaled = 8_000_000_000;
+    cubic.w_last_max_scaled = 8_000_000_000;
+    cubic.epoch_start_ns = 68_140;
+    cubic.srtt_ns = 15_898;
+    cubic.k_ns = 1_817_120_592;
+    let mut image = tcp_image(control, MSS);
+    image.stop_time_ns = ACK_TIME_NS;
+
+    let generator = &mut image.host_states[0].generators[0];
+    generator.packets_emitted = 1;
+    generator.bytes_emitted = MSS;
+    generator.next_emission.status = GeneratorStatus::Blocked;
+    generator.feedback.outstanding_bytes = MSS;
+    generator.feedback.unacknowledged_bytes = MSS;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.next_sequence = MSS;
+    tcp.bytes_in_flight = MSS;
+    tcp.last_attempt = FIRST;
+    tcp.timer_generation = 1;
+    tcp.active_timer = Some(TcpTimerState {
+        attempt: FIRST,
+        sequence: 0,
+        deadline_ns: TIMER_DEADLINE_NS,
+        generation: 1,
+        rto_ns: TIMER_DEADLINE_NS,
+    });
+    tcp.srtt_ns = 15_898;
+    tcp.rtt_var_ns = 1;
+    tcp.rto_ns = TIMER_DEADLINE_NS;
+
+    image.host_states[0].next_origin_seq = 2;
+    image.host_states[0].sourced_packets = 1;
+    image.host_states[0].departed_packets = 1;
+    image.host_states[1].next_origin_seq = 1;
+    image.host_states[1].next_payload_seq = 1;
+
+    let ack = PacketDescriptor {
+        id: PayloadId(1),
+        flow: FLOW,
+        size_bytes: ACK_BYTES,
+        kind: PacketKind::TcpAck(TcpAckHeader {
+            acknowledgment: MSS,
+            acknowledged_bytes: MSS,
+            echoed_sent_time_ns: ECHOED_TIME_NS,
+        }),
+    };
+    image.initial_packets.push(ack);
+    image.initial_packets.sort_by_key(|packet| packet.id);
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: ACK_TIME_NS,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SINK,
+                origin_seq: 0,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload: ack.id,
+        },
+        Event {
+            key: EventKey {
+                time_ns: TIMER_DEADLINE_NS,
+                phase: event_phase(EventKind::RetransmissionTimeout),
+                origin_node: SOURCE,
+                origin_seq: 1,
+            },
+            target: SOURCE,
+            kind: EventKind::RetransmissionTimeout,
+            payload: FIRST,
+        },
+    ];
     image
 }
 
@@ -608,6 +701,42 @@ fn cubic_window_uses_the_documented_integer_lattice() {
 }
 
 #[test]
+fn cubic_wide_magnitude_transition_is_byte_identical_on_all_available_backends() {
+    let image = cubic_wide_magnitude_checkpoint_image();
+    validate(&image, Backend::Scalar).expect("wide CUBIC checkpoint should validate");
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("wide CUBIC scalar checkpoint should run");
+    let TcpCongestionControl::Cubic(after) = scalar.tcp_transitions[0].after else {
+        unreachable!()
+    };
+    assert_eq!(after.cwnd_scaled, 6_094_816_939);
+
+    let cpu = run_cpu_with_observations(&image, None, CpuConfig::default(), ObservationMode::Full)
+        .expect("wide CUBIC CPU checkpoint should run");
+    assert_eq!(cpu.result, scalar);
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    {
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("wide CUBIC Metal checkpoint should run");
+        assert_eq!(metal.result, scalar);
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let cuda =
+            run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
+                .expect("wide CUBIC CUDA checkpoint should run");
+        assert_eq!(cuda.result, scalar);
+    }
+}
+
+#[test]
 fn retransmission_timeout_is_a_phase_one_fallback_classified_event() {
     assert_eq!(event_phase(EventKind::RetransmissionTimeout), 1);
     assert_eq!(
@@ -702,7 +831,7 @@ fn scalar_rounds_and_cpu_are_byte_identical_for_reno_and_cubic() {
 }
 
 #[test]
-fn tcp_cartesian_matrix_is_byte_identical_across_queue_and_cpu_axes() {
+fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
     let disciplines = [
         ("FIFO", SchedulerKind::Fifo, 0),
         ("TailDrop", SchedulerKind::Fifo, 1),
@@ -710,6 +839,10 @@ fn tcp_cartesian_matrix_is_byte_identical_across_queue_and_cpu_axes() {
         ("WFQ", SchedulerKind::weighted_fair_queue(vec![1]), 0),
     ];
     let mut comparisons = 0;
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    let mut metal_comparisons = 0;
+    #[cfg(feature = "cuda")]
+    let mut cuda_comparisons = 0;
     for control in [
         TcpCongestionControl::reno(MSS),
         TcpCongestionControl::cubic(MSS),
@@ -719,6 +852,15 @@ fn tcp_cartesian_matrix_is_byte_identical_across_queue_and_cpu_axes() {
             let partial_horizon = Some(2_000);
             let full = run_scalar_with_observations(&image, None, ObservationMode::Full)
                 .unwrap_or_else(|error| panic!("{discipline} scalar full failed: {error}"));
+            if matches!(control, TcpCongestionControl::Cubic(_)) {
+                assert!(
+                    full.tcp_transitions.iter().any(|record| {
+                        matches!(record.after, TcpCongestionControl::Cubic(_))
+                            && record.after.phase() == TcpPhase::CongestionAvoidance
+                    }),
+                    "the shared CUBIC fixture must exercise congestion avoidance"
+                );
+            }
             let partial =
                 run_scalar_with_observations(&image, partial_horizon, ObservationMode::Full)
                     .unwrap_or_else(|error| panic!("{discipline} scalar partial failed: {error}"));
@@ -757,9 +899,144 @@ fn tcp_cartesian_matrix_is_byte_identical_across_queue_and_cpu_axes() {
                     }
                 }
             }
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            for streams_enabled in [false, true] {
+                for round_threads_per_threadgroup in [32, 256] {
+                    for (horizon, expected) in [(None, &full), (partial_horizon, &partial)] {
+                        validate(&image, Backend::Metal).unwrap_or_else(|error| {
+                            panic!(
+                                "{} {discipline} Metal validation failed: {error}",
+                                control.label()
+                            )
+                        });
+                        let actual = run_metal_with_observations(
+                            &image,
+                            horizon,
+                            MetalConfig {
+                                streams_enabled,
+                                round_threads_per_threadgroup,
+                                ..MetalConfig::default()
+                            },
+                            ObservationMode::Full,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{} {discipline} Metal streams={streams_enabled}/geometry={round_threads_per_threadgroup}/{horizon:?} failed: {error}",
+                                control.label()
+                            )
+                        });
+                        assert_eq!(
+                            &actual.result,
+                            expected,
+                            "{} {discipline} Metal streams={streams_enabled}/geometry={round_threads_per_threadgroup}/{horizon:?}",
+                            control.label()
+                        );
+                        metal_comparisons += 1;
+                    }
+                }
+            }
+            #[cfg(feature = "cuda")]
+            for streams_enabled in [false, true] {
+                for round_threads_per_block in [32, 256] {
+                    for (horizon, expected) in [(None, &full), (partial_horizon, &partial)] {
+                        validate(&image, Backend::Cuda).unwrap_or_else(|error| {
+                            panic!(
+                                "{} {discipline} CUDA validation failed: {error}",
+                                control.label()
+                            )
+                        });
+                        let actual = run_cuda_with_observations(
+                            &image,
+                            horizon,
+                            CudaConfig {
+                                streams_enabled,
+                                round_threads_per_block,
+                                ..CudaConfig::default()
+                            },
+                            ObservationMode::Full,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{} {discipline} CUDA streams={streams_enabled}/geometry={round_threads_per_block}/{horizon:?} failed: {error}",
+                                control.label()
+                            )
+                        });
+                        assert_eq!(
+                            &actual.result,
+                            expected,
+                            "{} {discipline} CUDA streams={streams_enabled}/geometry={round_threads_per_block}/{horizon:?}",
+                            control.label()
+                        );
+                        cuda_comparisons += 1;
+                    }
+                }
+            }
         }
     }
     assert_eq!(comparisons, 2 * 4 * 2 * 3 * 2 * 2);
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    assert_eq!(metal_comparisons, 2 * 4 * 2 * 2 * 2);
+    #[cfg(feature = "cuda")]
+    assert_eq!(cuda_comparisons, 2 * 4 * 2 * 2 * 2);
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
+    for control in [
+        TcpCongestionControl::reno(MSS),
+        TcpCongestionControl::cubic(MSS),
+    ] {
+        let image = tcp_image(control, 2 * MSS);
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("scalar TCP smoke must run");
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("Metal {} TCP smoke failed: {error}", control.label()));
+        assert_eq!(metal.result, scalar, "Metal {} TCP smoke", control.label());
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_tcp_timer_checkpoint_is_byte_identical() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let prefix = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
+        .expect("scalar TCP prefix must run");
+    let checkpoint = checkpoint_image(&image, &prefix);
+    let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+        .expect("scalar timer checkpoint must resume");
+    let metal = run_metal_with_observations(
+        &checkpoint,
+        None,
+        MetalConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("Metal timer checkpoint must resume");
+    assert_eq!(metal.result, scalar);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tcp_timer_checkpoint_is_byte_identical() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let prefix = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
+        .expect("scalar TCP prefix must run");
+    let checkpoint = checkpoint_image(&image, &prefix);
+    let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+        .expect("scalar timer checkpoint must resume");
+    let cuda = run_cuda_with_observations(
+        &checkpoint,
+        None,
+        CudaConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("CUDA timer checkpoint must resume");
+    assert_eq!(cuda.result, scalar);
 }
 
 #[test]
@@ -808,21 +1085,16 @@ fn sub_mss_final_segment_respects_safe_horizon_and_cpu_byte_identity() {
 }
 
 #[test]
-fn tcp_images_reject_devices_with_the_t24_capability_diagnostic() {
-    let image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+fn tcp_images_validate_for_device_backends() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 8 * MSS);
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend).expect_err("T23 devices must reject TCP");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "TCP Reno generator for flow FlowId(0) requires Scalar or Cpu; {backend} support is T24"
-            )
-        );
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("T24 {backend} TCP image must validate: {error}"));
     }
 }
 
 #[test]
-fn devices_reject_tcp_packets_without_a_tcp_generator_before_packing() {
+fn device_validators_reject_tcp_packets_without_a_tcp_generator() {
     let packet_kinds = [
         PacketKind::TcpData(TcpDataHeader {
             sequence: 0,
@@ -843,66 +1115,55 @@ fn devices_reject_tcp_packets_without_a_tcp_generator_before_packing() {
 
         for backend in [Backend::Metal, Backend::Cuda] {
             let error = validate(&image, backend)
-                .expect_err("device packet encoding cannot represent TCP packet metadata");
+                .expect_err("TCP packet metadata requires a TCP generator");
             assert_eq!(
                 error.to_string(),
-                format!(
-                    "TCP packet PayloadId(0) for flow FlowId(0) requires Scalar or Cpu; {backend} support is T24"
-                )
+                "TCP packet PayloadId(0) for flow FlowId(0) requires a TCP generator"
             );
         }
     }
 }
 
 #[test]
-fn devices_reject_tcp_receiver_state_on_an_ordinary_data_image_before_packing() {
+fn device_validators_reject_orphan_tcp_receiver_state() {
     let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
     image.host_states[0].generators.clear();
     image.initial_packets[0].kind = PacketKind::Data;
 
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend)
-            .expect_err("device state encoding cannot represent TCP receiver state");
+        let error = validate(&image, backend).expect_err("receiver state requires a TCP generator");
         assert_eq!(
             error.to_string(),
-            format!(
-                "TCP receiver state for flow FlowId(0) at node NodeId(1) requires Scalar or Cpu; {backend} support is T24"
-            )
+            "host node NodeId(1) owns TCP receiver state for flow FlowId(0), but the flow has no generator"
         );
     }
 }
 
 #[test]
-fn devices_reject_tcp_timer_events_before_packing() {
-    let mut image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
-    image.host_states[0].generators.clear();
-    image.host_states[1].tcp_receivers.clear();
-    image.initial_packets[0].kind = PacketKind::Data;
-    image.initial_events[0].kind = EventKind::RetransmissionTimeout;
-    image.initial_events[0].key.phase = event_phase(EventKind::RetransmissionTimeout);
+fn device_validators_accept_tcp_timer_checkpoints() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let prefix = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
+        .expect("initial TCP send should produce a blocked checkpoint");
+    let checkpoint = checkpoint_image(&image, &prefix);
+    assert!(checkpoint.initial_events.iter().any(|event| {
+        event.kind == EventKind::RetransmissionTimeout
+            && event.key.phase == event_phase(EventKind::RetransmissionTimeout)
+    }));
 
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend)
-            .expect_err("device event encoding cannot represent TCP timers");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "TCP retransmission timer event at key {:?} requires Scalar or Cpu; {backend} support is T24",
-                image.initial_events[0].key
-            )
-        );
+        validate(&checkpoint, backend).unwrap_or_else(|error| {
+            panic!("{backend} must accept fallback-heap TCP timers: {error}")
+        });
     }
 }
 
 #[test]
-fn device_sizing_rejects_tcp_before_deriving_any_plan() {
+fn device_sizing_derives_a_tcp_plan() {
     let image = tcp_image(TcpCongestionControl::reno(MSS), MSS);
-    let error = size_default_device_plan(&image)
-        .expect_err("generic GPU sizing must reject TCP instead of reaching packing assumptions");
-    assert_eq!(
-        error.to_string(),
-        "TCP Reno generator for flow FlowId(0) requires a non-device backend; device sizing support is T24"
-    );
+    let report = size_default_device_plan(&image)
+        .expect("generic GPU sizing must account for TCP state and exact fallback timers");
+    assert!(report.total_device_bytes > 0);
+    assert!(report.event_arenas.fallback_heap_event_slots >= image.nodes.len() + 1);
 }
 
 #[test]

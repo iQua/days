@@ -23,24 +23,26 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 
 use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
+use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
     PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
-    SimulationImage, validate,
+    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
+    TcpTimerState, TcpTransitionInput, TcpTransitionRecord, validate,
 };
 
 const LANES: usize = 1_024;
-const EVENT_WORDS: usize = 11;
+const EVENT_WORDS: usize = 14;
 const NODE_WORDS: usize = 11;
-const GENERATOR_WORDS: usize = 16;
+const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
 const LINK_WORDS: usize = 4;
 const ARENA_META_WORDS: usize = 4;
 const SUMMARY_COUNTERS: usize = 12;
-const OBSERVED_WORDS: usize = 4;
-const DEPARTURE_WORDS: usize = 9;
-const ARRIVAL_WORDS: usize = 10;
+const OBSERVED_WORDS: usize = 7;
+const DEPARTURE_WORDS: usize = 12;
+const ARRIVAL_WORDS: usize = 13;
 const LP_STATE_WORDS: usize = 6;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
@@ -49,6 +51,11 @@ const OUTBOUND_META_WORDS: usize = 2;
 const OUTBOUND_ENTRY_WORDS: usize = 2;
 const CHANNEL_BATCH_WORDS: usize = 4;
 const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
+const TCP_RECEIVER_WORDS: usize = 7;
+const TCP_LEDGER_META_WORDS: usize = 4;
+const TCP_LEDGER_RECORD_WORDS: usize = 5;
+const TCP_TRANSITION_META_WORDS: usize = 4;
+const TCP_TRANSITION_WORDS: usize = 36;
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
 const DEFAULT_ROUND_THREADS_PER_BLOCK: usize = 256;
 const DEFAULT_ATTEMPTS_PER_GRAPH_WAVE: usize = 64;
@@ -202,16 +209,7 @@ fn read_record(storage: &[u64], slot: usize) -> &[u64] {
 
 fn read_packet(storage: &[u64], slot: usize) -> PacketDescriptor {
     let record = read_record(storage, slot);
-    PacketDescriptor {
-        id: PayloadId(record[7]),
-        flow: crate::FlowId(record[8]),
-        size_bytes: record[9],
-        kind: if record[10] == 0 {
-            PacketKind::Data
-        } else {
-            PacketKind::Feedback
-        },
-    }
+    decode_packet_fields(&record[7..14]).expect("device packet records have validated kind codes")
 }
 
 fn read_queue(lp: usize, meta: &[u64], records: &[u64]) -> Vec<PacketDescriptor> {
@@ -227,12 +225,7 @@ fn read_queue(lp: usize, meta: &[u64], records: &[u64]) -> Vec<PacketDescriptor>
 
 fn decode_event(record: &[u64]) -> Result<(Event, PacketDescriptor), CudaError> {
     let kind = decode_event_kind(record[5])?;
-    let packet = PacketDescriptor {
-        id: PayloadId(record[7]),
-        flow: crate::FlowId(record[8]),
-        size_bytes: record[9],
-        kind: decode_packet_kind(record[10])?,
-    };
+    let packet = decode_packet_fields(&record[7..14])?;
     Ok((
         Event {
             key: EventKey {
@@ -270,6 +263,7 @@ fn decode_event_kind(value: u64) -> Result<EventKind, CudaError> {
         1 => Ok(EventKind::TxReady),
         2 => Ok(EventKind::TxComplete),
         3 => Ok(EventKind::RemoteArrival),
+        4 => Ok(EventKind::RetransmissionTimeout),
         _ => Err(CudaError::DeviceExecution {
             code: 92,
             node: None,
@@ -277,10 +271,20 @@ fn decode_event_kind(value: u64) -> Result<EventKind, CudaError> {
     }
 }
 
-fn decode_packet_kind(value: u64) -> Result<PacketKind, CudaError> {
+fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaError> {
     match value {
         0 => Ok(PacketKind::Data),
         1 => Ok(PacketKind::Feedback),
+        2 => Ok(PacketKind::TcpData(TcpDataHeader {
+            sequence: metadata[0],
+            sent_time_ns: metadata[1],
+            retransmission: metadata[2] != 0,
+        })),
+        3 => Ok(PacketKind::TcpAck(TcpAckHeader {
+            acknowledgment: metadata[0],
+            acknowledged_bytes: metadata[1],
+            echoed_sent_time_ns: metadata[2],
+        })),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
@@ -301,6 +305,82 @@ fn decode_generator_status(value: u64) -> Result<GeneratorStatus, CudaError> {
     }
 }
 
+fn decode_tcp_phase(value: u64) -> Result<TcpPhase, CudaError> {
+    match value {
+        0 => Ok(TcpPhase::SlowStart),
+        1 => Ok(TcpPhase::CongestionAvoidance),
+        2 => Ok(TcpPhase::FastRecovery),
+        _ => Err(CudaError::DeviceExecution {
+            code: 96,
+            node: None,
+        }),
+    }
+}
+
+fn decode_control(words: &[u64]) -> Result<TcpCongestionControl, CudaError> {
+    match words[0] {
+        0 => Ok(TcpCongestionControl::Reno(TcpReno {
+            mss_bytes: words[1],
+            cwnd_bytes: words[2],
+            ssthresh_bytes: words[3],
+            phase: decode_tcp_phase(words[4])?,
+            duplicate_acks: words[5],
+            recovery_high_sequence: words[6],
+            ca_credit: words[7],
+        })),
+        1 => Ok(TcpCongestionControl::Cubic(TcpCubic {
+            mss_bytes: words[1],
+            cwnd_scaled: words[2],
+            ssthresh_scaled: words[3],
+            phase: decode_tcp_phase(words[4])?,
+            duplicate_acks: words[5],
+            recovery_high_sequence: words[6],
+            w_max_scaled: words[7],
+            w_last_max_scaled: words[8],
+            epoch_start_ns: words[9],
+            srtt_ns: words[10],
+            k_ns: words[11],
+        })),
+        _ => Err(CudaError::DeviceExecution {
+            code: 97,
+            node: None,
+        }),
+    }
+}
+
+fn decode_tcp_transition(words: &[u64]) -> Result<TcpTransitionRecord, CudaError> {
+    let input = match words[7] {
+        0 => TcpTransitionInput::NewAck {
+            acknowledged_bytes: words[8],
+            rtt_sample_ns: words[9],
+            flight_size_bytes: words[10],
+            acknowledgment: words[11],
+        },
+        1 => TcpTransitionInput::DuplicateAck {
+            flight_size_bytes: words[8],
+            recovery_high_sequence: words[9],
+        },
+        2 => TcpTransitionInput::Timeout {
+            flight_size_bytes: words[8],
+        },
+        _ => {
+            return Err(CudaError::DeviceExecution {
+                code: 98,
+                node: None,
+            });
+        }
+    };
+    Ok(TcpTransitionRecord {
+        key: decode_key(words)?,
+        node: NodeId(words[4]),
+        flow: crate::FlowId(words[5]),
+        mss_bytes: words[6],
+        input,
+        before: decode_control(&words[12..24])?,
+        after: decode_control(&words[24..36])?,
+    })
+}
+
 fn decode_disposition(value: u64) -> Result<ArrivalDisposition, CudaError> {
     match value {
         0 => Ok(ArrivalDisposition::Admitted),
@@ -315,11 +395,15 @@ fn decode_disposition(value: u64) -> Result<ArrivalDisposition, CudaError> {
 }
 
 fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
+    decode_packet_fields(words)
+}
+
+fn decode_packet_fields(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     Ok(PacketDescriptor {
         id: PayloadId(words[0]),
         flow: crate::FlowId(words[1]),
         size_bytes: words[2],
-        kind: decode_packet_kind(words[3])?,
+        kind: decode_packet_kind(words[3], &words[4..7])?,
     })
 }
 
@@ -779,6 +863,7 @@ struct CudaPlan {
     stream_state: Vec<u64>,
     stream_records: Vec<u64>,
     scheduler_state: Vec<u64>,
+    tcp_state: Vec<u64>,
     stream_layout: StreamLayout,
     memory_layout: CudaMemoryLayout,
     orphan_packets: Vec<PacketDescriptor>,
@@ -809,6 +894,168 @@ struct PreparedStreams {
     memory_layout: CudaMemoryLayout,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TcpLayout {
+    receiver_offset: usize,
+    ledger_meta_offset: usize,
+    transition_meta_offset: usize,
+}
+
+fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
+    words.fill(0);
+    match control {
+        TcpCongestionControl::Reno(state) => {
+            words[0] = 0;
+            words[1] = state.mss_bytes;
+            words[2] = state.cwnd_bytes;
+            words[3] = state.ssthresh_bytes;
+            words[4] = state.phase as u64;
+            words[5] = state.duplicate_acks;
+            words[6] = state.recovery_high_sequence;
+            words[7] = state.ca_credit;
+        }
+        TcpCongestionControl::Cubic(state) => {
+            words[0] = 1;
+            words[1] = state.mss_bytes;
+            words[2] = state.cwnd_scaled;
+            words[3] = state.ssthresh_scaled;
+            words[4] = state.phase as u64;
+            words[5] = state.duplicate_acks;
+            words[6] = state.recovery_high_sequence;
+            words[7] = state.w_max_scaled;
+            words[8] = state.w_last_max_scaled;
+            words[9] = state.epoch_start_ns;
+            words[10] = state.srtt_ns;
+            words[11] = state.k_ns;
+        }
+    }
+}
+
+fn tcp_flow_segment_capacity(image: &SimulationImage, flow: usize) -> usize {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .find(|generator| generator.flow.0 as usize == flow)
+        .and_then(|generator| match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => usize::try_from(tcp.total_bytes.div_ceil(tcp.mss_bytes))
+                .ok()
+                .map(|segments| segments.saturating_mul(4).saturating_add(8)),
+            FlowGeneratorKind::Constant(_) => None,
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn prepare_tcp_state(
+    image: &SimulationImage,
+    transition_capacities: &[usize],
+) -> Result<(Vec<u64>, TcpLayout), CudaError> {
+    let flow_count = image.flows.len().max(1);
+    let receiver_offset = 0;
+    let ledger_meta_offset = flow_count
+        .checked_mul(TCP_RECEIVER_WORDS)
+        .ok_or_else(|| CudaError::Validation("TCP receiver plane size overflows usize".into()))?;
+    let transition_meta_offset = ledger_meta_offset
+        .checked_add(flow_count * TCP_LEDGER_META_WORDS)
+        .ok_or_else(|| CudaError::Validation("TCP ledger metadata size overflows usize".into()))?;
+    let mut next = transition_meta_offset
+        .checked_add(image.nodes.len() * TCP_TRANSITION_META_WORDS)
+        .ok_or_else(|| {
+            CudaError::Validation("TCP transition metadata size overflows usize".into())
+        })?;
+    let mut state = vec![0_u64; next.max(1)];
+
+    for (owner_slot, host) in image.host_states.iter().enumerate() {
+        let owner = image
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Host && node.state_slot as usize == owner_slot)
+            .map_or(NONE, |node| node.id.0);
+        for receiver in &host.tcp_receivers {
+            let flow = receiver.flow.0 as usize;
+            let row = receiver_offset + flow * TCP_RECEIVER_WORDS;
+            let capacity = tcp_flow_segment_capacity(image, flow).max(receiver.out_of_order.len());
+            let range_offset = next;
+            next = next
+                .checked_add(capacity.saturating_mul(2))
+                .ok_or_else(|| {
+                    CudaError::Validation("TCP receive-range arena overflows usize".into())
+                })?;
+            state.resize(next, 0);
+            state[row] = 1;
+            state[row + 1] = owner;
+            state[row + 2] = receiver.ack_size_bytes;
+            state[row + 3] = receiver.next_expected_sequence;
+            state[row + 4] = range_offset as u64;
+            state[row + 5] = capacity as u64;
+            state[row + 6] = receiver.out_of_order.len() as u64;
+            for (index, range) in receiver.out_of_order.iter().enumerate() {
+                state[range_offset + index * 2] = range.start;
+                state[range_offset + index * 2 + 1] = range.end;
+            }
+        }
+    }
+
+    let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
+        CudaError::Validation(format!(
+            "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
+            conflict.flow,
+            conflict.sequence,
+            conflict.original_size_bytes,
+            conflict.replacement_size_bytes
+        ))
+    })?;
+    for flow in 0..image.flows.len() {
+        let packets = ledger
+            .get(&crate::FlowId(flow as u64))
+            .map_or_else(Vec::new, |segments| segments.values().copied().collect());
+        let capacity = tcp_flow_segment_capacity(image, flow).max(packets.len());
+        let row = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
+        let record_offset = next;
+        next = next
+            .checked_add(capacity.saturating_mul(TCP_LEDGER_RECORD_WORDS))
+            .ok_or_else(|| {
+                CudaError::Validation("TCP segment-ledger arena overflows usize".into())
+            })?;
+        state.resize(next, 0);
+        state[row] = record_offset as u64;
+        state[row + 1] = capacity as u64;
+        state[row + 2] = packets.len() as u64;
+        state[row + 3] = 0;
+        for (index, packet) in packets.into_iter().enumerate() {
+            let PacketKind::TcpData(header) = packet.kind else {
+                unreachable!("TCP ledgers contain only TCP data")
+            };
+            let record = record_offset + index * TCP_LEDGER_RECORD_WORDS;
+            state[record] = packet.id.0;
+            state[record + 1] = packet.size_bytes;
+            state[record + 2] = header.sequence;
+            state[record + 3] = header.sent_time_ns;
+            state[record + 4] = u64::from(header.retransmission);
+        }
+    }
+
+    for node in 0..image.nodes.len() {
+        let capacity = transition_capacities.get(node).copied().unwrap_or(0);
+        let row = transition_meta_offset + node * TCP_TRANSITION_META_WORDS;
+        state[row] = next as u64;
+        state[row + 1] = capacity as u64;
+        next = next
+            .checked_add(capacity.saturating_mul(TCP_TRANSITION_WORDS))
+            .ok_or_else(|| CudaError::Validation("TCP transition arena overflows usize".into()))?;
+        state.resize(next.max(1), 0);
+    }
+    Ok((
+        state,
+        TcpLayout {
+            receiver_offset,
+            ledger_meta_offset,
+            transition_meta_offset,
+        },
+    ))
+}
+
 impl CudaPlan {
     fn new(
         image: &SimulationImage,
@@ -818,16 +1065,7 @@ impl CudaPlan {
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
         let flow_packet_counts = flow_packet_counts(image)?;
-        let flow_feedback_counts = image.initial_packets.iter().fold(
-            vec![0_usize; image.flows.len()],
-            |mut counts, packet| {
-                if packet.kind == PacketKind::Feedback {
-                    counts[packet.flow.0 as usize] =
-                        counts[packet.flow.0 as usize].saturating_add(1);
-                }
-                counts
-            },
-        );
+        let flow_feedback_counts = flow_feedback_counts(image, &flow_packet_counts);
         let minimum_lookahead_ns = image
             .channels
             .iter()
@@ -839,28 +1077,13 @@ impl CudaPlan {
             .copied()
             .map(|packet| (packet.id, packet))
             .collect::<BTreeMap<_, _>>();
-        let positioned_payloads = image
-            .initial_events
-            .iter()
-            .map(|event| event.payload)
-            .chain(
-                image
-                    .host_states
-                    .iter()
-                    .flat_map(|state| state.queue.iter().copied().chain(state.in_service)),
-            )
-            .chain(image.switch_states.iter().flat_map(|state| {
-                state
-                    .queues
-                    .iter()
-                    .flat_map(|queue| queue.queue.iter().copied().chain(queue.in_service))
-            }))
-            .collect::<BTreeSet<_>>();
+        let positioned_payloads = crate::tcp_ledger::initial_live_payloads(image);
         let orphan_packets = image
             .initial_packets
             .iter()
             .copied()
             .filter(|packet| !positioned_payloads.contains(&packet.id))
+            .filter(|packet| !matches!(packet.kind, PacketKind::TcpData(_)))
             .collect();
 
         let mut queue_caps = vec![1_usize; node_count];
@@ -877,6 +1100,12 @@ impl CudaPlan {
             queue_caps[source_slot] = queue_caps[source_slot]
                 .saturating_add(source_queue_packet_bound(image, flow_index, data_count));
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
+            if tcp_generator(image, flow_index).is_some() {
+                // Timeout events are intentionally heap-class. Stale timers can coexist with the
+                // active timer, so reserve one slot per bounded sender attempt.
+                legacy_fel_caps[source_slot] =
+                    legacy_fel_caps[source_slot].saturating_add(data_count);
+            }
 
             add_flow_route_capacities(
                 image,
@@ -932,6 +1161,14 @@ impl CudaPlan {
             for event in &image.initial_events {
                 let target = event.target.0 as usize;
                 capacities[target] = capacities[target].saturating_add(1);
+            }
+            for (flow, descriptor) in image.flows.iter().enumerate() {
+                if tcp_generator(image, flow).is_some() {
+                    let feedback = flow_feedback_counts[flow];
+                    let attempts = flow_packet_counts[flow].saturating_sub(feedback);
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(attempts);
+                }
             }
             capacities
         } else {
@@ -994,18 +1231,48 @@ impl CudaPlan {
                         generators[offset + 8] = generator.feedback.arrivals;
                         generators[offset + 9] = generator.feedback.outstanding_bytes;
                         generators[offset + 10] = generator.feedback.unacknowledged_bytes;
-                        let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                            unreachable!("TCP generators are rejected before CUDA encoding")
-                        };
-                        generators[offset + 11] = constant.first_departure_ns;
-                        generators[offset + 12] = constant.interval_ns;
-                        generators[offset + 13] = constant.packet_size_bytes;
-                        let (kind, value) = match constant.termination {
-                            GeneratorTermination::Bytes(bytes) => (0, bytes),
-                            GeneratorTermination::DurationNs(duration) => (1, duration),
-                        };
-                        generators[offset + 14] = kind;
-                        generators[offset + 15] = value;
+                        match generator.kind {
+                            FlowGeneratorKind::Constant(constant) => {
+                                generators[offset + 11] = 0;
+                                generators[offset + 12] = constant.first_departure_ns;
+                                generators[offset + 13] = constant.interval_ns;
+                                generators[offset + 14] = constant.packet_size_bytes;
+                                let (kind, value) = match constant.termination {
+                                    GeneratorTermination::Bytes(bytes) => (0, bytes),
+                                    GeneratorTermination::DurationNs(duration) => (1, duration),
+                                };
+                                generators[offset + 15] = kind;
+                                generators[offset + 16] = value;
+                            }
+                            FlowGeneratorKind::Tcp(tcp) => {
+                                generators[offset + 11] = 1;
+                                generators[offset + 12] = tcp.total_bytes;
+                                generators[offset + 13] = tcp.mss_bytes;
+                                generators[offset + 14] = tcp.ack_size_bytes;
+                                generators[offset + 15] = tcp.next_sequence;
+                                generators[offset + 16] = tcp.highest_ack;
+                                generators[offset + 17] = tcp.bytes_in_flight;
+                                generators[offset + 18] = tcp.duplicate_acks;
+                                generators[offset + 19] = tcp.recovery_high_sequence;
+                                generators[offset + 20] = tcp.last_attempt.0;
+                                generators[offset + 21] = tcp.timer_generation;
+                                if let Some(timer) = tcp.active_timer {
+                                    generators[offset + 22] = 1;
+                                    generators[offset + 23] = timer.attempt.0;
+                                    generators[offset + 24] = timer.sequence;
+                                    generators[offset + 25] = timer.deadline_ns;
+                                    generators[offset + 26] = timer.generation;
+                                    generators[offset + 27] = timer.rto_ns;
+                                }
+                                generators[offset + 28] = tcp.srtt_ns;
+                                generators[offset + 29] = tcp.rtt_var_ns;
+                                generators[offset + 30] = tcp.rto_ns;
+                                encode_control(
+                                    tcp.control,
+                                    &mut generators[offset + 31..offset + 43],
+                                );
+                            }
+                        }
                     }
                 }
                 NodeKind::Switch => {
@@ -1047,7 +1314,11 @@ impl CudaPlan {
             prepare_device_schedulers(image, &queue_meta).map_err(CudaError::Validation)?;
 
         for event in &image.initial_events {
-            let packet = packet_for(&initial_by_payload, event.payload)?;
+            let packet = if event.kind == EventKind::RetransmissionTimeout {
+                timer_packet_for(image, *event)?
+            } else {
+                packet_for(&initial_by_payload, event.payload)?
+            };
             let record = event_record(*event, packet);
             heap_push_host(
                 event.target.0 as usize,
@@ -1144,6 +1415,12 @@ impl CudaPlan {
                     arrival_capacity as u64;
             }
         }
+        let tcp_transition_capacities = if observation_mode == ObservationMode::Full {
+            observation_capacities.clone()
+        } else {
+            vec![0; node_count]
+        };
+        let (tcp_state, tcp_layout) = prepare_tcp_state(image, &tcp_transition_capacities)?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1187,6 +1464,9 @@ impl CudaPlan {
             streams.layout.staging_channel_offset as u64,
             streams.layout.channel_target_offset as u64,
             u64::from(cfg!(debug_assertions)),
+            tcp_layout.receiver_offset as u64,
+            tcp_layout.ledger_meta_offset as u64,
+            tcp_layout.transition_meta_offset as u64,
         ];
 
         Ok(Self {
@@ -1218,6 +1498,7 @@ impl CudaPlan {
             stream_state: streams.state,
             stream_records: streams.records,
             scheduler_state,
+            tcp_state,
             stream_layout: streams.layout,
             memory_layout: streams.memory_layout,
             orphan_packets,
@@ -1239,7 +1520,22 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, CudaError> 
                 continue;
             }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("TCP generators are rejected before CUDA sizing")
+                let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+                    unreachable!()
+                };
+                let remaining = tcp.total_bytes.saturating_sub(tcp.next_sequence);
+                let fresh =
+                    usize::try_from(remaining.div_ceil(tcp.mss_bytes)).unwrap_or(usize::MAX);
+                // Each delivered attempt creates one ACK. Four attempts per original segment is
+                // the established bounded device arena allowance; explicit capacity overrides
+                // remain available for adversarial checkpoint images.
+                let segments =
+                    usize::try_from(tcp.total_bytes.div_ceil(tcp.mss_bytes)).unwrap_or(usize::MAX);
+                let attempts = fresh
+                    .saturating_add(segments.saturating_mul(4))
+                    .saturating_add(8);
+                counts[index] = counts[index].saturating_add(attempts.saturating_mul(2));
+                continue;
             };
             let termination_count = match constant.termination {
                 GeneratorTermination::Bytes(bytes) => {
@@ -1276,6 +1572,35 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, CudaError> 
         }
     }
     Ok(counts)
+}
+
+fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::TcpGenerator> {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .find(|generator| generator.flow.0 as usize == flow_index)
+        .and_then(|generator| match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => Some(tcp),
+            FlowGeneratorKind::Constant(_) => None,
+        })
+}
+
+fn flow_feedback_counts(image: &SimulationImage, total_counts: &[usize]) -> Vec<usize> {
+    let mut counts = vec![0_usize; image.flows.len()];
+    for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::Feedback | PacketKind::TcpAck(_)) {
+            counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
+        }
+    }
+    for flow in 0..image.flows.len() {
+        if tcp_generator(image, flow).is_some() {
+            // TCP data and ACK records are paired after the initial checkpoint population. A
+            // one-record outward rounding keeps the direction split conservative when odd.
+            counts[flow] = counts[flow].max(total_counts[flow].div_ceil(2));
+        }
+    }
+    counts
 }
 
 fn paced_single_source_queue_bound(
@@ -1369,7 +1694,7 @@ fn source_queue_packet_bound(
         return packet_count;
     }
     let FlowGeneratorKind::Constant(constant) = generator.kind else {
-        unreachable!("TCP generators are rejected before CUDA sizing")
+        return packet_count;
     };
     if initial_packet.size_bytes != constant.packet_size_bytes {
         return packet_count;
@@ -1402,7 +1727,7 @@ fn generator_round_burst(
         })
         .map(|generator| {
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("TCP generators are rejected before CUDA sizing")
+                return packet_count;
             };
             match lookahead {
                 Some(lookahead) => packet_count.min(
@@ -1465,7 +1790,10 @@ fn flow_link_serialization_ns(
     let minimum_size = image
         .initial_packets
         .iter()
-        .filter(|packet| packet.flow.0 as usize == flow_index && packet.kind == packet_kind)
+        .filter(|packet| {
+            packet.flow.0 as usize == flow_index
+                && packet_direction(packet.kind) == packet_direction(packet_kind)
+        })
         .map(|packet| packet.size_bytes)
         .chain(
             (packet_kind == PacketKind::Data)
@@ -1475,11 +1803,9 @@ fn flow_link_serialization_ns(
                         .iter()
                         .flat_map(|state| &state.generators)
                         .filter(move |generator| generator.flow.0 as usize == flow_index)
-                        .map(|generator| {
-                            let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                                unreachable!("TCP generators are rejected before CUDA sizing")
-                            };
-                            constant.packet_size_bytes
+                        .map(|generator| match generator.kind {
+                            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
+                            FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
                         })
                 })
                 .into_iter()
@@ -1489,6 +1815,13 @@ fn flow_link_serialization_ns(
         .unwrap_or(1);
     crate::time::serialization_time_ns(minimum_size, link.rate_bps)
         .expect("CUDA validation established a positive finite serialization interval")
+}
+
+fn packet_direction(kind: PacketKind) -> u8 {
+    match kind {
+        PacketKind::Data | PacketKind::TcpData(_) => 0,
+        PacketKind::Feedback | PacketKind::TcpAck(_) => 1,
+    }
 }
 
 fn flow_link_round_bound(
@@ -2174,6 +2507,51 @@ fn packet_for(
     })
 }
 
+fn timer_packet_for(image: &SimulationImage, event: Event) -> Result<PacketDescriptor, CudaError> {
+    let node = image
+        .nodes
+        .get(event.target.0 as usize)
+        .filter(|node| node.id == event.target && node.kind == NodeKind::Host)
+        .ok_or_else(|| {
+            CudaError::Validation(format!("TCP timeout {:?} targets no host state", event.key))
+        })?;
+    let mut matches = image.host_states[node.state_slot as usize]
+        .generators
+        .iter()
+        .filter_map(|generator| {
+            let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+                return None;
+            };
+            tcp.active_timer
+                .filter(|timer| {
+                    timer.attempt == event.payload && timer.deadline_ns == event.key.time_ns
+                })
+                .map(|timer| (generator.flow, timer))
+        });
+    let Some((flow, timer)) = matches.next() else {
+        return Err(CudaError::Validation(format!(
+            "TCP timeout {:?} payload {:?} has no owning active timer",
+            event.key, event.payload
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(CudaError::Validation(format!(
+            "TCP timeout {:?} payload {:?} has multiple owning active timers",
+            event.key, event.payload
+        )));
+    }
+    Ok(PacketDescriptor {
+        id: event.payload,
+        flow,
+        size_bytes: 0,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: timer.sequence,
+            sent_time_ns: event.key.time_ns,
+            retransmission: true,
+        }),
+    })
+}
+
 fn packet_record(packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
     let mut record = [0_u64; EVENT_WORDS];
     record[6] = packet.id.0;
@@ -2181,10 +2559,12 @@ fn packet_record(packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
     record[8] = packet.flow.0;
     record[9] = packet.size_bytes;
     record[10] = u64::from(packet.kind.code());
+    record[11..14].copy_from_slice(&packet_metadata(packet.kind));
     record
 }
 
 fn event_record(event: Event, packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
+    let metadata = packet_metadata(packet.kind);
     [
         event.key.time_ns,
         u64::from(event.key.phase),
@@ -2197,7 +2577,26 @@ fn event_record(event: Event, packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
         packet.flow.0,
         packet.size_bytes,
         u64::from(packet.kind.code()),
+        metadata[0],
+        metadata[1],
+        metadata[2],
     ]
+}
+
+fn packet_metadata(kind: PacketKind) -> [u64; 3] {
+    match kind {
+        PacketKind::Data | PacketKind::Feedback => [0; 3],
+        PacketKind::TcpData(header) => [
+            header.sequence,
+            header.sent_time_ns,
+            u64::from(header.retransmission),
+        ],
+        PacketKind::TcpAck(header) => [
+            header.acknowledgment,
+            header.acknowledged_bytes,
+            header.echoed_sent_time_ns,
+        ],
+    }
 }
 
 fn write_record(storage: &mut [u64], slot: usize, record: [u64; EVENT_WORDS]) {
@@ -2318,6 +2717,7 @@ impl CudaBuffers {
             plan.stream_state,
             plan.stream_records,
             plan.scheduler_state,
+            plan.tcp_state,
         ]
         .into_iter()
         .enumerate()
@@ -2367,6 +2767,7 @@ impl CudaBuffers {
             return Err(error);
         }
         let control = &planes[0];
+        let params = &planes[1];
         if control[CONTROL_ERROR] != 0 {
             return Err(decode_device_error(control));
         }
@@ -2392,6 +2793,7 @@ impl CudaBuffers {
         let stream_state = &planes[25];
         let stream_records = &planes[26];
         let scheduler_state = &planes[27];
+        let tcp_state = &planes[28];
 
         let mut host_states = image.host_states.clone();
         let mut switch_states = image.switch_states.clone();
@@ -2435,6 +2837,48 @@ impl CudaBuffers {
                         generator.feedback.arrivals = generators[offset + 8];
                         generator.feedback.outstanding_bytes = generators[offset + 9];
                         generator.feedback.unacknowledged_bytes = generators[offset + 10];
+                        match &mut generator.kind {
+                            FlowGeneratorKind::Constant(_) => {}
+                            FlowGeneratorKind::Tcp(tcp) => {
+                                tcp.total_bytes = generators[offset + 12];
+                                tcp.mss_bytes = generators[offset + 13];
+                                tcp.ack_size_bytes = generators[offset + 14];
+                                tcp.next_sequence = generators[offset + 15];
+                                tcp.highest_ack = generators[offset + 16];
+                                tcp.bytes_in_flight = generators[offset + 17];
+                                tcp.duplicate_acks = generators[offset + 18];
+                                tcp.recovery_high_sequence = generators[offset + 19];
+                                tcp.last_attempt = PayloadId(generators[offset + 20]);
+                                tcp.timer_generation = generators[offset + 21];
+                                tcp.active_timer =
+                                    (generators[offset + 22] != 0).then(|| TcpTimerState {
+                                        attempt: PayloadId(generators[offset + 23]),
+                                        sequence: generators[offset + 24],
+                                        deadline_ns: generators[offset + 25],
+                                        generation: generators[offset + 26],
+                                        rto_ns: generators[offset + 27],
+                                    });
+                                tcp.srtt_ns = generators[offset + 28];
+                                tcp.rtt_var_ns = generators[offset + 29];
+                                tcp.rto_ns = generators[offset + 30];
+                                tcp.control =
+                                    decode_control(&generators[offset + 31..offset + 43])?;
+                            }
+                        }
+                    }
+                    let receiver_base = params[28] as usize;
+                    for receiver in &mut state.tcp_receivers {
+                        let row = receiver_base + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+                        receiver.ack_size_bytes = tcp_state[row + 2];
+                        receiver.next_expected_sequence = tcp_state[row + 3];
+                        let range_offset = tcp_state[row + 4] as usize;
+                        let count = tcp_state[row + 6] as usize;
+                        receiver.out_of_order = (0..count)
+                            .map(|index| TcpReceiveRange {
+                                start: tcp_state[range_offset + index * 2],
+                                end: tcp_state[range_offset + index * 2 + 1],
+                            })
+                            .collect();
                     }
                 }
                 NodeKind::Switch => {
@@ -2462,7 +2906,9 @@ impl CudaBuffers {
             for index in 0..count {
                 let record = read_record(fel_records, offset + index);
                 let (event, packet) = decode_event(record)?;
-                resident.insert(packet.id, packet);
+                if event.kind != EventKind::RetransmissionTimeout {
+                    resident.insert(packet.id, packet);
+                }
                 pending_events.push(event);
             }
         }
@@ -2476,16 +2922,39 @@ impl CudaBuffers {
                 let physical = (head + index) % capacity.max(1);
                 let record = read_record(stream_records, offset + physical);
                 let (event, packet) = decode_event(record)?;
-                resident.insert(packet.id, packet);
+                if event.kind != EventKind::RetransmissionTimeout {
+                    resident.insert(packet.id, packet);
+                }
                 pending_events.push(event);
             }
         }
         pending_events.sort_unstable_by_key(|event| event.key);
+        let ledger_meta = params[29] as usize;
+        for flow in 0..image.flows.len() {
+            let row = ledger_meta + flow * TCP_LEDGER_META_WORDS;
+            let offset = tcp_state[row] as usize;
+            let count = tcp_state[row + 2] as usize;
+            for index in 0..count {
+                let record = offset + index * TCP_LEDGER_RECORD_WORDS;
+                let packet = PacketDescriptor {
+                    id: PayloadId(tcp_state[record]),
+                    flow: crate::FlowId(flow as u64),
+                    size_bytes: tcp_state[record + 1],
+                    kind: PacketKind::TcpData(TcpDataHeader {
+                        sequence: tcp_state[record + 2],
+                        sent_time_ns: tcp_state[record + 3],
+                        retransmission: tcp_state[record + 4] != 0,
+                    }),
+                };
+                resident.entry(packet.id).or_insert(packet);
+            }
+        }
 
         let summary = decode_summary_rows(summary_words, image.nodes.len());
         let mut observed_packets = BTreeMap::new();
         let mut departures = Vec::new();
         let mut arrivals = Vec::new();
+        let mut tcp_transitions = Vec::new();
         if observation_mode == ObservationMode::Full {
             let observed_words = compact_lp_log(
                 observed_words,
@@ -2520,7 +2989,7 @@ impl CudaBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[6]),
                     size_bytes: words[7],
-                    kind: decode_packet_kind(words[8])?,
+                    kind: decode_packet_kind(words[8], &words[9..12])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
                 keyed_departures.push((
@@ -2537,7 +3006,7 @@ impl CudaBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[7]),
                     size_bytes: words[8],
-                    kind: decode_packet_kind(words[9])?,
+                    kind: decode_packet_kind(words[9], &words[10..13])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
                 keyed_arrivals.push((
@@ -2559,6 +3028,24 @@ impl CudaBuffers {
                 .into_iter()
                 .map(|(_, arrival)| arrival)
                 .collect();
+            let transition_meta = params[30] as usize;
+            let mut keyed_transitions = Vec::new();
+            for node in 0..image.nodes.len() {
+                let row = transition_meta + node * TCP_TRANSITION_META_WORDS;
+                let offset = tcp_state[row] as usize;
+                let count = tcp_state[row + 3] as usize;
+                for index in 0..count {
+                    let record = offset + index * TCP_TRANSITION_WORDS;
+                    let transition =
+                        decode_tcp_transition(&tcp_state[record..record + TCP_TRANSITION_WORDS])?;
+                    keyed_transitions.push((transition.key, transition));
+                }
+            }
+            keyed_transitions.sort_unstable_by_key(|(key, _)| *key);
+            tcp_transitions = keyed_transitions
+                .into_iter()
+                .map(|(_, transition)| transition)
+                .collect();
         }
 
         Ok(CudaRun {
@@ -2570,7 +3057,7 @@ impl CudaBuffers {
                 observed_packets: observed_packets.into_values().collect(),
                 departures,
                 arrivals,
-                tcp_transitions: Vec::new(),
+                tcp_transitions,
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],
@@ -3014,7 +3501,7 @@ fn launch_uniform(
     buffers: &CudaBuffers,
     config: LaunchConfig,
 ) -> Result<(), cudarc::driver::DriverError> {
-    debug_assert_eq!(buffers.planes.len(), 28);
+    debug_assert_eq!(buffers.planes.len(), 29);
     let mut arguments = stream.launch_builder(function);
     for plane in &buffers.planes {
         arguments.arg(plane);

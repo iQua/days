@@ -27,24 +27,26 @@ use objc2_metal::{
 };
 
 use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
+use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
     PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
-    SimulationImage, validate,
+    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
+    TcpTimerState, TcpTransitionInput, TcpTransitionRecord, validate,
 };
 
 const LANES: usize = 1_024;
-const EVENT_WORDS: usize = 11;
+const EVENT_WORDS: usize = 14;
 const NODE_WORDS: usize = 11;
-const GENERATOR_WORDS: usize = 16;
+const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
 const LINK_WORDS: usize = 4;
 const ARENA_META_WORDS: usize = 4;
 const SUMMARY_COUNTERS: usize = 12;
-const OBSERVED_WORDS: usize = 4;
-const DEPARTURE_WORDS: usize = 9;
-const ARRIVAL_WORDS: usize = 10;
+const OBSERVED_WORDS: usize = 7;
+const DEPARTURE_WORDS: usize = 12;
+const ARRIVAL_WORDS: usize = 13;
 const LP_STATE_WORDS: usize = 6;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
@@ -53,6 +55,12 @@ const OUTBOUND_META_WORDS: usize = 2;
 const OUTBOUND_ENTRY_WORDS: usize = 2;
 const CHANNEL_BATCH_WORDS: usize = 4;
 const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
+const TCP_RECEIVER_WORDS: usize = 7;
+const TCP_RANGE_WORDS: usize = 2;
+const TCP_LEDGER_META_WORDS: usize = 4;
+const TCP_LEDGER_RECORD_WORDS: usize = 5;
+const TCP_TRANSITION_META_WORDS: usize = 4;
+const TCP_TRANSITION_WORDS: usize = 36;
 // The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
 // LP drains single-launch while putting a finite ceiling on pathological device work per lane.
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
@@ -181,6 +189,9 @@ pub enum MetalArena {
     ObservedPackets,
     Departures,
     Arrivals,
+    TcpReceiverRanges,
+    TcpSegmentLedger,
+    TcpTransitions,
 }
 
 impl fmt::Display for MetalArena {
@@ -196,6 +207,9 @@ impl fmt::Display for MetalArena {
             Self::ObservedPackets => "observed-packet log",
             Self::Departures => "departure log",
             Self::Arrivals => "arrival log",
+            Self::TcpReceiverRanges => "TCP receiver range arena",
+            Self::TcpSegmentLedger => "TCP segment ledger",
+            Self::TcpTransitions => "TCP transition log",
         })
     }
 }
@@ -1030,6 +1044,7 @@ struct MetalPlan {
     stream_state: Vec<u64>,
     stream_records: Vec<u64>,
     scheduler_state: Vec<u64>,
+    tcp_state: Vec<u64>,
     stream_layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
     orphan_packets: Vec<PacketDescriptor>,
@@ -1060,6 +1075,18 @@ struct PreparedStreams {
     memory_layout: MetalMemoryLayout,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TcpStateLayout {
+    receiver_offset: usize,
+    ledger_meta_offset: usize,
+    transition_meta_offset: usize,
+}
+
+struct PreparedTcpState {
+    words: Vec<u64>,
+    layout: TcpStateLayout,
+}
+
 impl MetalPlan {
     fn new(
         image: &SimulationImage,
@@ -1068,17 +1095,7 @@ impl MetalPlan {
         observation_mode: ObservationMode,
     ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
-        let flow_packet_counts = flow_packet_counts(image)?;
-        let flow_feedback_counts = image.initial_packets.iter().fold(
-            vec![0_usize; image.flows.len()],
-            |mut counts, packet| {
-                if packet.kind == PacketKind::Feedback {
-                    counts[packet.flow.0 as usize] =
-                        counts[packet.flow.0 as usize].saturating_add(1);
-                }
-                counts
-            },
-        );
+        let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
         let minimum_lookahead_ns = image
             .channels
             .iter()
@@ -1090,28 +1107,13 @@ impl MetalPlan {
             .copied()
             .map(|packet| (packet.id, packet))
             .collect::<BTreeMap<_, _>>();
-        let positioned_payloads = image
-            .initial_events
-            .iter()
-            .map(|event| event.payload)
-            .chain(
-                image
-                    .host_states
-                    .iter()
-                    .flat_map(|state| state.queue.iter().copied().chain(state.in_service)),
-            )
-            .chain(image.switch_states.iter().flat_map(|state| {
-                state
-                    .queues
-                    .iter()
-                    .flat_map(|queue| queue.queue.iter().copied().chain(queue.in_service))
-            }))
-            .collect::<BTreeSet<_>>();
+        let positioned_payloads = crate::tcp_ledger::initial_live_payloads(image);
         let orphan_packets = image
             .initial_packets
             .iter()
             .copied()
             .filter(|packet| !positioned_payloads.contains(&packet.id))
+            .filter(|packet| !matches!(packet.kind, PacketKind::TcpData(_)))
             .collect();
 
         let mut queue_caps = vec![1_usize; node_count];
@@ -1128,6 +1130,12 @@ impl MetalPlan {
             queue_caps[source_slot] = queue_caps[source_slot]
                 .saturating_add(source_queue_packet_bound(image, flow_index, data_count));
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
+            if tcp_generator(image, flow_index).is_some() {
+                // TCP timers remain fallback-heap events. ACK-driven replacement leaves stale
+                // timers resident until their deadlines, so reserve one slot per bounded attempt.
+                legacy_fel_caps[source_slot] =
+                    legacy_fel_caps[source_slot].saturating_add(data_count);
+            }
 
             add_flow_route_capacities(
                 image,
@@ -1183,6 +1191,14 @@ impl MetalPlan {
             for event in &image.initial_events {
                 let target = event.target.0 as usize;
                 capacities[target] = capacities[target].saturating_add(1);
+            }
+            for (flow, descriptor) in image.flows.iter().enumerate() {
+                if tcp_generator(image, flow).is_some() {
+                    let attempts =
+                        flow_packet_counts[flow].saturating_sub(flow_feedback_counts[flow]);
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(attempts);
+                }
             }
             capacities
         } else {
@@ -1245,18 +1261,27 @@ impl MetalPlan {
                         generators[offset + 8] = generator.feedback.arrivals;
                         generators[offset + 9] = generator.feedback.outstanding_bytes;
                         generators[offset + 10] = generator.feedback.unacknowledged_bytes;
-                        let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                            unreachable!("TCP generators are rejected before Metal encoding")
-                        };
-                        generators[offset + 11] = constant.first_departure_ns;
-                        generators[offset + 12] = constant.interval_ns;
-                        generators[offset + 13] = constant.packet_size_bytes;
-                        let (kind, value) = match constant.termination {
-                            GeneratorTermination::Bytes(bytes) => (0, bytes),
-                            GeneratorTermination::DurationNs(duration) => (1, duration),
-                        };
-                        generators[offset + 14] = kind;
-                        generators[offset + 15] = value;
+                        match generator.kind {
+                            FlowGeneratorKind::Constant(constant) => {
+                                generators[offset + 11] = 0;
+                                generators[offset + 12] = constant.first_departure_ns;
+                                generators[offset + 13] = constant.interval_ns;
+                                generators[offset + 14] = constant.packet_size_bytes;
+                                let (kind, value) = match constant.termination {
+                                    GeneratorTermination::Bytes(bytes) => (0, bytes),
+                                    GeneratorTermination::DurationNs(duration) => (1, duration),
+                                };
+                                generators[offset + 15] = kind;
+                                generators[offset + 16] = value;
+                            }
+                            FlowGeneratorKind::Tcp(tcp) => {
+                                generators[offset + 11] = 1;
+                                encode_tcp_generator(
+                                    tcp,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
+                            }
+                        }
                     }
                 }
                 NodeKind::Switch => {
@@ -1298,8 +1323,36 @@ impl MetalPlan {
             prepare_device_schedulers(image, &queue_meta).map_err(MetalError::Validation)?;
 
         for event in &image.initial_events {
-            let packet = packet_for(&initial_by_payload, event.payload)?;
-            let record = event_record(*event, packet);
+            let packet = if event.kind == EventKind::RetransmissionTimeout {
+                None
+            } else {
+                Some(packet_for(&initial_by_payload, event.payload)?)
+            };
+            let mut record = event_record(*event, packet);
+            if event.kind == EventKind::RetransmissionTimeout {
+                let timer_flow = image
+                    .host_states
+                    .iter()
+                    .flat_map(|state| &state.generators)
+                    .find_map(|generator| match generator.kind {
+                        FlowGeneratorKind::Tcp(tcp)
+                            if tcp.active_timer.is_some_and(|timer| {
+                                timer.attempt == event.payload
+                                    && timer.deadline_ns == event.key.time_ns
+                            }) =>
+                        {
+                            Some(generator.flow)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        MetalError::Validation(format!(
+                            "TCP retransmission timer at key {:?} has no matching active timer",
+                            event.key
+                        ))
+                    })?;
+                record[8] = timer_flow.0;
+            }
             heap_push_host(
                 event.target.0 as usize,
                 record,
@@ -1380,6 +1433,13 @@ impl MetalPlan {
         let mut observation_meta = vec![0_u64; node_count * OBSERVATION_META_WORDS];
         let observation_slots =
             assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
+        let tcp_state = prepare_tcp_state(
+            image,
+            &flow_packet_counts,
+            &flow_feedback_counts,
+            &observation_capacities,
+            observation_mode,
+        )?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1423,6 +1483,9 @@ impl MetalPlan {
             streams.layout.staging_channel_offset as u64,
             streams.layout.channel_target_offset as u64,
             u64::from(cfg!(debug_assertions)),
+            tcp_state.layout.receiver_offset as u64,
+            tcp_state.layout.ledger_meta_offset as u64,
+            tcp_state.layout.transition_meta_offset as u64,
         ];
 
         Ok(Self {
@@ -1454,6 +1517,7 @@ impl MetalPlan {
             stream_state: streams.state,
             stream_records: streams.records,
             scheduler_state,
+            tcp_state: tcp_state.words,
             stream_layout: streams.layout,
             memory_layout: streams.memory_layout,
             orphan_packets,
@@ -1463,20 +1527,58 @@ impl MetalPlan {
     }
 }
 
-fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, MetalError> {
-    let mut counts = vec![0_usize; image.flows.len()];
+fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::TcpGenerator> {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .find(|generator| generator.flow.0 as usize == flow_index)
+        .and_then(|generator| match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => Some(tcp),
+            FlowGeneratorKind::Constant(_) => None,
+        })
+}
+
+fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>), MetalError> {
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
+    let mut data_counts = vec![0_usize; image.flows.len()];
+    let mut feedback_counts = vec![0_usize; image.flows.len()];
     for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
+            continue;
+        }
+        let counts = if packet.kind.is_data() {
+            &mut data_counts
+        } else {
+            &mut feedback_counts
+        };
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+                    unreachable!()
+                };
+                let remaining = tcp.total_bytes.saturating_sub(tcp.next_sequence);
+                let fresh = remaining.div_ceil(tcp.mss_bytes) as usize;
+                let outstanding = tcp.bytes_in_flight.div_ceil(tcp.mss_bytes) as usize;
+                // Retransmissions replace an existing ledger entry. Four attempts per outstanding
+                // segment plus a small recovery allowance is conservative for the finite T24
+                // corpora while retaining an explicit device-capacity fault for pathological loss.
+                let attempts = fresh
+                    .saturating_add(outstanding.saturating_mul(4))
+                    .saturating_add(8);
+                let already_scheduled =
+                    usize::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+                data_counts[index] =
+                    data_counts[index].saturating_add(attempts.saturating_sub(already_scheduled));
+                continue;
+            };
             if generator.next_emission.status != GeneratorStatus::Scheduled {
                 continue;
             }
-            let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("TCP generators are rejected before Metal sizing")
-            };
             let termination_count = match constant.termination {
                 GeneratorTermination::Bytes(bytes) => {
                     if generator.bytes_emitted >= bytes {
@@ -1508,10 +1610,23 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, MetalError>
                     / constant.interval_ns
             };
             let future = termination_count.min(stop_count) as usize;
-            counts[index] = counts[index].saturating_add(future.saturating_sub(1));
+            data_counts[index] = data_counts[index].saturating_add(future.saturating_sub(1));
         }
     }
-    Ok(counts)
+    for state in &image.host_states {
+        for generator in &state.generators {
+            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+                let flow = generator.flow.0 as usize;
+                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
+            }
+        }
+    }
+    let totals = data_counts
+        .into_iter()
+        .zip(&feedback_counts)
+        .map(|(data, feedback)| data.saturating_add(*feedback))
+        .collect();
+    Ok((totals, feedback_counts))
 }
 
 fn paced_single_source_queue_bound(
@@ -1605,7 +1720,7 @@ fn source_queue_packet_bound(
         return packet_count;
     }
     let FlowGeneratorKind::Constant(constant) = generator.kind else {
-        unreachable!("TCP generators are rejected before Metal sizing")
+        return packet_count;
     };
     if initial_packet.size_bytes != constant.packet_size_bytes {
         return packet_count;
@@ -1638,7 +1753,7 @@ fn generator_round_burst(
         })
         .map(|generator| {
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("TCP generators are rejected before Metal sizing")
+                return packet_count;
             };
             match lookahead {
                 Some(lookahead) => packet_count.min(
@@ -1701,7 +1816,9 @@ fn flow_link_serialization_ns(
     let minimum_size = image
         .initial_packets
         .iter()
-        .filter(|packet| packet.flow.0 as usize == flow_index && packet.kind == packet_kind)
+        .filter(|packet| {
+            packet.flow.0 as usize == flow_index && packet.kind.is_data() == packet_kind.is_data()
+        })
         .map(|packet| packet.size_bytes)
         .chain(
             (packet_kind == PacketKind::Data)
@@ -1711,11 +1828,9 @@ fn flow_link_serialization_ns(
                         .iter()
                         .flat_map(|state| &state.generators)
                         .filter(move |generator| generator.flow.0 as usize == flow_index)
-                        .map(|generator| {
-                            let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                                unreachable!("TCP generators are rejected before Metal sizing")
-                            };
-                            constant.packet_size_bytes
+                        .map(|generator| match generator.kind {
+                            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
+                            FlowGeneratorKind::Tcp(_) => 1,
                         })
                 })
                 .into_iter()
@@ -2399,6 +2514,232 @@ fn zero_words(records: usize, words: usize) -> Result<Vec<u64>, MetalError> {
     Ok(vec![0; length.max(1)])
 }
 
+fn encode_tcp_generator(tcp: crate::TcpGenerator, row: &mut [u64]) {
+    row[12] = tcp.total_bytes;
+    row[13] = tcp.mss_bytes;
+    row[14] = tcp.ack_size_bytes;
+    row[15] = tcp.next_sequence;
+    row[16] = tcp.highest_ack;
+    row[17] = tcp.bytes_in_flight;
+    row[18] = tcp.duplicate_acks;
+    row[19] = tcp.recovery_high_sequence;
+    row[20] = tcp.last_attempt.0;
+    row[21] = tcp.timer_generation;
+    if let Some(timer) = tcp.active_timer {
+        row[22] = 1;
+        row[23] = timer.attempt.0;
+        row[24] = timer.sequence;
+        row[25] = timer.deadline_ns;
+        row[26] = timer.generation;
+        row[27] = timer.rto_ns;
+    }
+    row[28] = tcp.srtt_ns;
+    row[29] = tcp.rtt_var_ns;
+    row[30] = tcp.rto_ns;
+    encode_tcp_control(tcp.control, &mut row[31..43]);
+}
+
+fn encode_tcp_control(control: TcpCongestionControl, words: &mut [u64]) {
+    words.fill(0);
+    match control {
+        TcpCongestionControl::Reno(state) => {
+            words[0] = 0;
+            words[1] = state.mss_bytes;
+            words[2] = state.cwnd_bytes;
+            words[3] = state.ssthresh_bytes;
+            words[4] = state.phase as u64;
+            words[5] = state.duplicate_acks;
+            words[6] = state.recovery_high_sequence;
+            words[7] = state.ca_credit;
+        }
+        TcpCongestionControl::Cubic(state) => {
+            words[0] = 1;
+            words[1] = state.mss_bytes;
+            words[2] = state.cwnd_scaled;
+            words[3] = state.ssthresh_scaled;
+            words[4] = state.phase as u64;
+            words[5] = state.duplicate_acks;
+            words[6] = state.recovery_high_sequence;
+            words[7] = state.w_max_scaled;
+            words[8] = state.w_last_max_scaled;
+            words[9] = state.epoch_start_ns;
+            words[10] = state.srtt_ns;
+            words[11] = state.k_ns;
+        }
+    }
+}
+
+fn prepare_tcp_state(
+    image: &SimulationImage,
+    packet_counts: &[usize],
+    feedback_counts: &[usize],
+    observation_capacities: &[usize],
+    observation_mode: ObservationMode,
+) -> Result<PreparedTcpState, MetalError> {
+    let flow_count = image.flows.len();
+    let node_count = image.nodes.len();
+    let receiver_offset = 0;
+    let mut next = flow_count
+        .checked_mul(TCP_RECEIVER_WORDS)
+        .ok_or_else(|| MetalError::Validation("TCP receiver state size overflows".into()))?;
+
+    let mut receiver_ranges = vec![None; flow_count];
+    for (host_slot, state) in image.host_states.iter().enumerate() {
+        let owner = image
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Host && node.state_slot as usize == host_slot)
+            .map(|node| node.id)
+            .ok_or_else(|| MetalError::Validation("TCP receiver owner is missing".into()))?;
+        for receiver in &state.tcp_receivers {
+            let flow = receiver.flow.0 as usize;
+            let data_count = packet_counts
+                .get(flow)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
+            let capacity = receiver
+                .out_of_order
+                .len()
+                .saturating_add(data_count)
+                .max(1);
+            let words = capacity.checked_mul(TCP_RANGE_WORDS).ok_or_else(|| {
+                MetalError::Validation("TCP receiver range size overflows".into())
+            })?;
+            let range_offset = next;
+            next = next.checked_add(words).ok_or_else(|| {
+                MetalError::Validation("TCP receiver range arena overflows".into())
+            })?;
+            receiver_ranges[flow] = Some((owner, receiver.clone(), range_offset, capacity));
+        }
+    }
+
+    let ledger_meta_offset = next;
+    next = next
+        .checked_add(
+            flow_count
+                .checked_mul(TCP_LEDGER_META_WORDS)
+                .ok_or_else(|| MetalError::Validation("TCP ledger metadata overflows".into()))?,
+        )
+        .ok_or_else(|| MetalError::Validation("TCP ledger metadata arena overflows".into()))?;
+    let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
+        MetalError::Validation(format!(
+            "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
+            conflict.flow,
+            conflict.sequence,
+            conflict.original_size_bytes,
+            conflict.replacement_size_bytes
+        ))
+    })?;
+    let mut ledger_layout = vec![(0_usize, 0_usize); flow_count];
+    for (flow, layout) in ledger_layout.iter_mut().enumerate() {
+        let current = ledger
+            .get(&crate::FlowId(flow as u64))
+            .map_or(0, BTreeMap::len);
+        let data_count = packet_counts
+            .get(flow)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
+        let capacity = current.max(data_count).max(1);
+        let record_offset = next;
+        next = next
+            .checked_add(
+                capacity
+                    .checked_mul(TCP_LEDGER_RECORD_WORDS)
+                    .ok_or_else(|| {
+                        MetalError::Validation("TCP ledger record size overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| MetalError::Validation("TCP ledger arena overflows".into()))?;
+        *layout = (record_offset, capacity);
+    }
+
+    let transition_meta_offset = next;
+    next = next
+        .checked_add(
+            node_count
+                .checked_mul(TCP_TRANSITION_META_WORDS)
+                .ok_or_else(|| {
+                    MetalError::Validation("TCP transition metadata overflows".into())
+                })?,
+        )
+        .ok_or_else(|| MetalError::Validation("TCP transition metadata arena overflows".into()))?;
+    let mut transition_layout = vec![(0_usize, 0_usize); node_count];
+    for (node, layout) in transition_layout.iter_mut().enumerate() {
+        let capacity = if observation_mode == ObservationMode::Full {
+            observation_capacities
+                .get(node)
+                .copied()
+                .unwrap_or(0)
+                .max(1)
+        } else {
+            0
+        };
+        let record_offset = next;
+        next = next
+            .checked_add(capacity.checked_mul(TCP_TRANSITION_WORDS).ok_or_else(|| {
+                MetalError::Validation("TCP transition record size overflows".into())
+            })?)
+            .ok_or_else(|| MetalError::Validation("TCP transition arena overflows".into()))?;
+        *layout = (record_offset, capacity);
+    }
+
+    let mut words = vec![0_u64; next.max(1)];
+    for (flow, entry) in receiver_ranges.into_iter().enumerate() {
+        let Some((owner, receiver, range_offset, capacity)) = entry else {
+            continue;
+        };
+        let base = receiver_offset + flow * TCP_RECEIVER_WORDS;
+        words[base] = 1;
+        words[base + 1] = owner.0;
+        words[base + 2] = receiver.ack_size_bytes;
+        words[base + 3] = receiver.next_expected_sequence;
+        words[base + 4] = range_offset as u64;
+        words[base + 5] = capacity as u64;
+        words[base + 6] = receiver.out_of_order.len() as u64;
+        for (index, range) in receiver.out_of_order.iter().enumerate() {
+            let offset = range_offset + index * TCP_RANGE_WORDS;
+            words[offset] = range.start;
+            words[offset + 1] = range.end;
+        }
+    }
+    for (flow, &(record_offset, capacity)) in ledger_layout.iter().enumerate() {
+        let base = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
+        words[base] = record_offset as u64;
+        words[base + 1] = capacity as u64;
+        let segments = ledger.get(&crate::FlowId(flow as u64));
+        words[base + 2] = segments.map_or(0, BTreeMap::len) as u64;
+        if let Some(segments) = segments {
+            for (index, packet) in segments.values().enumerate() {
+                let PacketKind::TcpData(header) = packet.kind else {
+                    unreachable!("TCP ledgers contain only TCP data")
+                };
+                let offset = record_offset + index * TCP_LEDGER_RECORD_WORDS;
+                words[offset] = packet.id.0;
+                words[offset + 1] = packet.size_bytes;
+                words[offset + 2] = header.sequence;
+                words[offset + 3] = header.sent_time_ns;
+                words[offset + 4] = u64::from(header.retransmission);
+            }
+        }
+    }
+    for (node, (record_offset, capacity)) in transition_layout.into_iter().enumerate() {
+        let base = transition_meta_offset + node * TCP_TRANSITION_META_WORDS;
+        words[base] = record_offset as u64;
+        words[base + 1] = capacity as u64;
+    }
+
+    Ok(PreparedTcpState {
+        words,
+        layout: TcpStateLayout {
+            receiver_offset,
+            ledger_meta_offset,
+            transition_meta_offset,
+        },
+    })
+}
+
 fn packet_for(
     packets: &BTreeMap<PayloadId, PacketDescriptor>,
     payload: PayloadId,
@@ -2415,23 +2756,44 @@ fn packet_record(packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
     record[8] = packet.flow.0;
     record[9] = packet.size_bytes;
     record[10] = u64::from(packet.kind.code());
+    encode_packet_metadata(packet.kind, &mut record[11..14]);
     record
 }
 
-fn event_record(event: Event, packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
-    [
-        event.key.time_ns,
-        u64::from(event.key.phase),
-        event.key.origin_node.0,
-        event.key.origin_seq,
-        event.target.0,
-        event.kind as u64,
-        event.payload.0,
-        packet.id.0,
-        packet.flow.0,
-        packet.size_bytes,
-        u64::from(packet.kind.code()),
-    ]
+fn event_record(event: Event, packet: Option<PacketDescriptor>) -> [u64; EVENT_WORDS] {
+    let mut record = [0_u64; EVENT_WORDS];
+    record[0] = event.key.time_ns;
+    record[1] = u64::from(event.key.phase);
+    record[2] = event.key.origin_node.0;
+    record[3] = event.key.origin_seq;
+    record[4] = event.target.0;
+    record[5] = event.kind as u64;
+    record[6] = event.payload.0;
+    if let Some(packet) = packet {
+        record[7] = packet.id.0;
+        record[8] = packet.flow.0;
+        record[9] = packet.size_bytes;
+        record[10] = u64::from(packet.kind.code());
+        encode_packet_metadata(packet.kind, &mut record[11..14]);
+    }
+    record
+}
+
+fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
+    words.fill(0);
+    match kind {
+        PacketKind::Data | PacketKind::Feedback => {}
+        PacketKind::TcpData(header) => {
+            words[0] = header.sequence;
+            words[1] = header.sent_time_ns;
+            words[2] = u64::from(header.retransmission);
+        }
+        PacketKind::TcpAck(header) => {
+            words[0] = header.acknowledgment;
+            words[1] = header.acknowledged_bytes;
+            words[2] = header.echoed_sent_time_ns;
+        }
+    }
 }
 
 fn write_record(storage: &mut [u64], slot: usize, record: [u64; EVENT_WORDS]) {
@@ -2660,6 +3022,7 @@ impl FelProbeResources {
 
 struct MetalBuffers {
     planes: Vec<SharedBuffer>,
+    tcp_state: SharedBuffer,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
     stream_layout: StreamLayout,
@@ -2676,6 +3039,7 @@ impl MetalBuffers {
         let stream_layout = plan.stream_layout;
         let memory_layout = plan.memory_layout;
         let node_count = plan.params[0] as usize;
+        let tcp_state = SharedBuffer::new(device, plan.tcp_state)?;
         let planes = vec![
             plan.control,
             plan.params,
@@ -2711,6 +3075,7 @@ impl MetalBuffers {
         .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             planes,
+            tcp_state,
             orphan_packets,
             node_count,
             stream_layout,
@@ -2726,6 +3091,9 @@ impl MetalBuffers {
                 encoder.setBuffer_offset_atIndex(Some(&plane.raw), 0, index);
             }
         }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&self.tcp_state.raw), 0, 30);
+        }
     }
 
     fn finish(
@@ -2739,6 +3107,7 @@ impl MetalBuffers {
             .iter()
             .map(SharedBuffer::read)
             .collect::<Vec<_>>();
+        let tcp_state = self.tcp_state.read();
         let control = &planes[0];
         if control[CONTROL_ERROR] != 0 {
             return Err(decode_device_error(control));
@@ -2749,6 +3118,7 @@ impl MetalBuffers {
             });
         }
 
+        let params = &planes[1];
         let node_state = &planes[2];
         let generators = &planes[3];
         let fel_meta = &planes[7];
@@ -2808,6 +3178,34 @@ impl MetalBuffers {
                         generator.feedback.arrivals = generators[offset + 8];
                         generator.feedback.outstanding_bytes = generators[offset + 9];
                         generator.feedback.unacknowledged_bytes = generators[offset + 10];
+                        if generators[offset + 11] == 1 {
+                            generator.kind = FlowGeneratorKind::Tcp(decode_tcp_generator(
+                                &generators[offset..offset + GENERATOR_WORDS],
+                            )?);
+                        }
+                    }
+                    let receiver_base = params[28] as usize;
+                    for receiver in &mut state.tcp_receivers {
+                        let base = receiver_base + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+                        if tcp_state[base] == 0 || tcp_state[base + 1] != node.id.0 {
+                            return Err(MetalError::DeviceExecution {
+                                code: 96,
+                                node: Some(node.id),
+                            });
+                        }
+                        receiver.ack_size_bytes = tcp_state[base + 2];
+                        receiver.next_expected_sequence = tcp_state[base + 3];
+                        let range_offset = tcp_state[base + 4] as usize;
+                        let range_count = tcp_state[base + 6] as usize;
+                        receiver.out_of_order = (0..range_count)
+                            .map(|index| {
+                                let offset = range_offset + index * TCP_RANGE_WORDS;
+                                TcpReceiveRange {
+                                    start: tcp_state[offset],
+                                    end: tcp_state[offset + 1],
+                                }
+                            })
+                            .collect();
                     }
                 }
                 NodeKind::Switch => {
@@ -2835,7 +3233,9 @@ impl MetalBuffers {
             for index in 0..count {
                 let record = read_record(fel_records, offset + index);
                 let (event, packet) = decode_event(record)?;
-                resident.insert(packet.id, packet);
+                if let Some(packet) = packet {
+                    resident.insert(packet.id, packet);
+                }
                 pending_events.push(event);
             }
         }
@@ -2849,16 +3249,40 @@ impl MetalBuffers {
                 let physical = (head + index) % capacity.max(1);
                 let record = read_record(stream_records, offset + physical);
                 let (event, packet) = decode_event(record)?;
-                resident.insert(packet.id, packet);
+                if let Some(packet) = packet {
+                    resident.insert(packet.id, packet);
+                }
                 pending_events.push(event);
             }
         }
         pending_events.sort_unstable_by_key(|event| event.key);
 
+        let ledger_meta_offset = params[29] as usize;
+        for flow in 0..image.flows.len() {
+            let base = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
+            let offset = tcp_state[base] as usize;
+            let count = tcp_state[base + 2] as usize;
+            for index in 0..count {
+                let record = offset + index * TCP_LEDGER_RECORD_WORDS;
+                let packet = PacketDescriptor {
+                    id: PayloadId(tcp_state[record]),
+                    flow: crate::FlowId(flow as u64),
+                    size_bytes: tcp_state[record + 1],
+                    kind: PacketKind::TcpData(TcpDataHeader {
+                        sequence: tcp_state[record + 2],
+                        sent_time_ns: tcp_state[record + 3],
+                        retransmission: tcp_state[record + 4] != 0,
+                    }),
+                };
+                resident.entry(packet.id).or_insert(packet);
+            }
+        }
+
         let summary = decode_summary_rows(summary_words, image.nodes.len());
         let mut observed_packets = BTreeMap::new();
         let mut departures = Vec::new();
         let mut arrivals = Vec::new();
+        let mut tcp_transitions = Vec::new();
         if observation_mode == ObservationMode::Full {
             let observed_words = compact_lp_log(
                 observed_words,
@@ -2893,7 +3317,7 @@ impl MetalBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[6]),
                     size_bytes: words[7],
-                    kind: decode_packet_kind(words[8])?,
+                    kind: decode_packet_kind(words[8], &words[9..12])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
                 keyed_departures.push((
@@ -2910,7 +3334,7 @@ impl MetalBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[7]),
                     size_bytes: words[8],
-                    kind: decode_packet_kind(words[9])?,
+                    kind: decode_packet_kind(words[9], &words[10..13])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
                 keyed_arrivals.push((
@@ -2932,6 +3356,19 @@ impl MetalBuffers {
                 .into_iter()
                 .map(|(_, arrival)| arrival)
                 .collect();
+            let transition_meta_offset = params[30] as usize;
+            for node in 0..image.nodes.len() {
+                let base = transition_meta_offset + node * TCP_TRANSITION_META_WORDS;
+                let offset = tcp_state[base] as usize;
+                let count = tcp_state[base + 3] as usize;
+                for index in 0..count {
+                    let start = offset + index * TCP_TRANSITION_WORDS;
+                    tcp_transitions.push(decode_tcp_transition(
+                        &tcp_state[start..start + TCP_TRANSITION_WORDS],
+                    )?);
+                }
+            }
+            tcp_transitions.sort_unstable_by_key(|record| record.key);
         }
 
         let phase_profile = (!timing.profiled_attempts.is_empty()).then(|| {
@@ -2954,7 +3391,7 @@ impl MetalBuffers {
                 observed_packets: observed_packets.into_values().collect(),
                 departures,
                 arrivals,
-                tcp_transitions: Vec::new(),
+                tcp_transitions,
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],
@@ -3008,6 +3445,9 @@ fn decode_arena(value: u64) -> MetalArena {
         8 => MetalArena::ChannelInbox,
         9 => MetalArena::ServiceStream,
         10 => MetalArena::GeneratorStream,
+        11 => MetalArena::TcpReceiverRanges,
+        12 => MetalArena::TcpSegmentLedger,
+        13 => MetalArena::TcpTransitions,
         _ => MetalArena::Fel,
     }
 }
@@ -3050,11 +3490,8 @@ fn read_packet(storage: &[u64], slot: usize) -> PacketDescriptor {
         id: PayloadId(record[7]),
         flow: crate::FlowId(record[8]),
         size_bytes: record[9],
-        kind: if record[10] == 0 {
-            PacketKind::Data
-        } else {
-            PacketKind::Feedback
-        },
+        kind: decode_packet_kind(record[10], &record[11..14])
+            .expect("device error screening precedes packet readback"),
     }
 }
 
@@ -3069,14 +3506,18 @@ fn read_queue(lp: usize, meta: &[u64], records: &[u64]) -> Vec<PacketDescriptor>
         .collect()
 }
 
-fn decode_event(record: &[u64]) -> Result<(Event, PacketDescriptor), MetalError> {
+fn decode_event(record: &[u64]) -> Result<(Event, Option<PacketDescriptor>), MetalError> {
     let kind = decode_event_kind(record[5])?;
-    let packet = PacketDescriptor {
-        id: PayloadId(record[7]),
-        flow: crate::FlowId(record[8]),
-        size_bytes: record[9],
-        kind: decode_packet_kind(record[10])?,
-    };
+    let packet = (kind != EventKind::RetransmissionTimeout)
+        .then(|| {
+            Ok(PacketDescriptor {
+                id: PayloadId(record[7]),
+                flow: crate::FlowId(record[8]),
+                size_bytes: record[9],
+                kind: decode_packet_kind(record[10], &record[11..14])?,
+            })
+        })
+        .transpose()?;
     Ok((
         Event {
             key: EventKey {
@@ -3114,6 +3555,7 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
         1 => Ok(EventKind::TxReady),
         2 => Ok(EventKind::TxComplete),
         3 => Ok(EventKind::RemoteArrival),
+        4 => Ok(EventKind::RetransmissionTimeout),
         _ => Err(MetalError::DeviceExecution {
             code: 92,
             node: None,
@@ -3121,10 +3563,20 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
     }
 }
 
-fn decode_packet_kind(value: u64) -> Result<PacketKind, MetalError> {
+fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalError> {
     match value {
         0 => Ok(PacketKind::Data),
         1 => Ok(PacketKind::Feedback),
+        2 => Ok(PacketKind::TcpData(TcpDataHeader {
+            sequence: metadata[0],
+            sent_time_ns: metadata[1],
+            retransmission: metadata[2] != 0,
+        })),
+        3 => Ok(PacketKind::TcpAck(TcpAckHeader {
+            acknowledgment: metadata[0],
+            acknowledged_bytes: metadata[1],
+            echoed_sent_time_ns: metadata[2],
+        })),
         _ => Err(MetalError::DeviceExecution {
             code: 93,
             node: None,
@@ -3163,7 +3615,110 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, MetalError> {
         id: PayloadId(words[0]),
         flow: crate::FlowId(words[1]),
         size_bytes: words[2],
-        kind: decode_packet_kind(words[3])?,
+        kind: decode_packet_kind(words[3], &words[4..7])?,
+    })
+}
+
+fn decode_tcp_phase(value: u64) -> Result<TcpPhase, MetalError> {
+    match value {
+        0 => Ok(TcpPhase::SlowStart),
+        1 => Ok(TcpPhase::CongestionAvoidance),
+        2 => Ok(TcpPhase::FastRecovery),
+        _ => Err(MetalError::DeviceExecution {
+            code: 97,
+            node: None,
+        }),
+    }
+}
+
+fn decode_tcp_control(words: &[u64]) -> Result<TcpCongestionControl, MetalError> {
+    match words[0] {
+        0 => Ok(TcpCongestionControl::Reno(TcpReno {
+            mss_bytes: words[1],
+            cwnd_bytes: words[2],
+            ssthresh_bytes: words[3],
+            phase: decode_tcp_phase(words[4])?,
+            duplicate_acks: words[5],
+            recovery_high_sequence: words[6],
+            ca_credit: words[7],
+        })),
+        1 => Ok(TcpCongestionControl::Cubic(TcpCubic {
+            mss_bytes: words[1],
+            cwnd_scaled: words[2],
+            ssthresh_scaled: words[3],
+            phase: decode_tcp_phase(words[4])?,
+            duplicate_acks: words[5],
+            recovery_high_sequence: words[6],
+            w_max_scaled: words[7],
+            w_last_max_scaled: words[8],
+            epoch_start_ns: words[9],
+            srtt_ns: words[10],
+            k_ns: words[11],
+        })),
+        _ => Err(MetalError::DeviceExecution {
+            code: 98,
+            node: None,
+        }),
+    }
+}
+
+fn decode_tcp_generator(row: &[u64]) -> Result<crate::TcpGenerator, MetalError> {
+    let active_timer = (row[22] != 0).then(|| TcpTimerState {
+        attempt: PayloadId(row[23]),
+        sequence: row[24],
+        deadline_ns: row[25],
+        generation: row[26],
+        rto_ns: row[27],
+    });
+    Ok(crate::TcpGenerator {
+        total_bytes: row[12],
+        mss_bytes: row[13],
+        ack_size_bytes: row[14],
+        next_sequence: row[15],
+        highest_ack: row[16],
+        bytes_in_flight: row[17],
+        duplicate_acks: row[18],
+        recovery_high_sequence: row[19],
+        last_attempt: PayloadId(row[20]),
+        timer_generation: row[21],
+        active_timer,
+        srtt_ns: row[28],
+        rtt_var_ns: row[29],
+        rto_ns: row[30],
+        control: decode_tcp_control(&row[31..43])?,
+    })
+}
+
+fn decode_tcp_transition(words: &[u64]) -> Result<TcpTransitionRecord, MetalError> {
+    let input = match words[7] {
+        0 => TcpTransitionInput::NewAck {
+            acknowledged_bytes: words[8],
+            rtt_sample_ns: words[9],
+            flight_size_bytes: words[10],
+            acknowledgment: words[11],
+        },
+        1 => TcpTransitionInput::DuplicateAck {
+            flight_size_bytes: words[8],
+            recovery_high_sequence: words[9],
+        },
+        2 => TcpTransitionInput::Timeout {
+            flight_size_bytes: words[8],
+        },
+        _ => {
+            return Err(MetalError::DeviceExecution {
+                code: 99,
+                node: None,
+            });
+        }
+    };
+    Ok(TcpTransitionRecord {
+        key: decode_key(words)?,
+        node: NodeId(words[4]),
+        flow: crate::FlowId(words[5]),
+        mss_bytes: words[6],
+        input,
+        before: decode_tcp_control(&words[12..24])?,
+        after: decode_tcp_control(&words[24..36])?,
     })
 }
 

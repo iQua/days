@@ -83,7 +83,6 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_flow_ids(image)?;
     validate_packet_ids(image)?;
     validate_state_ownership(image)?;
-    validate_device_tcp_support(image, backend)?;
     validate_links(image)?;
     validate_flows(image)?;
     validate_generators(image)?;
@@ -99,68 +98,6 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_payload_sequences(image, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
     validate_initial_payload_positions(image)?;
-    Ok(())
-}
-
-fn validate_device_tcp_support(
-    image: &SimulationImage,
-    backend: Backend,
-) -> Result<(), ValidationError> {
-    if !matches!(backend, Backend::Metal | Backend::Cuda) {
-        return Ok(());
-    }
-
-    for owner in image
-        .nodes
-        .iter()
-        .filter(|node| node.kind == NodeKind::Host)
-    {
-        let state = &image.host_states[owner.state_slot as usize];
-        for generator in &state.generators {
-            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-                return Err(ValidationError::new(format!(
-                    "TCP {} generator for flow {:?} requires Scalar or Cpu; {backend} support is T24",
-                    tcp.control.label(),
-                    generator.flow
-                )));
-            }
-        }
-    }
-
-    for packet in &image.initial_packets {
-        if matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)) {
-            return Err(ValidationError::new(format!(
-                "TCP packet {:?} for flow {:?} requires Scalar or Cpu; {backend} support is T24",
-                packet.id, packet.flow
-            )));
-        }
-    }
-
-    for owner in image
-        .nodes
-        .iter()
-        .filter(|node| node.kind == NodeKind::Host)
-    {
-        let state = &image.host_states[owner.state_slot as usize];
-        if let Some(receiver) = state.tcp_receivers.first() {
-            return Err(ValidationError::new(format!(
-                "TCP receiver state for flow {:?} at node {:?} requires Scalar or Cpu; {backend} support is T24",
-                receiver.flow, owner.id
-            )));
-        }
-    }
-
-    if let Some(event) = image
-        .initial_events
-        .iter()
-        .find(|event| event.kind == EventKind::RetransmissionTimeout)
-    {
-        return Err(ValidationError::new(format!(
-            "TCP retransmission timer event at key {:?} requires Scalar or Cpu; {backend} support is T24",
-            event.key
-        )));
-    }
-
     Ok(())
 }
 

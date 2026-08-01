@@ -13,9 +13,9 @@ use crate::{
     serialization_time_ns,
 };
 
-const EVENT_WORDS: usize = 11;
+const EVENT_WORDS: usize = 14;
 const NODE_WORDS: usize = 11;
-const GENERATOR_WORDS: usize = 16;
+const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
 const LINK_WORDS: usize = 4;
 const ARENA_META_WORDS: usize = 4;
@@ -29,7 +29,7 @@ const OUTBOUND_ENTRY_WORDS: usize = 2;
 const CHANNEL_BATCH_WORDS: usize = 4;
 const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
 const CONTROL_WORDS: usize = 19;
-const PARAM_WORDS: usize = 28;
+const PARAM_WORDS: usize = 35;
 const WORD_BYTES: usize = std::mem::size_of::<u64>();
 
 const PLANE_NAMES: [&str; 28] = [
@@ -92,7 +92,10 @@ impl DeviceEventArenaSizing {
     }
 }
 
-/// Complete host-only sizing report for the 28 default production GPU device planes.
+/// Complete host-only sizing report for the default production GPU device planes.
+///
+/// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
+/// for receiver ranges, segment ledgers, and full-observation transition state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -116,12 +119,11 @@ impl std::error::Error for DeviceSizingError {}
 pub fn size_default_device_plan(
     image: &SimulationImage,
 ) -> Result<DeviceSizingReport, DeviceSizingError> {
-    reject_tcp_device_sizing(image)?;
     let node_count = image.nodes.len();
     let flow_count = image.flows.len();
     let link_count = image.links.len();
     let flow_packet_counts = flow_packet_counts(image)?;
-    let flow_feedback_counts = feedback_packet_counts(image);
+    let flow_feedback_counts = feedback_packet_counts(image, &flow_packet_counts);
     let minimum_lookahead_ns = image
         .channels
         .iter()
@@ -190,8 +192,19 @@ pub fn size_default_device_plan(
         }
     }
 
+    let runtime_tcp_timer_slots = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
+        .try_fold(0_usize, |total, generator| {
+            total
+                .checked_add(flow_packet_counts[generator.flow.0 as usize].max(1))
+                .ok_or_else(|| sizing_error("TCP fallback FEL slots overflow usize"))
+        })?;
     let fallback_fel_event_slots = node_count
         .checked_add(image.initial_events.len())
+        .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
@@ -258,7 +271,7 @@ pub fn size_default_device_plan(
         device_scheduler_word_count(image, &queue_capacities).map_err(DeviceSizingError)?,
     ];
 
-    let planes = PLANE_NAMES
+    let mut planes = PLANE_NAMES
         .into_iter()
         .zip(words)
         .enumerate()
@@ -271,6 +284,21 @@ pub fn size_default_device_plan(
             })
         })
         .collect::<Result<Vec<_>, DeviceSizingError>>()?;
+    if image.host_states.iter().any(|state| {
+        !state.tcp_receivers.is_empty()
+            || state
+                .generators
+                .iter()
+                .any(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
+    }) {
+        let tcp_words = packed_tcp_state_words(image, &flow_packet_counts)?;
+        planes.push(DevicePlaneSizing {
+            index: planes.len(),
+            name: "tcp_state",
+            words: tcp_words,
+            bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
+        });
+    }
     let total_device_bytes = planes.iter().try_fold(0_usize, |total, plane| {
         total
             .checked_add(plane.bytes)
@@ -303,47 +331,6 @@ pub fn size_default_device_plan(
     })
 }
 
-fn reject_tcp_device_sizing(image: &SimulationImage) -> Result<(), DeviceSizingError> {
-    for state in &image.host_states {
-        for generator in &state.generators {
-            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-                return Err(sizing_error(format!(
-                    "TCP {} generator for flow {:?} requires a non-device backend; device sizing support is T24",
-                    tcp.control.label(),
-                    generator.flow
-                )));
-            }
-        }
-    }
-    for packet in &image.initial_packets {
-        if matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)) {
-            return Err(sizing_error(format!(
-                "TCP packet {:?} for flow {:?} requires a non-device backend; device sizing support is T24",
-                packet.id, packet.flow
-            )));
-        }
-    }
-    for (slot, state) in image.host_states.iter().enumerate() {
-        if let Some(receiver) = state.tcp_receivers.first() {
-            return Err(sizing_error(format!(
-                "TCP receiver state for flow {:?} in host state {slot} requires a non-device backend; device sizing support is T24",
-                receiver.flow
-            )));
-        }
-    }
-    if let Some(event) = image
-        .initial_events
-        .iter()
-        .find(|event| event.kind == EventKind::RetransmissionTimeout)
-    {
-        return Err(sizing_error(format!(
-            "TCP retransmission timer event at key {:?} requires a non-device backend; device sizing support is T24",
-            event.key
-        )));
-    }
-    Ok(())
-}
-
 struct CapacityContext {
     packet_counts: Vec<usize>,
     feedback_counts: Vec<usize>,
@@ -368,13 +355,19 @@ impl CapacityContext {
         for state in &image.host_states {
             for generator in &state.generators {
                 let index = generator.flow.0 as usize;
-                let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                    unreachable!("device validation rejects TCP before sizing")
-                };
-                minimum_data_sizes[index] =
-                    minimum_data_sizes[index].min(constant.packet_size_bytes);
-                if generator.next_emission.status == GeneratorStatus::Scheduled {
-                    generator_intervals[index].push(constant.interval_ns);
+                match generator.kind {
+                    FlowGeneratorKind::Constant(constant) => {
+                        minimum_data_sizes[index] =
+                            minimum_data_sizes[index].min(constant.packet_size_bytes);
+                        if generator.next_emission.status == GeneratorStatus::Scheduled {
+                            generator_intervals[index].push(constant.interval_ns);
+                        }
+                    }
+                    FlowGeneratorKind::Tcp(tcp) => {
+                        minimum_data_sizes[index] = minimum_data_sizes[index].min(tcp.mss_bytes);
+                        minimum_feedback_sizes[index] =
+                            minimum_feedback_sizes[index].min(tcp.ack_size_bytes);
+                    }
                 }
             }
         }
@@ -418,56 +411,156 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
-            if generator.next_emission.status != GeneratorStatus::Scheduled {
-                continue;
+            match generator.kind {
+                FlowGeneratorKind::Constant(constant) => {
+                    if generator.next_emission.status != GeneratorStatus::Scheduled {
+                        continue;
+                    }
+                    let termination_count = match constant.termination {
+                        crate::GeneratorTermination::Bytes(bytes) => {
+                            if generator.bytes_emitted >= bytes {
+                                0
+                            } else {
+                                (bytes - generator.bytes_emitted)
+                                    .div_ceil(constant.packet_size_bytes)
+                            }
+                        }
+                        crate::GeneratorTermination::DurationNs(duration) => {
+                            let end = constant
+                                .first_departure_ns
+                                .checked_add(duration)
+                                .ok_or_else(|| {
+                                    sizing_error("generator duration endpoint overflows")
+                                })?;
+                            if generator.next_emission.departure_time_ns >= end {
+                                0
+                            } else {
+                                1 + (end - 1 - generator.next_emission.departure_time_ns)
+                                    / constant.interval_ns
+                            }
+                        }
+                    };
+                    let stop_count =
+                        if generator.next_emission.departure_time_ns > image.stop_time_ns {
+                            0
+                        } else {
+                            1 + (image.stop_time_ns - generator.next_emission.departure_time_ns)
+                                / constant.interval_ns
+                        };
+                    let future = termination_count.min(stop_count) as usize;
+                    counts[index] = counts[index].saturating_add(future.saturating_sub(1));
+                }
+                FlowGeneratorKind::Tcp(tcp) => {
+                    if matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Finished | GeneratorStatus::Stopped
+                    ) || tcp.highest_ack >= tcp.total_bytes
+                    {
+                        continue;
+                    }
+                    // Closed-loop send plans can fragment one nominal MSS at a congestion-window
+                    // boundary and can retransmit. Twice the remaining nominal segment count plus
+                    // preloaded ACK triggers is the practical bounded device arena reservation;
+                    // a valid trajectory that exceeds it reports an exact capacity error.
+                    let bound = tcp_data_attempt_bound(image, generator, tcp);
+                    // Every delivered data attempt creates one cumulative ACK attempt.
+                    counts[index] = counts[index].saturating_add(bound.saturating_mul(2));
+                }
             }
-            let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("device validation rejects TCP before sizing")
-            };
-            let termination_count = match constant.termination {
-                crate::GeneratorTermination::Bytes(bytes) => {
-                    if generator.bytes_emitted >= bytes {
-                        0
-                    } else {
-                        (bytes - generator.bytes_emitted).div_ceil(constant.packet_size_bytes)
-                    }
-                }
-                crate::GeneratorTermination::DurationNs(duration) => {
-                    let end = constant
-                        .first_departure_ns
-                        .checked_add(duration)
-                        .ok_or_else(|| sizing_error("generator duration endpoint overflows"))?;
-                    if generator.next_emission.departure_time_ns >= end {
-                        0
-                    } else {
-                        1 + (end - 1 - generator.next_emission.departure_time_ns)
-                            / constant.interval_ns
-                    }
-                }
-            };
-            let stop_count = if generator.next_emission.departure_time_ns > image.stop_time_ns {
-                0
-            } else {
-                1 + (image.stop_time_ns - generator.next_emission.departure_time_ns)
-                    / constant.interval_ns
-            };
-            let future = termination_count.min(stop_count) as usize;
-            counts[index] = counts[index].saturating_add(future.saturating_sub(1));
         }
     }
     Ok(counts)
 }
 
-fn feedback_packet_counts(image: &SimulationImage) -> Vec<usize> {
-    image
-        .initial_packets
-        .iter()
-        .fold(vec![0_usize; image.flows.len()], |mut counts, packet| {
-            if packet.kind == PacketKind::Feedback {
+fn feedback_packet_counts(image: &SimulationImage, packet_counts: &[usize]) -> Vec<usize> {
+    let mut counts = image.initial_packets.iter().fold(
+        vec![0_usize; image.flows.len()],
+        |mut counts, packet| {
+            if packet.kind.is_feedback() {
                 counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
             }
             counts
+        },
+    );
+    for state in &image.host_states {
+        for generator in &state.generators {
+            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+                let index = generator.flow.0 as usize;
+                let attempts = tcp_data_attempt_bound(image, generator, tcp);
+                counts[index] = counts[index].saturating_add(attempts);
+                counts[index] = counts[index].min(packet_counts[index]);
+            }
+        }
+    }
+    counts
+}
+
+fn tcp_data_attempt_bound(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    tcp: crate::TcpGenerator,
+) -> usize {
+    if matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Finished | GeneratorStatus::Stopped
+    ) || tcp.highest_ack >= tcp.total_bytes
+    {
+        return 0;
+    }
+    let remaining = tcp.total_bytes - tcp.highest_ack;
+    let nominal = remaining.div_ceil(tcp.mss_bytes.max(1));
+    let preloaded_acks = image
+        .initial_packets
+        .iter()
+        .filter(|packet| {
+            packet.flow == generator.flow && matches!(packet.kind, PacketKind::TcpAck(_))
         })
+        .count() as u64;
+    usize::try_from(
+        nominal
+            .saturating_mul(2)
+            .saturating_add(preloaded_acks)
+            .saturating_add(2),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+fn packed_tcp_state_words(
+    image: &SimulationImage,
+    packet_counts: &[usize],
+) -> Result<usize, DeviceSizingError> {
+    const RECEIVER_WORDS: usize = 4;
+    const RANGE_WORDS: usize = 2;
+    let flow_count = image.flows.len().max(1);
+    let tcp_record_slots = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
+        .try_fold(0_usize, |total, generator| {
+            total
+                .checked_add(packet_counts[generator.flow.0 as usize])
+                .ok_or_else(|| sizing_error("TCP auxiliary record slots overflow usize"))
+        })?
+        .max(1);
+    [
+        checked_product(flow_count, RECEIVER_WORDS, "TCP receiver rows")?,
+        checked_product(flow_count, ARENA_META_WORDS, "TCP range metadata")?,
+        checked_product(tcp_record_slots, RANGE_WORDS, "TCP receive ranges")?,
+        checked_product(flow_count, ARENA_META_WORDS, "TCP ledger metadata")?,
+        checked_product(tcp_record_slots, EVENT_WORDS, "TCP ledger records")?,
+        checked_product(
+            image.nodes.len().max(1),
+            ARENA_META_WORDS,
+            "TCP transition metadata",
+        )?,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, words| {
+        total
+            .checked_add(words)
+            .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
+    })
 }
 
 fn source_queue_bounds(
@@ -485,7 +578,7 @@ fn source_queue_bounds(
     let mut initial_data_size = vec![0_u64; flow_count];
     let mut payload_to_flow = BTreeMap::new();
     for packet in &image.initial_packets {
-        if packet.kind == PacketKind::Data {
+        if packet.kind.is_data() {
             let index = packet.flow.0 as usize;
             initial_data_count[index] = initial_data_count[index].saturating_add(1);
             initial_data_payload[index].get_or_insert(packet.id);
@@ -533,6 +626,9 @@ fn source_queue_bounds(
             let [generator] = state.generators.as_slice() else {
                 return Ok(packet_count);
             };
+            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+                return Ok(packet_count);
+            }
             if generator.flow.0 as usize != flow_index
                 || generator.next_emission.status != GeneratorStatus::Scheduled
                 || generator.packets_emitted != 0
@@ -553,7 +649,7 @@ fn source_queue_bounds(
                 return Ok(packet_count);
             }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("device validation rejects TCP before sizing")
+                return Ok(packet_count);
             };
             if initial_data_size[flow_index] != constant.packet_size_bytes {
                 return Ok(packet_count);
@@ -676,18 +772,28 @@ fn flow_link_round_bound(
     });
     let generator_burst =
         if packet_kind == PacketKind::Data && link.source == image.flows[flow_index].source {
-            context.generator_intervals[flow_index]
-                .iter()
-                .map(|interval| {
-                    context.lookahead.map_or(packet_count, |lookahead| {
-                        packet_count.min(
-                            usize::try_from(lookahead / interval)
-                                .unwrap_or(usize::MAX)
-                                .saturating_add(1),
-                        )
-                    })
+            let closed_loop = image.host_states.iter().any(|state| {
+                state.generators.iter().any(|generator| {
+                    generator.flow.0 as usize == flow_index
+                        && matches!(generator.kind, FlowGeneratorKind::Tcp(_))
                 })
-                .fold(0_usize, usize::saturating_add)
+            });
+            if closed_loop {
+                packet_count
+            } else {
+                context.generator_intervals[flow_index]
+                    .iter()
+                    .map(|interval| {
+                        context.lookahead.map_or(packet_count, |lookahead| {
+                            packet_count.min(
+                                usize::try_from(lookahead / interval)
+                                    .unwrap_or(usize::MAX)
+                                    .saturating_add(1),
+                            )
+                        })
+                    })
+                    .fold(0_usize, usize::saturating_add)
+            }
         } else {
             0
         };
