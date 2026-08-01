@@ -7,7 +7,8 @@ use days_executor::{
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor,
     PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
-    SwitchQueueState, SwitchState, event_phase, validate,
+    SwitchQueueState, SwitchState, TcpCongestionControl, TcpDataHeader, TcpGenerator,
+    TcpReceiverState, event_phase, validate,
 };
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -109,8 +110,23 @@ struct SourceTraffic {
     size: Option<u64>,
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
-    tcp: Option<toml::Value>,
+    tcp: Option<SourceTcp>,
     dcqcn: Option<toml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceTcp {
+    cc_algorithm: String,
+    #[serde(default)]
+    ecn: bool,
+    cubic: Option<SourceCubic>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCubic {
+    beta: Option<f64>,
+    c: Option<f64>,
+    fast_convergence: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -119,12 +135,31 @@ enum Termination {
     DurationNs(u64),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TrafficKind {
+    Constant,
+    Tcp(TcpAlgorithm),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TcpAlgorithm {
+    Reno,
+    Cubic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceFlowKind {
+    PacketDistribution,
+    Tcp,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TrafficKey {
     initial_delay_ns: u64,
     interval_ns: u64,
     packet_size_bytes: u64,
     termination: Termination,
+    kind: TrafficKind,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -372,13 +407,18 @@ fn parse_rate(value: Option<&toml::Value>) -> Result<u64, CompileError> {
     Ok(rate)
 }
 
-fn validate_flow_type(flow_type: &str) -> Result<(), CompileError> {
-    if flow_type != "PacketDistribution" {
-        return Err(CompileError::Unsupported(format!(
-            "unsupported flow type `{flow_type}`; Days executor v1 supports only open-loop PacketDistribution traffic"
-        )));
+fn validate_flow_type(flow_type: &str) -> Result<SourceFlowKind, CompileError> {
+    match flow_type {
+        "PacketDistribution" => Ok(SourceFlowKind::PacketDistribution),
+        "TCP" => Ok(SourceFlowKind::Tcp),
+        "DCQCN" => Err(CompileError::Unsupported(
+            "unsupported flow type `DCQCN`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic"
+                .to_owned(),
+        )),
+        _ => Err(CompileError::Unsupported(format!(
+            "unsupported flow type `{flow_type}`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic"
+        ))),
     }
-    Ok(())
 }
 
 fn reject_flow_options(
@@ -399,7 +439,7 @@ fn reject_flow_options(
         || starts_after.is_some_and(|dependencies| !dependencies.is_empty())
     {
         return Err(CompileError::Unsupported(
-            "unsupported closed-loop flow dependencies; Days executor v1 requires precomputed open-loop inputs"
+            "unsupported inter-flow start dependencies; executor generators must be independently scheduled in the lowered image"
                 .to_owned(),
         ));
     }
@@ -411,7 +451,7 @@ fn reject_flow_options(
     }
     if routing.is_some() || path.is_some() {
         return Err(CompileError::Unsupported(
-            "unsupported source routing selection; T7 does not approximate unencoded forwarding behavior"
+            "unsupported source routing or explicit path selection; executor scenario lowering derives deterministic topology routes"
                 .to_owned(),
         ));
     }
@@ -419,7 +459,7 @@ fn reject_flow_options(
 }
 
 fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileError> {
-    validate_flow_type(&flow.flow_type)?;
+    let flow_kind = validate_flow_type(&flow.flow_type)?;
     reject_flow_options(
         flow.flow_id,
         flow.starts_before.as_deref(),
@@ -430,25 +470,25 @@ fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileEr
     )?;
     if flow.graph.len() != 1 {
         return Err(CompileError::Invalid(format!(
-            "open-loop flow graph must contain exactly one source/target edge, got {}",
+            "flow graph must contain exactly one source/target edge, got {}",
             flow.graph.len()
         )));
     }
     let (source, target) = flow.graph[0];
     if source == target {
         return Err(CompileError::Invalid(format!(
-            "open-loop flow source and target must differ, got {source}"
+            "flow source and target must differ, got {source}"
         )));
     }
     Ok(ExplicitFlowKey {
         source,
         target,
-        traffic: validate_traffic(flow.traffic)?,
+        traffic: validate_traffic(flow.traffic, flow_kind)?,
     })
 }
 
 fn validate_flow_set(flow_set: SourceFlowSet) -> Result<FlowSetKey, CompileError> {
-    validate_flow_type(&flow_set.flow_type)?;
+    let flow_kind = validate_flow_type(&flow_set.flow_type)?;
     reject_flow_options(
         flow_set.first_flow_id,
         flow_set.starts_before.as_deref(),
@@ -459,44 +499,98 @@ fn validate_flow_set(flow_set: SourceFlowSet) -> Result<FlowSetKey, CompileError
     )?;
     Ok(FlowSetKey {
         flow_count: flow_set.flow_count,
-        traffic: validate_traffic(flow_set.traffic)?,
+        traffic: validate_traffic(flow_set.traffic, flow_kind)?,
     })
 }
 
-fn validate_traffic(traffic: SourceTraffic) -> Result<TrafficKey, CompileError> {
-    if traffic.tcp.is_some() {
-        return Err(CompileError::Unsupported(
-            "unsupported closed-loop TCP source behavior; Days executor v1 requires precomputed open-loop inputs"
-                .to_owned(),
-        ));
-    }
+fn validate_traffic(
+    traffic: SourceTraffic,
+    flow_kind: SourceFlowKind,
+) -> Result<TrafficKey, CompileError> {
     if traffic.dcqcn.is_some() {
         return Err(CompileError::Unsupported(
-            "unsupported DCQCN source behavior; Days executor v1 requires precomputed open-loop inputs"
-                .to_owned(),
-        ));
-    }
-
-    let interval_seconds = constant_distribution(&traffic.arr_dist, "packet arrival distribution")?;
-    let interval_ns = seconds_to_ns(interval_seconds, "packet arrival interval")?;
-    if interval_ns == 0 {
-        return Err(CompileError::Unsupported(
-            "unsupported zero packet arrival interval; deterministic precomputation would not advance time"
+            "unsupported DCQCN source behavior; the executor transport lattice implements exact loss-only TCP Reno/CUBIC"
                 .to_owned(),
         ));
     }
 
     let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist)?;
-
-    let termination = match (traffic.size, traffic.duration) {
-        (Some(size), _) => Termination::Bytes(size),
-        (None, Some(duration)) => {
-            Termination::DurationNs(seconds_to_ns(duration, "flow duration")?)
+    let (kind, interval_ns, termination) = match flow_kind {
+        SourceFlowKind::PacketDistribution => {
+            if traffic.tcp.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported TCP options on PacketDistribution traffic; use `flow_type = \"TCP\"`"
+                        .to_owned(),
+                ));
+            }
+            let interval_seconds =
+                constant_distribution(&traffic.arr_dist, "packet arrival distribution")?;
+            let interval_ns = seconds_to_ns(interval_seconds, "packet arrival interval")?;
+            if interval_ns == 0 {
+                return Err(CompileError::Unsupported(
+                    "unsupported zero packet arrival interval; deterministic precomputation would not advance time"
+                        .to_owned(),
+                ));
+            }
+            let termination = match (traffic.size, traffic.duration) {
+                (Some(size), _) => Termination::Bytes(size),
+                (None, Some(duration)) => {
+                    Termination::DurationNs(seconds_to_ns(duration, "flow duration")?)
+                }
+                (None, None) => {
+                    return Err(CompileError::Invalid(
+                        "open-loop traffic must specify `size` or `duration`".to_owned(),
+                    ));
+                }
+            };
+            (TrafficKind::Constant, interval_ns, termination)
         }
-        (None, None) => {
-            return Err(CompileError::Invalid(
-                "open-loop traffic must specify `size` or `duration`".to_owned(),
-            ));
+        SourceFlowKind::Tcp => {
+            let tcp = traffic.tcp.ok_or_else(|| {
+                CompileError::Invalid(
+                    "TCP traffic must provide `[flow.traffic.tcp]` or `[flow_set.traffic.tcp]`"
+                        .to_owned(),
+                )
+            })?;
+            if tcp.ecn {
+                return Err(CompileError::Unsupported(
+                    "unsupported TCP ECN; the T23 executor TCP lattice models loss feedback only"
+                        .to_owned(),
+                ));
+            }
+            let algorithm = match tcp.cc_algorithm.as_str() {
+                "TCPReno" | "RENO" | "Reno" | "reno" => {
+                    if tcp.cubic.is_some() {
+                        return Err(CompileError::Unsupported(
+                            "unsupported CUBIC parameters on a Reno flow".to_owned(),
+                        ));
+                    }
+                    TcpAlgorithm::Reno
+                }
+                "TCPCubic" | "CUBIC" | "Cubic" | "cubic" => {
+                    validate_cubic_profile(tcp.cubic.as_ref())?;
+                    TcpAlgorithm::Cubic
+                }
+                unsupported => {
+                    return Err(CompileError::Unsupported(format!(
+                        "unsupported TCP congestion control `{unsupported}`; Days executor supports exact Reno and CUBIC"
+                    )));
+                }
+            };
+            let size = traffic.size.ok_or_else(|| {
+                CompileError::Unsupported(
+                    "unsupported duration-terminated TCP traffic; the executor requires an exact byte `size`"
+                        .to_owned(),
+                )
+            })?;
+            if size == 0 {
+                return Err(CompileError::Invalid(
+                    "TCP traffic `size` must be positive".to_owned(),
+                ));
+            }
+            // Closed-loop TCP owns all post-start send timing. The legacy `arr_dist` field is
+            // accepted for source-file compatibility but has no executor semantic effect.
+            (TrafficKind::Tcp(algorithm), 0, Termination::Bytes(size))
         }
     };
 
@@ -508,7 +602,26 @@ fn validate_traffic(traffic: SourceTraffic) -> Result<TrafficKey, CompileError> 
         interval_ns,
         packet_size_bytes,
         termination,
+        kind,
     })
+}
+
+fn validate_cubic_profile(cubic: Option<&SourceCubic>) -> Result<(), CompileError> {
+    let supported = cubic.is_none_or(|cubic| {
+        cubic.beta.is_none_or(|beta| beta == 0.7)
+            && cubic.c.is_none_or(|c| c == 0.4)
+            && cubic
+                .fast_convergence
+                .is_none_or(|fast_convergence| fast_convergence)
+    });
+    if supported {
+        Ok(())
+    } else {
+        Err(CompileError::Unsupported(
+            "unsupported TCP CUBIC parameters; the exact T23 lattice requires beta=0.7, c=0.4, fast_convergence=true"
+                .to_owned(),
+        ))
+    }
 }
 
 fn constant_packet_size_bytes(distribution: &DistributionInfo) -> Result<u64, CompileError> {
@@ -829,11 +942,25 @@ fn lower(
             *sequence = sequence.checked_add(1).ok_or_else(|| {
                 CompileError::Invalid(format!("initial payload sequence overflow at {source:?}"))
             })?;
+            let initial_size_bytes = match (flow.traffic.kind, &flow.traffic.termination) {
+                (TrafficKind::Tcp(_), Termination::Bytes(total_bytes)) => {
+                    flow.traffic.packet_size_bytes.min(*total_bytes)
+                }
+                _ => flow.traffic.packet_size_bytes,
+            };
+            let packet_kind = match flow.traffic.kind {
+                TrafficKind::Constant => PacketKind::Data,
+                TrafficKind::Tcp(_) => PacketKind::TcpData(TcpDataHeader {
+                    sequence: 0,
+                    sent_time_ns: flow.traffic.initial_delay_ns,
+                    retransmission: false,
+                }),
+            };
             initial_packets.push(PacketDescriptor {
                 id: payload,
                 flow: descriptor.id,
-                size_bytes: flow.traffic.packet_size_bytes,
-                kind: PacketKind::Data,
+                size_bytes: initial_size_bytes,
+                kind: packet_kind,
             });
             initial_event_inputs.push((
                 source,
@@ -861,17 +988,38 @@ fn lower(
                     outstanding_bytes: 0,
                     unacknowledged_bytes: 0,
                 },
-                kind: FlowGeneratorKind::Constant(ConstantGenerator {
-                    first_departure_ns: flow.traffic.initial_delay_ns,
-                    interval_ns: flow.traffic.interval_ns,
-                    packet_size_bytes: flow.traffic.packet_size_bytes,
-                    termination: match flow.traffic.termination {
-                        Termination::Bytes(bytes) => GeneratorTermination::Bytes(bytes),
-                        Termination::DurationNs(duration_ns) => {
-                            GeneratorTermination::DurationNs(duration_ns)
-                        }
-                    },
-                }),
+                kind: match flow.traffic.kind {
+                    TrafficKind::Constant => FlowGeneratorKind::Constant(ConstantGenerator {
+                        first_departure_ns: flow.traffic.initial_delay_ns,
+                        interval_ns: flow.traffic.interval_ns,
+                        packet_size_bytes: flow.traffic.packet_size_bytes,
+                        termination: match flow.traffic.termination {
+                            Termination::Bytes(bytes) => GeneratorTermination::Bytes(bytes),
+                            Termination::DurationNs(duration_ns) => {
+                                GeneratorTermination::DurationNs(duration_ns)
+                            }
+                        },
+                    }),
+                    TrafficKind::Tcp(algorithm) => {
+                        let Termination::Bytes(total_bytes) = flow.traffic.termination else {
+                            unreachable!("TCP validation requires byte termination")
+                        };
+                        let control = match algorithm {
+                            TcpAlgorithm::Reno => {
+                                TcpCongestionControl::reno(flow.traffic.packet_size_bytes)
+                            }
+                            TcpAlgorithm::Cubic => {
+                                TcpCongestionControl::cubic(flow.traffic.packet_size_bytes)
+                            }
+                        };
+                        FlowGeneratorKind::Tcp(TcpGenerator::new(
+                            total_bytes,
+                            flow.traffic.packet_size_bytes,
+                            40,
+                            control,
+                        ))
+                    }
+                },
             });
     }
     initial_packets.sort_by_key(|packet| packet.id);
@@ -905,6 +1053,16 @@ fn lower(
     }
     initial_events.sort_by_key(|event| event.key);
 
+    let mut tcp_receivers_by_target = BTreeMap::<LpKey, Vec<TcpReceiverState>>::new();
+    for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+        if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
+            tcp_receivers_by_target
+                .entry(LpKey::Host(flow.target))
+                .or_default()
+                .push(TcpReceiverState::new(descriptor.id, 40));
+        }
+    }
+
     let host_states = host_topology_ids
         .iter()
         .map(|host| {
@@ -920,7 +1078,9 @@ fn lower(
                 in_service: None,
                 tx_ready_pending: false,
                 generators: generators_by_source.remove(&node_key).unwrap_or_default(),
-                tcp_receivers: vec![],
+                tcp_receivers: tcp_receivers_by_target
+                    .remove(&node_key)
+                    .unwrap_or_default(),
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,
@@ -973,29 +1133,40 @@ fn lower(
             continue;
         }
         let payload = initial_payload_by_flow[&flow.id];
-        for (index, link_id) in flow.route.iter().enumerate() {
-            let link = links.get(link_id.0 as usize).ok_or_else(|| {
-                CompileError::Invalid(format!(
-                    "flow {:?} references missing link {link_id:?}",
-                    flow.id
-                ))
-            })?;
-            link.delay_ns(input.traffic.packet_size_bytes)
-                .map_err(|error| {
+        let data_min_size = if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+            // Both controllers may fill the exact remaining congestion-window bytes, so even a
+            // byte-aligned total/MSS pair can legally produce a one-byte intermediate segment.
+            1
+        } else {
+            input.traffic.packet_size_bytes
+        };
+        let mut routed_packets = vec![(flow.route.as_slice(), flow.target, data_min_size, "data")];
+        if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+            routed_packets.push((flow.reverse_route.as_slice(), flow.source, 40, "ACK"));
+        }
+        for (route, terminal, packet_size_bytes, direction) in routed_packets {
+            for (index, link_id) in route.iter().enumerate() {
+                let link = links.get(link_id.0 as usize).ok_or_else(|| {
                     CompileError::Invalid(format!(
-                        "link {link_id:?} delay overflows for packet {:?}: {error}",
-                        payload
+                        "flow {:?} references missing link {link_id:?}",
+                        flow.id
                     ))
                 })?;
-            let target = flow
-                .route
-                .get(index + 1)
-                .map_or(flow.target, |next| links[next.0 as usize].source);
-            channel_keys.insert((*link_id, target));
-            min_packet_size_by_link
-                .entry(*link_id)
-                .and_modify(|size| *size = (*size).min(input.traffic.packet_size_bytes))
-                .or_insert(input.traffic.packet_size_bytes);
+                link.delay_ns(packet_size_bytes).map_err(|error| {
+                    CompileError::Invalid(format!(
+                        "link {link_id:?} delay overflows for flow {:?} TCP {direction} packet {:?}: {error}",
+                        flow.id, payload
+                    ))
+                })?;
+                let target = route
+                    .get(index + 1)
+                    .map_or(terminal, |next| links[next.0 as usize].source);
+                channel_keys.insert((*link_id, target));
+                min_packet_size_by_link
+                    .entry(*link_id)
+                    .and_modify(|size| *size = (*size).min(packet_size_bytes))
+                    .or_insert(packet_size_bytes);
+            }
         }
     }
     let channels = channel_keys
@@ -1125,6 +1296,23 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
 
     for flow in flows {
         let count = packet_count(&flow.traffic);
+        if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
+            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
+                unreachable!("TCP validation requires byte termination")
+            };
+            flow.traffic
+                .packet_size_bytes
+                .checked_mul(count)
+                .ok_or_else(|| {
+                    CompileError::Invalid("TCP segment input count overflow".to_owned())
+                })?;
+            if total_bytes == 0 {
+                return Err(CompileError::Invalid(
+                    "TCP traffic `size` must be positive".to_owned(),
+                ));
+            }
+            continue;
+        }
         match flow.traffic.termination {
             Termination::DurationNs(duration_ns) => {
                 flow.traffic
@@ -1158,6 +1346,12 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
 }
 
 fn packet_count(traffic: &TrafficKey) -> u64 {
+    if matches!(traffic.kind, TrafficKind::Tcp(_)) {
+        let Termination::Bytes(bytes) = traffic.termination else {
+            unreachable!("TCP validation requires byte termination")
+        };
+        return bytes.div_ceil(traffic.packet_size_bytes);
+    }
     let (extent, step) = match traffic.termination {
         Termination::Bytes(bytes) => (bytes, traffic.packet_size_bytes),
         Termination::DurationNs(duration_ns) => (duration_ns, traffic.interval_ns),
@@ -1217,7 +1411,7 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey) -> u64 {
     state = mix_seed(state ^ traffic.initial_delay_ns);
     state = mix_seed(state ^ traffic.interval_ns);
     state = mix_seed(state ^ traffic.packet_size_bytes);
-    match traffic.termination {
+    state = match traffic.termination {
         Termination::Bytes(bytes) => {
             state = mix_seed(state ^ 0x4259_5445_5300_0000);
             mix_seed(state ^ bytes)
@@ -1226,6 +1420,11 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey) -> u64 {
             state = mix_seed(state ^ 0x4455_5241_5449_4f4e);
             mix_seed(state ^ duration_ns)
         }
+    };
+    match traffic.kind {
+        TrafficKind::Constant => state,
+        TrafficKind::Tcp(TcpAlgorithm::Reno) => mix_seed(state ^ 0x5450_435f_5245_4e4f),
+        TrafficKind::Tcp(TcpAlgorithm::Cubic) => mix_seed(state ^ 0x5450_435f_4355_4249),
     }
 }
 

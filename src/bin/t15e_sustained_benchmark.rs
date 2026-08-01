@@ -24,6 +24,73 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchmarkWorkload {
+    Empty,
+    OpenLoop,
+    Tcp,
+    MixedTcp,
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+impl BenchmarkWorkload {
+    const fn workload(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::OpenLoop => "open_loop",
+            Self::Tcp => "tcp",
+            Self::MixedTcp => "mixed_tcp",
+        }
+    }
+
+    const fn rq(self) -> &'static str {
+        match self {
+            Self::Tcp | Self::MixedTcp => "RQ9",
+            Self::OpenLoop => "legacy",
+            Self::Empty => "na",
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+const fn classify_workload(has_tcp: bool, has_open_loop: bool) -> BenchmarkWorkload {
+    match (has_tcp, has_open_loop) {
+        (false, false) => BenchmarkWorkload::Empty,
+        (false, true) => BenchmarkWorkload::OpenLoop,
+        (true, false) => BenchmarkWorkload::Tcp,
+        (true, true) => BenchmarkWorkload::MixedTcp,
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn benchmark_workload(image: &days_executor::SimulationImage) -> BenchmarkWorkload {
+    let mut has_tcp = false;
+    let mut has_open_loop = false;
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        match generator.kind {
+            days_executor::FlowGeneratorKind::Tcp(_) => has_tcp = true,
+            days_executor::FlowGeneratorKind::Constant(_) => has_open_loop = true,
+        }
+    }
+    classify_workload(has_tcp, has_open_loop)
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComparisonOutcome {
     Beats,
     Parity,
@@ -596,9 +663,15 @@ fn main() {
         measurement
     }
 
-    fn print_record(kind: &str, fixture: &str, threadgroup_width: usize, measurement: Measurement) {
+    fn print_record(
+        kind: &str,
+        fixture: &str,
+        workload: BenchmarkWorkload,
+        threadgroup_width: usize,
+        measurement: Measurement,
+    ) {
         println!(
-            "record=t15e_{kind} config={fixture} sample={} order={} predecessor={} \
+            "record=t15e_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
              engine={} backend={} stream_mode={} metal_mode_order={} workers={} \
              threadgroup_width={} rounds={} transitions={} fixed_method={} separation_quality={} \
              end_to_end_ns={} \
@@ -606,6 +679,8 @@ fn main() {
              marginal_ns_per_round={} calibration_ns={} backend_wall_ns={} device_ns={} \
              host_encode_submit_ns={} encoded_attempts={} continuation_relaunches={} \
              wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
+            workload.workload(),
+            workload.rq(),
             measurement.sample,
             measurement.order,
             measurement.predecessor,
@@ -639,6 +714,7 @@ fn main() {
     fn print_summary(
         kind: &str,
         fixture: &str,
+        workload: BenchmarkWorkload,
         order: &str,
         threadgroup_width: usize,
         selected: &[Measurement],
@@ -667,7 +743,7 @@ fn main() {
         let (fixed_ns, _) = split_fixed(cold_end_to_end_ns, marginal_ns);
         println!(
             "record=t15e_{kind} statistic=median \
-             aggregation=component_medians_with_derived_fixed_closure config={fixture} \
+             aggregation=component_medians_with_derived_fixed_closure config={fixture} workload={} rq={} \
              order={order} predecessor={} engine={} \
              backend={} stream_mode={} workers={} samples={} threadgroup_width={} rounds={} transitions={} \
              fixed_method={} separation_quality={} end_to_end_ns={} cold_end_to_end_ns={} \
@@ -675,6 +751,8 @@ fn main() {
              calibration_ns={} backend_wall_ns={} \
              device_ns={} host_encode_submit_ns={} encoded_attempts={} continuation_relaunches={} \
              wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
+            workload.workload(),
+            workload.rq(),
             first.predecessor,
             first.engine,
             first.backend,
@@ -781,6 +859,7 @@ fn main() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative);
     let image = compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+    let workload = benchmark_workload(&image);
     let oracle = run_cpu(
         &image,
         None,
@@ -796,7 +875,7 @@ fn main() {
     let device_queue_setup_ns = u128::from(initialization.device_queue_setup_ns);
     let pipeline_creation_ns = u128::from(initialization.pipeline_creation_ns);
     println!(
-        "record=t15e_protocol scalar_samples={} scalar_predecessor=none \
+        "record=t15e_protocol workload={} rq={} scalar_samples={} scalar_predecessor=none \
          comparison_samples={samples} comparison_predecessor=same_kind_discarded \
          order_schedule=balanced_cpu_first_gpu_first_and_heap_streams \
          comparison_outcome_values=beats,parity,trails \
@@ -805,6 +884,8 @@ fn main() {
          paired_comparison_rule=same_sample_index \
          scalar_provenance={} scalar_reuse_days_commit={} \
          scalar_reuse_evidence={}",
+        workload.workload(),
+        workload.rq(),
         if skip_scalar { 0 } else { SCALAR_SAMPLES },
         if skip_scalar {
             "reused_audited_t15e"
@@ -823,9 +904,11 @@ fn main() {
         },
     );
     println!(
-        "record=t15e_initialization config={relative} engine=metal device_queue_setup_ns={} \
+        "record=t15e_initialization config={relative} workload={} rq={} engine=metal device_queue_setup_ns={} \
          pipeline_creation_ns={} in_process_reuse=1 archive_saving_status=unmeasured \
          archive_upper_bound_ns={}",
+        workload.workload(),
+        workload.rq(),
         initialization.device_queue_setup_ns,
         initialization.pipeline_creation_ns,
         initialization.pipeline_creation_ns,
@@ -856,7 +939,7 @@ fn main() {
     let expected = warmups[0].outcome;
     for warmup in warmups {
         assert_eq!(warmup.outcome, expected, "warmup backends must agree");
-        print_record("warmup", &relative, threadgroup_width, warmup);
+        print_record("warmup", &relative, workload, threadgroup_width, warmup);
     }
 
     let mut measurements =
@@ -943,7 +1026,13 @@ fn main() {
                 measurement.outcome, expected,
                 "timed sample backends must agree"
             );
-            print_record("sample", &relative, threadgroup_width, measurement);
+            print_record(
+                "sample",
+                &relative,
+                workload,
+                threadgroup_width,
+                measurement,
+            );
             measurements.push(measurement);
         }
     }
@@ -957,7 +1046,14 @@ fn main() {
         if pooled.is_empty() {
             continue;
         }
-        print_summary("summary", &relative, "pooled", threadgroup_width, &pooled);
+        print_summary(
+            "summary",
+            &relative,
+            workload,
+            "pooled",
+            threadgroup_width,
+            &pooled,
+        );
         for order in ["cpu_first", "gpu_first"] {
             let ordered = pooled
                 .iter()
@@ -968,6 +1064,7 @@ fn main() {
                 print_summary(
                     "order_summary",
                     &relative,
+                    workload,
                     order,
                     threadgroup_width,
                     &ordered,
@@ -1019,7 +1116,7 @@ fn main() {
     let w18_over_metal = w18_marginal_ns as f64 / metal_marginal_ns as f64;
     let crossover = crossover_summary(metal_vs_w4.outcome, metal_vs_w18.outcome);
     println!(
-        "record=t15e_pooled_summary statistic=median config={relative} \
+        "record=t15e_pooled_summary statistic=median config={relative} workload={} rq={} \
          scalar_samples={scalar_samples} comparison_samples={samples} \
          threadgroup_width={threadgroup_width} rounds={} transitions={} \
          ratio_definition=metal_marginal_div_cpu_marginal \
@@ -1037,6 +1134,8 @@ fn main() {
          metal_wins_vs_w4={} metal_vs_w4_paired_samples={} \
          metal_wins_vs_w18={} metal_vs_w18_paired_samples={} \
          crossover={crossover} crossover_basis=dispersion_qualified_marginal",
+        workload.workload(),
+        workload.rq(),
         expected.rounds,
         expected.transitions,
         metal_vs_w4.candidate_range_ns,
@@ -1082,10 +1181,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComparisonOutcome, SCALAR_SAMPLES, compare_retained_samples, cpu_engine_name,
-        crossover_summary, cuda_crossover_summary, median, order_for_sample, parse_worker_sweep,
-        recorded_predecessor_for_engine, split_fixed,
+        BenchmarkWorkload, ComparisonOutcome, SCALAR_SAMPLES, classify_workload,
+        compare_retained_samples, cpu_engine_name, crossover_summary, cuda_crossover_summary,
+        median, order_for_sample, parse_worker_sweep, recorded_predecessor_for_engine, split_fixed,
     };
+
+    #[test]
+    fn tcp_workloads_use_the_rq9_record_schema() {
+        let tcp = classify_workload(true, false);
+        assert_eq!(tcp, BenchmarkWorkload::Tcp);
+        assert_eq!(tcp.workload(), "tcp");
+        assert_eq!(tcp.rq(), "RQ9");
+
+        let mixed = classify_workload(true, true);
+        assert_eq!(mixed.workload(), "mixed_tcp");
+        assert_eq!(mixed.rq(), "RQ9");
+
+        let open_loop = classify_workload(false, true);
+        assert_eq!(open_loop.workload(), "open_loop");
+        assert_eq!(open_loop.rq(), "legacy");
+    }
 
     #[test]
     fn comparison_outcomes_use_the_record_schema_values() {

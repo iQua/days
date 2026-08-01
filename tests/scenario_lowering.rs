@@ -13,10 +13,10 @@ use days::topos::topo::{
     installed_host_attachment_state,
 };
 use days_executor::{
-    ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowId, LinkId,
-    NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture,
-    PacketKind, PayloadId, SchedulerKind, SimulationImage, run_cpu, run_scalar, run_scalar_rounds,
-    run_scalar_with_observations, validate,
+    ArrivalDisposition, Backend, ChunkGranularity, CpuConfig, EventKind, FlowGeneratorKind, FlowId,
+    LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
+    PacketDeparture, PacketKind, PayloadId, SchedulerKind, SimulationImage, TcpCongestionControl,
+    run_cpu, run_scalar, run_scalar_rounds, run_scalar_with_observations, validate,
 };
 use petgraph::graph::NodeIndex;
 use tempfile::TempDir;
@@ -1066,6 +1066,173 @@ pkt_size_dist = { type = "Uniform", low = 4, high = 4 }
 }
 
 #[test]
+fn configured_tcp_reno_and_cubic_lower_to_the_t23_closed_loop_image() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "tcp-reno-cubic.toml",
+        r#"
+seed = 24
+duration = 0.0001
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 16
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow]]
+flow_type = "TCP"
+graph = [[0, 1]]
+[flow.traffic]
+initial_delay = 0.0
+size = 4096
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+[flow.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[1, 0]]
+[flow.traffic]
+initial_delay = 0.0
+size = 4096
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+[flow.traffic.tcp]
+cc_algorithm = "CUBIC"
+[flow.traffic.tcp.cubic]
+beta = 0.7
+c = 0.4
+fast_convergence = true
+"#,
+    );
+
+    let image = compile_config(&path).expect("supported TCP should lower");
+    assert_eq!(image.flows.len(), 2);
+    assert_eq!(image.initial_packets.len(), 2);
+    assert!(image.initial_packets.iter().all(|packet| {
+        matches!(
+            packet.kind,
+            PacketKind::TcpData(header)
+                if header.sequence == 0
+                    && header.sent_time_ns == 0
+                    && !header.retransmission
+        )
+    }));
+
+    let generators = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .collect::<Vec<_>>();
+    assert_eq!(generators.len(), 2);
+    assert!(generators.iter().any(|generator| {
+        matches!(
+            generator.kind,
+            FlowGeneratorKind::Tcp(tcp)
+                if matches!(tcp.control, TcpCongestionControl::Reno(_))
+                    && tcp.total_bytes == 4096
+                    && tcp.mss_bytes == 512
+                    && tcp.ack_size_bytes == 40
+        )
+    }));
+    assert!(generators.iter().any(|generator| {
+        matches!(
+            generator.kind,
+            FlowGeneratorKind::Tcp(tcp)
+                if matches!(tcp.control, TcpCongestionControl::Cubic(_))
+                    && tcp.total_bytes == 4096
+                    && tcp.mss_bytes == 512
+                    && tcp.ack_size_bytes == 40
+        )
+    }));
+    assert_eq!(
+        image
+            .host_states
+            .iter()
+            .map(|state| state.tcp_receivers.len())
+            .sum::<usize>(),
+        2
+    );
+    validate(&image, Backend::Scalar).expect("lowered TCP image should validate");
+
+    let scalar = run_scalar(&image, None).expect("scalar TCP execution should succeed");
+    let cpu = run_cpu(
+        &image,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+    )
+    .expect("CPU TCP execution should succeed")
+    .result;
+    assert_eq!(cpu, scalar, "configured TCP must remain byte-identical");
+}
+
+#[test]
+fn configured_tcp_rejects_transport_options_outside_the_t23_lattice() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let cases = [
+        (
+            "bbr",
+            "size = 4096\narr_dist = { type = \"Uniform\", low = 1.0, high = 1.0 }\npkt_size_dist = { type = \"DiscreteUniform\", low = 512, high = 512 }\n[flow.traffic.tcp]\ncc_algorithm = \"TCPBBR\"",
+            "unsupported TCP congestion control `TCPBBR`; Days executor supports exact Reno and CUBIC",
+        ),
+        (
+            "ecn",
+            "size = 4096\narr_dist = { type = \"Uniform\", low = 1.0, high = 1.0 }\npkt_size_dist = { type = \"DiscreteUniform\", low = 512, high = 512 }\n[flow.traffic.tcp]\ncc_algorithm = \"TCPReno\"\necn = true",
+            "unsupported TCP ECN; the T23 executor TCP lattice models loss feedback only",
+        ),
+        (
+            "cubic-beta",
+            "size = 4096\narr_dist = { type = \"Uniform\", low = 1.0, high = 1.0 }\npkt_size_dist = { type = \"DiscreteUniform\", low = 512, high = 512 }\n[flow.traffic.tcp]\ncc_algorithm = \"CUBIC\"\n[flow.traffic.tcp.cubic]\nbeta = 0.8",
+            "unsupported TCP CUBIC parameters; the exact T23 lattice requires beta=0.7, c=0.4, fast_convergence=true",
+        ),
+        (
+            "duration",
+            "duration = 0.001\narr_dist = { type = \"Uniform\", low = 1.0, high = 1.0 }\npkt_size_dist = { type = \"DiscreteUniform\", low = 512, high = 512 }\n[flow.traffic.tcp]\ncc_algorithm = \"TCPReno\"",
+            "unsupported duration-terminated TCP traffic; the executor requires an exact byte `size`",
+        ),
+    ];
+
+    for (name, traffic, expected) in cases {
+        let config = format!(
+            r#"
+seed = 24
+duration = 0.001
+edges = [[0, 1]]
+hosts = [0, 1]
+[switch]
+port_rate = 100_000_000_000
+capacity = 16
+discipline = "FIFO"
+drop = "TailDrop"
+[[flow]]
+flow_type = "TCP"
+graph = [[0, 1]]
+[flow.traffic]
+{traffic}
+"#
+        );
+        let path = write_config(&directory, &format!("tcp-{name}.toml"), &config);
+        assert_eq!(
+            compile_config(path)
+                .expect_err("unsupported TCP option should fail")
+                .to_string(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn unsupported_source_behaviour_is_rejected_with_specific_diagnostics() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let cases = [
@@ -1098,27 +1265,6 @@ drop = "RED"
             "unsupported drop policy `RED`; Days executor v1 supports only TailDrop",
         ),
         (
-            "tcp",
-            r#"
-seed = 1
-edges = [[0, 1]]
-hosts = [0, 1]
-[switch]
-port_rate = 8_000
-capacity = 1
-discipline = "FIFO"
-drop = "TailDrop"
-[[flow]]
-flow_type = "TCP"
-graph = [[0, 1]]
-[flow.traffic]
-size = 1
-arr_dist = { type = "Uniform", low = 1, high = 1 }
-pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
-"#,
-            "unsupported flow type `TCP`; Days executor v1 supports only open-loop PacketDistribution traffic",
-        ),
-        (
             "dcqcn",
             r#"
 seed = 1
@@ -1137,7 +1283,7 @@ size = 1
 arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
 "#,
-            "unsupported flow type `DCQCN`; Days executor v1 supports only open-loop PacketDistribution traffic",
+            "unsupported flow type `DCQCN`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic",
         ),
         (
             "pfc",

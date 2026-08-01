@@ -349,9 +349,9 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
         "record=t17c_wide_sizing_arena \
          legacy_heap_event_slots=32775270 fallback_heap_event_slots=152986 \
          channel_stream_event_slots=2355300 service_stream_event_slots=294912 \
-         generator_stream_event_slots=11060 heap_arena_bytes=18181360 \
-         stream_arena_bytes=504865800 total_event_arena_bytes=523047160 \
-         legacy_heap_arena_bytes=2888942352"
+         generator_stream_event_slots=11060 heap_arena_bytes=21853024 \
+         stream_arena_bytes=568736328 total_event_arena_bytes=590589352 \
+         legacy_heap_arena_bytes=3675548832"
     ));
     assert!(stdout.contains("record=t17c_wide_sizing_total plane_count=28 total_device_bytes="));
 }
@@ -369,9 +369,9 @@ fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
             channel_stream_event_slots: 4_197_000,
             service_stream_event_slots: 294_912,
             generator_stream_event_slots: 22_118,
-            heap_arena_bytes: 18_667_912,
-            stream_arena_bytes: 910_948_704,
-            legacy_heap_arena_bytes: 5_671_614_552,
+            heap_arena_bytes: 22_472_272,
+            stream_arena_bytes: 1_019_285_424,
+            legacy_heap_arena_bytes: 7_217_131_632,
         }
     );
     assert_eq!(

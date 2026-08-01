@@ -8,8 +8,9 @@ use days_executor::{
 };
 
 use super::{
-    SCALAR_SAMPLES, compare_retained_samples, cpu_engine_name, cuda_crossover_summary, median,
-    order_for_sample, parse_worker_sweep, recorded_predecessor_for_engine, split_fixed,
+    BenchmarkWorkload, SCALAR_SAMPLES, benchmark_workload, compare_retained_samples,
+    cpu_engine_name, cuda_crossover_summary, median, order_for_sample, parse_worker_sweep,
+    recorded_predecessor_for_engine, split_fixed,
 };
 
 const COMPARISON_SAMPLES: usize = 4;
@@ -322,17 +323,20 @@ fn cuda_after_predecessor(
 fn print_record(
     kind: &str,
     fixture: &str,
+    workload: BenchmarkWorkload,
     round_threads_per_block: usize,
     measurement: Measurement,
 ) {
     println!(
-        "record=t17b_sustained_{kind} config={fixture} sample={} order={} predecessor={} \
+        "record=t17b_sustained_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
          engine={} backend={} workers={} round_threads_per_block={} rounds={} transitions={} \
          fixed_method={} separation_quality={} end_to_end_ns={} cold_end_to_end_ns={} \
          fixed_ns={} warm_fixed_ns={} marginal_ns={} marginal_ns_per_round={} calibration_ns={} \
          backend_wall_ns={} device_ns={} device_ns_per_round={} host_submit_ns={} \
          graph_capture_ns={} graph_replays={} encoded_attempts={} continuation_relaunches={} \
          wave_boundary_syncs={} mid_round_wave_boundary_syncs={}",
+        workload.workload(),
+        workload.rq(),
         measurement.sample,
         measurement.order,
         measurement.predecessor,
@@ -367,6 +371,7 @@ fn print_record(
 fn print_summary(
     kind: &str,
     fixture: &str,
+    workload: BenchmarkWorkload,
     order: &str,
     round_threads_per_block: usize,
     selected: &[Measurement],
@@ -395,7 +400,7 @@ fn print_summary(
     let (fixed_ns, _) = split_fixed(cold_end_to_end_ns, marginal_ns);
     println!(
         "record=t17b_sustained_{kind} statistic=median \
-         aggregation=component_medians_with_derived_fixed_closure config={fixture} order={order} \
+         aggregation=component_medians_with_derived_fixed_closure config={fixture} workload={} rq={} order={order} \
          predecessor={} engine={} backend={} workers={} samples={} round_threads_per_block={} \
          rounds={} transitions={} fixed_method={} separation_quality={} end_to_end_ns={} \
          cold_end_to_end_ns={} fixed_ns={} warm_fixed_ns={} marginal_ns={} \
@@ -403,6 +408,8 @@ fn print_summary(
          device_ns_per_round={} host_submit_ns={} graph_capture_ns={} graph_replays={} \
          encoded_attempts={} continuation_relaunches={} wave_boundary_syncs={} \
          mid_round_wave_boundary_syncs={}",
+        workload.workload(),
+        workload.rq(),
         first.predecessor,
         first.engine,
         first.backend,
@@ -483,7 +490,12 @@ fn print_summary(
     );
 }
 
-fn run_worker_sweep(image: &SimulationImage, fixture: &str, workers: &[usize]) {
+fn run_worker_sweep(
+    image: &SimulationImage,
+    fixture: &str,
+    workload: BenchmarkWorkload,
+    workers: &[usize],
+) {
     let mut expected_result = None;
     for &worker_count in workers {
         let started = Instant::now();
@@ -515,10 +527,12 @@ fn run_worker_sweep(image: &SimulationImage, fixture: &str, workers: &[usize]) {
         });
         let (fixed_ns, marginal_ns) = split_fixed(end_to_end_ns, marginal_ns);
         println!(
-            "record=t17b_worker_sweep config={fixture} workers={worker_count} samples=1 \
+            "record=t17b_worker_sweep config={fixture} workload={} rq={} workers={worker_count} samples=1 \
              predecessor=none rounds={rounds} transitions={transitions} \
              fixed_ns={fixed_ns} marginal_ns={marginal_ns} \
              marginal_ns_per_round={}",
+            workload.workload(),
+            workload.rq(),
             marginal_ns / u128::from(rounds)
         );
     }
@@ -587,8 +601,9 @@ pub fn main() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&fixture);
     let image = compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+    let workload = benchmark_workload(&image);
     if let Some(workers) = worker_sweep {
-        run_worker_sweep(&image, &fixture, &workers);
+        run_worker_sweep(&image, &fixture, workload, &workers);
         return;
     }
     let oracle = run_cpu(
@@ -608,19 +623,23 @@ pub fn main() {
         .expect("CUDA initialization time must fit in u128");
 
     println!(
-        "record=t17b_sustained_protocol scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
+        "record=t17b_sustained_protocol workload={} rq={} scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
          comparison_samples={samples} comparison_predecessor=same_kind_discarded \
          order_schedule=balanced_cpu_first_gpu_first comparison_outcome_values=beats,parity,trails \
          comparison_dispersion=maximum_retained_sample_range \
          comparison_parity_rule=equal_medians_or_twice_abs_median_difference_lt_dispersion \
          paired_comparison_rule=same_sample_index best_workers={best_workers} \
          run_multiplicity=2xscalar+10xw4+9xwbest+9xcuda \
-         scalar_calibration_multiplicity=2"
+         scalar_calibration_multiplicity=2",
+        workload.workload(),
+        workload.rq(),
     );
     println!(
-        "record=t17b_sustained_initialization config={fixture} engine=cuda \
+        "record=t17b_sustained_initialization config={fixture} workload={} rq={} engine=cuda \
          context_stream_setup_ns={} module_function_load_ns={} initialization_ns={} \
          graph_capture_treatment=per_run_marginal_backend_wall",
+        workload.workload(),
+        workload.rq(),
         initialization.context_stream_setup_ns,
         initialization.module_function_load_ns,
         initialization_ns,
@@ -640,7 +659,13 @@ pub fn main() {
     let expected = warmups[0].outcome;
     for warmup in warmups {
         assert_eq!(warmup.outcome, expected, "warmup backends must agree");
-        print_record("warmup", &fixture, round_threads_per_block, warmup);
+        print_record(
+            "warmup",
+            &fixture,
+            workload,
+            round_threads_per_block,
+            warmup,
+        );
     }
 
     let mut measurements =
@@ -687,7 +712,13 @@ pub fn main() {
                 measurement.outcome, expected,
                 "timed sample backends must agree"
             );
-            print_record("sample", &fixture, round_threads_per_block, measurement);
+            print_record(
+                "sample",
+                &fixture,
+                workload,
+                round_threads_per_block,
+                measurement,
+            );
             measurements.push(measurement);
         }
     }
@@ -704,6 +735,7 @@ pub fn main() {
         print_summary(
             "summary",
             &fixture,
+            workload,
             "pooled",
             round_threads_per_block,
             &pooled,
@@ -718,6 +750,7 @@ pub fn main() {
                 print_summary(
                     "order_summary",
                     &fixture,
+                    workload,
                     order,
                     round_threads_per_block,
                     &ordered,
@@ -758,7 +791,7 @@ pub fn main() {
     let wbest_over_cuda = wbest_marginal_ns as f64 / cuda_marginal_ns as f64;
     let crossover = cuda_crossover_summary(cuda_vs_w4.outcome, cuda_vs_wbest.outcome);
     println!(
-        "record=t17b_sustained_pooled_summary statistic=median config={fixture} \
+        "record=t17b_sustained_pooled_summary statistic=median config={fixture} workload={} rq={} \
          scalar_samples={scalar_samples} comparison_samples={samples} best_workers={best_workers} \
          round_threads_per_block={round_threads_per_block} rounds={} transitions={} \
          ratio_definition=cuda_marginal_div_cpu_marginal \
@@ -773,6 +806,8 @@ pub fn main() {
          cuda_wins_vs_w4={} cuda_vs_w4_paired_samples={} \
          cuda_wins_vs_wbest={} cuda_vs_wbest_paired_samples={} \
          crossover={crossover} crossover_basis=dispersion_qualified_marginal",
+        workload.workload(),
+        workload.rq(),
         expected.rounds,
         expected.transitions,
         cuda_vs_w4.candidate_range_ns,
