@@ -419,10 +419,9 @@ pub fn observed_feature_gates(
         }
         for error in collector.errors {
             parse_errors.push(format!(
-                "{}:{}: failed to parse recognized {}: {}",
+                "{}:{}: {}",
                 relative.display(),
                 error.line,
-                error.form,
                 error.message
             ));
         }
@@ -456,40 +455,28 @@ fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), 
 #[derive(Default)]
 struct FeatureGateCollector {
     predicates: Vec<String>,
-    errors: Vec<FeatureGateParseError>,
+    errors: Vec<FeatureGateAuditError>,
 }
 
-struct FeatureGateParseError {
+struct FeatureGateAuditError {
     line: usize,
-    form: &'static str,
     message: String,
+}
+
+#[derive(Clone, Copy)]
+enum CfgAttributeKind {
+    Cfg,
+    CfgAttr,
 }
 
 impl<'ast> Visit<'ast> for FeatureGateCollector {
     fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
-        if path_is_ident(attribute.path(), "cfg") {
-            match attribute
-                .meta
-                .require_list()
-                .and_then(|list| parse_single_meta(list.tokens.clone(), attribute.span()))
-            {
-                Ok(predicate) => self.collect_meta(&predicate, "cfg attribute", attribute.span()),
-                Err(error) => self.record_error("cfg attribute", attribute.span(), error),
-            }
-        } else if path_is_ident(attribute.path(), "cfg_attr") {
-            match attribute
-                .meta
-                .require_list()
-                .and_then(|list| parse_meta_list(list.tokens.clone()))
-            {
-                Ok(arguments) => self.collect_cfg_attr_arguments(
-                    &arguments,
-                    "cfg_attr attribute",
-                    attribute.span(),
-                ),
-                Err(error) => self.record_error("cfg_attr attribute", attribute.span(), error),
-            }
-        }
+        self.collect_cfg_attribute_meta(
+            &attribute.meta,
+            "cfg attribute",
+            "cfg_attr attribute",
+            attribute.span(),
+        );
         syn::visit::visit_attribute(self, attribute);
     }
 
@@ -500,13 +487,39 @@ impl<'ast> Visit<'ast> for FeatureGateCollector {
                 Err(error) => self.record_error("cfg macro", macro_.span(), error),
             }
         } else {
-            self.collect_nested_cfg_macros(macro_.tokens.clone());
+            self.collect_nested_cfg_forms(macro_.tokens.clone());
         }
         syn::visit::visit_macro(self, macro_);
     }
 }
 
 impl FeatureGateCollector {
+    fn collect_cfg_attribute_meta(
+        &mut self,
+        meta: &Meta,
+        cfg_form: &'static str,
+        cfg_attr_form: &'static str,
+        span: Span,
+    ) {
+        if path_is_ident(meta_path(meta), "cfg") {
+            match meta
+                .require_list()
+                .and_then(|list| parse_single_meta(list.tokens.clone(), span))
+            {
+                Ok(predicate) => self.collect_meta(&predicate, cfg_form, span),
+                Err(error) => self.record_error(cfg_form, span, error),
+            }
+        } else if path_is_ident(meta_path(meta), "cfg_attr") {
+            match meta
+                .require_list()
+                .and_then(|list| parse_meta_list(list.tokens.clone()))
+            {
+                Ok(arguments) => self.collect_cfg_attr_arguments(&arguments, cfg_attr_form, span),
+                Err(error) => self.record_error(cfg_attr_form, span, error),
+            }
+        }
+    }
+
     fn collect_meta(&mut self, meta: &Meta, form: &'static str, span: Span) {
         match contains_feature(meta) {
             Ok(true) => match canonical_meta(meta) {
@@ -519,10 +532,16 @@ impl FeatureGateCollector {
     }
 
     fn record_error(&mut self, form: &'static str, span: Span, error: syn::Error) {
-        self.errors.push(FeatureGateParseError {
+        self.errors.push(FeatureGateAuditError {
             line: span.start().line,
-            form,
-            message: error.to_string(),
+            message: format!("failed to parse recognized {form}: {error}"),
+        });
+    }
+
+    fn record_uncaptured_feature_key(&mut self, span: Span) {
+        self.errors.push(FeatureGateAuditError {
+            line: span.start().line,
+            message: "uncaptured feature predicate in cfg-shaped macro tokens".to_owned(),
         });
     }
 
@@ -576,7 +595,11 @@ impl FeatureGateCollector {
         }
     }
 
-    fn collect_nested_cfg_macros(&mut self, tokens: TokenStream) {
+    fn collect_nested_cfg_forms(&mut self, tokens: TokenStream) {
+        self.collect_nested_cfg_forms_in_context(tokens, false);
+    }
+
+    fn collect_nested_cfg_forms_in_context(&mut self, tokens: TokenStream, inside_cfg_shape: bool) {
         let tokens = tokens.into_iter().collect::<Vec<_>>();
         let mut index = 0;
         while index < tokens.len() {
@@ -593,10 +616,64 @@ impl FeatureGateCollector {
                 continue;
             }
 
+            if let Some((consumed, body, kind, span)) = cfg_attribute_at(&tokens, index) {
+                let cfg_form = "cfg attribute nested in macro tokens";
+                let cfg_attr_form = "cfg_attr attribute nested in macro tokens";
+                match syn::parse2::<Meta>(body) {
+                    Ok(meta) => {
+                        self.collect_cfg_attribute_meta(&meta, cfg_form, cfg_attr_form, span);
+                        self.collect_cfg_attribute_residuals(&meta);
+                    }
+                    Err(error) => {
+                        let form = match kind {
+                            CfgAttributeKind::Cfg => cfg_form,
+                            CfgAttributeKind::CfgAttr => cfg_attr_form,
+                        };
+                        self.record_error(form, span, error);
+                    }
+                }
+                index += consumed;
+                continue;
+            }
+
+            if inside_cfg_shape {
+                if let Some(span) = feature_predicate_key_at(&tokens, index) {
+                    self.record_uncaptured_feature_key(span);
+                    index += 1;
+                    continue;
+                }
+            }
+
             if let TokenTree::Group(group) = &tokens[index] {
-                self.collect_nested_cfg_macros(group.stream());
+                self.collect_nested_cfg_forms_in_context(
+                    group.stream(),
+                    inside_cfg_shape || cfg_shaped_group_at(&tokens, index),
+                );
             }
             index += 1;
+        }
+    }
+
+    fn collect_cfg_attribute_residuals(&mut self, meta: &Meta) {
+        let Meta::List(list) = meta else {
+            return;
+        };
+        if !path_is_ident(&list.path, "cfg_attr") {
+            return;
+        }
+        self.collect_cfg_attr_residual_tokens(list.tokens.clone());
+    }
+
+    fn collect_cfg_attr_residual_tokens(&mut self, tokens: TokenStream) {
+        for argument in split_top_level_arguments(tokens).into_iter().skip(1) {
+            match syn::parse2::<Meta>(argument.clone()) {
+                Ok(nested) if path_is_ident(meta_path(&nested), "cfg") => {}
+                Ok(Meta::List(nested)) if path_is_ident(&nested.path, "cfg_attr") => {
+                    self.collect_cfg_attr_residual_tokens(nested.tokens);
+                }
+                Ok(nested) if path_is_ident(meta_path(&nested), "cfg_attr") => {}
+                _ => self.collect_nested_cfg_forms_in_context(argument, true),
+            }
         }
     }
 }
@@ -622,6 +699,25 @@ fn parse_single_meta(tokens: TokenStream, span: Span) -> syn::Result<Meta> {
         ));
     }
     Ok(items.into_iter().next().expect("one cfg predicate exists"))
+}
+
+fn split_top_level_arguments(tokens: TokenStream) -> Vec<TokenStream> {
+    let mut arguments = Vec::new();
+    let mut current = TokenStream::new();
+    for token in tokens {
+        if matches!(&token, TokenTree::Punct(punct) if punct.as_char() == ',') {
+            if !current.is_empty() {
+                arguments.push(current);
+                current = TokenStream::new();
+            }
+        } else {
+            current.extend([token]);
+        }
+    }
+    if !current.is_empty() {
+        arguments.push(current);
+    }
+    arguments
 }
 
 fn cfg_macro_at(tokens: &[TokenTree], index: usize) -> Option<(usize, TokenStream, Span)> {
@@ -664,6 +760,83 @@ fn cfg_macro_at(tokens: &[TokenTree], index: usize) -> Option<(usize, TokenStrea
         return None;
     };
     Some((cursor + 2 - index, body.stream(), span))
+}
+
+fn cfg_attribute_at(
+    tokens: &[TokenTree],
+    index: usize,
+) -> Option<(usize, TokenStream, CfgAttributeKind, Span)> {
+    if !punct_at(tokens, index, '#') {
+        return None;
+    }
+
+    let mut cursor = index + 1;
+    if punct_at(tokens, cursor, '!') {
+        cursor += 1;
+    }
+    let TokenTree::Group(attribute) = tokens.get(cursor)? else {
+        return None;
+    };
+    if attribute.delimiter() != proc_macro2::Delimiter::Bracket {
+        return None;
+    }
+
+    let body = attribute.stream();
+    let body_tokens = body.clone().into_iter().collect::<Vec<_>>();
+    let path = ident_at(&body_tokens, 0)?;
+    if punct_at(&body_tokens, 1, ':') {
+        return None;
+    }
+    let kind = if ident_is(path, "cfg") {
+        CfgAttributeKind::Cfg
+    } else if ident_is(path, "cfg_attr") {
+        CfgAttributeKind::CfgAttr
+    } else {
+        return None;
+    };
+
+    Some((cursor + 1 - index, body, kind, path.span()))
+}
+
+fn cfg_shaped_group_at(tokens: &[TokenTree], index: usize) -> bool {
+    let Some(TokenTree::Group(group)) = tokens.get(index) else {
+        return false;
+    };
+
+    if index >= 2
+        && punct_at(tokens, index - 1, '!')
+        && ident_at(tokens, index - 2)
+            .is_some_and(|ident| ident_is(ident, "cfg") || ident_is(ident, "cfg_attr"))
+    {
+        return true;
+    }
+    if index >= 1
+        && ident_at(tokens, index - 1)
+            .is_some_and(|ident| ident_is(ident, "cfg") || ident_is(ident, "cfg_attr"))
+    {
+        return true;
+    }
+
+    if group.delimiter() != proc_macro2::Delimiter::Bracket {
+        return false;
+    }
+    group
+        .stream()
+        .into_iter()
+        .take_while(|token| match token {
+            TokenTree::Group(_) => false,
+            TokenTree::Punct(punct) => punct.as_char() != '=',
+            _ => true,
+        })
+        .any(|token| {
+            matches!(token, TokenTree::Ident(ident) if ident_is(&ident, "cfg") || ident_is(&ident, "cfg_attr"))
+        })
+}
+
+fn feature_predicate_key_at(tokens: &[TokenTree], index: usize) -> Option<Span> {
+    ident_at(tokens, index)
+        .filter(|ident| ident_is(ident, "feature") && punct_at(tokens, index + 1, '='))
+        .map(syn::Ident::span)
 }
 
 fn ident_at(tokens: &[TokenTree], index: usize) -> Option<&syn::Ident> {
@@ -810,6 +983,19 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn assert_package_compiles_offline(package: &Path, features: &str) {
+        let output = Command::new(env!("CARGO"))
+            .args(["check", "--offline", "--features", features])
+            .current_dir(package)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo check failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1117,9 +1303,6 @@ mod tests {
             temp.path().join("model.rs"),
             concat!(
                 "pub fn probe() {\n",
-                "    assert!(provider::cfg!(feature = \"protocol\"));\n",
-                "    assert!(provider::std::cfg!(feature = \"protocol\"));\n",
-                "    assert!(provider::core::cfg!(feature = \"protocol\"));\n",
                 "    assert!(cfg!(feature = \"protocol\"));\n",
                 "    assert!(std::cfg!(feature = \"protocol\"));\n",
                 "    assert!(core::cfg!(feature = \"protocol\"));\n",
@@ -1138,6 +1321,166 @@ mod tests {
         }];
 
         assert!(audit_semantic_feature_gates(temp.path(), &allow).is_ok());
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_compiling_cfg_if_attribute_in_opaque_macro_body() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"cfg-if-audit-probe\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n",
+                "\n",
+                "[features]\n",
+                "protocol = []\n",
+                "\n",
+                "[dependencies]\n",
+                "cfg-if = \"1.0\"\n",
+                "\n",
+                "[workspace]\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            concat!(
+                "cfg_if::cfg_if! {\n",
+                "    if #[cfg(feature = \"protocol\")] {\n",
+                "        pub fn semantic_branch() -> bool { true }\n",
+                "    } else {\n",
+                "        pub fn semantic_branch() -> bool { false }\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        assert_package_compiles_offline(temp.path(), "protocol");
+        let error = audit_semantic_feature_gates(&temp.path().join("src"), &[])
+            .expect_err("a compiling cfg_if feature attribute must be inventoried");
+        assert!(error.contains(r#"feature = "protocol""#), "{error}");
+
+        let allow = [AllowedFeatureGate {
+            path: "lib.rs",
+            predicate: r#"feature = "protocol""#,
+            count: 1,
+            purpose: "opaque cfg_if probe",
+        }];
+        assert!(audit_semantic_feature_gates(&temp.path().join("src"), &allow).is_ok());
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_cfg_attr_in_opaque_macro_body() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            concat!(
+                "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                "sink! {\n",
+                "    #[r#cfg_attr(unix, r#cfg(r#feature = \"protocol\"))]\n",
+                "    pub fn semantic_branch() {}\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let error = audit_semantic_feature_gates(temp.path(), &[])
+            .expect_err("a cfg_attr in opaque macro tokens must be inventoried");
+        assert!(error.contains(r#"cfg(feature = "protocol")"#), "{error}");
+        assert!(!error.contains("r#feature"), "{error}");
+
+        fs::write(
+            temp.path().join("model.rs"),
+            concat!(
+                "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                "sink! { #[cfg_attr(unix, cfg(feature = \"protocol\";))] }\n",
+            ),
+        )
+        .unwrap();
+        let error = audit_semantic_feature_gates(temp.path(), &[])
+            .expect_err("a malformed cfg_attr in opaque macro tokens must be fatal");
+        assert!(error.contains("failed to parse recognized"), "{error}");
+        assert!(error.contains("model.rs:2"), "{error}");
+    }
+
+    #[test]
+    fn semantic_gate_audit_rejects_cfg_attribute_in_doubly_nested_macro_groups() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            concat!(
+                "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                "sink! {\n",
+                "    ({ #[cfg(feature = \"protocol\")] pub fn semantic_branch() {} })\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let error = audit_semantic_feature_gates(temp.path(), &[])
+            .expect_err("a cfg attribute two token groups deep must be inventoried");
+        assert!(error.contains(r#"feature = "protocol""#), "{error}");
+    }
+
+    #[test]
+    fn semantic_gate_audit_fails_closed_on_uncaptured_cfg_shaped_feature_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("model.rs"),
+            concat!(
+                "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                "sink! { provider::cfg!(feature = \"protocol\") }\n",
+            ),
+        )
+        .unwrap();
+
+        let error = audit_semantic_feature_gates(temp.path(), &[])
+            .expect_err("an uncaptured feature key in a cfg-shaped group must be fatal");
+        assert!(error.contains("uncaptured feature predicate"), "{error}");
+        assert!(error.contains("model.rs:2"), "{error}");
+    }
+
+    #[test]
+    fn semantic_gate_audit_scans_residual_tokens_in_nested_cfg_attr() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut bypasses = Vec::new();
+        for (source, expected) in [
+            (
+                concat!(
+                    "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                    "sink! { #[cfg_attr(unix, marker(cfg!(feature = \"protocol\")))] }\n",
+                ),
+                r#"feature = "protocol""#,
+            ),
+            (
+                concat!(
+                    "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                    "sink! { #[cfg_attr(unix, marker(feature = \"protocol\"))] }\n",
+                ),
+                "uncaptured feature predicate",
+            ),
+            (
+                concat!(
+                    "macro_rules! sink { ($($tokens:tt)*) => {}; }\n",
+                    "sink! { #[cfg_attr(unix, cfg_attr(windows, marker(feature = \"protocol\")))] }\n",
+                ),
+                "uncaptured feature predicate",
+            ),
+        ] {
+            fs::write(temp.path().join("model.rs"), source).unwrap();
+            match audit_semantic_feature_gates(temp.path(), &[]) {
+                Ok(()) => bypasses.push(expected),
+                Err(error) => assert!(error.contains(expected), "{error}"),
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "cfg_attr residual-token probes bypassed the audit: {bypasses:?}"
+        );
     }
 
     #[test]
