@@ -598,6 +598,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                     )));
                 }
                 let remaining = remaining_generator_packets(generator)?;
+                validate_tcp_timer_capacity(image, generator, tcp)?;
                 if tcp.highest_ack > tcp.next_sequence
                     || tcp.bytes_in_flight != tcp.next_sequence - tcp.highest_ack
                     || generator.feedback.outstanding_bytes != tcp.bytes_in_flight
@@ -2745,6 +2746,97 @@ fn executable_generator_packets(
         }
         GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
     }
+}
+
+/// Conservative bound on timer installations reachable during the configured run.
+///
+/// Runtime TCP feedback is serialized by a positive-delay reverse route. A phase-0 ACK cancels
+/// the flow's single phase-1 timer, so at most one runtime send-plan trigger per timestamp can
+/// install a timer. Preloaded ACK events bypass that serialization and are reserved separately.
+/// A Scheduled emission beyond the stop time cannot install a timer in this run.
+fn tcp_timer_install_upper_bound(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    if matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Finished | GeneratorStatus::Stopped
+    ) {
+        return Ok(0);
+    }
+    let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+        return Ok(0);
+    };
+    if tcp.highest_ack >= tcp.total_bytes
+        || generator.next_emission.status == GeneratorStatus::Scheduled
+            && generator.next_emission.departure_time_ns > image.stop_time_ns
+    {
+        return Ok(0);
+    }
+    let Some(first_event_time) = image
+        .initial_events
+        .iter()
+        .map(|event| event.key.time_ns)
+        .filter(|time_ns| *time_ns <= image.stop_time_ns)
+        .min()
+    else {
+        return Ok(0);
+    };
+    let preloaded_ack_events = u64::try_from(
+        image
+            .initial_events
+            .iter()
+            .filter(|event| {
+                event.key.time_ns <= image.stop_time_ns
+                    && packet(image, event.payload).is_some_and(|packet| {
+                        packet.flow == generator.flow
+                            && matches!(packet.kind, PacketKind::TcpAck(_))
+                    })
+            })
+            .count(),
+    )
+    .map_err(|_| {
+        ValidationError::new(format!(
+            "flow {:?} TCP finite-run timer installation bound exceeds u64",
+            generator.flow
+        ))
+    })?;
+    image
+        .stop_time_ns
+        .checked_sub(first_event_time)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|timestamps| timestamps.checked_add(preloaded_ack_events))
+        .ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} TCP finite-run timer installation bound exceeds u64",
+                generator.flow
+            ))
+        })
+}
+
+fn validate_tcp_timer_capacity(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    tcp: crate::TcpGenerator,
+) -> Result<(), ValidationError> {
+    let installations = tcp_timer_install_upper_bound(image, generator)?;
+    if tcp.timer_generation.checked_add(installations).is_none() {
+        return Err(ValidationError::new(format!(
+            "flow {:?} TCP timer generation {} overflows with remaining upper bound {installations}",
+            generator.flow, tcp.timer_generation
+        )));
+    }
+    if installations == 0 {
+        return Ok(());
+    }
+    let deadline_headroom = u64::MAX - image.stop_time_ns;
+    if tcp.rto_ns > deadline_headroom {
+        return Err(ValidationError::new(format!(
+            "flow {:?} TCP retransmission timeout {} exceeds deadline headroom {deadline_headroom} for stop time {}",
+            generator.flow, tcp.rto_ns, image.stop_time_ns
+        )));
+    }
+    Ok(())
 }
 
 /// Conservative finite-run bound used only to reserve counters and node-strided PayloadIds.

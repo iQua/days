@@ -1026,6 +1026,97 @@ fn validator_rejects_nonprogressing_tcp_zero_rto_before_execution() {
 }
 
 #[test]
+fn validator_reserves_tcp_timer_generation_capacity_before_execution() {
+    let mut rejected = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    rejected.stop_time_ns = 0;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = rejected.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.timer_generation = u64::MAX;
+
+    let expected = "flow FlowId(0) TCP timer generation 18446744073709551615 overflows with remaining upper bound 1";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&rejected, backend)
+            .expect_err("an exhausted timer generation must reject before execution");
+        assert_eq!(error.to_string(), expected);
+    }
+
+    let mut boundary = rejected;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = boundary.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.timer_generation = u64::MAX - 1;
+    validate(&boundary, Backend::Scalar).expect("maximum safe Scalar generation must validate");
+    validate(&boundary, Backend::Cpu { workers: 2 })
+        .expect("maximum safe CPU generation must validate");
+    let scalar = run_scalar_with_observations(&boundary, None, ObservationMode::Full)
+        .expect("maximum safe Scalar generation must execute");
+    let cpu = run_cpu_with_observations(
+        &boundary,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("maximum safe CPU generation must execute")
+    .result;
+    assert_eq!(cpu, scalar, "timer-generation boundary byte identity");
+    let checkpoint = checkpoint_image(&boundary, &scalar);
+    validate(&checkpoint, Backend::Scalar)
+        .expect("maximum safe generation checkpoint must validate for Scalar");
+    validate(&checkpoint, Backend::Cpu { workers: 2 })
+        .expect("maximum safe generation checkpoint must validate for CPU");
+}
+
+#[test]
+fn validator_reserves_tcp_rto_deadline_headroom_before_execution() {
+    let mut rejected = tcp_image(TcpCongestionControl::reno(MSS), MSS);
+    rejected.stop_time_ns = 1;
+    let generator = &mut rejected.host_states[0].generators[0];
+    generator.next_emission.departure_time_ns = 1;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = generator.kind else {
+        unreachable!()
+    };
+    tcp.rto_ns = u64::MAX;
+    let PacketKind::TcpData(ref mut header) = rejected.initial_packets[0].kind else {
+        unreachable!()
+    };
+    header.sent_time_ns = 1;
+    rejected.initial_events[0].key.time_ns = 1;
+
+    let expected = "flow FlowId(0) TCP retransmission timeout 18446744073709551615 exceeds deadline headroom 18446744073709551614 for stop time 1";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&rejected, backend)
+            .expect_err("an unrepresentable first timer deadline must reject before execution");
+        assert_eq!(error.to_string(), expected);
+    }
+
+    let mut boundary = rejected;
+    let FlowGeneratorKind::Tcp(ref mut tcp) = boundary.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.rto_ns = u64::MAX - boundary.stop_time_ns;
+    validate(&boundary, Backend::Scalar).expect("maximum safe Scalar RTO must validate");
+    validate(&boundary, Backend::Cpu { workers: 2 }).expect("maximum safe CPU RTO must validate");
+    let scalar = run_scalar_with_observations(&boundary, None, ObservationMode::Full)
+        .expect("maximum safe Scalar RTO must execute");
+    let cpu = run_cpu_with_observations(
+        &boundary,
+        None,
+        CpuConfig {
+            workers: 2,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("maximum safe CPU RTO must execute")
+    .result;
+    assert_eq!(cpu, scalar, "RTO deadline boundary byte identity");
+}
+
+#[test]
 fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
     let mut traces = Vec::new();
     for control in [
