@@ -464,7 +464,7 @@ impl CsvLogger {
         for element in elements {
             let file_name = format!("{}{}.csv", log_path, element);
             if let Err(e) = fs::File::create(&file_name) {
-                return Err(format!("Error creating log file {}: {}", &file_name, e));
+                return Err(format!("Error creating log file {}: {}", file_name, e));
             }
         }
 

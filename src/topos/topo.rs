@@ -992,7 +992,7 @@ impl Topology {
 
     // Initializes mailboxes for switches.
     fn init_mailboxes(&mut self) {
-        for (_, switch) in self.switches.iter() {
+        for switch in self.switches.values() {
             let switch_mbox: Mailbox<PacketSwitch> = Mailbox::with_capacity(self.mailbox_capacity);
             self.switch_mailboxes.insert(switch.id(), switch_mbox);
         }
