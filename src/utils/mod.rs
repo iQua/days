@@ -1,4 +1,4 @@
-//! Shared utilities for logging, tracing, UI, and time helpers.
+//! Shared utilities for logging, tracing, and time helpers.
 
 pub mod logger;
 pub mod testgen;

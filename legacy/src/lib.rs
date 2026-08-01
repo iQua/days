@@ -17,7 +17,7 @@ pub use days::utils::tracing::{current_concurrency, peak_concurrency, reset_peak
 pub use days::validate_config;
 
 #[derive(Deserialize)]
-struct SeedConfig {
+pub struct SeedConfig {
     seed: usize,
 }
 

@@ -76,7 +76,7 @@ fn main() {
         .parent()
         .expect("xtask must be a direct workspace member");
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .args(["metadata", "--format-version", "1", "--all-features"])
         .current_dir(workspace)
         .output()
         .expect("failed to execute cargo metadata");
