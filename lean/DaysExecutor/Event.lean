@@ -196,15 +196,35 @@ inductive EventKind where
   | txComplete
   | remoteArrival
   | retransmissionTimeout
+  | pacingTimer
   deriving DecidableEq, Repr, Ord
+
+/-- Physical FEL placement class mirroring `executor/src/event.rs` (`EventFelClass`). -/
+inductive EventFelClass where
+  | channel
+  | service
+  | generator
+  | fallbackHeap
+  deriving DecidableEq, Repr, Ord
+
+/-- Closed event-kind to FEL-class assignment. -/
+def eventFelClass : EventKind → EventFelClass
+  | .remoteArrival => .channel
+  | .txReady | .txComplete => .service
+  | .packetArrival => .generator
+  | .retransmissionTimeout | .pacingTimer => .fallbackHeap
 
 /--
 Canonical equal-time phase dispatch mirroring `executor/src/event.rs:78-88` (`event_phase`).
 -/
 def eventPhase : EventKind → Nat
   | .packetArrival | .remoteArrival => 0
-  | .txComplete | .retransmissionTimeout => 1
+  | .txComplete | .retransmissionTimeout | .pacingTimer => 1
   | .txReady => 2
+
+@[simp] theorem pacingTimer_phase : eventPhase .pacingTimer = 1 := rfl
+
+@[simp] theorem pacingTimer_fallbackHeap : eventFelClass .pacingTimer = .fallbackHeap := rfl
 
 /--
 Persistent fixed-width semantic event mirroring `executor/src/event.rs:90-101` (`Event`).

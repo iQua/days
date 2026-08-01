@@ -79,7 +79,8 @@ fn benchmark_workload(image: &days_executor::SimulationImage) -> BenchmarkWorklo
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         match generator.kind {
             days_executor::FlowGeneratorKind::Tcp(_) => has_tcp = true,
-            days_executor::FlowGeneratorKind::Constant(_) => has_open_loop = true,
+            days_executor::FlowGeneratorKind::Constant(_)
+            | days_executor::FlowGeneratorKind::Rate(_) => has_open_loop = true,
         }
     }
     classify_workload(has_tcp, has_open_loop)

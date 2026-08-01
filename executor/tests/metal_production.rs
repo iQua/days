@@ -26,6 +26,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
         id: GENERATOR_FIRST_PACKET,
         flow: GENERATOR_FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Data,
     };
     let forward = LinkDescriptor {
@@ -104,6 +105,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
             id: GENERATOR_FLOW,
             source: GENERATOR_SOURCE,
             target: GENERATOR_SINK,
+            priority: 0,
             route: vec![GENERATOR_FORWARD],
             reverse_route: vec![GENERATOR_REVERSE],
         }],
@@ -147,6 +149,7 @@ fn feedback_image() -> SimulationImage {
         id: PayloadId(1),
         flow: GENERATOR_FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Feedback,
     };
     image.initial_packets = vec![feedback];
@@ -175,12 +178,14 @@ fn converging_generators_image() -> SimulationImage {
         id: PayloadId(2),
         flow: second_flow,
         size_bytes: 1,
+        ecn_marked: false,
         kind: PacketKind::Data,
     };
     image.flows.push(FlowDescriptor {
         id: second_flow,
         source: GENERATOR_SOURCE,
         target: GENERATOR_SINK,
+        priority: 0,
         route: vec![GENERATOR_FORWARD],
         reverse_route: vec![GENERATOR_REVERSE],
     });
@@ -270,6 +275,7 @@ fn reverse_switch_feedback_image() -> SimulationImage {
         id,
         flow: FlowId(0),
         size_bytes: 1,
+        ecn_marked: false,
         kind: PacketKind::Feedback,
     });
 
@@ -353,6 +359,8 @@ fn reverse_switch_feedback_image() -> SimulationImage {
                     egress_link: Some(LinkId(1)),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 0,
+                    drop_mark: Default::default(),
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -368,6 +376,8 @@ fn reverse_switch_feedback_image() -> SimulationImage {
                     egress_link: Some(LinkId(3)),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 0,
+                    drop_mark: Default::default(),
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -382,6 +392,7 @@ fn reverse_switch_feedback_image() -> SimulationImage {
             id: FlowId(0),
             source,
             target: sink,
+            priority: 0,
             route: vec![LinkId(0), LinkId(1)],
             reverse_route: vec![LinkId(2), LinkId(3)],
         }],
@@ -494,6 +505,8 @@ fn fifo_taildrop_image() -> SimulationImage {
                 egress_link: Some(FIFO_SWITCH_LINK),
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 2,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
@@ -508,6 +521,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 id: FlowId(index as u64),
                 source: FIFO_SOURCE,
                 target: FIFO_SINK,
+                priority: 0,
                 route: vec![FIFO_SOURCE_LINK, FIFO_SWITCH_LINK],
                 reverse_route: vec![],
             })
@@ -519,6 +533,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 id,
                 flow: FlowId(index as u64),
                 size_bytes: 2,
+                ecn_marked: false,
                 kind: PacketKind::Data,
             })
             .collect(),
@@ -594,6 +609,7 @@ fn backlog_drain_image() -> SimulationImage {
                 .expect("backlog payload IDs must fit"),
             flow: GENERATOR_FLOW,
             size_bytes: 1,
+            ecn_marked: false,
             kind: PacketKind::Data,
         })
         .collect::<Vec<_>>();
@@ -666,6 +682,7 @@ fn backlog_drain_image() -> SimulationImage {
             id: GENERATOR_FLOW,
             source: GENERATOR_SOURCE,
             target: GENERATOR_SINK,
+            priority: 0,
             route: vec![forward.id],
             reverse_route: vec![],
         }],
@@ -724,6 +741,7 @@ fn uneven_multi_lp_backlog_image() -> SimulationImage {
                     .expect("multi-LP backlog payload IDs must fit"),
                 flow,
                 size_bytes: 1,
+                ecn_marked: false,
                 kind: PacketKind::Data,
             })
             .collect::<Vec<_>>();
@@ -793,6 +811,7 @@ fn uneven_multi_lp_backlog_image() -> SimulationImage {
             id: flow,
             source,
             target: sink,
+            priority: 0,
             route: vec![forward.id],
             reverse_route: vec![],
         });
@@ -847,6 +866,7 @@ fn long_flight_backlog_image() -> SimulationImage {
                 .expect("long-flight payload IDs must fit"),
             flow: FLOW,
             size_bytes: 1,
+            ecn_marked: false,
             kind: PacketKind::Data,
         })
         .collect::<Vec<_>>();
@@ -918,6 +938,8 @@ fn long_flight_backlog_image() -> SimulationImage {
                 egress_link: Some(LONG_EGRESS),
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 1,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
@@ -931,6 +953,7 @@ fn long_flight_backlog_image() -> SimulationImage {
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![INGRESS, LONG_EGRESS],
             reverse_route: vec![],
         }],
@@ -983,6 +1006,7 @@ fn rich_mid_state_image() -> SimulationImage {
             .expect("feedback payload ID must fit"),
         flow: GENERATOR_FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Feedback,
     };
     image.initial_packets.push(feedback);

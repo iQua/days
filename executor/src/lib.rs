@@ -3,6 +3,7 @@
 //! Fixed-width event records and exact integer-time helpers form the common input contract for
 //! later CPU and GPU executors. The scalar backend defines their executable reference behavior.
 
+mod aqm_trace;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -23,6 +24,7 @@ pub mod tcp_trace;
 pub mod time;
 pub mod validate;
 
+pub use aqm_trace::{AqmTraceError, aqm_transitions_csv};
 pub use cpu::{
     ChunkGranularity, CpuConfig, CpuFaultInjection, CpuFaultKind, CpuRoundMetrics, CpuRun,
     LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass, WorkPartition,
@@ -46,9 +48,10 @@ pub use event::{
 pub use image::{
     ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
     GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
-    HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, RemoteChannel,
-    ScheduledEmission, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader,
-    TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
+    HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, PfcHeader,
+    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, ScheduledEmission,
+    SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator,
+    TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
@@ -60,7 +63,8 @@ pub use metal::{
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};
 pub use model::{
-    ExactRational, NodeKind, SchedulerKind, TransitionHandler, WfqSchedulerState,
+    DropMarkPolicy, DrrSchedulerState, EcnThresholdPolicy, ExactRational, NodeKind, QueueDepthUnit,
+    RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,
     resolve_transition,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -75,11 +79,13 @@ pub use safe_horizon::{
     run_scalar_rounds_with_windowed_replay_trace,
 };
 pub use scalar::{
-    ArrivalDisposition, ExecutionError, ObservationMode, PacketArrivalObservation, PacketDeparture,
-    RunResult, RunSummary, TcpTransitionInput, TcpTransitionRecord, run_scalar,
-    run_scalar_with_observations,
+    AqmTransitionAction, AqmTransitionRecord, ArrivalDisposition, ExecutionError, ObservationMode,
+    PacketArrivalObservation, PacketDeparture, RunResult, RunSummary, TcpTransitionInput,
+    TcpTransitionRecord, run_scalar, run_scalar_with_observations,
 };
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
-pub use validate::{Backend, ValidationError, validate};
+pub use validate::{
+    Backend, RateSourceLookahead, ValidationError, rate_source_lookahead, validate,
+};

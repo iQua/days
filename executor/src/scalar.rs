@@ -70,6 +70,30 @@ pub struct TcpTransitionRecord {
     pub after: TcpCongestionControl,
 }
 
+/// Closed admission result retained by an exact AQM transition certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AqmTransitionAction {
+    Enqueue,
+    Mark,
+    Drop,
+}
+
+/// One non-TailDrop enqueue decision, keyed by the event that caused it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AqmTransitionRecord {
+    pub key: EventKey,
+    pub node: NodeId,
+    pub payload: PayloadId,
+    pub queued_packets_before: u64,
+    pub queued_bytes_before: u64,
+    pub packet_size_bytes: u64,
+    pub ecn_before: bool,
+    pub ecn_after: bool,
+    pub before: crate::DropMarkPolicy,
+    pub after: crate::DropMarkPolicy,
+    pub action: AqmTransitionAction,
+}
+
 /// Whether the scalar oracle retains complete per-packet observations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ObservationMode {
@@ -114,6 +138,8 @@ pub struct RunResult {
     pub arrivals: Vec<PacketArrivalObservation>,
     /// Exact TCP control transitions retained in full observation mode.
     pub tcp_transitions: Vec<TcpTransitionRecord>,
+    /// Exact RED/ECN enqueue transitions retained in full observation mode.
+    pub aqm_transitions: Vec<AqmTransitionRecord>,
     /// Unprocessed events in canonical `EventKey` order.
     pub pending_events: Vec<Event>,
 }
@@ -461,6 +487,7 @@ pub(crate) struct TransitionState<'image> {
     departures: Vec<(EventKey, PacketDeparture)>,
     arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: Vec<TcpTransitionRecord>,
+    aqm_transitions: Vec<AqmTransitionRecord>,
     tcp_sent_segments: crate::tcp_ledger::TcpSegmentLedger,
 }
 
@@ -487,6 +514,7 @@ pub(crate) struct LocalTransitionResult {
     pub departures: Vec<(EventKey, PacketDeparture)>,
     pub arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     pub tcp_transitions: Vec<TcpTransitionRecord>,
+    pub aqm_transitions: Vec<AqmTransitionRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -495,6 +523,13 @@ struct ChildEmission {
     kind: EventKind,
     payload: PayloadId,
     time_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PfcFramePlan {
+    channel_index: u32,
+    flow: FlowId,
+    header: crate::PfcHeader,
 }
 
 struct TcpSendPlan {
@@ -565,6 +600,7 @@ impl<'image> TransitionState<'image> {
             departures: Vec::new(),
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
+            aqm_transitions: Vec::new(),
             tcp_sent_segments,
         })
     }
@@ -652,6 +688,7 @@ impl<'image> TransitionState<'image> {
             departures: Vec::new(),
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
+            aqm_transitions: Vec::new(),
             tcp_sent_segments,
         })
     }
@@ -694,6 +731,8 @@ impl<'image> TransitionState<'image> {
         self.arrivals.sort_unstable_by_key(|(key, _)| *key);
         self.tcp_transitions
             .sort_unstable_by_key(|record| record.key);
+        self.aqm_transitions
+            .sort_unstable_by_key(|record| record.key);
         RunResult {
             host_states: self.host_states,
             switch_states: self.switch_states,
@@ -711,6 +750,7 @@ impl<'image> TransitionState<'image> {
                 .map(|(_, arrival)| arrival)
                 .collect(),
             tcp_transitions: self.tcp_transitions,
+            aqm_transitions: self.aqm_transitions,
             pending_events,
         }
     }
@@ -722,6 +762,8 @@ impl<'image> TransitionState<'image> {
         self.departures.sort_unstable_by_key(|(key, _)| *key);
         self.arrivals.sort_unstable_by_key(|(key, _)| *key);
         self.tcp_transitions
+            .sort_unstable_by_key(|record| record.key);
+        self.aqm_transitions
             .sort_unstable_by_key(|record| record.key);
         let state = match node.kind {
             NodeKind::Host => LocalNodeState::Host(
@@ -753,6 +795,7 @@ impl<'image> TransitionState<'image> {
             departures: self.departures,
             arrivals: self.arrivals,
             tcp_transitions: self.tcp_transitions,
+            aqm_transitions: self.aqm_transitions,
         }
     }
 
@@ -797,6 +840,7 @@ impl<'image> TransitionState<'image> {
             TransitionHandler::HostRetransmissionTimeout => {
                 self.host_retransmission_timeout(node, event, children)
             }
+            TransitionHandler::HostPacingTimer => self.host_pacing_timer(node, event, children),
         }
     }
 
@@ -906,6 +950,7 @@ impl<'image> TransitionState<'image> {
                     id: payload,
                     flow: packet.flow,
                     size_bytes: constant.packet_size_bytes,
+                    ecn_marked: false,
                     kind: PacketKind::Data,
                 })
             } else {
@@ -1194,14 +1239,36 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let packet = self.packet(event.payload)?;
+        let mut packet = self.packet(event.payload)?;
+        let packet_ecn_before = packet.ecn_marked;
+        if let PacketKind::Pfc(header) = packet.kind {
+            return self.switch_pfc_remote_arrival(node, event, header, children);
+        }
         let egress_link = self.packet_egress_at(event.payload, node.id)?;
+        let incoming_link = self.packet_incoming_link_at(event.payload, node.id)?;
+        let priority = usize::from(self.flow(packet.flow)?.priority);
         let rate_bps = egress_link
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
             .transpose()?;
         let sp_position = self.switch_sp_insertion_position(node, egress_link, packet.flow)?;
+        let queue_bytes = {
+            let state = self.switch_state(node)?;
+            let queue = state
+                .queues
+                .iter()
+                .find(|queue| queue.egress_link == egress_link)
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link,
+                })?;
+            queue.queue.iter().try_fold(0_u64, |total, payload| {
+                total
+                    .checked_add(self.packet(*payload)?.size_bytes)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))
+            })?
+        };
 
-        let (disposition, schedule_ready) = {
+        let (disposition, schedule_ready, mark_packet, pfc_plan, aqm_transition) = {
             let state = self.switch_state_mut(node)?;
             state.arrived_packets = state
                 .arrived_packets
@@ -1217,12 +1284,52 @@ impl<'image> TransitionState<'image> {
                     egress_link,
                 })?;
             let queue_len = u64::try_from(queue.queue.len()).unwrap_or(u64::MAX);
-            if queue.queue_capacity_packets != 0 && queue_len >= queue.queue_capacity_packets {
+            let pfc_overflow = queue
+                .pfc
+                .as_ref()
+                .and_then(|pfc| {
+                    pfc.ingresses
+                        .iter()
+                        .find(|ingress| Some(ingress.controlled_link) == incoming_link)
+                })
+                .is_some_and(|ingress| {
+                    ingress.xoff_threshold_bytes[priority] != 0
+                        && ingress.occupancy_bytes[priority]
+                            .checked_add(packet.size_bytes)
+                            .is_none_or(|depth| depth > ingress.buffer_capacity_bytes[priority])
+                });
+            let (action, aqm_transition) = if pfc_overflow {
+                (QueueAdmissionAction::Drop, None)
+            } else {
+                let before = queue.drop_mark;
+                let action = drop_mark_decision(
+                    &mut queue.drop_mark,
+                    queue.queue_capacity_packets,
+                    queue_len,
+                    queue_bytes,
+                    packet.size_bytes,
+                    node.id,
+                )?;
+                let transition = (before != crate::DropMarkPolicy::TailDrop).then_some((
+                    before,
+                    queue.drop_mark,
+                    action,
+                    queue_len,
+                ));
+                (action, transition)
+            };
+            if action == QueueAdmissionAction::Drop {
                 state.dropped_packets = state
                     .dropped_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                (ArrivalDisposition::Dropped, false)
+                (
+                    ArrivalDisposition::Dropped,
+                    false,
+                    false,
+                    None,
+                    aqm_transition,
+                )
             } else {
                 match &mut queue.scheduler {
                     SchedulerKind::Fifo => queue.queue.push_back(event.payload),
@@ -1244,20 +1351,95 @@ impl<'image> TransitionState<'image> {
                             node.id,
                         )?;
                     }
+                    SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_) => {
+                        queue.queue.push_back(event.payload);
+                    }
                 }
+                let priority_paused = queue
+                    .pfc
+                    .as_ref()
+                    .is_some_and(|pfc| pfc.paused_priorities[priority]);
                 let schedule_ready = queue.egress_link.is_some()
                     && queue.in_service.is_none()
-                    && !queue.tx_ready_pending;
+                    && !queue.tx_ready_pending
+                    && !priority_paused;
                 if schedule_ready {
                     queue.tx_ready_pending = true;
                 }
-                (ArrivalDisposition::Admitted, schedule_ready)
+                let pfc_plan = queue
+                    .pfc
+                    .as_mut()
+                    .and_then(|pfc| {
+                        pfc.ingresses
+                            .iter_mut()
+                            .find(|ingress| Some(ingress.controlled_link) == incoming_link)
+                    })
+                    .and_then(|ingress| {
+                        let xoff = ingress.xoff_threshold_bytes[priority];
+                        if xoff == 0 {
+                            return None;
+                        }
+                        let depth =
+                            ingress.occupancy_bytes[priority].checked_add(packet.size_bytes)?;
+                        ingress.occupancy_bytes[priority] = depth;
+                        if depth < xoff || ingress.pause_asserted[priority] {
+                            return None;
+                        }
+                        ingress.pause_asserted[priority] = true;
+                        Some(PfcFramePlan {
+                            channel_index: ingress.control_channel_index,
+                            flow: packet.flow,
+                            header: crate::PfcHeader {
+                                controlled_link: ingress.controlled_link,
+                                priority: priority as u8,
+                                pause: true,
+                            },
+                        })
+                    });
+                (
+                    ArrivalDisposition::Admitted,
+                    schedule_ready,
+                    action == QueueAdmissionAction::Mark,
+                    pfc_plan,
+                    aqm_transition,
+                )
             }
         };
+
+        if mark_packet {
+            self.set_packet_marked(event.payload)?;
+            packet.ecn_marked = true;
+        }
+
+        if self.observation_mode == ObservationMode::Full {
+            if let Some((before, after, action, queued_packets_before)) = aqm_transition {
+                self.aqm_transitions.push(AqmTransitionRecord {
+                    key: event.key,
+                    node: node.id,
+                    payload: event.payload,
+                    queued_packets_before,
+                    queued_bytes_before: queue_bytes,
+                    packet_size_bytes: packet.size_bytes,
+                    ecn_before: packet_ecn_before,
+                    ecn_after: packet.ecn_marked,
+                    before,
+                    after,
+                    action: match action {
+                        QueueAdmissionAction::Enqueue => AqmTransitionAction::Enqueue,
+                        QueueAdmissionAction::Mark => AqmTransitionAction::Mark,
+                        QueueAdmissionAction::Drop => AqmTransitionAction::Drop,
+                    },
+                });
+            }
+        }
 
         self.record_arrival(node.id, packet, event.key, disposition)?;
         if disposition == ArrivalDisposition::Dropped {
             self.mark_terminal(event.payload)?;
+        }
+
+        if let Some(plan) = pfc_plan {
+            self.emit_pfc_frame(node, event, plan, children)?;
         }
 
         if schedule_ready {
@@ -1268,6 +1450,84 @@ impl<'image> TransitionState<'image> {
                     target: node.id,
                     kind: EventKind::TxReady,
                     payload: event.payload,
+                    time_ns: event.key.time_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn switch_pfc_remote_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        header: crate::PfcHeader,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let priority = usize::from(header.priority);
+        let queued = {
+            let state = self.switch_state(node)?;
+            let queue = state
+                .queues
+                .iter()
+                .find(|queue| queue.egress_link == Some(header.controlled_link))
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link: Some(header.controlled_link),
+                })?;
+            queue
+                .queue
+                .iter()
+                .map(|payload| {
+                    let packet = self.packet(*payload)?;
+                    Ok((*payload, usize::from(self.flow(packet.flow)?.priority)))
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?
+        };
+        let schedule_payload = {
+            let state = self.switch_state_mut(node)?;
+            let queue = state
+                .queues
+                .iter_mut()
+                .find(|queue| queue.egress_link == Some(header.controlled_link))
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link: Some(header.controlled_link),
+                })?;
+            let pfc = queue
+                .pfc
+                .as_mut()
+                .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+            let previous = pfc.paused_priorities[priority];
+            if header.pause {
+                pfc.paused_priorities[priority] = true;
+                None
+            } else if !previous {
+                // Duplicate/early resume is an idempotent no-op.
+                None
+            } else {
+                pfc.paused_priorities[priority] = false;
+                let payload = queued.iter().find_map(|(payload, packet_priority)| {
+                    (!pfc.paused_priorities[*packet_priority]).then_some(*payload)
+                });
+                if payload.is_some() && queue.in_service.is_none() && !queue.tx_ready_pending {
+                    queue.tx_ready_pending = true;
+                    payload
+                } else {
+                    None
+                }
+            }
+        };
+        self.mark_terminal(event.payload)?;
+        if let Some(payload) = schedule_payload {
+            self.emit_from_switch(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
                     time_ns: event.key.time_ns,
                 },
                 children,
@@ -1394,6 +1654,7 @@ impl<'image> TransitionState<'image> {
             id: ack_payload,
             flow: packet.flow,
             size_bytes: ack_size_bytes,
+            ecn_marked: false,
             kind: PacketKind::TcpAck(TcpAckHeader {
                 acknowledgment,
                 acknowledged_bytes: packet.size_bytes,
@@ -1634,6 +1895,187 @@ impl<'image> TransitionState<'image> {
         self.install_tcp_attempts(node, event, plan, children)
     }
 
+    fn host_pacing_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let packet = self.packet(event.payload)?;
+        let stop_time_ns = self.image.stop_time_ns;
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let mut emitted = false;
+        let mut next_packet = None;
+        let mut next_timer = None;
+        let mut terminal_unused_token = false;
+
+        {
+            let state = self.host_state_mut(node)?;
+            let Some(generator_index) = state
+                .generators
+                .iter()
+                .position(|generator| generator.flow == packet.flow)
+            else {
+                return Ok(());
+            };
+            let generator = &mut state.generators[generator_index];
+            let FlowGeneratorKind::Rate(mut rate) = generator.kind else {
+                return Ok(());
+            };
+            if !matches!(
+                generator.next_emission.status,
+                GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+            ) || generator.next_emission.payload != event.payload
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+            {
+                return Ok(());
+            }
+
+            let scale = u128::from(rate.rate_denominator)
+                .checked_mul(1_000_000_000)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let tick_credit = u128::from(rate.rate_numerator_bits_per_second)
+                .checked_mul(u128::from(rate.pacing_interval_ns))
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let packet_cost = u128::from(packet.size_bytes)
+                .checked_mul(8)
+                .and_then(|bits| bits.checked_mul(scale))
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            rate.credit_quanta = rate
+                .credit_quanta
+                .checked_add(tick_credit)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            if rate.credit_quanta >= packet_cost {
+                rate.credit_quanta -= packet_cost;
+                generator.packets_emitted = generator
+                    .packets_emitted
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                generator.bytes_emitted = generator
+                    .bytes_emitted
+                    .checked_add(packet.size_bytes)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                state.sourced_packets = state
+                    .sourced_packets
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                emitted = true;
+            }
+
+            let finished = generator.bytes_emitted >= rate.total_bytes;
+            let candidate_time = (!finished)
+                .then(|| {
+                    event
+                        .key
+                        .time_ns
+                        .checked_add(rate.pacing_interval_ns)
+                        .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))
+                })
+                .transpose()?;
+            if let Some(next_time) = candidate_time.filter(|time| *time <= stop_time_ns) {
+                let (payload, size_bytes) = if emitted {
+                    let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                    state.next_payload_seq = state
+                        .next_payload_seq
+                        .checked_add(1)
+                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                    let remaining = rate.total_bytes - generator.bytes_emitted;
+                    (payload, rate.packet_size_bytes.min(remaining))
+                } else {
+                    (packet.id, packet.size_bytes)
+                };
+                let next_cost = u128::from(size_bytes)
+                    .checked_mul(8)
+                    .and_then(|bits| bits.checked_mul(scale))
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                generator.next_emission = crate::ScheduledEmission {
+                    status: if rate
+                        .credit_quanta
+                        .checked_add(tick_credit)
+                        .is_some_and(|credit| credit >= next_cost)
+                    {
+                        GeneratorStatus::Scheduled
+                    } else {
+                        GeneratorStatus::Blocked
+                    },
+                    departure_time_ns: next_time,
+                    payload,
+                };
+                if emitted {
+                    next_packet = Some(PacketDescriptor {
+                        id: payload,
+                        flow: packet.flow,
+                        size_bytes,
+                        ecn_marked: false,
+                        kind: PacketKind::Data,
+                    });
+                }
+                next_timer = Some((payload, next_time));
+            } else {
+                generator.next_emission.status = if finished {
+                    GeneratorStatus::Finished
+                } else {
+                    GeneratorStatus::Stopped
+                };
+                if let Some(candidate_time) = candidate_time {
+                    generator.next_emission.departure_time_ns = candidate_time;
+                }
+                terminal_unused_token = !emitted;
+            }
+            generator.kind = FlowGeneratorKind::Rate(rate);
+        }
+
+        if emitted {
+            self.set_source_time(packet.id, event.key.time_ns)?;
+            self.enqueue_source_packet(node, packet.id)?;
+            self.record_sourced(node.id, packet)?;
+        } else if terminal_unused_token {
+            self.mark_terminal(packet.id)?;
+        }
+        if let Some(next_packet) = next_packet {
+            self.insert_packet(next_packet, None)?;
+        }
+        if let Some((payload, time_ns)) = next_timer {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacingTimer,
+                    payload,
+                    time_ns,
+                },
+                children,
+            )?;
+        }
+        if emitted {
+            let ready_payload = {
+                let state = self.host_state_mut(node)?;
+                if state.in_service.is_none() && !state.tx_ready_pending {
+                    state.tx_ready_pending = true;
+                    Some(packet.id)
+                } else {
+                    None
+                }
+            };
+            if let Some(payload) = ready_payload {
+                self.emit_from_host(
+                    node,
+                    event,
+                    ChildEmission {
+                        target: node.id,
+                        kind: EventKind::TxReady,
+                        payload,
+                        time_ns: event.key.time_ns,
+                    },
+                    children,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn switch_tx_ready(
         &mut self,
         node: NodeDescriptor,
@@ -1648,7 +2090,37 @@ impl<'image> TransitionState<'image> {
             });
         };
 
-        let payload = {
+        let (eligible_positions, eligible_packets, eligible_priorities, eligible_incoming_links) = {
+            let state = self.switch_state(node)?;
+            let queue = state
+                .queues
+                .iter()
+                .find(|queue| queue.egress_link == Some(egress_link))
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link: Some(egress_link),
+                })?;
+            let mut positions = Vec::new();
+            let mut packets = Vec::new();
+            let mut priorities = Vec::new();
+            let mut incoming_links = Vec::new();
+            for (position, payload) in queue.queue.iter().enumerate() {
+                let packet = self.packet(*payload)?;
+                let priority = usize::from(self.flow(packet.flow)?.priority);
+                let paused = queue
+                    .pfc
+                    .as_ref()
+                    .is_some_and(|pfc| pfc.paused_priorities[priority]);
+                if !paused {
+                    positions.push(position);
+                    packets.push(packet);
+                    priorities.push(priority);
+                    incoming_links.push(self.packet_incoming_link_at(*payload, node.id)?);
+                }
+            }
+            (positions, packets, priorities, incoming_links)
+        };
+        let (payload, pfc_plan) = {
             let state = self.switch_state_mut(node)?;
             let queue = state
                 .queues
@@ -1666,9 +2138,16 @@ impl<'image> TransitionState<'image> {
                 });
             }
 
-            let Some(payload) = queue.queue.pop_front() else {
+            let Some(eligible_position) =
+                scheduler_select_position(&mut queue.scheduler, &eligible_packets, node.id)?
+            else {
                 return Ok(());
             };
+            let position = eligible_positions[eligible_position];
+            let payload = queue
+                .queue
+                .remove(position)
+                .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
             if let SchedulerKind::WeightedFairQueue(wfq) = &mut queue.scheduler {
                 wfq.packet_finish_times.get(&payload).ok_or(
                     ExecutionError::MissingWfqFinishTag {
@@ -1678,7 +2157,43 @@ impl<'image> TransitionState<'image> {
                 )?;
             }
             queue.in_service = Some(payload);
-            payload
+            let packet = eligible_packets[eligible_position];
+            let priority = eligible_priorities[eligible_position];
+            let incoming_link = eligible_incoming_links[eligible_position];
+            let ingress = queue.pfc.as_mut().and_then(|pfc| {
+                pfc.ingresses
+                    .iter_mut()
+                    .find(|ingress| Some(ingress.controlled_link) == incoming_link)
+            });
+            let pfc_plan = if let Some(ingress) = ingress {
+                let xoff = ingress.xoff_threshold_bytes[priority];
+                if xoff == 0 {
+                    None
+                } else {
+                    let depth = ingress.occupancy_bytes[priority]
+                        .checked_sub(packet.size_bytes)
+                        .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                    ingress.occupancy_bytes[priority] = depth;
+                    let xon = ingress.xon_threshold_bytes[priority];
+                    if !ingress.pause_asserted[priority] || depth > xon {
+                        None
+                    } else {
+                        ingress.pause_asserted[priority] = false;
+                        Some(PfcFramePlan {
+                            channel_index: ingress.control_channel_index,
+                            flow: packet.flow,
+                            header: crate::PfcHeader {
+                                controlled_link: ingress.controlled_link,
+                                priority: priority as u8,
+                                pause: false,
+                            },
+                        })
+                    }
+                }
+            } else {
+                None
+            };
+            (payload, pfc_plan)
         };
 
         let link = self.link(egress_link)?;
@@ -1695,6 +2210,10 @@ impl<'image> TransitionState<'image> {
         let departure_time_ns = arrival_time_ns
             .checked_sub(link.propagation_ns)
             .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+
+        if let Some(plan) = pfc_plan {
+            self.emit_pfc_frame(node, event, plan, children)?;
+        }
 
         self.emit_from_switch(
             node,
@@ -1736,6 +2255,26 @@ impl<'image> TransitionState<'image> {
         let rate_bps = self.link(egress_link)?.rate_bps;
         let packet = self.packet(event.payload)?;
 
+        let eligible_next_payload = {
+            let state = self.switch_state(node)?;
+            let queue = state
+                .queues
+                .iter()
+                .find(|queue| queue.egress_link == Some(egress_link))
+                .ok_or(ExecutionError::MissingSwitchQueue {
+                    node: node.id,
+                    egress_link: Some(egress_link),
+                })?;
+            queue.queue.iter().find_map(|payload| {
+                let packet = self.packet(*payload).ok()?;
+                let priority = usize::from(self.flow(packet.flow).ok()?.priority);
+                let paused = queue
+                    .pfc
+                    .as_ref()
+                    .is_some_and(|pfc| pfc.paused_priorities[priority]);
+                (!paused).then_some(*payload)
+            })
+        };
         let next_payload = {
             let state = self.switch_state_mut(node)?;
             let queue = state
@@ -1758,10 +2297,9 @@ impl<'image> TransitionState<'image> {
             }
             queue.in_service = None;
 
-            let next_payload = queue.queue.front().copied();
-            let schedule_payload = if next_payload.is_some() && !queue.tx_ready_pending {
+            let schedule_payload = if eligible_next_payload.is_some() && !queue.tx_ready_pending {
                 queue.tx_ready_pending = true;
-                next_payload
+                eligible_next_payload
             } else {
                 None
             };
@@ -2018,6 +2556,26 @@ impl<'image> TransitionState<'image> {
         })
     }
 
+    fn packet_incoming_link_at(
+        &self,
+        payload: PayloadId,
+        node: NodeId,
+    ) -> Result<Option<LinkId>, ExecutionError> {
+        let packet = self.packet(payload)?;
+        let flow = self.flow(packet.flow)?;
+        let route = if packet.kind.is_data() {
+            &flow.route
+        } else {
+            &flow.reverse_route
+        };
+        for link_id in route {
+            if self.packet_remote_target(payload, *link_id)? == node {
+                return Ok(Some(*link_id));
+            }
+        }
+        Ok(None)
+    }
+
     fn packet_remote_target(
         &self,
         payload: PayloadId,
@@ -2046,6 +2604,51 @@ impl<'image> TransitionState<'image> {
         })
     }
 
+    fn emit_pfc_frame(
+        &mut self,
+        origin: NodeDescriptor,
+        parent: Event,
+        plan: PfcFramePlan,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let channel = self
+            .image
+            .channels
+            .get(plan.channel_index as usize)
+            .copied()
+            .ok_or(ExecutionError::UnknownLink(plan.header.controlled_link))?;
+        let sequence = self.switch_state(origin)?.next_origin_seq;
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let payload = PayloadId::from_node_sequence(origin.id, node_count, sequence)
+            .ok_or(ExecutionError::PayloadSequenceOverflow(origin.id))?;
+        self.insert_packet(
+            PacketDescriptor {
+                id: payload,
+                flow: plan.flow,
+                size_bytes: 64,
+                ecn_marked: false,
+                kind: PacketKind::Pfc(plan.header),
+            },
+            Some(parent.key.time_ns),
+        )?;
+        let arrival_time_ns = parent
+            .key
+            .time_ns
+            .checked_add(channel.min_delay_ns)
+            .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+        self.emit_from_switch(
+            origin,
+            parent,
+            ChildEmission {
+                target: channel.target,
+                kind: EventKind::RemoteArrival,
+                payload,
+                time_ns: arrival_time_ns,
+            },
+            children,
+        )
+    }
+
     fn insert_packet(
         &mut self,
         packet: PacketDescriptor,
@@ -2072,6 +2675,15 @@ impl<'image> TransitionState<'image> {
             .get_mut(&payload)
             .ok_or(ExecutionError::UnknownPacket(payload))?;
         packet.source_time_ns = Some(time_ns);
+        Ok(())
+    }
+
+    fn set_packet_marked(&mut self, payload: PayloadId) -> Result<(), ExecutionError> {
+        let packet = self
+            .packets
+            .get_mut(&payload)
+            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        packet.descriptor.ecn_marked = true;
         Ok(())
     }
 
@@ -2148,6 +2760,7 @@ impl<'image> TransitionState<'image> {
             id: payload,
             flow,
             size_bytes,
+            ecn_marked: false,
             kind: PacketKind::Data,
         };
         self.insert_packet(packet, Some(parent.key.time_ns))?;
@@ -2219,6 +2832,7 @@ impl<'image> TransitionState<'image> {
                 id: payload,
                 flow,
                 size_bytes,
+                ecn_marked: false,
                 kind: PacketKind::TcpData(TcpDataHeader {
                     sequence,
                     sent_time_ns: now_ns,
@@ -2270,6 +2884,7 @@ impl<'image> TransitionState<'image> {
                     id: payload,
                     flow,
                     size_bytes,
+                    ecn_marked: false,
                     kind: PacketKind::TcpData(TcpDataHeader {
                         sequence,
                         sent_time_ns: now_ns,
@@ -2704,6 +3319,205 @@ fn wfq_complete(
     Ok(())
 }
 
+fn scheduler_select_position(
+    scheduler: &mut SchedulerKind,
+    packets: &[PacketDescriptor],
+    node: NodeId,
+) -> Result<Option<usize>, ExecutionError> {
+    if packets.is_empty() {
+        return Ok(None);
+    }
+    match scheduler {
+        SchedulerKind::Fifo
+        | SchedulerKind::StaticPriority { .. }
+        | SchedulerKind::WeightedFairQueue(_) => Ok(Some(0)),
+        SchedulerKind::DeficitRoundRobin(state) => {
+            let class_count = state.quanta_bytes.len();
+            if class_count == 0
+                || state.deficits_bytes.len() != class_count
+                || state.quanta_bytes.contains(&0)
+            {
+                return Err(ExecutionError::InvalidSchedulerState(node));
+            }
+            let mut current = usize::try_from(state.current_class)
+                .ok()
+                .filter(|class| *class < class_count)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            loop {
+                let position = packets
+                    .iter()
+                    .position(|packet| scheduler_class(packet.flow, class_count) == Some(current));
+                if let Some(position) = position {
+                    let size = packets[position].size_bytes;
+                    if state.deficits_bytes[current] > 0 && size <= state.deficits_bytes[current] {
+                        state.deficits_bytes[current] -= size;
+                        state.current_class = current as u64;
+                        return Ok(Some(position));
+                    }
+                }
+                current += 1;
+                if current == class_count {
+                    for class in 0..class_count {
+                        if packets
+                            .iter()
+                            .any(|packet| scheduler_class(packet.flow, class_count) == Some(class))
+                        {
+                            state.deficits_bytes[class] = state.deficits_bytes[class]
+                                .checked_add(state.quanta_bytes[class])
+                                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+                        } else {
+                            state.deficits_bytes[class] = 0;
+                        }
+                    }
+                    current = 0;
+                }
+                state.current_class = current as u64;
+            }
+        }
+        SchedulerKind::WeightedRoundRobin(state) => {
+            let class_count = state.weights.len();
+            if class_count == 0
+                || state.packets_sent_in_round.len() != class_count
+                || state.weights.contains(&0)
+            {
+                return Err(ExecutionError::InvalidSchedulerState(node));
+            }
+            let mut current = usize::try_from(state.current_class)
+                .ok()
+                .filter(|class| *class < class_count)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            loop {
+                if state.packets_sent_in_round[current] < state.weights[current] {
+                    if let Some(position) = packets.iter().position(|packet| {
+                        scheduler_class(packet.flow, class_count) == Some(current)
+                    }) {
+                        state.packets_sent_in_round[current] += 1;
+                        state.current_class = current as u64;
+                        return Ok(Some(position));
+                    }
+                }
+                state.packets_sent_in_round[current] = 0;
+                current = (current + 1) % class_count;
+                state.current_class = current as u64;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueAdmissionAction {
+    Enqueue,
+    Mark,
+    Drop,
+}
+
+fn drop_mark_decision(
+    policy: &mut crate::DropMarkPolicy,
+    taildrop_capacity_packets: u64,
+    queued_packets: u64,
+    queued_bytes: u64,
+    packet_size_bytes: u64,
+    node: NodeId,
+) -> Result<QueueAdmissionAction, ExecutionError> {
+    let post_packets = queued_packets
+        .checked_add(1)
+        .ok_or(ExecutionError::CounterOverflow(node))?;
+    let post_bytes = queued_bytes
+        .checked_add(packet_size_bytes)
+        .ok_or(ExecutionError::CounterOverflow(node))?;
+    match policy {
+        crate::DropMarkPolicy::TailDrop => Ok(
+            if taildrop_capacity_packets != 0 && post_packets > taildrop_capacity_packets {
+                QueueAdmissionAction::Drop
+            } else {
+                QueueAdmissionAction::Enqueue
+            },
+        ),
+        crate::DropMarkPolicy::EcnThreshold(config) => {
+            let post_depth = match config.unit {
+                crate::QueueDepthUnit::Packets => post_packets,
+                crate::QueueDepthUnit::Bytes => post_bytes,
+            };
+            Ok(if config.capacity != 0 && post_depth > config.capacity {
+                QueueAdmissionAction::Drop
+            } else if post_depth >= config.threshold {
+                QueueAdmissionAction::Mark
+            } else {
+                QueueAdmissionAction::Enqueue
+            })
+        }
+        crate::DropMarkPolicy::Red(state) => {
+            // Let S=2^32, A' = floor((511*A + sample*S)/512), and
+            // p(A') = p_num*(A'-min*S)/(p_den*(max-min)*S). In the open threshold
+            // interval, increment c and signal exactly when c*p(A') >= 1, then reset c.
+            // At/below min resets without signaling; at/above max signals and resets.
+            const RED_AVERAGE_SCALE: u128 = 1_u128 << 32;
+            let sample_depth = match state.unit {
+                crate::QueueDepthUnit::Packets => queued_packets,
+                crate::QueueDepthUnit::Bytes => queued_bytes,
+            };
+            let post_depth = match state.unit {
+                crate::QueueDepthUnit::Packets => post_packets,
+                crate::QueueDepthUnit::Bytes => post_bytes,
+            };
+            let weighted_previous = state
+                .average_scaled
+                .checked_mul(511)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            let weighted_sample = u128::from(sample_depth)
+                .checked_mul(RED_AVERAGE_SCALE)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            state.average_scaled = weighted_previous
+                .checked_add(weighted_sample)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?
+                / 512;
+
+            if state.capacity != 0 && post_depth > state.capacity {
+                return Ok(QueueAdmissionAction::Drop);
+            }
+            let min_scaled = u128::from(state.min_threshold)
+                .checked_mul(RED_AVERAGE_SCALE)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            let max_scaled = u128::from(state.max_threshold)
+                .checked_mul(RED_AVERAGE_SCALE)
+                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            let signal = if state.average_scaled <= min_scaled {
+                state.counter = 0;
+                false
+            } else if state.average_scaled >= max_scaled {
+                state.counter = 0;
+                true
+            } else {
+                state.counter = state
+                    .counter
+                    .checked_add(1)
+                    .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+                let left = BigUint::from(state.counter)
+                    * BigUint::from(state.max_probability_numerator)
+                    * BigUint::from(state.average_scaled - min_scaled);
+                let right = BigUint::from(state.max_probability_denominator)
+                    * BigUint::from(state.max_threshold - state.min_threshold)
+                    * BigUint::from(RED_AVERAGE_SCALE);
+                if left >= right {
+                    state.counter = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            Ok(if signal {
+                if state.mark_ecn {
+                    QueueAdmissionAction::Mark
+                } else {
+                    QueueAdmissionAction::Drop
+                }
+            } else {
+                QueueAdmissionAction::Enqueue
+            })
+        }
+    }
+}
+
 fn tcp_receive_range(receiver: &mut crate::TcpReceiverState, start: u64, end: u64) {
     if end <= start || end <= receiver.next_expected_sequence {
         return;
@@ -2786,5 +3600,6 @@ fn apply_generator_feedback(
     match generator.kind {
         FlowGeneratorKind::Constant(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Tcp(_) => Ok(GeneratorFeedbackAction::None),
+        FlowGeneratorKind::Rate(_) => Ok(GeneratorFeedbackAction::None),
     }
 }

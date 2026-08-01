@@ -1074,6 +1074,7 @@ mod tests {
                 id: flow,
                 source: NodeId(0),
                 target: NodeId(1),
+                priority: 0,
                 route: vec![LinkId(0)],
                 reverse_route: vec![],
             });
@@ -1081,6 +1082,7 @@ mod tests {
                 id: payload,
                 flow,
                 size_bytes: 1,
+                ecn_marked: false,
                 kind: PacketKind::Data,
             });
             initial_events.push(Event {

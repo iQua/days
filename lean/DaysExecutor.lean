@@ -8,5 +8,6 @@ import DaysExecutor.IntraRoundReordering
 import DaysExecutor.Proofs
 import DaysExecutor.SafeHorizon
 import DaysExecutor.SchedulerInstances
+import DaysExecutor.MechanismInstances
 import DaysExecutor.Statements
 import DaysExecutor.Transition

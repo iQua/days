@@ -3,12 +3,13 @@ use std::fs;
 use std::path::Path;
 
 use days_executor::{
-    Backend, ConstantGenerator, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
-    FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
-    HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor,
-    PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
-    SwitchQueueState, SwitchState, TcpCongestionControl, TcpDataHeader, TcpGenerator,
-    TcpReceiverState, event_phase, validate,
+    Backend, ConstantGenerator, DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind,
+    FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
+    GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor,
+    NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId, PfcIngressState, PfcQueueState,
+    QueueDepthUnit, RedPolicyState, RemoteChannel, ScheduledEmission, SchedulerKind,
+    SimulationImage, SwitchQueueState, SwitchState, TcpCongestionControl, TcpDataHeader,
+    TcpGenerator, TcpReceiverState, event_phase, validate,
 };
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -68,6 +69,7 @@ struct SourceSwitch {
     capacity: u64,
     discipline: Option<String>,
     drop: Option<String>,
+    ecn_threshold: Option<f64>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
 }
@@ -75,7 +77,18 @@ struct SourceSwitch {
 #[derive(Debug, Default, Deserialize)]
 struct SourceLink {
     mode: Option<String>,
+    pfc: Option<SourcePfc>,
     propagation_ns: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SourcePfc {
+    xoff: Option<Vec<u64>>,
+    xon: Option<Vec<u64>>,
+    buffer_capacity: Option<Vec<u64>>,
+    pause_quanta: Option<Vec<u16>>,
+    refresh_interval: Option<f64>,
+    drain_interval: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,12 +179,14 @@ struct TrafficKey {
 struct ExplicitFlowKey {
     source: u64,
     target: u64,
+    priority: u8,
     traffic: TrafficKey,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FlowSetKey {
     flow_count: u64,
+    priority: u8,
     traffic: TrafficKey,
 }
 
@@ -195,6 +210,7 @@ struct FlowInput {
     key: FlowKey,
     source: u64,
     target: u64,
+    priority: u8,
     traffic: TrafficKey,
 }
 
@@ -230,9 +246,18 @@ struct SupportedModel {
     rate_bps: u64,
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
+    drop_mark: DropMarkPolicy,
+    pfc: Option<PfcLowering>,
     propagation_ns: u64,
     explicit_flows: Vec<ExplicitFlowKey>,
     flow_sets: Vec<FlowSetKey>,
+}
+
+#[derive(Clone)]
+struct PfcLowering {
+    xoff: [u64; 8],
+    xon: [u64; 8],
+    buffer_capacity: [u64; 8],
 }
 
 impl SupportedModel {
@@ -248,7 +273,7 @@ impl SupportedModel {
             .discipline
             .as_deref()
             .ok_or_else(|| CompileError::Unsupported(
-                "unsupported scheduler: `switch.discipline` is missing; Days executor supports FIFO, SP, and WFQ"
+                "unsupported scheduler: `switch.discipline` is missing; Days executor supports FIFO, SP, WFQ, DRR, and WRR"
                     .to_owned(),
             ))?;
         let scheduler = match discipline {
@@ -281,35 +306,139 @@ impl SupportedModel {
                 }
                 SchedulerKind::weighted_fair_queue(weights)
             }
+            "DRR" => {
+                let weights = validated_weights(source.switch.weights.clone(), "DRR")?;
+                let minimum = *weights.iter().min().expect("weights are nonempty");
+                let quanta = weights
+                    .into_iter()
+                    .map(|weight| {
+                        1_500_u64
+                            .checked_mul(weight)
+                            .map(|scaled| scaled / minimum)
+                            .ok_or_else(|| {
+                                CompileError::Invalid(
+                                    "DRR quantum normalization exceeds u64".to_owned(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                SchedulerKind::deficit_round_robin(quanta)
+            }
+            "WRR" => SchedulerKind::weighted_round_robin(validated_weights(
+                source.switch.weights.clone(),
+                "WRR",
+            )?),
             unsupported => {
                 return Err(CompileError::Unsupported(format!(
-                    "unsupported scheduler `{unsupported}`; Days executor supports FIFO, SP, and WFQ"
+                    "unsupported scheduler `{unsupported}`; Days executor supports FIFO, SP, WFQ, DRR, and WRR"
                 )));
             }
         };
 
         let drop = source.switch.drop.as_deref().ok_or_else(|| {
             CompileError::Unsupported(
-                "unsupported drop policy: `switch.drop` is missing; Days executor v1 supports only TailDrop"
+                "unsupported drop policy: `switch.drop` is missing; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
                     .to_owned(),
             )
         })?;
-        if drop != "TailDrop" {
-            return Err(CompileError::Unsupported(format!(
-                "unsupported drop policy `{drop}`; Days executor v1 supports only TailDrop"
-            )));
-        }
+        let drop_mark = match drop {
+            "TailDrop" => DropMarkPolicy::TailDrop,
+            "RED" | "RED_ECN" => {
+                if source.switch.capacity < 10 {
+                    return Err(CompileError::Invalid(
+                        "RED packet capacity must be at least 10 to represent 70%/90% thresholds"
+                            .to_owned(),
+                    ));
+                }
+                DropMarkPolicy::Red(RedPolicyState {
+                    unit: QueueDepthUnit::Packets,
+                    capacity: source.switch.capacity,
+                    min_threshold: source.switch.capacity * 7 / 10,
+                    max_threshold: source.switch.capacity * 9 / 10,
+                    max_probability_numerator: 4,
+                    max_probability_denominator: 5,
+                    average_scaled: 0,
+                    counter: 0,
+                    mark_ecn: drop == "RED_ECN",
+                })
+            }
+            "ECN_THRESHOLD" => {
+                let fraction = source.switch.ecn_threshold.unwrap_or(0.8);
+                if source.switch.capacity == 0
+                    || !fraction.is_finite()
+                    || !(0.0..=1.0).contains(&fraction)
+                    || fraction == 0.0
+                {
+                    return Err(CompileError::Invalid(
+                        "ECN threshold requires finite 0 < switch.ecn_threshold <= 1 and positive capacity"
+                            .to_owned(),
+                    ));
+                }
+                let threshold = (fraction * source.switch.capacity as f64).ceil() as u64;
+                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+                    unit: QueueDepthUnit::Packets,
+                    capacity: source.switch.capacity,
+                    threshold,
+                })
+            }
+            unsupported => {
+                return Err(CompileError::Unsupported(format!(
+                    "unsupported drop policy `{unsupported}`; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
+                )));
+            }
+        };
 
         let link = source.link.unwrap_or_default();
+        let mut pfc = None;
         if let Some(mode) = link.mode.as_deref() {
-            if mode != "None" {
-                let suffix = if mode == "Pfc" {
-                    "Days executor v1 does not support PFC".to_owned()
-                } else {
-                    "Days executor v1 supports only direct constant links".to_owned()
-                };
+            if mode == "Pfc" {
+                let config = link.pfc.as_ref().ok_or_else(|| {
+                    CompileError::Invalid("`link.pfc` is required when link mode is Pfc".to_owned())
+                })?;
+                if config
+                    .refresh_interval
+                    .is_some_and(|interval| interval != 0.0)
+                    || config
+                        .drain_interval
+                        .is_some_and(|interval| interval != 0.0)
+                {
+                    return Err(CompileError::Unsupported(
+                        "PFC refresh/drain timers are outside the T25 executor mechanism; use edge-triggered XOFF/XON"
+                            .to_owned(),
+                    ));
+                }
+                let mut xoff = exact_pfc_array(config.xoff.as_deref(), "xoff")?;
+                let mut xon = exact_pfc_array(config.xon.as_deref(), "xon")?;
+                let mut buffer_capacity =
+                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?;
+                if let Some(quanta) = config.pause_quanta.as_deref() {
+                    let quanta: [u16; 8] = quanta.try_into().map_err(|_| {
+                        CompileError::Invalid(
+                            "`link.pfc.pause_quanta` must contain exactly eight entries".to_owned(),
+                        )
+                    })?;
+                    for priority in 0..8 {
+                        if quanta[priority] == 0 {
+                            xoff[priority] = 0;
+                            xon[priority] = 0;
+                            buffer_capacity[priority] = 0;
+                        }
+                    }
+                }
+                for priority in 0..8 {
+                    if xoff[priority] == 0 {
+                        xon[priority] = 0;
+                        buffer_capacity[priority] = 0;
+                    }
+                }
+                pfc = Some(PfcLowering {
+                    xoff,
+                    xon,
+                    buffer_capacity,
+                });
+            } else if mode != "None" {
                 return Err(CompileError::Unsupported(format!(
-                    "unsupported link mode `{mode}`; {suffix}"
+                    "unsupported link mode `{mode}`; Days executor supports None and Pfc"
                 )));
             }
         }
@@ -354,11 +483,48 @@ impl SupportedModel {
             rate_bps,
             queue_capacity_packets: source.switch.capacity,
             scheduler,
+            drop_mark,
+            pfc,
             propagation_ns: link.propagation_ns.unwrap_or(0),
             explicit_flows,
             flow_sets,
         })
     }
+}
+
+fn exact_pfc_array(values: Option<&[u64]>, field: &str) -> Result<[u64; 8], CompileError> {
+    let values = values.ok_or_else(|| {
+        CompileError::Invalid(format!(
+            "`link.pfc.{field}` must contain exactly eight entries"
+        ))
+    })?;
+    values.try_into().map_err(|_| {
+        CompileError::Invalid(format!(
+            "`link.pfc.{field}` must contain exactly eight entries"
+        ))
+    })
+}
+
+fn validated_weights(
+    weights: Option<Vec<u64>>,
+    discipline: &str,
+) -> Result<Vec<u64>, CompileError> {
+    let weights = weights.ok_or_else(|| {
+        CompileError::Invalid(format!(
+            "`switch.weights` must be provided for {discipline} scheduling"
+        ))
+    })?;
+    if weights.is_empty() {
+        return Err(CompileError::Invalid(format!(
+            "`switch.weights` must contain at least one class for {discipline} scheduling"
+        )));
+    }
+    if let Some(class) = weights.iter().position(|weight| *weight == 0) {
+        return Err(CompileError::Invalid(format!(
+            "`switch.weights[{class}]` must be positive for {discipline} scheduling"
+        )));
+    }
+    Ok(weights)
 }
 
 fn parse_rate(value: Option<&toml::Value>) -> Result<u64, CompileError> {
@@ -443,10 +609,9 @@ fn reject_flow_options(
                 .to_owned(),
         ));
     }
-    if priority.is_some_and(|priority| priority != 0) {
-        return Err(CompileError::Unsupported(
-            "unsupported packet priority; Days executor v1 FIFO lowering supports only priority 0"
-                .to_owned(),
+    if priority.is_some_and(|priority| priority > 7) {
+        return Err(CompileError::Invalid(
+            "packet priority must be in IEEE 802.1Q range 0..=7".to_owned(),
         ));
     }
     if routing.is_some() || path.is_some() {
@@ -483,6 +648,7 @@ fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileEr
     Ok(ExplicitFlowKey {
         source,
         target,
+        priority: flow.priority.unwrap_or(0),
         traffic: validate_traffic(flow.traffic, flow_kind)?,
     })
 }
@@ -499,6 +665,7 @@ fn validate_flow_set(flow_set: SourceFlowSet) -> Result<FlowSetKey, CompileError
     )?;
     Ok(FlowSetKey {
         flow_count: flow_set.flow_count,
+        priority: flow_set.priority.unwrap_or(0),
         traffic: validate_traffic(flow_set.traffic, flow_kind)?,
     })
 }
@@ -890,6 +1057,7 @@ fn lower(
                 id: FlowId(flow_ids[&flow.key]),
                 source: ids.node(LpKey::Host(flow.source)),
                 target: ids.node(LpKey::Host(flow.target)),
+                priority: flow.priority,
                 route: image_route(flow.source, flow.target, switch_path, &ids),
                 reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
             }
@@ -960,6 +1128,7 @@ fn lower(
                 id: payload,
                 flow: descriptor.id,
                 size_bytes: initial_size_bytes,
+                ecn_marked: false,
                 kind: packet_kind,
             });
             initial_event_inputs.push((
@@ -1089,7 +1258,7 @@ fn lower(
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-    let switch_states = switch_port_keys
+    let mut switch_states: Vec<SwitchState> = switch_port_keys
         .iter()
         .map(|port| {
             let LpKey::SwitchPort { switch, egress } = *port else {
@@ -1101,6 +1270,8 @@ fn lower(
                     egress_link: Some(ids.link(egress)),
                     scheduler: model.scheduler.clone(),
                     queue_capacity_packets: model.queue_capacity_packets,
+                    drop_mark: model.drop_mark,
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -1169,7 +1340,7 @@ fn lower(
             }
         }
     }
-    let channels = channel_keys
+    let mut channels = channel_keys
         .into_iter()
         .map(|(link_id, target)| {
             let link = links[link_id.0 as usize];
@@ -1181,6 +1352,97 @@ fn lower(
                 })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
+
+    if let Some(pfc) = &model.pfc {
+        let mut monitored_paths = BTreeMap::<(LinkId, NodeId), u64>::new();
+        for (descriptor, input) in flow_descriptors.iter().zip(&flows) {
+            for pair in descriptor.route.windows(2) {
+                let controlled = links[pair[0].0 as usize];
+                let downstream = links[pair[1].0 as usize].source;
+                if nodes[controlled.source.0 as usize].kind != NodeKind::Switch
+                    || nodes[downstream.0 as usize].kind != NodeKind::Switch
+                {
+                    continue;
+                }
+                monitored_paths
+                    .entry((controlled.id, downstream))
+                    .and_modify(|maximum| {
+                        *maximum = (*maximum).max(input.traffic.packet_size_bytes)
+                    })
+                    .or_insert(input.traffic.packet_size_bytes);
+            }
+        }
+        for ((controlled_id, downstream), max_frame_bytes) in monitored_paths {
+            let controlled = links[controlled_id.0 as usize];
+            let upstream_physical = switch_states
+                [nodes[controlled.source.0 as usize].state_slot as usize]
+                .physical_switch;
+            let downstream_physical =
+                switch_states[nodes[downstream.0 as usize].state_slot as usize].physical_switch;
+            let reverse = links
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    let source = nodes[candidate.source.0 as usize];
+                    let target = nodes[candidate.target.0 as usize];
+                    source.kind == NodeKind::Switch
+                        && target.kind == NodeKind::Switch
+                        && switch_states[source.state_slot as usize].physical_switch
+                            == downstream_physical
+                        && switch_states[target.state_slot as usize].physical_switch
+                            == upstream_physical
+                })
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "PFC controlled link {controlled_id:?} has no reverse physical link"
+                    ))
+                })?;
+            let control_channel_index = u32::try_from(channels.len()).map_err(|_| {
+                CompileError::Invalid("PFC control channel table exceeds u32".to_owned())
+            })?;
+            channels.push(RemoteChannel {
+                source: downstream,
+                target: controlled.source,
+                link: reverse.id,
+                event_kind: EventKind::RemoteArrival,
+                min_delay_ns: reverse.delay_ns(64).map_err(|error| {
+                    CompileError::Invalid(format!(
+                        "PFC reverse channel for controlled link {controlled_id:?} overflows: {error}"
+                    ))
+                })?,
+            });
+
+            let upstream_slot = nodes[controlled.source.0 as usize].state_slot as usize;
+            let upstream_queue = switch_states[upstream_slot]
+                .queues
+                .iter_mut()
+                .find(|queue| queue.egress_link == Some(controlled_id))
+                .expect("lowered switch egress owns the controlled link");
+            upstream_queue
+                .pfc
+                .get_or_insert_with(PfcQueueState::default);
+
+            let downstream_slot = nodes[downstream.0 as usize].state_slot as usize;
+            let downstream_queue = switch_states[downstream_slot]
+                .queues
+                .first_mut()
+                .expect("lowered switch LP owns one queue");
+            downstream_queue
+                .pfc
+                .get_or_insert_with(PfcQueueState::default)
+                .ingresses
+                .push(PfcIngressState {
+                    controlled_link: controlled_id,
+                    control_channel_index,
+                    buffer_capacity_bytes: pfc.buffer_capacity,
+                    max_frame_bytes,
+                    xoff_threshold_bytes: pfc.xoff,
+                    xon_threshold_bytes: pfc.xon,
+                    occupancy_bytes: [0; 8],
+                    pause_asserted: [false; 8],
+                });
+        }
+    }
 
     Ok(SimulationImage {
         stop_time_ns: model.stop_time_ns,
@@ -1230,6 +1492,7 @@ fn canonical_flows(
             key,
             source: semantic.source,
             target: semantic.target,
+            priority: semantic.priority,
             traffic: semantic.traffic,
         });
     }
@@ -1274,6 +1537,7 @@ fn canonical_flows(
                 },
                 source,
                 target,
+                priority: semantic.priority,
                 traffic: semantic.traffic.clone(),
             });
         }
@@ -1385,6 +1649,9 @@ fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
             state = mix_seed(state ^ 0x4558_504c_4943_4954);
             state = mix_seed(state ^ semantic.source);
             state = mix_seed(state ^ semantic.target);
+            if semantic.priority != 0 {
+                state = mix_seed(state ^ u64::from(semantic.priority));
+            }
             state = mix_traffic_seed(state, &semantic.traffic);
             state = mix_seed(state ^ duplicate_ordinal);
         }
@@ -1397,6 +1664,9 @@ fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
         } => {
             state = mix_seed(state ^ 0x5345_545f_4d45_4d42);
             state = mix_seed(state ^ semantic.flow_count);
+            if semantic.priority != 0 {
+                state = mix_seed(state ^ u64::from(semantic.priority));
+            }
             state = mix_traffic_seed(state, &semantic.traffic);
             state = mix_seed(state ^ duplicate_ordinal);
             state = mix_seed(state ^ member_ordinal);

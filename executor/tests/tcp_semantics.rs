@@ -45,6 +45,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
         id: FIRST,
         flow: FLOW,
         size_bytes: first_size,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: 0,
             sent_time_ns: 0,
@@ -119,6 +120,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![REVERSE],
         }],
@@ -186,6 +188,7 @@ fn switched_tcp_image(
         id: FIRST,
         flow: FLOW,
         size_bytes: MSS,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: 0,
             sent_time_ns: 0,
@@ -272,6 +275,8 @@ fn switched_tcp_image(
                     egress_link: Some(LinkId(1)),
                     scheduler,
                     queue_capacity_packets,
+                    drop_mark: Default::default(),
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -287,6 +292,8 @@ fn switched_tcp_image(
                     egress_link: Some(LinkId(3)),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 0,
+                    drop_mark: Default::default(),
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -301,6 +308,7 @@ fn switched_tcp_image(
             id: FLOW,
             source,
             target: sink,
+            priority: 0,
             route: vec![LinkId(0), LinkId(1)],
             reverse_route: vec![LinkId(2), LinkId(3)],
         }],
@@ -338,6 +346,7 @@ fn recovery_campaign_image(control: TcpCongestionControl) -> SimulationImage {
             id: payload,
             flow: FLOW,
             size_bytes: ACK_BYTES,
+            ecn_marked: false,
             kind: PacketKind::TcpAck(TcpAckHeader {
                 acknowledgment,
                 acknowledged_bytes: 0,
@@ -377,6 +386,7 @@ fn tcp_ack_burst_image(
             id: payload,
             flow: FLOW,
             size_bytes: ACK_BYTES,
+            ecn_marked: false,
             kind: PacketKind::TcpAck(TcpAckHeader {
                 acknowledgment,
                 acknowledged_bytes: acknowledgment,
@@ -456,6 +466,7 @@ fn cubic_wide_magnitude_checkpoint_image() -> SimulationImage {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: ACK_BYTES,
+        ecn_marked: false,
         kind: PacketKind::TcpAck(TcpAckHeader {
             acknowledgment: MSS,
             acknowledged_bytes: MSS,
@@ -505,6 +516,7 @@ fn scheduled_tcp_checkpoint_image(in_flight_segments: u64, total_segments: u64) 
             id: payload,
             flow: FLOW,
             size_bytes: MSS,
+            ecn_marked: false,
             kind: PacketKind::TcpData(TcpDataHeader {
                 sequence: sequence * MSS,
                 sent_time_ns: 0,
@@ -529,6 +541,7 @@ fn scheduled_tcp_checkpoint_image(in_flight_segments: u64, total_segments: u64) 
         id: scheduled_payload,
         flow: FLOW,
         size_bytes: MSS,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: in_flight_segments * MSS,
             sent_time_ns: 0,
@@ -616,6 +629,8 @@ fn stitch_checkpoint_run(
     arrivals.extend_from_slice(&suffix.arrivals);
     let mut tcp_transitions = prefix.tcp_transitions.clone();
     tcp_transitions.extend_from_slice(&suffix.tcp_transitions);
+    let mut aqm_transitions = prefix.aqm_transitions.clone();
+    aqm_transitions.extend_from_slice(&suffix.aqm_transitions);
 
     days_executor::RunResult {
         host_states: suffix.host_states.clone(),
@@ -626,6 +641,7 @@ fn stitch_checkpoint_run(
         departures,
         arrivals,
         tcp_transitions,
+        aqm_transitions,
         pending_events: suffix.pending_events.clone(),
     }
 }
@@ -2025,6 +2041,7 @@ fn cpu_checkpoint_retransmission_uses_source_owned_segment_ledger() {
             id: payload,
             flow: FLOW,
             size_bytes: ACK_BYTES,
+            ecn_marked: false,
             kind: PacketKind::TcpAck(TcpAckHeader {
                 acknowledgment: 0,
                 acknowledged_bytes: 0,
@@ -2090,6 +2107,7 @@ fn ack_normalized_checkpoint_reconstructs_partial_segment_for_both_backends() {
             id: payload,
             flow: FLOW,
             size_bytes: ACK_BYTES,
+            ecn_marked: false,
             kind: PacketKind::TcpAck(TcpAckHeader {
                 acknowledgment: 1,
                 acknowledged_bytes: 1,
@@ -2149,6 +2167,7 @@ fn inconsistent_initial_tcp_segment_sizes_are_rejected_by_both_validators() {
         id: PayloadId(4),
         flow: FLOW,
         size_bytes: MSS - 1,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: 0,
             sent_time_ns: 0,
@@ -2181,6 +2200,7 @@ fn ack_normalization_conflicts_are_rejected_by_both_validators() {
         id: PayloadId(4),
         flow: FLOW,
         size_bytes: MSS - 2,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: 1,
             sent_time_ns: 0,
@@ -2226,6 +2246,7 @@ fn future_initial_tcp_segment_is_rejected_before_fresh_send_collision() {
         id: PayloadId(2),
         flow: FLOW,
         size_bytes: MSS - 1,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: MSS,
             sent_time_ns: 0,
@@ -2431,6 +2452,7 @@ fn receiver_reserves_ack_payloads_for_preloaded_in_flight_data() {
         id: PayloadId(2),
         flow: FLOW,
         size_bytes: MSS,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: 0,
             sent_time_ns: 0,
@@ -2878,6 +2900,7 @@ fn one_timeout_event_cannot_drive_two_blocked_tcp_flows() {
         id: PayloadId(2),
         flow: FlowId(1),
         size_bytes: MSS,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence: 0,
             sent_time_ns: 0,
@@ -3077,6 +3100,7 @@ fn loss_acks_before_a_scheduled_send_still_retransmit() {
             id: payload,
             flow: FLOW,
             size_bytes: ACK_BYTES,
+            ecn_marked: false,
             kind: PacketKind::TcpAck(TcpAckHeader {
                 acknowledgment: 0,
                 acknowledged_bytes: 0,

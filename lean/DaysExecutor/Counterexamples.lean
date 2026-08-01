@@ -486,6 +486,7 @@ def queueCounterexampleDescriptor (payload : PayloadId) : PacketDescriptor :=
   { id := payload
     flow := 0
     sizeBytes := 1
+    ecnMarked := false
     kind := .data }
 
 /--
@@ -966,7 +967,7 @@ def tinyQueueTransitionResult
     | .txComplete =>
         { state with
           committedService := state.committedService.erase event.payload }
-    | .packetArrival | .retransmissionTimeout => state
+    | .packetArrival | .retransmissionTimeout | .pacingTimer => state
   { nextState
     children := tinyQueueServiceChildren node event selected
     packetReferenceIncrements :=

@@ -13,12 +13,21 @@ inductive NodeKind where
 /-- Stable flow identifier used by immutable packet descriptors. -/
 abbrev FlowId := Nat
 
+/-- PFC control data carried by an ordinary reverse-channel `RemoteArrival`. -/
+structure PfcHeader where
+  controlledLink : LinkId
+  priority : Nat
+  pause : Bool
+  deriving DecidableEq, Repr, Ord
+
 /--
-Closed packet direction mirroring `executor/src/image.rs:175-181` (`PacketKind`).
+Packet payload category at the abstraction used by the executor proofs. PFC remains a typed packet
+payload and deliberately does not extend `EventKind`.
 -/
 inductive PacketKind where
   | data
   | feedback
+  | pfc (header : PfcHeader)
   deriving DecidableEq, Repr, Ord
 
 /--
@@ -29,6 +38,7 @@ structure PacketDescriptor where
   id : PayloadId
   flow : FlowId
   sizeBytes : Nat
+  ecnMarked : Bool
   kind : PacketKind
   deriving DecidableEq, Repr
 

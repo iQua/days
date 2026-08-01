@@ -1293,6 +1293,7 @@ mod app {
                 EventKind::TxComplete => 2,
                 EventKind::RemoteArrival => 3,
                 EventKind::RetransmissionTimeout => 4,
+                EventKind::PacingTimer => 5,
             };
             checked_add(&mut stats.events_by_kind[kind], 1, "event-kind count")?;
             if step.is_direct_continuation() {

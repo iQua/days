@@ -24,6 +24,38 @@ pub enum Backend {
     Cuda,
 }
 
+/// Validator-derived lower bound between timer-clocked source emission opportunities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RateSourceLookahead {
+    pub source: NodeId,
+    pub flow: crate::FlowId,
+    pub lower_bound_ns: u64,
+}
+
+/// Reports the per-source pacing bounds consumed by validation.
+pub fn rate_source_lookahead(image: &SimulationImage) -> Vec<RateSourceLookahead> {
+    image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+        .flat_map(|owner| {
+            image.host_states[owner.state_slot as usize]
+                .generators
+                .iter()
+                .filter_map(|generator| {
+                    let FlowGeneratorKind::Rate(rate) = generator.kind else {
+                        return None;
+                    };
+                    Some(RateSourceLookahead {
+                        source: owner.id,
+                        flow: generator.flow,
+                        lower_bound_ns: rate.pacing_interval_ns,
+                    })
+                })
+        })
+        .collect()
+}
+
 impl Backend {
     const fn is_parallel(self) -> bool {
         !matches!(self, Self::Scalar)
@@ -86,11 +118,13 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_links(image)?;
     validate_flows(image)?;
     validate_generators(image)?;
+    validate_backend_capabilities(image, backend)?;
     let derived_delays = validate_packets_and_derive_delays(image)?;
     validate_tcp_segment_ledger(image)?;
     validate_owned_service_state(image, backend)?;
-    validate_channels(image, backend, &derived_delays)?;
-    validate_events(image)?;
+    let pfc_channels = validate_pfc(image)?;
+    validate_channels(image, backend, &derived_delays, &pfc_channels)?;
+    validate_events(image, &pfc_channels)?;
     validate_global_time_capacity(image, backend)?;
     validate_service_event_consistency(image)?;
     let future_work = validate_counters(image)?;
@@ -98,6 +132,70 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_payload_sequences(image, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
     validate_initial_payload_positions(image)?;
+    Ok(())
+}
+
+fn validate_backend_capabilities(
+    image: &SimulationImage,
+    backend: Backend,
+) -> Result<(), ValidationError> {
+    if !matches!(backend, Backend::Metal | Backend::Cuda) {
+        return Ok(());
+    }
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        if matches!(generator.kind, FlowGeneratorKind::Rate(_)) {
+            return Err(ValidationError::new(format!(
+                "backend {backend} does not support rate-based sources; use Scalar or Cpu"
+            )));
+        }
+    }
+    for packet in &image.initial_packets {
+        if packet.ecn_marked {
+            return Err(ValidationError::new(format!(
+                "backend {backend} does not support the ECN-marked packet plane; use Scalar or Cpu"
+            )));
+        }
+        if matches!(packet.kind, PacketKind::Pfc(_)) {
+            return Err(ValidationError::new(format!(
+                "backend {backend} does not support PFC control payloads; use Scalar or Cpu"
+            )));
+        }
+    }
+    for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
+        if queue.pfc.is_some() {
+            return Err(ValidationError::new(format!(
+                "backend {backend} does not support PFC per-priority link pause; use Scalar or Cpu"
+            )));
+        }
+        match queue.drop_mark {
+            crate::DropMarkPolicy::TailDrop => {}
+            crate::DropMarkPolicy::EcnThreshold(_) => {
+                return Err(ValidationError::new(format!(
+                    "backend {backend} does not support ECN threshold marking; use Scalar or Cpu"
+                )));
+            }
+            crate::DropMarkPolicy::Red(_) => {
+                return Err(ValidationError::new(format!(
+                    "backend {backend} does not support RED admission; use Scalar or Cpu"
+                )));
+            }
+        }
+        match queue.scheduler {
+            SchedulerKind::DeficitRoundRobin(_) => {
+                return Err(ValidationError::new(format!(
+                    "backend {backend} does not support DRR scheduling; use Scalar or Cpu"
+                )));
+            }
+            SchedulerKind::WeightedRoundRobin(_) => {
+                return Err(ValidationError::new(format!(
+                    "backend {backend} does not support WRR scheduling; use Scalar or Cpu"
+                )));
+            }
+            SchedulerKind::Fifo
+            | SchedulerKind::StaticPriority { .. }
+            | SchedulerKind::WeightedFairQueue(_) => {}
+        }
+    }
     Ok(())
 }
 
@@ -276,6 +374,12 @@ fn validate_links(image: &SimulationImage) -> Result<(), ValidationError> {
 
 fn validate_flows(image: &SimulationImage) -> Result<(), ValidationError> {
     for flow in &image.flows {
+        if flow.priority > 7 {
+            return Err(ValidationError::new(format!(
+                "flow {:?} priority {} is outside IEEE 802.1Q range 0..=7",
+                flow.id, flow.priority
+            )));
+        }
         let source = node(image, flow.source).ok_or_else(|| {
             ValidationError::new(format!(
                 "flow {:?} names unknown source node {:?}",
@@ -404,6 +508,323 @@ fn physical_location(image: &SimulationImage, id: NodeId) -> PhysicalLocation {
     }
 }
 
+fn derived_pfc_max_frame_bytes(
+    image: &SimulationImage,
+    controlled_link: LinkId,
+) -> Result<u64, ValidationError> {
+    let resident_maximum = image
+        .initial_packets
+        .iter()
+        .filter(|packet| !matches!(packet.kind, PacketKind::Pfc(_)))
+        .filter(|packet| {
+            let flow = flow(image, packet.flow).expect("packet validation established the flow");
+            packet_route(flow, packet.kind).contains(&controlled_link)
+        })
+        .map(|packet| packet.size_bytes)
+        .max()
+        .unwrap_or(0);
+
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .try_fold(resident_maximum, |maximum, generator| {
+            let flow =
+                flow(image, generator.flow).expect("generator validation established the flow");
+            if !flow.route.contains(&controlled_link)
+                || executable_generator_packets(generator)? == 0
+            {
+                return Ok(maximum);
+            }
+            let size = match generator.kind {
+                FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
+                FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
+                FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
+            };
+            Ok(maximum.max(size))
+        })
+}
+
+fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationError> {
+    let mut control_lanes = BTreeSet::new();
+    let mut controlled_priorities = BTreeSet::<(LinkId, u8)>::new();
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+    {
+        let state = &image.switch_states[owner.state_slot as usize];
+        for (queue_index, queue) in state.queues.iter().enumerate() {
+            let Some(pfc) = &queue.pfc else {
+                continue;
+            };
+            for ingress in &pfc.ingresses {
+                let controlled = link(image, ingress.controlled_link).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "switch node {:?} queue {queue_index} PFC ingress references unknown controlled link {:?}",
+                    owner.id, ingress.controlled_link
+                ))
+            })?;
+                if physical_location(image, controlled.target) != physical_location(image, owner.id)
+                {
+                    return Err(ValidationError::new(format!(
+                        "switch node {:?} queue {queue_index} PFC ingress controls link {:?}, which terminates at a different physical switch",
+                        owner.id, controlled.id
+                    )));
+                }
+                let channel_index = ingress.control_channel_index as usize;
+                let channel = image.channels.get(channel_index).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "switch node {:?} queue {queue_index} PFC ingress references unknown control channel {channel_index}",
+                    owner.id
+                ))
+            })?;
+                if !control_lanes.insert(channel_index) {
+                    return Err(ValidationError::new(format!(
+                        "PFC control channel {channel_index} is referenced by more than one ingress monitor"
+                    )));
+                }
+                let reverse = link(image, channel.link).ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "PFC control channel {channel_index} references unknown reverse link {:?}",
+                        channel.link
+                    ))
+                })?;
+                if channel.event_kind != EventKind::RemoteArrival
+                    || channel.source != owner.id
+                    || channel.target != controlled.source
+                {
+                    return Err(ValidationError::new(format!(
+                        "PFC control channel {channel_index} must be RemoteArrival from downstream LP {:?} to controlled-link owner {:?}",
+                        owner.id, controlled.source
+                    )));
+                }
+                if physical_location(image, reverse.source) != physical_location(image, owner.id)
+                    || physical_location(image, reverse.target)
+                        != physical_location(image, controlled.source)
+                {
+                    return Err(ValidationError::new(format!(
+                        "PFC control channel {channel_index} reverse link {:?} does not connect the downstream and upstream physical switches",
+                        reverse.id
+                    )));
+                }
+                let reverse_delay = reverse.delay_ns(64).map_err(|error| {
+                    ValidationError::new(format!(
+                        "PFC control channel {channel_index} 64-byte delay overflows: {error}"
+                    ))
+                })?;
+                if channel.min_delay_ns != reverse_delay {
+                    return Err(ValidationError::new(format!(
+                        "PFC control channel {channel_index} min_delay_ns {} must equal exact 64-byte reverse-link delay {reverse_delay}",
+                        channel.min_delay_ns
+                    )));
+                }
+                if ingress.max_frame_bytes == 0 {
+                    return Err(ValidationError::new(format!(
+                        "switch node {:?} queue {queue_index} PFC maximum frame size must be positive",
+                        owner.id
+                    )));
+                }
+                let reachable_frame_bytes = derived_pfc_max_frame_bytes(image, controlled.id)?;
+                if ingress.max_frame_bytes < reachable_frame_bytes {
+                    return Err(ValidationError::new(format!(
+                        "switch node {:?} queue {queue_index} PFC maximum frame bound {} is below reachable frame size {reachable_frame_bytes} on controlled link {:?}",
+                        owner.id, ingress.max_frame_bytes, controlled.id
+                    )));
+                }
+
+                let reaction_ns = u128::from(controlled.propagation_ns)
+                    .checked_add(u128::from(reverse_delay))
+                    .ok_or_else(|| ValidationError::new("PFC reaction window overflows u128"))?;
+                let line_numerator = u128::from(controlled.rate_bps)
+                    .checked_mul(reaction_ns)
+                    .ok_or_else(|| {
+                        ValidationError::new("PFC line-rate headroom product overflows u128")
+                    })?;
+                let line_bytes = line_numerator
+                    .checked_add(8_000_000_000_u128 - 1)
+                    .ok_or_else(|| ValidationError::new("PFC headroom rounding overflows u128"))?
+                    / 8_000_000_000_u128;
+                let required_headroom = u128::from(ingress.max_frame_bytes - 1)
+                    .checked_add(line_bytes)
+                    .and_then(|value| value.checked_add(u128::from(ingress.max_frame_bytes)))
+                    .ok_or_else(|| ValidationError::new("PFC required headroom overflows u128"))?;
+
+                let mut derived_occupancy = [0_u64; 8];
+                for payload in &queue.queue {
+                    let packet = packet(image, *payload)
+                        .expect("owned-state validation established queue payloads");
+                    if packet_incoming_link_at(image, packet, owner.id)
+                        == Some(ingress.controlled_link)
+                    {
+                        let priority = usize::from(
+                            flow(image, packet.flow)
+                                .expect("packet validation established flow")
+                                .priority,
+                        );
+                        derived_occupancy[priority] = derived_occupancy[priority]
+                        .checked_add(packet.size_bytes)
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "switch node {:?} queue {queue_index} PFC derived occupancy overflows",
+                                owner.id
+                            ))
+                        })?;
+                    }
+                }
+                if ingress.occupancy_bytes != derived_occupancy {
+                    return Err(ValidationError::new(format!(
+                        "switch node {:?} queue {queue_index} PFC occupancy {:?} does not equal derived waiting bytes {:?}",
+                        owner.id, ingress.occupancy_bytes, derived_occupancy
+                    )));
+                }
+                for priority in 0..8 {
+                    let xoff = ingress.xoff_threshold_bytes[priority];
+                    let xon = ingress.xon_threshold_bytes[priority];
+                    let occupancy = ingress.occupancy_bytes[priority];
+                    let capacity = ingress.buffer_capacity_bytes[priority];
+                    if xoff == 0 {
+                        if xon != 0
+                            || capacity != 0
+                            || occupancy != 0
+                            || ingress.pause_asserted[priority]
+                        {
+                            return Err(ValidationError::new(format!(
+                                "switch node {:?} queue {queue_index} disabled PFC priority {priority} must have zero XON, capacity, occupancy, and pause state",
+                                owner.id
+                            )));
+                        }
+                        continue;
+                    }
+                    controlled_priorities.insert((controlled.id, priority as u8));
+                    if capacity == 0 || xon > xoff || xoff > capacity {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {queue_index} PFC priority {priority} requires XON <= XOFF <= capacity, got {xon} <= {xoff} <= {}",
+                            owner.id, capacity
+                        )));
+                    }
+                    if occupancy > capacity {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {queue_index} PFC priority {priority} occupancy {occupancy} exceeds capacity {}",
+                            owner.id, capacity
+                        )));
+                    }
+                    if ingress.pause_asserted[priority] && occupancy <= xon {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {queue_index} PFC priority {priority} is asserted at occupancy {occupancy}, which is at or below XON {xon}",
+                            owner.id
+                        )));
+                    }
+                    if !ingress.pause_asserted[priority] && occupancy >= xoff {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {queue_index} PFC priority {priority} is unasserted at occupancy {occupancy}, at or above XOFF {xoff}",
+                            owner.id
+                        )));
+                    }
+                    let available = u128::from(capacity - xoff);
+                    if available < required_headroom {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {queue_index} PFC priority {priority} has {available} bytes of headroom, below derived requirement {required_headroom}",
+                            owner.id
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    validate_pfc_deadlock_scope(image, &controlled_priorities)?;
+
+    let pfc_events = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::RemoteArrival)
+        .fold(BTreeMap::<PayloadId, usize>::new(), |mut counts, event| {
+            *counts.entry(event.payload).or_default() += 1;
+            counts
+        });
+    for packet in image
+        .initial_packets
+        .iter()
+        .filter(|packet| matches!(packet.kind, PacketKind::Pfc(_)))
+    {
+        if pfc_events.get(&packet.id).copied() != Some(1) {
+            return Err(ValidationError::new(format!(
+                "initial PFC packet {:?} must own exactly one RemoteArrival event",
+                packet.id
+            )));
+        }
+    }
+    Ok(control_lanes)
+}
+
+fn validate_pfc_deadlock_scope(
+    image: &SimulationImage,
+    controlled: &BTreeSet<(LinkId, u8)>,
+) -> Result<(), ValidationError> {
+    let mut edges = BTreeMap::<(LinkId, u8), BTreeSet<(LinkId, u8)>>::new();
+    let mut indegree = BTreeMap::<(LinkId, u8), usize>::new();
+    for vertex in controlled {
+        edges.entry(*vertex).or_default();
+        indegree.entry(*vertex).or_default();
+    }
+    for flow in &image.flows {
+        for pair in flow.route.windows(2) {
+            let from = (pair[0], flow.priority);
+            let to = (pair[1], flow.priority);
+            if controlled.contains(&from)
+                && controlled.contains(&to)
+                && edges.entry(from).or_default().insert(to)
+            {
+                *indegree.entry(to).or_default() += 1;
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(vertex, degree)| (*degree == 0).then_some(*vertex))
+        .collect::<BTreeSet<_>>();
+    let mut visited = 0_usize;
+    while let Some(vertex) = ready.pop_first() {
+        visited += 1;
+        for target in edges.get(&vertex).into_iter().flatten() {
+            let degree = indegree
+                .get_mut(target)
+                .expect("PFC graph contains every edge target");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(*target);
+            }
+        }
+    }
+    if visited != indegree.len() {
+        let cycle = indegree
+            .iter()
+            .filter_map(|(vertex, degree)| (*degree != 0).then_some(*vertex))
+            .collect::<Vec<_>>();
+        return Err(ValidationError::new(format!(
+            "PFC circular pause dependency rejected by static deadlock scope: {cycle:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn pfc_channel_controls(image: &SimulationImage, channel_index: usize) -> Option<LinkId> {
+    image
+        .switch_states
+        .iter()
+        .flat_map(|state| &state.queues)
+        .flat_map(|queue| {
+            queue
+                .pfc
+                .as_ref()
+                .into_iter()
+                .flat_map(|pfc| &pfc.ingresses)
+        })
+        .find(|ingress| ingress.control_channel_index as usize == channel_index)
+        .map(|ingress| ingress.controlled_link)
+}
+
 fn route_target(
     image: &SimulationImage,
     route: &[LinkId],
@@ -419,12 +840,22 @@ fn route_target(
 
 fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut arrival_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
+    let mut pacing_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
     for event in image
         .initial_events
         .iter()
         .filter(|event| event.kind == EventKind::PacketArrival)
     {
         *arrival_counts
+            .entry((event.target, event.payload, event.key.time_ns))
+            .or_default() += 1;
+    }
+    for event in image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacingTimer)
+    {
+        *pacing_counts
             .entry((event.target, event.payload, event.key.time_ns))
             .or_default() += 1;
     }
@@ -687,8 +1118,185 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                 continue;
             }
 
+            if let FlowGeneratorKind::Rate(rate) = generator.kind {
+                if rate.first_pacing_time_ns == 0
+                    || rate.pacing_interval_ns == 0
+                    || rate.packet_size_bytes == 0
+                    || rate.total_bytes == 0
+                    || rate.rate_numerator_bits_per_second == 0
+                    || rate.rate_denominator == 0
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source requires positive first pacing time, interval, packet size, total bytes, and rational rate",
+                        flow.id
+                    )));
+                }
+                if gcd_u64(rate.rate_numerator_bits_per_second, rate.rate_denominator) != 1 {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source rational {}/{} is not canonical",
+                        flow.id, rate.rate_numerator_bits_per_second, rate.rate_denominator
+                    )));
+                }
+                if generator.bytes_emitted > rate.total_bytes {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source emitted bytes {} exceed total bytes {}",
+                        flow.id, generator.bytes_emitted, rate.total_bytes
+                    )));
+                }
+                let scale = u128::from(rate.rate_denominator)
+                    .checked_mul(1_000_000_000)
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} rate source credit scale exceeds u128",
+                            flow.id
+                        ))
+                    })?;
+                let tick_credit = u128::from(rate.rate_numerator_bits_per_second)
+                    .checked_mul(u128::from(rate.pacing_interval_ns))
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} rate source tick credit exceeds u128",
+                            flow.id
+                        ))
+                    })?;
+                let full_packet_cost = u128::from(rate.packet_size_bytes)
+                    .checked_mul(8)
+                    .and_then(|bits| bits.checked_mul(scale))
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} rate source packet credit cost exceeds u128",
+                            flow.id
+                        ))
+                    })?;
+                if tick_credit > full_packet_cost {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source adds {tick_credit} credit quanta per tick, exceeding one full-packet cost {full_packet_cost}",
+                        flow.id
+                    )));
+                }
+                if full_packet_cost
+                    .saturating_sub(1)
+                    .checked_add(tick_credit)
+                    .is_none()
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source credit plus one tick can exceed u128",
+                        flow.id
+                    )));
+                }
+                let remaining_bytes = rate.total_bytes - generator.bytes_emitted;
+                let active = matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                );
+                if active != (remaining_bytes != 0)
+                    && generator.next_emission.status != GeneratorStatus::Stopped
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source status {:?} is inconsistent with {remaining_bytes} remaining bytes",
+                        flow.id, generator.next_emission.status
+                    )));
+                }
+                if generator.next_emission.status == GeneratorStatus::Finished
+                    && remaining_bytes != 0
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source is Finished with {remaining_bytes} bytes remaining",
+                        flow.id
+                    )));
+                }
+                if active {
+                    let packet =
+                        packet(image, generator.next_emission.payload).ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} rate source pacing timer references unknown packet {:?}",
+                                flow.id, generator.next_emission.payload
+                            ))
+                        })?;
+                    let expected_size = rate.packet_size_bytes.min(remaining_bytes);
+                    if packet.flow != flow.id
+                        || packet.kind != PacketKind::Data
+                        || packet.size_bytes != expected_size
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} rate source pacing token {:?} does not match its next data packet",
+                            flow.id, packet.id
+                        )));
+                    }
+                    let packet_cost = u128::from(expected_size)
+                        .checked_mul(8)
+                        .and_then(|bits| bits.checked_mul(scale))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} rate source next-packet credit cost exceeds u128",
+                                flow.id
+                            ))
+                        })?;
+                    if rate.credit_quanta >= packet_cost {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} rate source credit {} is not below next-packet cost {packet_cost}",
+                            flow.id, rate.credit_quanta
+                        )));
+                    }
+                    let next_credit =
+                        rate.credit_quanta.checked_add(tick_credit).ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} rate source next pacing credit exceeds u128",
+                                flow.id
+                            ))
+                        })?;
+                    let can_emit = next_credit >= packet_cost;
+                    let expected_status = if can_emit {
+                        GeneratorStatus::Scheduled
+                    } else {
+                        GeneratorStatus::Blocked
+                    };
+                    if generator.next_emission.status != expected_status {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} rate source timer status {:?} disagrees with next-tick credit (expected {:?})",
+                            flow.id, generator.next_emission.status, expected_status
+                        )));
+                    }
+                    let deadline = generator.next_emission.departure_time_ns;
+                    if deadline < rate.first_pacing_time_ns
+                        || (deadline - rate.first_pacing_time_ns) % rate.pacing_interval_ns != 0
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} rate source pacing deadline {deadline} is off its interval grid",
+                            flow.id
+                        )));
+                    }
+                    let matches = pacing_counts
+                        .get(&(owner.id, packet.id, deadline))
+                        .copied()
+                        .unwrap_or(0);
+                    if matches != 1 {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} rate source has {matches} matching PacingTimer events; expected 1",
+                            flow.id
+                        )));
+                    }
+                    validate_scheduled_payload_sequence(
+                        image,
+                        owner,
+                        state,
+                        packet.id,
+                        flow.id,
+                        generator.packets_emitted,
+                    )?;
+                } else if generator.next_emission.status == GeneratorStatus::Stopped
+                    && generator.next_emission.departure_time_ns <= image.stop_time_ns
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} rate source is Stopped at {}, which is not beyond stop time {}",
+                        flow.id, generator.next_emission.departure_time_ns, image.stop_time_ns
+                    )));
+                }
+                continue;
+            }
+
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("TCP generators continue above")
+                unreachable!("TCP and rate generators continue above")
             };
             if constant.interval_ns == 0 {
                 return Err(ValidationError::new(format!(
@@ -1140,6 +1748,21 @@ fn validate_packets_and_derive_delays(
                 packet.id, packet.flow
             ))
         })?;
+        if let PacketKind::Pfc(header) = packet.kind {
+            if packet.size_bytes != 64 {
+                return Err(ValidationError::new(format!(
+                    "PFC packet {:?} has size {}, expected exactly 64 bytes",
+                    packet.id, packet.size_bytes
+                )));
+            }
+            if header.priority > 7 {
+                return Err(ValidationError::new(format!(
+                    "PFC packet {:?} priority {} is outside 0..=7",
+                    packet.id, header.priority
+                )));
+            }
+            continue;
+        }
         if packet.kind.is_feedback() {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
@@ -1222,6 +1845,9 @@ fn validate_packets_and_derive_delays(
                     // single byte is therefore the conservative lower bound for every future
                     // forward transmission on this route.
                     (1, flow.route.as_slice(), flow.target)
+                }
+                FlowGeneratorKind::Rate(rate) => {
+                    (rate.packet_size_bytes, flow.route.as_slice(), flow.target)
                 }
             };
             for (index, link_id) in route.iter().enumerate() {
@@ -1327,23 +1953,25 @@ fn validate_owned_service_state(
         }
         let mut egresses = BTreeSet::new();
         for (queue_index, queue) in state.queues.iter().enumerate() {
-            if let Some(limit) = backend.capacity_limit() {
-                if queue.queue_capacity_packets > limit {
+            if queue.drop_mark == crate::DropMarkPolicy::TailDrop {
+                if let Some(limit) = backend.capacity_limit() {
+                    if queue.queue_capacity_packets > limit {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {queue_index} capacity {} exceeds backend {backend} limit {limit}",
+                            owner.id, queue.queue_capacity_packets
+                        )));
+                    }
+                }
+                if queue.queue_capacity_packets != 0
+                    && queue.queue.len() as u64 > queue.queue_capacity_packets
+                {
                     return Err(ValidationError::new(format!(
-                        "switch node {:?} queue {queue_index} capacity {} exceeds backend {backend} limit {limit}",
-                        owner.id, queue.queue_capacity_packets
+                        "switch node {:?} queue {queue_index} contains {} packets, exceeding capacity {}",
+                        owner.id,
+                        queue.queue.len(),
+                        queue.queue_capacity_packets
                     )));
                 }
-            }
-            if queue.queue_capacity_packets != 0
-                && queue.queue.len() as u64 > queue.queue_capacity_packets
-            {
-                return Err(ValidationError::new(format!(
-                    "switch node {:?} queue {queue_index} contains {} packets, exceeding capacity {}",
-                    owner.id,
-                    queue.queue.len(),
-                    queue.queue_capacity_packets
-                )));
             }
             let Some(egress_id) = queue.egress_link else {
                 return Err(ValidationError::new(format!(
@@ -1405,9 +2033,22 @@ fn validate_owned_service_state(
                     owner.id
                 )));
             }
-            if !queue.queue.is_empty() && queue.in_service.is_none() && !queue.tx_ready_pending {
+            let has_eligible_packet = queue.queue.iter().any(|payload| {
+                let packet = packet(image, *payload)
+                    .expect("owned-state validation established queue payloads");
+                let priority = usize::from(
+                    flow(image, packet.flow)
+                        .expect("packet validation established flow")
+                        .priority,
+                );
+                !queue
+                    .pfc
+                    .as_ref()
+                    .is_some_and(|pfc| pfc.paused_priorities[priority])
+            });
+            if has_eligible_packet && queue.in_service.is_none() && !queue.tx_ready_pending {
                 return Err(ValidationError::new(format!(
-                    "switch node {:?} queue {queue_index} has packets but neither active service nor TxReady pending",
+                    "switch node {:?} queue {queue_index} has eligible packets but neither active service nor TxReady pending",
                     owner.id
                 )));
             }
@@ -1530,6 +2171,7 @@ fn validate_scheduler_state(
     queue: &crate::SwitchQueueState,
     pending_event_frontier: Option<u64>,
 ) -> Result<(), ValidationError> {
+    validate_drop_mark_policy(image, owner, queue_index, queue)?;
     match &queue.scheduler {
         SchedulerKind::Fifo => Ok(()),
         SchedulerKind::StaticPriority { priorities } => {
@@ -1696,6 +2338,166 @@ fn validate_scheduler_state(
             }
             Ok(())
         }
+        SchedulerKind::DeficitRoundRobin(state) => {
+            if state.quanta_bytes.is_empty()
+                || state.quanta_bytes.contains(&0)
+                || state.deficits_bytes.len() != state.quanta_bytes.len()
+                || usize::try_from(state.current_class)
+                    .ok()
+                    .is_none_or(|class| class >= state.quanta_bytes.len())
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} DRR requires positive quanta, matching deficits, and an in-range current class"
+                )));
+            }
+            for (class, quantum) in state.quanta_bytes.iter().copied().enumerate() {
+                let maximum_frame = queue
+                    .queue
+                    .iter()
+                    .filter(|payload| {
+                        scheduler_class(image, **payload, state.quanta_bytes.len()) == Some(class)
+                    })
+                    .filter_map(|payload| packet(image, *payload))
+                    .map(|packet| packet.size_bytes)
+                    .max()
+                    .unwrap_or(0);
+                if maximum_frame == 0 {
+                    continue;
+                }
+                let deficit = state.deficits_bytes[class];
+                if deficit < maximum_frame {
+                    let needed = maximum_frame - deficit;
+                    let rounds = needed / quantum + u64::from(needed % quantum != 0);
+                    if rounds
+                        .checked_mul(quantum)
+                        .and_then(|addition| deficit.checked_add(addition))
+                        .is_none()
+                    {
+                        return Err(ValidationError::new(format!(
+                            "switch node {owner:?} queue {queue_index} DRR class {class} cannot accumulate enough deficit for a {maximum_frame}-byte packet without overflowing"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        }
+        SchedulerKind::WeightedRoundRobin(state) => {
+            if state.weights.is_empty()
+                || state.weights.contains(&0)
+                || state.packets_sent_in_round.len() != state.weights.len()
+                || state
+                    .packets_sent_in_round
+                    .iter()
+                    .zip(&state.weights)
+                    .any(|(sent, weight)| sent > weight)
+                || usize::try_from(state.current_class)
+                    .ok()
+                    .is_none_or(|class| class >= state.weights.len())
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} WRR requires positive weights, matching bounded counters, and an in-range current class"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_drop_mark_policy(
+    image: &SimulationImage,
+    owner: NodeId,
+    queue_index: usize,
+    queue: &crate::SwitchQueueState,
+) -> Result<(), ValidationError> {
+    let queued_packets = u64::try_from(queue.queue.len()).map_err(|_| {
+        ValidationError::new(format!(
+            "switch node {owner:?} queue {queue_index} packet depth exceeds u64"
+        ))
+    })?;
+    let queued_bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
+        let size = packet(image, *payload)
+            .expect("packet validation precedes drop/mark validation")
+            .size_bytes;
+        total.checked_add(size).ok_or_else(|| {
+            ValidationError::new(format!(
+                "switch node {owner:?} queue {queue_index} byte depth exceeds u64"
+            ))
+        })
+    })?;
+    match queue.drop_mark {
+        crate::DropMarkPolicy::TailDrop => Ok(()),
+        crate::DropMarkPolicy::EcnThreshold(config) => {
+            if config.capacity == 0 || config.threshold == 0 || config.threshold > config.capacity {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} ECN threshold must satisfy 0 < threshold <= capacity"
+                )));
+            }
+            let depth = match config.unit {
+                crate::QueueDepthUnit::Packets => queued_packets,
+                crate::QueueDepthUnit::Bytes => queued_bytes,
+            };
+            if depth > config.capacity {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} ECN depth {depth} exceeds policy capacity {}",
+                    config.capacity
+                )));
+            }
+            Ok(())
+        }
+        crate::DropMarkPolicy::Red(state) => {
+            if state.capacity == 0
+                || state.min_threshold >= state.max_threshold
+                || state.max_threshold > state.capacity
+                || state.max_probability_numerator == 0
+                || state.max_probability_denominator == 0
+                || state.max_probability_numerator > state.max_probability_denominator
+            {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} RED requires 0 <= min < max <= capacity and 0 < max probability <= 1"
+                )));
+            }
+            let depth = match state.unit {
+                crate::QueueDepthUnit::Packets => queued_packets,
+                crate::QueueDepthUnit::Bytes => queued_bytes,
+            };
+            if depth > state.capacity {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} RED depth {depth} exceeds policy capacity {}",
+                    state.capacity
+                )));
+            }
+            let maximum_average = u128::from(state.capacity)
+                .checked_mul(1_u128 << 32)
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} RED average bound exceeds u128"
+                    ))
+                })?;
+            if state.average_scaled > maximum_average {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} RED average {} exceeds scaled capacity {maximum_average}",
+                    state.average_scaled
+                )));
+            }
+            let probability_numerator = BigUint::from(state.max_probability_numerator);
+            let worst_spacing_numerator = BigUint::from(state.max_probability_denominator)
+                * BigUint::from(state.max_threshold - state.min_threshold)
+                * BigUint::from(1_u128 << 32);
+            let worst_spacing =
+                (&worst_spacing_numerator + &probability_numerator - 1_u8) / probability_numerator;
+            if worst_spacing > BigUint::from(u64::MAX) {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} RED worst-case signal spacing exceeds u64 counter state"
+                )));
+            }
+            if BigUint::from(state.counter) >= worst_spacing {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} RED counter {} is not below its worst-case signal spacing",
+                    state.counter
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1745,6 +2547,7 @@ fn validate_channels(
     image: &SimulationImage,
     backend: Backend,
     derived_delays: &DerivedChannelDelays,
+    pfc_channels: &BTreeSet<usize>,
 ) -> Result<(), ValidationError> {
     let mut channels_by_route = BTreeMap::<(LinkId, NodeId), usize>::new();
     for (index, channel) in image.channels.iter().enumerate() {
@@ -1754,7 +2557,7 @@ fn validate_channels(
                 channel.link
             ))
         })?;
-        if channel.source != link.source {
+        if !pfc_channels.contains(&index) && channel.source != link.source {
             return Err(ValidationError::new(format!(
                 "channel {index} source {:?} does not match physical link {:?} source {:?}",
                 channel.source, link.id, link.source,
@@ -1777,6 +2580,9 @@ fn validate_channels(
                 "channel {index} declares unsupported {:?}; packet links emit RemoteArrival",
                 channel.event_kind
             )));
+        }
+        if pfc_channels.contains(&index) {
+            continue;
         }
         if let Some(first) = channels_by_route.insert((channel.link, channel.target), index) {
             return Err(ValidationError::new(format!(
@@ -1819,11 +2625,16 @@ fn validate_channels(
     Ok(())
 }
 
-fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_events(
+    image: &SimulationImage,
+    pfc_channels: &BTreeSet<usize>,
+) -> Result<(), ValidationError> {
     let declared_route_channels = image
         .channels
         .iter()
-        .map(|channel| {
+        .enumerate()
+        .filter(|(index, _)| !pfc_channels.contains(index))
+        .map(|(_, channel)| {
             (
                 channel.source,
                 channel.target,
@@ -1948,27 +2759,57 @@ fn validate_events(image: &SimulationImage) -> Result<(), ValidationError> {
                 }
             }
             EventKind::RemoteArrival => {
-                if !packet_route(flow, packet.kind).iter().any(|link_id| {
-                    declared_route_channels.contains(&(
-                        origin.id,
+                if let PacketKind::Pfc(header) = packet.kind {
+                    let matches_lane = pfc_channels.iter().any(|channel_index| {
+                        let channel = &image.channels[*channel_index];
+                        channel.source == origin.id
+                            && channel.target == event.target
+                            && pfc_channel_controls(image, *channel_index)
+                                == Some(header.controlled_link)
+                    });
+                    if !matches_lane {
+                        return Err(ValidationError::new(format!(
+                            "PFC RemoteArrival event {index} from {:?} to {:?} has no declared control lane for link {:?}",
+                            origin.id, event.target, header.controlled_link
+                        )));
+                    }
+                } else {
+                    if !packet_route(flow, packet.kind).iter().any(|link_id| {
+                        declared_route_channels.contains(&(
+                            origin.id,
+                            event.target,
+                            EventKind::RemoteArrival,
+                            *link_id,
+                        ))
+                    }) {
+                        return Err(ValidationError::new(format!(
+                            "RemoteArrival event {index} from {:?} to {:?} has no declared route channel for payload {:?}",
+                            origin.id, event.target, event.payload
+                        )));
+                    }
+                    validate_remaining_route_time(
+                        image,
+                        flow,
+                        packet,
+                        event.key.time_ns,
                         event.target,
-                        EventKind::RemoteArrival,
-                        *link_id,
-                    ))
-                }) {
+                        index,
+                    )?;
+                }
+            }
+            EventKind::PacingTimer => {
+                if origin.id != event.target || event.target != flow.source {
                     return Err(ValidationError::new(format!(
-                        "RemoteArrival event {index} from {:?} to {:?} has no declared route channel for payload {:?}",
-                        origin.id, event.target, event.payload
+                        "PacingTimer event {index} for payload {:?} must be owned by source host {:?}",
+                        event.payload, flow.source
                     )));
                 }
-                validate_remaining_route_time(
-                    image,
-                    flow,
-                    packet,
-                    event.key.time_ns,
-                    event.target,
-                    index,
-                )?;
+                if !packet.kind.is_data() {
+                    return Err(ValidationError::new(format!(
+                        "PacingTimer event {index} references non-data payload {:?}",
+                        event.payload
+                    )));
+                }
             }
             EventKind::RetransmissionTimeout => unreachable!("handled before packet lookup"),
         }
@@ -2062,6 +2903,7 @@ fn validate_global_time_capacity(
     for packet in &image.initial_packets {
         if scheduled_payloads.contains(&packet.id)
             || matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id)
+            || matches!(packet.kind, PacketKind::Pfc(_))
             || service_payloads
                 .as_ref()
                 .is_some_and(|payloads| !payloads.contains(&packet.id))
@@ -2087,6 +2929,7 @@ fn validate_global_time_capacity(
         let packet_size_bytes = match generator.kind {
             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
             FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
+            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
         };
         let remaining = executable_generator_packets(generator)?;
         for link_id in &flow.route {
@@ -2141,6 +2984,21 @@ fn validate_global_time_capacity(
                     })
             }
             FlowGeneratorKind::Tcp(_) => Ok(image.stop_time_ns),
+            FlowGeneratorKind::Rate(rate) => rate
+                .pacing_interval_ns
+                .checked_mul(remaining_generator_packets(generator)?.saturating_sub(1))
+                .and_then(|offset| {
+                    generator
+                        .next_emission
+                        .departure_time_ns
+                        .checked_add(offset)
+                })
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} latest pacing time exceeds u64",
+                        generator.flow
+                    ))
+                }),
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -2181,6 +3039,7 @@ fn validate_service_event_consistency(image: &SimulationImage) -> Result<(), Val
             EventKind::TxComplete => events.completions.push(event.payload),
             EventKind::PacketArrival
             | EventKind::RemoteArrival
+            | EventKind::PacingTimer
             | EventKind::RetransmissionTimeout => unreachable!(),
         }
     }
@@ -2415,11 +3274,26 @@ fn describe_initial_position(image: &SimulationImage, index: usize, event: crate
                 event.target
             )
         }
+        EventKind::PacingTimer => {
+            format!("PacingTimer event {index} at node {:?}", event.target)
+        }
     }
 }
 
 fn remote_arrival_link(image: &SimulationImage, event: crate::Event) -> Option<LinkId> {
     let packet = packet(image, event.payload)?;
+    if let PacketKind::Pfc(header) = packet.kind {
+        return image
+            .channels
+            .iter()
+            .enumerate()
+            .find_map(|(index, channel)| {
+                (channel.source == event.key.origin_node
+                    && channel.target == event.target
+                    && pfc_channel_controls(image, index) == Some(header.controlled_link))
+                .then_some(channel.link)
+            });
+    }
     let flow = flow(image, packet.flow)?;
     let route = packet_route(flow, packet.kind);
     let terminal = packet_terminal(flow, packet.kind);
@@ -2451,6 +3325,7 @@ fn record_mutable_payload(
 struct FutureWork {
     data_by_flow: Vec<u64>,
     feedback_by_flow: Vec<u64>,
+    pfc_by_node: Vec<u64>,
 }
 
 fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
@@ -2467,6 +3342,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
     for packet in &image.initial_packets {
         if scheduled_payloads.contains(&packet.id)
             || matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id)
+            || matches!(packet.kind, PacketKind::Pfc(_))
         {
             continue;
         }
@@ -2496,11 +3372,46 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
                 )?;
                 add_packet_count(&mut feedback_by_flow[generator.flow.0 as usize], attempts)?;
             }
+            FlowGeneratorKind::Rate(_) => add_packet_count(
+                &mut data_by_flow[generator.flow.0 as usize],
+                executable_generator_packets(generator)?,
+            )?,
+        }
+    }
+    let mut pfc_by_node = vec![0_u64; image.nodes.len()];
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+    {
+        for ingress in image.switch_states[owner.state_slot as usize]
+            .queues
+            .iter()
+            .flat_map(|queue| {
+                queue
+                    .pfc
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|pfc| &pfc.ingresses)
+            })
+        {
+            for flow in &image.flows {
+                if flow.route.contains(&ingress.controlled_link) {
+                    let frames =
+                        data_by_flow[flow.id.0 as usize]
+                            .checked_mul(2)
+                            .ok_or_else(|| {
+                                ValidationError::new("PFC control-frame bound exceeds u64")
+                            })?;
+                    add_packet_count(&mut pfc_by_node[owner.id.0 as usize], frames)?;
+                }
+            }
         }
     }
     Ok(FutureWork {
         data_by_flow,
         feedback_by_flow,
+        pfc_by_node,
     })
 }
 
@@ -2608,9 +3519,33 @@ fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationEr
 fn remaining_generator_packets(
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
+    if let FlowGeneratorKind::Rate(rate) = generator.kind {
+        if generator.bytes_emitted > rate.total_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} rate source emitted byte state exceeds total bytes {}",
+                generator.flow, rate.total_bytes
+            )));
+        }
+        let expected_bytes = u128::from(generator.packets_emitted)
+            .checked_mul(u128::from(rate.packet_size_bytes))
+            .map(|bytes| bytes.min(u128::from(rate.total_bytes)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} rate source byte bookkeeping exceeds u128",
+                    generator.flow
+                ))
+            })?;
+        if u128::from(generator.bytes_emitted) != expected_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} rate source records {} emitted bytes, expected {expected_bytes}",
+                generator.flow, generator.bytes_emitted
+            )));
+        }
+        return Ok((rate.total_bytes - generator.bytes_emitted).div_ceil(rate.packet_size_bytes));
+    }
     let FlowGeneratorKind::Constant(constant) = generator.kind else {
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-            unreachable!()
+            unreachable!("rate generators return above")
         };
         if generator.bytes_emitted > tcp.total_bytes || tcp.next_sequence > tcp.total_bytes {
             return Err(ValidationError::new(format!(
@@ -2683,7 +3618,12 @@ fn executable_generator_packets(
 ) -> Result<u64, ValidationError> {
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
-        GeneratorStatus::Blocked if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) => {
+        GeneratorStatus::Blocked
+            if matches!(
+                generator.kind,
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Rate(_)
+            ) =>
+        {
             remaining_generator_packets(generator)
         }
         GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
@@ -2915,9 +3855,20 @@ fn validate_origin_sequences(
                     remaining.saturating_sub(scheduled)
                 }
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
+                FlowGeneratorKind::Rate(_) => {
+                    let remaining = executable_generator_packets(generator)?;
+                    let reserved = u64::from(matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                    ));
+                    remaining.saturating_sub(reserved)
+                }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
         }
+    }
+    for (node_index, pfc_frames) in work.pfc_by_node.iter().copied().enumerate() {
+        emissions_by_node[node_index] += u128::from(pfc_frames);
     }
     for node in &image.nodes {
         let next = match node.kind {
@@ -2930,6 +3881,20 @@ fn validate_origin_sequences(
                     "node {:?} next origin sequence {next} does not advance existing sequence {existing}",
                     node.id
                 )));
+            }
+        }
+        if node.kind == NodeKind::Switch {
+            let node_count = image.nodes.len() as u64;
+            for packet in &image.initial_packets {
+                if node_count != 0 && packet.id.0 % node_count == node.id.0 {
+                    let sequence = packet.id.0 / node_count;
+                    if sequence >= next {
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} PFC payload sequence {sequence} is not below next origin sequence {next}",
+                            node.id
+                        )));
+                    }
+                }
             }
         }
         let transmission_events =
@@ -2970,13 +3935,26 @@ fn validate_payload_sequences(
             let owner = packet.id.0 % node_count;
             let sequence = packet.id.0 / node_count;
             let flow = flow(image, packet.flow).expect("packet validation established the flow");
-            if packet.kind.is_data() && owner != flow.source.0 {
+            if let PacketKind::Pfc(_) = packet.kind {
+                let control_origin = image
+                    .initial_events
+                    .iter()
+                    .find(|event| {
+                        event.payload == packet.id && event.kind == EventKind::RemoteArrival
+                    })
+                    .map(|event| event.key.origin_node);
+                if control_origin != Some(NodeId(owner)) {
+                    return Err(ValidationError::new(format!(
+                        "PFC packet {:?} is not allocated by its control-lane origin {:?}",
+                        packet.id, control_origin
+                    )));
+                }
+            } else if packet.kind.is_data() && owner != flow.source.0 {
                 return Err(ValidationError::new(format!(
                     "data packet {:?} for flow {:?} is not allocated by source node {:?}",
                     packet.id, flow.id, flow.source
                 )));
-            }
-            if packet.kind.is_feedback() && owner != flow.target.0 {
+            } else if packet.kind.is_feedback() && owner != flow.target.0 {
                 return Err(ValidationError::new(format!(
                     "feedback packet {:?} for flow {:?} is not allocated by target node {:?}",
                     packet.id, flow.id, flow.target
@@ -2999,9 +3977,13 @@ fn validate_payload_sequences(
             let remaining = match generator.kind {
                 FlowGeneratorKind::Constant(_) => executable_generator_packets(generator)?,
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
+                FlowGeneratorKind::Rate(_) => executable_generator_packets(generator)?,
             };
-            let already_scheduled =
-                u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+            let already_scheduled = u64::from(
+                generator.next_emission.status == GeneratorStatus::Scheduled
+                    || matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                        && generator.next_emission.status == GeneratorStatus::Blocked,
+            );
             consumed_sequences = consumed_sequences
                 .checked_add(generator.packets_emitted)
                 .and_then(|total| total.checked_add(already_scheduled))
@@ -3087,6 +4069,7 @@ fn possible_emission_links(image: &SimulationImage) -> BTreeSet<LinkId> {
     let mut links = image
         .initial_packets
         .iter()
+        .filter(|packet| !matches!(packet.kind, PacketKind::Pfc(_)))
         .flat_map(|packet| {
             flow(image, packet.flow)
                 .into_iter()
@@ -3153,18 +4136,44 @@ fn packet_remote_target_after_link(
     route_target(image, route, index, packet_terminal(flow, packet.kind))
 }
 
+fn packet_incoming_link_at(
+    image: &SimulationImage,
+    packet: &crate::PacketDescriptor,
+    target: NodeId,
+) -> Option<LinkId> {
+    let flow = flow(image, packet.flow)?;
+    let route = packet_route(flow, packet.kind);
+    let terminal = packet_terminal(flow, packet.kind);
+    route
+        .iter()
+        .copied()
+        .enumerate()
+        .find_map(|(index, link_id)| {
+            (route_target(image, route, index, terminal) == Some(target)).then_some(link_id)
+        })
+}
+
 fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
     match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => &flow.route,
-        PacketKind::Feedback | PacketKind::TcpAck(_) => &flow.reverse_route,
+        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => &flow.reverse_route,
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => flow.target,
-        PacketKind::Feedback | PacketKind::TcpAck(_) => flow.source,
+        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => flow.source,
     }
+}
+
+fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn node(image: &SimulationImage, id: NodeId) -> Option<&NodeDescriptor> {

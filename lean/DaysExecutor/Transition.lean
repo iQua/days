@@ -152,8 +152,13 @@ Closed role/event support table mirroring `executor/src/model.rs:41-60`
 -/
 def roleSupports : NodeKind → EventKind → Prop
   | .host, _ => True
-  | .switch, .packetArrival | .switch, .retransmissionTimeout => False
+  | .switch, .packetArrival | .switch, .retransmissionTimeout | .switch, .pacingTimer => False
   | .switch, .txReady | .switch, .txComplete | .switch, .remoteArrival => True
+
+@[simp] theorem host_supports_pacingTimer : roleSupports .host .pacingTimer := trivial
+
+@[simp] theorem switch_does_not_support_pacingTimer : ¬ roleSupports .switch .pacingTimer :=
+  id
 
 /--
 Determinism of each LP's abstract handler, matching the single-result dispatch in

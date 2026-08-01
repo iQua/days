@@ -403,6 +403,7 @@ fn decode_packet_fields(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
         id: PayloadId(words[0]),
         flow: crate::FlowId(words[1]),
         size_bytes: words[2],
+        ecn_marked: false,
         kind: decode_packet_kind(words[3], &words[4..7])?,
     })
 }
@@ -941,7 +942,7 @@ fn tcp_flow_segment_capacity(image: &SimulationImage, flow: usize) -> usize {
             FlowGeneratorKind::Tcp(tcp) => usize::try_from(tcp.total_bytes.div_ceil(tcp.mss_bytes))
                 .ok()
                 .map(|segments| segments.saturating_mul(4).saturating_add(8)),
-            FlowGeneratorKind::Constant(_) => None,
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
         })
         .unwrap_or(1)
         .max(1)
@@ -1270,6 +1271,9 @@ impl CudaPlan {
                                     tcp.control,
                                     &mut generators[offset + 31..offset + 43],
                                 );
+                            }
+                            FlowGeneratorKind::Rate(_) => {
+                                unreachable!("CUDA capability validation rejects rate sources")
                             }
                         }
                     }
@@ -1610,7 +1614,7 @@ fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::Tc
         .find(|generator| generator.flow.0 as usize == flow_index)
         .and_then(|generator| match generator.kind {
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
-            FlowGeneratorKind::Constant(_) => None,
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
         })
 }
 
@@ -1770,6 +1774,9 @@ fn add_flow_route_capacities(
         PacketKind::Feedback | PacketKind::TcpAck(_) => {
             (flow.reverse_route.as_slice(), flow.source)
         }
+        PacketKind::Pfc(_) => {
+            unreachable!("CUDA capability validation rejects PFC payloads")
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -1817,6 +1824,7 @@ fn flow_link_serialization_ns(
                         .map(|generator| match generator.kind {
                             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                             FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
+                            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
                         })
                 })
                 .into_iter()
@@ -1831,7 +1839,7 @@ fn flow_link_serialization_ns(
 fn packet_direction(kind: PacketKind) -> u8 {
     match kind {
         PacketKind::Data | PacketKind::TcpData(_) => 0,
-        PacketKind::Feedback | PacketKind::TcpAck(_) => 1,
+        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => 1,
     }
 }
 
@@ -2553,6 +2561,7 @@ fn timer_packet_for(image: &SimulationImage, event: Event) -> Result<PacketDescr
         id: event.payload,
         flow,
         size_bytes: 0,
+        ecn_marked: false,
         kind: PacketKind::TcpData(TcpDataHeader {
             sequence,
             sent_time_ns: event.key.time_ns,
@@ -2604,6 +2613,11 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
             header.acknowledgment,
             header.acknowledged_bytes,
             header.echoed_sent_time_ns,
+        ],
+        PacketKind::Pfc(header) => [
+            header.controlled_link.0,
+            u64::from(header.priority),
+            u64::from(header.pause),
         ],
     }
 }
@@ -2949,6 +2963,7 @@ impl CudaBuffers {
                     id: PayloadId(tcp_state[record]),
                     flow: crate::FlowId(flow as u64),
                     size_bytes: tcp_state[record + 1],
+                    ecn_marked: false,
                     kind: PacketKind::TcpData(TcpDataHeader {
                         sequence: tcp_state[record + 2],
                         sent_time_ns: tcp_state[record + 3],
@@ -2998,6 +3013,7 @@ impl CudaBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[6]),
                     size_bytes: words[7],
+                    ecn_marked: false,
                     kind: decode_packet_kind(words[8], &words[9..12])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
@@ -3015,6 +3031,7 @@ impl CudaBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[7]),
                     size_bytes: words[8],
+                    ecn_marked: false,
                     kind: decode_packet_kind(words[9], &words[10..13])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
@@ -3067,6 +3084,7 @@ impl CudaBuffers {
                 departures,
                 arrivals,
                 tcp_transitions,
+                aqm_transitions: Vec::new(),
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],

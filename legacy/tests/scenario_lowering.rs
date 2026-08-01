@@ -1321,34 +1321,6 @@ fn unsupported_source_behaviour_is_rejected_with_specific_diagnostics() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let cases = [
         (
-            "scheduler",
-            r#"
-seed = 1
-edges = [[0, 1]]
-hosts = [0, 1]
-[switch]
-port_rate = 8_000
-capacity = 1
-discipline = "DRR"
-drop = "TailDrop"
-"#,
-            "unsupported scheduler `DRR`; Days executor supports FIFO, SP, and WFQ",
-        ),
-        (
-            "drop",
-            r#"
-seed = 1
-edges = [[0, 1]]
-hosts = [0, 1]
-[switch]
-port_rate = 8_000
-capacity = 1
-discipline = "FIFO"
-drop = "RED"
-"#,
-            "unsupported drop policy `RED`; Days executor v1 supports only TailDrop",
-        ),
-        (
             "dcqcn",
             r#"
 seed = 1
@@ -1368,22 +1340,6 @@ arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
 "#,
             "unsupported flow type `DCQCN`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic",
-        ),
-        (
-            "pfc",
-            r#"
-seed = 1
-edges = [[0, 1]]
-hosts = [0, 1]
-[switch]
-port_rate = 8_000
-capacity = 1
-discipline = "FIFO"
-drop = "TailDrop"
-[link]
-mode = "Pfc"
-"#,
-            "unsupported link mode `Pfc`; Days executor v1 does not support PFC",
         ),
         (
             "zero-rate",

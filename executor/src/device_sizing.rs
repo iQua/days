@@ -368,6 +368,16 @@ impl CapacityContext {
                         minimum_feedback_sizes[index] =
                             minimum_feedback_sizes[index].min(tcp.ack_size_bytes);
                     }
+                    FlowGeneratorKind::Rate(rate) => {
+                        minimum_data_sizes[index] =
+                            minimum_data_sizes[index].min(rate.packet_size_bytes);
+                        if matches!(
+                            generator.next_emission.status,
+                            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                        ) {
+                            generator_intervals[index].push(rate.pacing_interval_ns);
+                        }
+                    }
                 }
             }
         }
@@ -376,7 +386,7 @@ impl CapacityContext {
                 PacketKind::Data | PacketKind::TcpData(_) => {
                     &mut minimum_data_sizes[packet.flow.0 as usize]
                 }
-                PacketKind::Feedback | PacketKind::TcpAck(_) => {
+                PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => {
                     &mut minimum_feedback_sizes[packet.flow.0 as usize]
                 }
             };
@@ -465,6 +475,16 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
                     let bound = tcp_data_attempt_bound(image, generator, tcp);
                     // Every delivered data attempt creates one cumulative ACK attempt.
                     counts[index] = counts[index].saturating_add(bound.saturating_mul(2));
+                }
+                FlowGeneratorKind::Rate(rate) => {
+                    if !matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Finished | GeneratorStatus::Stopped
+                    ) {
+                        let remaining = rate.total_bytes.saturating_sub(generator.bytes_emitted);
+                        counts[index] = counts[index]
+                            .saturating_add(remaining.div_ceil(rate.packet_size_bytes) as usize);
+                    }
                 }
             }
         }
@@ -686,7 +706,7 @@ fn add_flow_route_capacities(
     let flow = &image.flows[flow_index];
     let (route, terminal) = match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => (flow.route.as_slice(), flow.target),
-        PacketKind::Feedback | PacketKind::TcpAck(_) => {
+        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => {
             (flow.reverse_route.as_slice(), flow.source)
         }
     };
@@ -721,7 +741,9 @@ fn flow_link_serialization_ns(
 ) -> u64 {
     let minimum_size = match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => context.minimum_data_sizes[flow_index],
-        PacketKind::Feedback | PacketKind::TcpAck(_) => context.minimum_feedback_sizes[flow_index],
+        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => {
+            context.minimum_feedback_sizes[flow_index]
+        }
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")

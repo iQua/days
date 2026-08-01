@@ -27,6 +27,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
         id: FIRST_PACKET,
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Data,
     };
     let forward = LinkDescriptor {
@@ -105,6 +106,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![REVERSE],
         }],
@@ -115,6 +117,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 id: REVERSE,
                 source: SINK,
                 target: SOURCE,
+                priority: 0,
                 rate_bps: 8_000_000_000,
                 propagation_ns: 0,
             },
@@ -148,6 +151,7 @@ fn feedback_image() -> SimulationImage {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Feedback,
     };
     image.initial_packets = vec![feedback];
@@ -200,6 +204,7 @@ fn rich_mid_state_image() -> SimulationImage {
         id: PayloadId::from_node_sequence(SINK, 2, 0).expect("feedback payload ID must fit"),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Feedback,
     };
     image.initial_packets.push(feedback);
@@ -280,6 +285,7 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
                 .expect("wide payload ID must fit"),
             flow: FlowId(index as u64),
             size_bytes: 1,
+            ecn_marked: false,
             kind: PacketKind::Data,
         };
         nodes.push(NodeDescriptor {
@@ -304,6 +310,7 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
             id: packet.flow,
             source,
             target: sink,
+            priority: 0,
             route: vec![link.id],
             reverse_route: vec![],
         });
@@ -399,12 +406,14 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
         id: PayloadId(0),
         flow: FlowId(0),
         size_bytes: 1,
+        ecn_marked: false,
         kind: PacketKind::Data,
     };
     let packet_one = PacketDescriptor {
         id: PayloadId(1),
         flow: FlowId(1),
         size_bytes: 1,
+        ecn_marked: false,
         kind: PacketKind::Data,
     };
 
@@ -479,6 +488,8 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
                 egress_link: Some(switch_link.id),
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 1,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
@@ -493,6 +504,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
                 id: packet_zero.flow,
                 source: NodeId(0),
                 target: NodeId(3),
+                priority: 0,
                 route: vec![source_zero_link.id, switch_link.id],
                 reverse_route: vec![],
             },
@@ -500,6 +512,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
                 id: packet_one.flow,
                 source: NodeId(1),
                 target: NodeId(3),
+                priority: 0,
                 route: vec![source_one_link.id, switch_link.id],
                 reverse_route: vec![],
             },

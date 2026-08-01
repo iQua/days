@@ -21,6 +21,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
         id: FIRST_PACKET,
         flow: FLOW,
         size_bytes: 1,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     };
     let forward = LinkDescriptor {
@@ -98,6 +99,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![REVERSE],
         }],
@@ -137,6 +139,7 @@ fn feedback_image() -> SimulationImage {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 1,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Feedback,
     });
     image.initial_events.push(Event {
@@ -424,6 +427,7 @@ fn converging_emissions_keep_canonical_flow_order_at_the_source() {
             id: FlowId(0),
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![REVERSE],
         },
@@ -431,6 +435,7 @@ fn converging_emissions_keep_canonical_flow_order_at_the_source() {
             id: FlowId(1),
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![REVERSE],
         },
@@ -486,12 +491,14 @@ fn converging_emissions_keep_canonical_flow_order_at_the_source() {
             id: PayloadId(0),
             flow: FlowId(0),
             size_bytes: 1,
+            ecn_marked: false,
             kind: days_executor::PacketKind::Data,
         },
         PacketDescriptor {
             id: PayloadId(2),
             flow: FlowId(1),
             size_bytes: 1,
+            ecn_marked: false,
             kind: days_executor::PacketKind::Data,
         },
     ];

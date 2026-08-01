@@ -88,7 +88,7 @@ def orderedQueueReady : Event :=
 
 /-- Immutable packet descriptors used by the concrete scheduler image. -/
 def orderedQueueDescriptor (payload : PayloadId) : PacketDescriptor :=
-  { id := payload, flow := payload, sizeBytes := 1, kind := .data }
+  { id := payload, flow := payload, sizeBytes := 1, ecnMarked := false, kind := .data }
 
 /-- One descriptor-store entry with explicit structural owners. -/
 def orderedQueueEntry
@@ -217,7 +217,7 @@ def orderedQueueTransitionResult
     | .txComplete =>
         { state with
           committedService := state.committedService.erase event.payload }
-    | .packetArrival | .retransmissionTimeout => state
+    | .packetArrival | .retransmissionTimeout | .pacingTimer => state
   { nextState
     children := orderedQueueServiceChildren node event selected
     packetReferenceIncrements :=
@@ -609,6 +609,9 @@ private theorem orderedQueue_decision_trace (before) :
   | retransmissionTimeout =>
       simp [SelectionIntroduced, orderedQueueTransitionResult, hkind,
         orderedQueueDecisions]
+  | pacingTimer =>
+      simp [SelectionIntroduced, orderedQueueTransitionResult, hkind,
+        orderedQueueDecisions]
 
 private theorem orderedQueue_committed_nonpreemptive (before) :
     CommittedServiceNonPreemptive (orderedQueueTransition before) := by
@@ -644,6 +647,8 @@ private theorem orderedQueue_committed_nonpreemptive (before) :
         ↓reduceIte, hpresent, true_and]
       exact ⟨fun hnodup => hnodup.erase _, trivial⟩
   | retransmissionTimeout =>
+      simp [orderedQueueTransitionResult, hkind, orderedQueueDecisions]
+  | pacingTimer =>
       simp [orderedQueueTransitionResult, hkind, orderedQueueDecisions]
 
 private theorem orderedQueue_private_irrelevant (before) :

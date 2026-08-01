@@ -23,6 +23,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
         id: FIRST_PACKET,
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: PacketKind::Data,
     };
     let forward = LinkDescriptor {
@@ -101,6 +102,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![REVERSE],
         }],
@@ -111,6 +113,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 id: REVERSE,
                 source: SINK,
                 target: SOURCE,
+                priority: 0,
                 rate_bps: 8_000_000_000,
                 propagation_ns: 0,
             },
@@ -216,6 +219,8 @@ fn fifo_taildrop_image() -> SimulationImage {
                 egress_link: Some(FIFO_SWITCH_LINK),
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 2,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
@@ -230,6 +235,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 id: FlowId(index as u64),
                 source: FIFO_SOURCE,
                 target: FIFO_SINK,
+                priority: 0,
                 route: vec![FIFO_SOURCE_LINK, FIFO_SWITCH_LINK],
                 reverse_route: vec![],
             })
@@ -241,6 +247,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 id,
                 flow: FlowId(index as u64),
                 size_bytes: 2,
+                ecn_marked: false,
                 kind: PacketKind::Data,
             })
             .collect(),
@@ -316,6 +323,7 @@ fn long_continuation_image() -> SimulationImage {
                 .expect("backlog payload IDs must fit"),
             flow: FLOW,
             size_bytes: 1,
+            ecn_marked: false,
             kind: PacketKind::Data,
         })
         .collect::<Vec<_>>();
@@ -388,6 +396,7 @@ fn long_continuation_image() -> SimulationImage {
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![FORWARD],
             reverse_route: vec![],
         }],

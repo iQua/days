@@ -27,6 +27,15 @@ lean_exe drr_check where
 lean_exe wfq_check where
   root := `LeanGuard.WfqMain
 
+lean_exe sp_check where
+  root := `LeanGuard.SpMain
+
+lean_exe p10c_mechanisms_check where
+  root := `LeanGuard.P10cMain
+
+lean_exe p10c_aqm_check where
+  root := `LeanGuard.P10cAqmMain
+
 lean_exe aqm_check where
   root := `LeanGuard.AqmMain
 

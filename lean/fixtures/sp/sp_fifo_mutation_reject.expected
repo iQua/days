@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 4: scheduled packet violates SP order: got flow 3/packet 2, expected flow 1/packet 1

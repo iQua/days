@@ -1,9 +1,10 @@
 //! Immutable, backend-neutral simulation image records.
 
 use std::collections::VecDeque;
+use std::fmt;
 
 use crate::{
-    Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind,
+    DropMarkPolicy, Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind,
     TcpCongestionControl, TimeError, link_arrival_time_ns,
 };
 
@@ -42,18 +43,67 @@ pub struct HostState {
 }
 
 /// One switch-port-owned TailDrop egress queue with discipline-owned service state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SwitchQueueState {
     /// `None` is used only by terminal hand-built fixtures whose flow ends at the switch.
     pub egress_link: Option<LinkId>,
     pub scheduler: SchedulerKind,
     /// Maximum queued packets. A value of zero denotes an unbounded queue.
     pub queue_capacity_packets: u64,
+    /// Deterministic admission/marking policy. TailDrop preserves the original capacity field.
+    pub drop_mark: DropMarkPolicy,
+    /// Optional IEEE 802.1Qbb-style per-priority pause state and ingress monitor.
+    pub pfc: Option<PfcQueueState>,
     pub queue: VecDeque<PayloadId>,
     /// Packet committed to the non-preemptive transmission currently in progress.
     pub in_service: Option<PayloadId>,
     /// Whether this queue already owns a future `TxReady` decision point.
     pub tx_ready_pending: bool,
+}
+
+impl fmt::Debug for SwitchQueueState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SwitchQueueState");
+        debug
+            .field("egress_link", &self.egress_link)
+            .field("scheduler", &self.scheduler)
+            .field("queue_capacity_packets", &self.queue_capacity_packets);
+        if self.drop_mark != DropMarkPolicy::TailDrop {
+            debug.field("drop_mark", &self.drop_mark);
+        }
+        if self.pfc.is_some() {
+            debug.field("pfc", &self.pfc);
+        }
+        debug
+            .field("queue", &self.queue)
+            .field("in_service", &self.in_service)
+            .field("tx_ready_pending", &self.tx_ready_pending)
+            .finish()
+    }
+}
+
+/// Per-priority pause state owned by one switch egress queue.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PfcQueueState {
+    /// Priorities whose waiting packets are ineligible at service start.
+    pub paused_priorities: [bool; 8],
+    /// Downstream buffer monitors, one for each PFC-controlled incoming link feeding this queue.
+    pub ingresses: Vec<PfcIngressState>,
+}
+
+/// Exact byte-accounting state for one PFC-controlled incoming link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfcIngressState {
+    pub controlled_link: LinkId,
+    /// Index of the reverse control lane in `SimulationImage::channels`.
+    pub control_channel_index: u32,
+    pub buffer_capacity_bytes: [u64; 8],
+    pub max_frame_bytes: u64,
+    /// A zero XOFF threshold disables PFC for that priority.
+    pub xoff_threshold_bytes: [u64; 8],
+    pub xon_threshold_bytes: [u64; 8],
+    pub occupancy_bytes: [u64; 8],
+    pub pause_asserted: [bool; 8],
 }
 
 /// Switch-port-owned state.
@@ -72,15 +122,34 @@ pub struct SwitchState {
 }
 
 /// Stable endpoints and canonical directed route for one open-loop flow.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FlowDescriptor {
     pub id: FlowId,
     pub source: NodeId,
     pub target: NodeId,
+    /// IEEE 802.1Q priority code point used by link-level eligibility mechanisms.
+    pub priority: u8,
     /// Canonical data-packet route from source to target.
     pub route: Vec<LinkId>,
     /// Canonical feedback-packet route from target back to source.
     pub reverse_route: Vec<LinkId>,
+}
+
+impl fmt::Debug for FlowDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("FlowDescriptor");
+        debug
+            .field("id", &self.id)
+            .field("source", &self.source)
+            .field("target", &self.target);
+        if self.priority != 0 {
+            debug.field("priority", &self.priority);
+        }
+        debug
+            .field("route", &self.route)
+            .field("reverse_route", &self.reverse_route)
+            .finish()
+    }
 }
 
 /// Whether a generator owns a scheduled emission or is waiting without local work.
@@ -140,6 +209,24 @@ pub struct ConstantGenerator {
 pub enum FlowGeneratorKind {
     Constant(ConstantGenerator),
     Tcp(TcpGenerator),
+    Rate(RateGenerator),
+}
+
+/// Exact rational rate source paced by the M3 fallback-heap timer.
+///
+/// Credit uses `rate_denominator * 1_000_000_000` quanta per bit. Each pacing tick adds
+/// `rate_numerator_bits_per_second * pacing_interval_ns` quanta and one packet is emitted when the
+/// accumulated credit covers `packet_size_bytes * 8` bits.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RateGenerator {
+    pub first_pacing_time_ns: u64,
+    pub pacing_interval_ns: u64,
+    pub packet_size_bytes: u64,
+    pub total_bytes: u64,
+    pub rate_numerator_bits_per_second: u64,
+    pub rate_denominator: u64,
+    pub credit_quanta: u128,
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.
@@ -258,12 +345,37 @@ impl TcpReceiverState {
 /// Lowered images retain only the first scheduled packet for each active flow. Later records are
 /// produced by the source generator and live only while the packet is scheduled or in flight.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PacketDescriptor {
     pub id: PayloadId,
     pub flow: FlowId,
     pub size_bytes: u64,
+    /// Congestion-experienced bit carried unchanged across every hop.
+    pub ecn_marked: bool,
     pub kind: PacketKind,
+}
+
+impl fmt::Debug for PacketDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("PacketDescriptor");
+        debug
+            .field("id", &self.id)
+            .field("flow", &self.flow)
+            .field("size_bytes", &self.size_bytes);
+        if self.ecn_marked {
+            debug.field("ecn_marked", &self.ecn_marked);
+        }
+        debug.field("kind", &self.kind).finish()
+    }
+}
+
+/// PFC control payload carried by an ordinary reverse-channel `RemoteArrival`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PfcHeader {
+    pub controlled_link: LinkId,
+    pub priority: u8,
+    pub pause: bool,
 }
 
 /// TCP data metadata independent of the transmission-attempt `PayloadId`.
@@ -292,6 +404,7 @@ pub enum PacketKind {
     Feedback = 1,
     TcpData(TcpDataHeader) = 2,
     TcpAck(TcpAckHeader) = 3,
+    Pfc(PfcHeader) = 4,
 }
 
 impl PacketKind {
@@ -300,7 +413,7 @@ impl PacketKind {
     }
 
     pub const fn is_feedback(self) -> bool {
-        matches!(self, Self::Feedback | Self::TcpAck(_))
+        matches!(self, Self::Feedback | Self::TcpAck(_) | Self::Pfc(_))
     }
 
     pub const fn code(self) -> u8 {
@@ -309,6 +422,7 @@ impl PacketKind {
             Self::Feedback => 1,
             Self::TcpData(_) => 2,
             Self::TcpAck(_) => 3,
+            Self::Pfc(_) => 4,
         }
     }
 }

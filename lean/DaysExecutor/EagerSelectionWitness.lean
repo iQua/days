@@ -545,6 +545,9 @@ private theorem tinyQueue_decision_trace (eager : Bool) :
   | retransmissionTimeout =>
       simp [SelectionIntroduced, tinyQueueTransitionResult, hkind,
         tinyQueueDecisions]
+  | pacingTimer =>
+      simp [SelectionIntroduced, tinyQueueTransitionResult, hkind,
+        tinyQueueDecisions]
 
 private theorem tinyQueue_committed_nonpreemptive (eager : Bool) :
     CommittedServiceNonPreemptive (tinyQueueTransition eager) := by
@@ -598,6 +601,8 @@ private theorem tinyQueue_committed_nonpreemptive (eager : Bool) :
         ↓reduceIte, hpresent, true_and]
       exact ⟨fun hnodup => hnodup.erase _, trivial⟩
   | retransmissionTimeout =>
+      simp [tinyQueueTransitionResult, hkind, tinyQueueDecisions]
+  | pacingTimer =>
       simp [tinyQueueTransitionResult, hkind, tinyQueueDecisions]
 
 private theorem tinyQueue_canonical_private_irrelevant :

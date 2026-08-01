@@ -44,6 +44,8 @@ fn one_image_contains_host_and_switch_state_arenas() {
                 egress_link: None,
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 64,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,

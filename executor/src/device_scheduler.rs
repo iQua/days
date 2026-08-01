@@ -52,6 +52,8 @@ pub(crate) fn device_scheduler_word_count(
             SchedulerKind::Fifo => 0,
             SchedulerKind::StaticPriority { priorities } => priorities.len(),
             SchedulerKind::WeightedFairQueue(state) => state.weights.len(),
+            SchedulerKind::DeficitRoundRobin(state) => state.quanta_bytes.len(),
+            SchedulerKind::WeightedRoundRobin(state) => state.weights.len(),
         };
         words = words
             .checked_add(
@@ -169,6 +171,9 @@ pub(crate) fn prepare_device_schedulers(
                     })?;
                     write_rational(&mut words, node_base + SCHEDULER_IN_SERVICE_TAG, finish)?;
                 }
+            }
+            SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_) => {
+                unreachable!("device validation rejects DRR and WRR before scheduler packing")
             }
         }
     }

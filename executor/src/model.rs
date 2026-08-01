@@ -40,6 +40,92 @@ pub struct WfqSchedulerState {
     pub packet_finish_times: BTreeMap<PayloadId, ExactRational>,
 }
 
+/// Mutable exact state of one Deficit Round Robin scheduler.
+///
+/// Quanta and deficits are bytes. `current_class` is the next class inspected at service start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrrSchedulerState {
+    pub quanta_bytes: Vec<u64>,
+    pub deficits_bytes: Vec<u64>,
+    pub current_class: u64,
+}
+
+impl DrrSchedulerState {
+    pub fn new(quanta_bytes: Vec<u64>) -> Self {
+        Self {
+            deficits_bytes: vec![0; quanta_bytes.len()],
+            quanta_bytes,
+            current_class: 0,
+        }
+    }
+}
+
+/// Mutable exact state of one packet-count Weighted Round Robin scheduler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrrSchedulerState {
+    pub weights: Vec<u64>,
+    pub packets_sent_in_round: Vec<u64>,
+    pub current_class: u64,
+}
+
+impl WrrSchedulerState {
+    pub fn new(weights: Vec<u64>) -> Self {
+        Self {
+            packets_sent_in_round: vec![0; weights.len()],
+            weights,
+            current_class: 0,
+        }
+    }
+}
+
+/// Queue-depth unit used by deterministic admission and marking policies.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueDepthUnit {
+    Packets = 0,
+    Bytes = 1,
+}
+
+/// Deterministic ECN threshold configuration.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EcnThresholdPolicy {
+    pub unit: QueueDepthUnit,
+    pub capacity: u64,
+    /// The arriving packet is marked when post-enqueue depth is at least this value.
+    pub threshold: u64,
+}
+
+/// Exact deterministic RED state.
+///
+/// Between the thresholds, `counter` replaces the legacy random draw. The discrete signaling
+/// rule is documented beside `drop_mark_decision` in the scalar transition.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedPolicyState {
+    pub unit: QueueDepthUnit,
+    pub capacity: u64,
+    pub min_threshold: u64,
+    pub max_threshold: u64,
+    pub max_probability_numerator: u64,
+    pub max_probability_denominator: u64,
+    /// Queue-average numerator at the fixed scale `2^32`.
+    pub average_scaled: u128,
+    pub counter: u64,
+    /// Signal by setting the packet mark instead of dropping it.
+    pub mark_ecn: bool,
+}
+
+/// Admission/marking hook evaluated exactly once on switch enqueue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DropMarkPolicy {
+    /// Preserve the v1 packet-capacity TailDrop behavior.
+    #[default]
+    TailDrop,
+    EcnThreshold(EcnThresholdPolicy),
+    Red(RedPolicyState),
+}
+
 impl WfqSchedulerState {
     pub fn new(weights: Vec<u64>) -> Self {
         let zero = Ratio::from_integer(BigUint::from(0_u8));
@@ -56,12 +142,14 @@ impl WfqSchedulerState {
 
 /// Scheduling discipline and discipline-owned state for a node-owned queue.
 ///
-/// TailDrop is the only admission policy, so it does not need a second open-ended selector.
+/// Admission/marking is an orthogonal closed selector in `SwitchQueueState::drop_mark`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchedulerKind {
     Fifo,
     StaticPriority { priorities: Vec<u64> },
     WeightedFairQueue(WfqSchedulerState),
+    DeficitRoundRobin(DrrSchedulerState),
+    WeightedRoundRobin(WrrSchedulerState),
 }
 
 impl SchedulerKind {
@@ -73,12 +161,22 @@ impl SchedulerKind {
         Self::WeightedFairQueue(WfqSchedulerState::new(weights))
     }
 
+    pub fn deficit_round_robin(quanta_bytes: Vec<u64>) -> Self {
+        Self::DeficitRoundRobin(DrrSchedulerState::new(quanta_bytes))
+    }
+
+    pub fn weighted_round_robin(weights: Vec<u64>) -> Self {
+        Self::WeightedRoundRobin(WrrSchedulerState::new(weights))
+    }
+
     /// Stable device-facing tag shared by the Metal and CUDA scheduler planes.
     pub const fn code(&self) -> u8 {
         match self {
             Self::Fifo => 0,
             Self::StaticPriority { .. } => 1,
             Self::WeightedFairQueue(_) => 2,
+            Self::DeficitRoundRobin(_) => 3,
+            Self::WeightedRoundRobin(_) => 4,
         }
     }
 
@@ -87,6 +185,8 @@ impl SchedulerKind {
             Self::Fifo => "FIFO",
             Self::StaticPriority { .. } => "SP",
             Self::WeightedFairQueue(_) => "WFQ",
+            Self::DeficitRoundRobin(_) => "DRR",
+            Self::WeightedRoundRobin(_) => "WRR",
         }
     }
 }
@@ -105,6 +205,7 @@ pub enum TransitionHandler {
     SwitchTxComplete = 5,
     SwitchRemoteArrival = 6,
     HostRetransmissionTimeout = 7,
+    HostPacingTimer = 8,
 }
 
 /// Resolves a role/event pair to its supported v1 transition handler.
@@ -123,6 +224,7 @@ pub const fn resolve_transition(
         (NodeKind::Host, EventKind::RetransmissionTimeout) => {
             Some(TransitionHandler::HostRetransmissionTimeout)
         }
+        (NodeKind::Host, EventKind::PacingTimer) => Some(TransitionHandler::HostPacingTimer),
         (NodeKind::Switch, EventKind::PacketArrival) => None,
         (NodeKind::Switch, EventKind::TxReady) => Some(TransitionHandler::SwitchTxReady),
         (NodeKind::Switch, EventKind::TxComplete) => Some(TransitionHandler::SwitchTxComplete),
@@ -130,5 +232,6 @@ pub const fn resolve_transition(
             Some(TransitionHandler::SwitchRemoteArrival)
         }
         (NodeKind::Switch, EventKind::RetransmissionTimeout) => None,
+        (NodeKind::Switch, EventKind::PacingTimer) => None,
     }
 }

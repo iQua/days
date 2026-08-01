@@ -1281,6 +1281,9 @@ impl MetalPlan {
                                     &mut generators[offset..offset + GENERATOR_WORDS],
                                 );
                             }
+                            FlowGeneratorKind::Rate(_) => {
+                                unreachable!("Metal capability validation rejects rate sources")
+                            }
                         }
                     }
                 }
@@ -1529,7 +1532,7 @@ fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::Tc
         .find(|generator| generator.flow.0 as usize == flow_index)
         .and_then(|generator| match generator.kind {
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
-            FlowGeneratorKind::Constant(_) => None,
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
         })
 }
 
@@ -1784,6 +1787,9 @@ fn add_flow_route_capacities(
         PacketKind::Feedback | PacketKind::TcpAck(_) => {
             (flow.reverse_route.as_slice(), flow.source)
         }
+        PacketKind::Pfc(_) => {
+            unreachable!("Metal capability validation rejects PFC payloads")
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -1830,6 +1836,7 @@ fn flow_link_serialization_ns(
                         .map(|generator| match generator.kind {
                             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                             FlowGeneratorKind::Tcp(_) => 1,
+                            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
                         })
                 })
                 .into_iter()
@@ -2792,6 +2799,11 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
             words[1] = header.acknowledged_bytes;
             words[2] = header.echoed_sent_time_ns;
         }
+        PacketKind::Pfc(header) => {
+            words[0] = header.controlled_link.0;
+            words[1] = u64::from(header.priority);
+            words[2] = u64::from(header.pause);
+        }
     }
 }
 
@@ -3267,6 +3279,7 @@ impl MetalBuffers {
                     id: PayloadId(tcp_state[record]),
                     flow: crate::FlowId(flow as u64),
                     size_bytes: tcp_state[record + 1],
+                    ecn_marked: false,
                     kind: PacketKind::TcpData(TcpDataHeader {
                         sequence: tcp_state[record + 2],
                         sent_time_ns: tcp_state[record + 3],
@@ -3316,6 +3329,7 @@ impl MetalBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[6]),
                     size_bytes: words[7],
+                    ecn_marked: false,
                     kind: decode_packet_kind(words[8], &words[9..12])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
@@ -3333,6 +3347,7 @@ impl MetalBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[7]),
                     size_bytes: words[8],
+                    ecn_marked: false,
                     kind: decode_packet_kind(words[9], &words[10..13])?,
                 };
                 observed_packets.entry(packet.id).or_insert(packet);
@@ -3391,6 +3406,7 @@ impl MetalBuffers {
                 departures,
                 arrivals,
                 tcp_transitions,
+                aqm_transitions: Vec::new(),
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],
@@ -3489,6 +3505,7 @@ fn read_packet(storage: &[u64], slot: usize) -> PacketDescriptor {
         id: PayloadId(record[7]),
         flow: crate::FlowId(record[8]),
         size_bytes: record[9],
+        ecn_marked: false,
         kind: decode_packet_kind(record[10], &record[11..14])
             .expect("device error screening precedes packet readback"),
     }
@@ -3513,6 +3530,7 @@ fn decode_event(record: &[u64]) -> Result<(Event, Option<PacketDescriptor>), Met
                 id: PayloadId(record[7]),
                 flow: crate::FlowId(record[8]),
                 size_bytes: record[9],
+                ecn_marked: false,
                 kind: decode_packet_kind(record[10], &record[11..14])?,
             })
         })
@@ -3614,6 +3632,7 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, MetalError> {
         id: PayloadId(words[0]),
         flow: crate::FlowId(words[1]),
         size_bytes: words[2],
+        ecn_marked: false,
         kind: decode_packet_kind(words[3], &words[4..7])?,
     })
 }

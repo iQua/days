@@ -44,6 +44,7 @@ fn image(
             id: PayloadId(*payload * 3),
             flow: FlowId(*flow),
             size_bytes: *size_bytes,
+            ecn_marked: false,
             kind: PacketKind::Data,
         })
         .collect::<Vec<_>>();
@@ -132,6 +133,8 @@ fn image(
                 egress_link: Some(SWITCH_LINK),
                 scheduler,
                 queue_capacity_packets: 0,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
@@ -146,6 +149,7 @@ fn image(
                 id: FlowId(flow),
                 source: SOURCE,
                 target: SINK,
+                priority: 0,
                 route: vec![SOURCE_LINK, SWITCH_LINK],
                 reverse_route: vec![],
             })
@@ -309,6 +313,113 @@ fn wfq_virtual_time_is_fractional_while_active_and_resets_when_idle() {
     assert_eq!(wfq.virtual_time.to_string(), "0");
     assert_eq!(wfq.active_packets, [0, 0]);
     assert!(wfq.packet_finish_times.is_empty());
+}
+
+#[test]
+fn drr_accumulates_exact_byte_quanta_across_wraps() {
+    let image = image(
+        SchedulerKind::deficit_round_robin(vec![2, 1]),
+        &[(0, 0, 3, 0), (1, 1, 1, 0)],
+        8,
+    );
+
+    assert_eq!(switch_departures(&image), vec![PayloadId(3), PayloadId(0)]);
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let SchedulerKind::DeficitRoundRobin(state) = &result.switch_states[0].queues[0].scheduler
+    else {
+        panic!("fixture must retain DRR state");
+    };
+    assert_eq!(state.deficits_bytes, [1, 0]);
+    assert_eq!(state.current_class, 0);
+}
+
+#[test]
+fn wrr_uses_exact_packet_weights_and_fifo_within_class() {
+    let image = image(
+        SchedulerKind::weighted_round_robin(vec![2, 1]),
+        &[(0, 0, 1, 0), (1, 1, 1, 0), (2, 0, 1, 0), (3, 1, 1, 0)],
+        8,
+    );
+
+    assert_eq!(
+        switch_departures(&image),
+        vec![PayloadId(0), PayloadId(6), PayloadId(3), PayloadId(9)]
+    );
+}
+
+#[test]
+fn drr_and_wrr_are_byte_identical_on_scalar_and_cpu() {
+    for scheduler in [
+        SchedulerKind::deficit_round_robin(vec![2, 1]),
+        SchedulerKind::weighted_round_robin(vec![2, 1]),
+    ] {
+        let image = image(
+            scheduler,
+            &[(0, 0, 3, 0), (1, 1, 1, 0), (2, 0, 1, 0), (3, 1, 2, 0)],
+            16,
+        );
+        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        for workers in [1, 2, 4] {
+            validate(&image, Backend::Cpu { workers }).unwrap();
+            let actual = run_cpu_with_observations(
+                &image,
+                None,
+                CpuConfig {
+                    workers,
+                    ..CpuConfig::default()
+                },
+                ObservationMode::Full,
+            )
+            .unwrap();
+            assert_eq!(actual.result, expected);
+        }
+    }
+}
+
+#[test]
+fn devices_reject_drr_and_wrr_before_packing() {
+    for (scheduler, expected) in [
+        (
+            SchedulerKind::deficit_round_robin(vec![1]),
+            "does not support DRR scheduling",
+        ),
+        (
+            SchedulerKind::weighted_round_robin(vec![1]),
+            "does not support WRR scheduling",
+        ),
+    ] {
+        let image = image(scheduler, &[(0, 0, 1, 0)], 4);
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let error = validate(&image, backend).unwrap_err().to_string();
+            assert!(error.contains(expected), "{backend}: {error}");
+        }
+    }
+}
+
+#[test]
+fn validator_rejects_drr_state_whose_next_quantum_addition_overflows() {
+    let mut image = image(
+        SchedulerKind::deficit_round_robin(vec![u64::MAX]),
+        &[(0, 0, 2, 0)],
+        8,
+    );
+    let SchedulerKind::DeficitRoundRobin(state) = &mut image.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.deficits_bytes[0] = 1;
+    image.initial_events.clear();
+    image.switch_states[0].queues[0]
+        .queue
+        .push_back(PayloadId(0));
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the next DRR quantum addition would overflow")
+        .to_string();
+    assert!(
+        error.contains("DRR class 0 cannot accumulate enough deficit"),
+        "expected a DRR closure diagnostic, got: {error}"
+    );
 }
 
 #[test]

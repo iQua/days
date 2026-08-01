@@ -78,6 +78,8 @@ pub enum EventKind {
     /// This kind is deliberately not assigned to a monotone producer stream. It is the first
     /// runtime client of the exact stream-FEL fallback heap retained by T15f.
     RetransmissionTimeout = 4,
+    /// A source-owned exact rate pacing timer fires.
+    PacingTimer = 5,
 }
 
 /// Physical FEL class used by the stream decomposition.
@@ -95,7 +97,7 @@ pub const fn event_fel_class(kind: EventKind) -> EventFelClass {
         EventKind::RemoteArrival => EventFelClass::Channel,
         EventKind::TxReady | EventKind::TxComplete => EventFelClass::Service,
         EventKind::PacketArrival => EventFelClass::Generator,
-        EventKind::RetransmissionTimeout => EventFelClass::FallbackHeap,
+        EventKind::RetransmissionTimeout | EventKind::PacingTimer => EventFelClass::FallbackHeap,
     }
 }
 
@@ -106,7 +108,7 @@ pub const fn event_fel_class(kind: EventKind) -> EventFelClass {
 pub const fn event_phase(kind: EventKind) -> u16 {
     match kind {
         EventKind::PacketArrival | EventKind::RemoteArrival => 0,
-        EventKind::TxComplete | EventKind::RetransmissionTimeout => 1,
+        EventKind::TxComplete | EventKind::RetransmissionTimeout | EventKind::PacingTimer => 1,
         EventKind::TxReady => 2,
     }
 }

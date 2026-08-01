@@ -3242,7 +3242,9 @@ fn build_lps<'image>(
         .filter(|event| {
             matches!(
                 event.kind,
-                crate::EventKind::PacketArrival | crate::EventKind::RemoteArrival
+                crate::EventKind::PacketArrival
+                    | crate::EventKind::RemoteArrival
+                    | crate::EventKind::PacingTimer
             )
         })
         .map(|event| event.payload)
@@ -3499,6 +3501,7 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
                 let packets = tcp.total_bytes.div_ceil(tcp.mss_bytes).max(1);
                 image.stop_time_ns.max(1).div_ceil(packets)
             }
+            FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
         };
         let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
             continue;
@@ -3590,6 +3593,7 @@ fn assemble_result(
     let mut departures = Vec::new();
     let mut arrivals = Vec::new();
     let mut tcp_transitions = Vec::new();
+    let mut aqm_transitions = Vec::new();
     let mut pending_events = Vec::new();
 
     for lp in lps {
@@ -3615,6 +3619,7 @@ fn assemble_result(
             &mut departures,
             &mut arrivals,
             &mut tcp_transitions,
+            &mut aqm_transitions,
         )?;
     }
     for packet in tcp_segment_ledger.into_values() {
@@ -3624,6 +3629,7 @@ fn assemble_result(
     departures.sort_unstable_by_key(|(key, _)| *key);
     arrivals.sort_unstable_by_key(|(key, _)| *key);
     tcp_transitions.sort_unstable_by_key(|record| record.key);
+    aqm_transitions.sort_unstable_by_key(|record| record.key);
     Ok(RunResult {
         host_states: host_states
             .into_iter()
@@ -3642,6 +3648,7 @@ fn assemble_result(
             .collect(),
         arrivals: arrivals.into_iter().map(|(_, arrival)| arrival).collect(),
         tcp_transitions,
+        aqm_transitions,
         pending_events,
     })
 }
@@ -3674,6 +3681,7 @@ fn install_local_result(
     departures: &mut Vec<(EventKey, PacketDeparture)>,
     arrivals: &mut Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: &mut Vec<crate::TcpTransitionRecord>,
+    aqm_transitions: &mut Vec<crate::AqmTransitionRecord>,
 ) -> Result<(), ExecutionError> {
     match local.state {
         LocalNodeState::Host(state) => {
@@ -3725,15 +3733,27 @@ fn install_local_result(
         }
     }
     for packet in local.observed_packets {
-        if let Some(existing) = observed_packets.insert(packet.id, packet) {
-            if existing != packet {
+        if let Some(existing) = observed_packets.get_mut(&packet.id) {
+            let mut existing_unmarked = *existing;
+            existing_unmarked.ecn_marked = false;
+            let mut packet_unmarked = packet;
+            packet_unmarked.ecn_marked = false;
+            if existing_unmarked != packet_unmarked {
                 return Err(ExecutionError::DuplicatePayload(packet.id));
             }
+            // Scalar observation retains the first descriptor. ECN is monotone, so an
+            // unmarked copy is necessarily earlier than a marked copy across LP shards.
+            if existing.ecn_marked && !packet.ecn_marked {
+                *existing = packet;
+            }
+        } else {
+            observed_packets.insert(packet.id, packet);
         }
     }
     departures.extend(local.departures);
     arrivals.extend(local.arrivals);
     tcp_transitions.extend(local.tcp_transitions);
+    aqm_transitions.extend(local.aqm_transitions);
     Ok(())
 }
 
@@ -4175,6 +4195,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 id: PayloadId::from_node_sequence(NodeId(0), 5, sequence).unwrap(),
                 flow,
                 size_bytes: 1,
+                ecn_marked: false,
                 kind: PacketKind::Data,
             }
         })
@@ -4257,6 +4278,8 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                     egress_link: Some(lower_port_link.id),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 1,
+                    drop_mark: Default::default(),
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -4272,6 +4295,8 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                     egress_link: Some(higher_port_link.id),
                     scheduler: SchedulerKind::Fifo,
                     queue_capacity_packets: 1,
+                    drop_mark: Default::default(),
+                    pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
                     tx_ready_pending: false,
@@ -4287,6 +4312,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 id: FlowId(0),
                 source: NodeId(0),
                 target: NodeId(4),
+                priority: 0,
                 route: vec![source_link.id, higher_port_link.id],
                 reverse_route: vec![],
             },
@@ -4294,6 +4320,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 id: FlowId(1),
                 source: NodeId(0),
                 target: NodeId(3),
+                priority: 0,
                 route: vec![source_link.id, lower_port_link.id],
                 reverse_route: vec![],
             },
@@ -4301,6 +4328,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 id: FlowId(2),
                 source: NodeId(0),
                 target: NodeId(4),
+                priority: 0,
                 route: vec![source_link.id, higher_port_link.id],
                 reverse_route: vec![],
             },

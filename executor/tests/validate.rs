@@ -72,6 +72,8 @@ fn valid_image() -> SimulationImage {
                 egress_link: Some(SWITCH_LINK),
                 scheduler: SchedulerKind::Fifo,
                 queue_capacity_packets: 2,
+                drop_mark: Default::default(),
+                pfc: None,
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
@@ -85,6 +87,7 @@ fn valid_image() -> SimulationImage {
             id: FLOW,
             source: SOURCE,
             target: SINK,
+            priority: 0,
             route: vec![SOURCE_LINK, SWITCH_LINK],
             reverse_route: vec![],
         }],
@@ -92,6 +95,7 @@ fn valid_image() -> SimulationImage {
             id: PACKET,
             flow: FLOW,
             size_bytes: 2,
+            ecn_marked: false,
             kind: days_executor::PacketKind::Data,
         }],
         links: vec![
@@ -269,6 +273,7 @@ fn descriptor_ids_must_match_their_dense_table_indices() {
         id: FlowId(1),
         source: SOURCE,
         target: SINK,
+        priority: 0,
         route: vec![SOURCE_LINK, SWITCH_LINK],
         reverse_route: vec![],
     });
@@ -283,6 +288,7 @@ fn descriptor_ids_must_match_their_dense_table_indices() {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
     packets.initial_packets.swap(0, 1);
@@ -423,6 +429,8 @@ fn routes_and_preloaded_service_state_must_be_executable() {
         egress_link: Some(other_egress),
         scheduler: SchedulerKind::Fifo,
         queue_capacity_packets: 2,
+        drop_mark: Default::default(),
+        pfc: None,
         queue: VecDeque::from([PACKET]),
         in_service: None,
         tx_ready_pending: true,
@@ -482,6 +490,7 @@ fn channel_bounds_use_the_minimum_delay_across_packets_on_the_link() {
         id: PayloadId(3),
         flow: FLOW,
         size_bytes: 100,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
 
@@ -522,6 +531,8 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
             egress_link: Some(return_link),
             scheduler: SchedulerKind::Fifo,
             queue_capacity_packets: 2,
+            drop_mark: Default::default(),
+            pfc: None,
             queue: VecDeque::new(),
             in_service: None,
             tx_ready_pending: false,
@@ -535,6 +546,7 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
         id: FlowId(1),
         source: SINK,
         target: SOURCE,
+        priority: 0,
         route: vec![SINK_EGRESS, return_link],
         reverse_route: vec![],
     });
@@ -542,6 +554,7 @@ fn channel_bounds_use_only_packets_admitted_to_the_referenced_link() {
         id: PayloadId(2),
         flow: FlowId(1),
         size_bytes: 1,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
     image.channels.extend([
@@ -720,6 +733,7 @@ fn keys_services_capacities_and_arithmetic_must_fit_the_backend() {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
     queued_overflow.initial_events.push(Event {
@@ -878,6 +892,7 @@ fn initial_event_keys_must_be_strictly_ascending() {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
     image.initial_events[0].key.time_ns = 1;
@@ -925,6 +940,7 @@ fn completion_diagnostics_preserve_initial_event_payload_order() {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
     image.initial_events[0].kind = EventKind::TxComplete;
@@ -956,6 +972,7 @@ fn aggregate_packet_counts_retain_counter_and_sequence_diagnostics() {
         id: PayloadId(1),
         flow: FLOW,
         size_bytes: 2,
+        ecn_marked: false,
         kind: days_executor::PacketKind::Data,
     });
     counter.host_states[0].sourced_packets = u64::MAX - 1;
