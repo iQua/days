@@ -1555,6 +1555,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
                 let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                     unreachable!()
                 };
+                // Validation rejects the open-loop Stopped state for TCP. A Finished sender has
+                // no future attempts, but any genuinely live initial packets were counted above.
+                if generator.next_emission.status == GeneratorStatus::Finished {
+                    continue;
+                }
                 let remaining = tcp.total_bytes.saturating_sub(tcp.next_sequence);
                 let fresh = remaining.div_ceil(tcp.mss_bytes) as usize;
                 let outstanding = tcp.bytes_in_flight.div_ceil(tcp.mss_bytes) as usize;

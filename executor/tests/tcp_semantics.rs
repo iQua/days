@@ -1365,6 +1365,46 @@ fn device_sizing_derives_a_tcp_plan() {
         .expect("generic GPU sizing must account for TCP state and exact fallback timers");
     assert!(report.total_device_bytes > 0);
     assert!(report.event_arenas.fallback_heap_event_slots >= image.nodes.len() + 1);
+
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal-spike", target_vendor = "apple")
+    ))]
+    let checkpoint = {
+        let completed = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("single-segment TCP fixture must finish");
+        checkpoint_image(&image, &completed)
+    };
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    {
+        let metal = run_metal_with_observations(
+            &checkpoint,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("Finished TCP checkpoint must fit the derived Metal plan");
+        assert_eq!(metal.memory_layout.legacy_heap_event_slots, 20);
+        assert_eq!(metal.memory_layout.fallback_heap_event_slots, 2);
+        assert_eq!(metal.memory_layout.channel_stream_event_slots, 4);
+        assert_eq!(metal.memory_layout.total_event_arena_bytes(), 2_128);
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let cuda = run_cuda_with_observations(
+            &checkpoint,
+            None,
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("Finished TCP checkpoint must fit the derived CUDA plan");
+        assert_eq!(cuda.memory_layout.legacy_heap_event_slots, 20);
+        assert_eq!(cuda.memory_layout.fallback_heap_event_slots, 2);
+        assert_eq!(cuda.memory_layout.channel_stream_event_slots, 4);
+        assert_eq!(cuda.memory_layout.total_event_arena_bytes(), 2_128);
+    }
 }
 
 #[test]
