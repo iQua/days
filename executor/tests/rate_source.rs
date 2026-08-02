@@ -243,6 +243,149 @@ fn scheduled_rate_deadline_at_stop_remains_executable() {
 }
 
 #[test]
+fn blocked_rate_ticks_are_reserved_in_origin_sequence_capacity() {
+    let packet_cost = 8_u128 * 1_000_000_000;
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 1,
+            rate_denominator: 1,
+            credit_quanta: packet_cost - 3,
+        },
+        GeneratorStatus::Blocked,
+        3,
+    );
+    image.host_states[0].next_origin_seq = u64::MAX - 3;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("successor pacing timers must be included in origin-sequence capacity")
+        .to_string();
+    assert!(
+        error.contains("origin sequence space overflows") && error.contains("NodeId(0)"),
+        "expected the pacing-timer origin-capacity diagnostic, got: {error}"
+    );
+    let error = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect_err("execution demonstrates the origin-capacity fault validation must prevent")
+        .to_string();
+    assert!(
+        error.contains("origin sequence overflow") && error.contains("NodeId(0)"),
+        "expected the protected runtime fault, got: {error}"
+    );
+}
+
+#[test]
+fn blocked_rate_deadline_beyond_stop_reserves_no_origin_capacity() {
+    let packet_cost = 8_u128 * 1_000_000_000;
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 11,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 1,
+            rate_denominator: 1,
+            credit_quanta: packet_cost - 2,
+        },
+        GeneratorStatus::Blocked,
+        10,
+    );
+    image.host_states[0].next_origin_seq = u64::MAX;
+
+    validate(&image, Backend::Scalar)
+        .expect("a blocked pacing deadline beyond stop cannot allocate a successor timer");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the beyond-stop timer must not execute");
+    assert_eq!(result.host_states[0].next_origin_seq, u64::MAX);
+}
+
+#[test]
+fn blocked_tick_at_stop_reserves_only_packets_it_can_emit() {
+    let packet_cost = 8_u128 * 1_000_000_000;
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 10,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 1,
+            rate_denominator: 1,
+            credit_quanta: packet_cost - 2,
+        },
+        GeneratorStatus::Blocked,
+        10,
+    );
+    image.host_states[0].sourced_packets = u64::MAX;
+
+    validate(&image, Backend::Scalar)
+        .expect("the stop-time blocked tick cannot emit a packet before the horizon");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the stop-time blocked tick must stop without sourcing a packet");
+    assert_eq!(result.summary.sourced_packets, 0);
+    assert_eq!(
+        result.host_states[0].generators[0].next_emission.status,
+        GeneratorStatus::Stopped
+    );
+}
+
+#[test]
+fn scheduled_tick_at_stop_does_not_reserve_later_packets() {
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 10,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 2,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    image.host_states[0].sourced_packets = u64::MAX - 1;
+
+    validate(&image, Backend::Scalar)
+        .expect("only the executable stop-time packet must be reserved");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the one executable stop-time packet fits the counter boundary");
+    assert_eq!(result.summary.sourced_packets, 1);
+    assert_eq!(
+        result.host_states[0].generators[0].next_emission.status,
+        GeneratorStatus::Stopped
+    );
+}
+
+#[test]
+fn payload_capacity_counts_emissions_before_a_terminal_blocked_tick() {
+    let packet_cost = 8_u128 * 1_000_000_000;
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 2,
+            rate_numerator_bits_per_second: 1,
+            rate_denominator: 1,
+            credit_quanta: packet_cost - 1,
+        },
+        GeneratorStatus::Scheduled,
+        2,
+    );
+    image.host_states[0].next_payload_seq = u64::MAX;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the first emission allocates the token reused by the final blocked tick")
+        .to_string();
+    assert!(
+        error.contains("payload identity sequence") && error.contains("reserving 1"),
+        "expected the exact payload-capacity diagnostic, got: {error}"
+    );
+}
+
+#[test]
 fn exact_rational_credit_produces_remainder_cadence_and_status_transitions() {
     assert_eq!(
         event_fel_class(EventKind::PacingTimer),

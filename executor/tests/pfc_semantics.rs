@@ -4,7 +4,7 @@ use days_executor::{
     Backend, CpuConfig, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, PfcHeader, PfcIngressState, PfcQueueState, RemoteChannel, RunResult,
+    PayloadId, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RunResult,
     ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState,
     TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase,
     pfc_transitions_csv, run_cpu_with_observations, run_scalar_with_observations, validate,
@@ -1349,6 +1349,68 @@ fn validator_rejects_a_configured_frame_bound_below_reachable_traffic() {
         error.contains("maximum frame bound 999") && error.contains("reachable frame size 1000"),
         "expected a derived frame-bound diagnostic, got: {error}"
     );
+}
+
+fn final_partial_rate_pfc_image(max_frame_bytes: u64) -> SimulationImage {
+    let mut image = path_image();
+    image.stop_time_ns = 0;
+    image.switch_states[1].queues[0]
+        .pfc
+        .as_mut()
+        .and_then(|pfc| pfc.ingresses.first_mut())
+        .expect("fixture has a PFC monitor")
+        .max_frame_bytes[usize::from(PRIORITY)] = max_frame_bytes;
+    image.host_states[0].generators.push(FlowGeneratorState {
+        flow: FLOW,
+        packets_emitted: 0,
+        bytes_emitted: 0,
+        next_emission: ScheduledEmission {
+            status: GeneratorStatus::Scheduled,
+            departure_time_ns: 0,
+            payload: DATA_0,
+        },
+        rng_state: 25,
+        feedback: GeneratorFeedbackState {
+            arrivals: 0,
+            outstanding_bytes: 0,
+            unacknowledged_bytes: 0,
+        },
+        kind: FlowGeneratorKind::Rate(RateGenerator {
+            first_pacing_time_ns: 0,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1_000,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        }),
+    });
+    image.host_states[0].next_origin_seq = 1;
+    image.host_states[0].next_payload_seq = 1;
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::PacingTimer),
+            origin_node: SOURCE,
+            origin_seq: 0,
+        },
+        target: SOURCE,
+        kind: EventKind::PacingTimer,
+        payload: DATA_0,
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image
+}
+
+#[test]
+fn pfc_max_frame_uses_exact_final_partial_rate_packet() {
+    let image = final_partial_rate_pfc_image(1);
+    validate(&image, Backend::Scalar)
+        .expect("the one-byte final partial packet fits the exact PFC frame bound");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the one-byte final packet executes");
+    assert_eq!(result.summary.sourced_packets, 1);
+    assert_eq!(result.summary.sourced_bytes, 1);
 }
 
 #[test]

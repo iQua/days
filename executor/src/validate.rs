@@ -531,7 +531,9 @@ fn derived_pfc_max_frame_bytes(
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                 FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
-                FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
+                FlowGeneratorKind::Rate(rate) => rate
+                    .packet_size_bytes
+                    .min(rate.total_bytes - generator.bytes_emitted),
             };
             maximum[priority] = maximum[priority].max(size);
         }
@@ -3300,6 +3302,85 @@ fn remaining_rate_pacing_ticks(
     Ok(ticks)
 }
 
+fn executable_rate_pacing_ticks(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<BigUint, ValidationError> {
+    if !matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+    ) || generator.next_emission.departure_time_ns > image.stop_time_ns
+    {
+        return Ok(BigUint::from(0_u8));
+    }
+    remaining_generator_packets(generator)?;
+    let FlowGeneratorKind::Rate(rate) = generator.kind else {
+        unreachable!("only rate generators have pacing ticks")
+    };
+    let available_ticks = BigUint::from(
+        (image.stop_time_ns - generator.next_emission.departure_time_ns) / rate.pacing_interval_ns,
+    ) + 1_u8;
+    Ok(remaining_rate_pacing_ticks(generator)?.min(available_ticks))
+}
+
+fn rate_packets_within_ticks(
+    generator: &crate::FlowGeneratorState,
+    ticks: &BigUint,
+) -> Result<u64, ValidationError> {
+    let remaining_packets = remaining_generator_packets(generator)?;
+    if ticks == &BigUint::from(0_u8) || remaining_packets == 0 {
+        return Ok(0);
+    }
+    let FlowGeneratorKind::Rate(rate) = generator.kind else {
+        unreachable!("only rate generators have pacing ticks")
+    };
+    let remaining_bytes = rate.total_bytes - generator.bytes_emitted;
+    let full_packets = BigUint::from(remaining_bytes / rate.packet_size_bytes);
+    let partial_packet = !remaining_bytes.is_multiple_of(rate.packet_size_bytes);
+    let scale = BigUint::from(rate.rate_denominator) * BigUint::from(1_000_000_000_u64);
+    let tick_credit =
+        BigUint::from(rate.rate_numerator_bits_per_second) * BigUint::from(rate.pacing_interval_ns);
+    let full_packet_cost = BigUint::from(rate.packet_size_bytes) * BigUint::from(8_u8) * scale;
+    let total_credit = BigUint::from(rate.credit_quanta) + ticks * tick_credit;
+    let credit_limited = total_credit / full_packet_cost;
+    let emitted_full = full_packets.clone().min(ticks.clone()).min(credit_limited);
+    let emitted_all_full = emitted_full == full_packets;
+    let mut emitted = u64::try_from(emitted_full).map_err(|_| {
+        ValidationError::new(format!(
+            "flow {:?} executable rate packet count exceeds u64",
+            generator.flow
+        ))
+    })?;
+    if partial_packet && emitted_all_full && remaining_rate_pacing_ticks(generator)? <= *ticks {
+        emitted = emitted.checked_add(1).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} executable rate packet count exceeds u64",
+                generator.flow
+            ))
+        })?;
+    }
+    Ok(emitted)
+}
+
+fn executable_rate_packets(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    rate_packets_within_ticks(generator, &executable_rate_pacing_ticks(image, generator)?)
+}
+
+fn rate_payload_allocations(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let mut successor_ticks = executable_rate_pacing_ticks(image, generator)?;
+    if successor_ticks == BigUint::from(0_u8) {
+        return Ok(0);
+    }
+    successor_ticks -= 1_u8;
+    rate_packets_within_ticks(generator, &successor_ticks)
+}
+
 fn latest_rate_pacing_time(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
@@ -4167,23 +4248,17 @@ fn executable_generator_packets(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
-    if matches!(
-        generator.next_emission.status,
-        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-    ) && matches!(generator.kind, FlowGeneratorKind::Rate(_))
-        && generator.next_emission.departure_time_ns > image.stop_time_ns
+    if matches!(generator.kind, FlowGeneratorKind::Rate(_))
+        && matches!(
+            generator.next_emission.status,
+            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+        )
     {
-        remaining_generator_packets(generator)?;
-        return Ok(0);
+        return executable_rate_packets(image, generator);
     }
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
-        GeneratorStatus::Blocked
-            if matches!(
-                generator.kind,
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Rate(_)
-            ) =>
-        {
+        GeneratorStatus::Blocked if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) => {
             remaining_generator_packets(generator)
         }
         GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
@@ -4416,12 +4491,17 @@ fn validate_origin_sequences(
                 }
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
                 FlowGeneratorKind::Rate(_) => {
-                    let remaining = executable_generator_packets(image, generator)?;
-                    let reserved = u64::from(matches!(
-                        generator.next_emission.status,
-                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-                    ));
-                    remaining.saturating_sub(reserved)
+                    let ticks = executable_rate_pacing_ticks(image, generator)?;
+                    if ticks == BigUint::from(0_u8) {
+                        0
+                    } else {
+                        u64::try_from(ticks - 1_u8).map_err(|_| {
+                            ValidationError::new(format!(
+                                "flow {:?} successor pacing-timer count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
+                    }
                 }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
@@ -4552,7 +4632,7 @@ fn validate_payload_sequences(
             let remaining = match generator.kind {
                 FlowGeneratorKind::Constant(_) => executable_generator_packets(image, generator)?,
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
-                FlowGeneratorKind::Rate(_) => executable_generator_packets(image, generator)?,
+                FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
             };
             let already_scheduled = u64::from(
                 generator.next_emission.status == GeneratorStatus::Scheduled
@@ -4568,25 +4648,16 @@ fn validate_payload_sequences(
                         owner.id
                     ))
                 })?;
-            let dormant_rate_token = matches!(generator.kind, FlowGeneratorKind::Rate(_))
-                && matches!(
-                    generator.next_emission.status,
-                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-                )
-                && generator.next_emission.departure_time_ns > image.stop_time_ns;
-            let reserved_from_remaining = if dormant_rate_token {
-                0
+            let required = if matches!(generator.kind, FlowGeneratorKind::Rate(_)) {
+                remaining
             } else {
-                already_scheduled
-            };
-            let required = remaining
-                .checked_sub(reserved_from_remaining)
-                .ok_or_else(|| {
+                remaining.checked_sub(already_scheduled).ok_or_else(|| {
                     ValidationError::new(format!(
                         "flow {:?} has a scheduled emission after its constant generator finished",
                         generator.flow
                     ))
-                })?;
+                })?
+            };
             allocations = allocations.checked_add(required).ok_or_else(|| {
                 ValidationError::new(format!(
                     "node {:?} generated-packet count exceeds u64",
