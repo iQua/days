@@ -429,6 +429,28 @@ fn blocked_rate_source_reserves_every_pacing_tick_in_the_time_domain() {
 }
 
 #[test]
+fn blocked_rate_token_is_reserved_exactly_once() {
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 2,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 1,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Blocked,
+        10,
+    );
+    image.host_states[0].sourced_packets = u64::MAX - 1;
+
+    validate(&image, Backend::Scalar).expect(
+        "the resident Blocked pacing token is part of the generator's one remaining packet, not a second future packet",
+    );
+}
+
+#[test]
 fn time_zero_is_a_legal_rate_source_deadline() {
     let image = rate_image(
         RateGenerator {

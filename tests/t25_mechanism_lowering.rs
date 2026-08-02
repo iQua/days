@@ -273,3 +273,73 @@ pkt_size_dist = { type = "Uniform", low = 2000, high = 2000 }
     let image = compiled.expect("mixed-frame branches sharing a link/priority must lower");
     validate(&image, Backend::Scalar).expect("branched PFC image must validate");
 }
+
+#[test]
+fn pfc_lowering_uses_the_executor_tcp_ack_size_on_reverse_routes() {
+    let path = std::env::temp_dir().join(format!(
+        "days-t25-pfc-tcp-ack-frame-{}.toml",
+        std::process::id()
+    ));
+    let config = r#"
+seed = 25
+edges = [[0, 1], [1, 2]]
+hosts = [0, 2]
+duration = 0.00001
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+xoff = [0, 0, 0, 1000, 0, 0, 0, 0]
+xon = [0, 0, 0, 500, 0, 0, 0, 0]
+pause_quanta = [0, 0, 0, 1, 0, 0, 0, 0]
+buffer_capacity = [0, 0, 0, 4000, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "TCP"
+priority = 3
+graph = [[0, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 1000
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "TCPReno"
+"#;
+    fs::write(&path, config).expect("temporary TCP/PFC fixture must be writable");
+    let image = compile_config(&path).expect("TCP/PFC fixture must lower");
+    fs::remove_file(&path).expect("temporary TCP/PFC fixture must be removable");
+
+    let reverse_links = image.flows[0]
+        .reverse_route
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let reverse_bounds = image
+        .switch_states
+        .iter()
+        .flat_map(|state| &state.queues)
+        .flat_map(|queue| queue.pfc.as_ref().into_iter())
+        .flat_map(|pfc| &pfc.ingresses)
+        .filter(|ingress| reverse_links.contains(&ingress.controlled_link))
+        .map(|ingress| ingress.max_frame_bytes[3])
+        .collect::<Vec<_>>();
+    assert!(
+        !reverse_bounds.is_empty(),
+        "fixture must monitor a reverse TCP link"
+    );
+    assert!(
+        reverse_bounds.iter().all(|bound| *bound == 40),
+        "compiler TCP ACKs are 40 bytes, not the 64-byte PFC control size: {reverse_bounds:?}"
+    );
+    validate(&image, Backend::Scalar).expect("TCP/PFC image must validate");
+}

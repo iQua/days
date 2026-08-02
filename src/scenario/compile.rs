@@ -1383,8 +1383,8 @@ fn lower(
                     for link_id in &descriptor.reverse_route {
                         max_frame_by_link_priority
                             .entry((*link_id, priority))
-                            .and_modify(|maximum| *maximum = (*maximum).max(64))
-                            .or_insert(64);
+                            .and_modify(|maximum| *maximum = (*maximum).max(40))
+                            .or_insert(40);
                     }
                 }
             }

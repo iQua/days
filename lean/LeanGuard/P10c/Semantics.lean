@@ -10,6 +10,8 @@ namespace Aqm
 
 def averageScale : Nat := 2 ^ 32
 
+def maxQueueBytes : Nat := 2 ^ 64 - 1
+
 inductive DepthUnit
   | packets
   | bytes
@@ -46,11 +48,16 @@ def postDepth
   | .packets => queuedPackets + 1
   | .bytes => queuedBytes + packetSizeBytes
 
+def queueByteSumRepresentable (queuedBytes packetSizeBytes : Nat) : Bool :=
+  queuedBytes + packetSizeBytes ≤ maxQueueBytes
+
 def thresholdDecision
     (config : ThresholdConfig)
     (queuedPackets queuedBytes packetSizeBytes : Nat) : Action :=
   let depth := postDepth config.unit queuedPackets queuedBytes packetSizeBytes
-  if config.capacity ≠ 0 && config.capacity < depth then
+  if !queueByteSumRepresentable queuedBytes packetSizeBytes then
+    .drop
+  else if config.capacity ≠ 0 && config.capacity < depth then
     .drop
   else if config.threshold ≤ depth then
     .mark
@@ -67,7 +74,9 @@ def redDecision
   let depth := postDepth state.unit queuedPackets queuedBytes packetSizeBytes
   let average := (state.averageScaled * 511 + sample * averageScale) / 512
   let state := { state with averageScaled := average }
-  if state.capacity ≠ 0 && state.capacity < depth then
+  if !queueByteSumRepresentable queuedBytes packetSizeBytes then
+    (state, .drop)
+  else if state.capacity ≠ 0 && state.capacity < depth then
     (state, .drop)
   else
     let minimum := state.minThreshold * averageScale
@@ -331,7 +340,9 @@ def scheduleLoop (lineNo : Nat) : Nat → State → Except String (State × Pack
 def schedule (lineNo : Nat) (state : State) : Except String (State × Packet) := do
   require lineNo (state.classCount > 0) "class_count must be > 0"
   require lineNo (state.waiting > 0) "schedule on empty WRR"
-  scheduleLoop lineNo (state.classCount + 1) state
+  -- Every class is inspected at most once to reset its round state and once more to select
+  -- from a nonempty class, matching the scalar executor's cyclic scan.
+  scheduleLoop lineNo (2 * state.classCount) state
 
 end Wrr
 

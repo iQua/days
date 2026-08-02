@@ -1,12 +1,15 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    Backend, CpuConfig, DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind,
-    FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
-    ObservationMode, PacketDescriptor, PacketKind, PayloadId, QueueDepthUnit, RemoteChannel,
-    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, drr_transitions_csv,
-    event_phase, run_cpu_with_observations, run_scalar_with_observations, validate,
-    wrr_transitions_csv,
+    Backend, CpuConfig, DropMarkPolicy, DrrTransitionRecord, EcnThresholdPolicy, Event, EventKey,
+    EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
+    GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId,
+    MechanismTransitionRecord, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
+    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, ScheduledEmission, SchedulerKind,
+    SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, TcpTimerState,
+    drr_transitions_csv, event_phase, run_cpu_with_observations, run_scalar_with_observations,
+    validate, wrr_transitions_csv,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
@@ -468,6 +471,206 @@ fn validator_reserves_drr_deficit_for_future_arrivals() {
     assert!(
         error.contains("DRR class 0 cannot accumulate enough deficit"),
         "expected a future-arrival DRR closure diagnostic, got: {error}"
+    );
+}
+
+fn drr_future_tcp_image() -> SimulationImage {
+    let mut image = image(
+        SchedulerKind::deficit_round_robin(vec![u64::MAX]),
+        &[(0, 0, 1, 0)],
+        10,
+    );
+    let reverse = &mut image.links[SINK_EGRESS.0 as usize];
+    reverse.target = SOURCE;
+    image
+        .channels
+        .push(RemoteChannel::for_packet_link(*reverse, 1).expect("one-byte ACK delay must fit"));
+    image.flows.push(FlowDescriptor {
+        id: FlowId(1),
+        source: SOURCE,
+        target: SINK,
+        priority: 0,
+        route: vec![SOURCE_LINK, SWITCH_LINK],
+        reverse_route: vec![],
+    });
+    image.flows.push(FlowDescriptor {
+        id: FlowId(2),
+        source: SOURCE,
+        target: SINK,
+        priority: 0,
+        route: vec![SOURCE_LINK, SWITCH_LINK],
+        reverse_route: vec![SINK_EGRESS],
+    });
+
+    let prior_attempt = PacketDescriptor {
+        id: PayloadId(3),
+        flow: FlowId(2),
+        size_bytes: 1,
+        ecn_marked: false,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: 0,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+    };
+    let ack = PacketDescriptor {
+        id: PayloadId(2),
+        flow: FlowId(2),
+        size_bytes: 1,
+        ecn_marked: false,
+        kind: PacketKind::TcpAck(TcpAckHeader {
+            acknowledgment: 1,
+            acknowledged_bytes: 1,
+            echoed_sent_time_ns: 0,
+        }),
+    };
+    image.initial_packets.extend([ack, prior_attempt]);
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image.initial_events.extend([
+        Event {
+            key: EventKey {
+                time_ns: 1,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SINK,
+                origin_seq: 0,
+            },
+            target: SOURCE,
+            kind: EventKind::RemoteArrival,
+            payload: ack.id,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 100,
+                phase: event_phase(EventKind::RetransmissionTimeout),
+                origin_node: SOURCE,
+                origin_seq: 1,
+            },
+            target: SOURCE,
+            kind: EventKind::RetransmissionTimeout,
+            payload: prior_attempt.id,
+        },
+    ]);
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+
+    let mut tcp = TcpGenerator::new(4, 2, 1, TcpCongestionControl::reno(2));
+    tcp.next_sequence = 1;
+    tcp.bytes_in_flight = 1;
+    tcp.last_attempt = prior_attempt.id;
+    tcp.timer_generation = 1;
+    tcp.active_timer = Some(TcpTimerState {
+        attempt: prior_attempt.id,
+        sequence: 0,
+        deadline_ns: 100,
+        generation: 1,
+        rto_ns: 100,
+    });
+    tcp.rto_ns = 100;
+    image.host_states[0].generators.push(FlowGeneratorState {
+        flow: FlowId(2),
+        packets_emitted: 1,
+        bytes_emitted: 1,
+        next_emission: ScheduledEmission {
+            status: GeneratorStatus::Blocked,
+            departure_time_ns: 0,
+            payload: prior_attempt.id,
+        },
+        rng_state: 19,
+        feedback: GeneratorFeedbackState {
+            arrivals: 0,
+            outstanding_bytes: 1,
+            unacknowledged_bytes: 1,
+        },
+        kind: FlowGeneratorKind::Tcp(tcp),
+    });
+    image.host_states[0].next_origin_seq = 2;
+    image.host_states[0].next_payload_seq = 2;
+    image.host_states[0].sourced_packets = 1;
+    image.host_states[0].departed_packets = 1;
+    image.host_states[1].tcp_receivers = vec![TcpReceiverState {
+        flow: FlowId(2),
+        ack_size_bytes: 1,
+        next_expected_sequence: 1,
+        out_of_order: vec![],
+    }];
+    image.host_states[1].next_origin_seq = 1;
+    image.host_states[1].next_payload_seq = 1;
+    image.host_states[1].sourced_packets = 1;
+    image.host_states[1].departed_packets = 1;
+    image.host_states[1].received_packets = 1;
+    let SchedulerKind::DeficitRoundRobin(state) = &mut image.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.deficits_bytes[0] = 2;
+    image
+}
+
+#[test]
+fn validator_reserves_drr_deficit_for_larger_future_tcp_segments() {
+    let image = drr_future_tcp_image();
+    match validate(&image, Backend::Scalar) {
+        Ok(()) => {
+            run_scalar_with_observations(&image, None, ObservationMode::Full)
+                .expect("an accepted future TCP segment must not fault DRR accumulation");
+        }
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("DRR class 0 cannot accumulate enough deficit"),
+            "expected a DRR future-TCP closure diagnostic, got: {error}"
+        ),
+    }
+}
+
+#[test]
+fn validator_does_not_reserve_drr_for_a_packet_already_past_the_egress() {
+    let mut image = image(
+        SchedulerKind::deficit_round_robin(vec![u64::MAX]),
+        &[(0, 0, 2, 0)],
+        4,
+    );
+    let event = &mut image.initial_events[0];
+    event.key.origin_node = SWITCH;
+    event.target = SINK;
+    image.switch_states[0].next_origin_seq = 1;
+
+    validate(&image, Backend::Scalar)
+        .expect("a terminal arrival cannot return to the scheduler egress it has crossed");
+}
+
+#[test]
+fn drr_trace_scan_steps_are_wider_than_u64() {
+    let beyond_u64 = u128::from(u64::MAX) + 1;
+    let csv = drr_transitions_csv(&[MechanismTransitionRecord::Drr(DrrTransitionRecord {
+        key: EventKey {
+            time_ns: 0,
+            phase: 2,
+            origin_node: SWITCH,
+            origin_seq: 0,
+        },
+        node: SWITCH,
+        queue_id: 0,
+        class_count: 1,
+        quanta_bytes: vec![1],
+        before_deficits_bytes: vec![0],
+        before_current_class: 0,
+        scan_steps: beyond_u64,
+        eligible_packets: vec![SchedulerPacket {
+            payload: PayloadId(0),
+            flow: FlowId(0),
+            size_bytes: 1,
+        }],
+        selected_payload: PayloadId(0),
+        after_deficits_bytes: vec![0],
+        after_current_class: 0,
+    })])
+    .expect("one DRR transition has a unique key");
+
+    assert_eq!(
+        csv.lines().nth(1).and_then(|row| row.split(',').nth(10)),
+        Some("18446744073709551616")
     );
 }
 

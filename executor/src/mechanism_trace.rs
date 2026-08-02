@@ -95,7 +95,7 @@ pub struct DrrTransitionRecord {
     pub quanta_bytes: Vec<u64>,
     pub before_deficits_bytes: Vec<u64>,
     pub before_current_class: u64,
-    pub scan_steps: u64,
+    pub scan_steps: u128,
     pub eligible_packets: Vec<SchedulerPacket>,
     pub selected_payload: PayloadId,
     pub after_deficits_bytes: Vec<u64>,

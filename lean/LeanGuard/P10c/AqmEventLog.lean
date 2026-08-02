@@ -169,6 +169,9 @@ def checkRed (row : Row) : Except String Unit := do
 def checkRow (row : Row) : Except String Unit := do
   require row.srcLine (row.eventPhase = 0) "AQM enqueue certificate must have phase 0"
   require row.srcLine (row.packetSizeBytes > 0) "packet size must be positive"
+  require row.srcLine
+    (row.queuedBytesBefore ≤ Aqm.maxQueueBytes && row.packetSizeBytes ≤ Aqm.maxQueueBytes)
+    "AQM byte operands exceed the u64 representation domain"
   require row.srcLine (row.capacity > 0) "AQM capacity must be positive"
   require row.srcLine
     (row.ecnAfter = expectedEcnAfter row.ecnBefore row.action)

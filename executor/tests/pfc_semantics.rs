@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use days_executor::{
-    Backend, CpuConfig, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
-    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, PfcHeader, PfcIngressState, PfcQueueState, RemoteChannel, RunResult,
-    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    Backend, CpuConfig, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
+    FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor,
+    LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
+    PayloadId, PfcHeader, PfcIngressState, PfcQueueState, RemoteChannel, RunResult,
+    ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase,
     pfc_transitions_csv, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
@@ -689,6 +691,224 @@ fn validator_requires_pfc_state_on_the_controlled_upstream_queue() {
     assert!(
         error.contains("controlled upstream queue") && error.contains("LinkId(1)"),
         "expected an upstream PFC-state diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_rejects_control_for_a_disabled_priority() {
+    let mut image = path_image();
+    add_control(&mut image, 1, 0, true);
+    let control = image
+        .initial_packets
+        .iter_mut()
+        .find(|packet| matches!(packet.kind, PacketKind::Pfc(_)))
+        .expect("fixture must contain the in-flight control frame");
+    let PacketKind::Pfc(mut header) = control.kind else {
+        unreachable!("packet selection requires PFC")
+    };
+    header.priority = 2;
+    control.kind = PacketKind::Pfc(header);
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("an in-flight control frame for a disabled priority must be rejected")
+        .to_string();
+    assert!(
+        error.contains("disabled") && error.contains("priority 2"),
+        "expected a disabled-priority control-lane diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_rejects_duplicate_controller_identity_for_one_link() {
+    let mut image = path_image();
+    let duplicate_channel_index = image.channels.len() as u32;
+    image.channels.push(image.channels[3]);
+    let pfc = image.switch_states[1].queues[0]
+        .pfc
+        .as_mut()
+        .expect("fixture must contain PFC state");
+    let mut duplicate = pfc.ingresses[0].clone();
+    duplicate.control_channel_index = duplicate_channel_index;
+    pfc.ingresses.push(duplicate);
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("one controller LP must not own two monitors for one controlled link")
+        .to_string();
+    assert!(
+        error.contains("duplicate PFC controller")
+            && error.contains("NodeId(2)")
+            && error.contains("LinkId(1)"),
+        "expected a duplicate-controller diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_rejects_equal_xon_xoff_thresholds() {
+    let mut image = path_image();
+    let ingress = image.switch_states[1].queues[0]
+        .pfc
+        .as_mut()
+        .and_then(|pfc| pfc.ingresses.first_mut())
+        .expect("fixture must contain an ingress monitor");
+    ingress.xon_threshold_bytes[usize::from(PRIORITY)] =
+        ingress.xoff_threshold_bytes[usize::from(PRIORITY)];
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("equal XON/XOFF cannot produce checkpoint-closed edge transitions")
+        .to_string();
+    assert!(
+        error.contains("XON < XOFF") && error.contains("priority 3"),
+        "expected a strict hysteresis diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn host_sourced_controlled_link_is_rejected_without_panicking() {
+    let mut image = path_image();
+    image.nodes[UPSTREAM.0 as usize].kind = NodeKind::Host;
+    image.nodes[UPSTREAM.0 as usize].state_slot = 2;
+    image.host_states.push(host_state(CONTROLLED_LINK));
+    image.nodes[DOWNSTREAM.0 as usize].state_slot = 0;
+    image.switch_states.remove(0);
+    image.flows[0].source = UPSTREAM;
+    image.flows[0].route = vec![CONTROLLED_LINK, EGRESS_LINK];
+
+    let result = std::panic::catch_unwind(|| validate(&image, Backend::Scalar));
+    assert!(
+        result.is_ok(),
+        "validation must capability-reject a host-owned controlled link instead of panicking"
+    );
+    let error = result
+        .expect("panic was checked above")
+        .expect_err("PFC state is representable only on a switch-owned upstream queue")
+        .to_string();
+    assert!(
+        error.contains("controlled upstream") && error.contains("Switch"),
+        "expected a controlled-upstream switch diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_uses_configured_tcp_ack_size_for_pfc_frame_bounds() {
+    let mut image = path_image();
+    let reverse_egress = NodeId(4);
+    image.nodes.push(NodeDescriptor {
+        id: reverse_egress,
+        kind: NodeKind::Switch,
+        state_slot: 2,
+    });
+    image
+        .switch_states
+        .push(switch_state(20, CONTROL_LINK, None));
+    image.links[CONTROL_LINK.0 as usize].source = reverse_egress;
+    let reverse_terminal = NodeId(5);
+    image.nodes.push(NodeDescriptor {
+        id: reverse_terminal,
+        kind: NodeKind::Switch,
+        state_slot: 3,
+    });
+    let upstream_to_source = LinkDescriptor {
+        id: LinkId(5),
+        source: reverse_terminal,
+        target: SOURCE,
+        rate_bps: 100_000_000_000,
+        propagation_ns: 0,
+    };
+    image
+        .switch_states
+        .push(switch_state(10, upstream_to_source.id, None));
+    image.links.push(upstream_to_source);
+    image.channels.extend([
+        RemoteChannel::for_packet_link_to(image.links[SINK_EGRESS.0 as usize], reverse_egress, 1)
+            .expect("TCP data ingress delay must fit"),
+        RemoteChannel::for_packet_link_to(
+            image.links[CONTROL_LINK.0 as usize],
+            reverse_terminal,
+            1,
+        )
+        .expect("TCP data reverse-switch delay must fit"),
+        RemoteChannel::for_packet_link(upstream_to_source, 1)
+            .expect("TCP data terminal delay must fit"),
+    ]);
+
+    let tcp_flow = FlowId(1);
+    image.flows.push(FlowDescriptor {
+        id: tcp_flow,
+        source: SINK,
+        target: SOURCE,
+        priority: PRIORITY,
+        route: vec![SINK_EGRESS, CONTROL_LINK, upstream_to_source.id],
+        reverse_route: vec![SOURCE_LINK, CONTROLLED_LINK, EGRESS_LINK],
+    });
+    let tcp_payload = PayloadId::from_node_sequence(SINK, image.nodes.len() as u64, 0)
+        .expect("small TCP fixture identity must fit");
+    image.initial_packets.push(PacketDescriptor {
+        id: tcp_payload,
+        flow: tcp_flow,
+        size_bytes: 100,
+        ecn_marked: false,
+        kind: PacketKind::TcpData(TcpDataHeader {
+            sequence: 0,
+            sent_time_ns: 0,
+            retransmission: false,
+        }),
+    });
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::PacketArrival),
+            origin_node: SINK,
+            origin_seq: 0,
+        },
+        target: SINK,
+        kind: EventKind::PacketArrival,
+        payload: tcp_payload,
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image.host_states[1].generators.push(FlowGeneratorState {
+        flow: tcp_flow,
+        packets_emitted: 0,
+        bytes_emitted: 0,
+        next_emission: ScheduledEmission {
+            status: GeneratorStatus::Scheduled,
+            departure_time_ns: 0,
+            payload: tcp_payload,
+        },
+        rng_state: 25,
+        feedback: GeneratorFeedbackState {
+            arrivals: 0,
+            outstanding_bytes: 0,
+            unacknowledged_bytes: 0,
+        },
+        kind: FlowGeneratorKind::Tcp(TcpGenerator::new(
+            100,
+            100,
+            128,
+            TcpCongestionControl::reno(100),
+        )),
+    });
+    image.host_states[1].next_origin_seq = 1;
+    image.host_states[1].next_payload_seq = 1;
+    image.host_states[0]
+        .tcp_receivers
+        .push(TcpReceiverState::new(tcp_flow, 128));
+    image.host_states[0].next_payload_seq = 1;
+    image.switch_states[1].queues[0]
+        .pfc
+        .as_mut()
+        .and_then(|pfc| pfc.ingresses.first_mut())
+        .expect("fixture must contain an ingress monitor")
+        .max_frame_bytes[usize::from(PRIORITY)] = 100;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the declared PFC frame bound must cover the configured 128-byte TCP ACK")
+        .to_string();
+    assert!(
+        error.contains("maximum frame bound 100") && error.contains("frame size 128"),
+        "expected the configured TCP ACK size in the frame-bound diagnostic, got: {error}"
     );
 }
 

@@ -525,12 +525,10 @@ fn derived_pfc_max_frame_bytes(
         }
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        if executable_generator_packets(generator)? == 0 {
-            continue;
-        }
+        let executable = executable_generator_packets(generator)? != 0;
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
-        if flow.route.contains(&controlled_link) {
+        if executable && flow.route.contains(&controlled_link) {
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                 FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
@@ -538,10 +536,12 @@ fn derived_pfc_max_frame_bytes(
             };
             maximum[priority] = maximum[priority].max(size);
         }
-        if matches!(generator.kind, FlowGeneratorKind::Tcp(_))
-            && flow.reverse_route.contains(&controlled_link)
-        {
-            maximum[priority] = maximum[priority].max(64);
+        if flow.reverse_route.contains(&controlled_link) {
+            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+                if executable || tcp.bytes_in_flight != 0 {
+                    maximum[priority] = maximum[priority].max(tcp.ack_size_bytes);
+                }
+            }
         }
     }
     Ok(maximum)
@@ -549,6 +549,7 @@ fn derived_pfc_max_frame_bytes(
 
 fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationError> {
     let mut control_lanes = BTreeSet::new();
+    let mut controller_monitors = BTreeSet::<(LinkId, NodeId)>::new();
     let mut controlled_priorities = BTreeSet::<(LinkId, u8)>::new();
     let mut controllers_by_link_priority = BTreeMap::<LinkId, [BTreeSet<NodeId>; 8]>::new();
     for owner in image
@@ -577,6 +578,18 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                 }
                 let controlled_owner = node(image, controlled.source)
                     .expect("link validation established the controlled-link source");
+                if controlled_owner.kind != NodeKind::Switch {
+                    return Err(ValidationError::new(format!(
+                        "PFC controlled upstream link {:?} must be owned by a Switch queue, got {:?} node {:?}",
+                        controlled.id, controlled_owner.kind, controlled_owner.id
+                    )));
+                }
+                if !controller_monitors.insert((controlled.id, owner.id)) {
+                    return Err(ValidationError::new(format!(
+                        "duplicate PFC controller {:?} for controlled link {:?}; one controller LP may own only one ingress monitor per controlled link",
+                        owner.id, controlled.id
+                    )));
+                }
                 let controlled_queue = image.switch_states[controlled_owner.state_slot as usize]
                     .queues
                     .iter()
@@ -710,9 +723,9 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                             owner.id, controlled.id
                         )));
                     }
-                    if capacity == 0 || xon > xoff || xoff > capacity {
+                    if capacity == 0 || xon >= xoff || xoff > capacity {
                         return Err(ValidationError::new(format!(
-                            "switch node {:?} queue {queue_index} PFC priority {priority} requires XON <= XOFF <= capacity, got {xon} <= {xoff} <= {}",
+                            "switch node {:?} queue {queue_index} PFC priority {priority} requires XON < XOFF <= capacity, got {xon} < {xoff} <= {}",
                             owner.id, capacity
                         )));
                     }
@@ -862,7 +875,10 @@ fn validate_pfc_deadlock_scope(
     Ok(())
 }
 
-fn pfc_channel_controls(image: &SimulationImage, channel_index: usize) -> Option<LinkId> {
+fn pfc_channel_ingress(
+    image: &SimulationImage,
+    channel_index: usize,
+) -> Option<&crate::PfcIngressState> {
     image
         .switch_states
         .iter()
@@ -875,7 +891,10 @@ fn pfc_channel_controls(image: &SimulationImage, channel_index: usize) -> Option
                 .flat_map(|pfc| &pfc.ingresses)
         })
         .find(|ingress| ingress.control_channel_index as usize == channel_index)
-        .map(|ingress| ingress.controlled_link)
+}
+
+fn pfc_channel_controls(image: &SimulationImage, channel_index: usize) -> Option<LinkId> {
+    pfc_channel_ingress(image, channel_index).map(|ingress| ingress.controlled_link)
 }
 
 fn route_target(
@@ -2210,6 +2229,167 @@ fn validate_device_rational(
     Ok(())
 }
 
+fn route_outgoing_index(
+    image: &SimulationImage,
+    route: &[LinkId],
+    source: NodeId,
+) -> Option<usize> {
+    route.iter().position(|link_id| {
+        link(image, *link_id).is_some_and(|route_link| route_link.source == source)
+    })
+}
+
+fn packet_can_still_reach_egress(
+    image: &SimulationImage,
+    packet: &crate::PacketDescriptor,
+    egress: LinkId,
+) -> bool {
+    if matches!(packet.kind, PacketKind::Pfc(_)) {
+        return false;
+    }
+    let Some(flow) = flow(image, packet.flow) else {
+        return false;
+    };
+    let route = packet_route(flow, packet.kind);
+    let Some(egress_index) = route.iter().position(|link_id| *link_id == egress) else {
+        return false;
+    };
+
+    for node in &image.nodes {
+        let (waiting, in_service) = match node.kind {
+            NodeKind::Host => {
+                let state = &image.host_states[node.state_slot as usize];
+                (
+                    state.queue.contains(&packet.id),
+                    state.in_service == Some(packet.id),
+                )
+            }
+            NodeKind::Switch => {
+                let state = &image.switch_states[node.state_slot as usize];
+                (
+                    state
+                        .queues
+                        .iter()
+                        .any(|queue| queue.queue.contains(&packet.id)),
+                    state
+                        .queues
+                        .iter()
+                        .any(|queue| queue.in_service == Some(packet.id)),
+                )
+            }
+        };
+        let Some(outgoing_index) = route_outgoing_index(image, route, node.id) else {
+            continue;
+        };
+        if waiting && egress_index >= outgoing_index || in_service && egress_index > outgoing_index
+        {
+            return true;
+        }
+    }
+
+    image.initial_events.iter().any(|event| {
+        if event.payload != packet.id {
+            return false;
+        }
+        let Some(outgoing_index) = route_outgoing_index(image, route, event.target) else {
+            return false;
+        };
+        match event.kind {
+            EventKind::PacketArrival | EventKind::TxReady | EventKind::RemoteArrival => {
+                egress_index >= outgoing_index
+            }
+            EventKind::TxComplete => egress_index > outgoing_index,
+            EventKind::PacingTimer | EventKind::RetransmissionTimeout => false,
+        }
+    })
+}
+
+fn tcp_future_data_max_frame(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    tcp: crate::TcpGenerator,
+) -> u64 {
+    if matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Finished | GeneratorStatus::Stopped
+    ) {
+        return 0;
+    }
+    let fresh = tcp.mss_bytes.min(tcp.total_bytes - tcp.next_sequence);
+    let retransmission = image
+        .initial_packets
+        .iter()
+        .filter(|packet| packet.flow == generator.flow)
+        .filter_map(|packet| {
+            let PacketKind::TcpData(header) = packet.kind else {
+                return None;
+            };
+            let end = header.sequence.checked_add(packet.size_bytes)?;
+            (header.sequence < tcp.next_sequence && end > tcp.highest_ack)
+                .then_some(end - header.sequence.max(tcp.highest_ack))
+        })
+        .max()
+        .unwrap_or(0);
+    fresh.max(retransmission)
+}
+
+fn maximum_drr_frame_bytes(
+    image: &SimulationImage,
+    egress: LinkId,
+    class_count: usize,
+    class: usize,
+) -> Result<u64, ValidationError> {
+    let class_count_u64 = u64::try_from(class_count).map_err(|_| {
+        ValidationError::new("DRR class count exceeds the u64 scheduler-class domain")
+    })?;
+    let mut maximum = image
+        .initial_packets
+        .iter()
+        .filter(|packet| scheduler_class(image, packet.id, class_count) == Some(class))
+        .filter(|packet| packet_can_still_reach_egress(image, packet, egress))
+        .map(|packet| packet.size_bytes)
+        .max()
+        .unwrap_or(0);
+
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let Some(generator_class) = usize::try_from(generator.flow.0 % class_count_u64).ok() else {
+            continue;
+        };
+        if generator_class != class {
+            continue;
+        }
+        let flow = flow(image, generator.flow)
+            .expect("generator validation precedes scheduler-state validation");
+        let forward_reaches = flow.route.contains(&egress);
+        let reverse_reaches = flow.reverse_route.contains(&egress);
+        match generator.kind {
+            FlowGeneratorKind::Constant(constant) => {
+                if forward_reaches && executable_generator_packets(generator)? != 0 {
+                    maximum = maximum.max(constant.packet_size_bytes);
+                }
+            }
+            FlowGeneratorKind::Rate(rate) => {
+                if forward_reaches && executable_generator_packets(generator)? != 0 {
+                    maximum = maximum.max(
+                        rate.packet_size_bytes
+                            .min(rate.total_bytes - generator.bytes_emitted),
+                    );
+                }
+            }
+            FlowGeneratorKind::Tcp(tcp) => {
+                let future_data = tcp_future_data_max_frame(image, generator, tcp);
+                if forward_reaches {
+                    maximum = maximum.max(future_data);
+                }
+                if reverse_reaches && (future_data != 0 || tcp.bytes_in_flight != 0) {
+                    maximum = maximum.max(tcp.ack_size_bytes);
+                }
+            }
+        }
+    }
+    Ok(maximum)
+}
+
 fn validate_scheduler_state(
     image: &SimulationImage,
     owner: NodeId,
@@ -2397,38 +2577,20 @@ fn validate_scheduler_state(
                 )));
             }
             for (class, quantum) in state.quanta_bytes.iter().copied().enumerate() {
-                let maximum_frame = image
-                    .initial_packets
-                    .iter()
-                    .filter(|packet| {
-                        scheduler_class(image, packet.id, state.quanta_bytes.len()) == Some(class)
+                let maximum_frame = queue
+                    .egress_link
+                    .map(|egress| {
+                        maximum_drr_frame_bytes(image, egress, state.quanta_bytes.len(), class)
                     })
-                    .filter(|packet| {
-                        let flow = flow(image, packet.flow)
-                            .expect("packet validation precedes scheduler-state validation");
-                        queue.egress_link.is_some_and(|egress_link| {
-                            packet_route(flow, packet.kind).contains(&egress_link)
-                        })
-                    })
-                    .map(|packet| packet.size_bytes)
-                    .max()
+                    .transpose()?
                     .unwrap_or(0);
                 if maximum_frame == 0 {
                     continue;
                 }
-                let deficit = state.deficits_bytes[class];
-                if deficit < maximum_frame {
-                    let needed = maximum_frame - deficit;
-                    let rounds = needed / quantum + u64::from(needed % quantum != 0);
-                    if rounds
-                        .checked_mul(quantum)
-                        .and_then(|addition| deficit.checked_add(addition))
-                        .is_none()
-                    {
-                        return Err(ValidationError::new(format!(
-                            "switch node {owner:?} queue {queue_index} DRR class {class} cannot accumulate enough deficit for a {maximum_frame}-byte packet without overflowing"
-                        )));
-                    }
+                if quantum.checked_add(maximum_frame - 1).is_none() {
+                    return Err(ValidationError::new(format!(
+                        "switch node {owner:?} queue {queue_index} DRR class {class} cannot accumulate enough deficit for a {maximum_frame}-byte packet without overflowing"
+                    )));
                 }
             }
             Ok(())
@@ -2812,17 +2974,30 @@ fn validate_events(
             }
             EventKind::RemoteArrival => {
                 if let PacketKind::Pfc(header) = packet.kind {
-                    let matches_lane = pfc_channels.iter().any(|channel_index| {
+                    let matching_lane = pfc_channels.iter().copied().find(|channel_index| {
                         let channel = &image.channels[*channel_index];
                         channel.source == origin.id
                             && channel.target == event.target
                             && pfc_channel_controls(image, *channel_index)
                                 == Some(header.controlled_link)
                     });
-                    if !matches_lane {
+                    let Some(channel_index) = matching_lane else {
                         return Err(ValidationError::new(format!(
                             "PFC RemoteArrival event {index} from {:?} to {:?} has no declared control lane for link {:?}",
                             origin.id, event.target, header.controlled_link
+                        )));
+                    };
+                    let enabled = pfc_channel_ingress(image, channel_index)
+                        .and_then(|ingress| {
+                            ingress
+                                .xoff_threshold_bytes
+                                .get(usize::from(header.priority))
+                        })
+                        .is_some_and(|xoff| *xoff != 0);
+                    if !enabled {
+                        return Err(ValidationError::new(format!(
+                            "PFC RemoteArrival event {index} uses disabled priority {} on control lane {channel_index}",
+                            header.priority
                         )));
                     }
                 } else {
@@ -3506,7 +3681,11 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
+        .filter(|generator| {
+            generator.next_emission.status == GeneratorStatus::Scheduled
+                || matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                    && generator.next_emission.status == GeneratorStatus::Blocked
+        })
         .map(|generator| generator.next_emission.payload)
         .collect::<BTreeSet<_>>();
     let live_payloads = crate::tcp_ledger::initial_live_payloads(image);

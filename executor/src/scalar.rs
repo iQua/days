@@ -3510,7 +3510,7 @@ fn scheduler_select_position(
     scheduler: &mut SchedulerKind,
     packets: &[PacketDescriptor],
     node: NodeId,
-) -> Result<Option<(usize, u64)>, ExecutionError> {
+) -> Result<Option<(usize, u128)>, ExecutionError> {
     if packets.is_empty() {
         return Ok(None);
     }
@@ -3530,7 +3530,7 @@ fn scheduler_select_position(
                 .ok()
                 .filter(|class| *class < class_count)
                 .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let mut scan_steps = 0_u64;
+            let mut scan_steps = 0_u128;
             loop {
                 let position = packets
                     .iter()
@@ -3560,9 +3560,9 @@ fn scheduler_select_position(
                     current = 0;
                 }
                 state.current_class = current as u64;
-                scan_steps = scan_steps
-                    .checked_add(1)
-                    .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+                // A selection scans at most `u64::MAX` deficit rounds across at most `u64::MAX`
+                // classes, so the exact instrumentation count is strictly below `u128::MAX`.
+                scan_steps += 1;
             }
         }
         SchedulerKind::WeightedRoundRobin(state) => {
@@ -3613,23 +3613,24 @@ fn drop_mark_decision(
     let post_packets = queued_packets
         .checked_add(1)
         .ok_or(ExecutionError::CounterOverflow(node))?;
+    let post_bytes = queued_bytes.checked_add(packet_size_bytes);
     match policy {
         crate::DropMarkPolicy::TailDrop => Ok(
-            if taildrop_capacity_packets != 0 && post_packets > taildrop_capacity_packets {
+            if post_bytes.is_none()
+                || taildrop_capacity_packets != 0 && post_packets > taildrop_capacity_packets
+            {
                 QueueAdmissionAction::Drop
             } else {
                 QueueAdmissionAction::Enqueue
             },
         ),
         crate::DropMarkPolicy::EcnThreshold(config) => {
+            let Some(post_bytes) = post_bytes else {
+                return Ok(QueueAdmissionAction::Drop);
+            };
             let post_depth = match config.unit {
                 crate::QueueDepthUnit::Packets => post_packets,
-                crate::QueueDepthUnit::Bytes => {
-                    let Some(post_bytes) = queued_bytes.checked_add(packet_size_bytes) else {
-                        return Ok(QueueAdmissionAction::Drop);
-                    };
-                    post_bytes
-                }
+                crate::QueueDepthUnit::Bytes => post_bytes,
             };
             Ok(if config.capacity != 0 && post_depth > config.capacity {
                 QueueAdmissionAction::Drop
@@ -3651,7 +3652,7 @@ fn drop_mark_decision(
             };
             let post_depth = match state.unit {
                 crate::QueueDepthUnit::Packets => Some(post_packets),
-                crate::QueueDepthUnit::Bytes => queued_bytes.checked_add(packet_size_bytes),
+                crate::QueueDepthUnit::Bytes => post_bytes,
             };
             let weighted_previous = state
                 .average_scaled
@@ -3665,7 +3666,9 @@ fn drop_mark_decision(
                 .ok_or(ExecutionError::InvalidSchedulerState(node))?
                 / 512;
 
-            if post_depth.is_none_or(|depth| state.capacity != 0 && depth > state.capacity) {
+            if post_bytes.is_none()
+                || post_depth.is_none_or(|depth| state.capacity != 0 && depth > state.capacity)
+            {
                 return Ok(QueueAdmissionAction::Drop);
             }
             let min_scaled = u128::from(state.min_threshold)

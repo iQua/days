@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    ArrivalDisposition, Backend, CpuConfig, DropMarkPolicy, EcnThresholdPolicy, Event, EventKey,
-    EventKind, FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId,
-    NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, QueueDepthUnit,
-    RedPolicyState, RemoteChannel, RunResult, SchedulerKind, SimulationImage, SwitchQueueState,
-    SwitchState, aqm_transitions_csv, event_phase, run_cpu_with_observations,
-    run_scalar_with_observations, validate,
+    AqmTransitionAction, ArrivalDisposition, Backend, CpuConfig, DropMarkPolicy,
+    EcnThresholdPolicy, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
+    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
+    PacketKind, PayloadId, QueueDepthUnit, RedPolicyState, RemoteChannel, RunResult, SchedulerKind,
+    SimulationImage, SwitchQueueState, SwitchState, aqm_transitions_csv, event_phase,
+    run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -194,12 +194,169 @@ fn checkpoint_image(original: &SimulationImage, checkpoint: &RunResult) -> Simul
     image
 }
 
+fn hidden_byte_overflow_image(policy: DropMarkPolicy) -> SimulationImage {
+    let mut image = aqm_image(policy, &[u64::MAX, 1]);
+    image.links[0].rate_bps = u64::MAX;
+    image.links[1].rate_bps = u64::MAX;
+    image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1).unwrap();
+    image.channels[1] = RemoteChannel::for_packet_link(image.links[1], 1).unwrap();
+
+    let queue = &mut image.switch_states[0].queues[0];
+    queue.queue.push_back(payload(0));
+    queue.tx_ready_pending = true;
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: SOURCE,
+                origin_seq: 1,
+            },
+            target: SWITCH,
+            kind: EventKind::RemoteArrival,
+            payload: payload(1),
+        },
+        Event {
+            key: EventKey {
+                time_ns: 1,
+                phase: event_phase(EventKind::TxReady),
+                origin_node: SWITCH,
+                origin_seq: 0,
+            },
+            target: SWITCH,
+            kind: EventKind::TxReady,
+            payload: payload(0),
+        },
+    ];
+    image.switch_states[0].next_origin_seq = 1;
+    image
+}
+
+fn hidden_byte_overflow_result(image: &SimulationImage) -> RunResult {
+    validate(image, Backend::Scalar).expect("the representable pre-arrival state must validate");
+    let result = run_scalar_with_observations(image, Some(1), ObservationMode::Full)
+        .expect("an unrepresentable post-enqueue byte total must be a capacity drop");
+    assert_eq!(result.summary.dropped_packets, 1);
+    assert_eq!(
+        result.arrivals.last().map(|arrival| arrival.disposition),
+        Some(ArrivalDisposition::Dropped)
+    );
+    assert!(
+        result
+            .resident_packets
+            .iter()
+            .all(|packet| packet.id != payload(1))
+    );
+    validate(&checkpoint_image(image, &result), Backend::Scalar)
+        .expect("the forced drop must leave a representable checkpoint");
+
+    for workers in [1, 2, 4] {
+        validate(image, Backend::Cpu { workers }).unwrap();
+        let cpu = run_cpu_with_observations(
+            image,
+            Some(1),
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap();
+        assert_eq!(cpu.result, result, "worker count {workers}");
+    }
+    result
+}
+
 fn marked(result: &RunResult, id: PayloadId) -> bool {
     result
         .resident_packets
         .iter()
         .find(|packet| packet.id == id)
         .is_some_and(|packet| packet.ecn_marked)
+}
+
+#[test]
+fn taildrop_forces_drop_when_post_enqueue_byte_sum_is_unrepresentable() {
+    let image = hidden_byte_overflow_image(DropMarkPolicy::TailDrop);
+    let result = hidden_byte_overflow_result(&image);
+
+    assert!(result.aqm_transitions.is_empty());
+}
+
+#[test]
+fn packet_ecn_forces_traced_drop_when_post_enqueue_byte_sum_is_unrepresentable() {
+    let policy = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Packets,
+        capacity: 2,
+        threshold: 2,
+    });
+    let image = hidden_byte_overflow_image(policy);
+    let result = hidden_byte_overflow_result(&image);
+
+    assert_eq!(result.aqm_transitions.len(), 1);
+    let transition = &result.aqm_transitions[0];
+    assert_eq!(transition.queued_packets_before, 1);
+    assert_eq!(transition.queued_bytes_before, u64::MAX);
+    assert_eq!(transition.packet_size_bytes, 1);
+    assert_eq!(transition.before, policy);
+    assert_eq!(transition.after, policy);
+    assert_eq!(transition.action, AqmTransitionAction::Drop);
+
+    let csv = aqm_transitions_csv(&result.aqm_transitions).unwrap();
+    assert_eq!(
+        csv,
+        include_str!(
+            "../../lean/fixtures/p10c/aqm_threshold_packet_byte_overflow_executor_accept.csv"
+        ),
+        "the hidden-byte threshold certificate must be generated byte-for-byte by the scalar oracle"
+    );
+}
+
+#[test]
+fn packet_red_updates_ewma_then_traces_hidden_byte_domain_drop() {
+    const SCALE: u128 = 1_u128 << 32;
+    let policy = DropMarkPolicy::Red(RedPolicyState {
+        unit: QueueDepthUnit::Packets,
+        capacity: 2,
+        min_threshold: 1,
+        max_threshold: 2,
+        max_probability_numerator: 1,
+        max_probability_denominator: 1,
+        average_scaled: 0,
+        counter: 7,
+        mark_ecn: true,
+    });
+    let image = hidden_byte_overflow_image(policy);
+    let result = hidden_byte_overflow_result(&image);
+
+    assert_eq!(result.aqm_transitions.len(), 1);
+    let transition = &result.aqm_transitions[0];
+    assert_eq!(transition.queued_packets_before, 1);
+    assert_eq!(transition.queued_bytes_before, u64::MAX);
+    assert_eq!(transition.packet_size_bytes, 1);
+    assert_eq!(transition.before, policy);
+    assert_eq!(
+        transition.after,
+        DropMarkPolicy::Red(RedPolicyState {
+            unit: QueueDepthUnit::Packets,
+            capacity: 2,
+            min_threshold: 1,
+            max_threshold: 2,
+            max_probability_numerator: 1,
+            max_probability_denominator: 1,
+            average_scaled: SCALE / 512,
+            counter: 7,
+            mark_ecn: true,
+        })
+    );
+    assert_eq!(transition.action, AqmTransitionAction::Drop);
+
+    let csv = aqm_transitions_csv(&result.aqm_transitions).unwrap();
+    assert_eq!(
+        csv,
+        include_str!("../../lean/fixtures/p10c/aqm_red_packet_byte_overflow_executor_accept.csv"),
+        "the hidden-byte RED certificate must be generated byte-for-byte by the scalar oracle"
+    );
 }
 
 #[test]
