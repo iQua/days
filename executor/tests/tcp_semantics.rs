@@ -631,6 +631,8 @@ fn stitch_checkpoint_run(
     tcp_transitions.extend_from_slice(&suffix.tcp_transitions);
     let mut aqm_transitions = prefix.aqm_transitions.clone();
     aqm_transitions.extend_from_slice(&suffix.aqm_transitions);
+    let mut mechanism_transitions = prefix.mechanism_transitions.clone();
+    mechanism_transitions.extend_from_slice(&suffix.mechanism_transitions);
 
     days_executor::RunResult {
         host_states: suffix.host_states.clone(),
@@ -642,6 +644,7 @@ fn stitch_checkpoint_run(
         arrivals,
         tcp_transitions,
         aqm_transitions,
+        mechanism_transitions,
         pending_events: suffix.pending_events.clone(),
     }
 }

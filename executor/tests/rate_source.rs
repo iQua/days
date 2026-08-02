@@ -6,7 +6,8 @@ use days_executor::{
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
     PacketDescriptor, PacketKind, PayloadId, RateGenerator, RemoteChannel, RunResult,
     ScheduledEmission, SimulationImage, event_fel_class, event_phase, rate_source_lookahead,
-    run_cpu_with_observations, run_scalar_rounds, run_scalar_with_observations, validate,
+    rate_transitions_csv, run_cpu_with_observations, run_scalar_rounds,
+    run_scalar_with_observations, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -194,6 +195,29 @@ fn exact_rational_credit_produces_remainder_cadence_and_status_transitions() {
 }
 
 #[test]
+fn rate_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 2,
+            rate_numerator_bits_per_second: 10_000_000_000,
+            rate_denominator: 3,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Blocked,
+        20,
+    );
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+    let csv = rate_transitions_csv(&result.mechanism_transitions).unwrap();
+    assert_eq!(
+        csv,
+        include_str!("../../lean/fixtures/p10c/rate_executor_accept.csv")
+    );
+}
+
+#[test]
 fn final_partial_packet_uses_its_exact_smaller_credit_cost() {
     let image = rate_image(
         RateGenerator {
@@ -289,11 +313,21 @@ fn credit_boundary_and_representability_are_validated_exactly() {
         unreachable!()
     };
     rate.credit_quanta = packet_cost;
+    validate(&saturated, Backend::Scalar)
+        .expect("credit at packet cost is a reachable carried-credit boundary");
+
+    let mut next_tick_overflow = saturated;
+    let FlowGeneratorKind::Rate(ref mut rate) =
+        next_tick_overflow.host_states[0].generators[0].kind
+    else {
+        unreachable!()
+    };
+    rate.credit_quanta = u128::MAX;
     assert_eq!(
-        validate(&saturated, Backend::Scalar)
-            .expect_err("credit at packet cost must be rejected")
+        validate(&next_tick_overflow, Backend::Scalar)
+            .expect_err("the immediately produced next credit must remain representable")
             .to_string(),
-        "flow FlowId(0) rate source credit 8000000000 is not below next-packet cost 8000000000"
+        "flow FlowId(0) rate source next pacing credit exceeds u128"
     );
 
     let overflow = rate_image(
@@ -337,6 +371,86 @@ fn credit_boundary_and_representability_are_validated_exactly() {
             .expect_err("future credit accumulation must remain representable")
             .to_string(),
         "flow FlowId(0) rate source credit plus one tick can exceed u128"
+    );
+}
+
+#[test]
+fn checkpoint_accepts_credit_carried_into_a_smaller_final_packet() {
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 3,
+            total_bytes: 4,
+            rate_numerator_bits_per_second: 24_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 8_000_000_000,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1).unwrap();
+    validate(&image, Backend::Scalar).expect("reachable pre-emission state must validate");
+
+    let prefix = run_scalar_with_observations(&image, Some(2), ObservationMode::Full)
+        .expect("the first full-packet pacing tick must execute");
+    let (generator, rate) = rate_state(&prefix);
+    assert_eq!(generator.bytes_emitted, 3);
+    assert_eq!(generator.next_emission.status, GeneratorStatus::Scheduled);
+    assert_eq!(rate.credit_quanta, 8_000_000_000);
+
+    validate(&checkpoint_image(&image, &prefix), Backend::Scalar)
+        .expect("a produced checkpoint may carry exact credit for its smaller final packet");
+}
+
+#[test]
+fn blocked_rate_source_reserves_every_pacing_tick_in_the_time_domain() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: u64::MAX - 2,
+            pacing_interval_ns: 3,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 1,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Blocked,
+        u64::MAX,
+    );
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the blocked source's next pacing deadline exceeds u64")
+        .to_string();
+    assert!(
+        error.contains("latest pacing time exceeds u64"),
+        "expected a pacing-time closure diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn time_zero_is_a_legal_rate_source_deadline() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 0,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+
+    validate(&image, Backend::Scalar).expect("absolute pacing time zero is representable");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the time-zero source must execute");
+    assert_eq!(result.summary.sourced_packets, 1);
+    assert_eq!(
+        rate_state(&result).0.next_emission.status,
+        GeneratorStatus::Finished
     );
 }
 

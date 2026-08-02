@@ -3594,6 +3594,7 @@ fn assemble_result(
     let mut arrivals = Vec::new();
     let mut tcp_transitions = Vec::new();
     let mut aqm_transitions = Vec::new();
+    let mut mechanism_transitions = Vec::new();
     let mut pending_events = Vec::new();
 
     for lp in lps {
@@ -3620,6 +3621,7 @@ fn assemble_result(
             &mut arrivals,
             &mut tcp_transitions,
             &mut aqm_transitions,
+            &mut mechanism_transitions,
         )?;
     }
     for packet in tcp_segment_ledger.into_values() {
@@ -3630,6 +3632,8 @@ fn assemble_result(
     arrivals.sort_unstable_by_key(|(key, _)| *key);
     tcp_transitions.sort_unstable_by_key(|record| record.key);
     aqm_transitions.sort_unstable_by_key(|record| record.key);
+    mechanism_transitions
+        .sort_unstable_by_key(crate::MechanismTransitionRecord::canonical_order_key);
     Ok(RunResult {
         host_states: host_states
             .into_iter()
@@ -3649,6 +3653,7 @@ fn assemble_result(
         arrivals: arrivals.into_iter().map(|(_, arrival)| arrival).collect(),
         tcp_transitions,
         aqm_transitions,
+        mechanism_transitions,
         pending_events,
     })
 }
@@ -3682,6 +3687,7 @@ fn install_local_result(
     arrivals: &mut Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: &mut Vec<crate::TcpTransitionRecord>,
     aqm_transitions: &mut Vec<crate::AqmTransitionRecord>,
+    mechanism_transitions: &mut Vec<crate::MechanismTransitionRecord>,
 ) -> Result<(), ExecutionError> {
     match local.state {
         LocalNodeState::Host(state) => {
@@ -3754,6 +3760,7 @@ fn install_local_result(
     arrivals.extend(local.arrivals);
     tcp_transitions.extend(local.tcp_transitions);
     aqm_transitions.extend(local.aqm_transitions);
+    mechanism_transitions.extend(local.mechanism_transitions);
     Ok(())
 }
 

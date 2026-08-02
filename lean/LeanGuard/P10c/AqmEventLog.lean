@@ -13,6 +13,7 @@ structure Row where
   originNode : Nat
   originSeq : Nat
   nodeId : Nat
+  queueId : Nat
   payloadId : Nat
   queuedPacketsBefore : Nat
   queuedBytesBefore : Nat
@@ -68,6 +69,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         originNode := ← parseNat (← getField idx fields "event_origin_node")
         originSeq := ← parseNat (← getField idx fields "event_origin_sequence")
         nodeId := ← parseNat (← getField idx fields "node_id")
+        queueId := ← parseNat (← getField idx fields "queue_id")
         payloadId := ← parseNat (← getField idx fields "payload_id")
         queuedPacketsBefore := ← parseNat (← getField idx fields "queued_packets_before")
         queuedBytesBefore := ← parseNat (← getField idx fields "queued_bytes_before")
@@ -186,8 +188,41 @@ def canonicalize (rows : List Row) : Except String (List Row) := do
   check sorted
   pure sorted
 
+def sameConfig (first second : Row) : Bool :=
+  first.policy = second.policy &&
+    first.depthUnit = second.depthUnit &&
+    first.capacity = second.capacity &&
+    first.threshold = second.threshold &&
+    first.minThreshold = second.minThreshold &&
+    first.maxThreshold = second.maxThreshold &&
+    first.maxProbabilityNumerator = second.maxProbabilityNumerator &&
+    first.maxProbabilityDenominator = second.maxProbabilityDenominator &&
+    first.markEcn = second.markEcn
+
+def sameQueue (first second : Row) : Bool :=
+  first.nodeId = second.nodeId && first.queueId = second.queueId
+
+def checkContinuity (rows : List Row) : Except String Unit := do
+  let rec go (previous : List Row) : List Row → Except String Unit
+    | [] => pure ()
+    | row :: rest => do
+        match previous.find? (sameQueue · row) with
+        | none => pure ()
+        | some prior =>
+            require row.srcLine (sameConfig prior row)
+              s!"AQM config does not continue the prior config for queue (node_id={row.nodeId}, queue_id={row.queueId})"
+            if row.policy = "red" then
+              require row.srcLine
+                (row.beforeAverageScaled = prior.afterAverageScaled &&
+                  row.beforeCounter = prior.afterCounter)
+                s!"RED before-state does not continue the prior state for queue (node_id={row.nodeId}, queue_id={row.queueId})"
+        go (row :: previous.filter (fun prior => !sameQueue prior row)) rest
+  go [] rows
+
 def checkRows (rows : List Row) : Except String Unit := do
-  for row in ← canonicalize rows do
+  let rows ← canonicalize rows
+  for row in rows do
     checkRow row
+  checkContinuity rows
 
 end LeanGuard.P10c.AqmEventLog

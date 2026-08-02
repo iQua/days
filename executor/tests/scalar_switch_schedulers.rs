@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    Backend, CpuConfig, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
-    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, RemoteChannel, SchedulerKind, SimulationImage, SwitchQueueState,
-    SwitchState, event_phase, run_cpu_with_observations, run_scalar_with_observations, validate,
+    Backend, CpuConfig, DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind,
+    FlowDescriptor, FlowId, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
+    ObservationMode, PacketDescriptor, PacketKind, PayloadId, QueueDepthUnit, RemoteChannel,
+    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, drr_transitions_csv,
+    event_phase, run_cpu_with_observations, run_scalar_with_observations, validate,
+    wrr_transitions_csv,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
@@ -348,6 +350,31 @@ fn wrr_uses_exact_packet_weights_and_fifo_within_class() {
 }
 
 #[test]
+fn drr_and_wrr_certificates_are_generated_by_the_scalar_oracle() {
+    let drr = image(
+        SchedulerKind::deficit_round_robin(vec![2, 1]),
+        &[(0, 0, 3, 0), (1, 1, 1, 0)],
+        8,
+    );
+    let drr_result = run_scalar_with_observations(&drr, None, ObservationMode::Full).unwrap();
+    assert_eq!(
+        drr_transitions_csv(&drr_result.mechanism_transitions).unwrap(),
+        include_str!("../../lean/fixtures/p10c/drr_executor_accept.csv")
+    );
+
+    let wrr = image(
+        SchedulerKind::weighted_round_robin(vec![2, 1]),
+        &[(0, 0, 1, 0), (1, 1, 1, 0), (2, 0, 1, 0), (3, 1, 1, 0)],
+        8,
+    );
+    let wrr_result = run_scalar_with_observations(&wrr, None, ObservationMode::Full).unwrap();
+    assert_eq!(
+        wrr_transitions_csv(&wrr_result.mechanism_transitions).unwrap(),
+        include_str!("../../lean/fixtures/p10c/wrr_executor_accept.csv")
+    );
+}
+
+#[test]
 fn drr_and_wrr_are_byte_identical_on_scalar_and_cpu() {
     for scheduler in [
         SchedulerKind::deficit_round_robin(vec![2, 1]),
@@ -419,6 +446,73 @@ fn validator_rejects_drr_state_whose_next_quantum_addition_overflows() {
     assert!(
         error.contains("DRR class 0 cannot accumulate enough deficit"),
         "expected a DRR closure diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_reserves_drr_deficit_for_future_arrivals() {
+    let mut image = image(
+        SchedulerKind::deficit_round_robin(vec![u64::MAX]),
+        &[(0, 0, 2, 0)],
+        8,
+    );
+    let SchedulerKind::DeficitRoundRobin(state) = &mut image.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.deficits_bytes[0] = 1;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the future arrival's DRR quantum addition would overflow")
+        .to_string();
+    assert!(
+        error.contains("DRR class 0 cannot accumulate enough deficit"),
+        "expected a future-arrival DRR closure diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn byte_capacity_overflow_drops_before_unneeded_post_sum() {
+    let mut image = image(SchedulerKind::Fifo, &[(0, 0, u64::MAX, 0), (1, 1, 1, 0)], 4);
+    image.links[0].rate_bps = u64::MAX;
+    image.links[1].rate_bps = u64::MAX;
+    image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1).unwrap();
+    image.channels[1] = RemoteChannel::for_packet_link(image.links[1], 1).unwrap();
+    let queue = &mut image.switch_states[0].queues[0];
+    queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Bytes,
+        capacity: u64::MAX,
+        threshold: u64::MAX,
+    });
+    queue.queue.push_back(PayloadId(0));
+    queue.tx_ready_pending = true;
+
+    image
+        .initial_events
+        .retain(|event| event.payload == PayloadId(3));
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 1,
+            phase: event_phase(EventKind::TxReady),
+            origin_node: SWITCH,
+            origin_seq: 0,
+        },
+        target: SWITCH,
+        kind: EventKind::TxReady,
+        payload: PayloadId(0),
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image.switch_states[0].next_origin_seq = 1;
+
+    validate(&image, Backend::Scalar).expect("the exact byte-capacity boundary must validate");
+    let result = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
+        .expect("the overflowing post-byte sum is a capacity drop, not an execution fault");
+    assert_eq!(result.summary.dropped_packets, 1);
+    assert!(
+        result
+            .resident_packets
+            .iter()
+            .all(|packet| packet.id != PayloadId(3))
     );
 }
 

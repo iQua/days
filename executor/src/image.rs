@@ -1,6 +1,6 @@
 //! Immutable, backend-neutral simulation image records.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::{
@@ -82,13 +82,20 @@ impl fmt::Debug for SwitchQueueState {
     }
 }
 
-/// Per-priority pause state owned by one switch egress queue.
+/// Controller-scoped per-priority pause state owned by one switch egress queue.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PfcQueueState {
-    /// Priorities whose waiting packets are ineligible at service start.
-    pub paused_priorities: [bool; 8],
+    /// Downstream controller LPs currently asserting pause for each priority. A priority remains
+    /// paused until every asserting controller has resumed.
+    pub paused_by_controller: [BTreeSet<NodeId>; 8],
     /// Downstream buffer monitors, one for each PFC-controlled incoming link feeding this queue.
     pub ingresses: Vec<PfcIngressState>,
+}
+
+impl PfcQueueState {
+    pub fn is_paused(&self, priority: usize) -> bool {
+        !self.paused_by_controller[priority].is_empty()
+    }
 }
 
 /// Exact byte-accounting state for one PFC-controlled incoming link.
@@ -98,7 +105,9 @@ pub struct PfcIngressState {
     /// Index of the reverse control lane in `SimulationImage::channels`.
     pub control_channel_index: u32,
     pub buffer_capacity_bytes: [u64; 8],
-    pub max_frame_bytes: u64,
+    /// Maximum reachable frame size for each enabled priority on the controlled link. Disabled or
+    /// unreachable priorities use zero.
+    pub max_frame_bytes: [u64; 8],
     /// A zero XOFF threshold disables PFC for that priority.
     pub xoff_threshold_bytes: [u64; 8],
     pub xon_threshold_bytes: [u64; 8],

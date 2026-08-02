@@ -1,0 +1,5 @@
+time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,queue_id,class_count,weights,before_packets_sent,before_current_class,eligible_packets,selected_payload,after_packets_sent,after_current_class
+0,2,1,0,1,0,2,2;1,0;0,0,0:0:1;3:1:1;6:0:1;9:1:1,0,1;0,0
+1,2,1,3,1,0,2,2;1,1;0,0,3:1:1;6:0:1;9:1:1,6,2;0,0
+2,2,1,6,1,0,2,2;1,2;0,0,3:1:1;9:1:1,3,0;1,1
+3,2,1,9,1,0,2,2;1,0;1,1,9:1:1,9,0;1,1

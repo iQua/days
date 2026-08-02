@@ -227,6 +227,7 @@ mod tests {
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
             aqm_transitions: Vec::new(),
+            mechanism_transitions: Vec::new(),
             pending_events: Vec::new(),
         }
     }

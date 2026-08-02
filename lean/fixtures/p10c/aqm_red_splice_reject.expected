@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 3: RED before-state does not continue the prior state for queue (node_id=1, queue_id=0)

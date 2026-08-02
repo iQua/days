@@ -179,14 +179,17 @@ def occupancyTransition (state : ThresholdState) (occupancyBytes : Nat) :
   else
     (state, none)
 
-abbrev PauseMask := Std.HashMap Nat Bool
+abbrev PauseMask := Std.HashMap Nat (List Nat)
 
-def applyControl (mask : PauseMask) (priority : Nat) : Control → PauseMask
-  | .pause => mask.insert priority true
-  | .resume => mask.insert priority false
+def applyControl (mask : PauseMask) (priority controller : Nat) : Control → PauseMask
+  | .pause =>
+      let controllers := mask.getD priority []
+      if controllers.contains controller then mask
+      else mask.insert priority ((controller :: controllers).mergeSort)
+  | .resume => mask.insert priority ((mask.getD priority []).erase controller)
 
 def eligible (mask : PauseMask) (priority : Nat) : Bool :=
-  !(mask.getD priority false)
+  (mask.getD priority []).isEmpty
 
 end Pfc
 

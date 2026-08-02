@@ -5,19 +5,22 @@ use days_executor::{
     LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
     PacketKind, PayloadId, PfcHeader, PfcIngressState, PfcQueueState, RemoteChannel, RunResult,
     SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
-    run_cpu_with_observations, run_scalar_with_observations, validate,
+    pfc_transitions_csv, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
 const UPSTREAM: NodeId = NodeId(1);
 const DOWNSTREAM: NodeId = NodeId(2);
 const SINK: NodeId = NodeId(3);
+const DOWNSTREAM_B: NodeId = NodeId(4);
 
 const SOURCE_LINK: LinkId = LinkId(0);
 const CONTROLLED_LINK: LinkId = LinkId(1);
 const EGRESS_LINK: LinkId = LinkId(2);
 const CONTROL_LINK: LinkId = LinkId(3);
 const SINK_EGRESS: LinkId = LinkId(4);
+const EGRESS_LINK_B: LinkId = LinkId(5);
+const CONTROL_LINK_B: LinkId = LinkId(6);
 
 const FLOW: FlowId = FlowId(0);
 const PRIORITY: u8 = 3;
@@ -30,6 +33,12 @@ fn thresholds(xoff: u64, xon: u64) -> ([u64; 8], [u64; 8]) {
     xoff_threshold_bytes[usize::from(PRIORITY)] = xoff;
     xon_threshold_bytes[usize::from(PRIORITY)] = xon;
     (xoff_threshold_bytes, xon_threshold_bytes)
+}
+
+fn frame_bounds(maximum: u64) -> [u64; 8] {
+    let mut bounds = [0; 8];
+    bounds[usize::from(PRIORITY)] = maximum;
+    bounds
 }
 
 fn host_state(egress_link: LinkId) -> HostState {
@@ -50,7 +59,7 @@ fn host_state(egress_link: LinkId) -> HostState {
 
 fn pfc_queue(ingress: Option<PfcIngressState>) -> PfcQueueState {
     PfcQueueState {
-        paused_priorities: [false; 8],
+        paused_by_controller: Default::default(),
         ingresses: ingress.into_iter().collect(),
     }
 }
@@ -179,7 +188,7 @@ fn path_image() -> SimulationImage {
                         capacity[usize::from(PRIORITY)] = 20_000;
                         capacity
                     },
-                    max_frame_bytes: 1_000,
+                    max_frame_bytes: frame_bounds(1_000),
                     xoff_threshold_bytes,
                     xon_threshold_bytes,
                     occupancy_bytes: [0; 8],
@@ -222,7 +231,17 @@ fn path_image() -> SimulationImage {
 }
 
 fn add_control(image: &mut SimulationImage, time_ns: u64, origin_seq: u64, pause: bool) {
-    let payload = PayloadId::from_node_sequence(DOWNSTREAM, 4, origin_seq)
+    add_control_from(image, DOWNSTREAM, time_ns, origin_seq, pause);
+}
+
+fn add_control_from(
+    image: &mut SimulationImage,
+    controller: NodeId,
+    time_ns: u64,
+    origin_seq: u64,
+    pause: bool,
+) {
+    let payload = PayloadId::from_node_sequence(controller, image.nodes.len() as u64, origin_seq)
         .expect("small PFC fixture identity must fit");
     image.initial_packets.push(control_packet(payload, pause));
     image
@@ -232,15 +251,107 @@ fn add_control(image: &mut SimulationImage, time_ns: u64, origin_seq: u64, pause
         key: EventKey {
             time_ns,
             phase: event_phase(EventKind::RemoteArrival),
-            origin_node: DOWNSTREAM,
+            origin_node: controller,
             origin_seq,
         },
         target: UPSTREAM,
         kind: EventKind::RemoteArrival,
         payload,
     });
-    image.switch_states[1].next_origin_seq = origin_seq + 1;
+    let controller_state_slot = image.nodes[controller.0 as usize].state_slot as usize;
+    image.switch_states[controller_state_slot].next_origin_seq = origin_seq + 1;
     image.initial_events.sort_unstable_by_key(|event| event.key);
+}
+
+fn branched_path_image() -> SimulationImage {
+    let mut image = path_image();
+    let egress_b = LinkDescriptor {
+        id: EGRESS_LINK_B,
+        source: DOWNSTREAM_B,
+        target: SINK,
+        rate_bps: 100_000_000_000,
+        propagation_ns: 0,
+    };
+    let control_b = LinkDescriptor {
+        id: CONTROL_LINK_B,
+        source: DOWNSTREAM_B,
+        target: UPSTREAM,
+        rate_bps: 100_000_000_000,
+        propagation_ns: 0,
+    };
+    image.nodes.push(NodeDescriptor {
+        id: DOWNSTREAM_B,
+        kind: NodeKind::Switch,
+        state_slot: 2,
+    });
+    image.links.extend([egress_b, control_b]);
+    image.channels.push(
+        RemoteChannel::for_packet_link_to(image.links[CONTROLLED_LINK.0 as usize], DOWNSTREAM_B, 1)
+            .expect("branched controlled-link delay must fit"),
+    );
+    image
+        .channels
+        .push(RemoteChannel::for_packet_link(egress_b, 1).expect("branch egress delay must fit"));
+    let control_channel_index = image.channels.len() as u32;
+    image.channels.push(RemoteChannel {
+        source: DOWNSTREAM_B,
+        target: UPSTREAM,
+        link: CONTROL_LINK_B,
+        event_kind: EventKind::RemoteArrival,
+        min_delay_ns: control_b.delay_ns(64).expect("branch PFC delay must fit"),
+    });
+    let (xoff_threshold_bytes, xon_threshold_bytes) = thresholds(1_000, 500);
+    image.switch_states.push(switch_state(
+        20,
+        EGRESS_LINK_B,
+        Some(pfc_queue(Some(PfcIngressState {
+            controlled_link: CONTROLLED_LINK,
+            control_channel_index,
+            buffer_capacity_bytes: {
+                let mut capacity = [0; 8];
+                capacity[usize::from(PRIORITY)] = 20_000;
+                capacity
+            },
+            max_frame_bytes: frame_bounds(1_000),
+            xoff_threshold_bytes,
+            xon_threshold_bytes,
+            occupancy_bytes: [0; 8],
+            pause_asserted: [false; 8],
+        }))),
+    ));
+    image.flows.push(FlowDescriptor {
+        id: FlowId(1),
+        source: SOURCE,
+        target: SINK,
+        priority: PRIORITY,
+        route: vec![SOURCE_LINK, CONTROLLED_LINK, EGRESS_LINK_B],
+        reverse_route: vec![],
+    });
+    let branch_payload = PayloadId(5);
+    image.initial_packets.push(PacketDescriptor {
+        id: branch_payload,
+        flow: FlowId(1),
+        size_bytes: 1,
+        ecn_marked: false,
+        kind: PacketKind::Data,
+    });
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 100,
+            phase: event_phase(EventKind::PacketArrival),
+            origin_node: SOURCE,
+            origin_seq: 0,
+        },
+        target: SOURCE,
+        kind: EventKind::PacketArrival,
+        payload: branch_payload,
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image.host_states[0].next_origin_seq = 1;
+    image
 }
 
 fn run_scalar_cpu(image: &SimulationImage) -> RunResult {
@@ -311,7 +422,7 @@ fn pause_during_service_completes_in_service_and_blocks_the_next_priority() {
     assert_eq!(queue.in_service, None, "the committed packet must complete");
     assert_eq!(queue.queue, VecDeque::from([DATA_1]));
     assert!(!queue.tx_ready_pending);
-    assert!(upstream_pfc(&result).paused_priorities[usize::from(PRIORITY)]);
+    assert!(upstream_pfc(&result).is_paused(usize::from(PRIORITY)));
     assert_eq!(result.departures.len(), 1);
     assert_eq!(result.departures[0].payload, DATA_0);
     assert!(
@@ -359,8 +470,24 @@ fn resume_before_pause_is_an_idempotent_no_op() {
     let early_result = run_scalar_cpu(&early_resume);
 
     assert_eq!(upstream_pfc(&pause_result), upstream_pfc(&early_result));
-    assert!(upstream_pfc(&early_result).paused_priorities[usize::from(PRIORITY)]);
+    assert!(upstream_pfc(&early_result).is_paused(usize::from(PRIORITY)));
     assert!(early_result.pending_events.is_empty());
+}
+
+#[test]
+fn one_controller_resume_does_not_clear_another_controllers_pause() {
+    let mut image = branched_path_image();
+    image.stop_time_ns = 3;
+    add_control_from(&mut image, DOWNSTREAM, 1, 0, true);
+    add_control_from(&mut image, DOWNSTREAM_B, 2, 0, true);
+    add_control_from(&mut image, DOWNSTREAM, 3, 1, false);
+
+    let result = run_scalar_cpu(&image);
+
+    assert!(
+        upstream_pfc(&result).is_paused(usize::from(PRIORITY)),
+        "controller B remains asserted after controller A resumes"
+    );
 }
 
 #[test]
@@ -374,13 +501,14 @@ fn resume_emits_one_same_time_ready_and_enables_service() {
         .pfc
         .as_mut()
         .expect("fixture has PFC")
-        .paused_priorities[usize::from(PRIORITY)] = true;
+        .paused_by_controller[usize::from(PRIORITY)]
+    .insert(DOWNSTREAM);
     add_control(&mut image, 5, 0, false);
 
     let result = run_scalar_cpu(&image);
     let queue = &result.switch_states[0].queues[0];
 
-    assert!(!upstream_pfc(&result).paused_priorities[usize::from(PRIORITY)]);
+    assert!(!upstream_pfc(&result).is_paused(usize::from(PRIORITY)));
     assert_eq!(queue.queue, VecDeque::new());
     assert_eq!(queue.in_service, Some(DATA_0));
     assert!(!queue.tx_ready_pending);
@@ -472,6 +600,163 @@ fn xoff_boundary_emits_a_64_byte_pause_on_the_referenced_control_channel() {
 }
 
 #[test]
+fn pfc_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
+    let mut threshold_image = path_image();
+    threshold_image.stop_time_ns = 1;
+    add_xoff_arrival(&mut threshold_image, 1);
+    let mut records = run_scalar_cpu(&threshold_image).mechanism_transitions;
+
+    let mut controller_image = branched_path_image();
+    controller_image.stop_time_ns = 3;
+    add_control_from(&mut controller_image, DOWNSTREAM, 1, 0, true);
+    add_control_from(&mut controller_image, DOWNSTREAM_B, 2, 0, true);
+    add_control_from(&mut controller_image, DOWNSTREAM, 3, 1, false);
+    records.extend(run_scalar_cpu(&controller_image).mechanism_transitions);
+
+    assert_eq!(
+        pfc_transitions_csv(&records).unwrap(),
+        include_str!("../../lean/fixtures/p10c/pfc_executor_accept.csv")
+    );
+}
+
+fn add_xoff_arrival(image: &mut SimulationImage, time_ns: u64) {
+    image.initial_packets[0] = data_packet(DATA_0, 1_000);
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns,
+            phase: event_phase(EventKind::RemoteArrival),
+            origin_node: UPSTREAM,
+            origin_seq: 0,
+        },
+        target: DOWNSTREAM,
+        kind: EventKind::RemoteArrival,
+        payload: DATA_0,
+    });
+    image.switch_states[0].next_origin_seq = 1;
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+}
+
+#[test]
+fn validator_reserves_pfc_payload_identity_space() {
+    let mut image = path_image();
+    image.stop_time_ns = 1;
+    add_xoff_arrival(&mut image, 1);
+    image.switch_states[1].next_origin_seq = 4_611_686_018_427_387_904;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("an XOFF frame whose node-strided payload identity cannot fit must be rejected")
+        .to_string();
+    assert!(
+        error.contains("PFC payload") && error.contains("NodeId(2)"),
+        "expected a PFC payload-space diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_reserves_pfc_reverse_lane_time() {
+    let mut image = path_image();
+    let xoff_time = u64::MAX - 3_000;
+    image.stop_time_ns = xoff_time;
+    image.links[CONTROL_LINK.0 as usize].rate_bps = 1_000_000;
+    image.channels[3].min_delay_ns = image.links[CONTROL_LINK.0 as usize]
+        .delay_ns(64)
+        .expect("slow PFC control delay must fit");
+    image.switch_states[1].queues[0]
+        .pfc
+        .as_mut()
+        .and_then(|pfc| pfc.ingresses.first_mut())
+        .expect("fixture has an ingress monitor")
+        .buffer_capacity_bytes[usize::from(PRIORITY)] = 1_000_000;
+    add_xoff_arrival(&mut image, xoff_time);
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("a reachable XOFF arrival beyond the u64 horizon must be rejected")
+        .to_string();
+    assert!(
+        error.contains("PFC") && error.contains("time"),
+        "expected a PFC reverse-lane time diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_requires_pfc_state_on_the_controlled_upstream_queue() {
+    let mut image = path_image();
+    image.switch_states[0].queues[0].pfc = None;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("a controlled upstream queue must own controller-scoped PFC state")
+        .to_string();
+    assert!(
+        error.contains("controlled upstream queue") && error.contains("LinkId(1)"),
+        "expected an upstream PFC-state diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_reserves_only_control_frames_that_can_be_emitted() {
+    let mut disabled = path_image();
+    disabled.flows[0].priority = 2;
+    disabled.switch_states[1].next_origin_seq = u64::MAX - 3;
+    validate(&disabled, Backend::Scalar)
+        .expect("a disabled priority emits no PFC frames and must reserve zero frame identities");
+
+    let mut branched = branched_path_image();
+    branched.switch_states[1].next_origin_seq = (u64::MAX - DOWNSTREAM.0) / 5 - 4;
+    branched.switch_states[2].next_origin_seq = (u64::MAX - DOWNSTREAM_B.0) / 5 - 4;
+    validate(&branched, Backend::Scalar).expect(
+        "each branch controller must reserve frames only for traffic selecting its monitored LP",
+    );
+}
+
+#[test]
+fn disabled_priority_waiting_bytes_remain_zero_in_a_checkpoint() {
+    let mut image = path_image();
+    image.stop_time_ns = 1;
+    image.flows[0].priority = 2;
+    image.initial_packets = vec![data_packet(DATA_0, 100), data_packet(DATA_1, 100)];
+    image.switch_states[1].queues[0].in_service = Some(DATA_0);
+    image.initial_events.extend([
+        Event {
+            key: EventKey {
+                time_ns: 1,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: UPSTREAM,
+                origin_seq: 0,
+            },
+            target: DOWNSTREAM,
+            kind: EventKind::RemoteArrival,
+            payload: DATA_1,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 100,
+                phase: event_phase(EventKind::TxComplete),
+                origin_node: DOWNSTREAM,
+                origin_seq: 0,
+            },
+            target: DOWNSTREAM,
+            kind: EventKind::TxComplete,
+            payload: DATA_0,
+        },
+    ]);
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image.switch_states[0].next_origin_seq = 1;
+    image.switch_states[1].next_origin_seq = 1;
+
+    validate(&image, Backend::Scalar).expect("pre-checkpoint image must validate");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("disabled-priority arrival must execute");
+    let mut checkpoint = image;
+    checkpoint.host_states = result.host_states;
+    checkpoint.switch_states = result.switch_states;
+    checkpoint.initial_packets = result.resident_packets;
+    checkpoint.initial_events = result.pending_events;
+
+    validate(&checkpoint, Backend::Scalar)
+        .expect("runtime-produced disabled-priority occupancy must revalidate");
+}
+
+#[test]
 fn disabled_pfc_priority_uses_the_ordinary_queue_capacity_path() {
     let mut image = path_image();
     image.stop_time_ns = 1;
@@ -553,7 +838,7 @@ fn validator_rejects_a_configured_frame_bound_below_reachable_traffic() {
         .as_mut()
         .and_then(|pfc| pfc.ingresses.first_mut())
         .expect("fixture has an ingress monitor")
-        .max_frame_bytes = 999;
+        .max_frame_bytes[usize::from(PRIORITY)] = 999;
     image.initial_packets[0] = data_packet(DATA_0, 1_000);
 
     let error = validate(&image, Backend::Scalar)
@@ -610,7 +895,7 @@ fn ring_pfc_ingress(controlled_link: LinkId, control_channel_index: u32) -> PfcI
             capacity[usize::from(PRIORITY)] = 10_000;
             capacity
         },
-        max_frame_bytes: 1,
+        max_frame_bytes: frame_bounds(1),
         xoff_threshold_bytes,
         xon_threshold_bytes,
         occupancy_bytes: [0; 8],

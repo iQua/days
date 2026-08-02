@@ -3407,6 +3407,7 @@ impl MetalBuffers {
                 arrivals,
                 tcp_transitions,
                 aqm_transitions: Vec::new(),
+                mechanism_transitions: Vec::new(),
                 pending_events,
             },
             rounds: control[CONTROL_ROUNDS],

@@ -1,5 +1,3 @@
 time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,queue_id,payload_id,queued_packets_before,queued_bytes_before,packet_size_bytes,ecn_before,ecn_after,policy,depth_unit,capacity,threshold,min_threshold,max_threshold,max_probability_numerator,max_probability_denominator,mark_ecn,before_average_scaled,before_counter,after_average_scaled,after_counter,action
-1,0,0,6,1,0,0,0,0,1,0,0,threshold,packets,2,2,,,,,0,,,,,enqueue
-2,0,0,9,1,0,3,0,0,1,0,0,threshold,packets,2,2,,,,,0,,,,,enqueue
-3,0,0,12,1,0,6,1,1,1,0,1,threshold,packets,2,2,,,,,0,,,,,mark
-4,0,0,15,1,0,9,2,2,1,0,0,threshold,packets,2,2,,,,,0,,,,,drop
+1,0,0,3,1,0,0,0,0,1,0,1,red,packets,10,,1,2,1,1,1,8589934592,9,8573157376,0,mark
+2,0,0,4,1,0,1,0,0,1,0,1,red,packets,10,,1,2,1,1,1,8589934592,9,8573157376,0,mark

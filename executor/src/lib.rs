@@ -11,6 +11,7 @@ mod device_scheduler;
 pub mod device_sizing;
 pub mod event;
 pub mod image;
+mod mechanism_trace;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub mod metal;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -52,6 +53,12 @@ pub use image::{
     PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, ScheduledEmission,
     SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator,
     TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
+};
+pub use mechanism_trace::{
+    DrrTransitionRecord, MechanismTraceError, MechanismTransitionRecord, PfcControlAction,
+    PfcControlTransitionRecord, PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig,
+    RateReplayState, RateTransitionRecord, SchedulerPacket, WrrTransitionRecord,
+    drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{

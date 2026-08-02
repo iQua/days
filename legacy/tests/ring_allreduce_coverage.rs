@@ -1,11 +1,22 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+use std::sync::{Mutex, MutexGuard};
 
 use csv::Reader;
 use days_legacy::flows::collective::Collective;
 use serde::Deserialize;
 use tempfile::{NamedTempFile, tempdir};
+
+static FLOW_ID_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn isolate_flow_ids() -> MutexGuard<'static, ()> {
+    let guard = FLOW_ID_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    days_legacy::update_next_flow_id(0);
+    guard
+}
 
 fn write_config(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("create temp config");
@@ -21,6 +32,7 @@ struct SourceReportRow {
 
 #[test]
 fn ring_collective_parses_explicit_paths_from_config() {
+    let _flow_id_guard = isolate_flow_ids();
     let config = r#"
 seed = 1
 
@@ -59,6 +71,7 @@ pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 
 #[test]
 fn mixed_tcp_broadcast_and_ring_collectives_emit_runtime_bytes() {
+    let _flow_id_guard = isolate_flow_ids();
     let tmp = tempdir().expect("tempdir");
     let log_path = tmp.path().join("logs");
     fs::create_dir_all(&log_path).expect("create log dir");
@@ -163,6 +176,7 @@ cc_algorithm = "TCPReno"
 #[test]
 #[should_panic(expected = "RingAllReduce requires byte size 2 to be at least the ring size 4")]
 fn ring_collective_rejects_undersized_byte_payload_from_config() {
+    let _flow_id_guard = isolate_flow_ids();
     let config = r#"
 seed = 1
 
@@ -189,6 +203,7 @@ pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 #[test]
 #[should_panic(expected = "RingAllReduce does not support duration-based traffic")]
 fn ring_collective_rejects_duration_traffic_from_config() {
+    let _flow_id_guard = isolate_flow_ids();
     let config = r#"
 seed = 1
 

@@ -350,11 +350,23 @@ impl SupportedModel {
                             .to_owned(),
                     ));
                 }
+                let min_threshold = u64::try_from(u128::from(source.switch.capacity) * 7 / 10)
+                    .map_err(|_| {
+                        CompileError::Invalid(
+                            "RED 70% packet threshold exceeds the u64 state domain".to_owned(),
+                        )
+                    })?;
+                let max_threshold = u64::try_from(u128::from(source.switch.capacity) * 9 / 10)
+                    .map_err(|_| {
+                        CompileError::Invalid(
+                            "RED 90% packet threshold exceeds the u64 state domain".to_owned(),
+                        )
+                    })?;
                 DropMarkPolicy::Red(RedPolicyState {
                     unit: QueueDepthUnit::Packets,
                     capacity: source.switch.capacity,
-                    min_threshold: source.switch.capacity * 7 / 10,
-                    max_threshold: source.switch.capacity * 9 / 10,
+                    min_threshold,
+                    max_threshold,
                     max_probability_numerator: 4,
                     max_probability_denominator: 5,
                     average_scaled: 0,
@@ -1354,8 +1366,28 @@ fn lower(
         .collect::<Result<Vec<_>, CompileError>>()?;
 
     if let Some(pfc) = &model.pfc {
-        let mut monitored_paths = BTreeMap::<(LinkId, NodeId), u64>::new();
+        let mut monitored_paths = BTreeSet::<(LinkId, NodeId)>::new();
+        let mut max_frame_by_link_priority = BTreeMap::<(LinkId, usize), u64>::new();
         for (descriptor, input) in flow_descriptors.iter().zip(&flows) {
+            let priority = usize::from(descriptor.priority);
+            if pfc.xoff[priority] != 0 {
+                for link_id in &descriptor.route {
+                    max_frame_by_link_priority
+                        .entry((*link_id, priority))
+                        .and_modify(|maximum| {
+                            *maximum = (*maximum).max(input.traffic.packet_size_bytes)
+                        })
+                        .or_insert(input.traffic.packet_size_bytes);
+                }
+                if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+                    for link_id in &descriptor.reverse_route {
+                        max_frame_by_link_priority
+                            .entry((*link_id, priority))
+                            .and_modify(|maximum| *maximum = (*maximum).max(64))
+                            .or_insert(64);
+                    }
+                }
+            }
             for pair in descriptor.route.windows(2) {
                 let controlled = links[pair[0].0 as usize];
                 let downstream = links[pair[1].0 as usize].source;
@@ -1364,15 +1396,27 @@ fn lower(
                 {
                     continue;
                 }
-                monitored_paths
-                    .entry((controlled.id, downstream))
-                    .and_modify(|maximum| {
-                        *maximum = (*maximum).max(input.traffic.packet_size_bytes)
-                    })
-                    .or_insert(input.traffic.packet_size_bytes);
+                monitored_paths.insert((controlled.id, downstream));
+            }
+            if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+                for pair in descriptor.reverse_route.windows(2) {
+                    let controlled = links[pair[0].0 as usize];
+                    let downstream = links[pair[1].0 as usize].source;
+                    if nodes[controlled.source.0 as usize].kind == NodeKind::Switch
+                        && nodes[downstream.0 as usize].kind == NodeKind::Switch
+                    {
+                        monitored_paths.insert((controlled.id, downstream));
+                    }
+                }
             }
         }
-        for ((controlled_id, downstream), max_frame_bytes) in monitored_paths {
+        for (controlled_id, downstream) in monitored_paths {
+            let max_frame_bytes = std::array::from_fn(|priority| {
+                max_frame_by_link_priority
+                    .get(&(controlled_id, priority))
+                    .copied()
+                    .unwrap_or(0)
+            });
             let controlled = links[controlled_id.0 as usize];
             let upstream_physical = switch_states
                 [nodes[controlled.source.0 as usize].state_slot as usize]

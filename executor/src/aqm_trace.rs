@@ -4,7 +4,7 @@ use std::fmt::{self, Write};
 
 use crate::{AqmTransitionAction, AqmTransitionRecord, DropMarkPolicy, QueueDepthUnit};
 
-const HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,payload_id,queued_packets_before,queued_bytes_before,packet_size_bytes,ecn_before,ecn_after,policy,depth_unit,capacity,threshold,min_threshold,max_threshold,max_probability_numerator,max_probability_denominator,mark_ecn,before_average_scaled,before_counter,after_average_scaled,after_counter,action\n";
+const HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,queue_id,payload_id,queued_packets_before,queued_bytes_before,packet_size_bytes,ecn_before,ecn_after,policy,depth_unit,capacity,threshold,min_threshold,max_threshold,max_probability_numerator,max_probability_denominator,mark_ecn,before_average_scaled,before_counter,after_average_scaled,after_counter,action\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AqmTraceError {
@@ -90,12 +90,13 @@ pub fn aqm_transitions_csv(records: &[AqmTransitionRecord]) -> Result<String, Aq
         };
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{policy},{unit},{capacity},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{policy},{unit},{capacity},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
             record.key.origin_seq,
             record.node.0,
+            record.queue_id,
             record.payload.0,
             record.queued_packets_before,
             record.queued_bytes_before,

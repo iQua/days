@@ -6,4 +6,37 @@ lean_dir="$(cd "$script_dir/.." && pwd)"
 
 cd "$lean_dir"
 lake build p10c_mechanisms_check
-.lake/build/bin/p10c_mechanisms_check
+
+checker="$lean_dir/.lake/build/bin/p10c_mechanisms_check"
+fixture_dir="$lean_dir/fixtures/p10c"
+failures=0
+checked=0
+
+for mechanism in rate pfc drr wrr; do
+  for csv in "$fixture_dir"/"${mechanism}"_*.csv; do
+    [[ -e "$csv" ]] || continue
+    expected="${csv%.csv}.expected"
+    checked=$((checked + 1))
+    expected_exit="$(sed -n '1s/^exit=//p' "$expected")"
+    expected_output="$(sed '1d' "$expected")"
+
+    set +e
+    actual_output="$("$checker" "$mechanism" "$csv" 2>&1)"
+    actual_exit=$?
+    set -e
+
+    if [[ "$actual_exit" != "$expected_exit" || "$actual_output" != "$expected_output" ]]; then
+      echo "fixture failed: $(basename "$csv")" >&2
+      echo "expected exit: $expected_exit" >&2
+      echo "actual exit:   $actual_exit" >&2
+      echo "expected output: $expected_output" >&2
+      echo "actual output:   $actual_output" >&2
+      failures=$((failures + 1))
+    else
+      echo "ok: $(basename "$csv")"
+    fi
+  done
+done
+
+echo "P10c executor stateful mechanism campaign checks: $checked"
+exit "$failures"

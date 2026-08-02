@@ -97,6 +97,38 @@ drop = "TailDrop"
 }
 
 #[test]
+fn red_lowering_reports_the_largest_toml_integer_capacity_without_panicking() {
+    let path = std::env::temp_dir().join(format!("days-t25-red-max-{}.toml", std::process::id()));
+    fs::write(
+        &path,
+        r#"
+seed = 25
+edges = [[0, 1]]
+hosts = [0, 1]
+duration = 0.00001
+
+[switch]
+port_rate = 8000000000
+capacity = 9223372036854775807
+discipline = "FIFO"
+drop = "RED"
+"#,
+    )
+    .expect("temporary RED boundary fixture must be writable");
+
+    let result = std::panic::catch_unwind(|| compile_config(&path));
+    fs::remove_file(&path).expect("temporary RED boundary fixture must be removable");
+    let error = result
+        .expect("maximum-range RED lowering must return a diagnostic instead of panicking")
+        .expect_err("the derived RED counter range exceeds the executor state domain")
+        .to_string();
+    assert!(
+        error.contains("RED worst-case signal spacing exceeds u64 counter state"),
+        "expected the post-lowering representability diagnostic, got: {error}"
+    );
+}
+
+#[test]
 fn pfc_lowering_builds_typed_reverse_lanes_and_matches_cpu() {
     let path = std::env::temp_dir().join(format!("days-t25-pfc-{}.toml", std::process::id()));
     let config = r#"
@@ -183,4 +215,61 @@ pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }
         .unwrap();
         assert_eq!(actual.result, expected);
     }
+}
+
+#[test]
+fn pfc_frame_bound_is_shared_by_link_and_priority_across_branches() {
+    let path = std::env::temp_dir().join(format!(
+        "days-t25-pfc-branch-frame-scope-{}.toml",
+        std::process::id()
+    ));
+    let config = r#"
+seed = 25
+edges = [[0, 1], [1, 2], [2, 3], [2, 4]]
+hosts = [0, 3, 4]
+duration = 0.00001
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+xoff = [0, 0, 0, 1000, 0, 0, 0, 0]
+xon = [0, 0, 0, 500, 0, 0, 0, 0]
+pause_quanta = [0, 0, 0, 1, 0, 0, 0, 0]
+buffer_capacity = [0, 0, 0, 10000, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "PacketDistribution"
+priority = 3
+graph = [[0, 3]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 1000
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }
+
+[[flow]]
+flow_type = "PacketDistribution"
+priority = 3
+graph = [[0, 4]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 2000
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 2000, high = 2000 }
+"#;
+    fs::write(&path, config).expect("temporary branched PFC fixture must be writable");
+    let compiled = compile_config(&path);
+    fs::remove_file(&path).expect("temporary branched PFC fixture must be removable");
+
+    let image = compiled.expect("mixed-frame branches sharing a link/priority must lower");
+    validate(&image, Backend::Scalar).expect("branched PFC image must validate");
 }

@@ -222,7 +222,7 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
     let rows = csv.lines().collect::<Vec<_>>();
 
     assert_eq!(rows.len(), 5);
-    assert!(rows.iter().all(|row| row.split(',').count() == 25));
+    assert!(rows.iter().all(|row| row.split(',').count() == 26));
     assert!(rows[1].ends_with(",enqueue"));
     assert!(rows[3].contains(",0,1,threshold,packets,2,2,"), "{csv}");
     assert!(rows[3].ends_with(",mark"));

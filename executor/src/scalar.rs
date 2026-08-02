@@ -83,6 +83,8 @@ pub enum AqmTransitionAction {
 pub struct AqmTransitionRecord {
     pub key: EventKey,
     pub node: NodeId,
+    /// Stable index of the queue within the node-owned switch state.
+    pub queue_id: u64,
     pub payload: PayloadId,
     pub queued_packets_before: u64,
     pub queued_bytes_before: u64,
@@ -140,6 +142,8 @@ pub struct RunResult {
     pub tcp_transitions: Vec<TcpTransitionRecord>,
     /// Exact RED/ECN enqueue transitions retained in full observation mode.
     pub aqm_transitions: Vec<AqmTransitionRecord>,
+    /// Exact rate/PFC/DRR/WRR transitions retained in full observation mode.
+    pub mechanism_transitions: Vec<crate::MechanismTransitionRecord>,
     /// Unprocessed events in canonical `EventKey` order.
     pub pending_events: Vec<Event>,
 }
@@ -488,6 +492,7 @@ pub(crate) struct TransitionState<'image> {
     arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     tcp_transitions: Vec<TcpTransitionRecord>,
     aqm_transitions: Vec<AqmTransitionRecord>,
+    mechanism_transitions: Vec<crate::MechanismTransitionRecord>,
     tcp_sent_segments: crate::tcp_ledger::TcpSegmentLedger,
 }
 
@@ -515,6 +520,7 @@ pub(crate) struct LocalTransitionResult {
     pub arrivals: Vec<(EventKey, PacketArrivalObservation)>,
     pub tcp_transitions: Vec<TcpTransitionRecord>,
     pub aqm_transitions: Vec<AqmTransitionRecord>,
+    pub mechanism_transitions: Vec<crate::MechanismTransitionRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -601,6 +607,7 @@ impl<'image> TransitionState<'image> {
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
             aqm_transitions: Vec::new(),
+            mechanism_transitions: Vec::new(),
             tcp_sent_segments,
         })
     }
@@ -689,6 +696,7 @@ impl<'image> TransitionState<'image> {
             arrivals: Vec::new(),
             tcp_transitions: Vec::new(),
             aqm_transitions: Vec::new(),
+            mechanism_transitions: Vec::new(),
             tcp_sent_segments,
         })
     }
@@ -733,6 +741,8 @@ impl<'image> TransitionState<'image> {
             .sort_unstable_by_key(|record| record.key);
         self.aqm_transitions
             .sort_unstable_by_key(|record| record.key);
+        self.mechanism_transitions
+            .sort_unstable_by_key(crate::MechanismTransitionRecord::canonical_order_key);
         RunResult {
             host_states: self.host_states,
             switch_states: self.switch_states,
@@ -751,6 +761,7 @@ impl<'image> TransitionState<'image> {
                 .collect(),
             tcp_transitions: self.tcp_transitions,
             aqm_transitions: self.aqm_transitions,
+            mechanism_transitions: self.mechanism_transitions,
             pending_events,
         }
     }
@@ -765,6 +776,8 @@ impl<'image> TransitionState<'image> {
             .sort_unstable_by_key(|record| record.key);
         self.aqm_transitions
             .sort_unstable_by_key(|record| record.key);
+        self.mechanism_transitions
+            .sort_unstable_by_key(crate::MechanismTransitionRecord::canonical_order_key);
         let state = match node.kind {
             NodeKind::Host => LocalNodeState::Host(
                 self.host_states
@@ -796,6 +809,7 @@ impl<'image> TransitionState<'image> {
             arrivals: self.arrivals,
             tcp_transitions: self.tcp_transitions,
             aqm_transitions: self.aqm_transitions,
+            mechanism_transitions: self.mechanism_transitions,
         }
     }
 
@@ -1251,24 +1265,26 @@ impl<'image> TransitionState<'image> {
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
             .transpose()?;
         let sp_position = self.switch_sp_insertion_position(node, egress_link, packet.flow)?;
-        let queue_bytes = {
+        let (queue_id, queue_bytes) = {
             let state = self.switch_state(node)?;
-            let queue = state
+            let (queue_id, queue) = state
                 .queues
                 .iter()
-                .find(|queue| queue.egress_link == egress_link)
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == egress_link)
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link,
                 })?;
-            queue.queue.iter().try_fold(0_u64, |total, payload| {
+            let queue_bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
                 total
                     .checked_add(self.packet(*payload)?.size_bytes)
                     .ok_or(ExecutionError::CounterOverflow(node.id))
-            })?
+            })?;
+            (u64::try_from(queue_id).unwrap_or(u64::MAX), queue_bytes)
         };
 
-        let (disposition, schedule_ready, mark_packet, pfc_plan, aqm_transition) = {
+        let (disposition, schedule_ready, mark_packet, pfc_plan, pfc_transition, aqm_transition) = {
             let state = self.switch_state_mut(node)?;
             state.arrived_packets = state
                 .arrived_packets
@@ -1328,6 +1344,7 @@ impl<'image> TransitionState<'image> {
                     false,
                     false,
                     None,
+                    None,
                     aqm_transition,
                 )
             } else {
@@ -1358,7 +1375,7 @@ impl<'image> TransitionState<'image> {
                 let priority_paused = queue
                     .pfc
                     .as_ref()
-                    .is_some_and(|pfc| pfc.paused_priorities[priority]);
+                    .is_some_and(|pfc| pfc.is_paused(priority));
                 let schedule_ready = queue.egress_link.is_some()
                     && queue.in_service.is_none()
                     && !queue.tx_ready_pending
@@ -1366,41 +1383,66 @@ impl<'image> TransitionState<'image> {
                 if schedule_ready {
                     queue.tx_ready_pending = true;
                 }
-                let pfc_plan = queue
-                    .pfc
-                    .as_mut()
-                    .and_then(|pfc| {
-                        pfc.ingresses
-                            .iter_mut()
-                            .find(|ingress| Some(ingress.controlled_link) == incoming_link)
-                    })
-                    .and_then(|ingress| {
-                        let xoff = ingress.xoff_threshold_bytes[priority];
-                        if xoff == 0 {
-                            return None;
-                        }
-                        let depth =
-                            ingress.occupancy_bytes[priority].checked_add(packet.size_bytes)?;
+                let ingress = queue.pfc.as_mut().and_then(|pfc| {
+                    pfc.ingresses
+                        .iter_mut()
+                        .find(|ingress| Some(ingress.controlled_link) == incoming_link)
+                });
+                let (pfc_plan, pfc_transition) = if let Some(ingress) = ingress {
+                    let xoff = ingress.xoff_threshold_bytes[priority];
+                    if xoff == 0 {
+                        (None, None)
+                    } else {
+                        let before_occupancy = ingress.occupancy_bytes[priority];
+                        let before_asserted = ingress.pause_asserted[priority];
+                        let depth = before_occupancy
+                            .checked_add(packet.size_bytes)
+                            .ok_or(ExecutionError::CounterOverflow(node.id))?;
                         ingress.occupancy_bytes[priority] = depth;
-                        if depth < xoff || ingress.pause_asserted[priority] {
-                            return None;
-                        }
-                        ingress.pause_asserted[priority] = true;
-                        Some(PfcFramePlan {
-                            channel_index: ingress.control_channel_index,
-                            flow: packet.flow,
-                            header: crate::PfcHeader {
+                        let plan = if depth < xoff || before_asserted {
+                            None
+                        } else {
+                            ingress.pause_asserted[priority] = true;
+                            Some(PfcFramePlan {
+                                channel_index: ingress.control_channel_index,
+                                flow: packet.flow,
+                                header: crate::PfcHeader {
+                                    controlled_link: ingress.controlled_link,
+                                    priority: priority as u8,
+                                    pause: true,
+                                },
+                            })
+                        };
+                        let transition = crate::MechanismTransitionRecord::PfcThreshold(
+                            crate::PfcThresholdTransitionRecord {
+                                key: event.key,
+                                node: node.id,
+                                queue_id,
                                 controlled_link: ingress.controlled_link,
                                 priority: priority as u8,
-                                pause: true,
+                                xon_bytes: ingress.xon_threshold_bytes[priority],
+                                xoff_bytes: xoff,
+                                buffer_capacity_bytes: ingress.buffer_capacity_bytes[priority],
+                                amount_bytes: packet.size_bytes,
+                                action: crate::PfcOccupancyAction::Admit,
+                                before_occupancy_bytes: before_occupancy,
+                                before_asserted,
+                                after_occupancy_bytes: depth,
+                                after_asserted: ingress.pause_asserted[priority],
+                                emitted: plan.map(|_| crate::PfcControlAction::Pause),
                             },
-                        })
-                    });
+                        );
+                        (plan, Some(transition))
+                    }
+                } else {
+                    (None, None)
+                };
                 (
                     ArrivalDisposition::Admitted,
                     schedule_ready,
                     action == QueueAdmissionAction::Mark,
                     pfc_plan,
+                    pfc_transition,
                     aqm_transition,
                 )
             }
@@ -1412,10 +1454,12 @@ impl<'image> TransitionState<'image> {
         }
 
         if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.extend(pfc_transition);
             if let Some((before, after, action, queued_packets_before)) = aqm_transition {
                 self.aqm_transitions.push(AqmTransitionRecord {
                     key: event.key,
                     node: node.id,
+                    queue_id,
                     payload: event.payload,
                     queued_packets_before,
                     queued_bytes_before: queue_bytes,
@@ -1485,12 +1529,13 @@ impl<'image> TransitionState<'image> {
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?
         };
-        let schedule_payload = {
+        let (schedule_payload, transition) = {
             let state = self.switch_state_mut(node)?;
-            let queue = state
+            let (queue_id, queue) = state
                 .queues
                 .iter_mut()
-                .find(|queue| queue.egress_link == Some(header.controlled_link))
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == Some(header.controlled_link))
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link: Some(header.controlled_link),
@@ -1499,17 +1544,24 @@ impl<'image> TransitionState<'image> {
                 .pfc
                 .as_mut()
                 .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
-            let previous = pfc.paused_priorities[priority];
-            if header.pause {
-                pfc.paused_priorities[priority] = true;
+            let before_controllers = pfc.paused_by_controller[priority]
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            let was_paused = pfc.is_paused(priority);
+            let schedule_payload = if header.pause {
+                pfc.paused_by_controller[priority].insert(event.key.origin_node);
                 None
-            } else if !previous {
+            } else if !pfc.paused_by_controller[priority].remove(&event.key.origin_node) {
                 // Duplicate/early resume is an idempotent no-op.
                 None
+            } else if pfc.is_paused(priority) {
+                // Another controller still owns the aggregate pause.
+                None
             } else {
-                pfc.paused_priorities[priority] = false;
+                debug_assert!(was_paused);
                 let payload = queued.iter().find_map(|(payload, packet_priority)| {
-                    (!pfc.paused_priorities[*packet_priority]).then_some(*payload)
+                    (!pfc.is_paused(*packet_priority)).then_some(*payload)
                 });
                 if payload.is_some() && queue.in_service.is_none() && !queue.tx_ready_pending {
                     queue.tx_ready_pending = true;
@@ -1517,8 +1569,28 @@ impl<'image> TransitionState<'image> {
                 } else {
                     None
                 }
-            }
+            };
+            let transition =
+                crate::MechanismTransitionRecord::PfcControl(crate::PfcControlTransitionRecord {
+                    key: event.key,
+                    node: node.id,
+                    queue_id: u64::try_from(queue_id).unwrap_or(u64::MAX),
+                    controlled_link: header.controlled_link,
+                    controller: event.key.origin_node,
+                    priority: header.priority,
+                    action: if header.pause {
+                        crate::PfcControlAction::Pause
+                    } else {
+                        crate::PfcControlAction::Resume
+                    },
+                    before_controllers,
+                    after_controllers: pfc.paused_by_controller[priority].iter().copied().collect(),
+                });
+            (schedule_payload, transition)
         };
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.push(transition);
+        }
         self.mark_terminal(event.payload)?;
         if let Some(payload) = schedule_payload {
             self.emit_from_switch(
@@ -1908,6 +1980,7 @@ impl<'image> TransitionState<'image> {
         let mut next_packet = None;
         let mut next_timer = None;
         let mut terminal_unused_token = false;
+        let transition;
 
         {
             let state = self.host_state_mut(node)?;
@@ -1930,6 +2003,21 @@ impl<'image> TransitionState<'image> {
             {
                 return Ok(());
             }
+
+            let config = crate::RateReplayConfig {
+                pacing_interval_ns: rate.pacing_interval_ns,
+                packet_size_bytes: rate.packet_size_bytes,
+                total_bytes: rate.total_bytes,
+                rate_numerator_bits_per_second: rate.rate_numerator_bits_per_second,
+                rate_denominator: rate.rate_denominator,
+            };
+            let before = crate::RateReplayState {
+                packets_emitted: generator.packets_emitted,
+                bytes_emitted: generator.bytes_emitted,
+                credit_quanta: rate.credit_quanta,
+                status: generator.next_emission.status,
+                next_time_ns: generator.next_emission.departure_time_ns,
+            };
 
             let scale = u128::from(rate.rate_denominator)
                 .checked_mul(1_000_000_000)
@@ -2024,6 +2112,27 @@ impl<'image> TransitionState<'image> {
                 terminal_unused_token = !emitted;
             }
             generator.kind = FlowGeneratorKind::Rate(rate);
+            transition = crate::MechanismTransitionRecord::Rate(crate::RateTransitionRecord {
+                key: event.key,
+                node: node.id,
+                flow: packet.flow,
+                payload: packet.id,
+                stop_time_ns,
+                current_packet_size_bytes: packet.size_bytes,
+                config,
+                before,
+                after: crate::RateReplayState {
+                    packets_emitted: generator.packets_emitted,
+                    bytes_emitted: generator.bytes_emitted,
+                    credit_quanta: rate.credit_quanta,
+                    status: generator.next_emission.status,
+                    next_time_ns: generator.next_emission.departure_time_ns,
+                },
+            });
+        }
+
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.push(transition);
         }
 
         if emitted {
@@ -2110,7 +2219,7 @@ impl<'image> TransitionState<'image> {
                 let paused = queue
                     .pfc
                     .as_ref()
-                    .is_some_and(|pfc| pfc.paused_priorities[priority]);
+                    .is_some_and(|pfc| pfc.is_paused(priority));
                 if !paused {
                     positions.push(position);
                     packets.push(packet);
@@ -2120,12 +2229,13 @@ impl<'image> TransitionState<'image> {
             }
             (positions, packets, priorities, incoming_links)
         };
-        let (payload, pfc_plan) = {
+        let (payload, pfc_plan, pfc_transition, scheduler_transition) = {
             let state = self.switch_state_mut(node)?;
-            let queue = state
+            let (queue_id, queue) = state
                 .queues
                 .iter_mut()
-                .find(|queue| queue.egress_link == Some(egress_link))
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == Some(egress_link))
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link: Some(egress_link),
@@ -2138,7 +2248,8 @@ impl<'image> TransitionState<'image> {
                 });
             }
 
-            let Some(eligible_position) =
+            let scheduler_before = queue.scheduler.clone();
+            let Some((eligible_position, scan_steps)) =
                 scheduler_select_position(&mut queue.scheduler, &eligible_packets, node.id)?
             else {
                 return Ok(());
@@ -2160,22 +2271,25 @@ impl<'image> TransitionState<'image> {
             let packet = eligible_packets[eligible_position];
             let priority = eligible_priorities[eligible_position];
             let incoming_link = eligible_incoming_links[eligible_position];
+            let queue_id = u64::try_from(queue_id).unwrap_or(u64::MAX);
             let ingress = queue.pfc.as_mut().and_then(|pfc| {
                 pfc.ingresses
                     .iter_mut()
                     .find(|ingress| Some(ingress.controlled_link) == incoming_link)
             });
-            let pfc_plan = if let Some(ingress) = ingress {
+            let (pfc_plan, pfc_transition) = if let Some(ingress) = ingress {
                 let xoff = ingress.xoff_threshold_bytes[priority];
                 if xoff == 0 {
-                    None
+                    (None, None)
                 } else {
-                    let depth = ingress.occupancy_bytes[priority]
+                    let before_occupancy = ingress.occupancy_bytes[priority];
+                    let before_asserted = ingress.pause_asserted[priority];
+                    let depth = before_occupancy
                         .checked_sub(packet.size_bytes)
                         .ok_or(ExecutionError::CounterOverflow(node.id))?;
                     ingress.occupancy_bytes[priority] = depth;
                     let xon = ingress.xon_threshold_bytes[priority];
-                    if !ingress.pause_asserted[priority] || depth > xon {
+                    let plan = if !before_asserted || depth > xon {
                         None
                     } else {
                         ingress.pause_asserted[priority] = false;
@@ -2188,13 +2302,86 @@ impl<'image> TransitionState<'image> {
                                 pause: false,
                             },
                         })
-                    }
+                    };
+                    let transition = crate::MechanismTransitionRecord::PfcThreshold(
+                        crate::PfcThresholdTransitionRecord {
+                            key: event.key,
+                            node: node.id,
+                            queue_id,
+                            controlled_link: ingress.controlled_link,
+                            priority: priority as u8,
+                            xon_bytes: xon,
+                            xoff_bytes: xoff,
+                            buffer_capacity_bytes: ingress.buffer_capacity_bytes[priority],
+                            amount_bytes: packet.size_bytes,
+                            action: crate::PfcOccupancyAction::Drain,
+                            before_occupancy_bytes: before_occupancy,
+                            before_asserted,
+                            after_occupancy_bytes: depth,
+                            after_asserted: ingress.pause_asserted[priority],
+                            emitted: plan.map(|_| crate::PfcControlAction::Resume),
+                        },
+                    );
+                    (plan, Some(transition))
                 }
             } else {
-                None
+                (None, None)
             };
-            (payload, pfc_plan)
+            let scheduler_packets = eligible_packets
+                .iter()
+                .map(|packet| crate::SchedulerPacket {
+                    payload: packet.id,
+                    flow: packet.flow,
+                    size_bytes: packet.size_bytes,
+                })
+                .collect::<Vec<_>>();
+            let scheduler_transition = match (&scheduler_before, &queue.scheduler) {
+                (
+                    SchedulerKind::DeficitRoundRobin(before),
+                    SchedulerKind::DeficitRoundRobin(after),
+                ) => Some(crate::MechanismTransitionRecord::Drr(
+                    crate::DrrTransitionRecord {
+                        key: event.key,
+                        node: node.id,
+                        queue_id,
+                        class_count: u64::try_from(before.quanta_bytes.len()).unwrap_or(u64::MAX),
+                        quanta_bytes: before.quanta_bytes.clone(),
+                        before_deficits_bytes: before.deficits_bytes.clone(),
+                        before_current_class: before.current_class,
+                        scan_steps,
+                        eligible_packets: scheduler_packets,
+                        selected_payload: payload,
+                        after_deficits_bytes: after.deficits_bytes.clone(),
+                        after_current_class: after.current_class,
+                    },
+                )),
+                (
+                    SchedulerKind::WeightedRoundRobin(before),
+                    SchedulerKind::WeightedRoundRobin(after),
+                ) => Some(crate::MechanismTransitionRecord::Wrr(
+                    crate::WrrTransitionRecord {
+                        key: event.key,
+                        node: node.id,
+                        queue_id,
+                        class_count: u64::try_from(before.weights.len()).unwrap_or(u64::MAX),
+                        weights: before.weights.clone(),
+                        before_packets_sent: before.packets_sent_in_round.clone(),
+                        before_current_class: before.current_class,
+                        eligible_packets: scheduler_packets,
+                        selected_payload: payload,
+                        after_packets_sent: after.packets_sent_in_round.clone(),
+                        after_current_class: after.current_class,
+                    },
+                )),
+                _ => None,
+            };
+            (payload, pfc_plan, pfc_transition, scheduler_transition)
         };
+
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.extend(pfc_transition);
+            self.mechanism_transitions.extend(scheduler_transition);
+        }
 
         let link = self.link(egress_link)?;
         if link.source != node.id {
@@ -2271,7 +2458,7 @@ impl<'image> TransitionState<'image> {
                 let paused = queue
                     .pfc
                     .as_ref()
-                    .is_some_and(|pfc| pfc.paused_priorities[priority]);
+                    .is_some_and(|pfc| pfc.is_paused(priority));
                 (!paused).then_some(*payload)
             })
         };
@@ -3323,14 +3510,14 @@ fn scheduler_select_position(
     scheduler: &mut SchedulerKind,
     packets: &[PacketDescriptor],
     node: NodeId,
-) -> Result<Option<usize>, ExecutionError> {
+) -> Result<Option<(usize, u64)>, ExecutionError> {
     if packets.is_empty() {
         return Ok(None);
     }
     match scheduler {
         SchedulerKind::Fifo
         | SchedulerKind::StaticPriority { .. }
-        | SchedulerKind::WeightedFairQueue(_) => Ok(Some(0)),
+        | SchedulerKind::WeightedFairQueue(_) => Ok(Some((0, 0))),
         SchedulerKind::DeficitRoundRobin(state) => {
             let class_count = state.quanta_bytes.len();
             if class_count == 0
@@ -3343,6 +3530,7 @@ fn scheduler_select_position(
                 .ok()
                 .filter(|class| *class < class_count)
                 .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+            let mut scan_steps = 0_u64;
             loop {
                 let position = packets
                     .iter()
@@ -3352,7 +3540,7 @@ fn scheduler_select_position(
                     if state.deficits_bytes[current] > 0 && size <= state.deficits_bytes[current] {
                         state.deficits_bytes[current] -= size;
                         state.current_class = current as u64;
-                        return Ok(Some(position));
+                        return Ok(Some((position, scan_steps)));
                     }
                 }
                 current += 1;
@@ -3372,6 +3560,9 @@ fn scheduler_select_position(
                     current = 0;
                 }
                 state.current_class = current as u64;
+                scan_steps = scan_steps
+                    .checked_add(1)
+                    .ok_or(ExecutionError::InvalidSchedulerState(node))?;
             }
         }
         SchedulerKind::WeightedRoundRobin(state) => {
@@ -3393,7 +3584,7 @@ fn scheduler_select_position(
                     }) {
                         state.packets_sent_in_round[current] += 1;
                         state.current_class = current as u64;
-                        return Ok(Some(position));
+                        return Ok(Some((position, 0)));
                     }
                 }
                 state.packets_sent_in_round[current] = 0;
@@ -3422,9 +3613,6 @@ fn drop_mark_decision(
     let post_packets = queued_packets
         .checked_add(1)
         .ok_or(ExecutionError::CounterOverflow(node))?;
-    let post_bytes = queued_bytes
-        .checked_add(packet_size_bytes)
-        .ok_or(ExecutionError::CounterOverflow(node))?;
     match policy {
         crate::DropMarkPolicy::TailDrop => Ok(
             if taildrop_capacity_packets != 0 && post_packets > taildrop_capacity_packets {
@@ -3436,7 +3624,12 @@ fn drop_mark_decision(
         crate::DropMarkPolicy::EcnThreshold(config) => {
             let post_depth = match config.unit {
                 crate::QueueDepthUnit::Packets => post_packets,
-                crate::QueueDepthUnit::Bytes => post_bytes,
+                crate::QueueDepthUnit::Bytes => {
+                    let Some(post_bytes) = queued_bytes.checked_add(packet_size_bytes) else {
+                        return Ok(QueueAdmissionAction::Drop);
+                    };
+                    post_bytes
+                }
             };
             Ok(if config.capacity != 0 && post_depth > config.capacity {
                 QueueAdmissionAction::Drop
@@ -3457,8 +3650,8 @@ fn drop_mark_decision(
                 crate::QueueDepthUnit::Bytes => queued_bytes,
             };
             let post_depth = match state.unit {
-                crate::QueueDepthUnit::Packets => post_packets,
-                crate::QueueDepthUnit::Bytes => post_bytes,
+                crate::QueueDepthUnit::Packets => Some(post_packets),
+                crate::QueueDepthUnit::Bytes => queued_bytes.checked_add(packet_size_bytes),
             };
             let weighted_previous = state
                 .average_scaled
@@ -3472,7 +3665,7 @@ fn drop_mark_decision(
                 .ok_or(ExecutionError::InvalidSchedulerState(node))?
                 / 512;
 
-            if state.capacity != 0 && post_depth > state.capacity {
+            if post_depth.is_none_or(|depth| state.capacity != 0 && depth > state.capacity) {
                 return Ok(QueueAdmissionAction::Drop);
             }
             let min_scaled = u128::from(state.min_threshold)
