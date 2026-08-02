@@ -125,6 +125,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     let pfc_channels = validate_pfc(image)?;
     validate_channels(image, backend, &derived_delays, &pfc_channels)?;
     validate_events(image, &pfc_channels)?;
+    validate_pfc_causal_consistency(image)?;
     validate_global_time_capacity(image, backend)?;
     validate_service_event_consistency(image)?;
     let future_work = validate_counters(image)?;
@@ -513,19 +514,17 @@ fn derived_pfc_max_frame_bytes(
     controlled_link: LinkId,
 ) -> Result<[u64; 8], ValidationError> {
     let mut maximum = [0_u64; 8];
-    for packet in image
-        .initial_packets
-        .iter()
-        .filter(|packet| !matches!(packet.kind, PacketKind::Pfc(_)))
-    {
+    for packet in executable_resident_packets(image) {
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
-        if packet_route(flow, packet.kind).contains(&controlled_link) {
+        if packet_route(flow, packet.kind).contains(&controlled_link)
+            && packet_can_still_cross_link(image, packet, controlled_link)
+        {
             let priority = usize::from(flow.priority);
             maximum[priority] = maximum[priority].max(packet.size_bytes);
         }
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        let executable = executable_generator_packets(generator)? != 0;
+        let executable = executable_generator_packets(image, generator)? != 0;
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
         if executable && flow.route.contains(&controlled_link) {
@@ -835,14 +834,16 @@ fn validate_pfc_deadlock_scope(
         indegree.entry(*vertex).or_default();
     }
     for flow in &image.flows {
-        for pair in flow.route.windows(2) {
-            let from = (pair[0], flow.priority);
-            let to = (pair[1], flow.priority);
-            if controlled.contains(&from)
-                && controlled.contains(&to)
-                && edges.entry(from).or_default().insert(to)
-            {
-                *indegree.entry(to).or_default() += 1;
+        for route in [&flow.route, &flow.reverse_route] {
+            for pair in route.windows(2) {
+                let from = (pair[0], flow.priority);
+                let to = (pair[1], flow.priority);
+                if controlled.contains(&from)
+                    && controlled.contains(&to)
+                    && edges.entry(from).or_default().insert(to)
+                {
+                    *indegree.entry(to).or_default() += 1;
+                }
             }
         }
     }
@@ -871,6 +872,80 @@ fn validate_pfc_deadlock_scope(
         return Err(ValidationError::new(format!(
             "PFC circular pause dependency rejected by static deadlock scope: {cycle:?}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_pfc_causal_consistency(image: &SimulationImage) -> Result<(), ValidationError> {
+    for controller in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+    {
+        let controller_state = &image.switch_states[controller.state_slot as usize];
+        for (controller_queue_index, queue) in controller_state.queues.iter().enumerate() {
+            let Some(pfc) = &queue.pfc else {
+                continue;
+            };
+            for ingress in &pfc.ingresses {
+                let controlled = link(image, ingress.controlled_link)
+                    .expect("PFC structural validation established the controlled link");
+                let upstream = node(image, controlled.source)
+                    .expect("link validation established the controlled-link source");
+                let (upstream_queue_index, upstream_pfc) = image.switch_states
+                    [upstream.state_slot as usize]
+                    .queues
+                    .iter()
+                    .enumerate()
+                    .find_map(|(queue_index, queue)| {
+                        (queue.egress_link == Some(controlled.id))
+                            .then_some((queue_index, queue.pfc.as_ref()))
+                    })
+                    .and_then(|(queue_index, pfc)| pfc.map(|pfc| (queue_index, pfc)))
+                    .expect("PFC structural validation established upstream controller state");
+
+                for priority in 0..8 {
+                    if ingress.xoff_threshold_bytes[priority] == 0 {
+                        continue;
+                    }
+                    let upstream_paused =
+                        upstream_pfc.paused_by_controller[priority].contains(&controller.id);
+                    let asserted = ingress.pause_asserted[priority];
+                    let mut actions = image
+                        .initial_events
+                        .iter()
+                        .filter_map(|event| {
+                            if event.kind != EventKind::RemoteArrival
+                                || event.key.origin_node != controller.id
+                                || event.target != upstream.id
+                            {
+                                return None;
+                            }
+                            let packet = packet(image, event.payload)
+                                .expect("event validation established the PFC payload");
+                            let PacketKind::Pfc(header) = packet.kind else {
+                                return None;
+                            };
+                            (header.controlled_link == controlled.id
+                                && usize::from(header.priority) == priority)
+                                .then_some((event.key, header.pause))
+                        })
+                        .collect::<Vec<_>>();
+                    actions.sort_unstable_by_key(|(key, _)| *key);
+                    let reconciled = actions.iter().fold(upstream_paused, |_, (_, pause)| *pause);
+                    if reconciled != asserted {
+                        let pending = actions
+                            .iter()
+                            .map(|(_, pause)| if *pause { "pause" } else { "resume" })
+                            .collect::<Vec<_>>();
+                        return Err(ValidationError::new(format!(
+                            "switch node {:?} queue {upstream_queue_index} PFC causal pause-state mismatch for controlled link {:?} priority {priority} and controller {:?} queue {controller_queue_index}: upstream paused={upstream_paused}, controller asserted={asserted}, in-flight actions={pending:?}",
+                            upstream.id, controlled.id, controller.id
+                        )));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2304,6 +2379,93 @@ fn packet_can_still_reach_egress(
     })
 }
 
+fn executable_resident_packets(image: &SimulationImage) -> Vec<&crate::PacketDescriptor> {
+    let scheduled_payloads = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| {
+            generator.next_emission.status == GeneratorStatus::Scheduled
+                || matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                    && generator.next_emission.status == GeneratorStatus::Blocked
+        })
+        .map(|generator| generator.next_emission.payload)
+        .collect::<BTreeSet<_>>();
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
+    image
+        .initial_packets
+        .iter()
+        .filter(|packet| !scheduled_payloads.contains(&packet.id))
+        .filter(|packet| {
+            !matches!(packet.kind, PacketKind::TcpData(_)) || live_payloads.contains(&packet.id)
+        })
+        .filter(|packet| !matches!(packet.kind, PacketKind::Pfc(_)))
+        .collect()
+}
+
+/// Returns whether a resident packet can still cross `candidate` from its checkpoint position.
+/// Unknown positions remain reachable so API images retain a conservative bound.
+fn packet_can_still_cross_link(
+    image: &SimulationImage,
+    packet: &crate::PacketDescriptor,
+    candidate: LinkId,
+) -> bool {
+    let Some(flow) = flow(image, packet.flow) else {
+        return false;
+    };
+    let route = packet_route(flow, packet.kind);
+    let Some(candidate_index) = route.iter().position(|link_id| *link_id == candidate) else {
+        return false;
+    };
+    let mut has_position = false;
+    let mut reachable = false;
+
+    for node in &image.nodes {
+        let owns_packet = match node.kind {
+            NodeKind::Host => {
+                let state = &image.host_states[node.state_slot as usize];
+                state.queue.contains(&packet.id) || state.in_service == Some(packet.id)
+            }
+            NodeKind::Switch => image.switch_states[node.state_slot as usize]
+                .queues
+                .iter()
+                .any(|queue| {
+                    queue.queue.contains(&packet.id) || queue.in_service == Some(packet.id)
+                }),
+        };
+        if !owns_packet {
+            continue;
+        }
+        if let Some(outgoing_index) = route_outgoing_index(image, route, node.id) {
+            has_position = true;
+            reachable |= candidate_index >= outgoing_index;
+        }
+    }
+
+    for event in image
+        .initial_events
+        .iter()
+        .filter(|event| event.payload == packet.id)
+    {
+        let position = match event.kind {
+            EventKind::PacketArrival | EventKind::TxReady => {
+                route_outgoing_index(image, route, event.target)
+            }
+            EventKind::TxComplete => event_egress(image, event)
+                .and_then(|egress| route.iter().position(|link_id| *link_id == egress)),
+            EventKind::RemoteArrival => remote_arrival_link(image, *event)
+                .and_then(|incoming| route.iter().position(|link_id| *link_id == incoming)),
+            EventKind::PacingTimer | EventKind::RetransmissionTimeout => None,
+        };
+        if let Some(position) = position {
+            has_position = true;
+            reachable |= candidate_index >= position;
+        }
+    }
+
+    !has_position || reachable
+}
+
 fn tcp_future_data_max_frame(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
@@ -2364,12 +2526,12 @@ fn maximum_drr_frame_bytes(
         let reverse_reaches = flow.reverse_route.contains(&egress);
         match generator.kind {
             FlowGeneratorKind::Constant(constant) => {
-                if forward_reaches && executable_generator_packets(generator)? != 0 {
+                if forward_reaches && executable_generator_packets(image, generator)? != 0 {
                     maximum = maximum.max(constant.packet_size_bytes);
                 }
             }
             FlowGeneratorKind::Rate(rate) => {
-                if forward_reaches && executable_generator_packets(generator)? != 0 {
+                if forward_reaches && executable_generator_packets(image, generator)? != 0 {
                     maximum = maximum.max(
                         rate.packet_size_bytes
                             .min(rate.total_bytes - generator.bytes_emitted),
@@ -3251,7 +3413,7 @@ fn validate_global_time_capacity(
             FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
             FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
         };
-        let remaining = executable_generator_packets(generator)?;
+        let remaining = executable_generator_packets(image, generator)?;
         for link_id in &flow.route {
             let link = link(image, *link_id).expect("flow validation established the route link");
             let delay = link
@@ -3307,7 +3469,7 @@ fn validate_global_time_capacity(
         })
         .map(|generator| match generator.kind {
             FlowGeneratorKind::Constant(constant) => {
-                let remaining = executable_generator_packets(generator)?;
+                let remaining = executable_generator_packets(image, generator)?;
                 let intervals = remaining.saturating_sub(1);
                 constant
                     .interval_ns
@@ -3677,25 +3839,8 @@ fn route_enters_pfc_controller(
 fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
     let mut data_by_flow = vec![0_u64; image.flows.len()];
     let mut feedback_by_flow = vec![0_u64; image.flows.len()];
-    let scheduled_payloads = image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| {
-            generator.next_emission.status == GeneratorStatus::Scheduled
-                || matches!(generator.kind, FlowGeneratorKind::Rate(_))
-                    && generator.next_emission.status == GeneratorStatus::Blocked
-        })
-        .map(|generator| generator.next_emission.payload)
-        .collect::<BTreeSet<_>>();
-    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
-    for packet in &image.initial_packets {
-        if scheduled_payloads.contains(&packet.id)
-            || matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id)
-            || matches!(packet.kind, PacketKind::Pfc(_))
-        {
-            continue;
-        }
+    let resident_packets = executable_resident_packets(image);
+    for packet in &resident_packets {
         let counts = if packet.kind.is_data() {
             &mut data_by_flow
         } else {
@@ -3710,7 +3855,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
         match generator.kind {
             FlowGeneratorKind::Constant(_) => add_packet_count(
                 &mut data_by_flow[generator.flow.0 as usize],
-                executable_generator_packets(generator)?,
+                executable_generator_packets(image, generator)?,
             )?,
             FlowGeneratorKind::Tcp(_) => {
                 let preloaded_data = data_by_flow[generator.flow.0 as usize];
@@ -3724,7 +3869,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
             }
             FlowGeneratorKind::Rate(_) => add_packet_count(
                 &mut data_by_flow[generator.flow.0 as usize],
-                executable_generator_packets(generator)?,
+                executable_generator_packets(image, generator)?,
             )?,
         }
     }
@@ -3746,6 +3891,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
                     .flat_map(|pfc| &pfc.ingresses)
             })
         {
+            let mut controller_frames = 0_u64;
             for flow in &image.flows {
                 let priority = usize::from(flow.priority);
                 if ingress.xoff_threshold_bytes[priority] == 0 {
@@ -3758,7 +3904,20 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
                     ingress.controlled_link,
                     owner.id,
                 ) {
-                    add_packet_count(&mut monitored_packets, data_by_flow[flow.id.0 as usize])?;
+                    let past_resident = u64::try_from(
+                        resident_packets
+                            .iter()
+                            .filter(|packet| packet.flow == flow.id && packet.kind.is_data())
+                            .filter(|packet| {
+                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
+                            })
+                            .count(),
+                    )
+                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
+                    let reachable = data_by_flow[flow.id.0 as usize]
+                        .checked_sub(past_resident)
+                        .expect("resident data count is included in the per-flow total");
+                    add_packet_count(&mut monitored_packets, reachable)?;
                 }
                 if route_enters_pfc_controller(
                     image,
@@ -3766,17 +3925,36 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
                     ingress.controlled_link,
                     owner.id,
                 ) {
-                    add_packet_count(&mut monitored_packets, feedback_by_flow[flow.id.0 as usize])?;
+                    let past_resident = u64::try_from(
+                        resident_packets
+                            .iter()
+                            .filter(|packet| packet.flow == flow.id && packet.kind.is_feedback())
+                            .filter(|packet| {
+                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
+                            })
+                            .count(),
+                    )
+                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
+                    let reachable = feedback_by_flow[flow.id.0 as usize]
+                        .checked_sub(past_resident)
+                        .expect("resident feedback count is included in the per-flow total");
+                    add_packet_count(&mut monitored_packets, reachable)?;
                 }
                 let frames = monitored_packets
                     .checked_mul(2)
                     .ok_or_else(|| ValidationError::new("PFC control-frame bound exceeds u64"))?;
-                add_packet_count(&mut pfc_by_node[owner.id.0 as usize], frames)?;
-                add_packet_count(
-                    &mut pfc_by_channel[ingress.control_channel_index as usize],
-                    frames,
-                )?;
+                add_packet_count(&mut controller_frames, frames)?;
             }
+            for priority in 0..8 {
+                if ingress.xoff_threshold_bytes[priority] != 0 && ingress.pause_asserted[priority] {
+                    add_packet_count(&mut controller_frames, 1)?;
+                }
+            }
+            add_packet_count(&mut pfc_by_node[owner.id.0 as usize], controller_frames)?;
+            add_packet_count(
+                &mut pfc_by_channel[ingress.control_channel_index as usize],
+                controller_frames,
+            )?;
         }
     }
     Ok(FutureWork {
@@ -3986,8 +4164,18 @@ fn remaining_generator_packets(
 }
 
 fn executable_generator_packets(
+    image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
+    if matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+    ) && matches!(generator.kind, FlowGeneratorKind::Rate(_))
+        && generator.next_emission.departure_time_ns > image.stop_time_ns
+    {
+        remaining_generator_packets(generator)?;
+        return Ok(0);
+    }
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
         GeneratorStatus::Blocked
@@ -4123,7 +4311,7 @@ fn tcp_attempt_upper_bound(
         return Ok(0);
     }
     let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-        return executable_generator_packets(generator);
+        return executable_generator_packets(image, generator);
     };
     if tcp.highest_ack >= tcp.total_bytes {
         return Ok(0);
@@ -4221,14 +4409,14 @@ fn validate_origin_sequences(
         for generator in &state.generators {
             let emissions = match generator.kind {
                 FlowGeneratorKind::Constant(_) => {
-                    let remaining = executable_generator_packets(generator)?;
+                    let remaining = executable_generator_packets(image, generator)?;
                     let scheduled =
                         u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
                     remaining.saturating_sub(scheduled)
                 }
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
                 FlowGeneratorKind::Rate(_) => {
-                    let remaining = executable_generator_packets(generator)?;
+                    let remaining = executable_generator_packets(image, generator)?;
                     let reserved = u64::from(matches!(
                         generator.next_emission.status,
                         GeneratorStatus::Scheduled | GeneratorStatus::Blocked
@@ -4362,9 +4550,9 @@ fn validate_payload_sequences(
         let mut consumed_sequences = 0_u64;
         for generator in &state.generators {
             let remaining = match generator.kind {
-                FlowGeneratorKind::Constant(_) => executable_generator_packets(generator)?,
+                FlowGeneratorKind::Constant(_) => executable_generator_packets(image, generator)?,
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
-                FlowGeneratorKind::Rate(_) => executable_generator_packets(generator)?,
+                FlowGeneratorKind::Rate(_) => executable_generator_packets(image, generator)?,
             };
             let already_scheduled = u64::from(
                 generator.next_emission.status == GeneratorStatus::Scheduled
@@ -4380,12 +4568,25 @@ fn validate_payload_sequences(
                         owner.id
                     ))
                 })?;
-            let required = remaining.checked_sub(already_scheduled).ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} has a scheduled emission after its constant generator finished",
-                    generator.flow
-                ))
-            })?;
+            let dormant_rate_token = matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                && matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                )
+                && generator.next_emission.departure_time_ns > image.stop_time_ns;
+            let reserved_from_remaining = if dormant_rate_token {
+                0
+            } else {
+                already_scheduled
+            };
+            let required = remaining
+                .checked_sub(reserved_from_remaining)
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} has a scheduled emission after its constant generator finished",
+                        generator.flow
+                    ))
+                })?;
             allocations = allocations.checked_add(required).ok_or_else(|| {
                 ValidationError::new(format!(
                     "node {:?} generated-packet count exceeds u64",

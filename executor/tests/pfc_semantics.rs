@@ -357,11 +357,26 @@ fn branched_path_image() -> SimulationImage {
 }
 
 fn run_scalar_cpu(image: &SimulationImage) -> RunResult {
-    validate(image, Backend::Scalar).expect("scalar PFC fixture must validate");
+    run_scalar_cpu_inner(image, true)
+}
+
+// Receiver assignment/idempotency tests inject external control frames without modeling the
+// downstream occupancy transition that emitted them. They exercise runtime delivery, not the
+// checkpoint-admissibility contract enforced by `validate`.
+fn run_scalar_cpu_with_external_controls(image: &SimulationImage) -> RunResult {
+    run_scalar_cpu_inner(image, false)
+}
+
+fn run_scalar_cpu_inner(image: &SimulationImage, validate_input: bool) -> RunResult {
+    if validate_input {
+        validate(image, Backend::Scalar).expect("scalar PFC fixture must validate");
+    }
     let scalar = run_scalar_with_observations(image, None, ObservationMode::Full)
         .expect("scalar PFC fixture must execute");
     for workers in [1, 2, 4] {
-        validate(image, Backend::Cpu { workers }).expect("CPU PFC fixture must validate");
+        if validate_input {
+            validate(image, Backend::Cpu { workers }).expect("CPU PFC fixture must validate");
+        }
         let cpu = run_cpu_with_observations(
             image,
             None,
@@ -397,6 +412,272 @@ fn upstream_pfc(result: &RunResult) -> &PfcQueueState {
 }
 
 #[test]
+fn validator_rejects_orphaned_controller_pause_checkpoint() {
+    let mut image = path_image();
+    image.initial_packets[0] = data_packet(DATA_0, 100);
+    let queue = &mut image.switch_states[0].queues[0];
+    queue.queue.push_back(DATA_0);
+    queue
+        .pfc
+        .as_mut()
+        .expect("fixture has upstream PFC state")
+        .paused_by_controller[usize::from(PRIORITY)]
+    .insert(DOWNSTREAM);
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("orphaned pause has no asserted monitor or in-flight control frame")
+        .to_string();
+    assert!(
+        error.contains("PFC") && error.contains("NodeId(2)") && error.contains("priority 3"),
+        "expected a controller-specific causal-state diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_rejects_orphaned_downstream_assertion_checkpoint() {
+    let mut image = path_image();
+    image.initial_packets[0] = data_packet(DATA_0, 600);
+    let queue = &mut image.switch_states[1].queues[0];
+    queue.queue.push_back(DATA_0);
+    queue.tx_ready_pending = true;
+    let ingress = queue
+        .pfc
+        .as_mut()
+        .expect("fixture has downstream PFC state")
+        .ingresses
+        .first_mut()
+        .expect("fixture has a controller monitor");
+    ingress.occupancy_bytes[usize::from(PRIORITY)] = 600;
+    ingress.pause_asserted[usize::from(PRIORITY)] = true;
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::TxReady),
+            origin_node: DOWNSTREAM,
+            origin_seq: 0,
+        },
+        target: DOWNSTREAM,
+        kind: EventKind::TxReady,
+        payload: DATA_0,
+    });
+    image.switch_states[1].next_origin_seq = 1;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("asserted monitor has neither a delivered nor in-flight pause")
+        .to_string();
+    assert!(
+        error.contains("PFC") && error.contains("NodeId(2)") && error.contains("priority 3"),
+        "expected a controller-specific causal-state diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn validator_accepts_rapid_pause_resume_in_flight() {
+    let mut image = path_image();
+    add_control(&mut image, 1, 0, true);
+    add_control(&mut image, 2, 1, false);
+
+    validate(&image, Backend::Scalar)
+        .expect("ordered in-flight pause then resume reconciles two unasserted endpoints");
+    validate(&image, Backend::Cpu { workers: 4 })
+        .expect("ordered in-flight pause then resume is backend-neutral");
+}
+
+#[test]
+fn multiple_controller_interleavings_preserve_each_assertion() {
+    let mut image = branched_path_image();
+    image.stop_time_ns = 5;
+    add_control_from(&mut image, DOWNSTREAM, 1, 0, true);
+    add_control_from(&mut image, DOWNSTREAM_B, 2, 0, true);
+    add_control_from(&mut image, DOWNSTREAM, 3, 1, false);
+    add_control_from(&mut image, DOWNSTREAM, 4, 2, true);
+    add_control_from(&mut image, DOWNSTREAM_B, 5, 1, false);
+
+    let result = run_scalar_cpu_with_external_controls(&image);
+    let controllers = &upstream_pfc(&result).paused_by_controller[usize::from(PRIORITY)];
+    assert_eq!(controllers, &BTreeSet::from([DOWNSTREAM]));
+}
+
+fn packet_already_past_controller(enabled: bool) -> SimulationImage {
+    let mut image = path_image();
+    if !enabled {
+        image.flows[0].priority = 2;
+    }
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::RemoteArrival),
+            origin_node: DOWNSTREAM,
+            origin_seq: 0,
+        },
+        target: SINK,
+        kind: EventKind::RemoteArrival,
+        payload: DATA_0,
+    });
+    image.switch_states[1].next_origin_seq = u64::MAX - 3;
+    image
+}
+
+#[test]
+fn pfc_reservation_ignores_packet_past_controller() {
+    validate(&packet_already_past_controller(false), Backend::Scalar)
+        .expect("disabled priority establishes the non-PFC boundary baseline");
+
+    validate(&packet_already_past_controller(true), Backend::Scalar)
+        .expect("a terminal arrival cannot return to a PFC controller already crossed");
+}
+
+#[test]
+fn pfc_maximum_frame_ignores_packet_past_controller() {
+    let mut image = packet_already_past_controller(true);
+    image.initial_packets[0] = data_packet(DATA_0, 1_001);
+    image.switch_states[1].queues[0]
+        .pfc
+        .as_mut()
+        .and_then(|pfc| pfc.ingresses.first_mut())
+        .expect("fixture has a controller monitor")
+        .max_frame_bytes[usize::from(PRIORITY)] = 1_000;
+
+    validate(&image, Backend::Scalar)
+        .expect("a terminal arrival cannot inflate an already-crossed controller frame bound");
+}
+
+fn live_pfc_checkpoint_image(stop_time_ns: u64) -> SimulationImage {
+    let mut image = path_image();
+    image.stop_time_ns = stop_time_ns;
+    image.initial_packets = vec![data_packet(DATA_0, 1_000), data_packet(DATA_1, 1_000)];
+    image.switch_states[1].queues[0].in_service = Some(DATA_0);
+    image.initial_events = vec![
+        Event {
+            key: EventKey {
+                time_ns: 1,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: UPSTREAM,
+                origin_seq: 0,
+            },
+            target: DOWNSTREAM,
+            kind: EventKind::RemoteArrival,
+            payload: DATA_1,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 8,
+                phase: event_phase(EventKind::RemoteArrival),
+                origin_node: DOWNSTREAM,
+                origin_seq: 1,
+            },
+            target: SINK,
+            kind: EventKind::RemoteArrival,
+            payload: DATA_0,
+        },
+        Event {
+            key: EventKey {
+                time_ns: 8,
+                phase: event_phase(EventKind::TxComplete),
+                origin_node: DOWNSTREAM,
+                origin_seq: 0,
+            },
+            target: DOWNSTREAM,
+            kind: EventKind::TxComplete,
+            payload: DATA_0,
+        },
+    ];
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image.switch_states[0].next_origin_seq = 1;
+    image.switch_states[1].next_origin_seq = 2;
+    image
+}
+
+#[test]
+fn live_pfc_checkpoints_revalidate_across_pause_and_resume_delivery() {
+    for (stop_time_ns, expected_upstream, expected_asserted) in [
+        (1, false, true),
+        (7, true, true),
+        (8, true, false),
+        (14, false, false),
+    ] {
+        let image = live_pfc_checkpoint_image(stop_time_ns);
+        validate(&image, Backend::Scalar).expect("live PFC input must validate");
+        let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("live PFC prefix must execute");
+        assert_eq!(
+            result.switch_states[0].queues[0]
+                .pfc
+                .as_ref()
+                .expect("upstream PFC state")
+                .paused_by_controller[usize::from(PRIORITY)]
+            .contains(&DOWNSTREAM),
+            expected_upstream,
+            "stop {stop_time_ns} upstream membership"
+        );
+        assert_eq!(
+            result.switch_states[1].queues[0]
+                .pfc
+                .as_ref()
+                .and_then(|pfc| pfc.ingresses.first())
+                .expect("controller monitor")
+                .pause_asserted[usize::from(PRIORITY)],
+            expected_asserted,
+            "stop {stop_time_ns} controller assertion"
+        );
+        let mut checkpoint = image;
+        checkpoint.host_states = result.host_states;
+        checkpoint.switch_states = result.switch_states;
+        checkpoint.initial_packets = result.resident_packets;
+        checkpoint.initial_events = result.pending_events;
+
+        validate(&checkpoint, Backend::Scalar)
+            .unwrap_or_else(|error| panic!("stop {stop_time_ns} scalar checkpoint: {error}"));
+        validate(&checkpoint, Backend::Cpu { workers: 4 })
+            .unwrap_or_else(|error| panic!("stop {stop_time_ns} CPU checkpoint: {error}"));
+    }
+}
+
+#[test]
+fn asserted_monitor_reserves_its_future_resume_frame() {
+    let mut image = path_image();
+    image.initial_packets[0] = data_packet(DATA_0, 600);
+    image.switch_states[0].queues[0]
+        .pfc
+        .as_mut()
+        .expect("fixture has upstream PFC state")
+        .paused_by_controller[usize::from(PRIORITY)]
+    .insert(DOWNSTREAM);
+    let queue = &mut image.switch_states[1].queues[0];
+    queue.queue.push_back(DATA_0);
+    queue.tx_ready_pending = true;
+    let ingress = queue
+        .pfc
+        .as_mut()
+        .expect("fixture has downstream PFC state")
+        .ingresses
+        .first_mut()
+        .expect("fixture has a controller monitor");
+    ingress.occupancy_bytes[usize::from(PRIORITY)] = 600;
+    ingress.pause_asserted[usize::from(PRIORITY)] = true;
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::TxReady),
+            origin_node: DOWNSTREAM,
+            origin_seq: 0,
+        },
+        target: DOWNSTREAM,
+        kind: EventKind::TxReady,
+        payload: DATA_0,
+    });
+    image.switch_states[1].next_origin_seq = u64::MAX - 3;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("draining asserted occupancy can still emit one resume frame")
+        .to_string();
+    assert!(
+        error.contains("PFC payload") && error.contains("NodeId(2)"),
+        "expected an asserted-monitor resume reservation diagnostic, got: {error}"
+    );
+}
+
+#[test]
 fn pause_during_service_completes_in_service_and_blocks_the_next_priority() {
     let mut image = path_image();
     image.stop_time_ns = 10;
@@ -418,7 +699,7 @@ fn pause_during_service_completes_in_service_and_blocks_the_next_priority() {
     });
     image.initial_events.sort_unstable_by_key(|event| event.key);
 
-    let result = run_scalar_cpu(&image);
+    let result = run_scalar_cpu_with_external_controls(&image);
     let queue = &result.switch_states[0].queues[0];
 
     assert_eq!(queue.in_service, None, "the committed packet must complete");
@@ -447,8 +728,8 @@ fn duplicate_pause_is_an_idempotent_state_assignment() {
     add_control(&mut duplicate, 1, 0, true);
     add_control(&mut duplicate, 2, 1, true);
 
-    let one_result = run_scalar_cpu(&one);
-    let duplicate_result = run_scalar_cpu(&duplicate);
+    let one_result = run_scalar_cpu_with_external_controls(&one);
+    let duplicate_result = run_scalar_cpu_with_external_controls(&duplicate);
 
     assert_eq!(upstream_pfc(&one_result), upstream_pfc(&duplicate_result));
     assert!(
@@ -468,8 +749,8 @@ fn resume_before_pause_is_an_idempotent_no_op() {
     add_control(&mut early_resume, 1, 0, false);
     add_control(&mut early_resume, 2, 1, true);
 
-    let pause_result = run_scalar_cpu(&pause_only);
-    let early_result = run_scalar_cpu(&early_resume);
+    let pause_result = run_scalar_cpu_with_external_controls(&pause_only);
+    let early_result = run_scalar_cpu_with_external_controls(&early_resume);
 
     assert_eq!(upstream_pfc(&pause_result), upstream_pfc(&early_result));
     assert!(upstream_pfc(&early_result).is_paused(usize::from(PRIORITY)));
@@ -484,7 +765,7 @@ fn one_controller_resume_does_not_clear_another_controllers_pause() {
     add_control_from(&mut image, DOWNSTREAM_B, 2, 0, true);
     add_control_from(&mut image, DOWNSTREAM, 3, 1, false);
 
-    let result = run_scalar_cpu(&image);
+    let result = run_scalar_cpu_with_external_controls(&image);
 
     assert!(
         upstream_pfc(&result).is_paused(usize::from(PRIORITY)),
@@ -613,7 +894,7 @@ fn pfc_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
     add_control_from(&mut controller_image, DOWNSTREAM, 1, 0, true);
     add_control_from(&mut controller_image, DOWNSTREAM_B, 2, 0, true);
     add_control_from(&mut controller_image, DOWNSTREAM, 3, 1, false);
-    records.extend(run_scalar_cpu(&controller_image).mechanism_transitions);
+    records.extend(run_scalar_cpu_with_external_controls(&controller_image).mechanism_transitions);
 
     assert_eq!(
         pfc_transitions_csv(&records).unwrap(),
@@ -1417,6 +1698,15 @@ fn validator_rejects_a_circular_controlled_link_dependency() {
         .expect_err("AB -> BC -> CA -> AB must be rejected")
         .to_string();
 
+    for _ in 0..100 {
+        assert_eq!(
+            validate(&image, Backend::Scalar)
+                .expect_err("the forward ring must always be rejected")
+                .to_string(),
+            error
+        );
+    }
+
     assert!(
         error.contains("PFC circular pause dependency")
             && error.contains("(LinkId(3), 3)")
@@ -1424,4 +1714,193 @@ fn validator_rejects_a_circular_controlled_link_dependency() {
             && error.contains("(LinkId(5), 3)"),
         "expected the canonical PFC cycle diagnostic, got: {error}"
     );
+}
+
+fn reverse_route_cycle_image() -> SimulationImage {
+    const HOST_A: NodeId = NodeId(0);
+    const HOST_B: NodeId = NodeId(1);
+    const HOST_C: NodeId = NodeId(2);
+    const A_AB: NodeId = NodeId(3);
+    const B_BC: NodeId = NodeId(5);
+    const C_CA: NodeId = NodeId(7);
+
+    const HOST_A_LINK: LinkId = LinkId(0);
+    const HOST_B_LINK: LinkId = LinkId(1);
+    const HOST_C_LINK: LinkId = LinkId(2);
+    const AB: LinkId = LinkId(3);
+    const BC: LinkId = LinkId(4);
+    const CA: LinkId = LinkId(5);
+    const A_TERMINAL: LinkId = LinkId(6);
+    const B_TERMINAL: LinkId = LinkId(7);
+    const C_TERMINAL: LinkId = LinkId(8);
+    const BA_CONTROL: LinkId = LinkId(9);
+    const CB_CONTROL: LinkId = LinkId(10);
+    const AC_CONTROL: LinkId = LinkId(11);
+
+    let mut image = circular_dependency_image();
+    image.flows = vec![
+        FlowDescriptor {
+            id: FlowId(0),
+            source: HOST_C,
+            target: HOST_A,
+            priority: PRIORITY,
+            route: vec![HOST_C_LINK, CA, A_TERMINAL],
+            reverse_route: vec![HOST_A_LINK, AB, BC, C_TERMINAL],
+        },
+        FlowDescriptor {
+            id: FlowId(1),
+            source: HOST_A,
+            target: HOST_B,
+            priority: PRIORITY,
+            route: vec![HOST_A_LINK, AB, B_TERMINAL],
+            reverse_route: vec![HOST_B_LINK, BC, CA, A_TERMINAL],
+        },
+        FlowDescriptor {
+            id: FlowId(2),
+            source: HOST_B,
+            target: HOST_C,
+            priority: PRIORITY,
+            route: vec![HOST_B_LINK, BC, C_TERMINAL],
+            reverse_route: vec![HOST_C_LINK, CA, AB, B_TERMINAL],
+        },
+    ];
+
+    image.initial_packets = image
+        .flows
+        .iter()
+        .map(|flow| PacketDescriptor {
+            id: PayloadId(flow.source.0),
+            flow: flow.id,
+            size_bytes: 1,
+            ecn_marked: false,
+            kind: PacketKind::TcpData(TcpDataHeader {
+                sequence: 0,
+                sent_time_ns: 0,
+                retransmission: false,
+            }),
+        })
+        .collect();
+    image
+        .initial_packets
+        .sort_unstable_by_key(|packet| packet.id);
+    image.initial_events = image
+        .flows
+        .iter()
+        .map(|flow| Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::PacketArrival),
+                origin_node: flow.source,
+                origin_seq: 0,
+            },
+            target: flow.source,
+            kind: EventKind::PacketArrival,
+            payload: PayloadId(flow.source.0),
+        })
+        .collect();
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+
+    for host in &mut image.host_states {
+        host.generators.clear();
+        host.tcp_receivers.clear();
+        host.next_origin_seq = 1;
+        host.next_payload_seq = 1;
+    }
+    for flow in &image.flows {
+        let generator = FlowGeneratorState {
+            flow: flow.id,
+            packets_emitted: 0,
+            bytes_emitted: 0,
+            next_emission: ScheduledEmission {
+                status: GeneratorStatus::Scheduled,
+                departure_time_ns: 0,
+                payload: PayloadId(flow.source.0),
+            },
+            rng_state: 25,
+            feedback: GeneratorFeedbackState {
+                arrivals: 0,
+                outstanding_bytes: 0,
+                unacknowledged_bytes: 0,
+            },
+            kind: FlowGeneratorKind::Tcp(TcpGenerator::new(1, 1, 1, TcpCongestionControl::reno(1))),
+        };
+        let source_slot = image.nodes[flow.source.0 as usize].state_slot as usize;
+        image.host_states[source_slot].generators.push(generator);
+        let target_slot = image.nodes[flow.target.0 as usize].state_slot as usize;
+        image.host_states[target_slot]
+            .tcp_receivers
+            .push(TcpReceiverState::new(flow.id, 1));
+    }
+    for host in &mut image.host_states {
+        host.generators
+            .sort_unstable_by_key(|generator| generator.flow);
+        host.tcp_receivers
+            .sort_unstable_by_key(|receiver| receiver.flow);
+    }
+
+    image.channels.clear();
+    let mut seen = BTreeSet::new();
+    for flow in &image.flows {
+        for (route, terminal) in [
+            (&flow.route, flow.target),
+            (&flow.reverse_route, flow.source),
+        ] {
+            for (index, link_id) in route.iter().copied().enumerate() {
+                let target = route
+                    .get(index + 1)
+                    .map(|next| image.links[next.0 as usize].source)
+                    .unwrap_or(terminal);
+                if seen.insert((link_id, target)) {
+                    image.channels.push(
+                        RemoteChannel::for_packet_link_to(
+                            image.links[link_id.0 as usize],
+                            target,
+                            1,
+                        )
+                        .expect("ring packet-channel delay must fit"),
+                    );
+                }
+            }
+        }
+    }
+    let control_base = image.channels.len() as u32;
+    for (link_id, source, target) in [
+        (BA_CONTROL, B_BC, A_AB),
+        (CB_CONTROL, C_CA, B_BC),
+        (AC_CONTROL, A_AB, C_CA),
+    ] {
+        let link = image.links[link_id.0 as usize];
+        image.channels.push(RemoteChannel {
+            source,
+            target,
+            link: link_id,
+            event_kind: EventKind::RemoteArrival,
+            min_delay_ns: link.delay_ns(64).expect("ring PFC delay must fit"),
+        });
+    }
+    image.switch_states[0].queues[0]
+        .pfc
+        .as_mut()
+        .unwrap()
+        .ingresses[0]
+        .control_channel_index = control_base + 2;
+    image.switch_states[2].queues[0]
+        .pfc
+        .as_mut()
+        .unwrap()
+        .ingresses[0]
+        .control_channel_index = control_base;
+    image.switch_states[4].queues[0]
+        .pfc
+        .as_mut()
+        .unwrap()
+        .ingresses[0]
+        .control_channel_index = control_base + 1;
+    image
+}
+
+#[test]
+fn validator_rejects_a_pfc_cycle_carried_only_by_tcp_ack_routes() {
+    validate(&reverse_route_cycle_image(), Backend::Scalar)
+        .expect_err("AB -> BC -> CA -> AB on executable ACK routes must be rejected");
 }

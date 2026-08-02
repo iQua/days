@@ -151,6 +151,98 @@ fn rate_state(result: &RunResult) -> (FlowGeneratorState, RateGenerator) {
 }
 
 #[test]
+fn scheduled_rate_deadline_after_stop_reserves_zero_future_packets() {
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 11,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    validate(&image, Backend::Scalar)
+        .expect("a scheduled deadline beyond stop is accepted at ordinary counters");
+    image.host_states[0].sourced_packets = u64::MAX;
+
+    validate(&image, Backend::Scalar)
+        .expect("a pacing event beyond stop cannot increment the source counter");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the terminal run must perform no source transition");
+    assert_eq!(result.summary.sourced_packets, 0);
+    validate(&checkpoint_image(&image, &result), Backend::Scalar)
+        .expect("the no-op terminal checkpoint must preserve zero executable work");
+}
+
+#[test]
+fn scheduled_rate_deadline_after_stop_still_checks_emission_bookkeeping() {
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 11,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    let next_token = PayloadId::from_node_sequence(SOURCE, image.nodes.len() as u64, 1)
+        .expect("small fixture identity must fit");
+    image.initial_packets[0].id = next_token;
+    image.initial_events[0].payload = next_token;
+    let generator = &mut image.host_states[0].generators[0];
+    generator.packets_emitted = 1;
+    generator.next_emission.payload = next_token;
+    image.host_states[0].next_payload_seq = 2;
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("stop truncation must not hide inconsistent rate-source bookkeeping")
+        .to_string();
+    assert!(
+        error.contains("records 0 emitted bytes, expected 1"),
+        "expected an emitted-byte bookkeeping diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn scheduled_rate_deadline_at_stop_remains_executable() {
+    let mut image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 10,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    image.host_states[0].sourced_packets = u64::MAX;
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the inclusive stop-time pacing event still sources one packet")
+        .to_string();
+    assert!(
+        error.contains("sourced_packets") && error.contains("remaining upper bound 1"),
+        "expected an inclusive stop-time counter diagnostic, got: {error}"
+    );
+
+    image.host_states[0].sourced_packets = u64::MAX - 1;
+    validate(&image, Backend::Scalar).expect("one executable boundary packet still fits");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the stop-time event must execute");
+    assert_eq!(result.summary.sourced_packets, 1);
+}
+
+#[test]
 fn exact_rational_credit_produces_remainder_cadence_and_status_transitions() {
     assert_eq!(
         event_fel_class(EventKind::PacingTimer),
