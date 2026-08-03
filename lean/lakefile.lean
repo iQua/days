@@ -36,6 +36,9 @@ lean_exe p10c_mechanisms_check where
 lean_exe p10c_aqm_check where
   root := `LeanGuard.P10cAqmMain
 
+lean_exe p10c_dcqcn_check where
+  root := `LeanGuard.P10cDcqcnMain
+
 lean_exe aqm_check where
   root := `LeanGuard.AqmMain
 

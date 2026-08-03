@@ -13,6 +13,12 @@ namespace LeanGuard.DcqcnEventLog
 open LeanGuard.Shared
 open LeanGuard.Dcqcn.Semantics
 
+/-- Legacy floating-point DCQCN event-log checker.
+
+The exact-integer executor lineage is intentionally separate in
+`LeanGuard.P10c.DcqcnEventLog`; changes there must not alter this legacy replay.
+-/
+
 inductive Kind
   | cnpSent
   | cnpRecv
@@ -466,40 +472,5 @@ def checkRows (rows : List Row) : Except String Unit := do
   match checkRowsWithCoverage rows with
   | .ok _ => pure ()
   | .error (e, _) => throw e
-
-def dummyRow (timeNs eventId srcLine : Nat) : Row :=
-  { timeNs
-    eventId
-    kind := Kind.timerTick
-    endpointId := 0
-    flowId := 0
-    pktId := none
-    pktFlowId := none
-    triggerEcn := none
-    cnpPriority := none
-    cnpSizeB := none
-    cnpEcn := none
-    cnpCwr := none
-    cnpLastPacket := none
-    cnpIntervalNs := 0
-    gPpb := 0
-    miPpb := 0
-    initRateBps := 0
-    minRateBps := 0
-    maxRateBps := 0
-    aiRateBps := 0
-    haiRateBps := 0
-    alphaPpb := none
-    rateBps := none
-    cnpSeen := none
-    lastCnpNs := none
-    srcLine }
-
-example :
-    (match canonicalizeRows [dummyRow 2 1 10, dummyRow 1 5 11, dummyRow 2 0 12] key (fun r => r.srcLine) with
-      | .ok v => some v
-      | .error _ => none) =
-      some [dummyRow 1 5 11, dummyRow 2 0 12, dummyRow 2 1 10] := by
-  native_decide
 
 end LeanGuard.DcqcnEventLog

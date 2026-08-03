@@ -528,27 +528,6 @@ fn read_coverage_points(path: &Path) -> Option<Vec<String>> {
     Some(points)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::read_coverage_points;
-
-    #[test]
-    fn coverage_report_object_extracts_sorted_unique_coverpoints() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("coverage.json");
-        std::fs::write(
-            &path,
-            r#"{"checker":"tcp_check","accept":true,"cover":["reno_timeout","reno_new_ack","reno_timeout"],"stats":{"rows":3,"processed_rows":3}}"#,
-        )
-        .expect("write coverage report");
-
-        assert_eq!(
-            read_coverage_points(&path),
-            Some(vec!["reno_new_ack".to_string(), "reno_timeout".to_string()])
-        );
-    }
-}
-
 fn aggregate_coverage(results: &[CheckerResult]) -> Option<CoverageSummary> {
     let mut union = BTreeSet::new();
     let mut per_checker = BTreeMap::new();
@@ -626,4 +605,25 @@ fn required_features_hint(config: &toml::Value) -> String {
     features.dedup();
 
     format!("`--features {}`", features.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_coverage_points;
+
+    #[test]
+    fn coverage_report_object_extracts_sorted_unique_coverpoints() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("coverage.json");
+        std::fs::write(
+            &path,
+            r#"{"checker":"tcp_check","accept":true,"cover":["reno_timeout","reno_new_ack","reno_timeout"],"stats":{"rows":3,"processed_rows":3}}"#,
+        )
+        .expect("write coverage report");
+
+        assert_eq!(
+            read_coverage_points(&path),
+            Some(vec!["reno_new_ack".to_string(), "reno_timeout".to_string()])
+        );
+    }
 }
